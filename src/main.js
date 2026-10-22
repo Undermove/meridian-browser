@@ -1,13 +1,13 @@
 // Meridian — main process.
-// Owns windows, the app menu (all keyboard shortcuts live here so they work
+// Owns windows, the app menu and keyboard shortcuts (matched here on every webContents so they work
 // even when a page has focus), persistence, sessions/profiles, downloads,
 // permissions, ad blocking and the Arc importer.
 
-const { app, BrowserWindow, Menu, ipcMain, session, shell, dialog, clipboard, nativeTheme, webContents } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain, session, shell, dialog, clipboard, nativeTheme, webContents, protocol } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { pathToFileURL } = require('url');
+const { shortcutTable, findShortcut } = require('./shortcuts');
 const { importFromArc, arcDataExists } = require('./importers/arc');
 const { AgentHub } = require('./agent/hub');
 const { Assistant } = require('./ai/assistant');
@@ -20,6 +20,8 @@ const DEV = !app.isPackaged;
 if (DEV && process.env.MERIDIAN_USER_DATA) app.setPath('userData', process.env.MERIDIAN_USER_DATA);
 
 const STATE_FILE = () => path.join(app.getPath('userData'), 'state.json');
+const HISTORY_FILE = () => path.join(app.getPath('userData'), 'history.json');
+const FAVICONS_FILE = () => path.join(app.getPath('userData'), 'favicons.json');
 const PERMS_FILE = () => path.join(app.getPath('userData'), 'permissions.json');
 
 // Google & co. refuse to sign in from "Electron" user agents. Present as plain Chrome.
@@ -56,15 +58,67 @@ function openExternalUrl(url) {
   createMiniWindow(url);
 }
 
+// ---------- the UI page: served from meridian://app/ (only files under src/renderer) ----------
+// A custom privileged scheme instead of file:// lets the file:// fuse stay off, and gives the UI an
+// origin no web page or local file can share.
+
+const UI_SCHEME = 'meridian';
+const UI_ORIGIN = `${UI_SCHEME}://app`;
+const UI_URL = `${UI_ORIGIN}/index.html`;
+const RENDERER_DIR = path.join(__dirname, 'renderer');
+const MIME = {
+  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.ico': 'image/x-icon', '.woff2': 'font/woff2', '.woff': 'font/woff', '.ttf': 'font/ttf',
+};
+
+// Same as the <meta> CSP in index.html, also sent as a header.
+const UI_CSP = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+
+protocol.registerSchemesAsPrivileged([
+  { scheme: UI_SCHEME, privileges: { standard: true, secure: true, supportFetchAPI: true } },
+]);
+
+// Maps meridian://app/<path> to a file inside src/renderer, or null for anything else.
+function uiFilePath(url) {
+  let u;
+  try { u = new URL(url); } catch { return null; }
+  if (u.protocol !== `${UI_SCHEME}:` || u.host !== 'app') return null;
+  let rel;
+  try { rel = decodeURIComponent(u.pathname); } catch { return null; }
+  if (rel.includes('\0') || rel.includes('\\')) return null;
+  const file = path.resolve(RENDERER_DIR, '.' + path.posix.normalize('/' + rel));
+  if (!file.startsWith(RENDERER_DIR + path.sep)) return null;
+  return file;
+}
+
+function registerUiProtocol() {
+  protocol.handle(UI_SCHEME, async (req) => {
+    const file = req.method === 'GET' ? uiFilePath(req.url) : null;
+    const type = file && MIME[path.extname(file).toLowerCase()];
+    if (!file || !type) return new Response('Not found', { status: 404 });
+    try {
+      const body = await fs.promises.readFile(file);
+      const headers = { 'content-type': type, 'x-content-type-options': 'nosniff', 'cache-control': 'no-cache' };
+      if (type.startsWith('text/html')) headers['content-security-policy'] = UI_CSP;
+      return new Response(body, { headers });
+    } catch {
+      return new Response('Not found', { status: 404 });
+    }
+  });
+}
+
+const uiPageUrl = (query) => (query ? `${UI_URL}?${new URLSearchParams(query)}` : UI_URL);
+
 // ---------- IPC guard ----------
-// Every privileged channel only answers our own UI page (file://…/renderer/index.html).
+// Every privileged channel only answers our own UI page (meridian://app/index.html).
 // Web content lives in <webview> guests and can never reach these handlers, but checking the sender
 // keeps it that way even if something is misconfigured later.
 
-const UI_URL = pathToFileURL(path.join(__dirname, 'renderer', 'index.html')).href;
+const isUiUrl = (url) => url === UI_URL || url.startsWith(UI_URL + '?') || url.startsWith(UI_URL + '#');
 const fromUi = (e) => {
-  const url = e.senderFrame?.url || '';
-  return (url === UI_URL || url.startsWith(UI_URL + '?') || url.startsWith(UI_URL + '#')) && e.sender.getType() === 'window';
+  const frame = e.senderFrame;
+  return !!frame && !frame.parent && isUiUrl(frame.url || '') && e.sender.getType() === 'window';
 };
 const handle = (channel, fn) => ipcMain.handle(channel, (e, ...args) => {
   if (!fromUi(e)) throw new Error('forbidden');
@@ -83,13 +137,62 @@ function readJson(file, fallback) {
 
 function writeJsonAtomic(file, data) {
   const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(data));
+  fs.writeFileSync(tmp, typeof data === 'string' ? data : JSON.stringify(data));
   fs.renameSync(tmp, file);
 }
 
-handle('state:load', () => readJson(STATE_FILE(), null));
-handle('state:save', (_e, state) => { writeJsonAtomic(STATE_FILE(), state); return true; });
-on('state:save-sync', (e, state) => { try { writeJsonAtomic(STATE_FILE(), state); } catch {} e.returnValue = true; });
+// Async writes keep the main process (which routes all input) free; one chain per file keeps them in order.
+const writeChains = new Map();
+function writeJsonAtomicAsync(file, data) {
+  const run = async () => {
+    const tmp = file + '.tmp';
+    await fs.promises.writeFile(tmp, typeof data === 'string' ? data : JSON.stringify(data));
+    await fs.promises.rename(tmp, file);
+  };
+  const next = (writeChains.get(file) || Promise.resolve()).then(run, run);
+  writeChains.set(file, next.catch(() => {}));
+  return next;
+}
+
+// state.json holds spaces/tabs/settings. History and favicons change often and are big, so they live in
+// their own files and the UI sends them only when they changed. Older state.json files carry history
+// inline; it is moved out on first load.
+function loadState() {
+  const state = readJson(STATE_FILE(), null);
+  if (!state) return null;
+  const history = readJson(HISTORY_FILE(), null);
+  if (history) state.history = history;
+  else if (state.history && Object.keys(state.history).length) writeJsonAtomic(HISTORY_FILE(), state.history);
+  state.faviconCache = readJson(FAVICONS_FILE(), {});
+  return state;
+}
+
+// parts: { state: object | JSON string, history?: object, favicons?: object }. Legacy callers send the
+// state object itself (history inline).
+function splitStateParts(arg) {
+  if (arg && typeof arg === 'object' && 'state' in arg && !('spaces' in arg)) return arg;
+  const { history, ...state } = arg || {};
+  return { state, history };
+}
+
+async function saveStateParts(arg) {
+  const { state, history, favicons } = splitStateParts(arg);
+  if (history) await writeJsonAtomicAsync(HISTORY_FILE(), history);
+  if (favicons) await writeJsonAtomicAsync(FAVICONS_FILE(), favicons);
+  if (state) await writeJsonAtomicAsync(STATE_FILE(), state);
+  return true;
+}
+
+function saveStatePartsSync(arg) {
+  const { state, history, favicons } = splitStateParts(arg);
+  if (history) writeJsonAtomic(HISTORY_FILE(), history);
+  if (favicons) writeJsonAtomic(FAVICONS_FILE(), favicons);
+  if (state) writeJsonAtomic(STATE_FILE(), state);
+}
+
+handle('state:load', () => loadState());
+handle('state:save', (_e, parts) => saveStateParts(parts));
+on('state:save-sync', (e, parts) => { try { saveStatePartsSync(parts); } catch {} e.returnValue = true; });
 
 // ---------- sessions (one per profile) ----------
 
@@ -411,6 +514,42 @@ app.on('web-contents-created', (_e, contents) => {
   });
 });
 
+// ---------- keyboard shortcuts ----------
+// Matched before the page sees the key, on the UI windows and on every guest page. preventDefault()
+// also stops the menu accelerator, so a shortcut fires exactly once.
+
+const SHORTCUTS = shortcutTable();
+
+// The UI window a webContents belongs to (pages in <webview>s report to their embedder), or null for
+// page-opened popups and devtools, which keep plain menu behaviour.
+function uiWindowFor(contents) {
+  const owner = contents.getType() === 'webview' ? contents.hostWebContents : contents;
+  if (!owner || owner.isDestroyed()) return null;
+  const win = BrowserWindow.fromWebContents(owner);
+  return win && (win === mainWindow || miniWindows.has(win)) && owner === win.webContents ? win : null;
+}
+
+function runShortcut(sc, win) {
+  if (sc.run === 'mini-window') return createMiniWindow('');
+  if (sc.run === 'new-window') { if (!mainWindow) createMainWindow(); else mainWindow.focus(); return; }
+  if (sc.run === 'ui-devtools') return win?.webContents.openDevTools({ mode: 'detach' });
+  if (win && !win.isDestroyed()) win.webContents.send('command', ...sc.cmd);
+}
+
+app.on('web-contents-created', (_e, contents) => {
+  const type = contents.getType();
+  if (type !== 'webview' && type !== 'window') return;
+  contents.on('before-input-event', (event, input) => {
+    const sc = findShortcut(SHORTCUTS, input);
+    if (!sc) return;
+    const win = uiWindowFor(contents);
+    if (!win) return;
+    event.preventDefault();
+    if (input.isAutoRepeat && !sc.repeat) return;
+    runShortcut(sc, win);
+  });
+});
+
 function sendToHost(contents, channel, payload) {
   const host = contents.hostWebContents;
   if (host && !host.isDestroyed()) host.send(channel, payload);
@@ -574,7 +713,7 @@ function baseWindowOptions(extra) {
 function createMainWindow() {
   const bounds = readJson(path.join(app.getPath('userData'), 'window.json'), { width: 1440, height: 900 });
   mainWindow = new BrowserWindow(baseWindowOptions({ ...bounds, minWidth: 640, minHeight: 420, title: APP_NAME }));
-  mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  mainWindow.loadURL(uiPageUrl());
   mainWindow.once('ready-to-show', () => {
     if (bounds.maximized) mainWindow.maximize();
     if (DEV && process.env.MERIDIAN_SHOT) mainWindow.showInactive(); else mainWindow.show();
@@ -594,7 +733,7 @@ function createMainWindow() {
 
 function createMiniWindow(url = '') {
   const win = new BrowserWindow(baseWindowOptions({ width: 820, height: 640, minWidth: 360, minHeight: 300, title: APP_NAME }));
-  win.loadFile(path.join(__dirname, 'renderer', 'index.html'), { query: { mini: '1', url } });
+  win.loadURL(uiPageUrl({ mini: '1', url }));
   win.once('ready-to-show', () => win.show());
   win.webContents.on('will-navigate', (e) => e.preventDefault());
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -620,6 +759,16 @@ function runScreenshotScript(win) {
     for (const st of steps) {
       try {
         if (st.js) console.log('[eval]', JSON.stringify(await win.webContents.executeJavaScript(st.js)));
+        // {"key":"Right","modifiers":["meta","alt"],"to":"page"} — a keypress sent to the active tab's page
+        // ("to":"page") or to whatever has focus.
+        if (st.key) {
+          const pageId = st.to === 'page' ? await win.webContents.executeJavaScript('webview()?.getWebContentsId() || 0') : 0;
+          const target = (pageId && webContents.fromId(pageId)) || webContents.getFocusedWebContents() || win.webContents;
+          console.log('[key]', st.key, (st.modifiers || []).join('+'), '->', target.getType());
+          target.sendInputEvent({ type: 'keyDown', keyCode: st.key, modifiers: st.modifiers || [] });
+          if (st.key.length === 1 && !(st.modifiers || []).length) target.sendInputEvent({ type: 'char', keyCode: st.key });
+          target.sendInputEvent({ type: 'keyUp', keyCode: st.key, modifiers: st.modifiers || [] });
+        }
       } catch (err) { console.log('[eval error]', err.message); }
       await sleep(st.wait || 500);
       if (st.shot) fs.writeFileSync(st.shot, (await win.webContents.capturePage()).toPNG());
@@ -634,29 +783,43 @@ function debounce(fn, ms) {
   return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
 }
 
-// ---------- menu: every shortcut is an accelerator that forwards a command to the focused window ----------
+// ---------- menu: shows every shortcut; clicks (and keys nothing else caught) go to the focused UI window ----------
+
+function targetWindow() {
+  const win = BrowserWindow.getFocusedWindow();
+  return win && (win === mainWindow || miniWindows.has(win)) ? win : mainWindow;
+}
 
 function cmd(name, ...args) {
   return () => {
-    const win = BrowserWindow.getFocusedWindow() || mainWindow;
+    const win = targetWindow();
     if (win && !win.isDestroyed()) win.webContents.send('command', name, ...args);
   };
 }
 
+// A menu item for a shortcut from the table. Shortcuts handled in before-input-event aren't registered
+// as accelerators on Windows/Linux (macOS has no such option; preventDefault() there stops the menu).
+function sc(label, id, extra = {}) {
+  const s = SHORTCUTS.find((x) => x.id === id);
+  return {
+    label, accelerator: s.accel, registerAccelerator: !!s.soft,
+    click: () => runShortcut(s, targetWindow()),
+    ...extra,
+  };
+}
+
 function buildMenu() {
-  // macOS: Ctrl+N switches spaces, Cmd+N tabs (as in Arc). Elsewhere Ctrl is the tab modifier, so spaces use Alt.
-  const spaceMod = IS_MAC ? 'Ctrl' : 'Alt';
   const spaceItems = [];
-  for (let i = 1; i <= 9; i++) spaceItems.push({ label: `Space ${i}`, accelerator: `${spaceMod}+${i}`, click: cmd('space-index', i - 1) });
+  for (let i = 1; i <= 9; i++) spaceItems.push(sc(`Space ${i}`, `space-${i}`));
   const tabItems = [];
-  for (let i = 1; i <= 9; i++) tabItems.push({ label: `Tab ${i}`, accelerator: `CmdOrCtrl+${i}`, click: cmd('tab-index', i - 1) });
+  for (let i = 1; i <= 9; i++) tabItems.push(sc(`Tab ${i}`, `tab-${i}`));
 
   const template = [
     IS_MAC ? {
       label: APP_NAME,
       submenu: [
         { role: 'about' },
-        { label: 'Settings…', accelerator: 'CmdOrCtrl+,', click: cmd('settings') },
+        sc('Settings…', 'settings'),
         { type: 'separator' },
         { role: 'services' },
         { type: 'separator' },
@@ -668,16 +831,16 @@ function buildMenu() {
     {
       label: 'File',
       submenu: [
-        ...(IS_MAC ? [] : [{ label: 'Settings…', accelerator: 'Ctrl+,', click: cmd('settings') }, { type: 'separator' }]),
-        { label: 'New Tab…', accelerator: 'CmdOrCtrl+T', click: cmd('command-bar') },
-        { label: 'New Little Window', accelerator: 'CmdOrCtrl+Alt+N', click: () => createMiniWindow('') },
-        { label: 'New Window', accelerator: 'CmdOrCtrl+N', click: () => { if (!mainWindow) createMainWindow(); else mainWindow.focus(); } },
-        { label: 'New Folder', accelerator: 'CmdOrCtrl+Shift+N', click: cmd('new-folder') },
+        ...(IS_MAC ? [] : [sc('Settings…', 'settings'), { type: 'separator' }]),
+        sc('New Tab…', 'command-bar'),
+        sc('New Little Window', 'mini-window'),
+        sc('New Window', 'new-window'),
+        sc('New Folder', 'new-folder'),
         { type: 'separator' },
-        { label: 'Open Location…', accelerator: 'CmdOrCtrl+L', click: cmd('edit-url') },
-        { label: 'Reopen Closed Tab', accelerator: 'CmdOrCtrl+Shift+T', click: cmd('reopen-tab') },
+        sc('Open Location…', 'edit-url'),
+        sc('Reopen Closed Tab', 'reopen-tab'),
         { type: 'separator' },
-        { label: 'Close Tab', accelerator: 'CmdOrCtrl+W', click: cmd('close-tab') },
+        sc('Close Tab', 'close-tab'),
         { label: 'Close Window', accelerator: 'CmdOrCtrl+Shift+W', role: 'close' },
         { type: 'separator' },
         { label: 'Import from Arc…', click: cmd('import-arc') },
@@ -690,51 +853,51 @@ function buildMenu() {
         { role: 'undo' }, { role: 'redo' }, { type: 'separator' },
         { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'pasteAndMatchStyle' }, { role: 'selectAll' },
         { type: 'separator' },
-        { label: 'Copy URL', accelerator: 'CmdOrCtrl+Shift+C', click: cmd('copy-url') },
-        { label: 'Find…', accelerator: 'CmdOrCtrl+F', click: cmd('find') },
-        { label: 'Find Next', accelerator: 'CmdOrCtrl+G', click: cmd('find-next') },
-        { label: 'Find Previous', accelerator: 'CmdOrCtrl+Shift+G', click: cmd('find-prev') },
+        sc('Copy URL', 'copy-url'),
+        sc('Find…', 'find'),
+        sc('Find Next', 'find-next'),
+        sc('Find Previous', 'find-prev'),
       ],
     },
     {
       label: 'View',
       submenu: [
-        { label: 'Toggle Sidebar', accelerator: 'CmdOrCtrl+S', click: cmd('toggle-sidebar') },
-        { label: 'Ask AI about Page', accelerator: 'CmdOrCtrl+J', click: cmd('ai-panel') },
-        { label: 'Split View', accelerator: 'Ctrl+Shift+=', click: cmd('split') },
-        { label: 'Close Split View', accelerator: 'Ctrl+Shift+-', click: cmd('unsplit') },
+        sc('Toggle Sidebar', 'toggle-sidebar'),
+        sc('Ask AI about Page', 'ai-panel'),
+        sc('Split View', 'split'),
+        sc('Close Split View', 'unsplit'),
         { type: 'separator' },
-        { label: 'Reload', accelerator: 'CmdOrCtrl+R', click: cmd('reload') },
-        { label: 'Hard Reload', accelerator: 'CmdOrCtrl+Shift+R', click: cmd('hard-reload') },
-        { label: 'Zoom In', accelerator: 'CmdOrCtrl+=', click: cmd('zoom', 1) },
-        { label: 'Zoom In ', accelerator: 'CmdOrCtrl+Plus', visible: false, click: cmd('zoom', 1) },
-        { label: 'Zoom Out', accelerator: 'CmdOrCtrl+-', click: cmd('zoom', -1) },
-        { label: 'Actual Size', accelerator: 'CmdOrCtrl+0', click: cmd('zoom', 0) },
+        sc('Reload', 'reload'),
+        sc('Hard Reload', 'hard-reload'),
+        sc('Zoom In', 'zoom-in'),
+        sc('Zoom In ', 'zoom-in-plus', { visible: false }),
+        sc('Zoom Out', 'zoom-out'),
+        sc('Actual Size', 'zoom-reset'),
         { type: 'separator' },
         { role: 'togglefullscreen' },
-        { label: 'Developer Tools (page)', accelerator: 'CmdOrCtrl+Alt+I', click: cmd('devtools') },
-        { label: 'Developer Tools (Meridian UI)', accelerator: 'CmdOrCtrl+Alt+Shift+I', click: () => BrowserWindow.getFocusedWindow()?.webContents.openDevTools({ mode: 'detach' }) },
+        sc('Developer Tools (page)', 'devtools'),
+        sc('Developer Tools (Meridian UI)', 'ui-devtools'),
       ],
     },
     {
       label: 'History',
       submenu: [
-        { label: 'Back', accelerator: 'CmdOrCtrl+[', click: cmd('back') },
-        { label: 'Forward', accelerator: 'CmdOrCtrl+]', click: cmd('forward') },
-        { label: 'Back ', accelerator: 'CmdOrCtrl+Left', visible: false, click: cmd('back') },
-        { label: 'Forward ', accelerator: 'CmdOrCtrl+Right', visible: false, click: cmd('forward') },
+        sc('Back', 'back'),
+        sc('Forward', 'forward'),
+        sc('Back ', 'back-arrow', { visible: false }),
+        sc('Forward ', 'forward-arrow', { visible: false }),
       ],
     },
     {
       label: 'Tabs',
       submenu: [
-        { label: 'Pin / Unpin Tab', accelerator: 'CmdOrCtrl+D', click: cmd('toggle-pin') },
+        sc('Pin / Unpin Tab', 'toggle-pin'),
         { label: 'Add to Favorites', click: cmd('favorite') },
-        { label: 'Next Tab', accelerator: 'Ctrl+Tab', click: cmd('tab-step', 1) },
-        { label: 'Previous Tab', accelerator: 'Ctrl+Shift+Tab', click: cmd('tab-step', -1) },
-        { label: 'Next Tab ', accelerator: 'CmdOrCtrl+Alt+Down', visible: false, click: cmd('tab-step', 1) },
-        { label: 'Previous Tab ', accelerator: 'CmdOrCtrl+Alt+Up', visible: false, click: cmd('tab-step', -1) },
-        { label: 'Clear Today Tabs', accelerator: 'CmdOrCtrl+Shift+K', click: cmd('clear-today') },
+        sc('Next Tab', 'next-tab'),
+        sc('Previous Tab', 'prev-tab'),
+        sc('Next Tab ', 'next-tab-arrow', { visible: false }),
+        sc('Previous Tab ', 'prev-tab-arrow', { visible: false }),
+        sc('Clear Today Tabs', 'clear-today'),
         { type: 'separator' },
         ...tabItems,
       ],
@@ -743,8 +906,8 @@ function buildMenu() {
       label: 'Spaces',
       submenu: [
         { label: 'New Space…', click: cmd('new-space') },
-        { label: 'Next Space', accelerator: 'CmdOrCtrl+Alt+Right', click: cmd('space-step', 1) },
-        { label: 'Previous Space', accelerator: 'CmdOrCtrl+Alt+Left', click: cmd('space-step', -1) },
+        sc('Next Space', 'next-space'),
+        sc('Previous Space', 'prev-space'),
         { type: 'separator' },
         ...spaceItems,
       ],
@@ -766,6 +929,7 @@ app.whenReady().then(() => {
   hub = new AgentHub({ getWindow: () => mainWindow, userDataDir: app.getPath('userData') });
   assistant = new Assistant({ userDataDir: app.getPath('userData'), hub });
   if (saved?.settings) hub.setConfig({ access: saved.settings.agentAccess || 'off', allowJs: !!saved.settings.agentAllowJs });
+  registerUiProtocol();
   buildMenu();
   createMainWindow();
   for (const url of pendingUrls) openExternalUrl(url);
