@@ -72,7 +72,7 @@ class Assistant {
 
     const content = [];
     if (page && page.text) {
-      let body = page.text;
+      let body = String(page.text).replace(/<(\/?)(untrusted_page_content|current_page)/gi, '&lt;$1$2');
       if (body.length > PAGE_CHAR_LIMIT) body = body.slice(0, PAGE_CHAR_LIMIT) + `\n[Page text truncated: showing the first ${PAGE_CHAR_LIMIT} of ${page.text.length} characters.]`;
       content.push({ type: 'text', text: `<current_page url="${escapeAttr(page.url)}" title="${escapeAttr(page.title)}">\n${body}\n</current_page>` });
     }

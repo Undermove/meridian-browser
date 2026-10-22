@@ -261,7 +261,7 @@ async function refreshAiPanel() {
   const access = state.settings.agentAccess || 'off';
   const tools = $('#ai-tools');
   tools.disabled = access === 'off';
-  tools.checked = access !== 'off' && state.settings.aiUseTools !== false;
+  tools.checked = access !== 'off' && state.settings.aiUseTools === true;
   $('#ai-tools-label').title = access === 'off' ? 'Turn on agent access in Settings → AI' : `Agent access: ${AGENT_ACCESS.find((x) => x[0] === access)[1]}`;
   const t = activeTab();
   $('#ai-page-chip').textContent = t ? hostOf(tabUrl(t)) : 'no page';
@@ -274,8 +274,9 @@ async function pageForAi() {
   const wv = rt.views.get(t.id);
   if (!wv) return null;
   try {
-    const text = await wv.executeJavaScript('document.body ? document.body.innerText : ""');
-    return { url: tabUrl(t), title: titleOf(t), text: String(text || '') };
+    // Read by the main process in an isolated world — the page can't fake what we send to Claude.
+    const r = await api.aiPageText(wv.getWebContentsId());
+    return { url: tabUrl(t), title: titleOf(t), text: r ? r.text : '' };
   } catch { return { url: tabUrl(t), title: titleOf(t), text: '' }; }
 }
 
@@ -288,7 +289,8 @@ function addMsg(role, html = '') {
   return el;
 }
 
-async function sendAi(text) {
+// Preset chips (Summarize, …) never get browser tools: one click on a hostile page must not hand it the browser.
+async function sendAi(text, { allowTools = true } = {}) {
   text = text.trim();
   if (!text || ai.busy) return;
   ai.busy = true;
@@ -296,7 +298,7 @@ async function sendAi(text) {
   addMsg('user', esc(text));
   ai.current = { el: addMsg('assistant', '<span class="ai-typing"></span>'), text: '' };
   const page = await pageForAi();
-  const useTools = !$('#ai-tools').disabled && $('#ai-tools').checked;
+  const useTools = allowTools && !$('#ai-tools').disabled && $('#ai-tools').checked;
   api.aiChat({ sessionId: ai.sessionId, text, page, useTools });
 }
 
@@ -417,7 +419,7 @@ function initAiPanel() {
   $('#ai-stop').onclick = () => api.aiStop(ai.sessionId);
   $('#ai-page-chip').onclick = () => { ai.includePage = !ai.includePage; refreshAiPanel(); };
   $('#ai-tools').onchange = (e) => { state.settings.aiUseTools = e.target.checked; save(); };
-  panel.querySelectorAll('.ai-chip').forEach((b) => b.onclick = () => sendAi(b.dataset.q));
+  panel.querySelectorAll('.ai-chip').forEach((b) => b.onclick = () => sendAi(b.dataset.q, { allowTools: false }));
   $('#ai-input').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendAi(e.target.value); e.target.value = ''; }
     if (e.key === 'Escape') toggleAiPanel(false);

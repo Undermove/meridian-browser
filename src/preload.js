@@ -41,6 +41,10 @@ contextBridge.exposeInMainWorld('meridian', {
   aiReset: (sessionId) => ipcRenderer.send('ai:reset', sessionId),
   onAiEvent: (fn) => ipcRenderer.on('ai:event', (_e, ev) => fn(ev)),
 
+  fetchFavicon: (url, partition) => ipcRenderer.invoke('favicon:fetch', url, partition),
+  aiPageText: (wcId) => ipcRenderer.invoke('ai:page-text', wcId),
+  resetPermissions: () => ipcRenderer.invoke('permissions:reset'),
+
   promoteMini: (url) => ipcRenderer.send('mini:promote', url),
   platform: process.platform,
 });

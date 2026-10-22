@@ -68,7 +68,7 @@ function defaultState() {
     favorites: { default: [] },
     archive: [],
     history: {},
-    settings: { searchEngine: 'google', archiveAfterHours: 12, adblock: true, sidebarRight: false, sidebarHidden: false, extensions: [], agentAccess: 'off', agentAllowJs: false, aiUseTools: true },
+    settings: { searchEngine: 'google', archiveAfterHours: 12, adblock: true, sidebarRight: false, sidebarHidden: false, extensions: [], agentAccess: 'off', agentAllowJs: false, aiUseTools: false },
     onboarded: false,
   };
 }
@@ -145,10 +145,31 @@ function hostOf(url) {
   try { const u = new URL(url); return u.host.replace(/^www\./, '') || u.protocol.replace(':', ''); } catch { return url || ''; }
 }
 function originOf(url) { try { return new URL(url).origin; } catch { return ''; } }
+// The UI only ever renders data: favicons; the main process fetches them through the tab's profile session.
 function faviconFor(tab) {
-  if (tab.favicon && /^(https?|data):/i.test(tab.favicon)) return tab.favicon;
-  const o = originOf(tab.url);
-  return o.startsWith('http') ? o + '/favicon.ico' : '';
+  if (tab.favicon && tab.favicon.startsWith('data:image/')) return tab.favicon;
+  queueFavicon(tab);
+  return '';
+}
+
+const favQueue = [];
+let favActive = 0;
+function queueFavicon(tab, url) {
+  rt.favTried ||= new Set();
+  const src = url || (originOf(tab.url).startsWith('http') ? originOf(tab.url) + '/favicon.ico' : '');
+  if (!src || rt.favTried.has(tab.id + src)) return;
+  rt.favTried.add(tab.id + src);
+  favQueue.push({ tab, src, partition: partitionFor(space().profileId) });
+  pumpFavicons();
+}
+function pumpFavicons() {
+  while (favActive < 4 && favQueue.length) {
+    const { tab, src, partition } = favQueue.shift();
+    favActive++;
+    api.fetchFavicon(src, partition).then((data) => {
+      if (data) { tab.favicon = data; scheduleRender(); save(); }
+    }).finally(() => { favActive--; pumpFavicons(); });
+  }
 }
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const titleOf = (t) => t.customTitle || t.title || hostOf(t.url) || 'New Tab';
@@ -196,7 +217,7 @@ function bindView(wv, id) {
   });
   wv.addEventListener('page-favicon-updated', (e) => {
     const l = findTab(); if (!l || !e.favicons?.length) return;
-    l.node.favicon = e.favicons[e.favicons.length - 1]; update(); save();
+    queueFavicon(l.node, e.favicons[e.favicons.length - 1]);
   });
   const onNav = (url, inPage) => {
     const l = findTab(); if (!l) return;
@@ -619,7 +640,7 @@ function renderFavorites(sp) {
   const el = $('#favorites');
   const list = favs(sp);
   el.innerHTML = list.map((t) => `
-    <div class="fav ${t.id === sp.activeTabId ? 'active' : ''} ${rt.views.has(t.id) ? 'loaded' : ''}" draggable="true" data-id="${t.id}" title="${esc(titleOf(t))}">
+    <div class="fav ${t.id === sp.activeTabId ? 'active' : ''} ${rt.views.has(t.id) ? 'loaded' : ''}" draggable="true" data-id="${esc(t.id)}" title="${esc(titleOf(t))}">
       ${faviconImg(t, 20)}
     </div>`).join('');
   el.classList.toggle('empty', list.length === 0);
@@ -662,7 +683,7 @@ function nodeHtml(n, sp, depth) {
   if (n.type === 'tab') return tabRowHtml(n, sp, 'pinned', depth);
   return `
     <div class="folder-wrap ${n.collapsed ? 'collapsed' : ''}">
-      <div class="row folder" draggable="true" data-id="${n.id}" style="--depth:${depth}">
+      <div class="row folder" draggable="true" data-id="${esc(n.id)}" style="--depth:${depth}">
         <span class="folder-ic">${icon(n.collapsed ? 'folder' : 'folderOpen', 15)}</span>
         <span class="title">${esc(n.title)}</span>
       </div>
@@ -680,7 +701,7 @@ function tabRowHtml(t, sp, zone, depth) {
     ? `<button class="row-btn audio" data-act="mute" title="${nav.muted ? 'Unmute' : 'Mute'}">${icon(nav.muted ? 'mute' : 'speaker', 13)}</button>` : '';
   return `
     <div class="row tab ${t.id === sp.activeTabId ? 'active' : ''} ${loaded ? 'loaded' : 'unloaded'} ${nav.loading ? 'loading' : ''} ${inSplit ? 'in-split' : ''} ${agentGlow ? 'agent' : ''}"
-         draggable="true" data-id="${t.id}" data-zone="${zone}" style="--depth:${depth}" title="${esc(tabUrl(t))}">
+         draggable="true" data-id="${esc(t.id)}" data-zone="${zone}" style="--depth:${depth}" title="${esc(tabUrl(t))}">
       ${drifted ? `<button class="row-btn reset" data-act="reset" title="Back to pinned URL">${icon('slash', 13)}</button>` : ''}
       ${faviconImg(t)}
       <span class="title">${esc(titleOf(t))}</span>
@@ -693,7 +714,7 @@ function tabRowHtml(t, sp, zone, depth) {
 
 function renderSpaceDots() {
   $('#space-dots').innerHTML = state.spaces.map((s, i) => `
-    <button class="space-dot ${s.id === state.activeSpaceId ? 'active' : ''}" data-space="${s.id}" title="${esc(s.name)} (^${i + 1})" style="--dot:${s.color}">
+    <button class="space-dot ${s.id === state.activeSpaceId ? 'active' : ''}" data-space="${esc(s.id)}" title="${esc(s.name)} (^${i + 1})" style="--dot:${s.color}">
       ${s.icon ? `<span class="emoji">${esc(s.icon)}</span>` : '<span class="dot"></span>'}
     </button>`).join('');
 }
@@ -1324,12 +1345,13 @@ async function openSettings() {
     </div>
     <div class="field"><span>Arc</span><button class="btn" id="set-import" ${arc ? '' : 'disabled'}>${arc ? 'Import spaces &amp; pinned tabs' : 'Arc data not found'}</button></div>
     <div class="field col"><span>Profiles</span>
-      ${state.profiles.map((p) => `<div class="prof-row"><span>${esc(p.name)}</span><span class="muted">${state.spaces.filter((x) => x.profileId === p.id).map((x) => esc(x.name)).join(', ') || 'unused'}</span><button class="btn small" data-clear="${p.id}">Clear cookies &amp; data</button></div>`).join('')}
+      ${state.profiles.map((p) => `<div class="prof-row"><span>${esc(p.name)}</span><span class="muted">${state.spaces.filter((x) => x.profileId === p.id).map((x) => esc(x.name)).join(', ') || 'unused'}</span><button class="btn small" data-clear="${esc(p.id)}">Clear cookies &amp; data</button></div>`).join('')}
     </div>
     <div class="field col"><span>Extensions <em class="muted">(experimental — no toolbar popups yet)</em></span>
       ${(s.extensions || []).map((p, i) => `<div class="prof-row"><span title="${esc(p)}">${esc(p.split('/').slice(-2).join('/'))}</span><button class="btn small" data-rm-ext="${i}">Remove</button></div>`).join('')}
       <button class="btn small" id="set-add-ext">Load unpacked extension…</button>
     </div>
+    <div class="field"><span>Site permissions <span class="muted">(camera, mic, location, notifications…)</span></span><button class="btn small" id="set-reset-perms">Reset all</button></div>
     <div class="modal-actions"><span class="muted grow">Meridian · the open-source Arc browser alternative</span><button class="btn accent" data-a="close">Done</button></div>
   `, (m, close) => {
     $('#set-engine', m).onchange = (e) => { s.searchEngine = e.target.value; save(); };
@@ -1338,6 +1360,7 @@ async function openSettings() {
     $('#set-right', m).onchange = (e) => { s.sidebarRight = e.target.checked; render(); save(); };
     $('#set-default', m)?.addEventListener('click', setDefaultBrowser);
     $('#set-import', m)?.addEventListener('click', () => { close(); importArc(); });
+    $('#set-reset-perms', m).onclick = async () => { await api.resetPermissions(); toast('Site permissions reset — sites will ask again'); };
     $('#set-add-ext', m).onclick = async () => { const p = await api.pickExtension(); if (p) { s.extensions = [...(s.extensions || []), p]; await api.setExtensions(s.extensions); save(); close(); openSettings(); toast('Extension loaded'); } };
     m.querySelectorAll('[data-rm-ext]').forEach((b) => b.onclick = () => { s.extensions.splice(Number(b.dataset.rmExt), 1); save(); close(); openSettings(); toast('Removed — restart Meridian to fully unload it'); });
     m.querySelectorAll('[data-clear]').forEach((b) => b.onclick = async () => {
@@ -1454,7 +1477,7 @@ function runCommand(name, ...args) {
     case 'devtools': { if (wv) api.openDevTools(wv.getWebContentsId()); return; }
     case 'open-url-tab': return openTab(args[0]);
     case 'ai-panel': return MINI ? null : toggleAiPanel();
-    case 'ai-summarize': toggleAiPanel(true); return setTimeout(() => sendAi('Summarize this page.'), 100);
+    case 'ai-summarize': toggleAiPanel(true); return setTimeout(() => sendAi('Summarize this page.', { allowTools: false }), 100);
   }
 }
 

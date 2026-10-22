@@ -65,12 +65,14 @@ Agents act inside your logged-in browser, so access is explicit and layered:
 | **Ask before acting** | Everything else too, but every navigate / click / type / tab change needs your confirmation in a native dialog. |
 | **Full control** | Acts without asking. Meant for agents you trust. |
 
-- Running JavaScript in pages is a **separate opt-in**, off by default.
-- MCP clients connect over a **unix socket** (named pipe on Windows) with a random per-launch **bearer token** in a `chmod 600` file. There's no TCP port, so websites can't reach it, and requests carrying an `Origin` header are rejected.
-- Page text given to models is wrapped as **untrusted content**. The assistant is told never to follow instructions found in pages.
+- Running JavaScript in pages is a **separate opt-in**, off by default. In "ask" mode the dialog shows the full code (code too long to review is refused), and `type_text` shows the full text, including whether it will submit.
+- Click confirmations show the element's visible text next to its page-supplied label, its link and its form target. After you approve, the element is checked again so it can't move or be covered while the dialog is open. Dialogs default to **Deny**.
+- The assistant's preset buttons (Summarize, …) never get browser tools, and "use browser" is off until you turn it on for a chat.
+- MCP clients connect over a **unix socket** (named pipe on Windows) with a random name and a random **bearer token**, both new on every start, advertised only after the socket is bound, in a `chmod 600` file. The bridge checks that the socket is owned by the current user. There's no TCP port, so websites can't reach it, and requests carrying an `Origin` header are rejected.
+- Page text given to models is wrapped as **untrusted content**, with any attempt to close the wrapper tags neutralized, and is read in an isolated world so pages can't fake it. Models are told never to follow instructions found in pages.
 - Agent page scripts run in an **isolated JS world**, so pages can't tamper with them. Agents can only open `http(s)` URLs.
 - The Claude API key is **encrypted with the OS keychain** (safeStorage) and only used in the main process. Web content and the UI page never see it.
-- Electron hardening: sandboxed UI renderer with context isolation, `<webview>` preferences forced safe in `will-attach-webview`, IPC sender validation, page-initiated navigation to `file:` or other privileged schemes blocked, external app links (`mailto:`, `zoommtg:` …) ask first, WebUSB/HID/Serial denied, camera/mic/location/notifications prompt per site, and Electron fuses (no `RunAsNode`, no `NODE_OPTIONS`, ASAR integrity, cookie encryption).
+- Electron hardening: sandboxed UI renderer with context isolation, `<webview>` preferences forced safe in `will-attach-webview`, IPC sender validation, page-initiated navigation to `file:` or other privileged schemes blocked, server redirects to such schemes blocked, external app links (`mailto:`, `zoommtg:` …) allowlisted and confirmed every time, executable and HTML downloads and download bursts need confirmation, WebUSB/HID/Serial and Bluetooth pickers denied, client certificates chosen by you, camera and mic as separate per-site prompts (resettable in Settings), favicons fetched through the site's profile and shown as `data:` URLs, dev/test hooks disabled in packaged builds, and Electron fuses (no `RunAsNode`, no `NODE_OPTIONS`, no inspector flags, ASAR integrity, cookie encryption, no extra `file://` privileges).
 
 Found a vulnerability? Please open a private security advisory on GitHub.
 

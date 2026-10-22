@@ -31,6 +31,13 @@ function request(route, body) {
   let endpoint;
   try { endpoint = JSON.parse(fs.readFileSync(ENDPOINT_FILE, 'utf8')); } catch { return Promise.reject(new Error(NOT_RUNNING)); }
   const { socket, token } = endpoint;
+  // Only talk to a socket owned by this user (defends against another local user planting one).
+  if (process.platform !== 'win32') {
+    try {
+      const st = fs.lstatSync(socket);
+      if (!st.isSocket() || st.uid !== process.getuid()) return Promise.reject(new Error('Refusing to connect: the Meridian socket is not owned by you.'));
+    } catch { return Promise.reject(new Error(NOT_RUNNING)); }
+  }
   const payload = JSON.stringify(body || {});
   return new Promise((resolve, reject) => {
     const req = http.request({

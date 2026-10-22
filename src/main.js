@@ -15,7 +15,9 @@ const { Assistant } = require('./ai/assistant');
 const APP_NAME = 'Meridian';
 app.setName(APP_NAME);
 // Dev/test: isolated profile dir so test runs never touch real data.
-if (process.env.MERIDIAN_USER_DATA) app.setPath('userData', process.env.MERIDIAN_USER_DATA);
+// Dev/test hooks are ignored in packaged builds (they could otherwise inject code into the UI).
+const DEV = !app.isPackaged;
+if (DEV && process.env.MERIDIAN_USER_DATA) app.setPath('userData', process.env.MERIDIAN_USER_DATA);
 
 const STATE_FILE = () => path.join(app.getPath('userData'), 'state.json');
 const PERMS_FILE = () => path.join(app.getPath('userData'), 'permissions.json');
@@ -129,6 +131,9 @@ function prepareSession(ses) {
   ses.on('will-download', handleDownload);
   ses.setPermissionRequestHandler(handlePermissionRequest);
   ses.setDevicePermissionHandler(() => false); // WebUSB / WebHID / Web Serial: off
+  ses.on('select-hid-device', (event, _d, callback) => { event.preventDefault(); callback(); });
+  ses.on('select-serial-port', (event, _p, _wc, callback) => { event.preventDefault(); callback(''); });
+  ses.on('select-usb-device', (event, _d, callback) => { event.preventDefault(); callback(); });
   ses.setPermissionCheckHandler((_wc, permission, origin) => {
     if (SAFE_PERMISSIONS.has(permission)) return true;
     return permissionDecisions[`${originOf(origin)}|${permission}`] === true;
@@ -200,21 +205,43 @@ function originOf(url) {
   try { return new URL(url).origin; } catch { return String(url); }
 }
 
+function siteLabel(origin) {
+  try { return new URL(origin).host || origin; } catch { return origin || 'This page'; }
+}
+
 async function handlePermissionRequest(wc, permission, callback, details) {
   if (SAFE_PERMISSIONS.has(permission)) return callback(true);
-  const origin = originOf(details.requestingUrl || wc.getURL());
-  const key = `${origin}|${permission}`;
-  if (key in permissionDecisions) return callback(permissionDecisions[key]);
   const win = BrowserWindow.fromWebContents(wc.hostWebContents || wc) || mainWindow;
-  const what = PERMISSION_LABELS[permission] || permission;
+  const origin = originOf(details.requestingUrl || wc.getURL());
+
+  // External protocols (also reached via server redirects): allowlisted schemes only, URL shown, never remembered.
+  if (permission === 'openExternal') {
+    const url = details.externalURL || '';
+    if (!EXTERNAL_SCHEMES.has(schemeOf(url))) return callback(false);
+    const { response } = await dialog.showMessageBox(win, {
+      type: 'question', buttons: ['Open', 'Cancel'], defaultId: 1, cancelId: 1,
+      message: `${siteLabel(origin)} wants to open another app`, detail: url.length > 300 ? url.slice(0, 300) + '…' : url,
+    });
+    return callback(response === 0);
+  }
+
+  // Camera and microphone are separate decisions.
+  const kind = permission === 'media' ? `media:${(details.mediaTypes || []).slice().sort().join('+') || 'any'}` : permission;
+  const key = `${origin}|${kind}`;
+  if (key in permissionDecisions) return callback(permissionDecisions[key]);
+  let what = PERMISSION_LABELS[permission] || permission;
+  if (permission === 'media') {
+    const t = details.mediaTypes || [];
+    what = t.includes('video') && t.includes('audio') ? 'use your camera and microphone' : t.includes('video') ? 'use your camera' : 'use your microphone';
+  }
   const { response, checkboxChecked } = await dialog.showMessageBox(win, {
     type: 'question',
     buttons: ['Allow', 'Block'],
     defaultId: 1,
     cancelId: 1,
-    message: `${new URL(origin).host} wants to ${what}`,
+    message: `${siteLabel(origin)} wants to ${what}`,
     checkboxLabel: 'Remember for this site',
-    checkboxChecked: true,
+    checkboxChecked: false,
   });
   const allowed = response === 0;
   if (checkboxChecked) {
@@ -223,6 +250,20 @@ async function handlePermissionRequest(wc, permission, callback, details) {
   }
   callback(allowed);
 }
+
+// ---------- client certificates ----------
+
+app.on('select-client-certificate', async (event, wc, url, list, callback) => {
+  event.preventDefault();
+  if (!list.length) return callback();
+  const win = BrowserWindow.fromWebContents(wc.hostWebContents || wc) || mainWindow;
+  const buttons = [...list.slice(0, 5).map((c) => c.subjectName || c.issuerName || 'Certificate'), 'Don’t send'];
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'question', buttons, cancelId: buttons.length - 1, defaultId: buttons.length - 1,
+    message: `${siteLabel(originOf(url))} asks for a client certificate`,
+  });
+  callback(response < list.length && response < 5 ? list[response] : undefined);
+});
 
 // ---------- downloads ----------
 
@@ -234,9 +275,34 @@ function uniquePath(dir, name) {
   return candidate;
 }
 
-function handleDownload(_event, item) {
+// Files that run code when opened. Asking before keeping them, like Chrome's "dangerous file" warning.
+const DANGEROUS_EXT = new Set(['.exe', '.msi', '.msix', '.appx', '.bat', '.cmd', '.com', '.scr', '.pif', '.ps1', '.vbs', '.vbe', '.js', '.jse', '.wsf', '.hta', '.reg', '.lnk', '.cpl', '.jar', '.command', '.tool', '.app', '.pkg', '.mpkg', '.terminal', '.workflow', '.scpt', '.sh', '.bash', '.zsh', '.run', '.appimage', '.deb', '.rpm', '.desktop', '.html', '.htm', '.svg', '.xhtml', '.mht', '.mhtml']);
+const recentDownloads = new Map(); // origin -> timestamps
+const multiDownloadDecision = new Map(); // origin -> boolean (this session)
+
+function handleDownload(_event, item, wc) {
   const target = uniquePath(app.getPath('downloads'), item.getFilename());
   item.setSavePath(target);
+  const origin = originOf(wc && !wc.isDestroyed() ? wc.getURL() : item.getURL());
+  const ext = path.extname(target).toLowerCase();
+  const now = Date.now();
+  const times = (recentDownloads.get(origin) || []).filter((t) => now - t < 10_000);
+  times.push(now);
+  recentDownloads.set(origin, times);
+  const burst = times.length > 3 && multiDownloadDecision.get(origin) !== true;
+  if (multiDownloadDecision.get(origin) === false) { item.cancel(); return; }
+  if (DANGEROUS_EXT.has(ext) || burst) {
+    item.pause();
+    const win = (wc && BrowserWindow.fromWebContents(wc.hostWebContents || wc)) || mainWindow;
+    dialog.showMessageBox(win, {
+      type: 'warning', buttons: ['Keep', 'Discard'], defaultId: 1, cancelId: 1,
+      message: burst ? `${siteLabel(origin)} is trying to download multiple files` : `“${path.basename(target)}” can run code on your computer`,
+      detail: burst ? 'Allow this site to keep downloading files?' : `From ${siteLabel(origin)}. Only keep it if you trust this site.`,
+    }).then(({ response }) => {
+      if (burst) multiDownloadDecision.set(origin, response === 0);
+      if (response === 0) item.resume(); else item.cancel();
+    });
+  }
   const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   const send = (extra) => mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents.send('download', {
     id, name: path.basename(target), path: target,
@@ -251,6 +317,7 @@ function handleDownload(_event, item) {
 }
 
 on('download:reveal', (_e, p) => shell.showItemInFolder(p));
+handle('permissions:reset', () => { permissionDecisions = {}; writeJsonAtomic(PERMS_FILE(), {}); return true; });
 
 // ---------- URL scheme policy ----------
 
@@ -303,6 +370,9 @@ app.on('web-contents-created', (_e, contents) => {
     maybeOpenExternal(url, contents);
   };
   contents.on('will-navigate', guardNavigation);
+  contents.on('will-redirect', (event, url) => { if (!WEB_SCHEMES.has(schemeOf(url))) event.preventDefault(); });
+  // Bluetooth device picker: never auto-pick a nearby device.
+  contents.on('select-bluetooth-device', (event, _devices, callback) => { event.preventDefault(); callback(''); });
   contents.on('will-frame-navigate', (event) => { if (!event.isMainFrame && !SUBFRAME_SCHEMES.has(schemeOf(event.url))) event.preventDefault(); });
 
   contents.setWindowOpenHandler(({ url, disposition }) => {
@@ -350,7 +420,7 @@ function showPageContextMenu(contents, params) {
   const t = [];
   const act = (action, data = {}) => () => sendToHost(contents, 'webview:action', { action, fromId: contents.id, ...data });
 
-  if (params.linkURL) {
+  if (params.linkURL && /^https?:/i.test(params.linkURL)) {
     t.push(
       { label: 'Open Link in New Tab', click: act('open-tab', { url: params.linkURL }) },
       { label: 'Open Link in Split View', click: act('open-split', { url: params.linkURL }) },
@@ -359,7 +429,7 @@ function showPageContextMenu(contents, params) {
       { type: 'separator' },
     );
   }
-  if (params.mediaType === 'image' && params.srcURL) {
+  if (params.mediaType === 'image' && /^(https?|data|blob):/i.test(params.srcURL || '')) {
     t.push(
       { label: 'Open Image in New Tab', click: act('open-tab', { url: params.srcURL }) },
       { label: 'Copy Image', click: () => contents.copyImageAt(params.x, params.y) },
@@ -409,6 +479,29 @@ handle('menu:popup', (e, items) => new Promise((resolve) => {
 }));
 
 on('clipboard:write', (_e, text) => clipboard.writeText(text));
+
+// Favicons: fetched by main through the tab's own profile session and handed to the UI as data: URLs,
+// so the privileged UI page never loads page-chosen URLs itself.
+handle('favicon:fetch', async (_e, url, partition) => {
+  if (!/^https?:/i.test(String(url)) || !String(partition).startsWith('persist:profile-')) return null;
+  try {
+    const res = await session.fromPartition(partition).fetch(url, { signal: AbortSignal.timeout(8000) });
+    const type = (res.headers.get('content-type') || '').split(';')[0].trim();
+    if (!res.ok || !/^image\/(png|x-icon|vnd\.microsoft\.icon|svg\+xml|jpeg|gif|webp|ico)$/i.test(type)) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > 200_000) return null;
+    // SVG can carry script; rasterize-free option is to refuse it.
+    if (/svg/i.test(type)) return null;
+    return `data:${type};base64,${buf.toString('base64')}`;
+  } catch { return null; }
+});
+
+// Current page text for the ⌘J panel, read in an isolated world so the page can't spoof it.
+handle('ai:page-text', async (e, wcId) => {
+  const wc = webContents.fromId(Number(wcId));
+  if (!wc || wc.isDestroyed() || wc.getType() !== 'webview' || wc.hostWebContents?.id !== e.sender.id) return null;
+  try { return await hub.pageTextFor(wc); } catch { return null; }
+});
 handle('devtools:open', (_e, id) => { const wc = webContents.fromId(id); if (wc) wc.openDevTools({ mode: 'detach' }); });
 
 // ---------- AI: agent hub (MCP + assistant tools) and the built-in assistant ----------
@@ -484,7 +577,7 @@ function createMainWindow() {
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   mainWindow.once('ready-to-show', () => {
     if (bounds.maximized) mainWindow.maximize();
-    if (process.env.MERIDIAN_SHOT) mainWindow.showInactive(); else mainWindow.show();
+    if (DEV && process.env.MERIDIAN_SHOT) mainWindow.showInactive(); else mainWindow.show();
   });
   const saveBounds = () => {
     if (mainWindow.isDestroyed()) return;
@@ -495,7 +588,7 @@ function createMainWindow() {
   mainWindow.on('closed', () => { mainWindow = null; });
   mainWindow.webContents.on('will-navigate', (e) => e.preventDefault());
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  if (process.env.MERIDIAN_SHOT) runScreenshotScript(mainWindow);
+  if (DEV && process.env.MERIDIAN_SHOT) runScreenshotScript(mainWindow);
   return mainWindow;
 }
 
