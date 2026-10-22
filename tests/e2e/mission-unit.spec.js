@@ -26,7 +26,7 @@ test('Claude settings: the guard hook is kept and the observer hooks are async o
   expect(JSON.stringify(merged)).not.toMatch(/TOKEN|token/);
 });
 
-test('sandbox: the session dir is mounted, the token passed by name only, Claude gets --settings', async () => {
+test('sandbox: the session dir is mounted, the token goes only into the private env file, Claude gets --settings', async () => {
   const { m, dir } = mission();
   try {
     const reg = await m.registerTerminal({ kind: 'sandbox-claude', project: 'p', ownerWcId: 1, sandbox: true });
@@ -38,12 +38,19 @@ test('sandbox: the session dir is mounted, the token passed by name only, Claude
     expect(settings.hooks.PreToolUse[0].hooks[0].command).toBe('node /meridian/mission-hook.js');
     const sb = new Sandbox({ getEnv: async () => ({}), getSearchPath: async () => '' });
     sb.status = async () => ({ installed: true, running: true, docker: '/usr/local/bin/docker', image: 'meridian-sandbox:test', imagePresent: true, available: true });
-    const spec = await sb.launchSpec('sandbox-claude', { root: dir, secretNames: [], network: true, mission: mount });
+    const spec = await sb.launchSpec('sandbox-claude', { root: dir, secrets: {}, network: true, mission: { ...mount, token: reg.token } });
     const a = spec.args;
     expect(a).toContain(`type=bind,source=${mount.dir},target=/meridian`);
     expect(a).toContain('MERIDIAN_MISSION_FILE=/meridian/events.jsonl');
-    expect(a[a.indexOf('MERIDIAN_MISSION_TOKEN') - 1]).toBe('-e');
+    // The token never appears on the docker command line or as a container env var…
     expect(a.join(' ')).not.toContain(reg.token);
+    expect(a).not.toContain('MERIDIAN_MISSION_TOKEN');
+    // …only in the 0600 env file mounted read-only at /run/meridian/env (exported by the entrypoint).
+    const envMount = a.find((x) => /target=\/run\/meridian\/env,readonly$/.test(x));
+    const envFile = /source=([^,]+),/.exec(envMount)[1];
+    expect(fs.statSync(envFile).mode & 0o777).toBe(process.platform === 'linux' && process.getuid() !== 1000 ? 0o644 : 0o600);
+    expect(fs.readFileSync(envFile, 'utf8')).toContain(`MERIDIAN_MISSION_TOKEN=${Buffer.from(reg.token).toString('base64')}`);
+    expect(spec.secretNames).not.toContain('MERIDIAN_MISSION_TOKEN');
     expect(a.slice(-3)).toEqual(['claude', '--settings', '/meridian/settings.json']);
     // The container appends to the events file; Meridian follows it with the same validation.
     const line = (o) => JSON.stringify({ v: 1, token: reg.token, kind: 'claude', ...o }) + '\n';

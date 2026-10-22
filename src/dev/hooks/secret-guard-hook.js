@@ -4,12 +4,19 @@
 // Installed per session by the Meridian Workbench through `claude --settings <file>` (see
 // src/dev/guard.js). Standalone: plain Node, no dependencies, runs outside the app bundle.
 //
+// File tools (Read, Edit, NotebookEdit, LSP, Grep, Glob) are checked by path — both the path as given
+// and its real path, so a symlink can't hide a secret file. Shell-like tools (Bash, PowerShell,
+// Monitor, REPL) are checked heuristically: a secret file name appearing in the command text. A
+// command that reads a secret without naming it (a variable, a symlink, a script) is NOT caught.
+// Meridian's integrity check: src/dev/guard.js carries this file's SHA-256 — update it on any change.
+//
 // stdin:  the hook event JSON from Claude Code ({ tool_name, tool_input, cwd, ... }).
 // stdout: nothing (no opinion) or { hookSpecificOutput: { hookEventName: 'PreToolUse',
 //         permissionDecision: 'allow'|'deny'|'ask', permissionDecisionReason } }.
 
 'use strict';
 const net = require('net');
+const fs = require('fs');
 const path = require('path');
 
 const SECRET_FILE = /(^|[\\/])(\.env(\.(?!example$|sample$|template$|dist$|defaults$)[\w.-]+)?|\.envrc|([\w.-]*[-_.])?credentials(\.(json|ya?ml|toml|ini))?|service[-_]account[\w.-]*\.json|[^\\/]*\.pem|[^\\/]*\.p12|id_(rsa|dsa|ecdsa|ed25519)|\.npmrc|\.pypirc|\.netrc|\.git-credentials|secrets?\.(json|ya?ml|toml))$/i;
@@ -31,22 +38,44 @@ function readStdin() {
   });
 }
 
+// The real path of p (symlinks resolved). For a path that doesn't exist yet: its parent's real path.
+function realOf(p) {
+  try { return fs.realpathSync.native(p); } catch {}
+  try { return path.join(fs.realpathSync.native(path.dirname(p)), path.basename(p)); } catch {}
+  return p;
+}
+const isSecret = (p) => SECRET_FILE.test(String(p).replace(/\*+/g, 'x'));
+
+// File tools: which input fields hold paths. Shell-like tools: every string field is command text.
+const FILE_TOOLS = new Set(['Read', 'NotebookRead', 'NotebookEdit', 'Edit', 'MultiEdit', 'LSP']);
+const SHELL_TOOLS = new Set(['Bash', 'PowerShell', 'Monitor', 'REPL']);
+
 async function main() {
   let ev;
   try { ev = JSON.parse(await readStdin()); } catch { return out(); }
   const tool = String(ev.tool_name || '');
-  const input = ev.tool_input || {};
+  const input = ev.tool_input && typeof ev.tool_input === 'object' ? ev.tool_input : {};
   const cwd = typeof ev.cwd === 'string' ? ev.cwd : process.cwd();
   const paths = [];
   let command = null;
   const addPath = (p) => { if (typeof p === 'string' && p) paths.push(path.resolve(cwd, p)); };
-  if (tool === 'Read' || tool === 'NotebookRead') addPath(input.file_path || input.notebook_path);
-  else if (tool === 'Grep') { if (input.path) addPath(input.path); if (input.glob && SECRET_FILE.test(String(input.glob).replace(/\*/g, 'x'))) addPath(path.join(input.path || '.', String(input.glob))); }
+  if (FILE_TOOLS.has(tool)) { addPath(input.file_path); addPath(input.notebook_path); addPath(input.filePath); }
+  else if (tool === 'Grep') { if (input.path) addPath(input.path); if (input.glob && isSecret(String(input.glob))) addPath(path.join(input.path || '.', String(input.glob))); }
   else if (tool === 'Glob') { if (typeof input.pattern === 'string' && /\.env|\.pem|id_rsa|credentials/i.test(input.pattern)) addPath(path.join(input.path || '.', input.pattern)); }
-  else if (tool === 'Bash') command = typeof input.command === 'string' ? input.command : null;
+  else if (SHELL_TOOLS.has(tool)) {
+    // Heuristic only: a secret file name appearing as a word in the command text.
+    const texts = Object.values(input).filter((v) => typeof v === 'string');
+    command = texts.find((t) => SECRET_IN_CMD.test(t)) || null;
+  }
 
-  const hitPaths = paths.filter((p) => SECRET_FILE.test(p.replace(/\*+/g, 'x')));
-  const hitCmd = command && SECRET_IN_CMD.test(command);
+  // A path counts by its own name AND by what it really points at (a symlink named notes.txt -> .env).
+  const hitPaths = [];
+  for (const p of paths) {
+    const real = realOf(p);
+    if (isSecret(real)) hitPaths.push(real);
+    else if (isSecret(p)) hitPaths.push(p);
+  }
+  const hitCmd = !!command;
   if (!hitPaths.length && !hitCmd) return out();
 
   const socketPath = process.env.MERIDIAN_GUARD_SOCKET;

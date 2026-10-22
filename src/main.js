@@ -372,7 +372,9 @@ async function pickExtensionDir(parent) {
 
 // ---------- permissions ----------
 
-const SAFE_PERMISSIONS = new Set(['fullscreen', 'clipboard-sanitized-write', 'pointerLock', 'window-management']);
+// 'window-management' (screen layout + placing windows on any display) is not auto-granted: it falls
+// through to the normal ask/deny path like other powerful permissions.
+const SAFE_PERMISSIONS = new Set(['fullscreen', 'clipboard-sanitized-write', 'pointerLock']);
 const PERMISSION_LABELS = {
   media: 'use your camera / microphone',
   geolocation: 'know your location',
@@ -382,6 +384,7 @@ const PERMISSION_LABELS = {
   'clipboard-read': 'read your clipboard',
   'display-capture': 'record your screen',
   openExternal: 'open an external application',
+  'window-management': 'see your displays and place windows on them',
 };
 let permissionDecisions = {};
 
@@ -462,7 +465,9 @@ function uniquePath(dir, name) {
 }
 
 // Files that run code when opened. Asking before keeping them, like Chrome's "dangerous file" warning.
-const DANGEROUS_EXT = new Set(['.exe', '.msi', '.msix', '.appx', '.bat', '.cmd', '.com', '.scr', '.pif', '.ps1', '.vbs', '.vbe', '.js', '.jse', '.wsf', '.hta', '.reg', '.lnk', '.cpl', '.jar', '.command', '.tool', '.app', '.pkg', '.mpkg', '.terminal', '.workflow', '.scpt', '.sh', '.bash', '.zsh', '.run', '.appimage', '.deb', '.rpm', '.desktop', '.html', '.htm', '.svg', '.xhtml', '.mht', '.mhtml']);
+const DANGEROUS_EXT = new Set(['.exe', '.msi', '.msix', '.appx', '.bat', '.cmd', '.com', '.scr', '.pif', '.ps1', '.vbs', '.vbe', '.js', '.jse', '.wsf', '.hta', '.reg', '.lnk', '.cpl', '.jar', '.command', '.tool', '.app', '.pkg', '.mpkg', '.terminal', '.workflow', '.scpt', '.sh', '.bash', '.zsh', '.run', '.appimage', '.deb', '.rpm', '.desktop', '.html', '.htm', '.svg', '.xhtml', '.mht', '.mhtml',
+  // disk images / installers, link files that open URLs or apps, macro-enabled Office documents
+  '.dmg', '.iso', '.img', '.webloc', '.fileloc', '.url', '.inetloc', '.docm', '.xlsm', '.pptm', '.dotm', '.xltm', '.potm', '.ppsm', '.xlam', '.ppam']);
 const recentDownloads = new Map(); // origin -> timestamps
 const multiDownloadDecision = new Map(); // origin -> boolean (this session)
 

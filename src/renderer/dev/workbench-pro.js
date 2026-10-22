@@ -110,7 +110,7 @@ async function reloadCustom({ quiet = false } = {}) {
     const href = `/custom/user.css?v=${Math.round(st.cssMtime)}`;
     if (link.getAttribute('href') !== href) link.setAttribute('href', href);
   }
-  const sig = JSON.stringify([st.safeMode, st.disabled, (st.plugins || []).map((p) => [p.file, p.mtimeMs])]);
+  const sig = JSON.stringify([st.safeMode, st.disabled, (st.plugins || []).map((p) => [p.file, p.mtimeMs, p.sha256, p.approved])]);
   if (sig !== PRO.pluginSig) {
     const hadPlugins = PRO.plugins.size > 0;
     PRO.pluginSig = sig;
@@ -119,6 +119,13 @@ async function reloadCustom({ quiet = false } = {}) {
   }
   renderCustomStatus();
   if (PRO.activePanel === 'customize') renderPanel();
+  const pending = st.safeMode || st.unavailable ? [] : (st.plugins || []).filter((p) => !p.approved && !(st.disabled || []).includes(p.file));
+  if (pending.length) {
+    notice('plugins-pending', `${pending.length === 1 ? `Plugin ${pending[0].file} is` : `${pending.length} plugins are`} waiting for your approval before ${pending.length === 1 ? 'it runs' : 'they run'}.`, [
+      { label: 'Review…', accent: true, run: approvePlugins },
+      { label: 'Customize', run: () => openPanel('customize') },
+    ]);
+  } else hideNotice('plugins-pending');
 }
 
 function disposePlugin(rec) {
@@ -142,6 +149,8 @@ async function loadPluginsInner() {
     const rec = { file: p.file, id: p.file, name: p.file.replace(/\.js$/, ''), status: 'loading', error: null, disposers: [] };
     PRO.plugins.set(p.file, rec);
     if ((st.disabled || []).includes(p.file)) { rec.status = 'off'; continue; }
+    if (!p.approved) { rec.status = 'pending'; rec.error = p.everApproved ? 'Changed since you approved it — approve again to run it' : 'New — approve it to run it'; continue; }
+    PRO.everLoadedPlugins = true;
     await new Promise((resolve) => {
       const el = document.createElement('script');
       el.dataset.plugin = p.file;
@@ -530,7 +539,8 @@ function editSecret(existing = null, preset = {}) {
     <label class="field"><span>Value${existing ? ' <em class="muted">(leave empty to keep the current value)</em>' : ''}</span><input id="sec-value" type="password" spellcheck="false" autocomplete="off"></label>
     <label class="field"><span>Available in</span><select id="sec-scope"><option value="project">This project only</option><option value="global">All projects</option></select></label>
     <label class="field"><span>Note — where it’s used</span><input id="sec-note" spellcheck="false" placeholder="e.g. deploy script, Claude in sandbox"></label>
-    <p class="muted small">Encrypted with your system keychain. It reaches terminals and agents that Meridian starts as the environment variable of this name — never as text in files or chat.</p>
+    <label class="check"><input type="checkbox" id="sec-sandbox"> Pass to sandboxed agents in this project by default <span class="muted small">(project secrets only)</span></label>
+    <p class="muted small">Encrypted with your system keychain. It reaches terminals and agents that Meridian starts on this computer as the environment variable of this name — never as text in files or chat. Sandboxes only get the secrets you pick when you start one.</p>
     <div class="modal-actions"><button class="btn" data-a="cancel">Cancel</button><button class="btn accent" data-a="ok">${existing ? 'Save' : 'Add to vault'}</button></div>`, (m, close) => {
     const name = $('#sec-name', m), value = $('#sec-value', m), scope = $('#sec-scope', m), note = $('#sec-note', m);
     name.value = existing?.name || preset.name || '';
@@ -538,11 +548,16 @@ function editSecret(existing = null, preset = {}) {
     scope.value = existing ? existing.scope : (preset.scope || (hasProject ? 'project' : 'global'));
     if (!hasProject) { scope.querySelector('[value="project"]').disabled = true; scope.value = existing?.scope === 'project' ? 'project' : 'global'; }
     if (preset.value) value.value = preset.value;
+    const sbx = $('#sec-sandbox', m);
+    sbx.checked = !!existing?.sandbox;
+    const syncSbx = () => { sbx.disabled = scope.value !== 'project'; if (sbx.disabled) sbx.checked = false; };
+    scope.addEventListener('change', syncSbx);
+    syncSbx();
     (existing || preset.name ? value : name).focus();
     name.addEventListener('input', () => { const p = name.selectionStart; name.value = name.value.toUpperCase().replace(/[^A-Z0-9_]/g, '_'); name.setSelectionRange(p, p); });
     const submit = async () => {
       try {
-        await wb.vaultSet({ id: existing?.id, name: name.value.trim(), value: value.value ? value.value : (existing ? undefined : ''), scope: scope.value, note: note.value.trim() });
+        await wb.vaultSet({ id: existing?.id, name: name.value.trim(), value: value.value ? value.value : (existing ? undefined : ''), scope: scope.value, note: note.value.trim(), sandbox: sbx.checked });
         value.value = '';
         close();
         toast(`${name.value.trim()} saved — new terminals and agents get it`);
@@ -609,7 +624,7 @@ function renderSecretsPanel(el) {
     }
     el.appendChild(files);
   }
-  el.appendChild(h('p', 'muted small foot', 'New or changed secrets reach terminals started after you save. Claude Code sessions started here also ask you before reading .env, keys or credentials files.'));
+  el.appendChild(h('p', 'muted small foot', 'New or changed secrets reach terminals started after you save. Claude Code sessions started here also ask you before reading .env, keys or credentials files. File tools are checked by path (symlinks resolved); shell commands only by a name match — a command that reads a secret indirectly isn’t caught.'));
 }
 
 async function scanSecrets({ announce = false } = {}) {
@@ -776,9 +791,9 @@ async function sandboxMenu(anchor) {
   const names = new Set((PRO.vault.items || []).map((i) => i.name));
   const net = S.info?.sandboxNetwork !== false;
   popover(anchor, `<h3>Sandbox</h3>
-    <p>Only <b>this project</b> is mounted (read-write, at /workspace). No home folder, no Docker socket, non-root user, 2 CPUs / 4 GB. Vault secrets are passed in as environment variables.</p>
+    <p>Only <b>this project</b> is mounted (read-write, at /workspace) — except .git, .claude, .vscode and other files your computer runs automatically, which are read-only. No home folder, no Docker socket, non-root user, 2 CPUs / 4 GB. You pick which vault secrets go in each time.</p>
     <div class="sbx-list"></div>
-    <label class="check"><input type="checkbox" id="sbx-net" ${net ? 'checked' : ''}> Network access <span class="muted small">(agents need it to reach their API)</span></label>
+    <label class="check"><input type="checkbox" id="sbx-net" ${net ? 'checked' : ''}> Network access <span class="muted small">(on by default: agents need it to reach their API — it also lets them reach any site)</span></label>
     <p class="muted small sbx-image"></p>`, (pop, close) => {
     const list = $('.sbx-list', pop);
     for (const [k, need] of [['sandbox-claude', 'ANTHROPIC_API_KEY'], ['sandbox-codex', 'OPENAI_API_KEY'], ['sandbox-shell', null]]) {
@@ -799,6 +814,46 @@ async function sandboxMenu(anchor) {
     }
     $('.sbx-image', pop).textContent = st.imagePresent ? `Image ${st.image} is ready.` : `First start builds ${st.image} (a few minutes, shown in the terminal).`;
     $('#sbx-net', pop).addEventListener('change', (e) => setSandboxNetwork(e.target.checked));
+  });
+}
+
+// Per-session choice of the vault secrets a sandbox gets. Pre-checked: what the agent needs to sign
+// in plus project secrets marked "pass to sandboxes". Resolves to an array of names, or null (cancel).
+const SANDBOX_NEEDS = { 'sandbox-claude': ['ANTHROPIC_API_KEY'], 'sandbox-codex': ['OPENAI_API_KEY'], 'sandbox-shell': [] };
+function proPickSandboxSecrets(kind) {
+  const items = PRO.vault.items || [];
+  if (PRO.sandbox && PRO.sandbox.imagePresent === false) return Promise.resolve([]); // first run builds the image (no secrets)
+  const byName = new Map();
+  for (const i of items) { const cur = byName.get(i.name); if (!cur || i.scope === 'project') byName.set(i.name, i); }
+  const needs = SANDBOX_NEEDS[kind] || [];
+  const isDefault = (i) => needs.includes(i.name) || (i.scope === 'project' && i.sandbox);
+  if (!byName.size) return Promise.resolve([]);
+  const net = S.info?.sandboxNetwork !== false;
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    modal(`<h3>Secrets for ${esc(AGENT_UI[kind]?.label || 'the sandbox')}</h3>
+      <p class="muted small">Only the checked secrets are passed into this container (as environment variables of the agent, not visible in <code>docker inspect</code>). Network is <b>${net ? 'on' : 'off'}</b>${net ? ': the agent can send anything it has to any site' : ''}.</p>
+      <div class="sbx-secrets"></div>
+      <div class="modal-actions"><button class="btn" data-a="cancel">Cancel</button><button class="btn accent" data-a="ok">Start sandbox</button></div>`, (m, close) => {
+      const list = $('.sbx-secrets', m);
+      for (const i of [...byName.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+        const lab = h('label', 'check');
+        const cb = h('input');
+        cb.type = 'checkbox'; cb.value = i.name; cb.checked = isDefault(i);
+        lab.append(cb, h('span', 'mono', ` ${i.name}`), h('span', 'muted small', ` ${i.scope === 'project' ? 'project' : 'all projects'}${needs.includes(i.name) ? ' · needed to sign in' : ''}`));
+        list.appendChild(lab);
+      }
+      m.addEventListener('click', (e) => {
+        const a = e.target.closest('[data-a]')?.dataset.a;
+        if (!a) return;
+        const picked = [...m.querySelectorAll('.sbx-secrets input:checked')].map((x) => x.value);
+        close();
+        done(a === 'ok' ? picked : null);
+      });
+      m.addEventListener('keydown', (e) => { if (e.key === 'Escape') { close(); done(null); } });
+      $('#modal-overlay').addEventListener('dismiss', () => done(null), { once: true });
+    });
   });
 }
 
@@ -970,7 +1025,37 @@ async function setSafeMode(on) {
   try { localStorage.setItem('wb.bootCount', '0'); } catch {}
   PRO.pluginSig = null;
   await reloadCustom({ quiet: true });
-  toast(on ? 'Safe Mode on — no plugins, user.css or settings.json' : 'Safe Mode off — customizations loaded');
+  if (!on) toast('Safe Mode off — customizations loaded');
+  // on: main broadcasts the change to every Workbench page, which then reloads (reloadForSafeMode).
+}
+
+// Tearing plugins down removes what they registered through the API, but not timers, listeners or
+// patched globals they set up themselves. Safe Mode therefore reloads the page; terminals and agent
+// sessions live in main and re-attach (same path as any page reload).
+let safeReloading = false;
+async function reloadForSafeMode() {
+  if (safeReloading) return;
+  safeReloading = true;
+  try { await reloadForSafeModeInner(); } finally { safeReloading = false; }
+}
+async function reloadForSafeModeInner() {
+  const ranPlugins = PRO.everLoadedPlugins || [...PRO.plugins.values()].some((p) => p.status !== 'off' && p.status !== 'pending');
+  if (!ranPlugins) { toast('Safe Mode on — no plugins, user.css or settings.json'); return; }
+  const dirty = (S.tabs || []).filter((t) => typeof isDirty === 'function' && isDirty(t));
+  if (dirty.length && !(await confirmBox('Reload the Workbench to stop plugins?', `Safe Mode is on. Plugins that already ran may still have timers or listeners; a reload stops them (terminals keep running). Unsaved changes in ${dirty.length} file${dirty.length === 1 ? '' : 's'} will be lost.`, 'Reload now', true))) {
+    toast('Safe Mode on. Reload the Workbench to fully stop plugins that already ran.', 5000);
+    return;
+  }
+  location.reload();
+  await new Promise(() => {}); // keep the guard up until the page goes away
+}
+
+// Plugins that changed (or are new) don't run until the user approves them in Meridian's own dialog.
+async function approvePlugins() {
+  try {
+    const res = await wb.customApprovePlugins();
+    if (res?.approved?.length) toast(`Approved ${res.approved.length} plugin${res.approved.length === 1 ? '' : 's'}`);
+  } catch (err) { toast(cleanErr(err), 5000); }
 }
 
 function renderCustomStatus() {
@@ -1028,10 +1113,11 @@ function renderCustomizePanel(el) {
     const title = h('button', 'link', rec?.name && rec.name !== p.file.replace(/\.js$/, '') ? `${rec.name} (${p.file})` : p.file);
     title.addEventListener('click', async () => { if (S.project?.root !== st.root) { await setProject(await wb.customOpen()); openPanel('customize'); } openFile(`plugins/${p.file}`, { focus: true }); });
     info.appendChild(title);
-    const label = { active: 'active', error: 'error', inactive: 'not registered', off: 'off', safe: 'Safe Mode', loading: 'loading' }[status];
+    const label = { active: 'active', error: 'error', inactive: 'not registered', off: 'off', safe: 'Safe Mode', loading: 'loading', pending: 'needs approval' }[status];
     info.appendChild(h('span', `pstatus ${status}`, label));
+    if (status === 'pending') info.appendChild(btn('Approve…', 'small', approvePlugins));
     if (rec?.error && !off && !st.safeMode) info.appendChild(h('div', 'perr small', rec.error));
-    info.appendChild(h('div', 'muted small', `changed ${fmtTime(p.mtimeMs)}`));
+    info.appendChild(h('div', 'muted small', `changed ${fmtTime(p.mtimeMs)} · ${p.size} bytes${p.approved ? ' · approved' : ''}`));
     row.append(toggle, info);
     pl.appendChild(row);
   }
@@ -1091,7 +1177,7 @@ async function proBoot() {
   $('#welcome-customize').addEventListener('click', customizeWithClaude);
   $('#status-custom').addEventListener('click', () => openPanel('customize'));
   $('#status-vault').addEventListener('click', () => openPanel('secrets'));
-  wb.onCustomChange(() => reloadCustom());
+  wb.onCustomChange((p) => { if (p?.safeMode === true) reloadCustom({ quiet: true }).then(reloadForSafeMode); else reloadCustom(); });
   wb.onVaultChange(() => refreshVault());
   bus.addEventListener('info', (e) => { PRO.info = e.detail; });
   bus.addEventListener('editor-ready', () => applySettings(null));

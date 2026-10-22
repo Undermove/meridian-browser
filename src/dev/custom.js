@@ -8,14 +8,17 @@
 //   .history/       automatic snapshots of the three above, for one-click revert
 //
 // Trust: plugins run in the workbench page, which can open terminals and edit project files. That is
-// the point (agents extend the IDE live), so the safety net is visibility (active plugins are listed,
-// each can be switched off), Safe Mode (nothing from this folder loads), and snapshots (revert).
+// the point (agents extend the IDE live), so a plugin only runs after the user approved its exact
+// content in a native dialog (SHA-256 kept by main OUTSIDE this folder, see index.js; any change needs
+// approval again). On top: visibility (active plugins are listed, each can be switched off), Safe Mode
+// (nothing from this folder loads), and snapshots (revert).
 // The folder is served to the internal session only, read-only, at meridian://workbench/custom/,
 // with real-path checks so symlinks can't expose anything outside it.
 
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
+const crypto = require('crypto');
 
 const MAX_FILE = 2 * 1024 * 1024;
 const MAX_PLUGINS = 50;
@@ -196,7 +199,10 @@ class Customizations {
         const real = await fsp.realpath(path.join(this.realRoot, 'plugins', name));
         if (!this.inside(real)) continue;
         const st = await fsp.stat(real);
-        if (st.isFile()) out.push({ file: name, mtimeMs: st.mtimeMs, size: st.size });
+        if (!st.isFile()) continue;
+        const item = { file: name, path: real, mtimeMs: st.mtimeMs, size: st.size, sha256: null };
+        if (st.size <= MAX_FILE) item.sha256 = crypto.createHash('sha256').update(await fsp.readFile(real)).digest('hex');
+        out.push(item);
       } catch {}
     }
     return out;

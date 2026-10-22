@@ -29,7 +29,11 @@ contextBridge.exposeInMainWorld('workbench', {
   reveal: (rel) => ipcRenderer.invoke('wb:reveal', String(rel || '')),
   onFsChange: listen('wb:fs-change'),
 
-  ptyCreate: (opts) => ipcRenderer.invoke('wb:pty-create', { kind: String(opts?.kind || 'shell'), cols: Number(opts?.cols) || 80, rows: Number(opts?.rows) || 24 }),
+  ptyCreate: (opts) => ipcRenderer.invoke('wb:pty-create', {
+    kind: String(opts?.kind || 'shell'), cols: Number(opts?.cols) || 80, rows: Number(opts?.rows) || 24,
+    // sandboxes only: vault secret names picked for this session (undefined = Meridian's minimal default)
+    secrets: Array.isArray(opts?.secrets) ? opts.secrets.slice(0, 200).map(String) : undefined,
+  }),
   ptyList: () => ipcRenderer.invoke('wb:pty-list'),
   ptyKill: (id) => ipcRenderer.invoke('wb:pty-kill', String(id)),
   ptyWrite: (id, data) => ipcRenderer.send('wb:pty-write', String(id), String(data)),
@@ -46,13 +50,14 @@ contextBridge.exposeInMainWorld('workbench', {
   customTogglePlugin: (file, enabled) => ipcRenderer.invoke('wb:custom-toggle-plugin', String(file), !!enabled),
   customRestore: (id) => ipcRenderer.invoke('wb:custom-restore', String(id)),
   customOpen: () => ipcRenderer.invoke('wb:custom-open'),
+  customApprovePlugins: () => ipcRenderer.invoke('wb:custom-approve-plugins'),
   customReveal: () => ipcRenderer.invoke('wb:custom-reveal'),
   onCustomChange: listen('wb:custom-change'),
 
   vaultList: () => ipcRenderer.invoke('wb:vault-list'),
   vaultSet: (item) => ipcRenderer.invoke('wb:vault-set', {
     id: item?.id ? String(item.id) : undefined, name: String(item?.name || ''), scope: item?.scope === 'project' ? 'project' : 'global',
-    note: String(item?.note || ''), value: typeof item?.value === 'string' ? item.value : undefined,
+    note: String(item?.note || ''), value: typeof item?.value === 'string' ? item.value : undefined, sandbox: item?.sandbox === true,
   }),
   vaultReveal: (id) => ipcRenderer.invoke('wb:vault-reveal', String(id)),
   vaultDelete: (id) => ipcRenderer.invoke('wb:vault-delete', String(id)),
