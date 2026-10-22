@@ -59,7 +59,7 @@ function onWorkbenchMessage(tabId, msg) {
   switch (msg.type) {
     case 'ready': {
       entry.ready = true;
-      entry.wv.send('wb:command', { type: 'init', project: l.node.project || null, ...workbenchTheme() });
+      entry.wv.send('wb:command', { ...workbenchTheme(), type: 'init', project: l.node.project || null }); // type last: workbenchTheme() has its own `type`
       for (const m of entry.queue.splice(0)) entry.wv.send('wb:command', m);
       return;
     }
