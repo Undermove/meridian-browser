@@ -30,6 +30,14 @@ Arc is being sunset. Meridian keeps the Arc workflow you're used to (spaces, pin
 - **Mission Control** (`⇧⌘M`): a live tree of every agent working with Meridian: Claude Code and Codex sessions started from the Workbench (locally or in a Docker sandbox) with their subagents and nested subagents, MCP clients driving the browser, and ⌘J chats. Status (thinking / running a tool / waiting for you / done), the current tool with a redacted summary, elapsed time, tool calls, project. Click to jump to the agent's terminal or tab. A notification and a sidebar badge when an agent waits for you; "N agents working" in the sidebar and the Workbench.
 - **Tidy Today**: Claude proposes folders and shorter titles for your Today tabs; you review a diff and apply what you want. **Ask Claude** straight from the command bar. **Link previews**: hold `⇧` over a link for a short summary of the page (opt-in, Settings → AI).
 
+**Workbench: a mini IDE for working with coding agents** (`⇧⌘E`)
+- A tab with a file tree, a Monaco editor (the VS Code editor) and real terminals. One-click launchers for **Claude Code**, **Codex**, **Gemini CLI** or a shell in your project. Put it in split view next to your `localhost` preview.
+- Agents started here get Meridian's browser tools for that session only, so they can open your app, read it and take screenshots. Your global CLI configs aren't touched.
+- **Make it yours with agents**: the Workbench loads `user.css`, `settings.json` and plugins from its own folder and reloads them live. Click **Customize with Claude** and ask for a bigger font, a deploy button or a new panel. New plugins run only after you approve them. Every change is snapshotted, and Safe Mode starts without customizations.
+- **Secrets vault**: API keys encrypted with your system keychain, global or per project. Agents only see them as environment variables of the processes Meridian starts, never as text. Meridian warns you when you paste a key into a terminal or into ⌘J, offers to move `.env` files into the vault, and asks before a Claude Code session reads a secret file.
+- **Sandboxed agents** with Docker or OrbStack: run Claude Code, Codex or a shell in a container that sees only your project. The agent runs as a non-root user with no capabilities. `.git`, `.claude` and other auto-run config are read-only, so the agent can't plant hooks. It gets only the secrets you pick for the session (passed in a file, not visible in `docker inspect`), and you can switch the network off.
+- **Hubs**: set up a personal folder for posts, notes or code that you work on with agents. You get a structure, `AGENTS.md`/`CLAUDE.md` conventions, git and a starter skill, pinned in your sidebar in one click.
+
 **Also**
 - Built-in ad and tracker blocking (Ghostery engine), per-site permission prompts, downloads, find in page, zoom, reopen closed tab, session restore.
 - Chromium engine: sites work like in Chrome. Experimental unpacked Chrome extension loading.
@@ -112,6 +120,9 @@ Every shortcut can be changed in **Settings → Shortcuts**.
 - No built-in password manager or sync yet. Use your password manager's desktop app.
 - Chrome extensions are experimental: background and content scripts load, but toolbar popups don't yet.
 - No Boosts, Easels or Notes.
+- Codex has no per-tool hooks, so the secret-file guard and Mission Control's tool view only cover Claude Code. For Codex sessions Meridian falls back to scanning the project for secret files.
+- Inside a Docker sandbox git is read-only, by design. Commit from a host terminal.
+- Windows and Linux builds are produced by CI but have had far less hands-on testing than macOS.
 
 ## Roadmap
 
