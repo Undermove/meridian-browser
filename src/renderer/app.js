@@ -38,6 +38,7 @@ const SEARCH_ENGINES = {
 };
 const SPACE_COLORS = ['#8a8fe0', '#e08a9b', '#e0b27a', '#7fbf8e', '#6fb6d9', '#b48ae0', '#d98a6f', '#9aa3ad'];
 const ARCHIVE_OPTIONS = [[12, '12 hours'], [24, '24 hours'], [168, '7 days'], [720, '30 days'], [0, 'Never']];
+const UNLOAD_OPTIONS = [[15, '15 minutes'], [30, '30 minutes'], [60, '1 hour'], [240, '4 hours'], [0, 'Never']];
 
 const uid = () => crypto.randomUUID();
 const now = () => Date.now();
@@ -54,6 +55,11 @@ const rt = {
   cmd: { mode: 'new', results: [], index: 0 },
   sidebarPeek: false,
   findText: '',
+  pages: new Map(),        // spaceId -> { el, rows: Map(nodeId -> element), … } (sidebar page per space)
+  favEls: new Map(),       // tabId -> favorites tile element
+  shownSpace: null,        // space whose page is on screen
+  slide: null,             // running space-switch animation
+  lastSeen: new Map(),     // tabId -> last time the tab was shown (memory saver)
 };
 
 // ---------------------------------------------------------------- state
@@ -68,7 +74,7 @@ function defaultState() {
     favorites: { default: [] },
     archive: [],
     history: {},
-    settings: { searchEngine: 'google', archiveAfterHours: 12, adblock: true, sidebarRight: false, sidebarHidden: false, extensions: [], agentAccess: 'off', agentAllowJs: false, aiUseTools: false },
+    settings: { searchEngine: 'google', archiveAfterHours: 12, unloadAfterMinutes: 60, adblock: true, sidebarRight: false, sidebarHidden: false, extensions: [], agentAccess: 'off', agentAllowJs: false, aiUseTools: false },
     onboarded: false,
   };
 }
@@ -77,14 +83,45 @@ function newSpace(name, icon, color, profileId) {
   return { id: uid(), name, icon, color, profileId, pinned: [], today: [], activeTabId: null, split: null };
 }
 
-let saveTimer = null;
+// Saving: state.json is written debounced (but at least every few seconds while things keep changing).
+// History and favicons are big and go to their own files, at most every 15 s and only when changed.
+const SAVE_DELAY = 1200, SAVE_MAX_WAIT = 5000, SLOW_SAVE_EVERY = 15000;
+const persist = { timer: null, first: 0, slowTimer: null, historyDirty: false, faviconsDirty: false };
 function save() {
-  if (MINI) return;
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => api.saveState(serialize()), 600);
+  if (MINI || !state) return;
+  const t = now();
+  if (!persist.timer) persist.first = t;
+  clearTimeout(persist.timer);
+  persist.timer = setTimeout(() => flushSave(), Math.max(0, Math.min(SAVE_DELAY, persist.first + SAVE_MAX_WAIT - t)));
 }
-function serialize() { return state; }
-window.addEventListener('beforeunload', () => { if (!MINI && state) api.saveStateSync(serialize()); });
+function markHistoryDirty() { persist.historyDirty = true; scheduleSlowSave(); }
+function markFaviconsDirty() { persist.faviconsDirty = true; scheduleSlowSave(); }
+function scheduleSlowSave() {
+  if (MINI || persist.slowTimer) return;
+  persist.slowTimer = setTimeout(() => { persist.slowTimer = null; flushSave({ slow: true, state: false }); }, SLOW_SAVE_EVERY);
+}
+function saveParts({ slow = false, state: withState = true } = {}) {
+  const parts = { state: withState ? serialize() : null };
+  if (slow && persist.historyDirty) { parts.history = state.history; persist.historyDirty = false; }
+  if (slow && persist.faviconsDirty) { parts.favicons = faviconMap(); persist.faviconsDirty = false; }
+  return parts;
+}
+function flushSave(opts) {
+  if (MINI || !state) return;
+  if (opts?.state !== false) { clearTimeout(persist.timer); persist.timer = null; }
+  const parts = saveParts(opts);
+  if (parts.state || parts.history || parts.favicons) return api.saveState(parts);
+}
+// state.json without history and favicons (those have their own files).
+function serialize() { return JSON.stringify(state, (k, v) => (k === 'history' || k === 'favicon' ? undefined : v)); }
+function faviconMap() {
+  const out = {};
+  const add = (n) => { if (n.type === 'tab' && n.favicon) out[n.id] = n.favicon; };
+  for (const list of Object.values(state.favorites)) list.forEach(add);
+  for (const sp of state.spaces) { walk(sp.pinned, add); sp.today.forEach(add); }
+  return out;
+}
+window.addEventListener('beforeunload', () => { if (!MINI && state) api.saveStateSync(saveParts({ slow: true })); });
 
 const space = () => state.spaces.find((s) => s.id === state.activeSpaceId) || state.spaces[0];
 const favs = (sp = space()) => (state.favorites[sp.profileId] ||= []);
@@ -167,7 +204,7 @@ function pumpFavicons() {
     const { tab, src, partition } = favQueue.shift();
     favActive++;
     api.fetchFavicon(src, partition).then((data) => {
-      if (data) { tab.favicon = data; scheduleRender(); save(); }
+      if (data && data !== tab.favicon) { tab.favicon = data; scheduleRender(); markFaviconsDirty(); }
     }).finally(() => { favActive--; pumpFavicons(); });
   }
 }
@@ -189,6 +226,7 @@ function ensureView(tab, sp = space()) {
   bindView(wv, tab.id);
   $('#views').appendChild(wv);
   rt.views.set(tab.id, wv);
+  rt.lastSeen.set(tab.id, now());
   return wv;
 }
 
@@ -196,6 +234,7 @@ function destroyView(id) {
   const wv = rt.views.get(id);
   if (!wv) return;
   for (const [wc, t] of rt.wcToTab) if (t === id) rt.wcToTab.delete(wc);
+  if (document.activeElement === wv) wv.blur();
   wv.remove();
   rt.views.delete(id);
   rt.nav.delete(id);
@@ -262,8 +301,10 @@ function activate(id, { focus = true } = {}) {
   const sp = space();
   const l = locate(id, sp);
   if (!l) return;
+  if (sp.activeTabId && sp.activeTabId !== id) rt.lastSeen.set(sp.activeTabId, now());
   sp.activeTabId = id;
   l.node.lastActive = now();
+  rt.lastSeen.set(id, now());
   rt.mru = [id, ...rt.mru.filter((x) => x !== id)].slice(0, 50);
   if (l.parent?.collapsed) l.parent.collapsed = false;
   const wv = ensureView(l.node, sp);
@@ -290,10 +331,15 @@ function navigateActive(url) {
   activate(tab.id);
 }
 
-function nextActiveAfterClose(sp, closedId) {
+// The most recently used open tab; otherwise the Today tab that took the closed one's place.
+function nextActiveAfterClose(sp, closedId, todayBefore = null) {
   const visible = visibleTabIds(sp).filter((x) => x !== closedId);
   const recent = rt.mru.find((x) => x !== closedId && visible.includes(x) && rt.views.has(x));
-  return recent || null;
+  if (recent) return recent;
+  const i = todayBefore ? todayBefore.indexOf(closedId) : -1;
+  if (i < 0) return null;
+  const rest = todayBefore.filter((x) => x !== closedId && sp.today.some((t) => t.id === x));
+  return rest[Math.min(i, rest.length - 1)] || null;
 }
 
 function closeTab(id = space().activeTabId) {
@@ -301,6 +347,7 @@ function closeTab(id = space().activeTabId) {
   const sp = space();
   const l = locate(id, sp);
   if (!l) return;
+  const todayBefore = sp.today.map((t) => t.id);
   if (sp.split?.ids.includes(id)) sp.split = null;
   if (l.zone === 'today') {
     l.list.splice(l.list.indexOf(l.node), 1);
@@ -312,7 +359,7 @@ function closeTab(id = space().activeTabId) {
   destroyView(id);
   rt.mru = rt.mru.filter((x) => x !== id);
   if (sp.activeTabId === id) {
-    sp.activeTabId = nextActiveAfterClose(sp, id);
+    sp.activeTabId = nextActiveAfterClose(sp, id, todayBefore);
     if (sp.activeTabId) return activate(sp.activeTabId);
   }
   render(); save();
@@ -329,7 +376,7 @@ function reopenTab() {
 }
 
 function archiveTab(tab, sp) {
-  state.archive.unshift({ url: tab.url, title: titleOf(tab), favicon: tab.favicon, closedAt: now(), spaceId: sp.id });
+  state.archive.unshift({ url: tab.url, title: titleOf(tab), closedAt: now(), spaceId: sp.id });
   state.archive = state.archive.slice(0, 500);
 }
 
@@ -346,6 +393,30 @@ function autoArchive() {
     });
   }
   if (changed) { render(); save(); }
+}
+
+// Memory saver, like Arc: pages not looked at for a while are unloaded (they reload on click, pinned tabs
+// where they were). Never the tab on screen in any space, split tabs, tabs playing audio, or tabs an agent
+// used recently.
+function unloadIdleTabs() {
+  const minutes = state.settings.unloadAfterMinutes;
+  if (!minutes) return;
+  const cutoff = now() - minutes * 60e3;
+  const keep = new Set();
+  for (const sp of state.spaces) {
+    if (sp.activeTabId) keep.add(sp.activeTabId);
+    sp.split?.ids.forEach((x) => keep.add(x));
+  }
+  for (const a of rt.agentLog || []) if (a.tabId && a.ts > cutoff) keep.add(a.tabId);
+  for (const id of keep) rt.lastSeen.set(id, now()); // the clock starts when a tab leaves the screen
+  let changed = false;
+  for (const id of [...rt.views.keys()]) {
+    const nav = rt.nav.get(id) || {};
+    if (keep.has(id) || nav.audible || rt.agentGlow?.has(id) || (rt.lastSeen.get(id) || 0) > cutoff) continue;
+    destroyView(id);
+    changed = true;
+  }
+  if (changed) scheduleRender();
 }
 
 function clearToday() {
@@ -502,15 +573,21 @@ function initSplitHandle() {
 
 // ---------------------------------------------------------------- spaces
 
+// The sidebar page slides in from `dir` (render() runs the animation), the content area fades over.
 function switchSpace(id, dir = 0) {
-  if (id === state.activeSpaceId) return;
+  if (id === state.activeSpaceId || !state.spaces.some((s) => s.id === id)) return;
+  const from = state.spaces.findIndex((s) => s.id === state.activeSpaceId);
   state.activeSpaceId = id;
-  const pages = $('#space-pages');
-  pages.classList.remove('slide-left', 'slide-right');
-  void pages.offsetWidth;
-  if (dir) pages.classList.add(dir > 0 ? 'slide-left' : 'slide-right');
+  rt.slideDir = dir || Math.sign(state.spaces.findIndex((s) => s.id === id) - from) || 1;
   const sp = space();
-  if (sp.activeTabId && locate(sp.activeTabId)) activate(sp.activeTabId); else { sp.activeTabId = null; render(); save(); }
+  if (sp.activeTabId && locate(sp.activeTabId)) activate(sp.activeTabId);
+  else {
+    sp.activeTabId = null;
+    // Keys must not keep going to the previous space's (now hidden) page.
+    if (document.activeElement?.tagName === 'WEBVIEW') document.activeElement.blur();
+    render(); save();
+  }
+  if (!MINI) $('#views').animate([{ opacity: 0.5 }, { opacity: 1 }], { duration: 180, easing: 'ease-out' });
 }
 
 function stepSpace(dir) {
@@ -582,6 +659,7 @@ function recordHistory(url, title) {
   if (title) h.title = title;
   if (now() - h.last > 30_000) h.count++;
   h.last = now();
+  markHistoryDirty();
   const keys = Object.keys(state.history);
   if (keys.length > 4000) {
     keys.sort((a, b) => state.history[a].last - state.history[b].last).slice(0, keys.length - 3500).forEach((k) => delete state.history[k]);
@@ -589,16 +667,20 @@ function recordHistory(url, title) {
 }
 
 // ---------------------------------------------------------------- rendering
+// The sidebar is patched, not rebuilt: every row keeps its element and is only touched when what it
+// shows changed. Each space has its own page element, so switching spaces only patches the rows that
+// changed since that page was last on screen, and each page keeps its own scroll position.
 
 let renderQueued = false;
 function scheduleRender() {
   if (renderQueued) return;
   renderQueued = true;
-  requestAnimationFrame(() => { renderQueued = false; render(); });
+  requestAnimationFrame(() => { if (renderQueued) render(); });
 }
 
 function render() {
   if (!state) return;
+  renderQueued = false;
   const sp = space();
   applyTheme(sp);
   document.body.classList.toggle('sidebar-hidden', !!state.settings.sidebarHidden && !MINI);
@@ -606,9 +688,8 @@ function render() {
   if (!MINI) {
     renderTopBar(sp);
     renderFavorites(sp);
-    renderSpacePage(sp);
+    renderSpacePages(sp);
     renderSpaceDots();
-    localizeKeys($('#sidebar'));
   } else {
     renderMiniBar();
   }
@@ -620,16 +701,35 @@ function render() {
   }
 }
 
+const setText = (el, text) => { if (el.textContent !== text) el.textContent = text; };
+const setHtml = (el, html) => { if (el._html !== html) { el._html = html; el.innerHTML = html; } };
+
+// Puts `els` into `container` in order, moving only what is out of place and removing the rest.
+function syncChildren(container, els) {
+  let cursor = container.firstChild;
+  for (const el of els) {
+    if (el === cursor) cursor = cursor.nextSibling;
+    else container.insertBefore(el, cursor);
+  }
+  while (cursor) { const next = cursor.nextSibling; cursor.remove(); cursor = next; }
+}
+
 function applyTheme(sp) {
-  document.documentElement.style.setProperty('--space', sp.color || SPACE_COLORS[0]);
+  const color = sp.color || SPACE_COLORS[0];
+  if (rt.themeColor === color) return;
+  // No tint fade on the very first paint.
+  if (!rt.themeColor) { document.documentElement.style.transition = 'none'; requestAnimationFrame(() => { document.documentElement.style.transition = ''; }); }
+  rt.themeColor = color;
+  document.documentElement.style.setProperty('--space', color);
+  document.documentElement.style.setProperty('--space-bg', color);
 }
 
 function renderTopBar(sp) {
   const tab = activeTab();
   const nav = tab ? navOf(tab.id) : {};
   const url = tab ? tabUrl(tab) : '';
-  $('#urlbar .host').textContent = tab ? hostOf(url) : 'Search or enter URL';
-  $('#urlbar .lock').innerHTML = url.startsWith('https:') ? icon('lock', 12) : '';
+  setText($('#urlbar .host'), tab ? hostOf(url) : 'Search or enter URL');
+  setHtml($('#urlbar .lock'), url.startsWith('https:') ? icon('lock', 12) : '');
   $('#urlbar').classList.toggle('empty', !tab);
   $('#urlbar').classList.toggle('loading', !!nav.loading);
   $('[data-cmd="back"]').disabled = !nav.canBack;
@@ -639,84 +739,287 @@ function renderTopBar(sp) {
 function renderFavorites(sp) {
   const el = $('#favorites');
   const list = favs(sp);
-  el.innerHTML = list.map((t) => `
-    <div class="fav ${t.id === sp.activeTabId ? 'active' : ''} ${rt.views.has(t.id) ? 'loaded' : ''}" draggable="true" data-id="${esc(t.id)}" title="${esc(titleOf(t))}">
-      ${faviconImg(t, 20)}
-    </div>`).join('');
+  syncChildren(el, list.map((t) => favEl(t, sp)));
   el.classList.toggle('empty', list.length === 0);
+  if (rt.favEls.size > list.length + 100) for (const [id, e] of rt.favEls) if (!e.isConnected) rt.favEls.delete(id);
+}
+
+function favEl(t, sp) {
+  let el = rt.favEls.get(t.id);
+  if (!el) {
+    el = document.createElement('div');
+    el.setAttribute('draggable', 'true');
+    el.dataset.id = t.id;
+    rt.favEls.set(t.id, el);
+  }
+  const cls = `fav${t.id === sp.activeTabId ? ' active' : ''}${rt.views.has(t.id) ? ' loaded' : ''}`;
+  if (el.className !== cls) el.className = cls;
+  const title = titleOf(t);
+  if (el.title !== title) el.title = title;
+  if (el._fav !== t.favicon || el._host !== t.url || !el.firstChild) { el._fav = t.favicon; el._host = t.url; el.innerHTML = faviconImg(t, 20); }
+  return el;
 }
 
 function faviconImg(t, size = 16) {
   const src = faviconFor(t);
   const letter = esc((hostOf(t.url)[0] || '•').toUpperCase());
-  return `<span class="favicon" style="width:${size}px;height:${size}px">${src ? `<img src="${esc(src)}" width="${size}" height="${size}" loading="lazy" data-fallback="${letter}">` : `<span class="letter">${letter}</span>`}</span>`;
+  return `<span class="favicon" style="width:${size}px;height:${size}px">${src ? `<img src="${esc(src)}" width="${size}" height="${size}" data-fallback="${letter}">` : `<span class="letter">${letter}</span>`}</span>`;
 }
 
-function renderSpacePage(sp) {
-  const page = $('#space-pages');
-  const pinnedHtml = sp.pinned.map((n) => nodeHtml(n, sp, 0)).join('');
-  const todayHtml = sp.today.map((t) => tabRowHtml(t, sp, 'today', 0)).join('');
-  page.innerHTML = `
-    <div class="space-header">
-      <span class="space-icon">${sp.icon ? esc(sp.icon) : ''}</span>
-      <span class="space-name">${esc(sp.name)}</span>
-    </div>
-    <div class="zone" id="pinned" data-zone="pinned">${pinnedHtml || '<div class="zone-hint">Drag tabs here to pin them</div>'}</div>
-    <div class="divider"><span>Today</span><button class="clear-today" title="Clear Today (⇧⌘K)">Clear</button></div>
-    <button class="row new-tab" data-cmd="command-bar">${icon('plus', 14)}<span>New Tab</span></button>
-    <div class="zone" id="today" data-zone="today">${todayHtml}</div>
-  `;
-  page.querySelectorAll('img[data-fallback]').forEach(bindFaviconFallback);
-  $('#favorites').querySelectorAll('img[data-fallback]').forEach(bindFaviconFallback);
-}
-
-function bindFaviconFallback(img) {
-  img.addEventListener('error', () => {
+// One listener for every favicon in the UI: a broken image becomes the site's letter.
+function initFaviconFallback() {
+  document.addEventListener('error', (e) => {
+    const img = e.target;
+    if (img?.tagName !== 'IMG' || !img.dataset.fallback) return;
     const span = document.createElement('span');
     span.className = 'letter';
     span.textContent = img.dataset.fallback;
     img.replaceWith(span);
-  }, { once: true });
+  }, true);
 }
 
-function nodeHtml(n, sp, depth) {
-  if (n.type === 'tab') return tabRowHtml(n, sp, 'pinned', depth);
-  return `
-    <div class="folder-wrap ${n.collapsed ? 'collapsed' : ''}">
-      <div class="row folder" draggable="true" data-id="${esc(n.id)}" style="--depth:${depth}">
-        <span class="folder-ic">${icon(n.collapsed ? 'folder' : 'folderOpen', 15)}</span>
-        <span class="title">${esc(n.title)}</span>
-      </div>
-      <div class="children">${n.children.map((c) => nodeHtml(c, sp, depth + 1)).join('')}</div>
-    </div>`;
+function pageFor(sp) {
+  let p = rt.pages.get(sp.id);
+  if (p) return p;
+  const el = document.createElement('div');
+  el.className = 'space-page';
+  el.dataset.space = sp.id;
+  el.innerHTML = `
+    <div class="space-header"><span class="space-icon"></span><span class="space-name"></span></div>
+    <div class="zone" data-zone="pinned"></div>
+    <div class="divider"><span>Today</span><button class="clear-today" title="${esc(keys('Clear Today (⇧⌘K)'))}">Clear</button></div>
+    <button class="row new-tab" data-cmd="command-bar">${icon('plus', 14)}<span>New Tab</span></button>
+    <div class="zone" data-zone="today"></div>`;
+  p = {
+    el, rows: new Map(),
+    icon: $('.space-icon', el), name: $('.space-name', el),
+    pinned: $('[data-zone="pinned"]', el), today: $('[data-zone="today"]', el),
+  };
+  $('#space-pages').appendChild(el);
+  rt.pages.set(sp.id, p);
+  return p;
 }
 
-function tabRowHtml(t, sp, zone, depth) {
+function renderPage(sp) {
+  const p = pageFor(sp);
+  setText(p.icon, sp.icon || '');
+  setText(p.name, sp.name);
+  const ctx = { sp, p, seen: new Set() };
+  if (sp.pinned.length) syncChildren(p.pinned, sp.pinned.map((n) => nodeEl(n, ctx, 0)));
+  else if (!p.pinned.querySelector('.zone-hint')) p.pinned.innerHTML = '<div class="zone-hint">Drag tabs here to pin them</div>';
+  syncChildren(p.today, sp.today.map((t) => tabEl(t, ctx, 'today', 0)));
+  if (p.rows.size > ctx.seen.size) for (const id of p.rows.keys()) if (!ctx.seen.has(id)) p.rows.delete(id);
+  return p;
+}
+
+function nodeEl(n, ctx, depth) {
+  return n.type === 'tab' ? tabEl(n, ctx, 'pinned', depth) : folderEl(n, ctx, depth);
+}
+
+// Children of collapsed folders aren't built until the folder opens.
+function folderEl(n, ctx, depth) {
+  let w = ctx.p.rows.get(n.id);
+  if (!w || !w.classList.contains('folder-wrap')) {
+    w = document.createElement('div');
+    w.className = 'folder-wrap';
+    w.innerHTML = `<div class="row folder" draggable="true"></div><div class="children"></div>`;
+    w._row = w.firstChild;
+    w._children = w.lastChild;
+    w._row.dataset.id = n.id;
+    ctx.p.rows.set(n.id, w);
+  }
+  ctx.seen.add(n.id);
+  const sig = `${n.collapsed}|${depth}|${n.title}`;
+  if (w._sig !== sig) {
+    w._sig = sig;
+    w.className = `folder-wrap${n.collapsed ? ' collapsed' : ''}`;
+    w._row.style.setProperty('--depth', depth);
+    w._row.innerHTML = `<span class="folder-ic">${icon(n.collapsed ? 'folder' : 'folderOpen', 15)}</span><span class="title">${esc(n.title)}</span>`;
+  }
+  if (!n.collapsed) syncChildren(w._children, n.children.map((c) => nodeEl(c, ctx, depth + 1)));
+  return w;
+}
+
+function tabEl(t, ctx, zone, depth) {
+  const { sp, p } = ctx;
+  let el = p.rows.get(t.id);
+  if (!el || !el.classList.contains('tab')) {
+    el = document.createElement('div');
+    el.className = 'row tab';
+    el.setAttribute('draggable', 'true');
+    el.dataset.id = t.id;
+    p.rows.set(t.id, el);
+  }
+  ctx.seen.add(t.id);
   const nav = rt.nav.get(t.id) || {};
   const loaded = rt.views.has(t.id);
+  const inSplit = !!sp.split?.ids.includes(t.id);
+  const agentGlow = !!rt.agentGlow?.has(t.id);
+  // State that only restyles the row goes in classes, so a row being clicked is never rebuilt under the pointer.
+  const cls = `row tab${t.id === sp.activeTabId ? ' active' : ''} ${loaded ? 'loaded' : 'unloaded'}${nav.loading ? ' loading' : ''}${inSplit ? ' in-split' : ''}${agentGlow ? ' agent' : ''}`;
+  if (el.className !== cls) el.className = cls;
+  if (el.dataset.zone !== zone) el.dataset.zone = zone;
+  const url = tabUrl(t) || '';
+  if (el.title !== url) el.title = url;
   const drifted = zone !== 'today' && t.currentUrl && t.currentUrl !== t.url;
-  const inSplit = sp.split?.ids.includes(t.id);
-  const agentGlow = rt.agentGlow?.has(t.id);
+  const sig = `${depth}|${zone}|${drifted ? 1 : 0}|${inSplit ? 1 : 0}|${agentGlow ? 1 : 0}|${nav.audible ? 1 : 0}${nav.muted ? 1 : 0}|${t.url}|${titleOf(t)}`;
+  if (el._sig !== sig || el._fav !== t.favicon) {
+    el._sig = sig;
+    el._fav = t.favicon;
+    el.style.setProperty('--depth', depth);
+    el.innerHTML = tabRowInner(t, zone, nav, drifted, inSplit, agentGlow);
+  }
+  return el;
+}
+
+function tabRowInner(t, zone, nav, drifted, inSplit, agentGlow) {
   const audio = nav.audible || nav.muted
     ? `<button class="row-btn audio" data-act="mute" title="${nav.muted ? 'Unmute' : 'Mute'}">${icon(nav.muted ? 'mute' : 'speaker', 13)}</button>` : '';
   return `
-    <div class="row tab ${t.id === sp.activeTabId ? 'active' : ''} ${loaded ? 'loaded' : 'unloaded'} ${nav.loading ? 'loading' : ''} ${inSplit ? 'in-split' : ''} ${agentGlow ? 'agent' : ''}"
-         draggable="true" data-id="${esc(t.id)}" data-zone="${zone}" style="--depth:${depth}" title="${esc(tabUrl(t))}">
       ${drifted ? `<button class="row-btn reset" data-act="reset" title="Back to pinned URL">${icon('slash', 13)}</button>` : ''}
       ${faviconImg(t)}
       <span class="title">${esc(titleOf(t))}</span>
       ${inSplit ? `<span class="badge">${icon('split', 12)}</span>` : ''}
       ${agentGlow ? `<span class="badge agent-badge" title="An AI agent is working in this tab">${icon('bolt', 12)}</span>` : ''}
       ${audio}
-      <button class="row-btn close" data-act="close" title="${zone === 'today' ? 'Close' : 'Unload'} (⌘W)">${icon(zone === 'today' ? 'x' : 'x', 13)}</button>
-    </div>`;
+      <button class="row-btn close" data-act="close" title="${esc(keys(`${zone === 'today' ? 'Close' : 'Unload'} (⌘W)`))}">${icon('x', 13)}</button>`;
+}
+
+// Shows the active space's page; a change of space slides the old page out and the new one in.
+function renderSpacePages(sp) {
+  const p = renderPage(sp);
+  if (rt.pages.size > state.spaces.length) {
+    for (const [id, page] of rt.pages) if (!state.spaces.some((s) => s.id === id)) { page.el.remove(); rt.pages.delete(id); }
+  }
+  if (rt.shownSpace === sp.id) return;
+  const prev = rt.pages.get(rt.shownSpace);
+  rt.shownSpace = sp.id;
+  for (const z of $$('#pinned, #today')) z.removeAttribute('id');
+  p.pinned.id = 'pinned';
+  p.today.id = 'today';
+  const dir = rt.slideDir || 0;
+  const from = rt.slideFrom || 0;
+  rt.slideDir = 0; rt.slideFrom = 0;
+  endDrag(false);
+  endSlide();
+  if (prev && prev !== p && dir) slidePages(prev.el, p.el, dir, from);
+  else { prev?.el.classList.remove('current'); p.el.classList.add('current'); }
+}
+
+const SLIDE_MS = 280;
+const SLIDE_EASE = 'cubic-bezier(0.2, 0.8, 0.2, 1)';
+// Kept up to date by a ResizeObserver: reading clientWidth mid-switch would force a synchronous layout.
+const pageWidth = () => rt.pageW || 260;
+
+// `from` is where the finger left the old page (px); the animation continues from there.
+function slidePages(outEl, inEl, dir, from = 0) {
+  const w = pageWidth();
+  const opts = { duration: SLIDE_MS * Math.max(0.35, 1 - Math.abs(from) / w), easing: SLIDE_EASE };
+  outEl.classList.add('moving');
+  outEl.classList.remove('current');
+  inEl.classList.add('current');
+  const anims = [
+    outEl.animate([{ transform: `translateX(${from}px)` }, { transform: `translateX(${-dir * w}px)` }], opts),
+    inEl.animate([{ transform: `translateX(${from + dir * w}px)` }, { transform: 'translateX(0)' }], opts),
+  ];
+  const done = () => { outEl.classList.remove('moving'); outEl.style.transform = ''; inEl.style.transform = ''; };
+  rt.slide = { anims, done };
+  anims[1].onfinish = () => { if (rt.slide?.anims === anims) { rt.slide = null; done(); } };
+}
+
+// A new switch while one is animating snaps the old one to its end, so key repeats stay instant.
+function endSlide() {
+  const s = rt.slide;
+  if (!s) return;
+  rt.slide = null;
+  s.anims.forEach((a) => a.cancel());
+  s.done();
+}
+
+// Build the other spaces' pages while idle, so the first switch to each is as quick as the rest.
+function prebuildPages() {
+  const todo = state.spaces.filter((s) => !rt.pages.has(s.id));
+  const step = (deadline) => {
+    while (todo.length && deadline.timeRemaining() > 4) { const sp = todo.shift(); if (state.spaces.includes(sp)) renderPage(sp); }
+    if (todo.length) requestIdleCallback(step, { timeout: 2000 });
+  };
+  requestIdleCallback(step, { timeout: 2000 });
+}
+
+// ---------------------------------------------------------------- two-finger swipe between spaces
+
+function neighbourSpace(dir) {
+  const i = state.spaces.findIndex((s) => s.id === state.activeSpaceId);
+  return state.spaces[(i + dir + state.spaces.length) % state.spaces.length];
+}
+
+// Follow the finger: the current page moves with the gesture and the next page comes in beside it.
+function dragPages(offset) {
+  endSlide();
+  const cur = rt.pages.get(state.activeSpaceId)?.el;
+  if (!cur) return;
+  const dir = offset < 0 ? 1 : -1;
+  const nb = renderPage(neighbourSpace(dir)).el;
+  if (rt.drag && rt.drag.nb !== nb && rt.drag.nb !== cur) { rt.drag.nb.classList.remove('moving'); rt.drag.nb.style.transform = ''; }
+  cur.style.transform = `translateX(${offset}px)`;
+  if (nb !== cur) { nb.classList.add('moving'); nb.style.transform = `translateX(${offset + dir * pageWidth()}px)`; }
+  rt.drag = { offset, nb, cur, dir };
+}
+
+// Gesture ended below the threshold: spring back (or just reset when `animate` is false).
+function endDrag(animate = true) {
+  const d = rt.drag;
+  if (!d) return;
+  rt.drag = null;
+  const hasNb = d.nb !== d.cur;
+  d.cur.style.transform = '';
+  if (hasNb) d.nb.style.transform = '';
+  const dropNb = () => { if (hasNb && !d.nb.classList.contains('current')) d.nb.classList.remove('moving'); };
+  if (!animate || !d.offset) return dropNb();
+  const w = pageWidth();
+  const opts = { duration: 220, easing: SLIDE_EASE };
+  const anims = [d.cur.animate([{ transform: `translateX(${d.offset}px)` }, { transform: 'translateX(0)' }], opts)];
+  if (hasNb) anims.push(d.nb.animate([{ transform: `translateX(${d.offset + d.dir * w}px)` }, { transform: `translateX(${d.dir * w}px)` }], opts));
+  rt.slide = { anims, done: dropNb };
+  anims[0].onfinish = () => { if (rt.slide?.anims === anims) { rt.slide = null; dropNb(); } };
+}
+
+// Trackpad: horizontal wheel deltas accumulate; crossing the threshold switches once per gesture
+// (the momentum that follows is swallowed until the wheel goes quiet).
+function initSpaceSwipe() {
+  const sidebar = $('#sidebar');
+  new ResizeObserver(([e]) => { rt.pageW = e.contentRect.width; }).observe($('#space-scroller'));
+  let acc = 0, tracking = false, locked = false, idle = null;
+  const end = () => {
+    if (tracking && !locked) endDrag(true);
+    acc = 0; tracking = false; locked = false;
+  };
+  sidebar.addEventListener('wheel', (e) => {
+    if (state.spaces.length < 2 || e.ctrlKey) return;
+    const horizontal = Math.abs(e.deltaX) > Math.abs(e.deltaY) * 1.2;
+    if (!tracking && !locked && (!horizontal || Math.abs(e.deltaX) < 1)) return;
+    e.preventDefault();
+    clearTimeout(idle);
+    idle = setTimeout(end, 160);
+    if (locked) return;
+    tracking = true;
+    acc += e.deltaX;
+    if (Math.abs(acc) >= Math.min(pageWidth() * 0.3, 90)) {
+      locked = true;
+      rt.slideFrom = rt.drag?.offset || 0;
+      if (rt.drag) { const d = rt.drag; rt.drag = null; if (d.nb !== d.cur && d.dir !== Math.sign(acc)) { d.nb.classList.remove('moving'); d.nb.style.transform = ''; } }
+      stepSpace(Math.sign(acc));
+      return;
+    }
+    dragPages(-acc);
+  }, { passive: false });
 }
 
 function renderSpaceDots() {
-  $('#space-dots').innerHTML = state.spaces.map((s, i) => `
-    <button class="space-dot ${s.id === state.activeSpaceId ? 'active' : ''}" data-space="${esc(s.id)}" title="${esc(s.name)} (^${i + 1})" style="--dot:${s.color}">
+  setHtml($('#space-dots'), state.spaces.map((s, i) => `
+    <button class="space-dot ${s.id === state.activeSpaceId ? 'active' : ''}" data-space="${esc(s.id)}" title="${esc(s.name)} (${esc(keys(`^${i + 1}`))})" style="--dot:${esc(s.color)}">
       ${s.icon ? `<span class="emoji">${esc(s.icon)}</span>` : '<span class="dot"></span>'}
-    </button>`).join('');
+    </button>`).join(''));
 }
 
 function layoutViews() {
@@ -727,6 +1030,7 @@ function layoutViews() {
   const visible = split ? split.ids : activeId ? [activeId] : [];
   for (const [id, wv] of rt.views) {
     const i = visible.indexOf(id);
+    if (i < 0 && document.activeElement === wv) wv.blur();
     wv.classList.toggle('hidden', i < 0);
     wv.classList.toggle('focused', !!split && id === activeId);
     if (split && i >= 0) {
@@ -874,9 +1178,26 @@ function initSidebar() {
   initDragAndDrop();
   initSidebarResize();
 
-  // Hidden sidebar reveals on hover at the window edge, like Arc.
-  $('#edge-hotzone').addEventListener('mouseenter', () => { if (state.settings.sidebarHidden) { rt.sidebarPeek = true; document.body.classList.add('sidebar-peek'); } });
-  sidebar.addEventListener('mouseleave', () => { if (rt.sidebarPeek) { rt.sidebarPeek = false; document.body.classList.remove('sidebar-peek'); } });
+  // Hidden sidebar reveals on hover at the window edge, like Arc, and stays a moment after the pointer
+  // leaves (so a sloppy mouse doesn't close it).
+  let hideTimer = null;
+  const reveal = () => {
+    clearTimeout(hideTimer);
+    if (!state.settings.sidebarHidden || rt.sidebarPeek) return;
+    rt.sidebarPeek = true;
+    document.body.classList.add('sidebar-peek');
+  };
+  const conceal = () => {
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => {
+      if (!rt.sidebarPeek || sidebar.matches(':hover')) return;
+      rt.sidebarPeek = false;
+      document.body.classList.remove('sidebar-peek');
+    }, 350);
+  };
+  $('#edge-hotzone').addEventListener('mouseenter', reveal);
+  sidebar.addEventListener('mouseenter', () => { if (rt.sidebarPeek) clearTimeout(hideTimer); });
+  sidebar.addEventListener('mouseleave', () => { if (rt.sidebarPeek) conceal(); });
 }
 
 function moveToSpace(id, spaceId) {
@@ -1127,16 +1448,25 @@ function go(url) {
 
 function drawCommandResults() {
   const box = $('#cmd-results');
-  const { results, index } = rt.cmd;
-  box.innerHTML = results.map((r, i) => `
-    <div class="cmd-row ${i === index ? 'sel' : ''}" data-i="${i}">
+  box.innerHTML = rt.cmd.results.map((r, i) => `
+    <div class="cmd-row" data-i="${i}">
       <span class="cmd-ic">${r.favicon ? faviconImg(r.favicon, 16) : icon(r.icon, 16)}</span>
       <span class="cmd-title">${esc(r.title)}</span>
       <span class="cmd-sub">${esc(r.sub || '')}</span>
-      ${i === index && r.badge ? `<span class="cmd-badge">${esc(r.badge)} ↵</span>` : ''}
+      ${r.badge ? `<span class="cmd-badge">${esc(r.badge)} ↵</span>` : ''}
     </div>`).join('');
-  box.querySelectorAll('img[data-fallback]').forEach(bindFaviconFallback);
-  box.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+  selectCommandResult(rt.cmd.index);
+}
+
+// Moving the selection only restyles two rows; the list isn't rebuilt.
+function selectCommandResult(i, { scroll = true } = {}) {
+  const box = $('#cmd-results');
+  rt.cmd.index = i;
+  box.querySelector('.cmd-row.sel')?.classList.remove('sel');
+  const row = box.children[i];
+  if (!row) return;
+  row.classList.add('sel');
+  if (scroll) row.scrollIntoView({ block: 'nearest' });
 }
 
 function runResult(i) {
@@ -1149,15 +1479,21 @@ function initCommandBar() {
   const input = $('#cmd-input');
   input.addEventListener('input', updateCommandResults);
   input.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229) return; // IME candidate window owns these keys
     const n = rt.cmd.results.length;
-    if (e.key === 'ArrowDown' || (e.key === 'n' && e.ctrlKey)) { e.preventDefault(); rt.cmd.index = (rt.cmd.index + 1) % Math.max(n, 1); drawCommandResults(); }
-    else if (e.key === 'ArrowUp' || (e.key === 'p' && e.ctrlKey)) { e.preventDefault(); rt.cmd.index = (rt.cmd.index - 1 + n) % Math.max(n, 1); drawCommandResults(); }
+    if (e.key === 'ArrowDown' || (e.key === 'n' && e.ctrlKey)) { e.preventDefault(); if (n) selectCommandResult((rt.cmd.index + 1) % n); }
+    else if (e.key === 'ArrowUp' || (e.key === 'p' && e.ctrlKey)) { e.preventDefault(); if (n) selectCommandResult((rt.cmd.index - 1 + n) % n); }
     else if (e.key === 'Enter') { e.preventDefault(); runResult(rt.cmd.index); }
     else if (e.key === 'Escape') { e.preventDefault(); closeCommandBar(); }
   });
   $('#cmd-results').addEventListener('mousedown', (e) => {
     const row = e.target.closest('.cmd-row');
     if (row) { e.preventDefault(); runResult(Number(row.dataset.i)); }
+  });
+  // Hover selects (only on real pointer movement, so rows scrolling under a still pointer don't steal it).
+  $('#cmd-results').addEventListener('mousemove', (e) => {
+    const row = e.target.closest('.cmd-row');
+    if (row && Number(row.dataset.i) !== rt.cmd.index) selectCommandResult(Number(row.dataset.i), { scroll: false });
   });
   $('#cmdbar-overlay').addEventListener('mousedown', (e) => { if (e.target.id === 'cmdbar-overlay') closeCommandBar(); });
 }
@@ -1335,6 +1671,9 @@ async function openSettings() {
     <label class="field"><span>Search engine</span>
       <select id="set-engine">${Object.entries(SEARCH_ENGINES).map(([k, v]) => `<option value="${k}" ${k === s.searchEngine ? 'selected' : ''}>${v.name}</option>`).join('')}</select>
     </label>
+    <label class="field"><span>Unload tabs not used for</span>
+      <select id="set-unload">${UNLOAD_OPTIONS.map(([m, l]) => `<option value="${m}" ${m === s.unloadAfterMinutes ? 'selected' : ''}>${l}</option>`).join('')}</select>
+    </label>
     <label class="field"><span>Archive Today tabs after</span>
       <select id="set-archive">${ARCHIVE_OPTIONS.map(([h, l]) => `<option value="${h}" ${h === s.archiveAfterHours ? 'selected' : ''}>${l}</option>`).join('')}</select>
     </label>
@@ -1356,6 +1695,7 @@ async function openSettings() {
   `, (m, close) => {
     $('#set-engine', m).onchange = (e) => { s.searchEngine = e.target.value; save(); };
     $('#set-archive', m).onchange = (e) => { s.archiveAfterHours = Number(e.target.value); save(); };
+    $('#set-unload', m).onchange = (e) => { s.unloadAfterMinutes = Number(e.target.value); save(); };
     $('#set-adblock', m).onchange = (e) => { s.adblock = e.target.checked; api.setAdblock(s.adblock); save(); };
     $('#set-right', m).onchange = (e) => { s.sidebarRight = e.target.checked; render(); save(); };
     $('#set-default', m)?.addEventListener('click', setDefaultBrowser);
@@ -1531,6 +1871,17 @@ async function boot() {
   state.settings = { ...d.settings, ...state.settings };
   state.history ||= {}; state.archive ||= []; state.favorites ||= {}; state.profiles ||= d.profiles;
   for (const sp of state.spaces) { sp.split ||= null; sp.today ||= []; sp.pinned ||= []; }
+  // Favicons live in their own file; older state.json files have them inline (moved out on the next save).
+  const icons = state.faviconCache || {};
+  delete state.faviconCache;
+  const attach = (n) => {
+    if (n.type !== 'tab') return;
+    if (n.favicon) persist.faviconsDirty = true;
+    else if (icons[n.id]) n.favicon = icons[n.id];
+  };
+  for (const list of Object.values(state.favorites)) list.forEach(attach);
+  for (const sp of state.spaces) { walk(sp.pinned, attach); sp.today.forEach(attach); }
+  if (persist.faviconsDirty) scheduleSlowSave();
   if (!state.spaces.some((s) => s.id === state.activeSpaceId)) state.activeSpaceId = state.spaces[0].id;
 
   if (MINI) {
@@ -1541,6 +1892,7 @@ async function boot() {
 
   document.body.classList.add(IS_MAC ? 'plat-mac' : 'plat-other');
   localizeKeys();
+  initFaviconFallback();
   initSidebar();
   initCommandBar();
   initPeek();
@@ -1568,11 +1920,14 @@ async function boot() {
 
   if (MINI) return initMini();
   initAi();
+  initSpaceSwipe();
 
   const sp = space();
   if (sp.activeTabId && locate(sp.activeTabId)) activate(sp.activeTabId, { focus: true }); else render();
+  prebuildPages();
   autoArchive();
   setInterval(autoArchive, 10 * 60 * 1000);
+  setInterval(unloadIdleTabs, 60 * 1000);
   if (!state.onboarded) onboarding();
 }
 
