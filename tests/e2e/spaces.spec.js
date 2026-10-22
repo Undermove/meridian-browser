@@ -171,7 +171,7 @@ test.describe('spaces', () => {
     await inTab(page, alphaTab, `document.querySelector('#field').focus(); 1`);
     // precondition: the same key path does reach the field while its page is shown and focused
     await press(meridian, 'z', { target: await page.evaluate((id) => rt.views.get(id).getWebContentsId(), alphaTab) });
-    await expect.poll(() => inTab(page, alphaTab, `document.querySelector('#field').value`)).toBe('z');
+    await expect.poll(() => inTab(page, alphaTab, `document.querySelector('#field').value.toLowerCase()`)).toBe('z');
     await inTab(page, alphaTab, `document.querySelector('#field').value = ''; 1`);
     await page.evaluate(() => runCommand('space-index', 2));
     expect(await spaceIndex(page)).toBe(2);

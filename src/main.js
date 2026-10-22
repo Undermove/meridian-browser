@@ -652,6 +652,9 @@ app.on('web-contents-created', (_e, contents) => {
     if (settingsWindow && !settingsWindow.isDestroyed() && contents === settingsWindow.webContents) return settingsWindowInput(event, input);
     const sc = findShortcut(SHORTCUTS, input);
     if (!sc) return;
+    // Workbench integration: in its editor/terminal, keys like ⌘S/⌘F/⌘Z mean save/find/undo (the
+    // workbench decides which, by focus zone), not the browser shortcut on the same key.
+    if (workbench && isInternalContents(contents) && workbench.keyBelongsToPage(workbench.owners.get(contents.id)?.zone || 'other', input)) return;
     const win = uiWindowFor(contents);
     if (!win) return;
     event.preventDefault();

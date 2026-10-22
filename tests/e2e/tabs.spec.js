@@ -265,14 +265,24 @@ test.describe('drag and drop', () => {
   test('dragging a tab onto the (empty) favorites strip favorites it', async ({ page }) => {
     const row = page.locator('#today .row.tab').first();
     const id = await row.getAttribute('data-id');
-    const favRect = () => page.evaluate(() => { const r = document.querySelector('#favorites').getBoundingClientRect(); return { x: r.x + 30, y: r.y + r.height / 2, h: r.height }; });
-    expect((await favRect()).h).toBe(0); // no empty strip taking space when nothing is dragged
+    // the drop zone is the strip's ::before overlay (it sits over the URL bar right above the strip)
+    const zone = () => page.evaluate(() => {
+      const f = document.querySelector('#favorites');
+      const r = f.getBoundingClientRect();
+      const cs = getComputedStyle(f, '::before');
+      const h = cs.content === 'none' ? 0 : parseFloat(cs.height) || 0;
+      return { x: r.x + 30, y: r.bottom - h / 2, h, stripH: r.height };
+    });
+    expect(await zone()).toMatchObject({ h: 0, stripH: 0 }); // nothing shown, no space taken when nothing is dragged
+    const rowsBefore = await page.locator('#today .row.tab').evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().y)));
     const rb = await row.boundingBox();
     await page.mouse.move(rb.x + 20, rb.y + rb.height / 2);
     await page.mouse.down();
     await page.mouse.move(rb.x + 30, rb.y + rb.height / 2 - 10, { steps: 3 });
-    await expect.poll(async () => (await favRect()).h).toBeGreaterThanOrEqual(40);
-    const fav = await favRect();
+    await expect.poll(async () => (await zone()).h).toBeGreaterThanOrEqual(40);
+    // nothing in the sidebar moved under the pointer
+    expect(await page.locator('#today .row.tab').evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().y)))).toEqual(rowsBefore);
+    const fav = await zone();
     await page.mouse.move(fav.x, fav.y, { steps: 5 });
     await page.mouse.up();
     expect(await page.evaluate((id) => locate(id)?.zone, id)).toBe('fav');
