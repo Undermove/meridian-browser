@@ -61,6 +61,7 @@ function onWorkbenchMessage(tabId, msg) {
       entry.ready = true;
       entry.wv.send('wb:command', { ...workbenchTheme(), type: 'init', project: l.node.project || null }); // type last: workbenchTheme() has its own `type`
       for (const m of entry.queue.splice(0)) entry.wv.send('wb:command', m);
+      if (typeof mc !== 'undefined') { const c = mc.snap.counts; entry.wv.send('wb:command', { type: 'mission', working: c.working, waiting: c.waiting, live: c.live }); } // Mission Control
       return;
     }
     case 'project': {
@@ -77,6 +78,7 @@ function onWorkbenchMessage(tabId, msg) {
       toast(msg.where === 'fav' ? 'Added to Favorites' : 'Pinned to the sidebar');
       return;
     }
+    case 'mission-open': return openMissionControl(); // Mission Control chip in the workbench topbar
     case 'open-url': {
       const url = String(msg.url || '');
       if (/^https?:\/\//i.test(url)) openTab(url, { after: l.zone === 'today' ? tabId : null });

@@ -33,9 +33,11 @@ function detect(searchPath) {
 const tomlString = (s) => JSON.stringify(String(s)); // JSON string escaping is valid TOML basic-string escaping
 
 // mcp: { command, args } from main's mcpCommand(); dataDir: Meridian's userData (where the agent endpoint lives).
-// claudeSettings (Workbench Pro): extra settings for Claude Code (the secret-guard hook) — written to the
-// same private temp dir as --settings; it must never contain secret values.
-function launchSpec(kind, { searchPath, mcp, dataDir, claudeSettings = null }) {
+// claudeSettings (Workbench Pro): extra settings for Claude Code (the secret-guard hook, merged with
+// Mission Control's observer hooks) — written to the same private temp dir as --settings; it must
+// never contain secret values or tokens.
+// codexNotify (Mission Control): a `notify=[…]` config override for Codex, or null.
+function launchSpec(kind, { searchPath, mcp, dataDir, claudeSettings = null, codexNotify = null }) {
   if (kind === 'shell') {
     const sh = userShell();
     return { title: path.basename(sh).replace(/\.exe$/i, ''), file: sh, args: IS_WIN ? [] : ['-l'], cleanup: [], notes: [] };
@@ -66,6 +68,7 @@ function launchSpec(kind, { searchPath, mcp, dataDir, claudeSettings = null }) {
     fs.writeFileSync(file, JSON.stringify(claudeSettings, null, 2), { mode: 0o600 });
     args.push('--settings', file);
   }
+  if (kind === 'codex' && codexNotify) args.push('-c', codexNotify);
   if (agent.mcp && !node) notes.push('Node.js was not found on your PATH, so Meridian browser tools are not connected.');
   if (agent.mcp && node) {
     if (kind === 'claude') {

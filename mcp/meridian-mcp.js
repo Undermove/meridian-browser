@@ -25,6 +25,15 @@ function defaultDataDir() {
 const DATA_DIR = process.env.MERIDIAN_DATA_DIR || defaultDataDir();
 const ENDPOINT_FILE = path.join(DATA_DIR, 'agent-endpoint.json');
 
+// Mission Control: identify this bridge to Meridian (after token auth) so its calls show up as one
+// agent. The session hash links it to the Workbench session that started it, without revealing the token.
+const CLIENT_ID = require('crypto').randomBytes(9).toString('hex');
+const SESSION_HASH = process.env.MERIDIAN_MISSION_TOKEN ? require('crypto').createHash('sha256').update(process.env.MERIDIAN_MISSION_TOKEN).digest('hex').slice(0, 32) : null;
+function clientHeaders() {
+  const name = String(server.getClientVersion?.()?.name || '').replace(/[^\w .@/()+-]/g, '').slice(0, 60);
+  return { 'x-meridian-client': CLIENT_ID, ...(name ? { 'x-meridian-client-name': name } : {}), ...(SESSION_HASH ? { 'x-meridian-session': SESSION_HASH } : {}) };
+}
+
 const NOT_RUNNING = 'Meridian is not running, or AI agent access is off. Open Meridian → Settings → AI and choose an access level.';
 
 function request(route, body) {
@@ -42,7 +51,7 @@ function request(route, body) {
   return new Promise((resolve, reject) => {
     const req = http.request({
       socketPath: socket, path: route, method: 'POST',
-      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload), authorization: `Bearer ${token}` },
+      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload), authorization: `Bearer ${token}`, ...clientHeaders() },
       timeout: 120_000,
     }, (res) => {
       const chunks = [];

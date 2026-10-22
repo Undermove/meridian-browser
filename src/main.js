@@ -14,7 +14,9 @@ const { validatePatch } = require('./settings-schema');
 const { detectClis, connectCli } = require('./mcp-connect');
 const { importFromArc, arcDataExists } = require('./importers/arc');
 const { AgentHub } = require('./agent/hub');
-const { Assistant } = require('./ai/assistant');
+const { Assistant, describeError: describeAiError } = require('./ai/assistant');
+const { MissionControl } = require('./agents/mission'); // Mission Control
+const { tidyToday, LinkPreviews } = require('./ai/features');
 const { Workbench, isInternalContents, isWorkbenchResource } = require('./dev'); // Workbench (mini IDE), see src/dev/index.js
 
 const APP_NAME = 'Meridian';
@@ -799,6 +801,32 @@ on('ai:chat', (e, req) => { assistant.chat(e.sender, req || {}); });
 on('ai:stop', (_e, sessionId) => assistant.stop(sessionId));
 on('ai:reset', (_e, sessionId) => assistant.reset(sessionId));
 
+// ---------- Mission Control + Arc Max-style AI features (src/agents/mission.js, src/ai/features.js) ----------
+
+let mission = null;
+let linkPreviews = null;
+const isMainUiContents = (wc) => !!mainWindow && !mainWindow.isDestroyed() && wc === mainWindow.webContents;
+function setupMission() {
+  mission = new MissionControl({
+    app, getMainWindow: () => mainWindow, getSettings: () => uiSnapshot?.settings || {},
+    secretValues: (node) => workbench?.secretValuesFor?.(node.ownerWcId) || [],
+  });
+  mission.registerIpc(handleMain);
+  linkPreviews = new LinkPreviews({ assistant, getSettings: () => uiSnapshot?.settings || {}, isMainUi: isMainUiContents, isPrivatePartition: () => false, isInternal: isInternalContents });
+  app.on('web-contents-created', (_e, contents) => { if (contents.getType() === 'webview' && !isInternalContents(contents)) linkPreviews.attach(contents); });
+  if (DEV) global.__meridianMission = mission; // dev/test harness only
+}
+// Tidy Today: a proposal only; the UI shows it as a diff and applies what the user accepts.
+handleMain('ai:tidy', async (_e, tabs) => {
+  if (uiSnapshot?.settings?.aiTidy === false) return { error: 'Tidy Today is turned off in Settings → AI.' };
+  try { return await tidyToday(assistant, Array.isArray(tabs) ? tabs.slice(0, 80).map((t) => ({ id: str(t?.id, 64), title: str(t?.title, 300), url: str(t?.url, 2000) })) : []); }
+  catch (err) { return { error: describeAiError(err) }; }
+});
+handleMain('ai:link-preview-test', async (_e, url) => { // dev/test only: same path as Shift-hover, without input events
+  if (!DEV || !/^https?:\/\//i.test(String(url)) || !linkPreviews.enabled()) return null;
+  try { return await linkPreviews.summary(String(url).slice(0, 4000), session.fromPartition('persist:profile-default')); } catch (err) { return { error: describeAiError(err) }; }
+});
+
 // ---------- Arc import ----------
 
 handle('import:arc-available', () => arcDataExists());
@@ -1266,6 +1294,7 @@ function buildMenu() {
         sc('Toggle Sidebar', 'toggle-sidebar'),
         sc('Ask AI', 'ai-panel'),
         sc('Workbench', 'open-workbench'), // Workbench integration
+        sc('Mission Control', 'mission-control'), // Mission Control
         sc('Downloads', 'downloads'),
         { type: 'separator' },
         sc('Split View', 'split'),
@@ -1404,9 +1433,12 @@ app.whenReady().then(() => {
     website: REPO_URL, iconPath: path.join(__dirname, '..', 'build', 'icon-1024.png'),
   });
   hub = new AgentHub({ getWindow: () => mainWindow, userDataDir: app.getPath('userData'), isProtected: isInternalContents });
-  // Workbench integration: IPC for the internal workbench page (files, terminals, agents).
-  workbench = new Workbench({ app, getMainWindow: () => mainWindow, isUiContents, mcpCommand, agentStatus: () => hub.status() });
   assistant = new Assistant({ userDataDir: app.getPath('userData'), hub });
+  setupMission(); // Mission Control
+  hub.observer = mission;
+  assistant.observer = mission;
+  // Workbench integration: IPC for the internal workbench page (files, terminals, agents).
+  workbench = new Workbench({ app, getMainWindow: () => mainWindow, isUiContents, mcpCommand, agentStatus: () => hub.status(), mission });
   if (saved?.settings) hub.setConfig({ access: saved.settings.agentAccess || 'off', allowJs: !!saved.settings.agentAllowJs });
   registerUiProtocol();
   buildMenu();
@@ -1419,7 +1451,7 @@ app.whenReady().then(() => {
   app.on('activate', () => { if (!mainWindow) createMainWindow(); });
 });
 
-app.on('will-quit', () => { hub?.stopServer(); workbench?.dispose(); });
+app.on('will-quit', () => { hub?.stopServer(); workbench?.dispose(); mission?.dispose(); });
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();

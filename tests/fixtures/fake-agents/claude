@@ -1,0 +1,36 @@
+#!/usr/bin/env node
+// Fake `claude` for the Mission Control e2e test (no API calls, no money spent).
+// Reads the per-session --settings file Meridian generated and fires its hook commands with
+// recorded/synthetic Claude Code hook payloads, following the script in $FAKE_AGENT_SCRIPT.
+'use strict';
+const fs = require('fs');
+const { spawnSync } = require('child_process');
+
+const args = process.argv.slice(2);
+const i = args.indexOf('--settings');
+const settings = i >= 0 ? JSON.parse(fs.readFileSync(args[i + 1], 'utf8')) : {};
+const hooks = settings.hooks || {};
+const guard = (hooks.PreToolUse || []).some((g) => (g.hooks || []).some((h) => /secret-guard-hook/.test(h.command)));
+const mission = (hooks.PreToolUse || []).some((g) => (g.hooks || []).some((h) => /mission-hook/.test(h.command) && h.async === true));
+console.log(`fake-claude: hooks=${Object.keys(hooks).sort().join(',')} guard=${guard} mission=${mission} mcp=${args.includes('--mcp-config')}`);
+
+const script = JSON.parse(fs.readFileSync(process.env.FAKE_AGENT_SCRIPT, 'utf8')).claude || [];
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const matches = (matcher, tool) => !matcher || matcher === '*' || (tool && new RegExp(`^(?:${matcher})$`).test(tool));
+
+for (const step of script) {
+  if (step.sleep) sleep(step.sleep);
+  if (step.waitFile) { while (!fs.existsSync(step.waitFile)) sleep(100); }
+  if (step.exit !== undefined) { console.log('fake-claude: bye'); process.exit(step.exit); }
+  if (!step.event) continue;
+  const payload = { session_id: 'sess-fake-1', transcript_path: '', cwd: process.cwd(), permission_mode: 'default', hook_event_name: step.event, ...(step.payload || {}) };
+  for (const group of hooks[step.event] || []) {
+    if (!matches(group.matcher, payload.tool_name)) continue;
+    for (const h of group.hooks || []) {
+      if (h.type !== 'command') continue;
+      const r = spawnSync(h.command, { shell: true, input: JSON.stringify(payload), encoding: 'utf8', timeout: (h.timeout || 60) * 1000, env: process.env });
+      if (r.stdout && r.stdout.trim()) console.log(`fake-claude: hook said ${r.stdout.trim().slice(0, 200)}`);
+    }
+  }
+}
+setInterval(() => {}, 1000);

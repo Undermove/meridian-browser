@@ -20,6 +20,11 @@ function makeSchema(shortcutIds) {
     appearance: oneOf('system', 'light', 'dark'),
     agentAccess: oneOf('off', 'read', 'ask', 'full'),
     agentAllowJs: bool,
+    // Mission Control + Arc Max-style AI features (Settings → AI)
+    missionNotify: bool,
+    aiTidy: bool,
+    aiAskFromBar: bool,
+    aiLinkPreview: bool,
     // Only folders that really are unpacked extensions.
     extensions: (v) => {
       if (!Array.isArray(v) || v.length > 50) return undefined;
