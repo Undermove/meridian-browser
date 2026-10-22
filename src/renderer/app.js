@@ -216,6 +216,7 @@ const titleOf = (t) => t.customTitle || t.title || hostOf(t.url) || 'New Tab';
 function ensureView(tab, sp = space()) {
   let wv = rt.views.get(tab.id);
   if (wv) return wv;
+  if (isWorkbenchTab(tab)) return ensureWorkbenchView(tab, sp); // Workbench integration (dev/workbench-tab.js)
   wv = document.createElement('webview');
   wv.setAttribute('partition', partitionFor(sp.profileId));
   wv.setAttribute('allowpopups', '');
@@ -325,7 +326,7 @@ function openTab(url, { background = false, after = null } = {}) {
 
 function navigateActive(url) {
   const tab = activeTab();
-  if (!tab) return openTab(url);
+  if (!tab || isWorkbenchTab(tab)) return openTab(url); // Workbench integration: never load web pages into it
   const wv = ensureView(tab);
   wv.loadURL(url).catch(() => {});
   activate(tab.id);
@@ -387,7 +388,7 @@ function autoArchive() {
   let changed = false;
   for (const sp of state.spaces) {
     sp.today = sp.today.filter((t) => {
-      const keep = t.id === sp.activeTabId || (sp.split?.ids.includes(t.id)) || (t.lastActive || now()) > cutoff;
+      const keep = t.id === sp.activeTabId || (sp.split?.ids.includes(t.id)) || (t.lastActive || now()) > cutoff || isWorkbenchTab(t);
       if (!keep) { archiveTab(t, sp); destroyView(t.id); changed = true; }
       return keep;
     });
@@ -761,6 +762,7 @@ function favEl(t, sp) {
 }
 
 function faviconImg(t, size = 16) {
+  if (isWorkbenchTab(t)) return `<span class="favicon workbench-ic" style="width:${size}px;height:${size}px;color:var(--space)">${icon('code', size)}</span>`; // Workbench integration
   const src = faviconFor(t);
   const letter = esc((hostOf(t.url)[0] || '•').toUpperCase());
   return `<span class="favicon" style="width:${size}px;height:${size}px">${src ? `<img src="${esc(src)}" width="${size}" height="${size}" data-fallback="${letter}">` : `<span class="letter">${letter}</span>`}</span>`;
@@ -1134,7 +1136,8 @@ function initSidebar() {
     const row = e.target.closest('.row.tab, .fav, .row.folder');
     e.preventDefault();
     if (!row) {
-      const choice = await api.popupMenu([{ id: 'folder', label: 'New Folder' }, { id: 'tab', label: 'New Tab' }, { id: 'space', label: 'New Space…' }]);
+      const choice = await api.popupMenu([{ id: 'folder', label: 'New Folder' }, { id: 'tab', label: 'New Tab' }, { id: 'space', label: 'New Space…' }, { type: 'separator' }, { id: 'workbench', label: 'Open Project in Workbench…' }]);
+      if (choice === 'workbench') openWorkbench({ pickProject: true }); // Workbench integration
       if (choice === 'folder') newFolder();
       if (choice === 'tab') openCommandBar('new');
       if (choice === 'space') createSpace();
@@ -1326,6 +1329,9 @@ const COMMANDS = [
   { id: 'ai-panel', label: 'Ask AI about This Page', icon: 'bolt' },
   { id: 'ai-summarize', label: 'Summarize Page with AI', icon: 'bolt' },
   { id: 'sidebar-side', label: 'Move Sidebar to Other Side', icon: 'sidebar' },
+  // Workbench integration
+  { id: 'open-workbench', label: 'Open Workbench', icon: 'code' },
+  { id: 'open-project', label: 'Open Project in Workbench…', icon: 'code' },
 ];
 
 function openCommandBar(mode = 'new') {
@@ -1817,6 +1823,8 @@ function runCommand(name, ...args) {
     case 'devtools': { if (wv) api.openDevTools(wv.getWebContentsId()); return; }
     case 'open-url-tab': return openTab(args[0]);
     case 'ai-panel': return MINI ? null : toggleAiPanel();
+    case 'open-workbench': return MINI ? null : openWorkbench(); // Workbench integration
+    case 'open-project': return MINI ? null : openWorkbench({ pickProject: true });
     case 'ai-summarize': toggleAiPanel(true); return setTimeout(() => sendAi('Summarize this page.', { allowTools: false }), 100);
   }
 }

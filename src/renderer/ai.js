@@ -14,6 +14,9 @@ const AGENT_ACCESS = [
 
 // ---------------------------------------------------------------- 1. agent RPC
 
+// Workbench tabs (terminals, local files) are invisible and untouchable for agents.
+const agentVisible = (t) => !isWorkbenchTab(t);
+
 function tabInfo(t, sp, zone, folder) {
   return {
     id: t.id, title: titleOf(t), url: tabUrl(t), zone: zone === 'fav' ? 'favorite' : zone,
@@ -24,21 +27,22 @@ function tabInfo(t, sp, zone, folder) {
 }
 
 function allTabs(sp) {
-  const out = (state.favorites[sp.profileId] || []).map((t) => tabInfo(t, sp, 'fav'));
+  const out = (state.favorites[sp.profileId] || []).filter(agentVisible).map((t) => tabInfo(t, sp, 'fav'));
   const visit = (nodes, trail) => {
     for (const n of nodes) {
-      if (n.type === 'tab') out.push(tabInfo(n, sp, 'pinned', trail.join(' / ') || undefined));
+      if (n.type === 'tab') { if (agentVisible(n)) out.push(tabInfo(n, sp, 'pinned', trail.join(' / ') || undefined)); }
       else visit(n.children, [...trail, n.title]);
     }
   };
   visit(sp.pinned, []);
-  for (const t of sp.today) out.push(tabInfo(t, sp, 'today'));
+  for (const t of sp.today) if (agentVisible(t)) out.push(tabInfo(t, sp, 'today'));
   return out;
 }
 
 function mustLocate(tabId) {
   const l = tabId ? locateAnywhere(tabId) : (space().activeTabId ? locate(space().activeTabId) : null);
   if (!l) throw new Error(tabId ? `no tab with id ${tabId}` : 'no active tab — pass tab_id or open_tab first');
+  if (!agentVisible(l.node)) throw new Error(tabId ? `no tab with id ${tabId}` : 'the active tab is not available to agents — pass tab_id');
   return l;
 }
 

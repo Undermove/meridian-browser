@@ -26,6 +26,7 @@ function shortcutTable(isMac = IS_MAC) {
     { id: 'find-prev', accel: 'CmdOrCtrl+Shift+G', cmd: ['find-prev'], repeat: true },
     { id: 'toggle-sidebar', accel: 'CmdOrCtrl+S', cmd: ['toggle-sidebar'] },
     { id: 'ai-panel', accel: 'CmdOrCtrl+J', cmd: ['ai-panel'] },
+    { id: 'open-workbench', accel: 'CmdOrCtrl+Shift+E', cmd: ['open-workbench'] },
     { id: 'split', accel: 'Ctrl+Shift+=', cmd: ['split'] },
     { id: 'unsplit', accel: 'Ctrl+Shift+-', cmd: ['unsplit'] },
     { id: 'reload', accel: 'CmdOrCtrl+R', cmd: ['reload'] },
