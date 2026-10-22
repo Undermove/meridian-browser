@@ -11,6 +11,7 @@ const { pathToFileURL } = require('url');
 const { importFromArc, arcDataExists } = require('./importers/arc');
 const { AgentHub } = require('./agent/hub');
 const { Assistant } = require('./ai/assistant');
+const { Workbench, isInternalContents, isWorkbenchResource } = require('./dev'); // Workbench (mini IDE), see src/dev/index.js
 
 const APP_NAME = 'Meridian';
 app.setName(APP_NAME);
@@ -74,6 +75,11 @@ const on = (channel, fn) => ipcMain.on(channel, (e, ...args) => {
   if (!fromUi(e)) { e.returnValue = null; return; }
   return fn(e, ...args);
 });
+// Workbench integration: is this webContents Meridian's own UI window?
+const isUiContents = (wc) => {
+  const url = wc && !wc.isDestroyed() ? wc.getURL() : '';
+  return (url === UI_URL || url.startsWith(UI_URL + '?') || url.startsWith(UI_URL + '#')) && wc.getType() === 'window';
+};
 
 // ---------- state persistence ----------
 
@@ -343,6 +349,8 @@ async function maybeOpenExternal(url, contents) {
 // Force safe settings on every <webview> no matter what the embedder asked for.
 app.on('web-contents-created', (_e, contents) => {
   contents.on('will-attach-webview', (event, webPreferences, params) => {
+    // Workbench integration: the internal workbench page gets its own preload/partition; refuses misuse.
+    if (workbench && workbench.attachPolicy(contents, event, webPreferences, params)) return;
     delete webPreferences.preload;
     webPreferences.nodeIntegration = false;
     webPreferences.nodeIntegrationInSubFrames = false;
@@ -359,10 +367,12 @@ app.on('web-contents-created', (_e, contents) => {
 
 app.on('web-contents-created', (_e, contents) => {
   if (contents.getType() !== 'webview') return;
+  if (isInternalContents(contents)) return workbench?.wireInternal(contents); // Workbench integration
   prepareSession(contents.session);
 
   // Page-initiated navigation: web pages can't jump to file:// or other privileged schemes.
   const guardNavigation = (event, url) => {
+    if (isWorkbenchResource(url)) return event.preventDefault(); // Workbench integration: never from web pages
     const scheme = schemeOf(url);
     if (WEB_SCHEMES.has(scheme)) return;
     if (scheme === 'file:' && schemeOf(contents.getURL()) === 'file:') return;
@@ -499,7 +509,7 @@ handle('favicon:fetch', async (_e, url, partition) => {
 // Current page text for the ⌘J panel, read in an isolated world so the page can't spoof it.
 handle('ai:page-text', async (e, wcId) => {
   const wc = webContents.fromId(Number(wcId));
-  if (!wc || wc.isDestroyed() || wc.getType() !== 'webview' || wc.hostWebContents?.id !== e.sender.id) return null;
+  if (!wc || wc.isDestroyed() || wc.getType() !== 'webview' || wc.hostWebContents?.id !== e.sender.id || isInternalContents(wc)) return null;
   try { return await hub.pageTextFor(wc); } catch { return null; }
 });
 handle('devtools:open', (_e, id) => { const wc = webContents.fromId(id); if (wc) wc.openDevTools({ mode: 'detach' }); });
@@ -508,6 +518,7 @@ handle('devtools:open', (_e, id) => { const wc = webContents.fromId(id); if (wc)
 
 let hub = null;
 let assistant = null;
+let workbench = null;
 
 function mcpCommand() {
   const script = app.isPackaged
@@ -701,6 +712,7 @@ function buildMenu() {
       submenu: [
         { label: 'Toggle Sidebar', accelerator: 'CmdOrCtrl+S', click: cmd('toggle-sidebar') },
         { label: 'Ask AI about Page', accelerator: 'CmdOrCtrl+J', click: cmd('ai-panel') },
+        { label: 'Workbench', accelerator: 'CmdOrCtrl+Shift+E', click: cmd('open-workbench') }, // Workbench integration
         { label: 'Split View', accelerator: 'Ctrl+Shift+=', click: cmd('split') },
         { label: 'Close Split View', accelerator: 'Ctrl+Shift+-', click: cmd('unsplit') },
         { type: 'separator' },
@@ -763,7 +775,9 @@ app.whenReady().then(() => {
     adblockEnabled = saved.settings.adblock !== false;
     loadedExtensionPaths = saved.settings.extensions || [];
   }
-  hub = new AgentHub({ getWindow: () => mainWindow, userDataDir: app.getPath('userData') });
+  hub = new AgentHub({ getWindow: () => mainWindow, userDataDir: app.getPath('userData'), isProtected: isInternalContents });
+  // Workbench integration: IPC for the internal workbench page (files, terminals, agents).
+  workbench = new Workbench({ app, getMainWindow: () => mainWindow, isUiContents, mcpCommand, agentStatus: () => hub.status() });
   assistant = new Assistant({ userDataDir: app.getPath('userData'), hub });
   if (saved?.settings) hub.setConfig({ access: saved.settings.agentAccess || 'off', allowJs: !!saved.settings.agentAllowJs });
   buildMenu();
@@ -776,7 +790,7 @@ app.whenReady().then(() => {
   app.on('activate', () => { if (!mainWindow) createMainWindow(); });
 });
 
-app.on('will-quit', () => { hub?.stopServer(); });
+app.on('will-quit', () => { hub?.stopServer(); workbench?.dispose(); });
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();

@@ -143,8 +143,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const hostOf = (u) => { try { return new URL(u).host; } catch { return u || ''; } };
 
 class AgentHub {
-  constructor({ getWindow, userDataDir }) {
+  constructor({ getWindow, userDataDir, isProtected }) {
     this.getWindow = getWindow;
+    // webContents agents must never drive (the internal Workbench page: it has terminals).
+    this.isProtected = isProtected || (() => false);
     this.dir = userDataDir;
     // Unix socket paths are limited to ~104 bytes on macOS; fall back to the per-user temp dir if needed.
     this.socketPath = null; // chosen fresh on every start (see newSocketPath)
@@ -232,6 +234,7 @@ class AgentHub {
     const info = await this.rpc('resolve', { tab_id: tab_id || this.currentTab });
     const wc = webContents.fromId(info.wcId);
     if (!wc || wc.isDestroyed()) throw new Error('tab is not available');
+    if (wc.getType() !== 'webview' || this.isProtected(wc)) throw new Error('this tab is not available to agents');
     this.currentTab = info.tabId;
     await this.waitForLoad(wc, 15_000);
     this.activity({ tabId: info.tabId, tool: ctx.tool, source: ctx.source, host: hostOf(wc.getURL()) });
