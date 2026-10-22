@@ -29,7 +29,7 @@ test.describe('command bar', () => {
     await expect(page.locator('#cmd-input')).toHaveValue(server.url('/p/x'));
   });
 
-  test('edit mode (runCommand) is prefilled and selected; Enter on the same URL reloads', async ({ page, server }) => {
+  test('edit mode (runCommand) is prefilled and selected; Enter on the same URL reloads', async ({ meridian, page, server }) => {
     const id = await openTabDirect(page, server.url('/p/x'));
     await page.evaluate(() => runCommand('edit-url'));
     await expect(page.locator('#cmd-input')).toHaveValue(server.url('/p/x'));
@@ -38,7 +38,8 @@ test.describe('command bar', () => {
     expect(selected[1]).toBe(selected[2]);
     await expect(page.locator('#cmd-results .cmd-row.sel .cmd-title')).toHaveText('Reload page');
     await page.evaluate((id) => { window.__loads = 0; rt.views.get(id).addEventListener('did-start-loading', () => window.__loads++); }, id);
-    await page.keyboard.press('Enter');
+    // not page.keyboard: Playwright's CDP keyUp then lands in the reloading guest and is never acked (harness artifact)
+    await press(meridian, 'Enter');
     await expect.poll(() => page.evaluate(() => window.__loads)).toBeGreaterThan(0);
     expect((await snapshot(page)).todayCount).toBe(1); // no new tab
   });

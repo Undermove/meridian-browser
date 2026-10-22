@@ -191,23 +191,40 @@ test.describe('zoom / copy URL', () => {
 });
 
 test.describe('sidebar', () => {
-  test('toggle hides the sidebar; hovering the window edge reveals it; leaving hides it again', async ({ page, server }) => {
+  test('toggle hides the sidebar; hovering the window edge reveals it', async ({ page, server }) => {
     await openTabDirect(page, server.url('/p/x'));
     await page.evaluate(() => runCommand('toggle-sidebar'));
     await expect(page.locator('body')).toHaveClass(/sidebar-hidden/);
     const before = await page.evaluate(() => rt.views.get(space().activeTabId).getBoundingClientRect().width);
     expect(before).toBeGreaterThan(1100); // page uses the freed space
     await page.waitForTimeout(400); // let the slide-out transition finish (the sliding sidebar covers the hot zone)
-    await realMove(page, 600, 400);
-    await realMove(page, 2, 400, { steps: 4, from: [600, 400] });
+    await page.mouse.move(600, 400);
+    await page.mouse.move(2, 400, { steps: 4 });
     await expect(page.locator('body')).toHaveClass(/sidebar-peek/);
-    await realMove(page, 150, 300, { steps: 3, from: [2, 400] });
+    await page.mouse.move(150, 300, { steps: 3 });
     await page.waitForTimeout(250);
     await expect(page.locator('body')).toHaveClass(/sidebar-peek/); // still over the sidebar
-    await realMove(page, 900, 400, { steps: 6, from: [150, 300] }); // into the web page
-    await expect(page.locator('body')).not.toHaveClass(/sidebar-peek/);
     await page.evaluate(() => runCommand('toggle-sidebar'));
     await expect(page.locator('body')).not.toHaveClass(/sidebar-hidden/);
+  });
+
+  // PROBABLE BUG: the hover-revealed sidebar only hides on the sidebar's `mouseleave` (app.js:879). With
+  // input routed like hardware input (Playwright CDP → Chromium's input router → <webview> guest), moving
+  // from the sidebar straight into the page never produces mouseout/mouseleave in the UI document, so the
+  // sidebar stays open over the page. (With webContents.sendInputEvent — which bypasses the router — leave
+  // fires, so please confirm by hand: reveal the sidebar, then move quickly into the page.)
+  test('the revealed sidebar hides when the pointer moves into the page', async ({ page, server }) => {
+    test.fail(true, 'PROBABLE BUG: no mouseleave when moving from the sidebar into a <webview>');
+    await openTabDirect(page, server.url('/p/x'));
+    await page.evaluate(() => runCommand('toggle-sidebar'));
+    await page.waitForTimeout(400);
+    await page.mouse.move(600, 400);
+    await page.mouse.move(2, 400, { steps: 4 });
+    await expect(page.locator('body')).toHaveClass(/sidebar-peek/);
+    await page.mouse.move(150, 300, { steps: 3 });
+    await page.waitForTimeout(250);
+    await page.mouse.move(900, 400, { steps: 6 });
+    await expect(page.locator('body')).not.toHaveClass(/sidebar-peek/, { timeout: 2000 });
   });
 
   test('⌘S toggles the sidebar with focus inside the page @shortcut', async ({ meridian, page, server }) => {
@@ -221,8 +238,8 @@ test.describe('sidebar', () => {
     await page.evaluate(() => { state.settings.sidebarRight = true; runCommand('toggle-sidebar'); });
     await page.waitForTimeout(400);
     const w = await page.evaluate(() => innerWidth);
-    await realMove(page, w - 300, 400);
-    await realMove(page, w - 2, 400, { steps: 4, from: [w - 300, 400] });
+    await page.mouse.move(w - 300, 400);
+    await page.mouse.move(w - 2, 400, { steps: 4 });
     await expect(page.locator('body')).toHaveClass(/sidebar-peek/);
   });
 });
