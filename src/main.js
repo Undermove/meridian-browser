@@ -7,7 +7,11 @@ const { app, BrowserWindow, Menu, ipcMain, session, shell, dialog, clipboard, na
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { shortcutTable, findShortcut } = require('./shortcuts');
+const crypto = require('crypto');
+const { shortcutTable, findShortcut, acceleratorFromInput, formatAccelerator } = require('./shortcuts');
+const { routeLink, sanitizeAtc } = require('./atc');
+const { validatePatch } = require('./settings-schema');
+const { detectClis, connectCli } = require('./mcp-connect');
 const { importFromArc, arcDataExists } = require('./importers/arc');
 const { AgentHub } = require('./agent/hub');
 const { Assistant } = require('./ai/assistant');
@@ -34,7 +38,10 @@ app.userAgentFallback = CHROME_UA;
 
 let mainWindow = null;
 const miniWindows = new Set();
+const privateWindows = new Map(); // BrowserWindow -> in-memory partition name
+let settingsWindow = null;
 let pendingUrls = []; // URLs that arrived before the app was ready
+const REPO_URL = 'https://github.com/meridian-browser/meridian'; // placeholder until the public repo exists
 
 // ---------- single instance + default-browser plumbing ----------
 
@@ -54,9 +61,17 @@ app.on('open-url', (event, url) => {
   else pendingUrls.push(url);
 });
 
-// Links clicked in other apps open in a small "Little" window, like Little Arc.
+// Links clicked in other apps go where Air Traffic Control says (Settings → Links): the Little window
+// (like Little Arc) by default, or a tab in a chosen space.
 function openExternalUrl(url) {
-  createMiniWindow(url);
+  if (!/^https?:\/\//i.test(String(url))) return;
+  const settings = uiSnapshot?.settings || {};
+  const spaceIds = (uiSnapshot?.spaces || []).map((s) => s.id);
+  const route = routeLink(settings.atc, url, spaceIds);
+  if (route.target === 'little') return createMiniWindow(url);
+  deliverToMain(route.target === 'space' ? 'open-url-in-space' : 'open-url-tab', ...(route.target === 'space' ? [route.spaceId, url] : [url]));
+  const win = mainWindow;
+  if (win) { win.show(); win.focus(); }
 }
 
 // ---------- the UI page: served from meridian://app/ (only files under src/renderer) ----------
@@ -129,6 +144,31 @@ const on = (channel, fn) => ipcMain.on(channel, (e, ...args) => {
   if (!fromUi(e)) { e.returnValue = null; return; }
   return fn(e, ...args);
 });
+// Only the main window's UI may write state.json or describe it (private and Little windows never persist).
+const fromMainUi = (e) => fromUi(e) && !!mainWindow && !mainWindow.isDestroyed() && e.sender === mainWindow.webContents;
+const handleMain = (channel, fn) => ipcMain.handle(channel, (e, ...args) => {
+  if (!fromMainUi(e)) throw new Error('forbidden');
+  return fn(e, ...args);
+});
+const onMain = (channel, fn) => ipcMain.on(channel, (e, ...args) => {
+  if (!fromMainUi(e)) { e.returnValue = null; return; }
+  return fn(e, ...args);
+});
+
+// The Settings window is its own page (meridian://app/settings.html) with its own preload, and talks
+// only to settings:* channels. Same checks as fromUi, plus it must be *the* settings window.
+const SETTINGS_URL = `${UI_ORIGIN}/settings.html`;
+const isSettingsUrl = (url) => url === SETTINGS_URL || url.startsWith(SETTINGS_URL + '?') || url.startsWith(SETTINGS_URL + '#');
+const fromSettings = (e) => {
+  const frame = e.senderFrame;
+  return !!frame && !frame.parent && isSettingsUrl(frame.url || '') && e.sender.getType() === 'window'
+    && !!settingsWindow && !settingsWindow.isDestroyed() && e.sender === settingsWindow.webContents;
+};
+const handleSettings = (channel, fn) => ipcMain.handle(channel, (e, ...args) => {
+  if (!fromSettings(e)) throw new Error('forbidden');
+  return fn(e, ...args);
+});
+
 // Workbench integration: is this webContents Meridian's own UI window?
 const isUiContents = (wc) => {
   const url = wc && !wc.isDestroyed() ? wc.getURL() : '';
@@ -197,8 +237,8 @@ function saveStatePartsSync(arg) {
 }
 
 handle('state:load', () => loadState());
-handle('state:save', (_e, parts) => saveStateParts(parts));
-on('state:save-sync', (e, parts) => { try { saveStatePartsSync(parts); } catch {} e.returnValue = true; });
+handleMain('state:save', (_e, parts) => saveStateParts(parts));
+onMain('state:save-sync', (e, parts) => { try { saveStatePartsSync(parts); } catch {} e.returnValue = true; });
 
 // ---------- sessions (one per profile) ----------
 
@@ -281,8 +321,10 @@ handle('extensions:set', async (_e, paths) => {
   return true;
 });
 
-handle('extensions:pick', async () => {
-  const res = await dialog.showOpenDialog(mainWindow, {
+handle('extensions:pick', () => pickExtensionDir(mainWindow));
+
+async function pickExtensionDir(parent) {
+  const res = await dialog.showOpenDialog(parent, {
     title: 'Choose an unpacked extension folder (with manifest.json)',
     properties: ['openDirectory'],
   });
@@ -293,7 +335,7 @@ handle('extensions:pick', async () => {
     return null;
   }
   return dir;
-});
+}
 
 // ---------- permissions ----------
 
@@ -413,7 +455,9 @@ function handleDownload(_event, item, wc) {
     });
   }
   const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-  const send = (extra) => mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents.send('download', {
+  // Progress goes to the window the download came from (a private window keeps its own list).
+  const owner = (wc && !wc.isDestroyed() && uiWindowFor(wc)) || mainWindow;
+  const send = (extra) => owner && !owner.isDestroyed() && owner.webContents.send('download', {
     id, name: path.basename(target), path: target,
     received: item.getReceivedBytes(), total: item.getTotalBytes(), ...extra,
   });
@@ -464,7 +508,9 @@ app.on('web-contents-created', (_e, contents) => {
     webPreferences.experimentalFeatures = false;
     const scheme = schemeOf(params.src);
     if (params.src && !WEB_SCHEMES.has(scheme) && scheme !== 'file:') event.preventDefault();
-    if (!String(params.partition || '').startsWith('persist:profile-')) event.preventDefault();
+    // Profiles, or the in-memory partition main gave to this private window (and only that window).
+    const partition = String(params.partition || '');
+    if (!partition.startsWith('persist:profile-') && !(partition && partition === privatePartitionOf(contents))) event.preventDefault();
   });
 });
 
@@ -508,11 +554,13 @@ app.on('web-contents-created', (_e, contents) => {
     return { action: 'deny' };
   });
 
-  // Popup windows opened by pages get the same navigation rules.
+  // Popup windows opened by pages get the same navigation rules. Their links open in the window the
+  // page lives in (so a private window's popups never land in the normal profile).
   contents.on('did-create-window', (win) => {
     win.webContents.on('will-navigate', (event, url) => { if (!WEB_SCHEMES.has(schemeOf(url))) event.preventDefault(); });
     win.webContents.setWindowOpenHandler(({ url }) => {
-      if (/^https?:/i.test(url) && mainWindow) mainWindow.webContents.send('command', 'open-url-tab', url);
+      const owner = uiWindowFor(contents) || mainWindow;
+      if (/^https?:/i.test(url) && owner && !owner.isDestroyed()) owner.webContents.send('command', 'open-url-tab', url);
       return { action: 'deny' };
     });
   });
@@ -528,7 +576,9 @@ app.on('web-contents-created', (_e, contents) => {
 // Matched before the page sees the key, on the UI windows and on every guest page. preventDefault()
 // also stops the menu accelerator, so a shortcut fires exactly once.
 
-const SHORTCUTS = shortcutTable();
+// Rebuilt when Settings → Shortcuts remaps a key (applyShortcutOverrides); the menu follows.
+let SHORTCUTS = shortcutTable();
+let shortcutOverridesSig = '{}';
 
 // The UI window a webContents belongs to (pages in <webview>s report to their embedder), or null for
 // page-opened popups and devtools, which keep plain menu behaviour.
@@ -536,13 +586,17 @@ function uiWindowFor(contents) {
   const owner = contents.getType() === 'webview' ? contents.hostWebContents : contents;
   if (!owner || owner.isDestroyed()) return null;
   const win = BrowserWindow.fromWebContents(owner);
-  return win && (win === mainWindow || miniWindows.has(win)) && owner === win.webContents ? win : null;
+  return win && isUiWindow(win) && owner === win.webContents ? win : null;
 }
+const isUiWindow = (win) => !!win && (win === mainWindow || miniWindows.has(win) || privateWindows.has(win));
 
 function runShortcut(sc, win) {
   if (sc.run === 'mini-window') return createMiniWindow('');
   if (sc.run === 'new-window') { if (!mainWindow) createMainWindow(); else mainWindow.focus(); return; }
-  if (sc.run === 'ui-devtools') return win?.webContents.openDevTools({ mode: 'detach' });
+  if (sc.run === 'private-window') return createPrivateWindow();
+  if (sc.run === 'settings') return openSettingsWindow();
+  if (sc.run === 'shortcuts-help') return openSettingsWindow('shortcuts');
+  if (sc.run === 'ui-devtools') return (win || BrowserWindow.getFocusedWindow())?.webContents.openDevTools({ mode: 'detach' });
   if (win && !win.isDestroyed()) win.webContents.send('command', ...sc.cmd);
 }
 
@@ -550,6 +604,8 @@ app.on('web-contents-created', (_e, contents) => {
   const type = contents.getType();
   if (type !== 'webview' && type !== 'window') return;
   contents.on('before-input-event', (event, input) => {
+    // Settings window: records keys for Settings → Shortcuts, closes on ⌘W, ignores browser shortcuts.
+    if (settingsWindow && !settingsWindow.isDestroyed() && contents === settingsWindow.webContents) return settingsWindowInput(event, input);
     const sc = findShortcut(SHORTCUTS, input);
     if (!sc) return;
     const win = uiWindowFor(contents);
@@ -631,8 +687,9 @@ on('clipboard:write', (_e, text) => clipboard.writeText(text));
 
 // Favicons: fetched by main through the tab's own profile session and handed to the UI as data: URLs,
 // so the privileged UI page never loads page-chosen URLs itself.
-handle('favicon:fetch', async (_e, url, partition) => {
-  if (!/^https?:/i.test(String(url)) || !String(partition).startsWith('persist:profile-')) return null;
+handle('favicon:fetch', async (e, url, partition) => {
+  const own = privatePartitionOf(e.sender);
+  if (!/^https?:/i.test(String(url)) || !(String(partition).startsWith('persist:profile-') || (own && partition === own))) return null;
   try {
     const res = await session.fromPartition(partition).fetch(url, { signal: AbortSignal.timeout(8000) });
     const type = (res.headers.get('content-type') || '').split(';')[0].trim();
@@ -659,12 +716,30 @@ let hub = null;
 let assistant = null;
 let workbench = null;
 
-function mcpCommand() {
-  const script = app.isPackaged
+function mcpScript() {
+  return app.isPackaged
     ? path.join(process.resourcesPath, 'mcp', 'meridian-mcp.cjs')
     : path.join(__dirname, '..', 'mcp', 'meridian-mcp.js');
-  return { command: 'node', args: [script], claudeCode: `claude mcp add meridian -- node "${script}"` };
 }
+function mcpCommand() {
+  const script = mcpScript();
+  return { command: 'node', args: [script], claudeCode: `claude mcp add -s user meridian -- node "${script}"`, codex: `codex mcp add meridian -- node "${script}"` };
+}
+
+// "Connect Claude Code / Codex" (onboarding and Settings → AI): shows the exact command in a native
+// dialog and runs it only after the user confirms.
+async function connectMcpCli(cli, parent) {
+  return connectCli(String(cli), mcpScript(), async (command, name) => {
+    const { response } = await dialog.showMessageBox(parent || mainWindow, {
+      type: 'question', buttons: ['Run Command', 'Cancel'], defaultId: 1, cancelId: 1,
+      message: `Connect ${name} to Meridian?`,
+      detail: `Meridian will run this command:\n\n${command}\n\n${name} can then use Meridian's browser tools, within the agent access level you choose.`,
+    });
+    return response === 0;
+  });
+}
+handle('mcp:detect', () => detectClis(mcpScript()));
+handleMain('mcp:connect', (e, cli) => connectMcpCli(cli, BrowserWindow.fromWebContents(e.sender)));
 
 handle('agent:config', (_e, cfg) => { hub.setConfig(cfg || {}); return hub.status(); });
 handle('agent:status', () => ({ ...hub.status(), mcp: mcpCommand() }));
@@ -681,6 +756,18 @@ on('ai:reset', (_e, sessionId) => assistant.reset(sessionId));
 
 handle('import:arc-available', () => arcDataExists());
 handle('import:arc', () => importFromArc());
+// Counts for the onboarding ("12 spaces, 140 pinned tabs, 8 favorites") before anything is imported.
+handle('import:arc-preview', () => {
+  if (!arcDataExists()) return null;
+  try {
+    const d = importFromArc();
+    let pinned = 0, today = 0;
+    const count = (n) => { if (n.type === 'tab') pinned++; else (n.children || []).forEach(count); };
+    for (const sp of d.spaces) { sp.pinned.forEach(count); today += sp.today.length; }
+    const favorites = Object.values(d.favorites).reduce((a, l) => a + l.length, 0);
+    return { spaces: d.spaces.length, pinned, today, favorites, profiles: d.profiles.length, names: d.spaces.slice(0, 8).map((s) => ({ name: s.name, icon: s.icon, color: s.color })) };
+  } catch (err) { return { error: err.message }; }
+});
 
 // ---------- default browser ----------
 
@@ -724,6 +811,9 @@ function baseWindowOptions(extra) {
 function createMainWindow() {
   const bounds = readJson(path.join(app.getPath('userData'), 'window.json'), { width: 1440, height: 900 });
   mainWindow = new BrowserWindow(baseWindowOptions({ ...bounds, minWidth: 640, minHeight: 420, title: APP_NAME }));
+  mainUiReady = false;
+  // A reload re-boots the UI; commands wait for its next snapshot.
+  mainWindow.webContents.on('did-start-loading', () => { mainUiReady = false; });
   mainWindow.loadURL(uiPageUrl());
   mainWindow.once('ready-to-show', () => {
     if (bounds.maximized) mainWindow.maximize();
@@ -735,7 +825,7 @@ function createMainWindow() {
   };
   mainWindow.on('resize', debounce(saveBounds, 500));
   mainWindow.on('move', debounce(saveBounds, 500));
-  mainWindow.on('closed', () => { mainWindow = null; });
+  mainWindow.on('closed', () => { mainWindow = null; mainUiReady = false; });
   mainWindow.webContents.on('will-navigate', (e) => e.preventDefault());
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   if (DEV && process.env.MERIDIAN_SHOT) runScreenshotScript(mainWindow);
@@ -755,26 +845,257 @@ function createMiniWindow(url = '') {
 
 // Little window → "Open in Meridian": move the URL into the main window as a tab.
 on('mini:promote', (e, url) => {
-  const win = mainWindow || createMainWindow();
-  const deliver = () => { win.webContents.send('command', 'open-url-tab', url); win.show(); win.focus(); };
-  if (win.webContents.isLoading()) win.webContents.once('did-finish-load', deliver); else deliver();
+  if (!/^https?:\/\//i.test(String(url))) return;
+  deliverToMain('open-url-tab', url);
+  mainWindow?.show(); mainWindow?.focus();
   BrowserWindow.fromWebContents(e.sender)?.close();
 });
 
+// ---------- delivering commands to the main window's UI ----------
+// Commands sent before the UI has booted (its listeners register after state loads) would be lost, so
+// they wait until the UI's first snapshot says it's ready. Opens the main window if it's closed.
+
+let mainUiReady = false;
+const mainQueue = [];
+function deliverToMain(name, ...args) {
+  if (!mainWindow || mainWindow.isDestroyed()) createMainWindow();
+  if (mainUiReady) mainWindow.webContents.send('command', name, ...args);
+  else mainQueue.push([name, ...args]);
+}
+function flushMainQueue() {
+  while (mainUiReady && mainQueue.length && mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('command', ...mainQueue.shift());
+}
+
+// ---------- private windows ----------
+// Each gets its own in-memory partition (no "persist:" prefix: nothing touches disk), its own UI state
+// that is never saved, and is wiped when it closes. will-attach-webview only lets this window's page
+// use this partition.
+
+function privatePartitionOf(contents) {
+  if (!contents || contents.isDestroyed()) return null;
+  const win = BrowserWindow.fromWebContents(contents);
+  return win && privateWindows.has(win) && win.webContents === contents ? privateWindows.get(win) : null;
+}
+
+function createPrivateWindow() {
+  const partition = `meridian-private-${crypto.randomUUID()}`;
+  const win = new BrowserWindow(baseWindowOptions({
+    width: 1200, height: 800, minWidth: 640, minHeight: 420, title: `${APP_NAME} — Private`,
+    ...(IS_MAC ? { vibrancy: undefined, backgroundColor: '#1b1b1f' } : { backgroundColor: '#1b1b1f' }),
+  }));
+  privateWindows.set(win, partition);
+  win.loadURL(uiPageUrl({ private: partition }));
+  win.once('ready-to-show', () => { if (DEV && process.env.MERIDIAN_SHOT) win.showInactive(); else win.show(); });
+  win.webContents.on('will-navigate', (e) => e.preventDefault());
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  win.on('closed', () => {
+    privateWindows.delete(win);
+    const ses = session.fromPartition(partition);
+    ses.clearStorageData().catch(() => {});
+    ses.clearCache().catch(() => {});
+    ses.clearAuthCache?.().catch?.(() => {});
+    knownSessions.delete(ses);
+  });
+  return win;
+}
+
+// ---------- settings: the UI renderer owns state.json; this is the channel to the Settings window ----------
+//
+//   UI renderer --ui:snapshot--> main (cache: menus, shortcuts, Air Traffic Control) --settings:state--> Settings window
+//   Settings window --settings:set (patch) / settings:action--> main (validates) --command settings-patch--> UI renderer
+//
+// The UI applies the patch (and its side effects: ad blocker, agent access, sidebar side…), saves, and
+// sends a new snapshot, which flows back to the Settings window. One writer, live everywhere.
+
+let uiSnapshot = null;
+let menuSig = '';
+
+function applySnapshot(snap) {
+  uiSnapshot = snap;
+  const s = snap.settings || {};
+  if (!mainUiReady) { mainUiReady = true; flushMainQueue(); }
+  applyShortcutOverrides(s.shortcutOverrides || {});
+  applyAppearance(s.appearance);
+  const sig = JSON.stringify([snap.spaces, snap.activeSpaceId]);
+  if (sig !== menuSig) { menuSig = sig; scheduleMenu(); }
+  if (settingsWindow && !settingsWindow.isDestroyed()) settingsWindow.webContents.send('settings:state', settingsState());
+}
+
+function applyShortcutOverrides(overrides) {
+  const sig = JSON.stringify(overrides);
+  if (sig === shortcutOverridesSig) return;
+  shortcutOverridesSig = sig;
+  SHORTCUTS = shortcutTable(IS_MAC, overrides);
+  scheduleMenu();
+}
+
+function applyAppearance(mode) {
+  if (DEV && process.env.MERIDIAN_THEME) return; // screenshots pin the theme
+  const want = mode === 'light' || mode === 'dark' ? mode : 'system';
+  if (nativeTheme.themeSource !== want) nativeTheme.themeSource = want;
+}
+
+const str = (v, max = 200) => String(v ?? '').slice(0, max);
+onMain('ui:snapshot', (_e, snap) => {
+  if (!snap || typeof snap !== 'object') return;
+  applySnapshot({
+    settings: snap.settings && typeof snap.settings === 'object' ? snap.settings : {},
+    profiles: (Array.isArray(snap.profiles) ? snap.profiles : []).slice(0, 100).map((p) => ({ id: str(p.id, 64), name: str(p.name, 80) })),
+    spaces: (Array.isArray(snap.spaces) ? snap.spaces : []).slice(0, 200).map((sp) => ({ id: str(sp.id, 64), name: str(sp.name, 80), icon: sp.icon ? str(sp.icon, 16) : null, color: str(sp.color, 32), profileId: str(sp.profileId, 64) })),
+    activeSpaceId: str(snap.activeSpaceId, 64),
+    stats: snap.stats && typeof snap.stats === 'object' ? { archive: Number(snap.stats.archive) || 0, history: Number(snap.stats.history) || 0 } : {},
+  });
+});
+
+function shortcutRows() {
+  return SHORTCUTS.map((s) => ({
+    id: s.id, label: s.label, group: s.group, alias: !!s.alias,
+    accel: s.accel, defaultAccel: s.defaultAccel,
+    display: formatAccelerator(s.accel, IS_MAC), defaultDisplay: formatAccelerator(s.defaultAccel, IS_MAC),
+  }));
+}
+
+function settingsState() {
+  return { snapshot: uiSnapshot, shortcuts: shortcutRows() };
+}
+
+function openSettingsWindow(section) {
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    if (section) settingsWindow.webContents.send('settings:section', section);
+    settingsWindow.show(); settingsWindow.focus();
+    return settingsWindow;
+  }
+  const chrome = IS_MAC
+    ? { titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 16, y: 18 }, vibrancy: 'sidebar', visualEffectState: 'followWindow', backgroundColor: '#00000000' }
+    : { titleBarStyle: 'hidden', titleBarOverlay: { color: '#00000000', symbolColor: nativeTheme.shouldUseDarkColors ? '#e8e8ee' : '#3a3a44', height: 36 }, backgroundColor: nativeTheme.shouldUseDarkColors ? '#1b1b20' : '#f3f3f6', autoHideMenuBar: true };
+  settingsWindow = new BrowserWindow({
+    ...chrome,
+    width: 820, height: 620, minWidth: 680, minHeight: 480, title: `${APP_NAME} Settings`,
+    show: false, fullscreenable: false,
+    parent: undefined,
+    webPreferences: { preload: path.join(__dirname, 'settings-preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true, webviewTag: false, spellcheck: false },
+  });
+  settingsWindow.loadURL(`${SETTINGS_URL}${section ? `#${encodeURIComponent(section)}` : ''}`);
+  settingsWindow.once('ready-to-show', () => { if (DEV && process.env.MERIDIAN_SHOT) settingsWindow.showInactive(); else settingsWindow.show(); });
+  settingsWindow.webContents.on('will-navigate', (e) => e.preventDefault());
+  settingsWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  settingsWindow.on('closed', () => { settingsWindow = null; recordingShortcut = false; });
+  return settingsWindow;
+}
+
+let recordingShortcut = false;
+function settingsWindowInput(event, input) {
+  if (input.type !== 'keyDown' && input.type !== 'rawKeyDown') return;
+  if (recordingShortcut) {
+    if (['Meta', 'Control', 'Alt', 'Shift'].includes(input.key)) return event.preventDefault();
+    event.preventDefault();
+    const cancel = input.code === 'Escape' && !input.meta && !input.control && !input.alt && !input.shift;
+    const accel = cancel ? null : acceleratorFromInput(input, IS_MAC);
+    settingsWindow.webContents.send('settings:recorded', cancel ? { cancel: true } : { accel, display: formatAccelerator(accel, IS_MAC), raw: input.key });
+    return;
+  }
+  const sc = findShortcut(SHORTCUTS, input);
+  if (!sc) return;
+  if (sc.id === 'close-tab') { event.preventDefault(); settingsWindow.close(); }
+  else if (sc.run === 'settings') event.preventDefault();
+  else if (sc.run === 'private-window' || sc.run === 'mini-window' || sc.run === 'new-window') { event.preventDefault(); runShortcut(sc, null); }
+  // Everything else: the page gets the key (editing text fields), browser shortcuts don't fire here.
+  else if (!sc.soft) event.preventDefault();
+}
+
+const shortcutIds = () => new Set(SHORTCUTS.map((s) => s.id));
+on('window:open', (_e, kind, url) => { if (kind === 'private') createPrivateWindow(); else if (kind === 'little') createMiniWindow(/^https?:\/\//i.test(String(url || '')) ? String(url).slice(0, 4000) : ''); });
+on('settings:open', (_e, section) => openSettingsWindow(typeof section === 'string' ? section.slice(0, 20) : undefined));
+
+handleSettings('settings:get', async () => ({
+  ...settingsState(),
+  platform: process.platform, version: app.getVersion(), electron: process.versions.electron, chrome: process.versions.chrome,
+  packaged: app.isPackaged, mcp: mcpCommand(), repo: REPO_URL,
+}));
+handleSettings('settings:set', (_e, patch) => {
+  const clean = validatePatch(patch, shortcutIds());
+  if (!Object.keys(clean).length) return false;
+  if (clean.shortcutOverrides) applyShortcutOverrides(clean.shortcutOverrides);
+  if (clean.appearance) applyAppearance(clean.appearance);
+  deliverToMain('settings-patch', clean);
+  return true;
+});
+handleSettings('settings:record', (_e, on) => { recordingShortcut = !!on; return recordingShortcut; });
+handleSettings('settings:is-default', () => app.isDefaultProtocolClient('https'));
+handleSettings('settings:set-default', () => {
+  const ok = app.setAsDefaultProtocolClient('http') && app.setAsDefaultProtocolClient('https');
+  return { ok, packaged: app.isPackaged };
+});
+handleSettings('settings:arc-available', () => arcDataExists());
+handleSettings('settings:pick-extension', () => pickExtensionDir(settingsWindow));
+handleSettings('settings:reset-permissions', () => { permissionDecisions = {}; writeJsonAtomic(PERMS_FILE(), {}); return true; });
+handleSettings('settings:clear-profile-data', async (_e, profileId) => {
+  if (!/^[\w-]{1,64}$/.test(String(profileId))) return false;
+  const ses = session.fromPartition(`persist:profile-${profileId}`);
+  await ses.clearStorageData(); await ses.clearCache();
+  return true;
+});
+// what: { history, cache, cookies } — cache/cookies for every profile; history lives in the UI's state.
+handleSettings('settings:clear-browsing-data', async (_e, what = {}) => {
+  const profiles = (uiSnapshot?.profiles || []).map((p) => p.id).filter((id) => /^[\w-]{1,64}$/.test(id));
+  for (const id of profiles) {
+    const ses = session.fromPartition(`persist:profile-${id}`);
+    if (what.cache) await ses.clearCache();
+    if (what.cookies) await ses.clearStorageData();
+  }
+  if (what.history) deliverToMain('settings-action', 'clear-history');
+  return true;
+});
+// Profile/space edits and other things only the UI can do with its state.
+const UI_ACTIONS = new Set(['profile-rename', 'profile-add', 'profile-delete', 'import-arc', 'clear-archive', 'onboarding', 'edit-theme']);
+handleSettings('settings:action', (_e, name, arg) => {
+  if (!UI_ACTIONS.has(name)) return false;
+  const a = arg && typeof arg === 'object' ? { id: arg.id ? str(arg.id, 64) : undefined, name: arg.name ? str(arg.name, 80) : undefined } : {};
+  deliverToMain('settings-action', name, a);
+  if (name === 'onboarding' || name === 'edit-theme' || name === 'import-arc') { mainWindow?.show(); mainWindow?.focus(); }
+  return true;
+});
+handleSettings('settings:ai-has-key', () => assistant.hasKey());
+handleSettings('settings:ai-set-key', (_e, key) => { assistant.setKey(typeof key === 'string' ? key : ''); return assistant.hasKey(); });
+handleSettings('settings:agent-status', () => ({ ...hub.status(), mcp: mcpCommand() }));
+handleSettings('settings:mcp-detect', () => detectClis(mcpScript()));
+handleSettings('settings:mcp-connect', (_e, cli) => connectMcpCli(cli, settingsWindow));
+// "Where would this link go?" for Settings → Links, with the rules being edited (not yet saved).
+handleSettings('settings:route-test', (_e, atc, url) => {
+  const spaces = uiSnapshot?.spaces || [];
+  const r = routeLink(sanitizeAtc(atc) || {}, String(url || ''), spaces.map((sp) => sp.id));
+  return { target: r.target, spaceId: r.spaceId || null, pattern: r.rule?.pattern || null };
+});
+handleSettings('settings:copy', (_e, text) => { clipboard.writeText(str(text, 4000)); return true; });
+handleSettings('settings:open-url', (_e, url) => { if (/^https:\/\//i.test(String(url))) deliverToMain('open-url-tab', str(url, 2000)); return true; });
+
 // Dev/test: MERIDIAN_SHOT=out.png MERIDIAN_STEPS='[{"js":"...","wait":2000,"shot":"a.png"}]'
+// "win": "settings" | "private" | "mini" runs that step's js / shot in that window instead.
+function stepWindow(name, fallback) {
+  if (name === 'settings') return settingsWindow;
+  if (name === 'private') return [...privateWindows.keys()].at(-1) || null;
+  if (name === 'mini') return [...miniWindows].at(-1) || null;
+  return fallback;
+}
 function runScreenshotScript(win) {
   const steps = JSON.parse(process.env.MERIDIAN_STEPS || '[{"wait":3000}]');
   win.webContents.on('console-message', (e) => console.log('[renderer]', e.message));
   win.webContents.once('did-finish-load', async () => {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     for (const st of steps) {
+      const w = stepWindow(st.win, win);
       try {
-        if (st.js) console.log('[eval]', JSON.stringify(await win.webContents.executeJavaScript(st.js)));
+        if (st.win && (!w || w.webContents.isLoading())) await sleep(800);
+        if (st.js && w) console.log('[eval]', JSON.stringify(await w.webContents.executeJavaScript(st.js)));
+        // {"main":"open-url","url":"…"} = a link from another app; {"main":"menu","menu":"Spaces"} = print that menu.
+        if (st.main === 'open-url') app.emit('open-url', { preventDefault() {} }, st.url);
+        if (st.main === 'menu') console.log('[menu]', JSON.stringify(Menu.getApplicationMenu().items.find((m) => m.label === st.menu)?.submenu.items.map((i) => `${i.label}${i.checked ? ' ✓' : ''}${i.accelerator ? ' ' + i.accelerator : ''}`)));
+        if (st.main === 'windows') console.log('[windows]', JSON.stringify({ mini: miniWindows.size, private: privateWindows.size, settings: !!settingsWindow }));
         // {"key":"Right","modifiers":["meta","alt"],"to":"page"} — a keypress sent to the active tab's page
         // ("to":"page") or to whatever has focus.
         if (st.key) {
           const pageId = st.to === 'page' ? await win.webContents.executeJavaScript('webview()?.getWebContentsId() || 0') : 0;
-          const target = (pageId && webContents.fromId(pageId)) || webContents.getFocusedWebContents() || win.webContents;
+          const target = (pageId && webContents.fromId(pageId)) || (st.win && w ? w.webContents : null) || webContents.getFocusedWebContents() || win.webContents;
           console.log('[key]', st.key, (st.modifiers || []).join('+'), '->', target.getType());
           target.sendInputEvent({ type: 'keyDown', keyCode: st.key, modifiers: st.modifiers || [] });
           if (st.key.length === 1 && !(st.modifiers || []).length) target.sendInputEvent({ type: 'char', keyCode: st.key });
@@ -782,7 +1103,7 @@ function runScreenshotScript(win) {
         }
       } catch (err) { console.log('[eval error]', err.message); }
       await sleep(st.wait || 500);
-      if (st.shot) fs.writeFileSync(st.shot, (await win.webContents.capturePage()).toPNG());
+      if (st.shot) { const sw = stepWindow(st.win, win); if (sw && !sw.isDestroyed()) fs.writeFileSync(st.shot, (await sw.webContents.capturePage()).toPNG()); }
     }
     fs.writeFileSync(process.env.MERIDIAN_SHOT, (await win.webContents.capturePage()).toPNG());
     app.exit(0);
@@ -794,17 +1115,18 @@ function debounce(fn, ms) {
   return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
 }
 
-// ---------- menu: shows every shortcut; clicks (and keys nothing else caught) go to the focused UI window ----------
+// ---------- menu: modelled on Arc's. Shows every shortcut; clicks (and keys nothing else caught) go to the focused UI window ----------
 
 function targetWindow() {
   const win = BrowserWindow.getFocusedWindow();
-  return win && (win === mainWindow || miniWindows.has(win)) ? win : mainWindow;
+  return win && isUiWindow(win) ? win : mainWindow;
 }
 
 function cmd(name, ...args) {
   return () => {
     const win = targetWindow();
     if (win && !win.isDestroyed()) win.webContents.send('command', name, ...args);
+    else deliverToMain(name, ...args);
   };
 }
 
@@ -813,49 +1135,69 @@ function cmd(name, ...args) {
 function sc(label, id, extra = {}) {
   const s = SHORTCUTS.find((x) => x.id === id);
   return {
-    label, accelerator: s.accel, registerAccelerator: !!s.soft,
-    click: () => runShortcut(s, targetWindow()),
+    label, ...(s.accel ? { accelerator: s.accel, registerAccelerator: !!s.soft } : {}),
+    click: () => {
+      // ⌘W in the Settings window closes it rather than a tab behind it.
+      const focused = BrowserWindow.getFocusedWindow();
+      if (focused && focused === settingsWindow && s.id === 'close-tab') return focused.close();
+      const win = targetWindow();
+      if (!win && s.cmd) return deliverToMain(...s.cmd);
+      runShortcut(s, win);
+    },
     ...extra,
   };
 }
 
+const menuText = (v, max = 40) => String(v ?? '').replace(/[\u0000-\u001f]/g, '').slice(0, max);
+
 function buildMenu() {
-  const spaceItems = [];
-  for (let i = 1; i <= 9; i++) spaceItems.push(sc(`Space ${i}`, `space-${i}`));
+  const snap = uiSnapshot || {};
+  const spaces = Array.isArray(snap.spaces) ? snap.spaces : [];
+  const spaceItems = spaces.length
+    ? spaces.map((sp, i) => ({
+        label: `${sp.icon ? menuText(sp.icon, 4) + '  ' : ''}${menuText(sp.name) || 'Space'}`,
+        type: 'checkbox', checked: sp.id === snap.activeSpaceId,
+        ...(i < 9 && SHORTCUTS.find((x) => x.id === `space-${i + 1}`)?.accel ? { accelerator: SHORTCUTS.find((x) => x.id === `space-${i + 1}`).accel, registerAccelerator: false } : {}),
+        click: () => deliverToMain('space-select', sp.id),
+      }))
+    : Array.from({ length: 9 }, (_, i) => sc(`Space ${i + 1}`, `space-${i + 1}`));
   const tabItems = [];
-  for (let i = 1; i <= 9; i++) tabItems.push(sc(`Tab ${i}`, `tab-${i}`));
+  for (let i = 1; i <= 9; i++) tabItems.push(sc(i === 9 ? 'Last Tab' : `Tab ${i}`, `tab-${i}`));
+  const settingsItem = sc('Settings…', 'settings');
 
   const template = [
     IS_MAC ? {
       label: APP_NAME,
       submenu: [
-        { role: 'about' },
-        sc('Settings…', 'settings'),
+        { label: `About ${APP_NAME}`, role: 'about' },
+        { type: 'separator' },
+        settingsItem,
+        { label: 'Set as Default Browser…', click: () => setDefaultBrowserFromMenu() },
         { type: 'separator' },
         { role: 'services' },
         { type: 'separator' },
-        { role: 'hide' }, { role: 'hideOthers' }, { role: 'unhide' },
+        { role: 'hide', label: `Hide ${APP_NAME}` }, { role: 'hideOthers' }, { role: 'unhide' },
         { type: 'separator' },
-        { role: 'quit' },
+        { role: 'quit', label: `Quit ${APP_NAME}` },
       ],
     } : null,
     {
       label: 'File',
       submenu: [
-        ...(IS_MAC ? [] : [sc('Settings…', 'settings'), { type: 'separator' }]),
         sc('New Tab…', 'command-bar'),
-        sc('New Little Window', 'mini-window'),
         sc('New Window', 'new-window'),
-        sc('New Folder', 'new-folder'),
+        sc('New Little Window', 'mini-window'),
+        sc('New Private Window', 'private-window'),
         { type: 'separator' },
+        sc('New Folder', 'new-folder'),
         sc('Open Location…', 'edit-url'),
         sc('Reopen Closed Tab', 'reopen-tab'),
         { type: 'separator' },
         sc('Close Tab', 'close-tab'),
         { label: 'Close Window', accelerator: 'CmdOrCtrl+Shift+W', role: 'close' },
         { type: 'separator' },
-        { label: 'Import from Arc…', click: cmd('import-arc') },
-        ...(IS_MAC ? [] : [{ type: 'separator' }, { role: 'quit' }]),
+        { label: 'Import from Arc…', click: () => deliverToMain('import-arc') },
+        ...(IS_MAC ? [] : [{ type: 'separator' }, settingsItem, { label: 'Set as Default Browser…', click: () => setDefaultBrowserFromMenu() }, { type: 'separator' }, { role: 'quit' }]),
       ],
     },
     {
@@ -865,6 +1207,7 @@ function buildMenu() {
         { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'pasteAndMatchStyle' }, { role: 'selectAll' },
         { type: 'separator' },
         sc('Copy URL', 'copy-url'),
+        { type: 'separator' },
         sc('Find…', 'find'),
         sc('Find Next', 'find-next'),
         sc('Find Previous', 'find-prev'),
@@ -874,21 +1217,30 @@ function buildMenu() {
       label: 'View',
       submenu: [
         sc('Toggle Sidebar', 'toggle-sidebar'),
-        sc('Ask AI about Page', 'ai-panel'),
+        sc('Ask AI', 'ai-panel'),
         sc('Workbench', 'open-workbench'), // Workbench integration
+        sc('Downloads', 'downloads'),
+        { type: 'separator' },
         sc('Split View', 'split'),
         sc('Close Split View', 'unsplit'),
         { type: 'separator' },
         sc('Reload', 'reload'),
         sc('Hard Reload', 'hard-reload'),
+        { type: 'separator' },
         sc('Zoom In', 'zoom-in'),
         sc('Zoom In ', 'zoom-in-plus', { visible: false }),
         sc('Zoom Out', 'zoom-out'),
         sc('Actual Size', 'zoom-reset'),
         { type: 'separator' },
         { role: 'togglefullscreen' },
-        sc('Developer Tools (page)', 'devtools'),
-        sc('Developer Tools (Meridian UI)', 'ui-devtools'),
+        { type: 'separator' },
+        {
+          label: 'Developer',
+          submenu: [
+            sc('Developer Tools', 'devtools'),
+            sc('Meridian UI Developer Tools', 'ui-devtools'),
+          ],
+        },
       ],
     },
     {
@@ -898,35 +1250,85 @@ function buildMenu() {
         sc('Forward', 'forward'),
         sc('Back ', 'back-arrow', { visible: false }),
         sc('Forward ', 'forward-arrow', { visible: false }),
+        { type: 'separator' },
+        sc('Reopen Closed Tab', 'reopen-tab'),
+      ],
+    },
+    {
+      label: 'Spaces',
+      submenu: [
+        ...spaceItems,
+        { type: 'separator' },
+        sc('New Space…', 'new-space'),
+        sc('Edit Space Theme…', 'edit-theme'),
+        { type: 'separator' },
+        sc('Next Space', 'next-space'),
+        sc('Previous Space', 'prev-space'),
       ],
     },
     {
       label: 'Tabs',
       submenu: [
         sc('Pin / Unpin Tab', 'toggle-pin'),
-        { label: 'Add to Favorites', click: cmd('favorite') },
+        sc('Duplicate Tab', 'duplicate-tab'),
+        sc('Add to Favorites', 'add-favorite'),
+        sc('Copy URL', 'copy-url'),
+        { type: 'separator' },
+        sc('Clear Today', 'clear-today'),
+        { type: 'separator' },
         sc('Next Tab', 'next-tab'),
         sc('Previous Tab', 'prev-tab'),
         sc('Next Tab ', 'next-tab-arrow', { visible: false }),
         sc('Previous Tab ', 'prev-tab-arrow', { visible: false }),
-        sc('Clear Today Tabs', 'clear-today'),
         { type: 'separator' },
         ...tabItems,
       ],
     },
     {
-      label: 'Spaces',
+      label: 'Archive',
       submenu: [
-        { label: 'New Space…', click: cmd('new-space') },
-        sc('Next Space', 'next-space'),
-        sc('Previous Space', 'prev-space'),
-        { type: 'separator' },
-        ...spaceItems,
+        sc('View Archive', 'view-archive'),
+        sc('Reopen Last Archived Tab', 'reopen-archived'),
+      ],
+    },
+    {
+      label: 'Extensions',
+      submenu: [
+        { label: 'Manage Extensions…', click: () => openSettingsWindow('advanced') },
+        { label: 'Load Unpacked Extension…', click: () => loadExtensionFromMenu() },
       ],
     },
     { role: 'windowMenu' },
+    {
+      role: 'help',
+      submenu: [
+        sc('Keyboard Shortcuts', 'shortcuts-help'),
+        { label: 'Welcome Tour…', click: () => deliverToMain('onboarding') },
+        { type: 'separator' },
+        { label: 'Report an Issue…', click: () => deliverToMain('open-url-tab', `${REPO_URL}/issues/new`) },
+        { label: 'Meridian on GitHub', click: () => deliverToMain('open-url-tab', REPO_URL) },
+      ],
+    },
   ].filter(Boolean);
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+// Coalesces rebuilds (snapshots can arrive in bursts while spaces are edited).
+let menuTimer = null;
+function scheduleMenu() { clearTimeout(menuTimer); menuTimer = setTimeout(buildMenu, 50); }
+
+async function setDefaultBrowserFromMenu() {
+  if (!app.isPackaged) {
+    await dialog.showMessageBox(BrowserWindow.getFocusedWindow() || mainWindow, { type: 'info', message: 'Run the built app to make Meridian your default browser', detail: 'Development builds can’t register as the system browser (npm run dist).' });
+    return;
+  }
+  app.setAsDefaultProtocolClient('http');
+  app.setAsDefaultProtocolClient('https');
+}
+
+async function loadExtensionFromMenu() {
+  const dir = await pickExtensionDir(BrowserWindow.getFocusedWindow() || mainWindow);
+  if (dir) deliverToMain('extension-add', dir);
 }
 
 // ---------- lifecycle ----------
@@ -938,6 +1340,22 @@ app.whenReady().then(() => {
     adblockEnabled = saved.settings.adblock !== false;
     loadedExtensionPaths = saved.settings.extensions || [];
   }
+  if (DEV && /^(light|dark)$/.test(process.env.MERIDIAN_THEME || '')) nativeTheme.themeSource = process.env.MERIDIAN_THEME;
+  // Until the UI has booted, menus, shortcuts and link routing work from what's on disk.
+  if (saved) {
+    uiSnapshot = {
+      settings: saved.settings || {}, profiles: saved.profiles || [], activeSpaceId: saved.activeSpaceId,
+      spaces: (saved.spaces || []).map((sp) => ({ id: sp.id, name: sp.name, icon: sp.icon, color: sp.color, profileId: sp.profileId })),
+    };
+    SHORTCUTS = shortcutTable(IS_MAC, saved.settings?.shortcutOverrides || {});
+    shortcutOverridesSig = JSON.stringify(saved.settings?.shortcutOverrides || {});
+    applyAppearance(saved.settings?.appearance);
+  }
+  app.setAboutPanelOptions({
+    applicationName: APP_NAME, applicationVersion: app.getVersion(),
+    copyright: 'Open source, MIT licensed. Not affiliated with The Browser Company.',
+    website: REPO_URL, iconPath: path.join(__dirname, '..', 'build', 'icon-1024.png'),
+  });
   hub = new AgentHub({ getWindow: () => mainWindow, userDataDir: app.getPath('userData'), isProtected: isInternalContents });
   // Workbench integration: IPC for the internal workbench page (files, terminals, agents).
   workbench = new Workbench({ app, getMainWindow: () => mainWindow, isUiContents, mcpCommand, agentStatus: () => hub.status() });

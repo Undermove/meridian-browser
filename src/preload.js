@@ -46,5 +46,13 @@ contextBridge.exposeInMainWorld('meridian', {
   resetPermissions: () => ipcRenderer.invoke('permissions:reset'),
 
   promoteMini: (url) => ipcRenderer.send('mini:promote', url),
+
+  // Settings window, windows, onboarding
+  snapshot: (snap) => ipcRenderer.send('ui:snapshot', snap),
+  openSettings: (section) => ipcRenderer.send('settings:open', section),
+  openWindow: (kind, url) => ipcRenderer.send('window:open', kind, url),
+  arcPreview: () => ipcRenderer.invoke('import:arc-preview'),
+  mcpDetect: () => ipcRenderer.invoke('mcp:detect'),
+  mcpConnect: (cli) => ipcRenderer.invoke('mcp:connect', cli),
   platform: process.platform,
 });
