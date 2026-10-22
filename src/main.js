@@ -7,7 +7,10 @@ const { app, BrowserWindow, Menu, ipcMain, session, shell, dialog, clipboard, na
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { pathToFileURL } = require('url');
 const { importFromArc, arcDataExists } = require('./importers/arc');
+const { AgentHub } = require('./agent/hub');
+const { Assistant } = require('./ai/assistant');
 
 const APP_NAME = 'Meridian';
 app.setName(APP_NAME);
@@ -51,6 +54,25 @@ function openExternalUrl(url) {
   createMiniWindow(url);
 }
 
+// ---------- IPC guard ----------
+// Every privileged channel only answers our own UI page (file://…/renderer/index.html).
+// Web content lives in <webview> guests and can never reach these handlers, but checking the sender
+// keeps it that way even if something is misconfigured later.
+
+const UI_URL = pathToFileURL(path.join(__dirname, 'renderer', 'index.html')).href;
+const fromUi = (e) => {
+  const url = e.senderFrame?.url || '';
+  return (url === UI_URL || url.startsWith(UI_URL + '?') || url.startsWith(UI_URL + '#')) && e.sender.getType() === 'window';
+};
+const handle = (channel, fn) => ipcMain.handle(channel, (e, ...args) => {
+  if (!fromUi(e)) throw new Error('forbidden');
+  return fn(e, ...args);
+});
+const on = (channel, fn) => ipcMain.on(channel, (e, ...args) => {
+  if (!fromUi(e)) { e.returnValue = null; return; }
+  return fn(e, ...args);
+});
+
 // ---------- state persistence ----------
 
 function readJson(file, fallback) {
@@ -63,9 +85,9 @@ function writeJsonAtomic(file, data) {
   fs.renameSync(tmp, file);
 }
 
-ipcMain.handle('state:load', () => readJson(STATE_FILE(), null));
-ipcMain.handle('state:save', (_e, state) => { writeJsonAtomic(STATE_FILE(), state); return true; });
-ipcMain.on('state:save-sync', (e, state) => { try { writeJsonAtomic(STATE_FILE(), state); } catch {} e.returnValue = true; });
+handle('state:load', () => readJson(STATE_FILE(), null));
+handle('state:save', (_e, state) => { writeJsonAtomic(STATE_FILE(), state); return true; });
+on('state:save-sync', (e, state) => { try { writeJsonAtomic(STATE_FILE(), state); } catch {} e.returnValue = true; });
 
 // ---------- sessions (one per profile) ----------
 
@@ -106,6 +128,7 @@ function prepareSession(ses) {
   ses.setUserAgent(CHROME_UA);
   ses.on('will-download', handleDownload);
   ses.setPermissionRequestHandler(handlePermissionRequest);
+  ses.setDevicePermissionHandler(() => false); // WebUSB / WebHID / Web Serial: off
   ses.setPermissionCheckHandler((_wc, permission, origin) => {
     if (SAFE_PERMISSIONS.has(permission)) return true;
     return permissionDecisions[`${originOf(origin)}|${permission}`] === true;
@@ -114,13 +137,13 @@ function prepareSession(ses) {
   for (const ext of loadedExtensionPaths) loadExtensionInto(ses, ext);
 }
 
-ipcMain.handle('adblock:set', async (_e, enabled) => {
+handle('adblock:set', async (_e, enabled) => {
   adblockEnabled = !!enabled;
   for (const ses of knownSessions) await applyAdblock(ses);
   return adblockEnabled;
 });
 
-ipcMain.handle('profile:clear-data', async (_e, partition) => {
+handle('profile:clear-data', async (_e, partition) => {
   await session.fromPartition(partition).clearStorageData();
   return true;
 });
@@ -138,13 +161,13 @@ async function loadExtensionInto(ses, extPath) {
   }
 }
 
-ipcMain.handle('extensions:set', async (_e, paths) => {
+handle('extensions:set', async (_e, paths) => {
   loadedExtensionPaths = paths || [];
   for (const ses of knownSessions) for (const p of loadedExtensionPaths) await loadExtensionInto(ses, p);
   return true;
 });
 
-ipcMain.handle('extensions:pick', async () => {
+handle('extensions:pick', async () => {
   const res = await dialog.showOpenDialog(mainWindow, {
     title: 'Choose an unpacked extension folder (with manifest.json)',
     properties: ['openDirectory'],
@@ -227,24 +250,88 @@ function handleDownload(_event, item) {
   });
 }
 
-ipcMain.on('download:reveal', (_e, p) => shell.showItemInFolder(p));
+on('download:reveal', (_e, p) => shell.showItemInFolder(p));
 
-// ---------- webview wiring: popups, context menu, find ----------
+// ---------- URL scheme policy ----------
+
+const WEB_SCHEMES = new Set(['http:', 'https:', 'about:', 'data:', 'blob:']);
+const SUBFRAME_SCHEMES = new Set([...WEB_SCHEMES, 'chrome-extension:']);
+const EXTERNAL_SCHEMES = new Set(['mailto:', 'tel:', 'sms:', 'facetime:', 'zoommtg:', 'msteams:', 'slack:', 'tg:', 'spotify:', 'vscode:', 'figma:', 'notion:', 'linear:', 'obsidian:']);
+const schemeOf = (url) => { try { return new URL(url).protocol; } catch { return ''; } };
+
+// Pages may link to mailto:/zoom:/… — ask before handing those to another app. Never file:, javascript: etc.
+async function maybeOpenExternal(url, contents) {
+  const scheme = schemeOf(url);
+  if (!EXTERNAL_SCHEMES.has(scheme)) return;
+  const win = BrowserWindow.fromWebContents(contents.hostWebContents || contents) || mainWindow;
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'question', buttons: ['Open', 'Cancel'], defaultId: 0, cancelId: 1,
+    message: `Open this link in another app?`, detail: url.length > 300 ? url.slice(0, 300) + '…' : url,
+  });
+  if (response === 0) shell.openExternal(url);
+}
+
+// ---------- webview wiring: hardening, popups, context menu ----------
+
+// Force safe settings on every <webview> no matter what the embedder asked for.
+app.on('web-contents-created', (_e, contents) => {
+  contents.on('will-attach-webview', (event, webPreferences, params) => {
+    delete webPreferences.preload;
+    webPreferences.nodeIntegration = false;
+    webPreferences.nodeIntegrationInSubFrames = false;
+    webPreferences.contextIsolation = true;
+    webPreferences.sandbox = true;
+    webPreferences.webSecurity = true;
+    webPreferences.allowRunningInsecureContent = false;
+    webPreferences.experimentalFeatures = false;
+    const scheme = schemeOf(params.src);
+    if (params.src && !WEB_SCHEMES.has(scheme) && scheme !== 'file:') event.preventDefault();
+    if (!String(params.partition || '').startsWith('persist:profile-')) event.preventDefault();
+  });
+});
 
 app.on('web-contents-created', (_e, contents) => {
   if (contents.getType() !== 'webview') return;
   prepareSession(contents.session);
 
+  // Page-initiated navigation: web pages can't jump to file:// or other privileged schemes.
+  const guardNavigation = (event, url) => {
+    const scheme = schemeOf(url);
+    if (WEB_SCHEMES.has(scheme)) return;
+    if (scheme === 'file:' && schemeOf(contents.getURL()) === 'file:') return;
+    event.preventDefault();
+    maybeOpenExternal(url, contents);
+  };
+  contents.on('will-navigate', guardNavigation);
+  contents.on('will-frame-navigate', (event) => { if (!event.isMainFrame && !SUBFRAME_SCHEMES.has(schemeOf(event.url))) event.preventDefault(); });
+
   contents.setWindowOpenHandler(({ url, disposition }) => {
+    const scheme = schemeOf(url);
+    if (!(scheme === 'http:' || scheme === 'https:' || url === 'about:blank')) {
+      maybeOpenExternal(url, contents);
+      return { action: 'deny' };
+    }
     // Real popups (OAuth, payment windows) must stay real windows so window.opener works.
     if (disposition === 'new-window') {
       return {
         action: 'allow',
-        overrideBrowserWindowOptions: { width: 520, height: 720, autoHideMenuBar: true },
+        overrideBrowserWindowOptions: {
+          width: 520, height: 720, autoHideMenuBar: true,
+          webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, preload: undefined },
+        },
       };
     }
     sendToHost(contents, 'webview:open', { url, disposition, fromId: contents.id });
     return { action: 'deny' };
+  });
+
+  // Popup windows opened by pages get the same navigation rules.
+  contents.on('did-create-window', (win) => {
+    win.webContents.on('will-navigate', (event, url) => { if (!WEB_SCHEMES.has(schemeOf(url))) event.preventDefault(); });
+    win.webContents.setWindowOpenHandler(({ url }) => {
+      if (/^https?:/i.test(url) && mainWindow) mainWindow.webContents.send('command', 'open-url-tab', url);
+      return { action: 'deny' };
+    });
   });
 
   contents.on('context-menu', (_ev, params) => showPageContextMenu(contents, params));
@@ -310,7 +397,7 @@ function showPageContextMenu(contents, params) {
 }
 
 // Generic native context menu for the sidebar: renderer sends items, gets back the chosen id.
-ipcMain.handle('menu:popup', (e, items) => new Promise((resolve) => {
+handle('menu:popup', (e, items) => new Promise((resolve) => {
   let chosen = null;
   const build = (list) => list.map((it) => {
     if (it.type === 'separator') return { type: 'separator' };
@@ -321,37 +408,70 @@ ipcMain.handle('menu:popup', (e, items) => new Promise((resolve) => {
   menu.popup({ window: BrowserWindow.fromWebContents(e.sender), callback: () => setTimeout(() => resolve(chosen), 0) });
 }));
 
-ipcMain.on('clipboard:write', (_e, text) => clipboard.writeText(text));
-ipcMain.handle('devtools:open', (_e, id) => { const wc = webContents.fromId(id); if (wc) wc.openDevTools({ mode: 'detach' }); });
+on('clipboard:write', (_e, text) => clipboard.writeText(text));
+handle('devtools:open', (_e, id) => { const wc = webContents.fromId(id); if (wc) wc.openDevTools({ mode: 'detach' }); });
+
+// ---------- AI: agent hub (MCP + assistant tools) and the built-in assistant ----------
+
+let hub = null;
+let assistant = null;
+
+function mcpCommand() {
+  const script = app.isPackaged
+    ? path.join(process.resourcesPath, 'mcp', 'meridian-mcp.cjs')
+    : path.join(__dirname, '..', 'mcp', 'meridian-mcp.js');
+  return { command: 'node', args: [script], claudeCode: `claude mcp add meridian -- node "${script}"` };
+}
+
+handle('agent:config', (_e, cfg) => { hub.setConfig(cfg || {}); return hub.status(); });
+handle('agent:status', () => ({ ...hub.status(), mcp: mcpCommand() }));
+handle('agent:pause', (_e, paused) => { hub.paused = !!paused; return hub.paused; });
+on('agent:rpc-result', (e, payload) => hub.onRpcResult(e.sender, payload || {}));
+
+handle('ai:has-key', () => assistant.hasKey());
+handle('ai:set-key', (_e, key) => { assistant.setKey(typeof key === 'string' ? key : ''); return assistant.hasKey(); });
+on('ai:chat', (e, req) => { assistant.chat(e.sender, req || {}); });
+on('ai:stop', (_e, sessionId) => assistant.stop(sessionId));
+on('ai:reset', (_e, sessionId) => assistant.reset(sessionId));
 
 // ---------- Arc import ----------
 
-ipcMain.handle('import:arc-available', () => arcDataExists());
-ipcMain.handle('import:arc', () => importFromArc());
+handle('import:arc-available', () => arcDataExists());
+handle('import:arc', () => importFromArc());
 
 // ---------- default browser ----------
 
-ipcMain.handle('default-browser:set', () => {
+handle('default-browser:set', () => {
   const ok = app.setAsDefaultProtocolClient('http') && app.setAsDefaultProtocolClient('https');
   return { ok, packaged: app.isPackaged };
 });
-ipcMain.handle('default-browser:is', () => app.isDefaultProtocolClient('https'));
+handle('default-browser:is', () => app.isDefaultProtocolClient('https'));
 
 // ---------- windows ----------
 
+const IS_MAC = process.platform === 'darwin';
+
 function baseWindowOptions(extra) {
+  // macOS: inset traffic lights over a translucent sidebar. Windows/Linux: frameless with the
+  // native window controls drawn over the top-right corner (titleBarOverlay).
+  const chrome = IS_MAC
+    ? { titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 16, y: 16 }, vibrancy: 'sidebar', visualEffectState: 'followWindow', backgroundColor: '#00000000' }
+    : {
+        titleBarStyle: 'hidden',
+        titleBarOverlay: { color: '#00000000', symbolColor: nativeTheme.shouldUseDarkColors ? '#e8e8ee' : '#3a3a44', height: 36 },
+        backgroundColor: nativeTheme.shouldUseDarkColors ? '#1b1b20' : '#e9e9f0',
+        autoHideMenuBar: true,
+        icon: path.join(__dirname, '..', 'build', 'icon-1024.png'),
+      };
   return {
-    titleBarStyle: 'hiddenInset',
-    trafficLightPosition: { x: 16, y: 16 },
-    vibrancy: 'sidebar',
-    visualEffectState: 'followWindow',
-    backgroundColor: '#00000000',
+    ...chrome,
     show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       webviewTag: true,
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
       spellcheck: true,
     },
     ...extra,
@@ -374,6 +494,7 @@ function createMainWindow() {
   mainWindow.on('move', debounce(saveBounds, 500));
   mainWindow.on('closed', () => { mainWindow = null; });
   mainWindow.webContents.on('will-navigate', (e) => e.preventDefault());
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   if (process.env.MERIDIAN_SHOT) runScreenshotScript(mainWindow);
   return mainWindow;
 }
@@ -382,13 +503,15 @@ function createMiniWindow(url = '') {
   const win = new BrowserWindow(baseWindowOptions({ width: 820, height: 640, minWidth: 360, minHeight: 300, title: APP_NAME }));
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'), { query: { mini: '1', url } });
   win.once('ready-to-show', () => win.show());
+  win.webContents.on('will-navigate', (e) => e.preventDefault());
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   miniWindows.add(win);
   win.on('closed', () => miniWindows.delete(win));
   return win;
 }
 
 // Little window → "Open in Meridian": move the URL into the main window as a tab.
-ipcMain.on('mini:promote', (e, url) => {
+on('mini:promote', (e, url) => {
   const win = mainWindow || createMainWindow();
   const deliver = () => { win.webContents.send('command', 'open-url-tab', url); win.show(); win.focus(); };
   if (win.webContents.isLoading()) win.webContents.once('did-finish-load', deliver); else deliver();
@@ -428,13 +551,15 @@ function cmd(name, ...args) {
 }
 
 function buildMenu() {
+  // macOS: Ctrl+N switches spaces, Cmd+N tabs (as in Arc). Elsewhere Ctrl is the tab modifier, so spaces use Alt.
+  const spaceMod = IS_MAC ? 'Ctrl' : 'Alt';
   const spaceItems = [];
-  for (let i = 1; i <= 9; i++) spaceItems.push({ label: `Space ${i}`, accelerator: `Ctrl+${i}`, click: cmd('space-index', i - 1) });
+  for (let i = 1; i <= 9; i++) spaceItems.push({ label: `Space ${i}`, accelerator: `${spaceMod}+${i}`, click: cmd('space-index', i - 1) });
   const tabItems = [];
   for (let i = 1; i <= 9; i++) tabItems.push({ label: `Tab ${i}`, accelerator: `CmdOrCtrl+${i}`, click: cmd('tab-index', i - 1) });
 
   const template = [
-    {
+    IS_MAC ? {
       label: APP_NAME,
       submenu: [
         { role: 'about' },
@@ -446,10 +571,11 @@ function buildMenu() {
         { type: 'separator' },
         { role: 'quit' },
       ],
-    },
+    } : null,
     {
       label: 'File',
       submenu: [
+        ...(IS_MAC ? [] : [{ label: 'Settings…', accelerator: 'Ctrl+,', click: cmd('settings') }, { type: 'separator' }]),
         { label: 'New Tab…', accelerator: 'CmdOrCtrl+T', click: cmd('command-bar') },
         { label: 'New Little Window', accelerator: 'CmdOrCtrl+Alt+N', click: () => createMiniWindow('') },
         { label: 'New Window', accelerator: 'CmdOrCtrl+N', click: () => { if (!mainWindow) createMainWindow(); else mainWindow.focus(); } },
@@ -462,6 +588,7 @@ function buildMenu() {
         { label: 'Close Window', accelerator: 'CmdOrCtrl+Shift+W', role: 'close' },
         { type: 'separator' },
         { label: 'Import from Arc…', click: cmd('import-arc') },
+        ...(IS_MAC ? [] : [{ type: 'separator' }, { role: 'quit' }]),
       ],
     },
     {
@@ -480,6 +607,7 @@ function buildMenu() {
       label: 'View',
       submenu: [
         { label: 'Toggle Sidebar', accelerator: 'CmdOrCtrl+S', click: cmd('toggle-sidebar') },
+        { label: 'Ask AI about Page', accelerator: 'CmdOrCtrl+J', click: cmd('ai-panel') },
         { label: 'Split View', accelerator: 'Ctrl+Shift+=', click: cmd('split') },
         { label: 'Close Split View', accelerator: 'Ctrl+Shift+-', click: cmd('unsplit') },
         { type: 'separator' },
@@ -529,7 +657,7 @@ function buildMenu() {
       ],
     },
     { role: 'windowMenu' },
-  ];
+  ].filter(Boolean);
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
@@ -542,6 +670,9 @@ app.whenReady().then(() => {
     adblockEnabled = saved.settings.adblock !== false;
     loadedExtensionPaths = saved.settings.extensions || [];
   }
+  hub = new AgentHub({ getWindow: () => mainWindow, userDataDir: app.getPath('userData') });
+  assistant = new Assistant({ userDataDir: app.getPath('userData'), hub });
+  if (saved?.settings) hub.setConfig({ access: saved.settings.agentAccess || 'off', allowJs: !!saved.settings.agentAllowJs });
   buildMenu();
   createMainWindow();
   for (const url of pendingUrls) openExternalUrl(url);
@@ -551,6 +682,8 @@ app.whenReady().then(() => {
 
   app.on('activate', () => { if (!mainWindow) createMainWindow(); });
 });
+
+app.on('will-quit', () => { hub?.stopServer(); });
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();

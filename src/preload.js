@@ -27,6 +27,20 @@ contextBridge.exposeInMainWorld('meridian', {
   setDefaultBrowser: () => ipcRenderer.invoke('default-browser:set'),
   isDefaultBrowser: () => ipcRenderer.invoke('default-browser:is'),
 
+  agentConfig: (cfg) => ipcRenderer.invoke('agent:config', cfg),
+  agentStatus: () => ipcRenderer.invoke('agent:status'),
+  agentPause: (paused) => ipcRenderer.invoke('agent:pause', paused),
+  onAgentRpc: (fn) => ipcRenderer.on('agent:rpc', (_e, req) => fn(req)),
+  replyAgent: (payload) => ipcRenderer.send('agent:rpc-result', payload),
+  onAgentActivity: (fn) => ipcRenderer.on('agent:activity', (_e, a) => fn(a)),
+
+  aiHasKey: () => ipcRenderer.invoke('ai:has-key'),
+  aiSetKey: (key) => ipcRenderer.invoke('ai:set-key', key),
+  aiChat: (req) => ipcRenderer.send('ai:chat', req),
+  aiStop: (sessionId) => ipcRenderer.send('ai:stop', sessionId),
+  aiReset: (sessionId) => ipcRenderer.send('ai:reset', sessionId),
+  onAiEvent: (fn) => ipcRenderer.on('ai:event', (_e, ev) => fn(ev)),
+
   promoteMini: (url) => ipcRenderer.send('mini:promote', url),
   platform: process.platform,
 });

@@ -14,6 +14,19 @@ const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const params = new URLSearchParams(location.search);
 const MINI = params.get('mini') === '1';
+const IS_MAC = api.platform === 'darwin';
+
+// Shortcut labels are written Mac-style (⌘, ^); on Windows/Linux show Ctrl / Alt instead.
+function keys(text) {
+  if (IS_MAC) return text;
+  return text.replace(/\^(\d|1…9)/g, 'Alt+$1').replace(/\^⇧/g, 'Ctrl+Shift+').replace(/⇧⌘/g, 'Ctrl+Shift+').replace(/⌘/g, 'Ctrl+').replace(/⇧/g, 'Shift+').replace(/\^/g, 'Ctrl+');
+}
+function localizeKeys(root = document.body) {
+  if (IS_MAC || !root) return;
+  for (const el of root.querySelectorAll('[title]')) el.title = keys(el.title);
+  for (const el of root.querySelectorAll('.keys-text')) el.textContent = keys(el.textContent);
+  for (const el of root.querySelectorAll('kbd')) if (el.textContent === '⌘') el.textContent = 'Ctrl';
+}
 
 const SEARCH_ENGINES = {
   google: { name: 'Google', url: 'https://www.google.com/search?q=%s' },
@@ -55,7 +68,7 @@ function defaultState() {
     favorites: { default: [] },
     archive: [],
     history: {},
-    settings: { searchEngine: 'google', archiveAfterHours: 12, adblock: true, sidebarRight: false, sidebarHidden: false, extensions: [] },
+    settings: { searchEngine: 'google', archiveAfterHours: 12, adblock: true, sidebarRight: false, sidebarHidden: false, extensions: [], agentAccess: 'off', agentAllowJs: false, aiUseTools: true },
     onboarded: false,
   };
 }
@@ -133,7 +146,7 @@ function hostOf(url) {
 }
 function originOf(url) { try { return new URL(url).origin; } catch { return ''; } }
 function faviconFor(tab) {
-  if (tab.favicon) return tab.favicon;
+  if (tab.favicon && /^(https?|data):/i.test(tab.favicon)) return tab.favicon;
   const o = originOf(tab.url);
   return o.startsWith('http') ? o + '/favicon.ico' : '';
 }
@@ -574,10 +587,16 @@ function render() {
     renderFavorites(sp);
     renderSpacePage(sp);
     renderSpaceDots();
+    localizeKeys($('#sidebar'));
   } else {
     renderMiniBar();
   }
   layoutViews();
+  if (!MINI && document.body.classList.contains('ai-open')) {
+    const t = activeTab();
+    const chip = $('#ai-page-chip');
+    if (chip) { chip.textContent = t ? hostOf(tabUrl(t)) : 'no page'; chip.classList.toggle('off', !ai.includePage || !t); }
+  }
 }
 
 function applyTheme(sp) {
@@ -656,15 +675,17 @@ function tabRowHtml(t, sp, zone, depth) {
   const loaded = rt.views.has(t.id);
   const drifted = zone !== 'today' && t.currentUrl && t.currentUrl !== t.url;
   const inSplit = sp.split?.ids.includes(t.id);
+  const agentGlow = rt.agentGlow?.has(t.id);
   const audio = nav.audible || nav.muted
     ? `<button class="row-btn audio" data-act="mute" title="${nav.muted ? 'Unmute' : 'Mute'}">${icon(nav.muted ? 'mute' : 'speaker', 13)}</button>` : '';
   return `
-    <div class="row tab ${t.id === sp.activeTabId ? 'active' : ''} ${loaded ? 'loaded' : 'unloaded'} ${nav.loading ? 'loading' : ''} ${inSplit ? 'in-split' : ''}"
+    <div class="row tab ${t.id === sp.activeTabId ? 'active' : ''} ${loaded ? 'loaded' : 'unloaded'} ${nav.loading ? 'loading' : ''} ${inSplit ? 'in-split' : ''} ${agentGlow ? 'agent' : ''}"
          draggable="true" data-id="${t.id}" data-zone="${zone}" style="--depth:${depth}" title="${esc(tabUrl(t))}">
       ${drifted ? `<button class="row-btn reset" data-act="reset" title="Back to pinned URL">${icon('slash', 13)}</button>` : ''}
       ${faviconImg(t)}
       <span class="title">${esc(titleOf(t))}</span>
       ${inSplit ? `<span class="badge">${icon('split', 12)}</span>` : ''}
+      ${agentGlow ? `<span class="badge agent-badge" title="An AI agent is working in this tab">${icon('bolt', 12)}</span>` : ''}
       ${audio}
       <button class="row-btn close" data-act="close" title="${zone === 'today' ? 'Close' : 'Unload'} (⌘W)">${icon(zone === 'today' ? 'x' : 'x', 13)}</button>
     </div>`;
@@ -960,6 +981,8 @@ const COMMANDS = [
   { id: 'toggle-adblock', label: 'Toggle Ad Blocker', icon: 'shield' },
   { id: 'default-browser', label: 'Set Meridian as Default Browser', icon: 'globe' },
   { id: 'devtools', label: 'Developer Tools', icon: 'settings' },
+  { id: 'ai-panel', label: 'Ask AI about This Page', icon: 'bolt' },
+  { id: 'ai-summarize', label: 'Summarize Page with AI', icon: 'bolt' },
   { id: 'sidebar-side', label: 'Move Sidebar to Other Side', icon: 'sidebar' },
 ];
 
@@ -1195,6 +1218,7 @@ function showModal(html, onMount) {
   const close = () => { overlay.hidden = true; $('#modal').innerHTML = ''; };
   overlay.onmousedown = (e) => { if (e.target === overlay) { close(); overlay.dispatchEvent(new Event('dismiss')); } };
   onMount?.($('#modal'), close);
+  localizeKeys($('#modal'));
   return close;
 }
 
@@ -1281,8 +1305,12 @@ async function openSettings() {
   const s = state.settings;
   const isDefault = await api.isDefaultBrowser().catch(() => false);
   const arc = await api.arcAvailable().catch(() => false);
+  const aiHtml = await aiSettingsHtml();
   showModal(`
     <h3>Settings</h3>
+    <div class="settings-section">AI</div>
+    ${aiHtml}
+    <div class="settings-section">Browser</div>
     <label class="field"><span>Search engine</span>
       <select id="set-engine">${Object.entries(SEARCH_ENGINES).map(([k, v]) => `<option value="${k}" ${k === s.searchEngine ? 'selected' : ''}>${v.name}</option>`).join('')}</select>
     </label>
@@ -1317,6 +1345,7 @@ async function openSettings() {
       await api.clearProfileData(partitionFor(b.dataset.clear)); toast('Profile data cleared');
     });
     m.querySelector('[data-a="close"]').onclick = close;
+    bindAiSettings(m, () => { close(); openSettings(); });
   });
 }
 
@@ -1357,7 +1386,7 @@ async function onboarding() {
         ${arc ? '<button class="btn accent" data-a="import">Import from Arc</button>' : ''}
         <button class="btn" data-a="skip">${arc ? 'Start fresh' : 'Get started'}</button>
       </div>
-      <p class="muted small">⌘T new tab · ⌘L edit URL · ⌘S hide sidebar · ⌘D pin · ^⇧= split · ^1…9 spaces</p>
+      <p class="muted small keys-text">⌘T new tab · ⌘L edit URL · ⌘S hide sidebar · ⌘D pin · ^⇧= split · ^1…9 spaces · ⌘J ask AI</p>
     </div>
   `, (m, close) => {
     m.addEventListener('click', (e) => {
@@ -1424,6 +1453,8 @@ function runCommand(name, ...args) {
     case 'default-browser': return setDefaultBrowser();
     case 'devtools': { if (wv) api.openDevTools(wv.getWebContentsId()); return; }
     case 'open-url-tab': return openTab(args[0]);
+    case 'ai-panel': return MINI ? null : toggleAiPanel();
+    case 'ai-summarize': toggleAiPanel(true); return setTimeout(() => sendAi('Summarize this page.'), 100);
   }
 }
 
@@ -1485,6 +1516,8 @@ async function boot() {
     state.activeSpaceId = state.spaces[0].id;
   }
 
+  document.body.classList.add(IS_MAC ? 'plat-mac' : 'plat-other');
+  localizeKeys();
   initSidebar();
   initCommandBar();
   initPeek();
@@ -1511,6 +1544,7 @@ async function boot() {
   });
 
   if (MINI) return initMini();
+  initAi();
 
   const sp = space();
   if (sp.activeTabId && locate(sp.activeTabId)) activate(sp.activeTabId, { focus: true }); else render();
@@ -1519,4 +1553,5 @@ async function boot() {
   if (!state.onboarded) onboarding();
 }
 
-boot();
+// ai.js loads after this file; start once every script is in.
+window.addEventListener('DOMContentLoaded', boot);

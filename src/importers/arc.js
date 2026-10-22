@@ -7,11 +7,26 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 
-const ARC_DIR = path.join(os.homedir(), 'Library', 'Application Support', 'Arc');
-const SIDEBAR_FILE = path.join(ARC_DIR, 'StorableSidebar.json');
+// Arc for macOS keeps its data in Application Support; Arc for Windows is an MSIX package.
+function findSidebarFile() {
+  const candidates = [];
+  if (process.platform === 'darwin') {
+    candidates.push(path.join(os.homedir(), 'Library', 'Application Support', 'Arc', 'StorableSidebar.json'));
+  } else if (process.platform === 'win32') {
+    const local = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    try {
+      for (const pkg of fs.readdirSync(path.join(local, 'Packages'))) {
+        if (pkg.startsWith('TheBrowserCompany.Arc')) {
+          candidates.push(path.join(local, 'Packages', pkg, 'LocalCache', 'Local', 'Arc', 'StorableSidebar.json'));
+        }
+      }
+    } catch {}
+  }
+  return candidates.find((f) => fs.existsSync(f)) || null;
+}
 
 function arcDataExists() {
-  return fs.existsSync(SIDEBAR_FILE);
+  return !!findSidebarFile();
 }
 
 // Arc stores maps as flat arrays: [key, value, key, value, ...]
@@ -48,7 +63,9 @@ function spaceColor(customInfo) {
 const newId = () => crypto.randomUUID();
 
 function importFromArc() {
-  const raw = JSON.parse(fs.readFileSync(SIDEBAR_FILE, 'utf8'));
+  const file = findSidebarFile();
+  if (!file) throw new Error('Arc data not found on this computer');
+  const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
   const container = (raw.sidebar?.containers || []).find((c) => Array.isArray(c.items));
   if (!container) throw new Error('Unexpected Arc sidebar format');
 
