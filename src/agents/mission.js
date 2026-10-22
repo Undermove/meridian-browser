@@ -29,6 +29,8 @@ const WORKING = new Set(['starting', 'thinking', 'tool']);
 const LOG_MAX = 30;
 const HISTORY_MAX = 40;
 const LIVE_MAX = 300;
+const SUBTREE_MAX = 100;        // subagent nodes one session may create (hooks are agent-controlled)
+const NOTIFY_GAP_MS = 15_000;   // at most one "waiting" notification per session in this window
 const LINGER_MS = 20_000;       // finished sessions stay in the live tree this long
 const MCP_IDLE_MS = 10 * 60_000; // an MCP client with no calls for this long is considered gone
 const ASSISTANT_IDLE_MS = 3 * 60_000;
@@ -94,6 +96,7 @@ class MissionControl {
     this.tokenHashes = new Map(); // sha256(token)[0..16] -> nodeId (links MCP bridges to their session)
     this.calls = new Map();       // hub call id -> { nodeId, logEntry }
     this.notified = [];           // dev/test: notifications that would have been shown
+    this.lastNotify = new Map();  // root id -> time of its last waiting notification
     this.quiet = !app.isPackaged && (process.env.MERIDIAN_E2E_NO_FOCUS === '1' || !!process.env.MERIDIAN_SHOT || process.env.MERIDIAN_NO_NOTIFY === '1');
     this.channel = new EventChannel({ onEvent: (session, ev) => this.onHookEvent(session, ev) });
     this.loadHistory();
@@ -240,7 +243,7 @@ class MissionControl {
             where: root.where, label: ev.description || ev.subagentType || 'Subagent', sublabel: ev.subagentType, project: root.project,
             status: 'starting', statusText: ev.background ? 'Starting in background' : 'Starting', toolUseId: ev.toolUseId, subagentType: ev.subagentType, ownerWcId: root.ownerWcId, termId: root.termId,
           });
-          child.pending = true;
+          if (child) child.pending = true;
         }
         break;
       }
@@ -281,6 +284,7 @@ class MissionControl {
         let child = this.findChild(root, (n) => n.pending && !n.agentId && !n.endedAt && (!ev.agentType || !n.subagentType || n.subagentType === ev.agentType));
         if (!child) {
           child = this.addNode({ id: `${root.id}~agent~${ev.agentId}`, parentId: root.id, rootId: root.id, kind: 'subagent', source: 'claude', where: root.where, label: ev.agentType || 'Subagent', sublabel: ev.agentType, project: root.project, status: 'starting', ownerWcId: root.ownerWcId, termId: root.termId });
+          if (!child) break;
         }
         child.pending = false;
         child.agentId = ev.agentId;
@@ -361,10 +365,14 @@ class MissionControl {
     if (node) this.archive(node);
     const parentId = client.session && this.tokenHashes.get(client.session) || null;
     const parent = parentId && this.nodes.get(parentId);
-    const name = clean(client.name, 40) || 'MCP client';
+    // The client's name comes from the MCP client itself (anything holding the hub token can claim
+    // to be "Claude Code"), so it's always shown as self-reported. Only the session link is verified:
+    // the bridge proves it with a hash of that session's Mission token.
+    const name = clean(client.name, 40);
     return this.addNode({
       id, parentId: parent ? parent.id : null, rootId: parent ? parent.id : undefined, kind: 'client', source: 'mcp', where: 'mcp',
-      label: parent ? 'Meridian browser tools' : name, sublabel: parent ? name : 'MCP', project: parent?.project || null, status: 'idle', statusText: 'Connected',
+      label: parent ? 'Meridian browser tools' : (name || 'MCP client'), sublabel: name ? `${parent ? name + ' · ' : ''}self-reported name` : (parent ? null : 'MCP'),
+      selfReported: !!name, project: parent?.project || null, status: 'idle', statusText: 'Connected',
       ownerWcId: parent?.ownerWcId, termId: parent?.termId,
     });
   }
@@ -406,7 +414,14 @@ class MissionControl {
 
   // ---------- tree helpers ----------
 
+  // Returns null (nothing added) when an agent-driven node would exceed the caps: hook events and MCP
+  // client ids are attacker-influenced, and every node is re-sent to the UI on each change.
   addNode(n) {
+    if (n.kind === 'subagent' || n.kind === 'client') {
+      if (this.nodes.size >= LIVE_MAX) this.sweep(true);
+      if (this.nodes.size >= LIVE_MAX && !this.nodes.has(n.id)) return null;
+      if (n.kind === 'subagent' && n.rootId && !this.nodes.has(n.id) && this.descendants({ id: n.rootId }).length >= SUBTREE_MAX) return null;
+    }
     const node = {
       parentId: null, rootId: undefined, sublabel: null, project: null, statusText: null, tool: null, toolCalls: 0, errors: 0,
       startedAt: now(), endedAt: null, lastEventAt: now(), log: [], termId: null, ownerWcId: null, tabId: null, ...n,
@@ -451,6 +466,7 @@ class MissionControl {
     const sub = this.descendants(root);
     for (const n of sub) this.nodes.delete(n.id);
     this.nodes.delete(root.id);
+    this.lastNotify.delete(root.id);
     if (root.toolCalls === 0 && root.kind === 'client' && !sub.length) return; // an MCP bridge that only listed tools
     this.history.unshift({
       id: root.id, label: root.label, sublabel: root.sublabel, source: root.source, where: root.where, project: root.project,
@@ -500,7 +516,7 @@ class MissionControl {
       id: n.id, parentId: n.parentId, kind: n.kind, source: n.source, where: n.where, label: n.label, sublabel: n.sublabel,
       project: n.project, status: n.status, statusText: n.statusText, tool: n.tool, toolCalls: n.toolCalls, errors: n.errors,
       startedAt: n.startedAt, endedAt: n.endedAt, waitingSince: n.waitingSince || null, termId: n.termId, ownerWcId: n.ownerWcId, tabId: n.tabId,
-      turns: n.turns || 0, log: n.log.slice(-LOG_MAX),
+      turns: n.turns || 0, selfReported: !!n.selfReported, log: n.log.slice(-LOG_MAX),
     }));
     return { nodes, history: this.history.slice(0, HISTORY_MAX), counts: this.counts(), now: now() };
   }
@@ -525,6 +541,10 @@ class MissionControl {
   notifyWaiting(node) {
     const settings = this.getSettings() || {};
     const root = node.parentId ? this.nodes.get(node.rootId) : node;
+    // An agent can flip between waiting and working as fast as its hooks fire: throttle per session.
+    const key = root?.id || node.id;
+    if (now() - (this.lastNotify.get(key) || 0) < NOTIFY_GAP_MS) return;
+    this.lastNotify.set(key, now());
     const title = `${root?.label || node.label}${root?.project ? ' · ' + root.project : ''} is waiting for you`;
     const body = (node.statusText || (node !== root ? node.label : '') || 'It needs your input to continue.').slice(0, 200);
     const win = this.getMainWindow();

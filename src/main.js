@@ -817,7 +817,13 @@ function setupMission() {
     secretValues: (node) => workbench?.secretValuesFor?.(node.ownerWcId) || [],
   });
   mission.registerIpc(handleMain);
-  linkPreviews = new LinkPreviews({ assistant, getSettings: () => uiSnapshot?.settings || {}, isMainUi: isMainUiContents, isPrivatePartition: () => false, isInternal: isInternalContents });
+  linkPreviews = new LinkPreviews({ assistant, getSettings: () => uiSnapshot?.settings || {}, isMainUi: isMainUiContents,
+    // Private windows use in-memory partitions; profiles are persist:. (Their guests' host is also never the main UI.)
+    isPrivatePartition: (c) => { try { return !c.session.isPersistent(); } catch { return true; } },
+    isInternal: isInternalContents,
+    // Dev/test builds only: exact host:port pairs the preview may fetch even though they're local (the e2e fixture server).
+    allowHosts: DEV && process.env.MERIDIAN_TEST_PREVIEW_ALLOW ? process.env.MERIDIAN_TEST_PREVIEW_ALLOW.split(',').map((x) => x.trim()).filter(Boolean) : [],
+  });
   app.on('web-contents-created', (_e, contents) => { if (contents.getType() === 'webview' && !isInternalContents(contents)) linkPreviews.attach(contents); });
   if (DEV) global.__meridianMission = mission; // dev/test harness only
 }

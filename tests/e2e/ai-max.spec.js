@@ -12,9 +12,9 @@ test.beforeAll(async () => { mock = await startMockAnthropic(); });
 test.afterAll(async () => { await mock?.close(); });
 test.beforeEach(() => { mock.requests.length = 0; });
 
-async function launch(state) {
+async function launch(state, env = {}) {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mer-ai-'));
-  const m = await launchMeridian({ userDataDir, state, env: { ANTHROPIC_BASE_URL: mock.base, ANTHROPIC_API_KEY: 'test' } });
+  const m = await launchMeridian({ userDataDir, state, env: { ANTHROPIC_BASE_URL: mock.base, ANTHROPIC_API_KEY: 'test', ...env } });
   return { ...m, userDataDir, cleanup: async () => { await closeMeridian(m.app); fs.rmSync(userDataDir, { recursive: true, force: true }); } };
 }
 
@@ -94,7 +94,8 @@ test('Tidy Today: preview diff, nothing changes until Apply, partial accept', as
 });
 
 test('link preview: Shift over a link shows a Claude summary of the target page (only when enabled)', async ({ server }) => {
-  const m = await launch(seedState({ settings: { aiLinkPreview: false } }));
+  // The fixture server is local; previews refuse local targets except this dev/test allowance.
+  const m = await launch(seedState({ settings: { aiLinkPreview: false } }), { MERIDIAN_TEST_PREVIEW_ALLOW: new URL(server.other).host });
   try {
     const { page, app } = m;
     const id = await page.evaluate((u) => openTab(u).id, server.url('/links'));
@@ -145,5 +146,30 @@ test('link preview: Shift over a link shows a Claude summary of the target page 
     // Open in Peek from the card.
     await page.locator('#link-preview [data-a="peek"]').click();
     await expect(page.locator('#peek')).toBeVisible();
+  } finally { await m.cleanup(); }
+});
+
+test('link preview: no cookies, no local/private targets, redirects re-checked', async ({ server }) => {
+  const m = await launch(seedState({ settings: { aiLinkPreview: true } }), { MERIDIAN_TEST_PREVIEW_ALLOW: new URL(server.other).host });
+  try {
+    const { page } = m;
+    // A cookie for the (allowed) site in the profile the tab uses.
+    const id = await page.evaluate((u) => openTab(u).id, server.other + '/cookie/set?v=SECRET-COOKIE-VALUE');
+    await waitTabLoaded(page, id, server.other + '/cookie/set?v=SECRET-COOKIE-VALUE');
+    await page.evaluate(() => sendSnapshot());
+    await expect.poll(() => page.evaluate((u) => api.linkPreviewTest(u).then((r) => !!r), server.other + '/p/warm')).toBe(true);
+    mock.requests.length = 0;
+    const r = await page.evaluate((u) => api.linkPreviewTest(u), server.other + '/cookie/show');
+    expect(r.summary).toMatch(/fixture page/);
+    const sent = mock.requests.find((x) => /link-preview card/.test(x.body.system)).body.messages[0].content;
+    expect(sent).toContain('cookie=[]');
+    expect(sent).not.toContain('SECRET-COOKIE-VALUE');
+    // Loopback (127.0.0.1 is not the allowed host), a redirect into it, and non-http redirects: refused before any model call.
+    mock.requests.length = 0;
+    for (const u of [server.url('/p/local'), 'http://169.254.169.254/latest/meta-data/', server.other + '/redirect-to?u=' + encodeURIComponent(server.url('/p/local')), server.other + '/redirect-file']) {
+      const res = await page.evaluate((x) => api.linkPreviewTest(x), u);
+      expect(res?.error, u).toBeTruthy();
+    }
+    expect(mock.requests).toHaveLength(0);
   } finally { await m.cleanup(); }
 });

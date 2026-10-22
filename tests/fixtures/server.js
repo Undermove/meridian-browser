@@ -66,6 +66,7 @@ function routes(base) {
       <iframe id="fr" src="about:blank"></iframe>
       <script>window.__probe = { meridian: typeof window.meridian, require: typeof window.require, process: typeof window.process, electron: typeof window.electron };</script>`),
     '/redirect-file': (_url, _req, res) => { res.statusCode = 302; res.setHeader('Location', 'file:///etc/hosts'); return ''; },
+    '/redirect-to': (url, _req, res) => { res.statusCode = 302; res.setHeader('Location', url.searchParams.get('u') || '/'); return ''; },
     '/redirect-mailto': (_url, _req, res) => { res.statusCode = 302; res.setHeader('Location', 'mailto:x@example.com'); return ''; },
 
     // A page that swallows every key (like editors / games / web apps with global key handlers).

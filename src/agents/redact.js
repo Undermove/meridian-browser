@@ -29,6 +29,12 @@ function redact(text, secretValues = []) {
   s = s.replace(/([?&](?:access_token|token|key|api_key|apikey|secret|sig|signature|password|auth|code)=)[^&\s#"']+/gi, `$1${MASK}`);
   // -p<password> (mysql style) and --password <value>
   s = s.replace(/(--?(?:password|passwd|token|secret|api-key|apikey)(?:\s+|=))("[^"]*"|'[^']*'|\S+)/gi, `$1${MASK}`);
+  // curl -u user:pass / --user user:pass; mysql -pSECRET; docker login / sshpass -p SECRET.
+  s = s.replace(/((?:^|\s)(?:-u|--user)(?:\s+|=)["']?[^\s:"']+:)("[^"]*"|'[^']*'|[^\s"']+)/g, `$1${MASK}`);
+  s = s.replace(/(\b(?:mysql|mysqldump|mariadb|mysqladmin)\b[^|;&]*?\s-p)([^\s-][^\s]*)/gi, `$1${MASK}`);
+  s = s.replace(/(\b(?:(?:docker|podman|nerdctl|oras|skopeo|helm(?:\s+registry)?)\s+login|sshpass)\b[^|;&]*?\s-p\s+)("[^"]*"|'[^']*'|\S+)/gi, `$1${MASK}`);
+  // Stripe-style keys.
+  s = s.replace(/\b(?:sk|rk|pk|whsec)_(?:live|test)_[A-Za-z0-9]{10,}/g, MASK);
   // JWTs and long opaque strings (40+ chars of base64/hex) are almost never useful to show.
   s = s.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}/g, MASK);
   s = s.replace(/\b[A-Za-z0-9+/_-]{40,}={0,2}/g, (m) => (/^[a-f0-9]{40}$/i.test(m) ? m.slice(0, 10) : MASK)); // keep short git SHAs

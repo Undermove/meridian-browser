@@ -46,7 +46,7 @@ registerSection({
       ${group('Claude features', `
         ${row('Tidy Today', toggle('ai-tidy', s.aiTidy !== false), 'Claude suggests folders and shorter titles for your Today tabs (command bar → “Tidy Today”). You see a preview and choose what to apply.')}
         ${row('Ask Claude from the command bar', toggle('ai-ask-bar', s.aiAskFromBar !== false), 'Type a question in the command bar and pick “Ask Claude” to open it in ⌘J.')}
-        ${row('Link previews', toggle('ai-link-preview', s.aiLinkPreview === true), 'Hold ⇧ over a link to see a short summary of the page. Meridian loads the page in the background with that space’s profile (its cookies) and sends its text to Claude. Summaries are cached for 30 minutes. Never in private windows.')}
+        ${row('Link previews', toggle('ai-link-preview', s.aiLinkPreview === true), 'Hold ⇧ over a link to see a short summary of the page. Meridian loads the public page in the background without your cookies or logins and sends its text to Claude. Links to this computer or your local network are skipped. Summaries are cached for 30 minutes. Never in private windows.')}
       `, hasKey ? 'These use your Claude API key. Page text and tab titles are sent as untrusted content.' : 'Add a Claude API key above to use these.')}
       ${group('Mission Control', `
         ${row('Notify me when an agent is waiting', toggle('mission-notify', s.missionNotify !== false), 'A notification (or a toast while Meridian is in front) when Claude Code needs your permission or input. Mission Control (⇧⌘M) always shows it.')}
