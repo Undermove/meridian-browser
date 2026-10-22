@@ -5,12 +5,7 @@
  * Loaded after app.js and shares its globals (state, rt, space(), locate(), …).
  */
 
-const AGENT_ACCESS = [
-  ['off', 'Off', 'Agents can’t see or touch the browser.'],
-  ['read', 'Read only', 'Agents can list tabs, read pages and take screenshots.'],
-  ['ask', 'Ask before acting', 'Agents can also navigate, click and type — you confirm every action.'],
-  ['full', 'Full control', 'Agents act without asking. Only for agents you trust.'],
-];
+// AGENT_ACCESS (the access levels) is defined in agent-access.js, shared with the Settings window.
 
 // ---------------------------------------------------------------- 1. agent RPC
 
@@ -418,7 +413,7 @@ function initAiPanel() {
 
   $('#ai-close').onclick = () => toggleAiPanel(false);
   $('#ai-new').onclick = newAiChat;
-  $('#ai-open-settings').onclick = () => openSettings();
+  $('#ai-open-settings').onclick = () => openSettings('ai');
   $('#ai-send').onclick = () => { const i = $('#ai-input'); sendAi(i.value); i.value = ''; };
   $('#ai-stop').onclick = () => api.aiStop(ai.sessionId);
   $('#ai-page-chip').onclick = () => { ai.includePage = !ai.includePage; refreshAiPanel(); };
@@ -435,48 +430,7 @@ function initAiPanel() {
   api.onAiEvent(onAiEvent);
 }
 
-// ---------------------------------------------------------------- settings: AI section
-
-async function aiSettingsHtml() {
-  const s = state.settings;
-  const [hasKey, status] = await Promise.all([api.aiHasKey(), api.agentStatus()]);
-  return `
-    <div class="field col"><span>Claude API key <em class="muted">(stored encrypted in the system keychain)</em></span>
-      ${hasKey
-        ? `<div class="prof-row"><span class="muted">Key saved ✓</span><div class="grow"></div><button class="btn small" id="ai-key-remove">Remove</button></div>`
-        : `<div class="prof-row"><input class="text-input" id="ai-key" type="password" placeholder="sk-ant-…" autocomplete="off" spellcheck="false"><button class="btn small" id="ai-key-save">Save</button></div>`}
-    </div>
-    <div class="field col"><span>Agent access <em class="muted">(the ⌘J assistant and MCP clients like Claude Code)</em></span>
-      ${AGENT_ACCESS.map(([v, l, d]) => `<label class="radio-row"><input type="radio" name="agent-access" value="${v}" ${(s.agentAccess || 'off') === v ? 'checked' : ''}><span><b>${l}</b> <span class="muted">— ${d}</span></span></label>`).join('')}
-      <label class="field check"><input type="checkbox" id="agent-js" ${s.agentAllowJs ? 'checked' : ''}><span>Allow agents to run JavaScript in pages <span class="muted">(powerful — off unless you need it)</span></span></label>
-    </div>
-    <div class="field col"><span>Connect Claude Code (MCP)</span>
-      <code class="cmd-copy" id="mcp-cmd" title="Click to copy">${esc(status.mcp.claudeCode)}</code>
-      <span class="muted small">Then ask Claude Code things like “read my open GitHub tabs and summarize the PRs”. The agent only works while Meridian runs and agent access is on.</span>
-    </div>`;
-}
-
-function bindAiSettings(m, reopen) {
-  const s = state.settings;
-  $('#ai-key-save', m)?.addEventListener('click', async () => {
-    const v = $('#ai-key', m).value.trim();
-    if (!/^sk-ant-/.test(v)) return toast('That doesn’t look like an Anthropic API key (sk-ant-…)');
-    try { await api.aiSetKey(v); toast('API key saved'); reopen(); } catch (err) { toast('Could not save key: ' + err.message); }
-  });
-  $('#ai-key-remove', m)?.addEventListener('click', async () => { await api.aiSetKey(''); toast('API key removed'); reopen(); });
-  m.querySelectorAll('input[name="agent-access"]').forEach((r) => r.addEventListener('change', async () => {
-    if (r.value === 'full' && !(await confirmBox('Let AI agents click, type and navigate in your logged-in browser without asking?', 'Allow full control'))) { reopen(); return; }
-    s.agentAccess = r.value; save();
-    await api.agentConfig({ access: s.agentAccess, allowJs: s.agentAllowJs });
-    renderAgentBar(); refreshAiPanel();
-    toast(`Agent access: ${AGENT_ACCESS.find((x) => x[0] === r.value)[1]}`);
-  }));
-  $('#agent-js', m)?.addEventListener('change', async (e) => {
-    s.agentAllowJs = e.target.checked; save();
-    await api.agentConfig({ access: s.agentAccess || 'off', allowJs: s.agentAllowJs });
-  });
-  $('#mcp-cmd', m)?.addEventListener('click', (e) => { api.copy(e.target.textContent); toast('Command copied — paste it into your terminal'); });
-}
+// Settings → AI lives in the Settings window: see settings-ai.js.
 
 function initAi() {
   initAgentRpc();

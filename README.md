@@ -16,6 +16,9 @@ Arc is being sunset. Meridian keeps the Arc workflow you're used to (spaces, pin
 - **Split view** (`Ctrl+Shift+=`) with a draggable divider.
 - **Peek**: links from pinned tabs to other sites open in an overlay. Expand to a tab or a split.
 - **Little window**: links from other apps open in a small window. "Open in Meridian" moves them in.
+- **Air Traffic Control** (Settings → Links): route links from other apps by domain or URL pattern to a chosen space, or to the Little window.
+- **Private windows** (`⇧⌘N`): an in-memory profile; no history, cookies or site data survive closing the window.
+- **Archive** view (`⌥⌘A`) to browse, search and restore archived tabs; a downloads popover; a space theme editor with gradients and icons.
 - Hide the sidebar (`⌘S`) and reveal it by hovering the window edge. Sidebar can sit on the right.
 - Drag and drop tabs between favorites, pinned, folders and Today.
 - **Import from Arc**: spaces, colours, icons, pinned tabs, folders, favorites and Today tabs, read locally from Arc's sidebar file on macOS and Windows.
@@ -44,11 +47,11 @@ macOS builds are ad-hoc signed. To share them with other people, sign and notari
 
 ## Connect Claude Code (MCP)
 
-1. In Meridian open **Settings → AI** and pick an agent access level.
-2. Copy the command shown there, e.g.
+1. In Meridian open **Settings → AI** (or the welcome tour) and pick an agent access level.
+2. Click **Connect** next to Claude Code or Codex: Meridian shows the exact command and runs it after you confirm. Or run it yourself, e.g.
 
    ```bash
-   claude mcp add meridian -- node /path/to/meridian-browser/mcp/meridian-mcp.js
+   claude mcp add -s user meridian -- node /path/to/meridian-browser/mcp/meridian-mcp.js
    ```
 
    For Claude Desktop, add the same `command` / `args` to `claude_desktop_config.json`.
@@ -91,8 +94,13 @@ Found a vulnerability? Please open a private security advisory on GitHub.
 | Spaces | `⌃1…9`, `⌘⌥←/→` | `Alt+1…9`, `Ctrl+Alt+←/→` |
 | Tabs | `⌘1…9`, `⌃Tab` | `Ctrl+1…9`, `Ctrl+Tab` |
 | Copy URL | `⇧⌘C` | `Ctrl+Shift+C` |
-| New folder | `⇧⌘N` | `Ctrl+Shift+N` |
+| New folder | `⌥⇧⌘N` | `Ctrl+Alt+Shift+N` |
 | Little window | `⌘⌥N` | `Ctrl+Alt+N` |
+| Private window | `⇧⌘N` | `Ctrl+Shift+N` |
+| Archive / Downloads | `⌥⌘A` / `⇧⌘J` | `Ctrl+Alt+A` / `Ctrl+Shift+J` |
+| Settings / all shortcuts | `⌘,` / `⌘/` | `Ctrl+,` / `Ctrl+/` |
+
+Every shortcut can be changed in **Settings → Shortcuts**.
 
 ## Known limitations
 

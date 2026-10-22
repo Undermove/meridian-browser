@@ -14,6 +14,10 @@ const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const params = new URLSearchParams(location.search);
 const MINI = params.get('mini') === '1';
+// Private window: main hands us an in-memory partition; nothing here is ever saved.
+const PRIVATE_PARTITION = /^meridian-private-[\w-]+$/.test(params.get('private') || '') ? params.get('private') : '';
+const PRIVATE = !!PRIVATE_PARTITION;
+const EPHEMERAL = MINI || PRIVATE;
 const IS_MAC = api.platform === 'darwin';
 
 // Shortcut labels are written Mac-style (⌘, ^); on Windows/Linux show Ctrl / Alt instead.
@@ -88,7 +92,8 @@ function newSpace(name, icon, color, profileId) {
 const SAVE_DELAY = 1200, SAVE_MAX_WAIT = 5000, SLOW_SAVE_EVERY = 15000;
 const persist = { timer: null, first: 0, slowTimer: null, historyDirty: false, faviconsDirty: false };
 function save() {
-  if (MINI || !state) return;
+  if (EPHEMERAL || !state) return;
+  scheduleSnapshot();
   const t = now();
   if (!persist.timer) persist.first = t;
   clearTimeout(persist.timer);
@@ -97,7 +102,7 @@ function save() {
 function markHistoryDirty() { persist.historyDirty = true; scheduleSlowSave(); }
 function markFaviconsDirty() { persist.faviconsDirty = true; scheduleSlowSave(); }
 function scheduleSlowSave() {
-  if (MINI || persist.slowTimer) return;
+  if (EPHEMERAL || persist.slowTimer) return;
   persist.slowTimer = setTimeout(() => { persist.slowTimer = null; flushSave({ slow: true, state: false }); }, SLOW_SAVE_EVERY);
 }
 function saveParts({ slow = false, state: withState = true } = {}) {
@@ -107,7 +112,7 @@ function saveParts({ slow = false, state: withState = true } = {}) {
   return parts;
 }
 function flushSave(opts) {
-  if (MINI || !state) return;
+  if (EPHEMERAL || !state) return;
   if (opts?.state !== false) { clearTimeout(persist.timer); persist.timer = null; }
   const parts = saveParts(opts);
   if (parts.state || parts.history || parts.favicons) return api.saveState(parts);
@@ -121,11 +126,32 @@ function faviconMap() {
   for (const sp of state.spaces) { walk(sp.pinned, add); sp.today.forEach(add); }
   return out;
 }
-window.addEventListener('beforeunload', () => { if (!MINI && state) api.saveStateSync(saveParts({ slow: true })); });
+window.addEventListener('beforeunload', () => { if (!EPHEMERAL && state) api.saveStateSync(saveParts({ slow: true })); });
+
+// What main and the Settings window need to know about state (settings, profiles, spaces). Sent after
+// changes, coalesced; main forwards it to the Settings window and rebuilds menus from it.
+let snapshotTimer = null, lastSnapshot = '';
+function scheduleSnapshot() {
+  if (EPHEMERAL || snapshotTimer) return;
+  snapshotTimer = setTimeout(sendSnapshot, 60);
+}
+function sendSnapshot() {
+  snapshotTimer = null;
+  if (EPHEMERAL || !state) return;
+  const snap = {
+    settings: state.settings, profiles: state.profiles, activeSpaceId: state.activeSpaceId,
+    spaces: state.spaces.map((s) => ({ id: s.id, name: s.name, icon: s.icon, color: s.color, profileId: s.profileId })),
+    stats: { archive: state.archive.length, history: rt.historyCount ?? Object.keys(state.history).length },
+  };
+  const json = JSON.stringify(snap);
+  if (json === lastSnapshot) return;
+  lastSnapshot = json;
+  api.snapshot(snap);
+}
 
 const space = () => state.spaces.find((s) => s.id === state.activeSpaceId) || state.spaces[0];
 const favs = (sp = space()) => (state.favorites[sp.profileId] ||= []);
-const partitionFor = (profileId) => `persist:profile-${profileId}`;
+const partitionFor = (profileId) => (PRIVATE ? PRIVATE_PARTITION : `persist:profile-${profileId}`);
 
 function walk(nodes, fn, parent = null) {
   for (const n of nodes) {
@@ -376,6 +402,15 @@ function reopenTab() {
   activate(last.tab.id);
 }
 
+// The most recently archived tab (Today tabs that were closed, cleared or auto-archived).
+function reopenArchived(entry = state.archive[0]) {
+  if (!entry) return toast('The archive is empty');
+  state.archive = state.archive.filter((a) => a !== entry);
+  const sp = state.spaces.find((s) => s.id === entry.spaceId);
+  if (sp && sp.id !== state.activeSpaceId) switchSpace(sp.id);
+  openTab(entry.url);
+}
+
 function archiveTab(tab, sp) {
   state.archive.unshift({ url: tab.url, title: titleOf(tab), closedAt: now(), spaceId: sp.id });
   state.archive = state.archive.slice(0, 500);
@@ -605,42 +640,7 @@ async function createSpace() {
   switchSpace(sp.id, 1);
 }
 
-async function spaceMenu(sp) {
-  const choice = await api.popupMenu([
-    { id: 'rename', label: 'Rename…' },
-    { id: 'icon', label: 'Change icon (emoji)…' },
-    { label: 'Color', submenu: SPACE_COLORS.map((c, i) => ({ id: 'color:' + c, label: ['Lavender', 'Rose', 'Sand', 'Sage', 'Sky', 'Violet', 'Clay', 'Slate'][i], checked: sp.color === c })) },
-    { label: 'Profile', submenu: [
-      ...state.profiles.map((p) => ({ id: 'profile:' + p.id, label: p.name, checked: sp.profileId === p.id })),
-      { type: 'separator' },
-      { id: 'profile:new', label: 'New profile…' },
-    ] },
-    { type: 'separator' },
-    { id: 'left', label: 'Move left', enabled: state.spaces[0] !== sp },
-    { id: 'right', label: 'Move right', enabled: state.spaces.at(-1) !== sp },
-    { type: 'separator' },
-    { id: 'delete', label: 'Delete space…', enabled: state.spaces.length > 1 },
-  ]);
-  if (!choice) return;
-  if (choice === 'rename') { const v = await askText('Rename space', sp.name); if (v) sp.name = v; }
-  if (choice === 'icon') { const v = await askText('Space icon', sp.icon || '', 'Paste an emoji (empty = none)'); if (v != null) sp.icon = [...v.trim()].slice(0, 2).join('') || null; }
-  if (choice.startsWith('color:')) sp.color = choice.slice(6);
-  if (choice === 'profile:new') {
-    const name = await askText('New profile', sp.name, 'Profiles keep cookies & logins separate');
-    if (name) { const p = { id: uid().slice(0, 8), name }; state.profiles.push(p); state.favorites[p.id] = []; reassignProfile(sp, p.id); }
-  } else if (choice.startsWith('profile:')) reassignProfile(sp, choice.slice(8));
-  if (choice === 'left' || choice === 'right') {
-    const i = state.spaces.indexOf(sp); const j = i + (choice === 'left' ? -1 : 1);
-    [state.spaces[i], state.spaces[j]] = [state.spaces[j], state.spaces[i]];
-  }
-  if (choice === 'delete') {
-    if (!(await confirmBox(`Delete “${sp.name}” and its pinned tabs?`, 'Delete'))) return;
-    walk([...sp.pinned, ...sp.today], (n) => { if (n.type === 'tab') destroyView(n.id); });
-    state.spaces = state.spaces.filter((s) => s !== sp);
-    if (state.activeSpaceId === sp.id) state.activeSpaceId = state.spaces[0].id;
-  }
-  render(); save();
-}
+// Space context menu: spaceMenu() in menu.js.
 
 function reassignProfile(sp, profileId) {
   if (sp.profileId === profileId) return;
@@ -655,7 +655,7 @@ function reassignProfile(sp, profileId) {
 // ---------------------------------------------------------------- history
 
 function recordHistory(url, title) {
-  if (!url || !/^https?:/.test(url)) return;
+  if (PRIVATE || !url || !/^https?:/.test(url)) return;
   const h = state.history[url] || (state.history[url] = { url, title: '', count: 0, last: 0 });
   if (title) h.title = title;
   if (now() - h.last > 30_000) h.count++;
@@ -715,14 +715,20 @@ function syncChildren(container, els) {
   while (cursor) { const next = cursor.nextSibling; cursor.remove(); cursor = next; }
 }
 
+// A space's theme: `color`, plus an optional second colour `color2` for a gradient (Settings-free, set in
+// the theme editor). Private windows keep their own grey theme.
 function applyTheme(sp) {
-  const color = sp.color || SPACE_COLORS[0];
-  if (rt.themeColor === color) return;
+  const color = PRIVATE ? '#7d7d88' : sp.color || SPACE_COLORS[0];
+  const color2 = PRIVATE ? '#4a4a55' : sp.color2 || color;
+  const key = color + color2;
+  if (rt.themeColor === key) return;
   // No tint fade on the very first paint.
   if (!rt.themeColor) { document.documentElement.style.transition = 'none'; requestAnimationFrame(() => { document.documentElement.style.transition = ''; }); }
-  rt.themeColor = color;
-  document.documentElement.style.setProperty('--space', color);
-  document.documentElement.style.setProperty('--space-bg', color);
+  rt.themeColor = key;
+  const root = document.documentElement.style;
+  root.setProperty('--space', color);
+  root.setProperty('--space-bg', color);
+  root.setProperty('--space-bg2', color2);
 }
 
 function renderTopBar(sp) {
@@ -1071,6 +1077,8 @@ function initSidebar() {
   $$('[data-cmd]').forEach((b) => { if (b.dataset.cmd && !b.innerHTML.trim()) b.innerHTML = icon({ 'toggle-sidebar': 'sidebar', back: 'back', forward: 'forward', reload: 'reload', 'copy-url': 'copy' }[b.dataset.cmd] || 'plus'); });
   $('#btn-downloads').innerHTML = icon('download');
   $('#btn-add-space').innerHTML = icon('plus');
+  $$('[data-icon]').forEach((el) => { el.innerHTML = icon(el.dataset.icon, 15); });
+  if (EPHEMERAL) $$('.empty-act[data-cmd="ai-panel"], .empty-act[data-cmd="archive"]').forEach((el) => el.remove());
   $('.cmd-icon').innerHTML = icon('search', 18);
   $('#find-prev').innerHTML = icon('chevronUp', 14);
   $('#find-next').innerHTML = icon('chevronDown', 14);
@@ -1078,7 +1086,7 @@ function initSidebar() {
   $('#peek-split').innerHTML = icon('split', 14);
   $('#peek-expand').innerHTML = icon('expand', 14);
   $('#peek-close').innerHTML = icon('x', 14);
-  $('#empty-state .logo').innerHTML = `<svg width="56" height="56" viewBox="0 0 64 64"><path d="M10 50 A26 26 0 0 1 54 50" fill="none" stroke="var(--space)" stroke-width="7" stroke-linecap="round"/><circle cx="32" cy="50" r="4" fill="var(--space)"/></svg>`;
+  $('#empty-state .logo').innerHTML = `<svg width="56" height="56" viewBox="0 7 64 64"><path d="M10 50 A26 26 0 0 1 54 50" fill="none" stroke="var(--space)" stroke-width="7" stroke-linecap="round"/><circle cx="32" cy="50" r="4" fill="var(--space)"/></svg>`;
 
   document.addEventListener('click', (e) => {
     const cmdEl = e.target.closest('[data-cmd]');
@@ -1087,7 +1095,7 @@ function initSidebar() {
 
   $('#urlbar').addEventListener('click', (e) => { if (!e.target.closest('[data-cmd]')) openCommandBar('edit'); });
   $('#btn-add-space').addEventListener('click', createSpace);
-  $('#btn-downloads').addEventListener('click', showDownloadsMenu);
+  $('#btn-downloads').addEventListener('click', toggleDownloads);
 
   const sidebar = $('#sidebar');
   sidebar.addEventListener('click', (e) => {
@@ -1130,53 +1138,7 @@ function initSidebar() {
     if (row) renameNode(row.dataset.id);
   });
 
-  sidebar.addEventListener('contextmenu', async (e) => {
-    const dot = e.target.closest('.space-dot');
-    if (dot) { e.preventDefault(); return spaceMenu(state.spaces.find((s) => s.id === dot.dataset.space)); }
-    const row = e.target.closest('.row.tab, .fav, .row.folder');
-    e.preventDefault();
-    if (!row) {
-      const choice = await api.popupMenu([{ id: 'folder', label: 'New Folder' }, { id: 'tab', label: 'New Tab' }, { id: 'space', label: 'New Space…' }, { type: 'separator' }, { id: 'workbench', label: 'Open Project in Workbench…' }]);
-      if (choice === 'workbench') openWorkbench({ pickProject: true }); // Workbench integration
-      if (choice === 'folder') newFolder();
-      if (choice === 'tab') openCommandBar('new');
-      if (choice === 'space') createSpace();
-      return;
-    }
-    const id = row.dataset.id;
-    const l = locate(id);
-    if (!l) return;
-    if (l.node.type === 'folder') {
-      const choice = await api.popupMenu([{ id: 'rename', label: 'Rename…' }, { id: 'open', label: 'Open all in Today' }, { type: 'separator' }, { id: 'delete', label: 'Delete folder' }]);
-      if (choice === 'rename') renameNode(id);
-      if (choice === 'delete') deleteNode(id);
-      if (choice === 'open') walk(l.node.children, (n) => { if (n.type === 'tab') openTab(n.url, { background: true }); });
-      return;
-    }
-    const choice = await api.popupMenu([
-      { id: 'copy', label: 'Copy URL' },
-      { id: 'split', label: 'Open in Split View', enabled: space().activeTabId !== id },
-      { id: 'dup', label: 'Duplicate' },
-      { type: 'separator' },
-      l.zone === 'today' ? { id: 'pin', label: 'Pin Tab' } : { id: 'unpin', label: 'Unpin (move to Today)' },
-      { id: 'fav', label: 'Add to Favorites', enabled: l.zone !== 'fav' },
-      { id: 'rename', label: 'Rename…', enabled: l.zone !== 'today' },
-      { id: 'move', label: 'Move to Space', submenu: state.spaces.filter((s) => s.id !== state.activeSpaceId).map((s) => ({ id: 'move:' + s.id, label: s.name })) },
-      { type: 'separator' },
-      { id: 'unload', label: 'Unload', enabled: rt.views.has(id) },
-      { id: 'close', label: l.zone === 'today' ? 'Close Tab' : 'Delete from Sidebar' },
-    ]);
-    if (!choice) return;
-    if (choice === 'copy') { api.copy(tabUrl(l.node)); toast('Copied URL'); }
-    if (choice === 'split') splitWith(id);
-    if (choice === 'dup') openTab(tabUrl(l.node));
-    if (choice === 'pin' || choice === 'unpin') togglePin(id);
-    if (choice === 'fav') addFavorite(id);
-    if (choice === 'rename') renameNode(id);
-    if (choice === 'unload') { destroyView(id); if (space().activeTabId === id) { space().activeTabId = null; } render(); }
-    if (choice === 'close') { if (l.zone === 'today') closeTab(id); else deleteNode(id); }
-    if (choice.startsWith('move:')) moveToSpace(id, choice.slice(5));
-  });
+  sidebar.addEventListener('contextmenu', showSidebarMenu); // menu.js: tabs, folders, favorites, spaces, background
 
   initDragAndDrop();
   initSidebarResize();
@@ -1313,21 +1275,29 @@ function initDragAndDrop() {
 
 const COMMANDS = [
   { id: 'new-space', label: 'New Space', icon: 'layers' },
-  { id: 'new-folder', label: 'New Folder', icon: 'folder' },
-  { id: 'split', label: 'Split View', icon: 'split' },
-  { id: 'unsplit', label: 'Close Split View', icon: 'split' },
-  { id: 'toggle-sidebar', label: 'Toggle Sidebar', icon: 'sidebar' },
-  { id: 'copy-url', label: 'Copy URL', icon: 'copy' },
-  { id: 'toggle-pin', label: 'Pin / Unpin Tab', icon: 'pin' },
+  { id: 'new-folder', label: 'New Folder', icon: 'folder', keys: '⌥⇧⌘N' },
+  { id: 'split', label: 'Split View', icon: 'split', keys: '^⇧=' },
+  { id: 'unsplit', label: 'Close Split View', icon: 'split', keys: '^⇧-' },
+  { id: 'toggle-sidebar', label: 'Toggle Sidebar', icon: 'sidebar', keys: '⌘S' },
+  { id: 'copy-url', label: 'Copy URL', icon: 'copy', keys: '⇧⌘C' },
+  { id: 'toggle-pin', label: 'Pin / Unpin Tab', icon: 'pin', keys: '⌘D' },
+  { id: 'duplicate-tab', label: 'Duplicate Tab', icon: 'duplicate' },
   { id: 'favorite', label: 'Add to Favorites', icon: 'star' },
-  { id: 'clear-today', label: 'Clear Today Tabs', icon: 'archive' },
-  { id: 'settings', label: 'Settings', icon: 'settings' },
-  { id: 'import-arc', label: 'Import from Arc', icon: 'bolt' },
+  { id: 'clear-today', label: 'Clear Today Tabs', icon: 'wand', keys: '⇧⌘K' },
+  { id: 'archive', label: 'View Archive', icon: 'archive', keys: '⌥⌘A' },
+  { id: 'reopen-archived', label: 'Reopen Last Archived Tab', icon: 'restore' },
+  { id: 'downloads', label: 'Downloads', icon: 'download', keys: '⇧⌘J' },
+  { id: 'edit-theme', label: 'Edit Space Theme', icon: 'palette' },
+  { id: 'private-window', label: 'New Private Window', icon: 'incognito', keys: '⇧⌘N' },
+  { id: 'little-window', label: 'New Little Window', icon: 'littleWindow', keys: '⌥⌘N' },
+  { id: 'settings', label: 'Settings', icon: 'settings', keys: '⌘,' },
+  { id: 'import-arc', label: 'Import from Arc', icon: 'download' },
+  { id: 'onboarding', label: 'Welcome Tour', icon: 'sparkles' },
   { id: 'toggle-adblock', label: 'Toggle Ad Blocker', icon: 'shield' },
   { id: 'default-browser', label: 'Set Meridian as Default Browser', icon: 'globe' },
-  { id: 'devtools', label: 'Developer Tools', icon: 'settings' },
-  { id: 'ai-panel', label: 'Ask AI about This Page', icon: 'bolt' },
-  { id: 'ai-summarize', label: 'Summarize Page with AI', icon: 'bolt' },
+  { id: 'devtools', label: 'Developer Tools', icon: 'code', keys: '⌥⌘I' },
+  { id: 'ai-panel', label: 'Ask AI about This Page', icon: 'sparkles', keys: '⌘J' },
+  { id: 'ai-summarize', label: 'Summarize Page with AI', icon: 'sparkles' },
   { id: 'sidebar-side', label: 'Move Sidebar to Other Side', icon: 'sidebar' },
   // Workbench integration
   { id: 'open-workbench', label: 'Open Workbench', icon: 'code' },
@@ -1383,7 +1353,10 @@ function updateCommandResults() {
   if (mode !== 'split' && !MINI) {
     // Commands first when the query looks like one
     const cmds = COMMANDS.map((c) => ({ c, s: score(c.label, q) })).filter((x) => q && x.s >= 0).sort((a, b) => b.s - a.s).slice(0, 3);
-    for (const { c } of cmds) out.push({ kind: 'cmd', icon: c.icon, title: c.label, sub: 'Command', action: () => runCommand(c.id) });
+    for (const { c } of cmds) {
+      if (PRIVATE && ['settings', 'import-arc', 'onboarding', 'edit-theme', 'ai-panel', 'ai-summarize', 'open-workbench', 'open-project', 'new-space'].includes(c.id)) continue;
+      out.push({ kind: 'cmd', icon: c.icon, title: c.label, sub: 'Command', keys: c.keys, action: () => runCommand(c.id) });
+    }
   }
 
   if (!MINI) {
@@ -1459,6 +1432,7 @@ function drawCommandResults() {
       <span class="cmd-ic">${r.favicon ? faviconImg(r.favicon, 16) : icon(r.icon, 16)}</span>
       <span class="cmd-title">${esc(r.title)}</span>
       <span class="cmd-sub">${esc(r.sub || '')}</span>
+      ${r.keys ? `<span class="cmd-keys">${esc(keys(r.keys))}</span>` : ''}
       ${r.badge ? `<span class="cmd-badge">${esc(r.badge)} ↵</span>` : ''}
     </div>`).join('');
   selectCommandResult(rt.cmd.index);
@@ -1654,68 +1628,55 @@ function onDownload(d) {
     toast(`Download failed: ${d.name}`, { id: d.id, timeout: 4000 });
   }
   $('#btn-downloads').classList.toggle('active', rt.downloads.some((x) => x.state === 'progressing'));
-}
-
-async function showDownloadsMenu() {
-  if (!rt.downloads.length) return toast('No downloads yet');
-  const choice = await api.popupMenu(rt.downloads.map((d) => ({ id: d.path, label: `${d.name}  ${d.state === 'completed' ? fmtBytes(d.total) : d.state}` })));
-  if (choice) api.revealDownload(choice);
+  drawDownloads();
 }
 
 // ---------------------------------------------------------------- settings & import
 
-async function openSettings() {
+// Settings live in their own window (settings.html). It changes state through main, which forwards
+// validated patches here: this page stays the only writer of state.json.
+function openSettings(section) { if (!EPHEMERAL) api.openSettings(section); }
+
+function applySettingsPatch(patch) {
   const s = state.settings;
-  const isDefault = await api.isDefaultBrowser().catch(() => false);
-  const arc = await api.arcAvailable().catch(() => false);
-  const aiHtml = await aiSettingsHtml();
-  showModal(`
-    <h3>Settings</h3>
-    <div class="settings-section">AI</div>
-    ${aiHtml}
-    <div class="settings-section">Browser</div>
-    <label class="field"><span>Search engine</span>
-      <select id="set-engine">${Object.entries(SEARCH_ENGINES).map(([k, v]) => `<option value="${k}" ${k === s.searchEngine ? 'selected' : ''}>${v.name}</option>`).join('')}</select>
-    </label>
-    <label class="field"><span>Unload tabs not used for</span>
-      <select id="set-unload">${UNLOAD_OPTIONS.map(([m, l]) => `<option value="${m}" ${m === s.unloadAfterMinutes ? 'selected' : ''}>${l}</option>`).join('')}</select>
-    </label>
-    <label class="field"><span>Archive Today tabs after</span>
-      <select id="set-archive">${ARCHIVE_OPTIONS.map(([h, l]) => `<option value="${h}" ${h === s.archiveAfterHours ? 'selected' : ''}>${l}</option>`).join('')}</select>
-    </label>
-    <label class="field check"><input type="checkbox" id="set-adblock" ${s.adblock !== false ? 'checked' : ''}><span>Block ads &amp; trackers</span></label>
-    <label class="field check"><input type="checkbox" id="set-right" ${s.sidebarRight ? 'checked' : ''}><span>Sidebar on the right</span></label>
-    <div class="field"><span>Default browser</span>
-      ${isDefault ? '<span class="muted">Meridian is your default browser ✓</span>' : '<button class="btn" id="set-default">Make default</button>'}
-    </div>
-    <div class="field"><span>Arc</span><button class="btn" id="set-import" ${arc ? '' : 'disabled'}>${arc ? 'Import spaces &amp; pinned tabs' : 'Arc data not found'}</button></div>
-    <div class="field col"><span>Profiles</span>
-      ${state.profiles.map((p) => `<div class="prof-row"><span>${esc(p.name)}</span><span class="muted">${state.spaces.filter((x) => x.profileId === p.id).map((x) => esc(x.name)).join(', ') || 'unused'}</span><button class="btn small" data-clear="${esc(p.id)}">Clear cookies &amp; data</button></div>`).join('')}
-    </div>
-    <div class="field col"><span>Extensions <em class="muted">(experimental — no toolbar popups yet)</em></span>
-      ${(s.extensions || []).map((p, i) => `<div class="prof-row"><span title="${esc(p)}">${esc(p.split('/').slice(-2).join('/'))}</span><button class="btn small" data-rm-ext="${i}">Remove</button></div>`).join('')}
-      <button class="btn small" id="set-add-ext">Load unpacked extension…</button>
-    </div>
-    <div class="field"><span>Site permissions <span class="muted">(camera, mic, location, notifications…)</span></span><button class="btn small" id="set-reset-perms">Reset all</button></div>
-    <div class="modal-actions"><span class="muted grow">Meridian · the open-source Arc browser alternative</span><button class="btn accent" data-a="close">Done</button></div>
-  `, (m, close) => {
-    $('#set-engine', m).onchange = (e) => { s.searchEngine = e.target.value; save(); };
-    $('#set-archive', m).onchange = (e) => { s.archiveAfterHours = Number(e.target.value); save(); };
-    $('#set-unload', m).onchange = (e) => { s.unloadAfterMinutes = Number(e.target.value); save(); };
-    $('#set-adblock', m).onchange = (e) => { s.adblock = e.target.checked; api.setAdblock(s.adblock); save(); };
-    $('#set-right', m).onchange = (e) => { s.sidebarRight = e.target.checked; render(); save(); };
-    $('#set-default', m)?.addEventListener('click', setDefaultBrowser);
-    $('#set-import', m)?.addEventListener('click', () => { close(); importArc(); });
-    $('#set-reset-perms', m).onclick = async () => { await api.resetPermissions(); toast('Site permissions reset — sites will ask again'); };
-    $('#set-add-ext', m).onclick = async () => { const p = await api.pickExtension(); if (p) { s.extensions = [...(s.extensions || []), p]; await api.setExtensions(s.extensions); save(); close(); openSettings(); toast('Extension loaded'); } };
-    m.querySelectorAll('[data-rm-ext]').forEach((b) => b.onclick = () => { s.extensions.splice(Number(b.dataset.rmExt), 1); save(); close(); openSettings(); toast('Removed — restart Meridian to fully unload it'); });
-    m.querySelectorAll('[data-clear]').forEach((b) => b.onclick = async () => {
-      if (!(await confirmBox('Clear all cookies, logins and site data for this profile?', 'Clear'))) return;
-      await api.clearProfileData(partitionFor(b.dataset.clear)); toast('Profile data cleared');
-    });
-    m.querySelector('[data-a="close"]').onclick = close;
-    bindAiSettings(m, () => { close(); openSettings(); });
-  });
+  const changed = Object.keys(patch || {}).filter((k) => JSON.stringify(s[k]) !== JSON.stringify(patch[k]));
+  for (const k of changed) s[k] = patch[k];
+  if (changed.includes('adblock')) api.setAdblock(s.adblock);
+  if (changed.includes('extensions')) api.setExtensions(s.extensions);
+  if (changed.includes('agentAccess') || changed.includes('agentAllowJs')) {
+    api.agentConfig({ access: s.agentAccess || 'off', allowJs: !!s.agentAllowJs });
+    renderAgentBar(); refreshAiPanel();
+  }
+  if (changed.some((k) => k === 'sidebarRight' || k === 'sidebarHidden')) render();
+  if (changed.includes('archiveAfterHours')) autoArchive();
+  save();
+}
+
+async function runSettingsAction(name, arg = {}) {
+  const profile = arg.id && state.profiles.find((p) => p.id === arg.id);
+  switch (name) {
+    case 'profile-rename': if (profile && arg.name) profile.name = arg.name.trim().slice(0, 60) || profile.name; break;
+    case 'profile-add': {
+      const p = { id: uid().slice(0, 8), name: (arg.name || 'New Profile').trim().slice(0, 60) };
+      state.profiles.push(p); state.favorites[p.id] = [];
+      break;
+    }
+    case 'profile-delete': {
+      if (!profile || profile.id === 'default' || state.spaces.some((sp) => sp.profileId === profile.id)) return;
+      for (const t of state.favorites[profile.id] || []) destroyView(t.id);
+      delete state.favorites[profile.id];
+      state.profiles = state.profiles.filter((p) => p !== profile);
+      api.clearProfileData(partitionFor(profile.id));
+      break;
+    }
+    case 'import-arc': return importArc();
+    case 'clear-archive': state.archive = []; break;
+    case 'clear-history': state.history = {}; persist.historyDirty = true; flushSave({ slow: true }); toast('History cleared'); break;
+    case 'onboarding': return startOnboarding();
+    case 'edit-theme': return openThemeEditor(space());
+    default: return;
+  }
+  render(); save();
 }
 
 async function setDefaultBrowser() {
@@ -1726,7 +1687,7 @@ async function setDefaultBrowser() {
 
 async function importArc() {
   let data;
-  try { data = await api.importArc(); } catch (err) { return toast('Arc import failed: ' + err.message, { timeout: 5000 }); }
+  try { data = await api.importArc(); } catch (err) { toast('Arc import failed: ' + err.message, { timeout: 5000 }); return null; }
   // Replace the pristine starter space; otherwise append.
   const pristine = state.spaces.length === 1 && !state.spaces[0].pinned.length && !state.spaces[0].today.length;
   if (pristine) state.spaces = [];
@@ -1740,31 +1701,7 @@ async function importArc() {
   render(); save();
   const tabs = data.spaces.reduce((a, s) => { let c = s.today.length; walk(s.pinned, (n) => { if (n.type === 'tab') c++; }); return a + c; }, 0);
   toast(`Imported ${data.spaces.length} spaces and ${tabs} tabs from Arc. Logins don’t transfer — sign in once per profile.`, { timeout: 7000 });
-}
-
-async function onboarding() {
-  state.onboarded = true; save();
-  const arc = await api.arcAvailable().catch(() => false);
-  showModal(`
-    <div class="welcome">
-      <svg width="64" height="64" viewBox="0 0 64 64"><path d="M10 50 A26 26 0 0 1 54 50" fill="none" stroke="var(--space)" stroke-width="7" stroke-linecap="round"/><circle cx="32" cy="50" r="4" fill="var(--space)"/></svg>
-      <h2>Welcome to Meridian</h2>
-      <p class="muted">Spaces, pinned tabs, a Today list that tidies itself, split view, Peek and a command bar — the Arc workflow, open source.</p>
-      ${arc ? '<p>We found your Arc data on this Mac. Bring over your spaces, pinned tabs, folders and favorites?</p>' : ''}
-      <div class="modal-actions center">
-        ${arc ? '<button class="btn accent" data-a="import">Import from Arc</button>' : ''}
-        <button class="btn" data-a="skip">${arc ? 'Start fresh' : 'Get started'}</button>
-      </div>
-      <p class="muted small keys-text">⌘T new tab · ⌘L edit URL · ⌘S hide sidebar · ⌘D pin · ^⇧= split · ^1…9 spaces · ⌘J ask AI</p>
-    </div>
-  `, (m, close) => {
-    m.addEventListener('click', (e) => {
-      const a = e.target.closest('[data-a]')?.dataset.a;
-      if (!a) return;
-      close();
-      if (a === 'import') importArc();
-    });
-  });
+  return { spaces: data.spaces.length, tabs };
 }
 
 // ---------------------------------------------------------------- commands (menu accelerators land here)
@@ -1773,6 +1710,8 @@ function webview() { const t = activeTab(); return t ? rt.views.get(t.id) : null
 
 function runCommand(name, ...args) {
   const wv = webview();
+  // The welcome tour turns the shortcuts it teaches into "try it" checkmarks while it's open.
+  if (typeof onboardingIntercept === 'function' && onboardingIntercept(name, ...args)) return;
   switch (name) {
     case 'command-bar': return openCommandBar('new');
     case 'edit-url': return openCommandBar('edit');
@@ -1813,18 +1752,38 @@ function runCommand(name, ...args) {
     case 'tab-index': return tabByIndex(args[0]);
     case 'tab-step': return stepTab(args[0]);
     case 'clear-today': return clearToday();
-    case 'settings': return openSettings();
-    case 'import-arc': return importArc();
+    case 'settings': return openSettings(args[0]);
+    case 'settings-patch': return EPHEMERAL ? null : applySettingsPatch(args[0] || {});
+    case 'settings-action': return EPHEMERAL ? null : runSettingsAction(args[0], args[1] || {});
+    case 'import-arc': return EPHEMERAL ? null : importArc();
+    case 'onboarding': return EPHEMERAL ? null : startOnboarding();
+    case 'private-window': return api.openWindow('private');
+    case 'little-window': return api.openWindow('little');
+    case 'duplicate-tab': { const t = activeTab(); if (t && !isWorkbenchTab(t)) openTab(tabUrl(t), { after: locate(t.id)?.zone === 'today' ? t.id : null }); return; }
+    case 'archive': return MINI ? null : openArchive();
+    case 'reopen-archived': return reopenArchived();
+    case 'downloads': return MINI ? null : toggleDownloads();
+    case 'edit-theme': return EPHEMERAL ? null : openThemeEditor(space());
+    case 'space-select': { const i = state.spaces.findIndex((s) => s.id === args[0]); if (i >= 0) switchSpace(args[0], Math.sign(i - state.spaces.indexOf(space()))); return; }
+    case 'open-url-in-space': {
+      const sp = state.spaces.find((s) => s.id === args[0]);
+      if (sp && sp.id !== state.activeSpaceId) switchSpace(sp.id);
+      return openTab(args[1]);
+    }
+    case 'extension-add': {
+      const list = state.settings.extensions || [];
+      if (typeof args[0] === 'string' && !list.includes(args[0])) applySettingsPatch({ extensions: [...list, args[0]] });
+      return toast('Extension loaded');
+    }
     case 'toggle-adblock':
-      state.settings.adblock = state.settings.adblock === false;
-      api.setAdblock(state.settings.adblock); save();
+      applySettingsPatch({ adblock: state.settings.adblock === false });
       return toast(state.settings.adblock ? 'Ad blocker on' : 'Ad blocker off');
     case 'default-browser': return setDefaultBrowser();
     case 'devtools': { if (wv) api.openDevTools(wv.getWebContentsId()); return; }
     case 'open-url-tab': return openTab(args[0]);
-    case 'ai-panel': return MINI ? null : toggleAiPanel();
-    case 'open-workbench': return MINI ? null : openWorkbench(); // Workbench integration
-    case 'open-project': return MINI ? null : openWorkbench({ pickProject: true });
+    case 'ai-panel': return EPHEMERAL ? null : toggleAiPanel();
+    case 'open-workbench': return EPHEMERAL ? null : openWorkbench(); // Workbench integration
+    case 'open-project': return EPHEMERAL ? null : openWorkbench({ pickProject: true });
     case 'ai-summarize': toggleAiPanel(true); return setTimeout(() => sendAi('Summarize this page.', { allowTools: false }), 100);
   }
 }
@@ -1897,6 +1856,14 @@ async function boot() {
     state = { ...state, spaces: [newSpace('Little', null, space().color, 'default')], favorites: { default: [] } };
     state.activeSpaceId = state.spaces[0].id;
   }
+  if (PRIVATE) {
+    // Only the search engine carries over; no tabs, history or archive in or out.
+    const d = defaultState();
+    state = { ...d, settings: { ...d.settings, searchEngine: state.settings.searchEngine, sidebarRight: state.settings.sidebarRight }, onboarded: true, profiles: [{ id: 'private', name: 'Private' }], favorites: { private: [] } };
+    state.spaces = [newSpace('Private', null, '#7d7d88', 'private')];
+    state.activeSpaceId = state.spaces[0].id;
+    document.body.classList.add('private');
+  }
 
   document.body.classList.add(IS_MAC ? 'plat-mac' : 'plat-other');
   localizeKeys();
@@ -1927,8 +1894,9 @@ async function boot() {
   });
 
   if (MINI) return initMini();
-  initAi();
+  if (!PRIVATE) initAi(); // agents never see private windows
   initSpaceSwipe();
+  initPolish();
 
   const sp = space();
   if (sp.activeTabId && locate(sp.activeTabId)) activate(sp.activeTabId, { focus: true }); else render();
@@ -1936,7 +1904,8 @@ async function boot() {
   autoArchive();
   setInterval(autoArchive, 10 * 60 * 1000);
   setInterval(unloadIdleTabs, 60 * 1000);
-  if (!state.onboarded) onboarding();
+  sendSnapshot();
+  if (!state.onboarded && !PRIVATE) startOnboarding();
 }
 
 // ai.js loads after this file; start once every script is in.
