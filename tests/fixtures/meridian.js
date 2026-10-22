@@ -135,7 +135,7 @@ async function mainWindow(app) {
   while (Date.now() < deadline) {
     for (const w of app.windows()) {
       const u = w.url();
-      if (u.includes('renderer/index.html') && !u.includes('mini=1')) return w;
+      if ((u.includes('renderer/index.html') || u.startsWith('meridian://app/index.html')) && !u.includes('mini=1') && !u.includes('private=')) return w;
     }
     await app.waitForEvent('window', { timeout: 2000 }).catch(() => {});
   }

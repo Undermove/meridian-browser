@@ -198,7 +198,7 @@ class AgentHub {
 
   // ---------- tool execution ----------
 
-  async call(name, input = {}, { source = 'mcp' } = {}) {
+  async call(name, input = {}, { source = 'mcp', client = null, runId = null } = {}) {
     const tool = Object.hasOwn(byName, name) ? byName[name] : null;
     if (!tool) throw new Error(`unknown tool: ${name}`);
     const access = this.config.access;
@@ -210,8 +210,17 @@ class AgentHub {
     if (bad) throw new Error(`invalid input: ${bad}`);
 
     const ctx = { source, tool: name };
-    const result = await this[`t_${name}`](input, ctx);
-    return result;
+    // Mission Control: every accepted call is reported (start/end) to the observer, if any.
+    const callId = crypto.randomUUID();
+    try { this.observer?.hubCallStart(callId, name, input, { source, client, runId }); } catch {}
+    let ok = false;
+    try {
+      const result = await this[`t_${name}`](input, ctx);
+      ok = true;
+      return result;
+    } finally {
+      try { this.observer?.hubCallEnd(callId, { ok, tabId: ctx.tabId || null }); } catch {}
+    }
   }
 
   async confirm(ctx, summary, tabInfo) {
@@ -236,6 +245,7 @@ class AgentHub {
     if (!wc || wc.isDestroyed()) throw new Error('tab is not available');
     if (wc.getType() !== 'webview' || this.isProtected(wc)) throw new Error('this tab is not available to agents');
     this.currentTab = info.tabId;
+    ctx.tabId = info.tabId;
     await this.waitForLoad(wc, 15_000);
     this.activity({ tabId: info.tabId, tool: ctx.tool, source: ctx.source, host: hostOf(wc.getURL()) });
     return { wc, info };
@@ -293,6 +303,7 @@ class AgentHub {
     await this.confirm(ctx, `open ${url}`);
     const r = await this.rpc('open_tab', { url, space_id, activate });
     this.currentTab = r.tabId;
+    ctx.tabId = r.tabId;
     const wc = webContents.fromId(r.wcId);
     if (wc) await this.waitForLoad(wc, 15_000);
     this.activity({ tabId: r.tabId, tool: ctx.tool, source: ctx.source, host: hostOf(r.url) });
@@ -511,7 +522,7 @@ class AgentHub {
       }
       if (req.url === '/v1/call') {
         try {
-          const content = await this.call(String(body.name), body.input || {}, { source: 'mcp' });
+          const content = await this.call(String(body.name), body.input || {}, { source: 'mcp', client: clientOf(req) });
           return send(200, { content });
         } catch (err) {
           return send(200, { error: err.message });
@@ -528,6 +539,18 @@ class AgentHub {
       : t.access === 'write' ? rank >= ACCESS_RANK.ask
       : rank >= ACCESS_RANK.ask && this.config.allowJs);
   }
+}
+
+// Mission Control: which MCP bridge is calling (sent by mcp/meridian-mcp.js; only after token auth).
+//   x-meridian-client: random id per bridge process; x-meridian-client-name: the MCP client's name;
+//   x-meridian-session: sha256 prefix of the Workbench session's Mission token, if it started the bridge.
+function clientOf(req) {
+  const h = (k, re) => { const v = String(req.headers[k] || ''); return re.test(v) ? v : null; };
+  return {
+    id: h('x-meridian-client', /^[\w-]{6,64}$/),
+    name: h('x-meridian-client-name', /^[\w .@/()+-]{1,60}$/),
+    session: h('x-meridian-session', /^[a-f0-9]{32}$/),
+  };
 }
 
 const text = (t) => [{ type: 'text', text: t }];

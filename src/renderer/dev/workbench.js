@@ -985,6 +985,9 @@ function onHostCommand(msg) {
     if (!S.project && typeof msg.project === 'string') openRecent(msg.project);
   }
   if (msg.type === 'pick-project') pickProject();
+  // Mission Control: "Open terminal" on an agent node, and the live counts for the topbar chip.
+  if (msg.type === 'focus-term') { const t = S.terms.find((x) => x.id === String(msg.id)); if (t) { $('#term-area').classList.remove('collapsed'); activateTerm(t); } }
+  if (msg.type === 'mission' && typeof missionChip === 'function') missionChip(msg);
   if (typeof proHostCommand === 'function') proHostCommand(msg); // Workbench Pro: new-hub, customize, safe-mode
 }
 

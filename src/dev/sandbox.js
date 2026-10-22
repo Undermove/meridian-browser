@@ -86,7 +86,10 @@ class Sandbox {
   invalidate() { this.cache = null; }
 
   // Launch spec for node-pty. Builds the image first (in the terminal, with progress) if needed.
-  async launchSpec(kind, { root, secretNames = [], network = true }) {
+  // mission (optional, Mission Control): { dir, target, env, args } from MissionControl.sandboxMount():
+  // a per-session dir with the event hook, mounted read-write; the channel token is passed like a
+  // secret (bare `-e MERIDIAN_MISSION_TOKEN`, value in the docker CLI's environment).
+  async launchSpec(kind, { root, secretNames = [], network = true, mission = null }) {
     const k = KINDS[kind];
     if (!k) throw new Error('unknown sandbox');
     const st = await this.status({ fresh: true });
@@ -127,7 +130,12 @@ class Sandbox {
     const names = secretNames.filter((n) => NAME_RE.test(n));
     for (const n of names) args.push('-e', n); // value comes from the docker CLI's environment
     if (!network) args.push('--network', 'none');
-    args.push(st.image, ...k.cmd);
+    if (mission && path.isAbsolute(mission.dir) && !/[,\n\r\0]/.test(mission.dir)) {
+      args.push('--mount', `type=bind,source=${mission.dir},target=${mission.target}`);
+      for (const [n, v] of Object.entries(mission.env || {})) args.push('-e', `${n}=${v}`);
+      args.push('-e', 'MERIDIAN_MISSION_TOKEN');
+      args.push(st.image, ...k.cmd, ...(mission.args || []));
+    } else args.push(st.image, ...k.cmd);
 
     const notes = [`Sandbox: only this project is mounted (at /workspace); ${network ? 'network on' : 'no network'}; limits ${LIMITS.cpus} CPUs, ${LIMITS.memory} RAM.`];
     const missing = k.needs.filter((n) => !names.includes(n));

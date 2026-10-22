@@ -37,6 +37,7 @@ const { Customizations } = require('./custom');
 const { TEMPLATES, createHub, hubInfo } = require('./hubs');
 const { which } = require('./env');
 const { NAME_RE } = require('../renderer/dev/secret-detect');
+const { mergeClaudeSettings } = require('../agents/mission');
 
 // ---------- URLs and the partition ----------
 // The page is served from meridian://workbench/ by a protocol handler registered ONLY on the internal
@@ -135,8 +136,9 @@ function prepareInternalSession() {
 // ---------- the service ----------
 
 class Workbench {
-  constructor({ app, getMainWindow, isUiContents, mcpCommand, agentStatus }) {
+  constructor({ app, getMainWindow, isUiContents, mcpCommand, agentStatus, mission = null }) {
     this.app = app;
+    this.mission = mission; // Mission Control (src/agents/mission.js)
     this.getMainWindow = getMainWindow;
     this.isUiContents = isUiContents;
     this.mcpCommand = mcpCommand;
@@ -322,46 +324,68 @@ class Workbench {
     handle('wb:pty-create', async (owner, opts = {}) => {
       const p = project(owner);
       const kind = ['shell', 'claude', 'codex', 'gemini', ...Object.keys(SANDBOX_KINDS)].includes(opts.kind) ? opts.kind : 'shell';
-      const searchPath = await loginPath();
+      const searchPath = this.agentSearchPath(await loginPath());
       // Workbench Pro: vault secrets for this project go into the environment (names are shown, values never).
       const secrets = this.vault.envFor(p.root);
       const extra = { ...secrets };
       let names = Object.keys(secrets).sort();
       let spec;
       let guardToken = null;
-      if (SANDBOX_KINDS[kind]) {
-        spec = await this.sandbox.launchSpec(kind, { root: p.root, secretNames: names, network: this.readStore().sandboxNetwork !== false });
-        if (spec.then) { for (const n of names) delete extra[n]; names = []; } // the image build gets no secrets
-      } else {
-        let claudeSettings = null;
-        if (kind === 'claude') {
-          const node = which('node', searchPath);
-          const script = this.guard.hookScript();
-          claudeSettings = node && script ? hookSettings(node, script) : null;
-          if (claudeSettings) {
-            try {
-              await this.guard.start();
-              guardToken = this.guard.register({ owner, root: p.root, agent: 'Claude Code' });
-              extra.MERIDIAN_GUARD_SOCKET = this.guard.socketPath;
-              extra.MERIDIAN_GUARD_TOKEN = guardToken;
-            } catch { claudeSettings = null; }
-          }
-        }
-        spec = launchSpec(kind, { searchPath, mcp: this.mcpCommand(), dataDir: this.app.getPath('userData'), claudeSettings });
-        if (kind === 'claude' && !guardToken) spec.notes.push('Secret-file guard is off for this session (Node.js was not found on your PATH).');
+      // Mission Control: a live node + a private event channel for agent sessions (never for shells).
+      let mission = null;
+      if (this.mission && /^(claude|codex|gemini|sandbox-claude|sandbox-codex)$/.test(kind)) {
+        try { mission = await this.mission.registerTerminal({ kind, project: p.name, ownerWcId: owner.wc.id, sandbox: !!SANDBOX_KINDS[kind] }); } catch (err) { console.warn('mission control:', err.message); }
       }
+      const missionDone = (info) => { if (mission) this.mission.terminalExit(mission.token, mission.nodeId, info); mission = mission && { ...mission, ended: true }; };
+      try {
+        if (SANDBOX_KINDS[kind]) {
+          const mount = mission?.token ? this.mission.sandboxMount(mission.token, kind) : null;
+          spec = await this.sandbox.launchSpec(kind, { root: p.root, secretNames: names, network: this.readStore().sandboxNetwork !== false, mission: mount });
+          if (spec.then) { for (const n of names) delete extra[n]; names = []; this.mission.discard(mission?.token, mission?.nodeId); mission = null; } // the image build gets no secrets
+          else if (mount && mission) extra.MERIDIAN_MISSION_TOKEN = mission.token;
+        } else {
+          let claudeSettings = null;
+          const node = (kind === 'claude' || kind === 'codex') ? which('node', searchPath) : null;
+          if (kind === 'claude') {
+            const script = this.guard.hookScript();
+            claudeSettings = node && script ? hookSettings(node, script) : null;
+            if (claudeSettings) {
+              try {
+                await this.guard.start();
+                guardToken = this.guard.register({ owner, root: p.root, agent: 'Claude Code' });
+                extra.MERIDIAN_GUARD_SOCKET = this.guard.socketPath;
+                extra.MERIDIAN_GUARD_TOKEN = guardToken;
+              } catch { claudeSettings = null; }
+            }
+            // Merge, never replace: the guard's blocking hook and Mission Control's async observer hooks.
+            if (mission?.env.MERIDIAN_MISSION_SOCKET) claudeSettings = mergeClaudeSettings(claudeSettings, this.mission.claudeSettingsFor(node));
+          }
+          const codexNotify = kind === 'codex' && mission?.env.MERIDIAN_MISSION_SOCKET ? this.mission.codexNotifyArg(node) : null;
+          if (mission) Object.assign(extra, mission.env);
+          spec = launchSpec(kind, { searchPath, mcp: this.mcpCommand(), dataDir: this.app.getPath('userData'), claudeSettings, codexNotify });
+          if (kind === 'claude' && !guardToken) spec.notes.push('Secret-file guard is off for this session (Node.js was not found on your PATH).');
+        }
+      } catch (err) { missionDone({ code: 1 }); throw err; }
       const env = await childEnv(extra);
-      const meta = { secrets: names, guard: !!guardToken, sandbox: !!SANDBOX_KINDS[kind] && !spec.then, then: spec.then || null };
-      const info = this.ptys.create(owner.wc, {
-        kind, title: spec.title, file: spec.file, args: spec.args, cwd: p.root, env, cols: opts.cols, rows: opts.rows, cleanup: spec.cleanup, meta,
-        onExit: () => { if (guardToken) this.guard.unregister(guardToken); spec.onExit?.(); },
-        onKill: () => { if (guardToken) this.guard.unregister(guardToken); spec.onKill?.(); },
-      });
+      const meta = { secrets: names, guard: !!guardToken, sandbox: !!SANDBOX_KINDS[kind] && !spec.then, then: spec.then || null, missionNode: mission?.nodeId || null };
+      let info;
+      try {
+        info = this.ptys.create(owner.wc, {
+          kind, title: spec.title, file: spec.file, args: spec.args, cwd: p.root, env, cols: opts.cols, rows: opts.rows, cleanup: spec.cleanup, meta,
+          onExit: (ex) => { if (guardToken) this.guard.unregister(guardToken); missionDone({ code: ex?.code, killed: !!ex?.signal }); spec.onExit?.(); },
+          onKill: () => { if (guardToken) this.guard.unregister(guardToken); missionDone({ killed: true }); spec.onKill?.(); },
+        });
+      } catch (err) { missionDone({ code: 1 }); throw err; }
+      if (mission) this.mission.attachTerminal(mission.token, info.id, mission.nodeId);
       return { ...info, notes: spec.notes, browserTools: !!spec.browserTools };
     });
     handle('wb:pty-list', (owner) => this.ptys.list(owner.wc));
     handle('wb:pty-kill', (owner, id) => { this.ptys.kill(owner.wc, id); return true; });
-    on('wb:pty-write', (owner, id, data) => this.ptys.write(owner.wc, id, data));
+    on('wb:pty-write', (owner, id, data) => {
+      this.ptys.write(owner.wc, id, data);
+      // Mission Control: Enter in an agent terminal starts a turn (Codex has no per-tool hooks).
+      if (this.mission && typeof data === 'string' && data.includes('\r')) { const n = this.ptys.get(owner.wc, id)?.meta?.missionNode; if (n) this.mission.terminalInput(n, data); }
+    });
     on('wb:pty-resize', (owner, id, cols, rows) => this.ptys.resize(owner.wc, id, cols, rows));
     // Native context menu: the page sends items, gets back the chosen id (labels are plain text).
     handle('wb:menu', (owner, items) => new Promise((resolve) => {
@@ -375,8 +399,29 @@ class Workbench {
     on('wb:focus-zone', (owner, zone) => { owner.zone = ['editor', 'terminal'].includes(zone) ? zone : 'other'; });
   }
 
+  // Mission Control: vault values of the project a terminal belongs to, so summaries can mask them
+  // exactly (in memory only; cached briefly because every hook event asks).
+  secretValuesFor(ownerWcId) {
+    const owner = this.owners.get(ownerWcId);
+    const root = owner?.project?.root;
+    if (!root) return [];
+    const c = this.secretCache;
+    if (c && c.root === root && Date.now() - c.at < 5000) return c.values;
+    let values = [];
+    try { values = Object.entries(this.vault.envFor(root)).map(([name, value]) => ({ name, value })); } catch {}
+    this.secretCache = { root, at: Date.now(), values };
+    return values;
+  }
+
+  // Dev/test only (ignored in packaged builds): MERIDIAN_TEST_AGENT_BIN is searched first, so e2e
+  // tests can stand in recorded/fake agent CLIs for the real ones.
+  agentSearchPath(base) {
+    const extra = !this.app.isPackaged && process.env.MERIDIAN_TEST_AGENT_BIN;
+    return extra && path.isAbsolute(extra) ? `${extra}${path.delimiter}${base}` : base;
+  }
+
   async info(owner) {
-    const searchPath = await loginPath();
+    const searchPath = this.agentSearchPath(await loginPath());
     const store = this.readStore();
     const access = this.agentStatus()?.access || 'off';
     return {

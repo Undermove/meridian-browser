@@ -54,6 +54,7 @@ class Assistant {
 
   reset(sessionId) {
     this.stop(sessionId);
+    try { this.observer?.assistantReset(String(sessionId || '')); } catch {}
     this.sessions.delete(sessionId);
   }
 
@@ -62,11 +63,17 @@ class Assistant {
   }
 
   async chat(sender, { sessionId, text, page, useTools }) {
-    const send = (type, data = {}) => { if (!sender.isDestroyed()) sender.send('ai:event', { sessionId, type, ...data }); };
+    // Mission Control sees the run start and end (no prompt or answer text).
+    const runId = typeof sessionId === 'string' ? sessionId : '';
+    const send = (type, data = {}) => {
+      if (type === 'done' || type === 'error') { try { this.observer?.assistantRunEnd(runId, { error: type === 'error' ? data.message : null, stopped: !!data.stopped }); } catch {} }
+      if (!sender.isDestroyed()) sender.send('ai:event', { sessionId, type, ...data });
+    };
     let session = this.sessions.get(sessionId);
     if (!session) { session = { messages: [] }; this.sessions.set(sessionId, session); }
     session.abort = new AbortController();
 
+    try { this.observer?.assistantRunStart(runId, { host: page?.url ? safeHost(page.url) : null }); } catch {}
     let client;
     try { client = this.client(); } catch (err) { return send('error', { message: err.message }); }
 
@@ -114,7 +121,7 @@ class Assistant {
           send('tool', { name: block.name, input: block.input });
           try {
             if (!block.input || typeof block.input !== 'object') throw new Error('invalid tool input (could not parse arguments)');
-            const out = await this.hub.call(block.name, block.input, { source: 'assistant' });
+            const out = await this.hub.call(block.name, block.input, { source: 'assistant', runId });
             results.push({ type: 'tool_result', tool_use_id: block.id, content: out.map(toApiBlock) });
           } catch (err) {
             send('tool_error', { name: block.name, message: err.message });
@@ -139,6 +146,8 @@ function toApiBlock(b) {
   return { type: 'text', text: b.text };
 }
 
+function safeHost(u) { try { return new URL(String(u)).host; } catch { return null; } }
+
 function escapeAttr(s) { return String(s || '').replace(/[<>"&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '"': '&quot;', '&': '&amp;' }[c])); }
 
 function describeError(err) {
@@ -149,4 +158,4 @@ function describeError(err) {
   return err.message || String(err);
 }
 
-module.exports = { Assistant };
+module.exports = { Assistant, MODEL, describeError };

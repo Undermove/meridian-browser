@@ -36,6 +36,7 @@ function shortcutTable(isMac = IS_MAC, overrides = {}) {
     { id: 'toggle-sidebar', label: 'Toggle Sidebar', group: G.view, accel: 'CmdOrCtrl+S', cmd: ['toggle-sidebar'] },
     { id: 'ai-panel', label: 'Ask AI', group: G.view, accel: 'CmdOrCtrl+J', cmd: ['ai-panel'] },
     { id: 'open-workbench', label: 'Workbench', group: G.view, accel: 'CmdOrCtrl+Shift+E', cmd: ['open-workbench'] },
+    { id: 'mission-control', label: 'Mission Control', group: G.view, accel: 'CmdOrCtrl+Shift+M', cmd: ['mission-control'] },
     { id: 'downloads', label: 'Downloads', group: G.view, accel: 'CmdOrCtrl+Shift+J', cmd: ['downloads'] },
     { id: 'split', label: 'Split View', group: G.view, accel: 'Ctrl+Shift+=', cmd: ['split'] },
     { id: 'unsplit', label: 'Close Split View', group: G.view, accel: 'Ctrl+Shift+-', cmd: ['unsplit'] },

@@ -43,6 +43,14 @@ registerSection({
           </label>`).join('')}
         ${row('Allow agents to run JavaScript in pages', toggle('agent-js', !!s.agentAllowJs), 'Powerful: off unless you need it. In “Ask” mode you see and approve the code.')}
       `, `Applies to the ⌘J assistant and every MCP client. ${status.socket ? 'The MCP socket is open.' : 'The MCP socket is closed while access is off.'}`)}
+      ${group('Claude features', `
+        ${row('Tidy Today', toggle('ai-tidy', s.aiTidy !== false), 'Claude suggests folders and shorter titles for your Today tabs (command bar → “Tidy Today”). You see a preview and choose what to apply.')}
+        ${row('Ask Claude from the command bar', toggle('ai-ask-bar', s.aiAskFromBar !== false), 'Type a question in the command bar and pick “Ask Claude” to open it in ⌘J.')}
+        ${row('Link previews', toggle('ai-link-preview', s.aiLinkPreview === true), 'Hold ⇧ over a link to see a short summary of the page. Meridian loads the page in the background with that space’s profile (its cookies) and sends its text to Claude. Summaries are cached for 30 minutes. Never in private windows.')}
+      `, hasKey ? 'These use your Claude API key. Page text and tab titles are sent as untrusted content.' : 'Add a Claude API key above to use these.')}
+      ${group('Mission Control', `
+        ${row('Notify me when an agent is waiting', toggle('mission-notify', s.missionNotify !== false), 'A notification (or a toast while Meridian is in front) when Claude Code needs your permission or input. Mission Control (⇧⌘M) always shows it.')}
+      `, 'Mission Control shows Claude Code and Codex sessions started from the Workbench, MCP clients and ⌘J chats, live. It keeps a short history without tool inputs.')}
       ${group('Coding agents', `${cliRow('claude')}${cliRow('codex')}`,
         'Connect registers Meridian’s MCP server with that CLI. You’ll see the exact command and confirm before it runs. Agents only work while Meridian is running and agent access isn’t Off.')}`;
 
@@ -62,6 +70,10 @@ registerSection({
       toast(`Agent access: ${AGENT_ACCESS.find((x) => x[0] === r.value)[1]}`);
     }));
     $('#agent-js', el).onchange = (e) => ctx.set({ agentAllowJs: e.target.checked });
+    $('#ai-tidy', el).onchange = (e) => ctx.set({ aiTidy: e.target.checked });
+    $('#ai-ask-bar', el).onchange = (e) => ctx.set({ aiAskFromBar: e.target.checked });
+    $('#ai-link-preview', el).onchange = (e) => { ctx.set({ aiLinkPreview: e.target.checked }); if (e.target.checked && !hasKey) toast('Link previews start working once you add a Claude API key'); };
+    $('#mission-notify', el).onchange = (e) => ctx.set({ missionNotify: e.target.checked });
     el.addEventListener('click', async (e) => {
       const copy = e.target.closest('[data-copy]');
       if (copy) { await S.copy(copy.dataset.copy); return toast('Command copied — paste it into your terminal'); }

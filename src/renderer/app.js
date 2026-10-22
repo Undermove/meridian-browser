@@ -1298,6 +1298,9 @@ const COMMANDS = [
   { id: 'devtools', label: 'Developer Tools', icon: 'code', keys: '⌥⌘I' },
   { id: 'ai-panel', label: 'Ask AI about This Page', icon: 'sparkles', keys: '⌘J' },
   { id: 'ai-summarize', label: 'Summarize Page with AI', icon: 'sparkles' },
+  // Mission Control + AI features (handled in mission.js / ai-max.js)
+  { id: 'mission-control', label: 'Mission Control (agents)', icon: 'grid', keys: '⇧⌘M' },
+  { id: 'ai-tidy', label: 'Tidy Today Tabs with AI', icon: 'wand' },
   { id: 'sidebar-side', label: 'Move Sidebar to Other Side', icon: 'sidebar' },
   // Workbench integration
   { id: 'open-workbench', label: 'Open Workbench', icon: 'code' },
@@ -1353,13 +1356,14 @@ function updateCommandResults() {
       const engine = SEARCH_ENGINES[state.settings.searchEngine]?.name || 'Google';
       out.push({ kind: 'search', icon: 'search', title: raw.trim(), sub: `Search ${engine}`, action: () => go(searchUrl(raw.trim())) });
     }
+    if (typeof askClaudeResult === 'function' && mode === 'new' && !EPHEMERAL) { const r = askClaudeResult(raw, !!url); if (r) out.push(r); } // "Ask Claude" (ai-max.js)
   }
 
   if (mode !== 'split' && !MINI) {
     // Commands first when the query looks like one
     const cmds = COMMANDS.map((c) => ({ c, s: score(c.label, q) })).filter((x) => q && x.s >= 0).sort((a, b) => b.s - a.s).slice(0, 3);
     for (const { c } of cmds) {
-      if (PRIVATE && ['settings', 'import-arc', 'onboarding', 'edit-theme', 'ai-panel', 'ai-summarize', 'open-workbench', 'open-project', 'new-space'].includes(c.id)) continue;
+      if (PRIVATE && ['settings', 'import-arc', 'onboarding', 'edit-theme', 'ai-panel', 'ai-summarize', 'open-workbench', 'open-project', 'new-space', 'mission-control', 'ai-tidy'].includes(c.id)) continue;
       out.push({ kind: 'cmd', icon: c.icon, title: c.label, sub: 'Command', keys: c.keys, action: () => runCommand(c.id) });
     }
   }
@@ -1791,6 +1795,9 @@ function runCommand(name, ...args) {
     case 'open-project': return EPHEMERAL ? null : openWorkbench({ pickProject: true });
     case 'workbench-new-hub': case 'workbench-customize': case 'workbench-secrets': case 'workbench-safe-mode': return EPHEMERAL ? null : workbenchCommand(name); // Workbench Pro integration
     case 'ai-summarize': toggleAiPanel(true); return setTimeout(() => sendAi('Summarize this page.', { allowTools: false }), 100);
+    case 'mission-control': return EPHEMERAL ? null : toggleMissionControl(); // Mission Control (mission.js)
+    case 'mission-reveal': return EPHEMERAL ? null : revealMissionNode(args[0]);
+    case 'ai-tidy': return EPHEMERAL ? null : tidyToday(); // ai-max.js
   }
 }
 

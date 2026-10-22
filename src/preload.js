@@ -47,6 +47,16 @@ contextBridge.exposeInMainWorld('meridian', {
 
   promoteMini: (url) => ipcRenderer.send('mini:promote', url),
 
+  // Mission Control + Arc Max-style AI features
+  missionSnapshot: () => ipcRenderer.invoke('mission:snapshot'),
+  missionDismiss: (id) => ipcRenderer.invoke('mission:dismiss', String(id)),
+  missionClearHistory: () => ipcRenderer.invoke('mission:clear-history'),
+  onMission: (fn) => ipcRenderer.on('mission:state', (_e, s) => fn(s)),
+  onMissionToast: (fn) => ipcRenderer.on('mission:toast', (_e, t) => fn(t)),
+  aiTidy: (tabs) => ipcRenderer.invoke('ai:tidy', tabs),
+  onLinkPreview: (fn) => ipcRenderer.on('link-preview', (_e, p) => fn(p)),
+  linkPreviewTest: (url) => ipcRenderer.invoke('ai:link-preview-test', String(url)),
+
   // Settings window, windows, onboarding
   snapshot: (snap) => ipcRenderer.send('ui:snapshot', snap),
   openSettings: (section) => ipcRenderer.send('settings:open', section),
