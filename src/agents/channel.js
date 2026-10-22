@@ -121,12 +121,11 @@ class EventChannel {
   // ----- sandbox: a per-session directory with an append-only events file -----
 
   // Creates the dir (returned) and starts following <dir>/events.jsonl for this token.
-  tailDir(token, { writableByContainer = false } = {}) {
+  tailDir(token) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-mission-'));
-    fs.chmodSync(dir, writableByContainer ? 0o711 : 0o700);
+    fs.chmodSync(dir, 0o700);
     const file = path.join(dir, 'events.jsonl');
-    fs.writeFileSync(file, '', { mode: writableByContainer ? 0o666 : 0o600 });
-    if (writableByContainer) { try { fs.chmodSync(file, 0o666); } catch {} }
+    fs.writeFileSync(file, '', { mode: 0o600 });
     const st = { file, dir, offset: 0, partial: '', reading: false };
     const read = () => {
       if (st.reading) return;

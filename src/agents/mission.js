@@ -149,18 +149,19 @@ class MissionControl {
   }
 
   // Docker sandbox: a per-session dir (mounted at /meridian) holding a copy of the hook script, the
-  // Claude settings and the append-only events file. Linux hosts where the container user (uid 1000)
-  // isn't us get no hooks: the file would have to be writable by other local users.
+  // Claude settings and the append-only events file, all private to this user (0700/0600). Docker
+  // Desktop and OrbStack map container writes to the host user; on Linux that only holds when the
+  // container user (uid 1000) is us, so other Linux hosts get no hooks (never a world-writable file).
   sandboxMount(token, kind) {
     if (!token) return null;
     if (process.platform === 'linux' && process.getuid?.() !== 1000) return null;
     const src = this.hookScriptSource();
     if (!src) return null;
-    const dir = this.channel.tailDir(token, { writableByContainer: process.platform !== 'win32' });
-    fs.writeFileSync(path.join(dir, 'mission-hook.js'), src, { mode: 0o644 });
+    const dir = this.channel.tailDir(token);
+    fs.writeFileSync(path.join(dir, 'mission-hook.js'), src, { mode: 0o600 });
     const out = { dir, target: '/meridian', env: { MERIDIAN_MISSION_FILE: '/meridian/events.jsonl' }, args: [] };
     if (kind === 'sandbox-claude') {
-      fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(claudeHookSettings('node /meridian/mission-hook.js'), null, 2), { mode: 0o644 });
+      fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(claudeHookSettings('node /meridian/mission-hook.js'), null, 2), { mode: 0o600 });
       out.args = ['--settings', '/meridian/settings.json'];
     } else if (kind === 'sandbox-codex') {
       out.args = ['-c', 'notify=["node", "/meridian/mission-hook.js", "--codex"]'];
@@ -529,6 +530,7 @@ class MissionControl {
     const win = this.getMainWindow();
     const focused = !!win && !win.isDestroyed() && win.isFocused();
     const record = { nodeId: node.id, title, body, native: !focused };
+    if (this.notified.length > 50) this.notified.splice(0, this.notified.length - 50);
     if (settings.missionNotify === false) return;
     if (focused) { win.webContents.send('mission:toast', { nodeId: node.id, title, body }); this.notified.push({ ...record, toast: true }); return; }
     this.notified.push(record);

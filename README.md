@@ -27,6 +27,8 @@ Arc is being sunset. Meridian keeps the Arc workflow you're used to (spaces, pin
 - **Ask Claude** panel (`⌘J`): summarize, ask about the current page, or let Claude act in the browser (open tabs, read pages, click, type).
 - **MCP server** with 21 browser tools: `list_spaces`, `list_tabs`, `search_tabs`, `search_history`, `read_page`, `get_interactive_elements`, `screenshot`, `open_tab`, `navigate`, `history_nav`, `activate_tab`, `close_tab`, `click`, `type_text`, `press_key`, `scroll`, `wait_for`, `organize_tab`, `split_view`, `create_space`, and opt-in `run_javascript`.
 - Tabs an agent is working in glow. An activity bar shows what it did and has a **Stop** button.
+- **Mission Control** (`⇧⌘M`): a live tree of every agent working with Meridian: Claude Code and Codex sessions started from the Workbench (locally or in a Docker sandbox) with their subagents and nested subagents, MCP clients driving the browser, and ⌘J chats. Status (thinking / running a tool / waiting for you / done), the current tool with a redacted summary, elapsed time, tool calls, project. Click to jump to the agent's terminal or tab. A notification and a sidebar badge when an agent waits for you; "N agents working" in the sidebar and the Workbench.
+- **Tidy Today**: Claude proposes folders and shorter titles for your Today tabs; you review a diff and apply what you want. **Ask Claude** straight from the command bar. **Link previews**: hold `⇧` over a link for a short summary of the page (opt-in, Settings → AI).
 
 **Also**
 - Built-in ad and tracker blocking (Ghostery engine), per-site permission prompts, downloads, find in page, zoom, reopen closed tab, session restore.
@@ -74,6 +76,7 @@ Agents act inside your logged-in browser, so access is explicit and layered:
 - MCP clients connect over a **unix socket** (named pipe on Windows) with a random name and a random **bearer token**, both new on every start, advertised only after the socket is bound, in a `chmod 600` file. The bridge checks that the socket is owned by the current user. There's no TCP port, so websites can't reach it, and requests carrying an `Origin` header are rejected.
 - Page text given to models is wrapped as **untrusted content**, with any attempt to close the wrapper tags neutralized, and is read in an isolated world so pages can't fake it. Models are told never to follow instructions found in pages.
 - Agent page scripts run in an **isolated JS world**, so pages can't tamper with them. Agents can only open `http(s)` URLs.
+- **Mission Control** gets agent events over a private local channel: a unix socket in a `0700` temp dir (a random named pipe on Windows), a per-session random token in the agent's environment, size- and rate-limited JSON lines, nothing sent back. Claude Code hooks are added to the session's own `--settings` file as async hooks (they never block the agent) next to the secret guard; Codex gets a per-session `notify` override. Hooks send only short summaries (file names, command heads, hosts), which Meridian redacts again (tokens, `KEY=value`, URL credentials, vault values). Prompts, tool inputs and outputs are never sent; the persisted history holds only labels, times and counts.
 - The Claude API key is **encrypted with the OS keychain** (safeStorage) and only used in the main process. Web content and the UI page never see it.
 - Electron hardening: sandboxed UI renderer with context isolation, `<webview>` preferences forced safe in `will-attach-webview`, IPC sender validation, page-initiated navigation to `file:` or other privileged schemes blocked, server redirects to such schemes blocked, external app links (`mailto:`, `zoommtg:` …) allowlisted and confirmed every time, executable and HTML downloads and download bursts need confirmation, WebUSB/HID/Serial and Bluetooth pickers denied, client certificates chosen by you, camera and mic as separate per-site prompts (resettable in Settings), favicons fetched through the site's profile and shown as `data:` URLs, dev/test hooks disabled in packaged builds, and Electron fuses (no `RunAsNode`, no `NODE_OPTIONS`, no inspector flags, ASAR integrity, cookie encryption, no extra `file://` privileges).
 
@@ -90,6 +93,7 @@ Found a vulnerability? Please open a private security advisory on GitHub.
 | Pin / unpin | `⌘D` | `Ctrl+D` |
 | Toggle sidebar | `⌘S` | `Ctrl+S` |
 | Ask Claude | `⌘J` | `Ctrl+J` |
+| Mission Control | `⇧⌘M` | `Ctrl+Shift+M` |
 | Split view / close | `⌃⇧=` / `⌃⇧-` | `Ctrl+Shift+=` / `Ctrl+Shift+-` |
 | Spaces | `⌃1…9`, `⌘⌥←/→` | `Alt+1…9`, `Ctrl+Alt+←/→` |
 | Tabs | `⌘1…9`, `⌃Tab` | `Ctrl+1…9`, `Ctrl+Tab` |
@@ -111,7 +115,7 @@ Every shortcut can be changed in **Settings → Shortcuts**.
 
 ## Roadmap
 
-Extension toolbar, a password manager integration, sync between devices, AI tab tidying (group Today into folders), Boosts-style site tweaks.
+Extension toolbar, a password manager integration, sync between devices, Boosts-style site tweaks.
 
 ## License
 
