@@ -99,11 +99,46 @@ class ProjectFs {
       if (err.code !== 'ENOENT') throw err;
       abs = await this.resolve(rel, { mustExist: false });
     }
-    const st = await fsp.stat(abs).catch(() => null);
-    if (st && !st.isFile()) throw new Error('not a file');
-    await fsp.writeFile(abs, content, 'utf8');
-    const after = await fsp.stat(abs);
+    const after = await this.writeFileSafely(abs, content);
     return { path: rel, mtimeMs: after.mtimeMs, size: after.size };
+  }
+
+  // Write text to abs (already resolved inside the project) without a check-then-write race:
+  //  - the target is pinned to its real path and opened with O_NOFOLLOW (a symlink swapped in at the
+  //    last component fails to open), without O_TRUNC, so nothing is changed before verification;
+  //  - the opened handle is then verified: its inode must be the file the real path names now, and
+  //    that real path must be inside the project (catches a parent directory swapped for a symlink);
+  //  - only then is it truncated and written. Returns the handle's stat after writing.
+  async writeFileSafely(abs, content) {
+    const C = fs.constants;
+    let target;
+    let exists = true;
+    try { target = await fsp.realpath(abs); } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+      exists = false;
+      target = path.join(await fsp.realpath(path.dirname(abs)), path.basename(abs));
+    }
+    if (!this.inside(target)) throw new Error('path leads outside the project (symlink)');
+    const NOFOLLOW = C.O_NOFOLLOW || 0; // not on Windows (no symlink swaps by unprivileged users there)
+    const flags = C.O_WRONLY | NOFOLLOW | (exists ? 0 : C.O_CREAT | C.O_EXCL);
+    let fh;
+    try { fh = await fsp.open(target, flags, 0o666); } catch (err) {
+      if (err.code === 'ELOOP' || err.code === 'EMLINK') throw new Error('path leads outside the project (symlink)');
+      if (err.code === 'EEXIST') throw new Error('the file appeared while saving — try again');
+      throw err;
+    }
+    try {
+      const st = await fh.stat();
+      if (!st.isFile()) throw new Error('not a file');
+      const realNow = await fsp.realpath(target).catch(() => null);
+      const named = realNow && await fsp.stat(realNow).catch(() => null);
+      if (!realNow || !this.inside(realNow) || !named || named.ino !== st.ino || named.dev !== st.dev) {
+        throw new Error('the file moved while saving (symlink race) — nothing was written');
+      }
+      await fh.truncate(0);
+      await fh.writeFile(content, 'utf8');
+      return await fh.stat();
+    } finally { await fh.close().catch(() => {}); }
   }
 
   async create(rel, kind) {

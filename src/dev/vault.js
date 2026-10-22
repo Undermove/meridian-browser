@@ -88,11 +88,12 @@ class Vault {
   list(projectRoot) {
     return this.load()
       .filter((i) => i.scope === 'global' || i.scope === projectRoot)
-      .map((i) => ({ id: i.id, name: i.name, scope: i.scope === 'global' ? 'global' : 'project', note: i.note || '', createdAt: i.createdAt, updatedAt: i.updatedAt }))
+      .map((i) => ({ id: i.id, name: i.name, scope: i.scope === 'global' ? 'global' : 'project', note: i.note || '', sandbox: i.scope !== 'global' && i.sandbox === true, createdAt: i.createdAt, updatedAt: i.updatedAt }))
       .sort((a, b) => a.name.localeCompare(b.name) || (a.scope === 'project' ? -1 : 1));
   }
 
-  // { id?, name, value?, scope: 'global'|'project', note } — value may be omitted when editing metadata.
+  // { id?, name, value?, scope: 'global'|'project', note, sandbox? } — value may be omitted when editing
+  // metadata. `sandbox` (project scope only): passed to sandboxed agents of this project by default.
   set(item, projectRoot) {
     const why = this.unavailableReason();
     if (why) throw new Error(why);
@@ -112,7 +113,7 @@ class Vault {
     const now = Date.now();
     const target = existing || clash || { id: crypto.randomUUID(), createdAt: now };
     if (existing && clash && clash !== existing) items.splice(items.indexOf(clash), 1); // renamed onto another: replace it
-    Object.assign(target, { name, scope, note, updatedAt: now });
+    Object.assign(target, { name, scope, note, updatedAt: now, sandbox: scope !== 'global' && item?.sandbox === true });
     if (typeof value === 'string') target.enc = this.encrypt(value).toString('base64');
     if (!items.includes(target)) {
       if (items.length >= MAX_ITEMS) throw new Error('The vault is full.');
@@ -153,6 +154,15 @@ class Vault {
   }
 
   namesFor(projectRoot) { return Object.keys(this.envFor(projectRoot)).sort(); }
+
+  // Names a sandbox gets unless the user picks otherwise: what the agent needs to sign in (`needs`,
+  // e.g. ANTHROPIC_API_KEY) plus project secrets explicitly marked "available in sandboxes".
+  sandboxDefaults(projectRoot, needs = []) {
+    const items = this.load().filter((i) => i.scope === 'global' || i.scope === projectRoot);
+    const out = new Set(needs.filter((n) => items.some((i) => i.name === n)));
+    for (const i of items) if (i.scope === projectRoot && i.sandbox === true) out.add(i.name);
+    return [...out].sort();
+  }
 
   hasName(name, projectRoot) { return this.load().some((i) => i.name === name && (i.scope === 'global' || i.scope === projectRoot)); }
 }

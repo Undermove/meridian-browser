@@ -806,13 +806,19 @@ function mountTerm(info) {
 async function launch(kind) {
   if (!S.project) { toast('Open a project first'); return null; }
   if (S.info?.terminals === false) { toast(`Terminals are unavailable: ${S.info.terminalError || ''}`, 5000); return null; }
+  // Workbench Pro: a sandbox gets only the vault secrets picked for this session.
+  let secrets;
+  if (String(kind).startsWith('sandbox-') && typeof proPickSandboxSecrets === 'function') {
+    secrets = await proPickSandboxSecrets(kind);
+    if (secrets === null) return null;
+  }
   $('#term-area').classList.remove('collapsed');
   let info;
   try {
     // Size the pty right from the start so TUIs (Claude Code, Codex) draw correctly.
     const host = $('#term-host');
     const dims = estimateDims(host);
-    info = await wb.ptyCreate({ kind, cols: dims.cols, rows: dims.rows });
+    info = await wb.ptyCreate({ kind, cols: dims.cols, rows: dims.rows, secrets });
   } catch (err) {
     toast(err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, ''), 5000);
     if (/not installed/i.test(err.message)) refreshInfo();
@@ -820,8 +826,8 @@ async function launch(kind) {
   }
   const t = mountTerm(info);
   for (const n of info.notes || []) t.xterm.writeln(`\x1b[2m${n}\x1b[0m`);
-  if (t.secrets.length) t.xterm.writeln(`\x1b[2mVault: ${t.secrets.join(', ')} ${t.secrets.length === 1 ? 'is' : 'are'} set in this session’s environment (values hidden).\x1b[0m`);
-  if (t.guard) t.xterm.writeln('\x1b[2mSecret-file guard: Meridian asks before Claude Code reads .env, keys or credentials.\x1b[0m');
+  if (t.secrets.length && !t.sandbox) t.xterm.writeln(`\x1b[2mVault: ${t.secrets.join(', ')} ${t.secrets.length === 1 ? 'is' : 'are'} set in this session’s environment (values hidden).\x1b[0m`);
+  if (t.guard) t.xterm.writeln('\x1b[2mSecret-file guard: Meridian asks before Claude Code reads .env, keys or credentials (file tools by path; shell commands only by a name match, so it is a safety net, not a wall).\x1b[0m');
   if (info.browserTools) t.xterm.writeln(`\x1b[2mMeridian browser tools are connected for this session (access: ${ACCESS_LABEL[S.info?.agentAccess] || 'off'} — change it in Settings → AI).\x1b[0m`);
   activateTerm(t);
   return t;

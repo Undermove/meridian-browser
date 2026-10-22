@@ -16,11 +16,16 @@
 //
 // Workbench Pro (customizations, secrets vault, sandboxed agents, hubs) keeps the same rules:
 //  - The customization folder is served read-only under meridian://workbench/custom/ to this session
-//    only (real-path checked, nothing in Safe Mode, switched-off plugins are 404).
-//  - Vault values only ever leave main as environment variables of processes started here, or to the
-//    page when the user clicks Reveal. Never in files, logs, MCP results or terminal text.
+//    only (real-path checked, nothing in Safe Mode, switched-off plugins are 404). A plugin is served
+//    only while its exact content (SHA-256) is approved; approvals live in
+//    <userData>/workbench-plugins-approved.json, written only here after a native confirm.
+//  - Vault values only ever leave main as environment variables of host processes started here, in
+//    a sandbox's private 0600 env file (only the secrets picked for that session; deleted when it
+//    ends), or to the page when the user confirms Reveal in a native dialog. Never in logs, MCP
+//    results, terminal text or container metadata.
 //  - The secret guard is a private local socket (0700 dir / random pipe), not a network listener.
-//  - Docker is driven with argv arrays; secrets are passed as bare `-e NAME` (values via env).
+//  - Docker is driven with argv arrays. Sandboxes get host-executed config (.git, .claude, …)
+//    read-only; what they change elsewhere is shown before the next host session (sandbox.js).
 
 const { ipcMain, session, dialog, shell, BrowserWindow } = require('electron');
 const path = require('path');
@@ -32,7 +37,8 @@ const { detect, launchSpec } = require('./agents');
 // Workbench Pro
 const { Vault, scanProject, parseDotenv, DOTENV_FILE, RESERVED } = require('./vault');
 const { SecretGuard, hookSettings } = require('./guard');
-const { Sandbox, SANDBOX_KINDS } = require('./sandbox');
+const { Sandbox, SANDBOX_KINDS, autoExecSnapshot, snapshotDiff } = require('./sandbox');
+const crypto = require('crypto');
 const { Customizations } = require('./custom');
 const { TEMPLATES, createHub, hubInfo } = require('./hubs');
 const { which } = require('./env');
@@ -150,6 +156,11 @@ class Workbench {
     this.guard = new SecretGuard({ onRequest: (session, req) => this.guardDecision(session, req) });
     this.sandbox = new Sandbox({ getEnv: () => childEnv(), getSearchPath: () => loginPath() });
     this.safeMode = process.argv.includes('--workbench-safe-mode') || (!app.isPackaged && process.env.MERIDIAN_WB_SAFE === '1');
+    // Written only by main. Outside workbench-custom/, so nothing that can write plugins can approve them.
+    this.approvalsFile = path.join(app.getPath('userData'), 'workbench-plugins-approved.json');
+    // Per project: snapshot of host-executed config taken before a sandbox ran there (see sandbox.js).
+    this.reviewFile = path.join(app.getPath('userData'), 'workbench-sandbox-review.json');
+    this.sandboxRunning = new Map(); // project root -> running sandbox containers
     this.custom = null;
     this.dialogChain = Promise.resolve();
     try {
@@ -323,21 +334,43 @@ class Workbench {
       const p = project(owner);
       const kind = ['shell', 'claude', 'codex', 'gemini', ...Object.keys(SANDBOX_KINDS)].includes(opts.kind) ? opts.kind : 'shell';
       const searchPath = await loginPath();
-      // Workbench Pro: vault secrets for this project go into the environment (names are shown, values never).
-      const secrets = this.vault.envFor(p.root);
-      const extra = { ...secrets };
-      let names = Object.keys(secrets).sort();
+      const extra = {};
+      let names = [];
       let spec;
       let guardToken = null;
+      let sandboxRoot = null;
       if (SANDBOX_KINDS[kind]) {
-        spec = await this.sandbox.launchSpec(kind, { root: p.root, secretNames: names, network: this.readStore().sandboxNetwork !== false });
-        if (spec.then) { for (const n of names) delete extra[n]; names = []; } // the image build gets no secrets
+        // Only the secrets picked for this session (default: what the agent needs to sign in + project
+        // secrets marked "available in sandboxes"). They go into the container's env file, never into
+        // the docker CLI's environment or the container config.
+        const available = this.vault.envFor(p.root);
+        const wanted = Array.isArray(opts.secrets) ? opts.secrets : this.vault.sandboxDefaults(p.root, SANDBOX_KINDS[kind].needs);
+        const picked = {};
+        for (const n of new Set(wanted)) if (typeof n === 'string' && Object.prototype.hasOwnProperty.call(available, n)) picked[n] = available[n];
+        const review = this.readReview();
+        const baseline = review[p.root] ? null : await autoExecSnapshot(p.root);
+        spec = await this.sandbox.launchSpec(kind, {
+          root: p.root, secrets: picked, network: this.readStore().sandboxNetwork !== false,
+          forbiddenRoots: [this.app.getPath('userData'), this.custom?.realRoot],
+        });
+        if (!spec.then) {
+          names = spec.secretNames;
+          if (baseline) { const r = this.readReview(); if (!r[p.root]) { r[p.root] = { at: Date.now(), snapshot: baseline }; this.writeReview(r); } }
+          sandboxRoot = p.root;
+          this.sandboxRunning.set(p.root, (this.sandboxRunning.get(p.root) || 0) + 1);
+        }
       } else {
+        // A sandbox may have planted config the host runs (nested .git, .vscode tasks, …): ask first.
+        if (!(await this.reviewSandboxChanges(owner, p.root))) throw new Error('Not started — review what the sandboxed agent changed first.');
+        // Host terminals and agents: the project's vault secrets go into the environment (names are shown, values never).
+        Object.assign(extra, this.vault.envFor(p.root));
+        names = Object.keys(extra).sort();
         let claudeSettings = null;
         if (kind === 'claude') {
           const node = which('node', searchPath);
-          const script = this.guard.hookScript();
-          claudeSettings = node && script ? hookSettings(node, script) : null;
+          const hook = this.guard.hookScript();
+          if (hook.error === 'tampered') throw new Error('Claude Code was not started: Meridian’s secret-guard hook script failed its integrity check (it was changed on disk). Reinstall Meridian.');
+          claudeSettings = node && hook.path ? hookSettings(node, hook.path) : null;
           if (claudeSettings) {
             try {
               await this.guard.start();
@@ -352,11 +385,21 @@ class Workbench {
       }
       const env = await childEnv(extra);
       const meta = { secrets: names, guard: !!guardToken, sandbox: !!SANDBOX_KINDS[kind] && !spec.then, then: spec.then || null };
-      const info = this.ptys.create(owner.wc, {
-        kind, title: spec.title, file: spec.file, args: spec.args, cwd: p.root, env, cols: opts.cols, rows: opts.rows, cleanup: spec.cleanup, meta,
-        onExit: () => { if (guardToken) this.guard.unregister(guardToken); spec.onExit?.(); },
-        onKill: () => { if (guardToken) this.guard.unregister(guardToken); spec.onKill?.(); },
-      });
+      let ended = false;
+      const end = () => {
+        if (ended) return;
+        ended = true;
+        if (guardToken) this.guard.unregister(guardToken);
+        if (sandboxRoot) { const n = (this.sandboxRunning.get(sandboxRoot) || 1) - 1; if (n > 0) this.sandboxRunning.set(sandboxRoot, n); else this.sandboxRunning.delete(sandboxRoot); }
+      };
+      let info;
+      try {
+        info = this.ptys.create(owner.wc, {
+          kind, title: spec.title, file: spec.file, args: spec.args, cwd: p.root, env, cols: opts.cols, rows: opts.rows, cleanup: spec.cleanup, meta,
+          onExit: () => { end(); spec.onExit?.(); },
+          onKill: () => { end(); spec.onKill?.(); },
+        });
+      } catch (err) { end(); spec.onExit?.(); throw err; }
       return { ...info, notes: spec.notes, browserTools: !!spec.browserTools };
     });
     handle('wb:pty-list', (owner) => this.ptys.list(owner.wc));
@@ -425,7 +468,34 @@ class Workbench {
     handle('wb:custom-state', async () => {
       if (!this.custom) return { unavailable: true, safeMode: true };
       const store = this.readStore();
-      return { ...(await this.custom.state()), safeMode: this.safeMode, disabled: store.disabledPlugins, snapshots: (await this.custom.snapshots()).slice(0, 30) };
+      const st = await this.custom.state();
+      const approved = this.readApprovals();
+      // `approved`: this exact content was approved by the user; otherwise main won't serve it.
+      st.plugins = st.plugins.map((p) => ({ ...p, approved: !!p.sha256 && approved[p.file]?.sha256 === p.sha256, everApproved: !!approved[p.file] }));
+      return { ...st, safeMode: this.safeMode, disabled: store.disabledPlugins, snapshots: (await this.custom.snapshots()).slice(0, 30) };
+    });
+    // Native confirm for every new or changed (enabled) plugin, in one dialog. Only main writes approvals.
+    handle('wb:custom-approve-plugins', async (owner) => {
+      if (!this.custom) throw new Error('customizations are unavailable');
+      return this.serialDialog(async () => {
+        const disabled = this.readStore().disabledPlugins;
+        const approved = this.readApprovals();
+        const pending = (await this.custom.plugins()).filter((p) => p.sha256 && !disabled.includes(p.file) && approved[p.file]?.sha256 !== p.sha256);
+        if (!pending.length) return { approved: [] };
+        const kb = (n) => (n < 1024 ? `${n} bytes` : `${(n / 1024).toFixed(1)} KB`);
+        const lines = pending.slice(0, 12).map((p) => `• ${p.file} — ${kb(p.size)}, ${approved[p.file] ? 'CHANGED since you approved it' : 'new'}\n   ${clip(p.path, 200)}`);
+        if (pending.length > 12) lines.push(`…and ${pending.length - 12} more`);
+        const { response } = await dialog.showMessageBox(this.windowFor(owner), {
+          type: 'warning', buttons: ['Don’t run', pending.length === 1 ? 'Run this plugin' : `Run ${pending.length} plugins`], defaultId: 0, cancelId: 0, noLink: true,
+          message: pending.length === 1 ? 'Run this Workbench plugin?' : `Run these ${pending.length} Workbench plugins?`,
+          detail: `${lines.join('\n')}\n\nPlugins run inside the Workbench with its powers: they can open terminals and run commands, read and change project files, and use your vault secrets. Only run code you trust. Any later change to a plugin file needs your approval again.`,
+        });
+        if (response !== 1) return { approved: [] };
+        for (const p of pending) approved[p.file] = { sha256: p.sha256, size: p.size, at: Date.now() };
+        this.writeApprovals(approved);
+        this.broadcast('wb:custom-change', {});
+        return { approved: pending.map((p) => p.file) };
+      });
     });
     handle('wb:custom-safe-mode', async (_owner, on) => {
       this.safeMode = !!on;
@@ -463,11 +533,23 @@ class Workbench {
         value: typeof it.value === 'string' ? it.value : undefined,
         scope: it.scope === 'project' ? 'project' : 'global',
         note: str(it.note, 500),
+        sandbox: it.sandbox === true,
       }, root(owner));
       this.broadcast('wb:vault-change', {});
       return res;
     });
-    handle('wb:vault-reveal', async (owner, id) => this.vault.reveal(str(id, 64), root(owner)));
+    // Revealing a value always takes a native confirm: a click in the page (or a plugin) isn't enough.
+    handle('wb:vault-reveal', async (owner, id) => {
+      const item = this.vault.list(root(owner)).find((i) => i.id === str(id, 64));
+      if (!item) throw new Error('No such secret.');
+      const ok = await this.serialDialog(async () => (await dialog.showMessageBox(this.windowFor(owner), {
+        type: 'warning', buttons: ['Cancel', 'Reveal'], defaultId: 0, cancelId: 0, noLink: true,
+        message: `Show the value of ${item.name}?`,
+        detail: `${item.scope === 'project' ? 'Project' : 'Global'} secret. The value is shown in the Workbench for 20 seconds; anything running in the Workbench page, including plugins, can read what is shown there.`,
+      })).response === 1);
+      if (!ok) throw new Error('Not revealed.');
+      return this.vault.reveal(item.id, root(owner));
+    });
     handle('wb:vault-delete', async (owner, id) => { const ok = this.vault.remove(str(id, 64), root(owner)); this.broadcast('wb:vault-change', {}); return ok; });
     handle('wb:secret-scan', async (owner) => scanProject(project(owner).root));
     handle('wb:secret-migrate', async (owner, rel) => {
@@ -508,12 +590,77 @@ class Workbench {
     handle('wb:hub-info', async (owner) => hubInfo(project(owner).root));
   }
 
-  // meridian://workbench/custom/<rel>: nothing in Safe Mode, nothing for switched-off plugins.
+  // meridian://workbench/custom/<rel>: nothing in Safe Mode, nothing for switched-off plugins, and a
+  // plugin script only while its bytes match the approved SHA-256 (hashed from the very buffer that is
+  // served, so a file swapped after the check can't slip through). Scripts deeper in plugins/ are never
+  // served (an approved plugin could otherwise pull in unapproved code).
   async serveCustom(rel) {
     if (this.safeMode || !this.custom) return null;
-    const m = /^plugins\/([^/]+\.js)$/.exec(rel);
-    if (m && this.readStore().disabledPlugins.includes(m[1])) return null;
+    if (/^plugins\/.*\.js$/i.test(rel)) {
+      const m = /^plugins\/([A-Za-z0-9][A-Za-z0-9._-]{0,80}\.js)$/.exec(rel);
+      if (!m || this.readStore().disabledPlugins.includes(m[1])) return null;
+      const buf = await this.custom.serve(rel);
+      if (!buf) return null;
+      const sum = crypto.createHash('sha256').update(buf).digest('hex');
+      return this.readApprovals()[m[1]]?.sha256 === sum ? buf : null;
+    }
     return this.custom.serve(rel);
+  }
+
+  readApprovals() {
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.approvalsFile, 'utf8'));
+      const out = {};
+      for (const [f, v] of Object.entries(raw?.plugins || {})) if (v && /^[0-9a-f]{64}$/.test(v.sha256)) out[f] = v;
+      return out;
+    } catch { return {}; }
+  }
+
+  writeApprovals(plugins) { writePrivateJson(this.approvalsFile, { version: 1, plugins }); }
+
+  readReview() {
+    try { const r = JSON.parse(fs.readFileSync(this.reviewFile, 'utf8')); return r && typeof r === 'object' ? r : {}; } catch { return {}; }
+  }
+
+  writeReview(r) { writePrivateJson(this.reviewFile, r); }
+
+  windowFor(owner) { return BrowserWindow.fromWebContents(owner.wc.hostWebContents) || this.getMainWindow(); }
+
+  // Native dialogs one at a time (guard prompts, approvals, reveals, reviews).
+  serialDialog(fn) {
+    const next = this.dialogChain.then(fn, fn);
+    this.dialogChain = next.catch(() => {});
+    return next;
+  }
+
+  // Before a host terminal/agent starts in a project where a sandbox ran: show what the sandbox
+  // changed among files the host runs automatically, and let the user decide. true = go ahead.
+  async reviewSandboxChanges(owner, root) {
+    if (!this.readReview()[root]) return true;
+    return this.serialDialog(async () => {
+      const review = this.readReview();
+      const base = review[root];
+      if (!base) return true;
+      const running = (this.sandboxRunning.get(root) || 0) > 0;
+      const current = await autoExecSnapshot(root);
+      const changes = snapshotDiff(base.snapshot || {}, current);
+      const settle = () => {
+        const r = this.readReview();
+        if (running) r[root] = { at: Date.now(), snapshot: current }; else delete r[root];
+        this.writeReview(r);
+      };
+      if (!changes.length) { settle(); return true; }
+      const lines = changes.slice(0, 15).map((c) => `• ${c.change}: ${clip(c.path, 160)}`);
+      if (changes.length > 15) lines.push(`…and ${changes.length - 15} more`);
+      const { response } = await dialog.showMessageBox(this.windowFor(owner), {
+        type: 'warning', buttons: ['Cancel', 'Start anyway'], defaultId: 0, cancelId: 0, noLink: true,
+        message: 'A sandboxed agent changed files that run code on this computer',
+        detail: `In ${clip(root, 200)}${running ? ' (a sandbox is still running there)' : ''}:\n${lines.join('\n')}\n\nGit hooks and config, Claude Code / Codex / Gemini settings, MCP servers, editor tasks, direnv and similar files can run commands when you next use git, an agent or your editor in this folder. Look at them first (the file tree shows hidden files with the eye button).`,
+      });
+      if (response !== 1) return false;
+      settle();
+      return true;
+    });
   }
 
   // git for `git init` in new hubs. On macOS /usr/bin/git is a stub that pops an installer dialog when
@@ -530,11 +677,14 @@ class Workbench {
   }
 
   // Move the values of a dotenv file into the vault (project scope) and blank them in the file.
+  // Every file touched here goes through ProjectFs (real-path checks, O_NOFOLLOW writes); symlinked
+  // .env / .gitignore files are refused rather than followed.
   async migrateDotenv(p, rel) {
     if (!DOTENV_FILE.test(rel)) throw new Error('Only .env files can be migrated.');
     const abs = await p.resolve(rel);
-    const st = await fs.promises.stat(abs);
-    if (!st.isFile() || st.size > 256 * 1024) throw new Error('not a .env file');
+    const lst = await fs.promises.lstat(abs);
+    if (lst.isSymbolicLink()) throw new Error(`${rel} is a symlink — move the keys from the file it points to.`);
+    if (!lst.isFile() || lst.size > 256 * 1024) throw new Error('not a .env file');
     const why = this.vault.unavailableReason();
     if (why) throw new Error(why);
     const text = await fs.promises.readFile(abs, 'utf8');
@@ -553,16 +703,18 @@ class Workbench {
     if (imported.length && !text.includes(HEADER)) {
       lines.unshift(HEADER, '# environment variables in terminals and agents that Meridian starts for this project.');
     }
-    if (imported.length) await fs.promises.writeFile(abs, lines.join(eol), { mode: st.mode });
+    if (imported.length) await p.writeFileSafely(abs, lines.join(eol));
     // Keep it out of git too.
     let gitignored = false;
     if (fs.existsSync(path.join(p.root, '.git'))) {
       const gi = path.join(p.root, '.gitignore');
-      let cur = '';
-      try { cur = await fs.promises.readFile(gi, 'utf8'); } catch {}
+      let gst = null;
+      try { gst = await fs.promises.lstat(gi); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+      if (gst && !gst.isFile()) return { imported, skipped, gitignored, gitignoreSkipped: '.gitignore is not a regular file (symlink?) — add the entry yourself.' };
+      const cur = gst ? await fs.promises.readFile(gi, 'utf8') : '';
       const entry = '/' + rel;
       const covered = cur.split(/\r?\n/).some((l) => { const t = l.trim(); return t === entry || t === rel || t === '.env*' || t === '.env' && rel === '.env' || (t === '.env.*' && /^\.env\./.test(rel)); });
-      if (!covered) { await fs.promises.writeFile(gi, cur + (cur && !cur.endsWith('\n') ? '\n' : '') + entry + '\n'); gitignored = true; }
+      if (!covered) { await p.writeFileSafely(gi, cur + (cur && !cur.endsWith('\n') ? '\n' : '') + entry + '\n'); gitignored = true; }
     }
     return { imported, skipped, gitignored };
   }
@@ -589,10 +741,13 @@ class Workbench {
           if (keys.length) dotenvs.push({ rel, keys });
         } catch {}
       }
-      const what = req.command ? 'run a command that reads a secret file' : `read ${req.paths.map((a) => relOf(a) || a).join(', ').slice(0, 300)}`;
+      // Everything in req comes from the agent: shown as plain, bounded single lines, clearly labelled.
+      const shown = req.paths.map((a) => clip(relOf(a) || a, 160));
+      const what = req.command ? 'run a command that may read a secret file' : `read ${req.paths.length === 1 ? 'a file' : `${req.paths.length} files`} that may contain secrets`;
       const keyNames = [...new Set(dotenvs.flatMap((d) => d.keys))];
       const detail = [
-        req.command ? `Command: ${req.command.slice(0, 400)}` : null,
+        req.command ? `Command requested by the agent:\n   ${clip(req.command, 300)}` : null,
+        shown.length ? `${req.command ? 'Files' : 'Requested by the agent'}:\n${shown.slice(0, 8).map((x) => `   ${x}`).join('\n')}${shown.length > 8 ? `\n   …and ${shown.length - 8} more` : ''}` : null,
         keyNames.length ? `It contains ${keyNames.length} key${keyNames.length === 1 ? '' : 's'}: ${keyNames.slice(0, 8).join(', ')}${keyNames.length > 8 ? '…' : ''}.` : null,
         'Whatever an agent reads is sent to the model and kept in the session transcript.',
         keyNames.length ? '“Move keys to vault” stores the values encrypted in Meridian, leaves the keys empty in the file, and gives the values to terminals and agents Meridian starts as environment variables. The agent then sees only the names.' : null,
@@ -600,7 +755,7 @@ class Workbench {
       const buttons = keyNames.length ? ['Move keys to vault', 'Block', 'Allow once', 'Allow for this session'] : ['Block', 'Allow once', 'Allow for this session'];
       const win = BrowserWindow.fromWebContents(owner.wc.hostWebContents) || this.getMainWindow();
       const { response } = await dialog.showMessageBox(win, {
-        type: 'warning', buttons, defaultId: 0, cancelId: buttons.indexOf('Block'), noLink: true,
+        type: 'warning', buttons, defaultId: buttons.indexOf('Block'), cancelId: buttons.indexOf('Block'), noLink: true,
         message: `${session.agent} wants to ${what}`, detail,
       });
       const choice = buttons[response];
@@ -608,18 +763,20 @@ class Workbench {
       const hint = available.length ? ` Secrets are available to you as environment variables: ${available.slice(0, 20).join(', ')}. Use them by name (e.g. $${available[0]}) and never print their values.` : ' Ask the user to add the keys you need to the Meridian vault; they will be provided as environment variables.';
       if (choice === 'Move keys to vault') {
         const moved = [];
-        for (const d of dotenvs) { try { moved.push(...(await this.migrateDotenv(owner.project, d.rel)).imported); } catch (err) { return { decision: 'deny', reason: `Meridian couldn’t move the keys: ${err.message}` }; } }
+        const migrated = new Set();
+        for (const d of dotenvs) { try { moved.push(...(await this.migrateDotenv(owner.project, d.rel)).imported); migrated.add(d.rel); } catch (err) { return { decision: 'deny', reason: `Meridian couldn’t move the keys: ${err.message}` }; } }
         this.broadcast('wb:vault-change', {});
-        return { decision: 'allow', reason: `The values were moved to the Meridian vault; the file now holds only key names (${moved.join(', ')}). They are set as environment variables in sessions Meridian starts — restart this session to get them.` };
+        const movedText = `The values were moved to the Meridian vault; the file now holds only key names (${moved.join(', ')}). They are set as environment variables in sessions Meridian starts — restart this session to get them.`;
+        // Approve the call only if it reads nothing but the files that were just emptied.
+        const onlyMigrated = !req.command && req.paths.length > 0 && req.paths.every((a) => migrated.has(relOf(a)));
+        if (onlyMigrated) return { decision: 'allow', reason: movedText };
+        return { decision: 'deny', reason: `${movedText} This request was not run because it also reads other files or runs a command — retry it if you still need it.` };
       }
       if (choice === 'Allow for this session') { session.allowed.add(keyOf); return { decision: 'allow', reason: 'Allowed for this session in Meridian.' }; }
       if (choice === 'Allow once') return { decision: 'allow', reason: 'Allowed once in Meridian.' };
       return { decision: 'deny', reason: `The user blocked this in Meridian: files with secrets must not be read.${hint}` };
     };
-    // One prompt at a time.
-    const next = this.dialogChain.then(run, run);
-    this.dialogChain = next.catch(() => {});
-    return next;
+    return this.serialDialog(run); // one prompt at a time
   }
 
   readStore() {
@@ -639,6 +796,18 @@ class Workbench {
     fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
     fs.renameSync(tmp, this.storeFile);
   }
+}
+
+// Agent-controlled text in a native dialog: one line, no control/bidi characters, bounded.
+function clip(text, max) {
+  const t = String(text ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return t.length > max ? t.slice(0, max - 1) + '…' : t;
+}
+
+function writePrivateJson(file, data) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, file);
 }
 
 module.exports = { Workbench, INTERNAL_PARTITION, WORKBENCH_URL, isWorkbenchUrl, isWorkbenchResource, isInternalContents };

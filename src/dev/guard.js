@@ -21,6 +21,14 @@ const crypto = require('crypto');
 
 const MAX_REQUEST = 64 * 1024;
 const HOOK_SCRIPT = path.join(__dirname, 'hooks', 'secret-guard-hook.js').replace(`app.asar${path.sep}`, `app.asar.unpacked${path.sep}`);
+// The hook runs from app.asar.unpacked, which asar integrity doesn't cover. This file IS covered, so
+// it carries the script's SHA-256 and every session checks the script against it before using it.
+// Update it whenever the hook changes (tests/e2e/workbench-sec.spec.js fails if it is stale).
+const HOOK_SHA256 = '286bdd419244882597004227e0c17aea02e4d2456a6f13abb0aeaed962b0d395';
+// Claude Code tools that can show file contents to the model. File tools are checked by path;
+// shell-like tools by a heuristic match on their command text. (Tool names verified against the
+// Claude Code 2.1 CLI; NotebookRead is kept for older versions.)
+const GUARDED_TOOLS = ['Read', 'NotebookRead', 'NotebookEdit', 'Edit', 'MultiEdit', 'Grep', 'Glob', 'LSP', 'Bash', 'PowerShell', 'Monitor', 'REPL'];
 
 class SecretGuard {
   // onRequest(session, request) -> Promise<{ decision: 'allow'|'deny'|'ask', reason }>
@@ -33,7 +41,17 @@ class SecretGuard {
     this.starting = null;
   }
 
-  hookScript() { return fs.existsSync(HOOK_SCRIPT) ? HOOK_SCRIPT : null; }
+  // { path } when the shipped hook script is present and unmodified, otherwise { path: null, error }.
+  hookScript() {
+    let buf;
+    try { buf = fs.readFileSync(HOOK_SCRIPT); } catch { return { path: null, error: 'missing' }; }
+    const sum = crypto.createHash('sha256').update(buf).digest('hex');
+    if (sum !== HOOK_SHA256) {
+      console.warn(`workbench guard: ${HOOK_SCRIPT} failed its integrity check (sha256 ${sum}); the secret-file guard is off`);
+      return { path: null, error: 'tampered' };
+    }
+    return { path: HOOK_SCRIPT, error: null };
+  }
 
   start() {
     if (this.server) return Promise.resolve(this.socketPath);
@@ -46,10 +64,10 @@ class SecretGuard {
         this.socketPath = path.join(this.dir, 'guard.sock');
       }
       const server = net.createServer((sock) => this.onConnection(sock));
-      const restoreMask = process.platform === 'win32' ? () => {} : ((old) => () => process.umask(old))(process.umask(0o177));
-      server.on('error', (err) => { restoreMask(); this.starting = null; console.error('workbench guard: socket error', err.message); reject(err); });
+      // No process.umask() games (they leak into everything main spawns meanwhile): the socket lives in
+      // a 0700 dir nobody else can enter, and is chmod-ed right after listen.
+      server.on('error', (err) => { this.starting = null; console.error('workbench guard: socket error', err.message); reject(err); });
       server.listen(this.socketPath, () => {
-        restoreMask();
         if (process.platform !== 'win32') { try { fs.chmodSync(this.socketPath, 0o600); } catch {} }
         this.server = server;
         resolve(this.socketPath);
@@ -111,13 +129,16 @@ function hookSettings(nodePath, scriptPath) {
   if (/["`$\\\n\r]/.test(nodePath + scriptPath) && process.platform !== 'win32') return null;
   if (/["\n\r]/.test(nodePath + scriptPath)) return null;
   return {
+    // --settings outranks the project's .claude/settings*.json, so a repository can't switch the
+    // guard off with "disableAllHooks": true (verified with Claude Code 2.1.308). Managed policy can.
+    disableAllHooks: false,
     hooks: {
       PreToolUse: [{
-        matcher: 'Read|Grep|Glob|Bash|NotebookRead',
+        matcher: GUARDED_TOOLS.join('|'),
         hooks: [{ type: 'command', command: `"${nodePath}" "${scriptPath}"`, timeout: 140 }],
       }],
     },
   };
 }
 
-module.exports = { SecretGuard, hookSettings };
+module.exports = { SecretGuard, hookSettings, HOOK_SCRIPT, GUARDED_TOOLS };
