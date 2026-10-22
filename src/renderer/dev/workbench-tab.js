@@ -70,6 +70,13 @@ function onWorkbenchMessage(tabId, msg) {
       return;
     }
     case 'preview': return openWorkbenchPreview(tabId, String(msg.url || ''));
+    // Workbench Pro: keep a hub one click away (pinned tab or favorite).
+    case 'pin-hub': {
+      if (l.zone === 'today') moveNode(tabId, msg.where === 'fav' ? 'fav' : 'pinned', { index: msg.where === 'fav' ? favs().length : l.space.pinned.length });
+      else if (msg.where === 'fav' && l.zone !== 'fav') moveNode(tabId, 'fav', { index: favs().length });
+      toast(msg.where === 'fav' ? 'Added to Favorites' : 'Pinned to the sidebar');
+      return;
+    }
     case 'open-url': {
       const url = String(msg.url || '');
       if (/^https?:\/\//i.test(url)) openTab(url, { after: l.zone === 'today' ? tabId : null });
@@ -111,6 +118,15 @@ function openWorkbench({ pickProject = false } = {}) {
   }
   activate(target.id);
   if (pickProject) sendWorkbench(target.id, { type: 'pick-project' });
+}
+
+// Workbench Pro: command bar entries (New Hub, Customize with Claude, Secrets, Safe Mode).
+function workbenchCommand(name) {
+  const type = { 'workbench-new-hub': 'new-hub', 'workbench-customize': 'customize', 'workbench-secrets': 'secrets', 'workbench-safe-mode': 'safe-mode' }[name];
+  if (!type) return;
+  openWorkbench();
+  const target = activeTab();
+  if (isWorkbenchTab(target)) sendWorkbench(target.id, { type });
 }
 
 // Keep the workbench in the space colour.

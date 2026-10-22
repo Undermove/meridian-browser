@@ -40,6 +40,33 @@ contextBridge.exposeInMainWorld('workbench', {
   focusZone: (zone) => ipcRenderer.send('wb:focus-zone', String(zone)),
   menu: (items) => ipcRenderer.invoke('wb:menu', JSON.parse(JSON.stringify(items || []))),
 
+  // Workbench Pro — customizations, secrets vault, sandbox, hubs. Main validates every argument again.
+  customState: () => ipcRenderer.invoke('wb:custom-state'),
+  customSafeMode: (on) => ipcRenderer.invoke('wb:custom-safe-mode', !!on),
+  customTogglePlugin: (file, enabled) => ipcRenderer.invoke('wb:custom-toggle-plugin', String(file), !!enabled),
+  customRestore: (id) => ipcRenderer.invoke('wb:custom-restore', String(id)),
+  customOpen: () => ipcRenderer.invoke('wb:custom-open'),
+  customReveal: () => ipcRenderer.invoke('wb:custom-reveal'),
+  onCustomChange: listen('wb:custom-change'),
+
+  vaultList: () => ipcRenderer.invoke('wb:vault-list'),
+  vaultSet: (item) => ipcRenderer.invoke('wb:vault-set', {
+    id: item?.id ? String(item.id) : undefined, name: String(item?.name || ''), scope: item?.scope === 'project' ? 'project' : 'global',
+    note: String(item?.note || ''), value: typeof item?.value === 'string' ? item.value : undefined,
+  }),
+  vaultReveal: (id) => ipcRenderer.invoke('wb:vault-reveal', String(id)),
+  vaultDelete: (id) => ipcRenderer.invoke('wb:vault-delete', String(id)),
+  secretScan: () => ipcRenderer.invoke('wb:secret-scan'),
+  secretMigrate: (rel) => ipcRenderer.invoke('wb:secret-migrate', String(rel)),
+  onVaultChange: listen('wb:vault-change'),
+
+  sandboxStatus: (fresh) => ipcRenderer.invoke('wb:sandbox-status', !!fresh),
+  sandboxNetwork: (on) => ipcRenderer.invoke('wb:sandbox-network', !!on),
+
+  hubPickParent: () => ipcRenderer.invoke('wb:hub-pick-parent'),
+  hubCreate: (opts) => ipcRenderer.invoke('wb:hub-create', { name: String(opts?.name || ''), template: String(opts?.template || ''), git: opts?.git !== false, skills: opts?.skills !== false }),
+  hubInfo: () => ipcRenderer.invoke('wb:hub-info'),
+
   // To/from the Meridian window that hosts this page (no main-process privileges involved):
   // open a preview in split view, open a link as a browser tab, report the project name.
   toHost: (msg) => ipcRenderer.sendToHost('wb:host', JSON.parse(JSON.stringify(msg || {}))),

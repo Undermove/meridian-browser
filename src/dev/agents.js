@@ -33,7 +33,9 @@ function detect(searchPath) {
 const tomlString = (s) => JSON.stringify(String(s)); // JSON string escaping is valid TOML basic-string escaping
 
 // mcp: { command, args } from main's mcpCommand(); dataDir: Meridian's userData (where the agent endpoint lives).
-function launchSpec(kind, { searchPath, mcp, dataDir }) {
+// claudeSettings (Workbench Pro): extra settings for Claude Code (the secret-guard hook) — written to the
+// same private temp dir as --settings; it must never contain secret values.
+function launchSpec(kind, { searchPath, mcp, dataDir, claudeSettings = null }) {
   if (kind === 'shell') {
     const sh = userShell();
     return { title: path.basename(sh).replace(/\.exe$/i, ''), file: sh, args: IS_WIN ? [] : ['-l'], cleanup: [], notes: [] };
@@ -51,14 +53,24 @@ function launchSpec(kind, { searchPath, mcp, dataDir }) {
   const args = [];
   const node = mcp && which(mcp.command, searchPath);
   const env = { MERIDIAN_DATA_DIR: dataDir };
+  let tmpDir = null;
+  const privateDir = () => {
+    if (tmpDir) return tmpDir;
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-mcp-'));
+    fs.chmodSync(tmpDir, 0o700);
+    cleanup.push(tmpDir);
+    return tmpDir;
+  };
+  if (kind === 'claude' && claudeSettings) {
+    const file = path.join(privateDir(), `settings-${crypto.randomBytes(4).toString('hex')}.json`);
+    fs.writeFileSync(file, JSON.stringify(claudeSettings, null, 2), { mode: 0o600 });
+    args.push('--settings', file);
+  }
   if (agent.mcp && !node) notes.push('Node.js was not found on your PATH, so Meridian browser tools are not connected.');
   if (agent.mcp && node) {
     if (kind === 'claude') {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-mcp-'));
-      fs.chmodSync(dir, 0o700);
-      const file = path.join(dir, `mcp-${crypto.randomBytes(4).toString('hex')}.json`);
+      const file = path.join(privateDir(), `mcp-${crypto.randomBytes(4).toString('hex')}.json`);
       fs.writeFileSync(file, JSON.stringify({ mcpServers: { meridian: { command: node, args: mcp.args, env } } }, null, 2), { mode: 0o600 });
-      cleanup.push(dir);
       args.push('--mcp-config', file); // variadic flag: keep it last
     }
     if (kind === 'codex') {

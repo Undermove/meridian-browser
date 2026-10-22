@@ -19,7 +19,7 @@ function loadPty() {
 }
 
 class Terminal {
-  constructor({ id, owner, kind, title, file, args, cwd, env, cols, rows, cleanup }) {
+  constructor({ id, owner, kind, title, file, args, cwd, env, cols, rows, cleanup, meta, onExit, onKill }) {
     const pty = loadPty();
     if (!pty) throw new Error(`Terminals are unavailable: ${ptyLoadError?.message || 'node-pty missing'}`);
     this.id = id;
@@ -27,6 +27,9 @@ class Terminal {
     this.kind = kind;
     this.title = title;
     this.cleanup = cleanup || [];
+    this.meta = meta || {};     // Workbench Pro: { secrets: [names], guard, sandbox, then } — names only, never values
+    this.onExitHook = onExit;
+    this.onKillHook = onKill;
     this.chunks = [];
     this.size = 0;
     this.exited = null;
@@ -69,6 +72,7 @@ class Terminal {
     this.exited = { code, signal: signal || null };
     send(this.owner, 'wb:pty-exit', { id: this.id, ...this.exited });
     this.runCleanup();
+    try { this.onExitHook?.(this.exited); } catch {}
   }
 
   runCleanup() {
@@ -76,12 +80,14 @@ class Terminal {
   }
 
   info() {
-    return { id: this.id, kind: this.kind, title: this.title, exited: this.exited, scrollback: this.chunks.join('') };
+    return { id: this.id, kind: this.kind, title: this.title, exited: this.exited, scrollback: this.chunks.join(''), ...this.meta };
   }
 
   kill() {
-    if (!this.exited) { try { this.proc.kill(); } catch {} }
+    const running = !this.exited;
+    if (running) { try { this.proc.kill(); } catch {} }
     this.runCleanup();
+    if (running) { try { this.onKillHook?.(); } catch {} }
   }
 }
 

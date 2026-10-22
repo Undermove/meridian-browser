@@ -1332,6 +1332,11 @@ const COMMANDS = [
   // Workbench integration
   { id: 'open-workbench', label: 'Open Workbench', icon: 'code' },
   { id: 'open-project', label: 'Open Project in Workbench…', icon: 'code' },
+  // Workbench Pro integration (handled in dev/workbench-tab.js)
+  { id: 'workbench-new-hub', label: 'New Hub… (Workbench)', icon: 'layers' },
+  { id: 'workbench-customize', label: 'Customize Workbench with Claude', icon: 'settings' },
+  { id: 'workbench-secrets', label: 'Workbench Secrets Vault', icon: 'lock' },
+  { id: 'workbench-safe-mode', label: 'Workbench Safe Mode (no customizations)', icon: 'shield' },
 ];
 
 function openCommandBar(mode = 'new') {
@@ -1825,6 +1830,7 @@ function runCommand(name, ...args) {
     case 'ai-panel': return MINI ? null : toggleAiPanel();
     case 'open-workbench': return MINI ? null : openWorkbench(); // Workbench integration
     case 'open-project': return MINI ? null : openWorkbench({ pickProject: true });
+    case 'workbench-new-hub': case 'workbench-customize': case 'workbench-secrets': case 'workbench-safe-mode': return MINI ? null : workbenchCommand(name); // Workbench Pro integration
     case 'ai-summarize': toggleAiPanel(true); return setTimeout(() => sendAi('Summarize this page.', { allowTools: false }), 100);
   }
 }

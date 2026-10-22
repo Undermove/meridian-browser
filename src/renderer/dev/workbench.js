@@ -20,7 +20,15 @@ const AGENT_UI = {
   codex: { label: 'Codex', mark: 'X', color: '#3c3c46' },
   gemini: { label: 'Gemini', mark: 'G', color: '#4c8df6' },
   shell: { label: 'Shell', mark: '$', color: '#7a808c' },
+  // Workbench Pro: sandboxed agents (Docker / OrbStack)
+  'sandbox-claude': { label: 'Claude Code (sandbox)', mark: 'C', color: '#d97757' },
+  'sandbox-codex': { label: 'Codex (sandbox)', mark: 'X', color: '#3c3c46' },
+  'sandbox-shell': { label: 'Shell (sandbox)', mark: '$', color: '#7a808c' },
 };
+
+// Workbench Pro: events for workbench-pro.js and plugins ('project', 'file-open', 'file-save', 'info').
+const bus = new EventTarget();
+const emit = (type, detail) => bus.dispatchEvent(new CustomEvent(type, { detail }));
 const ACCESS_LABEL = { off: 'Off', read: 'Read only', ask: 'Ask before acting', full: 'Full control' };
 
 const S = {
@@ -57,6 +65,7 @@ function toast(text, timeout = 2600) {
 
 function modal(html, onMount) {
   const overlay = $('#modal-overlay');
+  $('#modal').className = '';
   $('#modal').innerHTML = html;
   overlay.hidden = false;
   const close = () => { overlay.hidden = true; $('#modal').innerHTML = ''; overlay.onmousedown = null; };
@@ -121,6 +130,7 @@ async function refreshInfo() {
   try { S.info = await wb.info(); } catch (err) { console.error(err); return; }
   renderLauncher();
   renderBrowserTools();
+  emit('info', S.info);
   return S.info;
 }
 
@@ -155,6 +165,7 @@ async function setProject(p, { reattach = false } = {}) {
   renderTree();
   if (reattach) await reattachTerminals();
   layoutTerminals();
+  emit('project', p);
 }
 
 async function projectMenu() {
@@ -260,6 +271,7 @@ function renderLauncher() {
     b.addEventListener('click', () => (installed ? launch(kind) : installHint(b, kind)));
     bar.appendChild(b);
   }
+  if (typeof proLauncherExtras === 'function') proLauncherExtras(bar); // Workbench Pro: sandbox + plugin launchers
   iconize(bar);
 }
 
@@ -500,7 +512,7 @@ function loadMonaco() {
     S.editor = monaco.editor.create($('#editor-host'), {
       model: null,
       automaticLayout: true,
-      theme: dark() ? 'meridian-dark' : 'meridian-light',
+      theme: editorThemeName(),
       fontFamily: cssVar('--mono'),
       fontSize: 13,
       lineHeight: 20,
@@ -517,11 +529,21 @@ function loadMonaco() {
     });
     S.editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveActive());
     S.editor.onDidChangeCursorPosition((e) => { $('#status-pos').textContent = `Ln ${e.position.lineNumber}, Col ${e.position.column}`; });
-    matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { defineThemes(); monaco.editor.setTheme(dark() ? 'meridian-dark' : 'meridian-light'); });
+    matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { defineThemes(); monaco.editor.setTheme(editorThemeName()); });
+    emit('editor-ready', S.editor);
     return monaco;
   });
   monacoReady.catch((err) => { console.error('Monaco failed to load', err); toast('The editor failed to load'); });
   return monacoReady;
+}
+
+// Workbench Pro: settings.json may pin a theme ('light' | 'dark' | 'hc-black' | 'hc-light'); default follows the system.
+function editorThemeName() {
+  const t = typeof proEditorTheme === 'function' ? proEditorTheme() : 'auto';
+  if (t === 'light') return 'meridian-light';
+  if (t === 'dark') return 'meridian-dark';
+  if (t === 'hc-black' || t === 'hc-light') return t;
+  return dark() ? 'meridian-dark' : 'meridian-light';
 }
 
 function defineThemes() {
@@ -544,7 +566,7 @@ function defineThemes() {
 function applySpace(color) {
   if (!/^#[0-9a-f]{3,8}$/i.test(color || '')) return;
   document.documentElement.style.setProperty('--space', color);
-  if (S.monaco) { defineThemes(); S.monaco.editor.setTheme(dark() ? 'meridian-dark' : 'meridian-light'); }
+  if (S.monaco) { defineThemes(); S.monaco.editor.setTheme(editorThemeName()); }
   for (const t of S.terms) t.xterm.options.theme = termTheme();
 }
 
@@ -568,6 +590,7 @@ async function openFile(rel, { preview = false, focus = false } = {}) {
     tab.savedVersion = tab.model.getAlternativeVersionId();
     tab.model.onDidChangeContent(() => { renderTabs(); markTreeDirty(); });
   }
+  emit('file-open', rel);
   // Single-click "preview" replaces a clean, untouched preview tab, like VS Code.
   const prev = S.tabs.find((t) => t.preview && !isDirty(t));
   tab.preview = preview;
@@ -669,6 +692,7 @@ async function saveActive() {
     tab.state = 'ok';
     tab.preview = false;
     renderTabs(); renderBanner(); renderTree();
+    emit('file-save', tab.path);
   } catch (err) { toast(`Couldn’t save: ${err.message}`, 4000); }
 }
 
@@ -743,10 +767,11 @@ function termTheme() {
 
 function newXterm() {
   // eslint-disable-next-line no-undef
+  const ts = typeof proTerminalOptions === 'function' ? proTerminalOptions() : {}; // Workbench Pro: settings.json
   const xterm = new Terminal({
-    fontFamily: cssVar('--mono'),
-    fontSize: 12.5,
-    lineHeight: 1.15,
+    fontFamily: ts.fontFamily || cssVar('--mono'),
+    fontSize: ts.fontSize || 12.5,
+    lineHeight: ts.lineHeight || 1.15,
     cursorBlink: true,
     allowTransparency: false,
     scrollback: 10000,
@@ -765,7 +790,9 @@ function mountTerm(info) {
   $('#term-host').appendChild(el);
   const { xterm, fit } = newXterm();
   xterm.open(el);
-  const t = { id: info.id, kind: info.kind, title: info.title, xterm, fit, el, exited: info.exited, browserTools: info.browserTools };
+  const t = { id: info.id, kind: info.kind, title: info.title, xterm, fit, el, exited: info.exited, browserTools: info.browserTools,
+    secrets: info.secrets || [], guard: !!info.guard, sandbox: !!info.sandbox, then: info.then || null };
+  if (typeof proGuardPaste === 'function') proGuardPaste(t); // Workbench Pro: secret paste guard
   xterm.onData((data) => { if (!t.exited) wb.ptyWrite(t.id, data); else if (data === '\r') restartTerm(t); });
   xterm.attachCustomKeyEventHandler((e) => {
     if (e.type === 'keydown' && (IS_MAC ? e.metaKey : e.ctrlKey && e.shiftKey) && e.key.toLowerCase() === 'k') { xterm.clear(); return false; }
@@ -793,6 +820,8 @@ async function launch(kind) {
   }
   const t = mountTerm(info);
   for (const n of info.notes || []) t.xterm.writeln(`\x1b[2m${n}\x1b[0m`);
+  if (t.secrets.length) t.xterm.writeln(`\x1b[2mVault: ${t.secrets.join(', ')} ${t.secrets.length === 1 ? 'is' : 'are'} set in this session’s environment (values hidden).\x1b[0m`);
+  if (t.guard) t.xterm.writeln('\x1b[2mSecret-file guard: Meridian asks before Claude Code reads .env, keys or credentials.\x1b[0m');
   if (info.browserTools) t.xterm.writeln(`\x1b[2mMeridian browser tools are connected for this session (access: ${ACCESS_LABEL[S.info?.agentAccess] || 'off'} — change it in Settings → AI).\x1b[0m`);
   activateTerm(t);
   return t;
@@ -847,6 +876,9 @@ function renderTermTabs() {
     name.textContent = t.title + (t.exited ? ' (exited)' : '');
     el.appendChild(name);
     if (t.browserTools) { const p = document.createElement('span'); p.className = 'plug'; p.title = 'Meridian browser tools connected'; p.innerHTML = icon('globe', 11); el.appendChild(p); }
+    // Workbench Pro: sandbox and vault indicators (secret NAMES only)
+    if (t.sandbox) { const p = document.createElement('span'); p.className = 'plug sbx'; p.title = 'Runs in a Docker sandbox: only this project is visible'; p.innerHTML = icon('shield', 11); el.appendChild(p); }
+    if (t.secrets?.length) { const p = document.createElement('span'); p.className = 'plug keys'; p.title = `Vault secrets in this session’s environment:\n${t.secrets.join('\n')}`; p.innerHTML = icon('lock', 11) + `<span>${t.secrets.length}</span>`; el.appendChild(p); }
     const x = document.createElement('button');
     x.className = 'tab-close'; x.title = t.exited ? 'Close' : 'Stop and close'; x.innerHTML = icon('x', 12);
     el.appendChild(x);
@@ -879,6 +911,8 @@ function initTerminals() {
     t.exited = { code };
     t.xterm.writeln(`\r\n\x1b[2m[process exited${code ? ` with code ${code}` : ''} — press Enter to restart]\x1b[0m`);
     renderTermTabs();
+    // Workbench Pro: the sandbox image build finished — start the sandbox it was built for.
+    if (t.then && code === 0) { t.xterm.writeln(`\x1b[2mImage ready — starting ${AGENT_UI[t.then]?.label || t.then}…\x1b[0m`); launch(t.then); }
   });
   $('#term-new').addEventListener('click', () => launch('shell'));
   $('#term-toggle').addEventListener('click', () => {
@@ -951,6 +985,7 @@ function onHostCommand(msg) {
     if (!S.project && typeof msg.project === 'string') openRecent(msg.project);
   }
   if (msg.type === 'pick-project') pickProject();
+  if (typeof proHostCommand === 'function') proHostCommand(msg); // Workbench Pro: new-hub, customize, safe-mode
 }
 
 // ---------------------------------------------------------------- keyboard + focus zones
@@ -992,6 +1027,7 @@ async function boot() {
   initKeys();
   wb.onFsChange(onFsChange);
   wb.onHostCommand(onHostCommand);
+  if (typeof proBoot === 'function') await proBoot(); // Workbench Pro: customizations, panels, vault, hubs
   loadMonaco();
 
   const info = await refreshInfo();
@@ -1000,4 +1036,5 @@ async function boot() {
   wb.toHost({ type: 'ready' });
 }
 
-boot();
+// After every script has loaded (workbench-pro.js comes after this file).
+document.addEventListener('DOMContentLoaded', () => boot());

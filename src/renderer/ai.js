@@ -297,6 +297,8 @@ function addMsg(role, html = '') {
 async function sendAi(text, { allowTools = true } = {}) {
   text = text.trim();
   if (!text || ai.busy) return;
+  // Workbench Pro integration: warn before sending something that looks like an API key or token.
+  if (window.MeridianSecrets?.find(text).length && !(await confirmSecretSend(text))) { $('#ai-input').value = text; $('#ai-input').focus(); return; }
   ai.busy = true;
   setAiBusy(true);
   addMsg('user', esc(text));
@@ -304,6 +306,19 @@ async function sendAi(text, { allowTools = true } = {}) {
   const page = await pageForAi();
   const useTools = allowTools && !$('#ai-tools').disabled && $('#ai-tools').checked;
   api.aiChat({ sessionId: ai.sessionId, text, page, useTools });
+}
+
+// Workbench Pro integration: secrets typed into chat end up with the model and in the transcript.
+function confirmSecretSend(text) {
+  const hits = MeridianSecrets.find(text).map((x) => `${x.kind} (${MeridianSecrets.mask(x.value)})`).join(', ');
+  return new Promise((resolve) => {
+    showModal(`<h3>Send what looks like a secret?</h3>
+      <p class="muted">Your message contains ${esc(hits)}. It would be sent to the model and kept in this chat. Keep keys in the Workbench vault instead — tools and agents get them as environment variables.</p>
+      <div class="modal-actions"><button class="btn" data-a="cancel">Edit message</button><button class="btn danger" data-a="ok">Send anyway</button></div>`, (m, close) => {
+      m.addEventListener('click', (e) => { const a = e.target.closest('[data-a]')?.dataset.a; if (a) { close(); resolve(a === 'ok'); } });
+      $('#modal-overlay').addEventListener('dismiss', () => resolve(false), { once: true });
+    });
+  });
 }
 
 function setAiBusy(busy) {
