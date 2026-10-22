@@ -342,6 +342,7 @@ function drawMissionDetail() {
   $('.mc-d-status .mc-pill', box).dataset.status = n.status;
   $('[data-k="where"]', box).textContent = { local: 'On this Mac', sandbox: 'Docker sandbox', mcp: 'MCP client', assistant: 'Built-in assistant' }[n.where] || n.where || '—';
   if (!IS_MAC && n.where === 'local') $('[data-k="where"]', box).textContent = 'On this computer';
+  if (n.selfReported) $('[data-k="where"]', box).title = 'The client chose its own name; Meridian can’t verify it.';
   $('[data-k="project"]', box).textContent = n.project || root.project || '—';
   $('[data-k="elapsed"]', box).textContent = mcElapsed(n);
   $('[data-k="calls"]', box).textContent = n.source === 'codex' ? String(n.turns || 0) : `${n.toolCalls}${n.errors ? ` · ${n.errors} failed` : ''}`;

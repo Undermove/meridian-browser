@@ -16,11 +16,14 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { StringDecoder } = require('string_decoder');
 
 const MAX_LINE = 16 * 1024;
 const MAX_CONN = 64 * 1024;
 const MAX_FILE = 4 * 1024 * 1024;
+const MAX_READ = 256 * 1024;
 const RATE = { burst: 200, perSecond: 60 };
+const OPEN_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
 
 class EventChannel {
   // onEvent(session, event) — session is whatever register() was given.
@@ -45,6 +48,7 @@ class EventChannel {
         this.socketPath = path.join(this.dir, 'events.sock');
       }
       const server = net.createServer((sock) => this.onConnection(sock));
+      server.maxConnections = 64; // hooks connect, write one line and leave
       const restoreMask = process.platform === 'win32' ? () => {} : ((old) => () => process.umask(old))(process.umask(0o177));
       server.on('error', (err) => { restoreMask(); this.starting = null; console.error('mission control: socket error', err.message); reject(err); });
       server.listen(this.socketPath, () => {
@@ -121,34 +125,49 @@ class EventChannel {
   // ----- sandbox: a per-session directory with an append-only events file -----
 
   // Creates the dir (returned) and starts following <dir>/events.jsonl for this token.
+  //
+  // The dir is mounted read-write into the container, so everything in it is hostile: events.jsonl
+  // may be swapped for a symlink (to any host file), a FIFO, a device, a directory, a hard link, or
+  // truncated/recreated at any time. We only ever read through an fd opened with O_NOFOLLOW (and
+  // O_NONBLOCK, so a FIFO can't park the open), and only if fstat says it's a regular file with a
+  // single link that lives on the same device as the dir we created. Reads are bounded per tick and
+  // in total; a shrunk or replaced file restarts from 0 (only its own session's token is accepted).
   tailDir(token) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-mission-'));
     fs.chmodSync(dir, 0o700);
     const file = path.join(dir, 'events.jsonl');
-    fs.writeFileSync(file, '', { mode: 0o600 });
-    const st = { file, dir, offset: 0, partial: '', reading: false };
+    fs.writeFileSync(file, '', { mode: 0o600, flag: 'wx' });
+    const dev = fs.lstatSync(dir).dev;
+    const st = { file, dir, offset: 0, total: 0, ino: null, partial: '', decoder: new StringDecoder('utf8'), reading: false, stopped: false };
     const read = () => {
-      if (st.reading) return;
+      if (st.reading || st.stopped) return;
       st.reading = true;
-      fs.stat(file, (err, s) => {
-        if (err || s.size <= st.offset || st.offset > MAX_FILE) { st.reading = false; return; }
-        const end = Math.min(s.size, MAX_FILE);
-        const stream = fs.createReadStream(file, { start: st.offset, end: end - 1, encoding: 'utf8' });
-        let data = '';
-        stream.on('data', (c) => { data += c; });
-        stream.on('error', () => { st.reading = false; });
-        stream.on('end', () => {
-          st.offset = end;
-          const text = st.partial + data;
-          const lines = text.split('\n');
-          st.partial = lines.pop().slice(0, MAX_LINE + 1);
-          for (const l of lines) this.accept(l);
-          st.reading = false;
-        });
-      });
+      let fd = null;
+      try {
+        fd = fs.openSync(file, OPEN_FLAGS);
+        const s = fs.fstatSync(fd);
+        if (!s.isFile() || s.nlink !== 1 || s.dev !== dev) return;
+        if (st.ino !== s.ino || s.size < st.offset) { st.ino = s.ino; st.offset = 0; st.partial = ''; st.decoder = new StringDecoder('utf8'); } // replaced or truncated
+        if (s.size <= st.offset || st.total >= MAX_FILE) return;
+        const len = Math.min(s.size - st.offset, MAX_READ, MAX_FILE - st.total);
+        const buf = Buffer.alloc(len);
+        const n = fs.readSync(fd, buf, 0, len, st.offset);
+        if (n <= 0) return;
+        st.offset += n;
+        st.total += n;
+        const lines = (st.partial + st.decoder.write(buf.subarray(0, n))).split('\n');
+        st.partial = lines.pop().slice(0, MAX_LINE + 1);
+        for (const l of lines) this.accept(l);
+      } catch { /* missing, a symlink (ELOOP), a dir, … : ignore */ } finally {
+        if (fd !== null) { try { fs.closeSync(fd); } catch {} }
+        st.reading = false;
+      }
     };
-    try { st.watcher = fs.watch(file, read); } catch {}
+    // Coalesced: the container can generate fs events as fast as it likes.
+    const soon = () => { if (!st.soon && !st.stopped) st.soon = setTimeout(() => { st.soon = null; read(); }, 50); };
+    try { st.watcher = fs.watch(dir, soon); st.watcher.on('error', () => {}); } catch {}
     st.timer = setInterval(read, 700); // fs.watch misses writes made through some VM file-sharing layers
+    st.timer.unref?.();
     this.tails.set(token, st);
     return dir;
   }
@@ -157,9 +176,12 @@ class EventChannel {
     const st = this.tails.get(token);
     if (!st) return;
     this.tails.delete(token);
+    st.stopped = true;
     try { st.watcher?.close(); } catch {}
     clearInterval(st.timer);
-    fs.rm(st.dir, { recursive: true, force: true }, () => {});
+    clearTimeout(st.soon);
+    // rmSync never follows symlinks the container planted in the dir.
+    try { fs.rmSync(st.dir, { recursive: true, force: true }); } catch {}
   }
 
   stop() {
