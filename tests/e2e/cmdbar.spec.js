@@ -141,14 +141,13 @@ test.describe('command bar', () => {
     expect(await page.evaluate(() => window.__r)).toBeNull();
   });
 
-  // BUG: Escape on a confirm box (e.g. "Delete space…", "Clear cookies") only hides #modal-overlay in the global
-  // keydown handler (app.js:1563); the 'dismiss' event isn't dispatched, so the confirmBox() promise never
-  // settles and the dialog's DOM stays in #modal. Same for the Settings modal (left mounted, handlers alive).
+  // Regression: Escape on a confirm box only hid #modal-overlay; the 'dismiss' event wasn't dispatched,
+  // so the confirmBox() promise never settled and the dialog's DOM stayed in #modal.
   test('Escape on a confirm box answers "no"', async ({ page }) => {
-    test.fail(true, 'BUG: confirmBox promise never resolves on Escape');
     await page.evaluate(() => { window.__r2 = 'pending'; confirmBox('Sure?', 'Yes').then((v) => { window.__r2 = v; }); });
     await page.keyboard.press('Escape');
     await expect(page.locator('#modal-overlay')).toBeHidden();
     await expect.poll(() => page.evaluate(() => window.__r2), { timeout: 1500 }).toBe(false);
+    expect(await page.evaluate(() => document.querySelector('#modal').innerHTML)).toBe('');
   });
 });

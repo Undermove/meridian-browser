@@ -216,7 +216,10 @@ function loadState() {
 // parts: { state: object | JSON string, history?: object, favicons?: object }. Legacy callers send the
 // state object itself (history inline).
 function splitStateParts(arg) {
-  if (arg && typeof arg === 'object' && 'state' in arg && !('spaces' in arg)) return arg;
+  // A bare string is the state JSON itself (destructuring it below would write an object of characters).
+  if (typeof arg === 'string') return { state: arg };
+  if (!arg || typeof arg !== 'object') return {};
+  if ('state' in arg && !('spaces' in arg)) return arg;
   const { history, ...state } = arg || {};
   return { state, history };
 }
@@ -287,8 +290,36 @@ function prepareSession(ses) {
     if (SAFE_PERMISSIONS.has(permission)) return true;
     return permissionDecisions[`${originOf(origin)}|${permission}`] === true;
   });
+  installFilePolicy(ses);
   applyAdblock(ses);
   for (const ext of loadedExtensionPaths) loadExtensionInto(ses, ext);
+}
+
+// Local files: a file:// page opened in a tab (a typed or dropped local HTML file) is shown, but it can't
+// load or read other local files — no fetch/XHR, <img>, <script>, <iframe>… of file:// URLs, only the page
+// itself. (Electron would otherwise let file:// pages read any file, e.g. ~/.ssh, and send it anywhere.)
+// Electron keeps one onBeforeRequest listener per session and the ad blocker sets its own, so ours wraps
+// session.webRequest.onBeforeRequest and runs the ad blocker's listener after the file check.
+const stripHash = (u) => String(u || '').split('#')[0];
+function fileRequestAllowed(details) {
+  if (details.resourceType === 'mainFrame') return true; // navigations are policed by guardNavigation
+  let page = '';
+  try { page = details.webContents && !details.webContents.isDestroyed() ? details.webContents.getURL() : ''; } catch {}
+  return !!page && stripHash(page) === stripHash(details.url);
+}
+function installFilePolicy(ses) {
+  const wr = ses.webRequest;
+  const register = wr.onBeforeRequest.bind(wr);
+  let inner = null;
+  const policy = (details, callback) => {
+    if (/^file:/i.test(details.url)) return callback(fileRequestAllowed(details) ? {} : { cancel: true });
+    if (inner) return inner(details, callback);
+    callback({});
+  };
+  // Without another listener only file:// requests pay for the hop into JS.
+  const apply = () => (inner ? register(policy) : register({ urls: ['file://*/*'] }, policy));
+  wr.onBeforeRequest = (filter, listener) => { inner = typeof filter === 'function' ? filter : listener || null; apply(); };
+  apply();
 }
 
 handle('adblock:set', async (_e, enabled) => {
@@ -369,6 +400,8 @@ async function handlePermissionRequest(wc, permission, callback, details) {
   if (permission === 'openExternal') {
     const url = details.externalURL || '';
     if (!EXTERNAL_SCHEMES.has(schemeOf(url))) return callback(false);
+    if (!hadRecentGesture(wc)) return callback(false);
+    lastGesture.delete(wc);
     const { response } = await dialog.showMessageBox(win, {
       type: 'question', buttons: ['Open', 'Cancel'], defaultId: 1, cancelId: 1,
       message: `${siteLabel(origin)} wants to open another app`, detail: url.length > 300 ? url.slice(0, 300) + '…' : url,
@@ -480,12 +513,19 @@ const EXTERNAL_SCHEMES = new Set(['mailto:', 'tel:', 'sms:', 'facetime:', 'zoomm
 const schemeOf = (url) => { try { return new URL(url).protocol; } catch { return ''; } };
 
 // Pages may link to mailto:/zoom:/… — ask before handing those to another app. Never file:, javascript: etc.
+// Only right after the user clicked or typed in that page (like Chrome's user activation): a page can't
+// pop "open another app?" prompts on its own, and a stray Enter answers Cancel.
+const lastGesture = new WeakMap(); // webContents -> time of the last mouse down / key down in it
+const GESTURE_MS = 5000;
+const hadRecentGesture = (contents) => Date.now() - (lastGesture.get(contents) || 0) < GESTURE_MS;
 async function maybeOpenExternal(url, contents) {
   const scheme = schemeOf(url);
   if (!EXTERNAL_SCHEMES.has(scheme)) return;
+  if (!hadRecentGesture(contents)) return;
+  lastGesture.delete(contents); // one prompt per gesture
   const win = BrowserWindow.fromWebContents(contents.hostWebContents || contents) || mainWindow;
   const { response } = await dialog.showMessageBox(win, {
-    type: 'question', buttons: ['Open', 'Cancel'], defaultId: 0, cancelId: 1,
+    type: 'question', buttons: ['Open', 'Cancel'], defaultId: 1, cancelId: 1,
     message: `Open this link in another app?`, detail: url.length > 300 ? url.slice(0, 300) + '…' : url,
   });
   if (response === 0) shell.openExternal(url);
@@ -565,6 +605,10 @@ app.on('web-contents-created', (_e, contents) => {
     });
   });
 
+  // User activation for external-app prompts (maybeOpenExternal / openExternal permission).
+  contents.on('input-event', (_ev, input) => {
+    if (input.type === 'mouseDown' || input.type === 'rawKeyDown' || input.type === 'keyDown' || input.type === 'gestureTap') lastGesture.set(contents, Date.now());
+  });
   contents.on('context-menu', (_ev, params) => showPageContextMenu(contents, params));
   // Esc inside a page still closes Peek / the find bar (pages keep receiving it too).
   contents.on('before-input-event', (_ev, input) => {

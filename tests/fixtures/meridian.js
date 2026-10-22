@@ -120,7 +120,7 @@ async function press(meridian, combo, { target } = {}) {
     return null;
   });
   await meridian.app.evaluate(({ webContents, BrowserWindow }, { wcId, keyCode, modifiers }) => {
-    const main = BrowserWindow.getAllWindows().find((w) => !w.webContents.getURL().includes('mini=1'));
+    const main = BrowserWindow.getAllWindows().find((w) => w.webContents.getURL() === 'meridian://app/index.html');
     const wc = wcId != null ? webContents.fromId(wcId) : main.webContents;
     wc.sendInputEvent({ type: 'keyDown', keyCode, modifiers });
     if (keyCode.length === 1 && !modifiers.some((m) => m === 'meta' || m === 'control')) wc.sendInputEvent({ type: 'char', keyCode, modifiers });
@@ -129,13 +129,15 @@ async function press(meridian, combo, { target } = {}) {
   await meridian.page.waitForTimeout(150);
 }
 
-// The main window is the one whose URL has no ?mini=1.
+// The main window is the UI page without a query (Little windows carry ?mini=1, private windows
+// ?private=…, the Settings window is settings.html).
+const MAIN_UI_URL = 'meridian://app/index.html';
 async function mainWindow(app) {
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
     for (const w of app.windows()) {
       const u = w.url();
-      if (u.includes('renderer/index.html') && !u.includes('mini=1')) return w;
+      if (u === MAIN_UI_URL) return w;
     }
     await app.waitForEvent('window', { timeout: 2000 }).catch(() => {});
   }
@@ -192,11 +194,41 @@ const test = base.extend({
   page: async ({ meridian }, use) => { await use(meridian.page); },
 });
 
+// ---------------------------------------------------------------- unattached runs
+// Playwright's CDP attach marks every webContents as "being captured" (webContents.isBeingCaptured()),
+// which keeps hidden pages visible and rendering. Checks of page visibility / background throttling
+// therefore launch Meridian without Playwright, through the dev screenshot-steps hook (MERIDIAN_SHOT +
+// MERIDIAN_STEPS, src/main.js runScreenshotScript): each step's `js` runs in the UI page and its result
+// comes back as an "[eval] <json>" line. Returns the parsed results in step order.
+// `during(child)`, if given, runs while the app is up; the app is stopped once it resolves.
+async function runUnattached({ userDataDir, state, steps, timeout = 60_000, during }) {
+  const { spawn } = require('child_process');
+  fs.writeFileSync(path.join(userDataDir, 'state.json'), JSON.stringify(state || seedState()));
+  fs.writeFileSync(path.join(userDataDir, 'window.json'), JSON.stringify({ x: 40, y: 40, width: 1280, height: 820 }));
+  const electronPath = require(path.join(ROOT, 'node_modules', 'electron'));
+  const child = spawn(electronPath, ['-r', NO_FOCUS, '.'], {
+    cwd: ROOT,
+    env: { ...process.env, MERIDIAN_USER_DATA: userDataDir, MERIDIAN_E2E_NO_FOCUS: '1', MERIDIAN_SHOT: path.join(userDataDir, 'unattached.png'), MERIDIAN_STEPS: JSON.stringify(steps) },
+  });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  child.stderr.on('data', () => {});
+  const exited = new Promise((resolve) => {
+    const kill = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, timeout);
+    child.on('exit', () => { clearTimeout(kill); resolve(); });
+  });
+  if (during) {
+    try { await during(child); } finally { try { child.kill('SIGKILL'); } catch {} }
+  }
+  await exited;
+  return out.split('\n').filter((l) => l.startsWith('[eval] ')).map((l) => { try { return JSON.parse(l.slice(7)); } catch { return l.slice(7); } });
+}
+
 // ---------------------------------------------------------------- helpers used by specs
 
 // Force the debounced save to disk now.
 async function flushState(page) {
-  await page.evaluate(() => api.saveState(serialize()));
+  await page.evaluate(() => api.saveState(saveParts({ slow: true })));
 }
 
 // Active space / tab snapshot.
@@ -264,7 +296,7 @@ async function clickIntoActivePage(page, { dx = 200, dy = 300 } = {}) {
 // realClick() does both: embedder-level press first (focus), then the CDP click (page sees the click).
 async function realMouse(page, events) {
   await page.__meridianApp.evaluate(({ BrowserWindow }, evs) => {
-    const win = BrowserWindow.getAllWindows().find((w) => !w.webContents.getURL().includes('mini=1'));
+    const win = BrowserWindow.getAllWindows().find((w) => w.webContents.getURL() === 'meridian://app/index.html');
     for (const e of evs) win.webContents.sendInputEvent(e);
   }, events);
 }
@@ -313,6 +345,6 @@ const focusInfo = (page) => page.evaluate(async () => {
 const nextFrames = (page) => page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
 
 module.exports = {
-  test, expect, launchMeridian, press, e2eLog, setDialogResponse, chooseMenu, closeMeridian, flushState, snapshot, openTabDirect, waitTabLoaded, inTab,
+  test, expect, launchMeridian, runUnattached, press, e2eLog, setDialogResponse, chooseMenu, closeMeridian, flushState, snapshot, openTabDirect, waitTabLoaded, inTab,
   activeViewBox, clickIntoActivePage, clickInTab, realClick, realMove, focusInfo, nextFrames, seedState, ROOT,
 };

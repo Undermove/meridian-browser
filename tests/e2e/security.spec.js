@@ -27,7 +27,7 @@ test.describe('web content isolation', () => {
   test('the UI page refuses to navigate away', async ({ meridian, page, server }) => {
     await page.evaluate((u) => { location.href = u; }, server.url('/p/hijack')).catch(() => {});
     await page.waitForTimeout(500);
-    expect(page.url()).toContain('renderer/index.html');
+    expect(page.url()).toBe('meridian://app/index.html');
     expect(await page.evaluate(() => typeof state)).toBe('object');
     void meridian;
   });
@@ -59,8 +59,9 @@ test.describe('file:// and privileged schemes', () => {
     await page.waitForTimeout(700);
     expect(await page.evaluate((id) => rt.views.get(id).getURL(), id)).toBe(server.url('/security'));
     expect((await snapshot(page)).todayCount).toBe(1);
-    expect((await allUrls(meridian.app)).some((u) => u.startsWith('file:'))).toBe(true); // only the UI itself
-    expect((await allUrls(meridian.app)).filter((u) => u.startsWith('file:')).every((u) => u.includes('renderer/index.html'))).toBe(true);
+    // The UI is served from meridian://app/, so no webContents at all may be on file:.
+    expect((await allUrls(meridian.app)).some((u) => u.startsWith('file:'))).toBe(false);
+    expect((await allUrls(meridian.app))).toContain('meridian://app/index.html');
   });
 
   test('a server redirect to file:// is blocked', async ({ meridian, page, server }) => {
@@ -83,26 +84,85 @@ test.describe('file:// and privileged schemes', () => {
     void meridian;
   });
 
-  // BUG (high): a local HTML file opened in a tab (typed/pasted file:// URL — webviews accept file: src,
-  // main.js:355, and toUrl() passes file: through, app.js:133) can read ANY local file with fetch()/XHR,
-  // e.g. ~/.ssh/id_rsa, and send it anywhere. Chrome forbids file:// → file:// reads. Cause: file:// gets
-  // Electron's extra privileges (GrantFileProtocolExtraPrivileges — default in dev, and explicitly re-enabled
-  // for packaged builds in package.json "electronFuses" because the UI itself loads from file://).
+  // Regression (high): a local HTML file opened in a tab (typed/pasted file:// URL) could read ANY local
+  // file with fetch()/XHR, e.g. ~/.ssh/id_rsa, and send it anywhere (Electron grants file:// extra
+  // privileges in dev; packaged builds have the fuse off). Main now blocks every file:// request from a
+  // page except the main-frame navigation and the page itself (installFilePolicy in main.js).
+  function localPage(dir, name, html) {
+    const fs = require('fs');
+    const path = require('path');
+    const f = path.join(dir, name);
+    fs.writeFileSync(f, html);
+    return f;
+  }
+
   test('a local HTML file opened in a tab cannot read other local files', async ({ meridian, page }) => {
-    test.fail(true, 'BUG: file:// pages can read arbitrary local files');
     const fs = require('fs');
     const path = require('path');
     const secret = path.join(meridian.userDataDir, 'secret.txt');
     fs.writeFileSync(secret, 'TOP-SECRET-TOKEN');
-    const f = path.join(meridian.userDataDir, 'evil.html');
-    fs.writeFileSync(f, `<title>evil</title><script>
+    const f = localPage(meridian.userDataDir, 'evil.html', `<title>evil</title><script>
       window.__r = 'pending';
       fetch(${JSON.stringify('file://' + secret)}).then((r) => r.text()).then((t) => { window.__r = t; }).catch((e) => { window.__r = 'blocked: ' + e.message; });
+      window.__x = 'pending';
+      const x = new XMLHttpRequest(); x.open('GET', ${JSON.stringify('file://' + secret)});
+      x.onload = () => { window.__x = x.responseText; }; x.onerror = () => { window.__x = 'blocked'; };
+      try { x.send(); } catch (e) { window.__x = 'blocked: ' + e.message; }
     </script>`);
     const id = await page.evaluate((u) => openTab(u).id, 'file://' + f);
     await waitTabLoaded(page, id);
     await expect.poll(() => inTab(page, id, 'window.__r')).not.toBe('pending');
+    await expect.poll(() => inTab(page, id, 'window.__x')).not.toBe('pending');
     expect(await inTab(page, id, 'window.__r')).not.toContain('TOP-SECRET-TOKEN');
+    expect(await inTab(page, id, 'window.__x')).not.toContain('TOP-SECRET-TOKEN');
+    expect(await inTab(page, id, 'window.__r')).toMatch(/^blocked/);
+  });
+
+  test('a local HTML file still opens and shows, but its file:// subresources and iframes do not load', async ({ meridian, page }) => {
+    const fs = require('fs');
+    const path = require('path');
+    // a 1×1 PNG next to the page
+    fs.writeFileSync(path.join(meridian.userDataDir, 'pic.png'), Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64'));
+    fs.writeFileSync(path.join(meridian.userDataDir, 'other.html'), '<title>other</title><p id="o">OTHER-FILE</p>');
+    const f = localPage(meridian.userDataDir, 'doc.html', `<title>Local Doc</title><h1 id="h">hello local</h1>
+      <img id="pic" src="pic.png" onload="window.__img='loaded'" onerror="window.__img='blocked'">
+      <iframe id="fr" src="other.html"></iframe>
+      <script>window.__self = 'pending'; fetch(location.href).then((r) => r.text()).then((t) => { window.__self = t.includes('hello local') ? 'self-ok' : 'self-other'; }, () => { window.__self = 'self-blocked'; });</script>`);
+    const id = await page.evaluate((u) => openTab(u).id, 'file://' + f);
+    await waitTabLoaded(page, id);
+    expect(await page.evaluate((id) => rt.views.get(id).getTitle(), id)).toBe('Local Doc');
+    expect(await inTab(page, id, `document.querySelector('#h').textContent`)).toBe('hello local');
+    await expect.poll(() => inTab(page, id, 'window.__img')).toBe('blocked');
+    await expect.poll(() => inTab(page, id, 'window.__self')).toBe('self-ok'); // the page itself is allowed
+    // the iframe's document never got the other file's content
+    expect(await inTab(page, id, `(() => { try { return document.querySelector('#fr').contentDocument?.body?.innerText || ''; } catch (e) { return 'cross-origin'; } })()`)).not.toContain('OTHER-FILE');
+    const frameUrls = await meridian.app.evaluate(({ webContents }, wcId) => webContents.fromId(wcId).mainFrame.framesInSubtree.map((fr) => fr.url), await page.evaluate((id) => rt.views.get(id).getWebContentsId(), id));
+    expect(frameUrls.some((u) => u.endsWith('/other.html'))).toBe(false);
+  });
+
+  test('the file:// policy keeps working when another onBeforeRequest listener (the ad blocker) is set', async ({ meridian, page, server }) => {
+    const fs = require('fs');
+    const path = require('path');
+    await openTabDirect(page, server.url('/p/warm')); // creates and prepares the profile session
+    // what the ad blocker does when it is switched on: its own listener for every URL
+    await meridian.app.evaluate(({ session }) => {
+      global.__seen = [];
+      session.fromPartition('persist:profile-default').webRequest.onBeforeRequest({ urls: ['<all_urls>'] }, (d, cb) => { global.__seen.push(d.url); cb(d.url.includes('/p/blocked-by-inner') ? { cancel: true } : {}); });
+    });
+    const secret = path.join(meridian.userDataDir, 'secret2.txt');
+    fs.writeFileSync(secret, 'SECRET-TWO');
+    const f = localPage(meridian.userDataDir, 'evil2.html', `<title>evil2</title><script>window.__r = 'pending'; fetch(${JSON.stringify('file://' + secret)}).then((r) => r.text()).then((t) => { window.__r = t; }, (e) => { window.__r = 'blocked'; });</script>`);
+    const id = await page.evaluate((u) => openTab(u).id, 'file://' + f);
+    await waitTabLoaded(page, id);
+    await expect.poll(() => inTab(page, id, 'window.__r')).toBe('blocked');
+    // the chained listener still sees (and can block) web requests
+    const web = await page.evaluate((u) => openTab(u).id, server.url('/p/after-inner'));
+    await waitTabLoaded(page, web);
+    expect((await meridian.app.evaluate(() => global.__seen)).some((u) => u.includes('/p/after-inner'))).toBe(true);
+    const blocked = await page.evaluate((u) => openTab(u).id, server.url('/p/blocked-by-inner'));
+    await page.waitForTimeout(800);
+    expect(server.hits.some((h) => h.includes('/p/blocked-by-inner'))).toBe(false);
+    void blocked;
   });
 
   test('javascript: typed in the command bar becomes a search, never runs', async ({ page }) => {
@@ -131,16 +191,16 @@ test.describe('external protocols', () => {
     expect(log.external).toEqual([]);
   });
 
-  // BUG: the external-app confirmation for links (maybeOpenExternal, src/main.js:334) uses defaultId: 0
-  // ("Open"), unlike every other Meridian prompt (defaultId = Cancel/Deny). A stray Enter/Space while a page
-  // spams zoommtg:/msteams:/tel: links launches the app.
+  // Regression: the external-app confirmation for links (maybeOpenExternal) defaulted to "Open", unlike every
+  // other Meridian prompt; a stray Enter/Space while a page spams zoommtg:/msteams:/tel: links launched the app.
   test('external app prompt defaults to Cancel', async ({ meridian, page, server }) => {
-    test.fail(true, 'BUG: external protocol dialog defaults to "Open"');
     const id = await securityTab(page, server);
     await clickInTab(page, id, '#zoom');
     await expect.poll(async () => (await e2eLog(meridian.app)).dialogs.length).toBeGreaterThan(0);
     const d = (await e2eLog(meridian.app)).dialogs.at(-1);
     expect(d.buttons[d.defaultId]).toBe('Cancel');
+    expect(d.buttons[d.cancelId]).toBe('Cancel');
+    expect((await e2eLog(meridian.app)).external).toEqual([]);
   });
 
   test('allowing the prompt hands the URL to the OS exactly once', async ({ meridian, page, server }) => {
@@ -172,5 +232,14 @@ test.describe('external protocols', () => {
     const log = await e2eLog(meridian.app);
     test.info().annotations.push({ type: 'dialogs for gesture-less external nav', description: String(log.dialogs.length) });
     expect(log.external).toEqual([]);
+    expect(log.dialogs).toEqual([]); // not even a prompt without a click/key in the page
+    // window.open() of an external scheme without a gesture: same
+    await inTab(page, id, `window.open('zoommtg://zoom.us/join?confno=3'); 1`);
+    await page.waitForTimeout(500);
+    expect((await e2eLog(meridian.app)).dialogs).toEqual([]);
+    // …while a real click in the page still asks
+    await clickInTab(page, id, '#zoom');
+    await expect.poll(async () => (await e2eLog(meridian.app)).dialogs.length).toBe(1);
+    expect((await e2eLog(meridian.app)).external).toEqual([]);
   });
 });

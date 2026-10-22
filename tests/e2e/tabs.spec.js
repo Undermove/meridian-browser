@@ -198,24 +198,43 @@ test.describe('folders', () => {
     await expect(page.locator(`.folder-wrap .children .row.tab[data-id="${id}"]`)).toBeVisible();
   });
 
+  // Sidebar context menus are Meridian's own (menu.js ctxMenu), not native popups.
   test('rename a folder from its context menu', async ({ meridian, page }) => {
     await page.evaluate(() => { space().pinned.unshift({ id: 'f1', type: 'folder', title: 'F', collapsed: false, children: [] }); render(); });
-    await require('../fixtures/meridian').chooseMenu(meridian.app, ['Rename…']);
     await page.locator('#pinned .row.folder').click({ button: 'right' });
+    const item = page.locator('.ctx-menu .ctx-item', { hasText: 'Rename Folder…' });
+    await expect(item).toBeVisible();
+    await item.click();
+    await expect(page.locator('.ctx-menu:not(.closing)')).toHaveCount(0);
     await page.locator('#ask-input').fill('Renamed');
     await page.keyboard.press('Enter');
     await expect(page.locator('#pinned .row.folder .title')).toHaveText('Renamed');
+    expect(await page.evaluate(() => locate('f1').node.title)).toBe('Renamed');
+    expect((await require('../fixtures/meridian').e2eLog(meridian.app)).menus).toEqual([]); // no native popup involved
   });
 
-  // BUG: double-click to rename never fires. Each click re-renders the whole sidebar
-  // (click → collapse toggle / activate → render() → innerHTML), so the two clicks land on different
-  // DOM nodes and Chromium never dispatches `dblclick` (src/renderer/app.js:805 + 822).
-  // Also the folder gets collapsed+expanded on the way.
+  // Regression: double-click to rename never fired, because each click re-rendered the row (click →
+  // collapse toggle / activate → innerHTML), so the two clicks landed on different DOM nodes.
   test('double-clicking a folder or pinned tab opens the rename prompt', async ({ page, server }) => {
-    test.fail(true, 'BUG: dblclick rename broken by full sidebar re-render on click');
-    await page.evaluate((u) => { space().pinned.unshift({ id: 'f1', type: 'folder', title: 'F', collapsed: false, children: [] }); render(); }, server.url('/'));
-    await page.locator('#pinned .row.folder').dblclick();
+    await page.evaluate((u) => {
+      space().pinned.unshift({ id: 'f1', type: 'folder', title: 'F', collapsed: false, children: [] });
+      space().pinned.push({ id: 'p1', type: 'tab', url: u, title: 'Pinned one' });
+      render();
+    }, server.url('/'));
+    await page.locator('#pinned .row.folder .title').dblclick();
     await expect(page.locator('#ask-input')).toBeVisible({ timeout: 2000 });
+    await expect(page.locator('#ask-input')).toHaveValue('F');
+    await page.locator('#ask-input').fill('Folder renamed');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('#pinned .row.folder .title')).toHaveText('Folder renamed');
+    expect(await page.evaluate(() => locate('f1').node.collapsed)).toBe(false); // toggled twice: back to open
+
+    await page.locator('#pinned .row.tab[data-id="p1"] .title').dblclick();
+    await expect(page.locator('#ask-input')).toBeVisible({ timeout: 2000 });
+    await expect(page.locator('#ask-input')).toHaveValue('Pinned one');
+    await page.locator('#ask-input').fill('Tab renamed');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('#pinned .row.tab[data-id="p1"] .title')).toHaveText('Tab renamed');
   });
 });
 
@@ -241,19 +260,24 @@ test.describe('drag and drop', () => {
     expect(await todayUrls(page)).toEqual([server.url('/p/d3'), server.url('/p/d1'), server.url('/p/d2')]);
   });
 
-  // BUG: with no favorites yet, #favorites has 0px height (styles.css:109 `.empty { min-height: 0 }`),
-  // so there is nothing to drop onto — the first favorite can't be created by drag and drop.
+  // Regression: with no favorites yet, #favorites was 0 px tall, so there was nothing to drop onto and the
+  // first favorite couldn't be created by drag and drop. While a tab is dragged it now opens up as a drop zone.
   test('dragging a tab onto the (empty) favorites strip favorites it', async ({ page }) => {
-    test.fail(true, 'BUG: empty favorites strip has no drop area');
     const row = page.locator('#today .row.tab').first();
     const id = await row.getAttribute('data-id');
-    const fav = await page.evaluate(() => { const r = document.querySelector('#favorites').getBoundingClientRect(); return { x: r.x + 30, y: r.y + r.height / 2, h: r.height }; });
+    const favRect = () => page.evaluate(() => { const r = document.querySelector('#favorites').getBoundingClientRect(); return { x: r.x + 30, y: r.y + r.height / 2, h: r.height }; });
+    expect((await favRect()).h).toBe(0); // no empty strip taking space when nothing is dragged
     const rb = await row.boundingBox();
     await page.mouse.move(rb.x + 20, rb.y + rb.height / 2);
     await page.mouse.down();
+    await page.mouse.move(rb.x + 30, rb.y + rb.height / 2 - 10, { steps: 3 });
+    await expect.poll(async () => (await favRect()).h).toBeGreaterThanOrEqual(40);
+    const fav = await favRect();
     await page.mouse.move(fav.x, fav.y, { steps: 5 });
     await page.mouse.up();
     expect(await page.evaluate((id) => locate(id)?.zone, id)).toBe('fav');
+    await expect(page.locator(`#favorites .fav[data-id="${id}"]`)).toBeVisible();
+    expect(await page.evaluate(() => document.body.classList.contains('dragging-tab'))).toBe(false);
   });
 
   test('dragging a tab next to an existing favorite favorites it', async ({ page, server }) => {
