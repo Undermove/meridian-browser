@@ -103,6 +103,16 @@ const AGENT_OPS = {
       .map((h) => ({ title: h.title, url: h.url, visits: h.count, last_visit: new Date(h.last).toISOString() }));
   },
 
+  // A background tab an agent is about to click/type in: rendered (still hidden behind the shown page,
+  // never on top) while the action runs. Chromium drops input to a page until it has painted a frame,
+  // and a tab that was never shown never paints.
+  live: ({ tab_id, on }) => {
+    const wv = rt.views.get(String(tab_id));
+    if (!wv) return false;
+    wv.classList.toggle('agent-live', !!on);
+    return true;
+  },
+
   describe: ({ tab_id }) => {
     const l = mustLocate(tab_id);
     return { tabId: l.node.id, title: titleOf(l.node), url: tabUrl(l.node) };

@@ -16,15 +16,23 @@ function threeSpaces(server) {
 
 const spaceIndex = (page) => snapshot(page).then((s) => s.spaceIndex);
 
-// Exactly one visible webview, and it belongs to the active tab.
+// Exactly one visible webview, and it belongs to the active tab. Every space keeps its own sidebar
+// page (keyed patching); exactly one of them is the current one, and it shows the active space.
 async function expectConsistentView(page) {
   const r = await page.evaluate(() => {
     const visible = [...document.querySelectorAll('#views webview')].filter((w) => !w.classList.contains('hidden'));
-    return { visible: visible.map((w) => w.dataset.tabId), active: space().activeTabId, dot: document.querySelector('.space-dot.active')?.dataset.space, spaceId: state.activeSpaceId, header: document.querySelector('#space-pages .space-name')?.textContent, name: space().name };
+    const current = [...document.querySelectorAll('#space-pages .space-page.current')];
+    return {
+      visible: visible.map((w) => w.dataset.tabId), active: space().activeTabId, dot: document.querySelector('.space-dot.active')?.dataset.space, spaceId: state.activeSpaceId,
+      currentPages: current.map((p) => p.dataset.space), header: current[0]?.querySelector('.space-name')?.textContent, name: space().name,
+      todayZoneInCurrent: !!current[0]?.querySelector('#today'),
+    };
   });
   expect(r.visible).toEqual(r.active ? [r.active] : []);
   expect(r.dot).toBe(r.spaceId);
+  expect(r.currentPages).toEqual([r.spaceId]);
   expect(r.header).toBe(r.name);
+  expect(r.todayZoneInCurrent).toBe(true);
 }
 
 test.describe('spaces', () => {
@@ -112,6 +120,7 @@ test.describe('spaces', () => {
   // keydown handler (editors, games, Google Docs…) must not be able to block space switching.
   test('space shortcuts still work when the page preventDefault()s every key @shortcut', async ({ meridian, page, server }) => {
     const alpha = await page.evaluate(() => space().activeTabId);
+    await waitTabLoaded(page, alpha); // loadURL() while the start-up load is still running rejects with ERR_ABORTED
     await page.evaluate(([id, u]) => rt.views.get(id).loadURL(u), [alpha, server.url('/greedy')]);
     await waitTabLoaded(page, alpha, server.url('/greedy'));
     await clickIntoActivePage(page);
@@ -141,12 +150,9 @@ test.describe('spaces', () => {
     }
   });
 
-  // BUG: the first switch into a space whose active tab isn't loaded yet leaves focus on the UI <body>:
-  // activate() calls wv.focus() in a setTimeout(0) right after creating the <webview>, before the guest
-  // is attached, and nothing re-focuses it once it loads (app.js:269-271). Keyboard scrolling / typing
-  // in the page does nothing until the user clicks into it.
+  // Regression: the first switch into a space whose active tab isn't loaded yet used to leave focus on
+  // the UI <body> (wv.focus() ran before the guest was attached and nothing re-focused it).
   test('first switch into a space with an unloaded tab focuses that page once it loads', async ({ page }) => {
-    test.fail(true, 'BUG: focus lost when the target tab has to be created');
     // no synthetic clicks: Alpha's page has focus from start-up (activate() at boot)
     await waitTabLoaded(page, await page.evaluate(() => space().activeTabId));
     await expect.poll(() => focusInfo(page).then((f) => f.tag)).toBe('webview');
@@ -156,21 +162,27 @@ test.describe('spaces', () => {
     await expect.poll(() => focusInfo(page).then((f) => f.tabId), { timeout: 3000 }).toBe(beta);
   });
 
-  // BUG: switching to a space with no open tab leaves keyboard focus in the previous space's
-  // now-hidden <webview> (switchSpace → render() only; `.view.hidden` is visibility:hidden and nothing
-  // blurs the guest — app.js:513, styles.css:243). Keystrokes then go into an invisible page
-  // (e.g. a half-typed form in another space), and page-level key handling keeps running there.
-  test('switching to an empty space does not leave focus in the hidden page', async ({ page }) => {
-    test.fail(true, 'BUG: focus stays in hidden webview');
+  // Regression: switching to a space with no open tab used to leave keyboard focus in the previous
+  // space's now-hidden <webview>, so keystrokes went into an invisible page.
+  test('switching to an empty space does not leave focus in the hidden page', async ({ meridian, page }) => {
     const alphaTab = await page.evaluate(() => space().activeTabId);
     await waitTabLoaded(page, alphaTab);
     await page.evaluate((id) => rt.views.get(id).focus(), alphaTab);
     await inTab(page, alphaTab, `document.querySelector('#field').focus(); 1`);
+    // precondition: the same key path does reach the field while its page is shown and focused
+    await press(meridian, 'z', { target: await page.evaluate((id) => rt.views.get(id).getWebContentsId(), alphaTab) });
+    await expect.poll(() => inTab(page, alphaTab, `document.querySelector('#field').value.toLowerCase()`)).toBe('z');
+    await inTab(page, alphaTab, `document.querySelector('#field').value = ''; 1`);
     await page.evaluate(() => runCommand('space-index', 2));
     expect(await spaceIndex(page)).toBe(2);
     const f = await focusInfo(page);
     test.info().annotations.push({ type: 'focus after switching to empty space', description: JSON.stringify(f) });
     expect(f.hidden, 'focus is inside a hidden webview').toBe(false);
+    expect(f.tag).not.toBe('webview');
+    // typing (real key events into the window) can't reach the hidden page's form
+    await press(meridian, 'q');
+    await press(meridian, 'w');
+    expect(await inTab(page, alphaTab, `document.querySelector('#field').value`)).toBe('');
   });
 
   test('rapid alternating switches end in a consistent state', async ({ page }) => {

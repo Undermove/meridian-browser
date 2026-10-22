@@ -311,6 +311,7 @@ function bindView(wv, id) {
   wv.addEventListener('media-started-playing', () => { navOf(id).audible = true; update(); });
   wv.addEventListener('media-paused', () => { navOf(id).audible = false; update(); });
   wv.addEventListener('found-in-page', (e) => {
+    if (id !== rt.findTabId) return; // a late result from a tab that is no longer shown
     const r = e.result;
     $('#find-count').textContent = r.matches ? `${r.activeMatchOrdinal}/${r.matches}` : (rt.findText ? '0/0' : '');
   });
@@ -695,6 +696,7 @@ function render() {
     renderMiniBar();
   }
   layoutViews();
+  retargetFind();
   if (!MINI && document.body.classList.contains('ai-open')) {
     const t = activeTab();
     const chip = $('#ai-page-chip');
@@ -830,19 +832,22 @@ function folderEl(n, ctx, depth) {
   if (!w || !w.classList.contains('folder-wrap')) {
     w = document.createElement('div');
     w.className = 'folder-wrap';
-    w.innerHTML = `<div class="row folder" draggable="true"></div><div class="children"></div>`;
+    w.innerHTML = `<div class="row folder" draggable="true"><span class="folder-ic"><span class="ic-closed">${icon('folder', 15)}</span><span class="ic-open">${icon('folderOpen', 15)}</span></span><span class="title"></span></div><div class="children"></div>`;
     w._row = w.firstChild;
     w._children = w.lastChild;
+    w._title = w._row.lastChild;
     w._row.dataset.id = n.id;
     ctx.p.rows.set(n.id, w);
   }
   ctx.seen.add(n.id);
+  // Patched in place (never innerHTML on the row): a click toggles `collapsed`, and replacing the nodes
+  // under the pointer between the two clicks of a double-click would stop `dblclick` (rename) firing.
   const sig = `${n.collapsed}|${depth}|${n.title}`;
   if (w._sig !== sig) {
     w._sig = sig;
     w.className = `folder-wrap${n.collapsed ? ' collapsed' : ''}`;
     w._row.style.setProperty('--depth', depth);
-    w._row.innerHTML = `<span class="folder-ic">${icon(n.collapsed ? 'folder' : 'folderOpen', 15)}</span><span class="title">${esc(n.title)}</span>`;
+    setText(w._title, n.title);
   }
   if (!n.collapsed) syncChildren(w._children, n.children.map((c) => nodeEl(c, ctx, depth + 1)));
   return w;
@@ -1161,6 +1166,18 @@ function initSidebar() {
     }, 350);
   };
   $('#edge-hotzone').addEventListener('mouseenter', reveal);
+  // Moving from the revealed sidebar straight into a web page doesn't reliably give the UI a mouseleave
+  // (the pointer goes into the <webview> guest), so while it is revealed a transparent catcher lies over
+  // the page area: entering it hides the sidebar again. A click on it hides it at once.
+  const catcher = document.createElement('div');
+  catcher.id = 'peek-catcher';
+  $('#app').appendChild(catcher);
+  catcher.addEventListener('mouseenter', conceal);
+  catcher.addEventListener('mousedown', () => {
+    clearTimeout(hideTimer);
+    rt.sidebarPeek = false;
+    document.body.classList.remove('sidebar-peek');
+  });
   sidebar.addEventListener('mouseenter', () => { if (rt.sidebarPeek) clearTimeout(hideTimer); });
   sidebar.addEventListener('mouseleave', () => { if (rt.sidebarPeek) conceal(); });
 }
@@ -1219,8 +1236,11 @@ function initDragAndDrop() {
     if (l?.node.type === 'tab') e.dataTransfer.setData('text/uri-list', tabUrl(l.node));
     e.dataTransfer.setData('text/meridian-id', dragId);
     el.classList.add('dragging');
+    // While a tab is dragged, an empty favorites strip opens up as a drop zone (it is 0 px tall otherwise).
+    // Deferred: changing layout inside dragstart can cancel the drag.
+    if (l?.node.type === 'tab') setTimeout(() => { if (dragId) document.body.classList.add('dragging-tab'); }, 0);
   });
-  sidebar.addEventListener('dragend', (e) => { e.target.closest?.('.dragging')?.classList.remove('dragging'); dragId = null; clearMarker(); });
+  sidebar.addEventListener('dragend', (e) => { e.target.closest?.('.dragging')?.classList.remove('dragging'); dragId = null; clearMarker(); document.body.classList.remove('dragging-tab'); });
 
   const target = (e) => {
     const fav = e.target.closest('.fav');
@@ -1256,6 +1276,7 @@ function initDragAndDrop() {
     const t = target(e);
     const id = dragId;
     clearMarker();
+    document.body.classList.remove('dragging-tab');
     if (!t || t.el?.dataset.id === id) return;
     if (!t.pos) {
       const zone = t.zone;
@@ -1521,6 +1542,7 @@ function initPeek() {
 
 function openFind() {
   if (!activeTab()) return;
+  rt.findTabId = activeTab().id;
   $('#findbar').hidden = false;
   const input = $('#find-input');
   input.focus(); input.select();
@@ -1533,7 +1555,21 @@ function find(forward = true, next = true) {
   if (!text) { wv.stopFindInPage('clearSelection'); $('#find-count').textContent = ''; return; }
   wv.findInPage(text, { forward, findNext: next });
 }
+// The find bar follows the shown tab: switching tabs clears the old page's highlights and count and
+// searches the new page for the same text (render() calls this).
+function retargetFind() {
+  const tab = activeTab();
+  if ($('#findbar').hidden || rt.findTabId === (tab?.id || null)) return;
+  const old = rt.findTabId && rt.views.get(rt.findTabId);
+  try { old?.stopFindInPage('clearSelection'); } catch {}
+  rt.findTabId = tab?.id || null;
+  $('#find-count').textContent = '';
+  if (!tab) { $('#findbar').hidden = true; return; }
+  const wv = rt.views.get(tab.id);
+  if (wv && rt.findText) { try { wv.findInPage(rt.findText, { forward: true, findNext: false }); } catch {} }
+}
 function closeFind() {
+  rt.findTabId = null;
   $('#findbar').hidden = true;
   const wv = activeTab() && rt.views.get(activeTab().id);
   wv?.stopFindInPage('clearSelection');
@@ -1557,8 +1593,11 @@ function showModal(html, onMount) {
   const overlay = $('#modal-overlay');
   $('#modal').innerHTML = html;
   overlay.hidden = false;
-  const close = () => { overlay.hidden = true; $('#modal').innerHTML = ''; };
-  overlay.onmousedown = (e) => { if (e.target === overlay) { close(); overlay.dispatchEvent(new Event('dismiss')); } };
+  const close = () => { overlay.hidden = true; $('#modal').innerHTML = ''; if (rt.modalDismiss === dismiss) rt.modalDismiss = null; };
+  // Clicking outside or Escape: close and tell the dialog (its promise answers "no" / null).
+  const dismiss = () => { close(); overlay.dispatchEvent(new Event('dismiss')); };
+  rt.modalDismiss = dismiss;
+  overlay.onmousedown = (e) => { if (e.target === overlay) dismiss(); };
   onMount?.($('#modal'), close);
   localizeKeys($('#modal'));
   return close;
@@ -1893,7 +1932,7 @@ async function boot() {
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
-      if (!$('#modal-overlay').hidden) { $('#modal-overlay').hidden = true; return; }
+      if (!$('#modal-overlay').hidden) { if (rt.modalDismiss) rt.modalDismiss(); else $('#modal-overlay').hidden = true; return; }
       if (rt.peek) return closePeek();
       if (!$('#findbar').hidden) return closeFind();
     }

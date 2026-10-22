@@ -35,21 +35,38 @@ for (const access of ['off', 'full']) {
   test.describe(`agent access "${access}" at start-up`, () => {
     test.use({ seed: async ({}, use) => use(S.seedState({ settings: { agentAccess: access } })) });
 
-    // BUG (access ≠ off): AgentHub.startServer() sets the process-wide umask to 0o177 while the socket is
-    // being created (src/agent/hub.js:463) and only restores it in the async listen callback. main.js:768
-    // calls it right before createMainWindow(), so Chromium creates Cache/, Code Cache/, Local Storage/,
-    // blob_storage/, Shared Dictionary/ … as 0600 directories (no x bit → unusable), and child processes
-    // spawned in that window inherit the umask. Symptoms: the window shows ~5 s late, the UI's localStorage
-    // and code cache are broken, and the damage persists across restarts.
+    // Regression (access ≠ off): AgentHub.startServer() used to set the process-wide umask to 0o177 while the
+    // socket was being created and only restored it in the async listen callback, so Chromium created
+    // Cache/, Code Cache/, Local Storage/, blob_storage/ … as 0600 directories (no x bit → unusable):
+    // the window showed ~5 s late and the UI's localStorage broke. The socket now lives in a 0700 directory
+    // and is chmod'ed 0600 after listen; the umask is never touched.
     test('profile directories are created with usable permissions', async ({ meridian, server }) => {
-      if (access !== 'off') test.fail(true, 'BUG: umask leak from agent socket setup');
       await openTabDirect(meridian.page, server.url('/p/perm'));
+      await meridian.page.evaluate(() => localStorage.setItem('perm-probe', '1'));
       await meridian.page.waitForTimeout(1500);
       expect(badDirs(meridian.userDataDir)).toEqual([]);
+      // Chromium's storage dirs exist and are usable directories
+      for (const d of ['Local Storage', 'Partitions']) {
+        const st = fs.statSync(path.join(meridian.userDataDir, d));
+        expect(st.isDirectory()).toBe(true);
+        expect(st.mode & 0o700).toBe(0o700);
+      }
+      // the main process umask is the one it was started with
+      const umask = await meridian.app.evaluate(() => { const m = process.umask(0o022); process.umask(m); return m; });
+      expect(umask & 0o100).toBe(0); // owner execute bit never masked
+      expect(umask).toBe(process.umask());
+      if (access !== 'off') {
+        // the agent socket is there and private
+        const file = path.join(meridian.userDataDir, 'agent-endpoint.json');
+        await expect.poll(() => fs.existsSync(file)).toBe(true);
+        const { socket } = JSON.parse(fs.readFileSync(file, 'utf8'));
+        expect(fs.statSync(socket).isSocket()).toBe(true);
+        expect(fs.statSync(socket).mode & 0o077).toBe(0);
+        expect(fs.statSync(path.dirname(socket)).mode & 0o077).toBe(0);
+      }
     });
 
     test('UI localStorage survives a restart (sidebar width)', async ({ meridian }) => {
-      if (access !== 'off') test.fail(true, 'BUG: umask leak breaks Local Storage');
       await meridian.page.evaluate(() => localStorage.setItem('sidebarWidth', '333'));
       await meridian.page.waitForTimeout(1500); // leveldb flush
       const { page } = await meridian.relaunch();
@@ -71,7 +88,6 @@ test('window becomes visible quickly with agent access on (vs off)', async ({ us
   }
   testInfo.annotations.push({ type: 'time to visible window (ms)', description: JSON.stringify(results) });
   console.log('time to visible window (ms):', results);
-  test.fail(results.full > 2500, 'BUG: start-up delayed when agent access is on (umask leak)');
   expect(results.full).toBeLessThan(2500);
   void userDataDir;
 });

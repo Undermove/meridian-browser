@@ -2,7 +2,7 @@
 // history entries). Times are measured in the UI renderer: performance.now() around the action plus
 // the next two animation frames (≈ "the user sees the result"). Numbers are attached to the test
 // results and printed; budgets are deliberately loose — they catch regressions, not perfection.
-const { test, expect, waitTabLoaded } = require('../fixtures/meridian');
+const { test, expect, runUnattached, openTabDirect, waitTabLoaded } = require('../fixtures/meridian');
 const S = require('../fixtures/state');
 
 const stats = (xs) => {
@@ -115,7 +115,7 @@ test.describe('perf: big profile', () => {
     const r = await page.evaluate(async () => {
       const size = JSON.stringify(state).length;
       const xs = [];
-      for (let i = 0; i < 10; i++) { const t = performance.now(); await api.saveState(serialize()); xs.push(performance.now() - t); }
+      for (let i = 0; i < 10; i++) { const t = performance.now(); await api.saveState(saveParts()); xs.push(performance.now() - t); }
       return { size, xs };
     });
     report(testInfo, `state.json save (${(r.size / 1024).toFixed(0)} KB)`, stats(r.xs));
@@ -144,22 +144,51 @@ test.describe('perf: big profile', () => {
 });
 
 test.describe('background tabs', () => {
-  // BUG (perf): hidden tabs are only `visibility:hidden` (styles.css:243), so their pages still report
-  // document.visibilityState === 'visible' and keep running requestAnimationFrame at full display rate
-  // (measured 120/s on a 120 Hz display), plus timers/animations/video, in EVERY loaded tab of every space.
-  // Chrome stops rAF and throttles timers for background tabs. Likely a big part of "lags a bit".
-  // (Caveat: Playwright adds --disable-renderer-backgrounding; page visibility is unaffected by it.)
-  test('a background tab is hidden to its page and does not render frames', async ({ page, server }, testInfo) => {
-    test.fail(true, 'BUG: background tabs stay "visible" and render at full rate');
-    const a = await page.evaluate((u) => openTab(u).id, server.url('/p/bg-a'));
-    await waitTabLoaded(page, a);
-    const b = await page.evaluate((u) => openTab(u).id, server.url('/p/bg-b'));
-    await waitTabLoaded(page, b);
-    const r = await page.evaluate((id) => rt.views.get(id).executeJavaScript(`new Promise((res) => { let n = 0; const t0 = performance.now(); const f = () => { n++; if (performance.now() - t0 < 1000) requestAnimationFrame(f); }; requestAnimationFrame(f); setTimeout(() => res({ visibility: document.visibilityState, rafPerSec: n }), 1100); })`), a);
-    testInfo.annotations.push({ type: 'background tab', description: JSON.stringify(r) });
-    console.log('[perf] background tab:', r);
-    expect(r.visibility).toBe('hidden');
-    expect(r.rafPerSec).toBeLessThan(5);
+  // QA reported background tabs at ~120 rAF/s with document.visibilityState 'visible'. That was measured
+  // under Playwright, whose CDP attach marks every webContents as being captured, which pins pages visible
+  // (see runUnattached in fixtures/meridian.js). Without a debugger attached, a tab that isn't shown
+  // (`.view.hidden`) is hidden to its page and gets no animation frames. The first test pins that the
+  // harness caveat still holds (so a passing visibility check below can't come from the harness), the
+  // second measures the real app.
+  test('harness caveat: under Playwright every webContents reports being captured', async ({ meridian, page, server }) => {
+    const id = await openTabDirect(page, server.url('/p/captured'));
+    const wcId = await page.evaluate((id) => rt.views.get(id).getWebContentsId(), id);
+    expect(await meridian.app.evaluate(({ webContents }, wcId) => webContents.fromId(wcId).isBeingCaptured(), wcId)).toBe(true);
+  });
+
+  const RAF = `new Promise((res) => { let n = 0; const t0 = performance.now(); const f = () => { n++; if (performance.now() - t0 < 1000) requestAnimationFrame(f); }; requestAnimationFrame(f); setTimeout(() => res({ visibility: document.visibilityState, rafPerSec: n }), 1100); })`;
+
+  test('a background tab is hidden to its page and does not render frames', async ({ userDataDir, server }, testInfo) => {
+    const a = S.tab(server.url('/p/bg-a'));
+    const b = S.tab(server.url('/p/bg-b'));
+    const c = S.tab(server.url('/p/bg-c'));
+    const sp = S.space('Main', { today: [b, a, c], activeTabId: b.id });
+    const loaded = (id) => `(async () => { for (let i = 0; i < 200; i++) { const wv = rt.views.get(${JSON.stringify(id)}); try { if (wv && !wv.isLoading() && rt.nav.get(${JSON.stringify(id)})?.loading === false) return true; } catch {} await new Promise((r) => setTimeout(r, 50)); } return false; })()`;
+    const results = await runUnattached({
+      userDataDir,
+      state: S.seedState({ spaces: [sp] }),
+      steps: [
+        { wait: 1500 },
+        // load A and C, then show B: A and C are background tabs
+        { js: `(async () => { activate(${JSON.stringify(a.id)}); await ${loaded(a.id)}; activate(${JSON.stringify(c.id)}); await ${loaded(c.id)}; activate(${JSON.stringify(b.id)}); return ${loaded(b.id)}; })()`, wait: 600 },
+        { js: `Promise.all([rt.views.get(${JSON.stringify(a.id)}).executeJavaScript(${JSON.stringify(RAF)}), rt.views.get(${JSON.stringify(b.id)}).executeJavaScript(${JSON.stringify(RAF)})]).then(([bg, fg]) => ({ bg, fg }))`, wait: 100 },
+        // agent tools still read a background tab (isolated world, like hub.js read_page)
+        { js: `rt.views.get(${JSON.stringify(a.id)}).executeJavaScript('document.querySelector("#content").textContent')`, wait: 100 },
+        // switching to it is instant and it becomes visible again
+        { js: `(async () => { activate(${JSON.stringify(a.id)}); await new Promise((r) => setTimeout(r, 300)); return rt.views.get(${JSON.stringify(a.id)}).executeJavaScript(${JSON.stringify(RAF)}); })()`, wait: 100 },
+      ],
+    });
+    testInfo.annotations.push({ type: 'background tab (unattached run)', description: JSON.stringify(results) });
+    console.log('[perf] background tab (no debugger attached):', JSON.stringify(results));
+    expect(results[0]).toBe(true);
+    const { bg, fg } = results[1];
+    expect(fg.visibility).toBe('visible');
+    expect(fg.rafPerSec).toBeGreaterThan(20); // control: the shown tab renders
+    expect(bg.visibility).toBe('hidden');
+    expect(bg.rafPerSec).toBeLessThan(5);
+    expect(results[2]).toBe('content-bg-a');
+    expect(results[3].visibility).toBe('visible');
+    expect(results[3].rafPerSec).toBeGreaterThan(20);
   });
 });
 

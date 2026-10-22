@@ -74,7 +74,24 @@ const BENCH = `(async () => {
   return { spaceSwitch: { first: +sw[0].toFixed(2), firstSync: +swSync[0].toFixed(2), median: med(sw), p95: p95(sw), syncMedian: med(swSync), syncMax: +Math.max(...swSync).toFixed(2) }, tabSwitch: { median: med(ts), p95: p95(ts), syncMedian: med(tsSync), syncMax: +Math.max(...tsSync).toFixed(2) }, titleChurn40: +churn.toFixed(2), saveRoutine: med(st), saveWithHistory: med(sf), rows: document.querySelectorAll('.row').length, webviews: document.querySelectorAll('webview').length };
 })()`;
 
-const steps = [{ wait: 2500 }, { js: BENCH, wait: 200, shot: path.join(dir, 'bench.png') }];
+// Background tabs: two real pages (local server) that run requestAnimationFrame; the first one is put in
+// the background by opening the second. Measured without a debugger attached (Playwright's CDP attach marks
+// every webContents as "being captured", which keeps hidden pages rendering).
+const RAF = `new Promise((res) => { let n = 0; const t0 = performance.now(); const f = () => { n++; if (performance.now() - t0 < 1000) requestAnimationFrame(f); }; requestAnimationFrame(f); setTimeout(() => res({ visibility: document.visibilityState, rafPerSec: n }), 1100); })`;
+const BG = (base) => `(async () => {
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const loaded = async (id) => { for (let i = 0; i < 100; i++) { const wv = rt.views.get(id); try { if (wv && !wv.isLoading() && wv.getURL().startsWith(${JSON.stringify(base)})) return; } catch {} await wait(50); } };
+  const a = openTab(${JSON.stringify(base + '/a')}).id; await loaded(a);
+  const b = openTab(${JSON.stringify(base + '/b')}).id; await loaded(b);
+  await wait(300);
+  const [bg, fg] = await Promise.all([rt.views.get(a).executeJavaScript(${JSON.stringify(RAF)}), rt.views.get(b).executeJavaScript(${JSON.stringify(RAF)})]);
+  return { backgroundTab: bg, activeTab: fg };
+})()`;
+
+const server = require('http').createServer((_req, res) => { res.setHeader('content-type', 'text/html'); res.end('<!doctype html><title>bench</title><p>bench page</p>'); });
+server.listen(0, '127.0.0.1', () => {
+const base = `http://127.0.0.1:${server.address().port}`;
+const steps = [{ wait: 2500 }, { js: BENCH, wait: 200, shot: path.join(dir, 'bench.png') }, { js: BG(base), wait: 200 }];
 const electron = require(path.join(ROOT, 'node_modules', 'electron'));
 const child = spawn(electron, ['.'], {
   cwd: ROOT,
@@ -86,8 +103,10 @@ child.stderr.on('data', () => {});
 const kill = setTimeout(() => child.kill('SIGKILL'), 90_000);
 child.on('exit', () => {
   clearTimeout(kill);
-  const line = out.split('\n').find((l) => l.startsWith('[eval]'));
-  if (!line) { console.error('no result\n' + out); process.exit(1); }
-  console.log(JSON.stringify(JSON.parse(line.slice(7)), null, 2));
+  server.close();
+  const lines = out.split('\n').filter((l) => l.startsWith('[eval]'));
+  if (lines.length < 2) { console.error('no result\n' + out); process.exit(1); }
+  console.log(JSON.stringify({ ...JSON.parse(lines[0].slice(7)), ...JSON.parse(lines[1].slice(7)) }, null, 2));
   console.log('screenshot:', path.join(dir, 'bench.png'));
+});
 });

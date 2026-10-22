@@ -135,21 +135,25 @@ test.describe('find in page', () => {
     await expect(page.locator('#find-input')).toBeFocused();
   });
 
-  // BUG: the find bar stays open with the old page's "1/3" after switching tabs; Enter then searches
-  // the new page while the count still describes the old one (no find handling in activate(), app.js:261).
+  // Regression: the find bar used to stay open with the old page's "1/3" after switching tabs; Enter then
+  // searched the new page while the count still described the old one. It now follows the shown tab.
   test('find bar closes or follows when switching tabs', async ({ page, server }) => {
-    test.fail(true, 'BUG: stale find bar after tab switch');
     const a = await openTabDirect(page, server.url('/find'));
-    await openTabDirect(page, server.url('/p/other'));
+    const b = await openTabDirect(page, server.url('/p/other'));
     await page.evaluate((id) => activate(id), a);
     await page.evaluate(() => runCommand('find'));
     await page.keyboard.type('needle');
     await expect(page.locator('#find-count')).toHaveText('1/3');
     await page.evaluate(() => runCommand('tab-step', -1));
-    // the count must not describe a different page than the one shown
+    expect(await page.evaluate(() => space().activeTabId)).toBe(b);
+    // the count must describe the page that is shown: /p/other has no "needle"
+    await expect(page.locator('#find-count')).toHaveText('0/0');
     const r = await page.evaluate(() => ({ open: !document.querySelector('#findbar').hidden, count: document.querySelector('#find-count').textContent }));
     test.info().annotations.push({ type: 'find bar after tab switch', description: JSON.stringify(r) });
     expect(r.open && r.count === '1/3').toBe(false);
+    // and back: it searches the find page again
+    await page.evaluate((id) => activate(id), a);
+    await expect(page.locator('#find-count')).toHaveText(/^\d\/3$/);
   });
 });
 
@@ -208,13 +212,10 @@ test.describe('sidebar', () => {
     await expect(page.locator('body')).not.toHaveClass(/sidebar-hidden/);
   });
 
-  // PROBABLE BUG: the hover-revealed sidebar only hides on the sidebar's `mouseleave` (app.js:879). With
-  // input routed like hardware input (Playwright CDP → Chromium's input router → <webview> guest), moving
-  // from the sidebar straight into the page never produces mouseout/mouseleave in the UI document, so the
-  // sidebar stays open over the page. (With webContents.sendInputEvent — which bypasses the router — leave
-  // fires, so please confirm by hand: reveal the sidebar, then move quickly into the page.)
+  // Regression: the hover-revealed sidebar only hid on the sidebar's `mouseleave`; with input routed like
+  // hardware input (Playwright CDP → Chromium's input router → <webview> guest), moving from the sidebar
+  // straight into the page never produced mouseleave in the UI document, so the sidebar stayed open.
   test('the revealed sidebar hides when the pointer moves into the page', async ({ page, server }) => {
-    test.fail(true, 'PROBABLE BUG: no mouseleave when moving from the sidebar into a <webview>');
     await openTabDirect(page, server.url('/p/x'));
     await page.evaluate(() => runCommand('toggle-sidebar'));
     await page.waitForTimeout(400);
@@ -225,6 +226,12 @@ test.describe('sidebar', () => {
     await page.waitForTimeout(250);
     await page.mouse.move(900, 400, { steps: 6 });
     await expect(page.locator('body')).not.toHaveClass(/sidebar-peek/, { timeout: 2000 });
+    // once hidden, the page is reachable again: a click lands in the page, not on a leftover catcher
+    await expect(page.locator('#peek-catcher')).toBeHidden();
+    const id = await page.evaluate(() => space().activeTabId);
+    await inTab(page, id, `window.__clicked = 0; addEventListener('mousedown', () => window.__clicked++); 1`);
+    await page.mouse.click(900, 400);
+    await expect.poll(() => inTab(page, id, 'window.__clicked')).toBe(1);
   });
 
   test('⌘S toggles the sidebar with focus inside the page @shortcut', async ({ meridian, page, server }) => {
@@ -280,7 +287,7 @@ test.describe('little window', () => {
   test('the Little window never writes state.json', async ({ meridian, page, server }) => {
     const fs = require('fs');
     const path = require('path');
-    await page.evaluate(() => api.saveState(serialize()));
+    await page.evaluate(() => api.saveState(saveParts({ slow: true })));
     const before = fs.readFileSync(path.join(meridian.userDataDir, 'state.json'), 'utf8');
     const winPromise = meridian.app.waitForEvent('window', (w) => w.url().includes('mini=1'));
     await meridian.app.evaluate(({ app }, u) => app.emit('open-url', { preventDefault() {} }, u), server.url('/p/little2'));
@@ -293,14 +300,21 @@ test.describe('little window', () => {
 });
 
 test.describe('persistence', () => {
-  test('settings changed in the Settings dialog survive a restart', async ({ meridian, page }) => {
+  // Settings moved from a modal in the main window to its own window (meridian://app/settings.html);
+  // changes travel Settings window → main (validated) → UI renderer, which applies and saves them.
+  test('settings changed in the Settings window survive a restart', async ({ meridian, page }) => {
+    const winPromise = meridian.app.waitForEvent('window', (w) => w.url().startsWith('meridian://app/settings.html'));
     await page.evaluate(() => runCommand('settings'));
-    await page.locator('#set-engine').selectOption('duckduckgo');
-    await page.locator('#set-archive').selectOption('168');
-    await page.locator('#set-right').check();
-    await page.locator('#set-adblock').uncheck();
-    await page.locator('[data-a="close"]').click();
-    await expect(page.locator('body')).toHaveClass(/sidebar-right/);
+    const sw = await winPromise;
+    await sw.waitForSelector('#engine');
+    await sw.locator('#engine').selectOption('duckduckgo');
+    await sw.locator('#archive').selectOption('168');
+    await sw.locator('.segmented[data-name="sidebar"] .seg[data-value="right"]').click();
+    await sw.locator('#tabs .tab[data-id="advanced"]').click();
+    await sw.locator('#adblock').uncheck({ force: true });
+    await expect(page.locator('body')).toHaveClass(/sidebar-right/); // applied live in the main window
+    await expect.poll(() => page.evaluate(() => state.settings.adblock)).toBe(false);
+    await sw.close();
 
     const { page: p2 } = await meridian.relaunch();
     const s = await p2.evaluate(() => state.settings);
