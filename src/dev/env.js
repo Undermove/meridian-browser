@@ -42,6 +42,8 @@ function loginPath() {
     return [...new Set([...(process.env.PATH || '').split(path.delimiter), ...extra].filter(Boolean))].join(path.delimiter);
   };
   if (IS_WIN) return (pathPromise = Promise.resolve(process.env.PATH || ''));
+  // One login shell for both: the environment capture already includes PATH.
+  if (envPromise) return (pathPromise = envPromise.then((e) => e.PATH || fallback()));
   pathPromise = new Promise((resolve) => {
     // Markers: rc files may print banners; only take what's between them.
     const script = 'printf "__MERIDIAN_PATH__%s__MERIDIAN_END__" "$PATH"';

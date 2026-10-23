@@ -8,7 +8,7 @@
  * Loaded after app.js / panels.js / ai.js and shares their globals.
  */
 
-const ob = { el: null, step: 0, steps: [], arc: null, arcLogins: false, agents: [], hasKey: false, provider: null, proposal: null, picks: null, poll: null, helloTimer: null };
+const ob = { el: null, step: 0, steps: [], agentsPromise: null, arc: null, arcLogins: false, agents: [], hasKey: false, provider: null, proposal: null, picks: null, poll: null, helloTimer: null };
 
 const HELLOS = ['hello', 'привет', 'hola', 'bonjour', 'hallo', 'ciao', 'olá', 'გამარჯობა', 'merhaba', 'hej', 'こんにちは', '你好'];
 const AGENT_COLORS = { claude: '#d97757', codex: '#10a37f', gemini: '#4285f4', copilot: '#8957e5', cursor: '#1c1c1c', opencode: '#4b5563', qwen: '#615ced', amp: '#f34e3f', goose: '#222', droid: '#ff6b00', ollama: '#333', lmstudio: '#4f46e5' };
@@ -19,6 +19,8 @@ async function startOnboarding() {
   if (EPHEMERAL || ob.el) return;
   closePanels?.();
   Object.assign(ob, { step: 0, proposal: null, picks: null });
+  // Finding agents asks each CLI whether it's signed in (a few seconds the first time): start now, on hello.
+  ob.agentsPromise = api.agentsList(true).catch(() => []);
   ob.arc = await api.arcPreview().catch(() => null);
   if (ob.arc?.error || !ob.arc?.spaces) ob.arc = null;
   ob.arcLogins = !!(ob.arc && await api.arcLoginsAvailable().catch(() => false));
@@ -85,7 +87,10 @@ async function showObStep(i, dir = 1) {
   const stage = $('.ob-stage', ob.el);
   const page = document.createElement('div');
   page.className = `ob-page ob-step-${name}`;
-  page.innerHTML = await def.html();
+  // A step that needs a moment to prepare shows it right away (a dead-looking button reads as broken).
+  const nextBtn = $('[data-ob="next"]', ob.el);
+  const slow = setTimeout(() => { nextBtn.disabled = true; nextBtn.classList.add('busy'); }, 120);
+  try { page.innerHTML = await def.html(); } finally { clearTimeout(slow); nextBtn.classList.remove('busy'); nextBtn.disabled = false; }
   if (!ob.el || ob.steps[ob.step] !== name) return;
   const old = stage.firstElementChild;
   if (old) old.animate([{ opacity: 1, transform: 'none', filter: 'blur(0)' }, { opacity: 0, transform: `translateX(${-dir * 40}px) scale(0.98)`, filter: 'blur(6px)' }], { duration: 260, easing: 'ease-in', fill: 'forwards' }).onfinish = () => old.remove();
@@ -142,7 +147,8 @@ const OB_STEPS = {
   // ------------------------------------------------------------ connect the AI they already use
   ai: {
     async html() {
-      const [agents, hasKey] = await Promise.all([api.agentsList(true).catch(() => []), api.aiHasKey().catch(() => false)]);
+      const [agents, hasKey] = await Promise.all([ob.agentsPromise || api.agentsList(true).catch(() => []), api.aiHasKey().catch(() => false)]);
+      ob.agentsPromise = null; // a revisit (after signing in) checks again
       ob.agents = agents; ob.hasKey = hasKey;
       const ready = agents.filter((a) => a.installed && a.loggedIn !== false);
       const p = pickAiProvider(agents, hasKey);

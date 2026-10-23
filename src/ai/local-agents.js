@@ -30,7 +30,7 @@ const PROVIDERS = {
     login: 'claude auth login',
     docs: 'https://docs.claude.com/en/docs/claude-code/setup',
     async auth(bin, env) {
-      const r = await run(bin, ['auth', 'status'], env, 8000);
+      const r = await run(bin, ['auth', 'status'], env, 4000);
       try { const j = JSON.parse(r.stdout); return { loggedIn: !!j.loggedIn, account: j.email || null }; } catch { return { loggedIn: null }; }
     },
     command({ prompt, system, resume, model }) {
@@ -60,7 +60,7 @@ const PROVIDERS = {
     login: 'codex login',
     docs: 'https://developers.openai.com/codex/cli',
     async auth(bin, env) {
-      const r = await run(bin, ['login', 'status'], env, 8000);
+      const r = await run(bin, ['login', 'status'], env, 4000);
       const out = `${r.stdout}${r.stderr}`;
       if (/logged in/i.test(out) && !/not logged in/i.test(out)) return { loggedIn: true, account: /ChatGPT/i.test(out) ? 'ChatGPT' : null };
       return { loggedIn: /not logged in/i.test(out) ? false : null };
@@ -132,7 +132,7 @@ const PROVIDERS = {
     login: 'cursor-agent login',
     docs: 'https://cursor.com/docs/cli/overview',
     async auth(bin, env) {
-      const r = await run(bin, ['status'], env, 8000);
+      const r = await run(bin, ['status'], env, 4000);
       const out = `${r.stdout}${r.stderr}`;
       if (/not logged in|log in|login required/i.test(out)) return { loggedIn: false };
       const m = /logged in(?: as)?\s+([^\s]+@[^\s]+)/i.exec(out);
@@ -165,7 +165,7 @@ const PROVIDERS = {
     login: 'opencode auth login',
     docs: 'https://opencode.ai/docs/cli',
     async auth(bin, env) {
-      const r = await run(bin, ['auth', 'list'], env, 8000);
+      const r = await run(bin, ['auth', 'list'], env, 4000);
       const m = /(\d+)\s+credentials?/i.exec(r.stdout.replace(/\x1b\[[0-9;]*m/g, ''));
       return { loggedIn: m ? Number(m[1]) > 0 : null };
     },
@@ -364,7 +364,8 @@ class LocalAgents {
   }
 
   async env() {
-    const env = { ...process.env, ...(await loginEnv()), PATH: await loginPath(), NO_COLOR: '1', CI: '1', TERM: 'dumb' };
+    const login = await loginEnv(); // first, so loginPath() reuses the same shell
+    const env = { ...process.env, ...login, PATH: await loginPath(), NO_COLOR: '1', CI: '1', TERM: 'dumb' };
     for (const k of Object.keys(env)) if (/^(ELECTRON_|MERIDIAN_|npm_|NODE_OPTIONS$)/i.test(k)) delete env[k];
     return env;
   }
