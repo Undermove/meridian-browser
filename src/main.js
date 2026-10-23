@@ -7,6 +7,7 @@ const { app, BrowserWindow, Menu, ipcMain, session, shell, dialog, clipboard, na
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { execFile } = require('child_process');
 const crypto = require('crypto');
 const { shortcutTable, findShortcut, acceleratorFromInput, formatAccelerator } = require('./shortcuts');
 const { routeLink, sanitizeAtc } = require('./atc');
@@ -870,7 +871,9 @@ async function agentSetup(win, id, action) {
   const opts = {
     type: 'question', buttons: ['Cancel', action === 'install' ? 'Open Terminal and Install' : 'Open Terminal and Sign In'], defaultId: 1, cancelId: 0,
     message: `${verb} ${p.label}?`,
-    detail: `Meridian will open a terminal window and run:\n\n${cmd}\n\n${action === 'install' ? 'Follow any prompts there. ' : 'Your browser may open to finish signing in. '}This window updates by itself when it’s done.`,
+    detail: action === 'install'
+      ? `A Terminal window will open and install ${p.label} with its official installer:\n\n${cmd}\n\nThat’s normal: it’s how ${p.label} is installed. Your Mac may ask for your password. When it says it’s done, come back — Meridian notices by itself.`
+      : `A Terminal window will open so you can sign in to ${p.label}:\n\n${cmd}\n\nYour browser may open a sign-in page — that’s ${p.vendor}’s own page. When you’re signed in, come back — Meridian notices by itself.`,
   };
   const { response } = win && !win.isDestroyed() ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts);
   if (response !== 1) return { ok: false, cancelled: true };
@@ -1082,10 +1085,18 @@ handleMain('import:arc-logins', () => importArcLogins(mainWindow));
 
 // ---------- default browser ----------
 
-handle('default-browser:set', () => {
+// macOS (and Windows) confirm the change in their own dialog: say so first.
+async function setDefaultBrowserAsked(win) {
+  if (!app.isPackaged) return { ok: false, packaged: false };
+  if (IS_MAC) {
+    const opts = { type: 'info', buttons: ['Cancel', 'Continue'], defaultId: 1, cancelId: 0, message: 'Make Meridian your default browser?', detail: 'macOS will show its own window to confirm. Choose “Use “Meridian”” there.\n\nLinks from Mail, Slack and other apps will then open in Meridian. You can switch back any time in System Settings → Desktop & Dock.' };
+    const { response } = win && !win.isDestroyed() ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts);
+    if (response !== 1) return { ok: false, cancelled: true, packaged: true };
+  }
   const ok = app.setAsDefaultProtocolClient('http') && app.setAsDefaultProtocolClient('https');
-  return { ok, packaged: app.isPackaged };
-});
+  return { ok, packaged: true };
+}
+handle('default-browser:set', (e) => setDefaultBrowserAsked(BrowserWindow.fromWebContents(e.sender)));
 handle('default-browser:is', () => app.isDefaultProtocolClient('https'));
 
 // ---------- windows ----------
@@ -1345,10 +1356,7 @@ handleSettings('settings:set', (_e, patch) => {
 });
 handleSettings('settings:record', (_e, on) => { recordingShortcut = !!on; return recordingShortcut; });
 handleSettings('settings:is-default', () => app.isDefaultProtocolClient('https'));
-handleSettings('settings:set-default', () => {
-  const ok = app.setAsDefaultProtocolClient('http') && app.setAsDefaultProtocolClient('https');
-  return { ok, packaged: app.isPackaged };
-});
+handleSettings('settings:set-default', () => setDefaultBrowserAsked(settingsWindow));
 handleSettings('settings:arc-available', () => arcDataExists());
 handleSettings('settings:arc-logins-available', () => arcLoginsAvailable());
 handleSettings('settings:import-arc-logins', () => importArcLogins(settingsWindow));
@@ -1664,7 +1672,31 @@ async function loadExtensionFromMenu() {
 
 // ---------- lifecycle ----------
 
-app.whenReady().then(() => {
+// macOS asks again for the "Meridian Safe Storage" keychain item whenever a differently signed build
+// opens it (every update of an ad-hoc-signed release). Say so first, before anything reads cookies, so the
+// system dialog doesn't come out of nowhere. Not shown on a first install (the item is created silently).
+async function warnBeforeKeychain() {
+  if (!IS_MAC || !app.isPackaged) return;
+  const marker = path.join(app.getPath('userData'), 'keychain-build.json');
+  let build = app.getVersion();
+  try { build += ':' + fs.statSync(process.execPath).mtimeMs; } catch {}
+  if (readJson(marker, null)?.build === build) return;
+  const run = (args) => new Promise((resolve) => execFile(args[0], args.slice(1), { timeout: 4000, encoding: 'utf8' }, (err, out, errOut) => resolve({ ok: !err, text: `${out || ''}${errOut || ''}` })));
+  const [item, sig] = await Promise.all([
+    run(['/usr/bin/security', 'find-generic-password', '-s', 'Meridian Safe Storage']), // metadata only: no prompt
+    run(['/usr/bin/codesign', '-dv', path.dirname(path.dirname(path.dirname(process.execPath)))]),
+  ]);
+  writeJsonAtomic(marker, { build });
+  if (!item.ok || !/Signature=adhoc/.test(sig.text)) return;
+  await dialog.showMessageBox({
+    type: 'info', buttons: ['Continue'], defaultId: 0,
+    message: 'macOS will ask about “Meridian Safe Storage”',
+    detail: 'That’s the key that keeps your logins and saved data encrypted on this Mac. Meridian was updated, so macOS checks once more that it’s really Meridian asking.\n\nClick “Always Allow” and it won’t ask again until the next update.',
+  });
+}
+
+app.whenReady().then(async () => {
+  await warnBeforeKeychain().catch(() => {});
   permissionDecisions = readJson(PERMS_FILE(), {});
   const saved = readJson(STATE_FILE(), null);
   if (saved && saved.settings) {

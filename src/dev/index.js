@@ -345,6 +345,7 @@ class Workbench {
       let mission = null;
       if (this.mission && /^(claude|codex|gemini|sandbox-claude|sandbox-codex)$/.test(kind)) {
         try { mission = await this.mission.registerTerminal({ kind, project: p.name, ownerWcId: owner.wc.id, sandbox: !!SANDBOX_KINDS[kind] }); } catch (err) { console.warn('mission control:', err.message); }
+        this.notificationsHeadsUp();
       }
       const missionDone = (info) => { if (mission) this.mission.terminalExit(mission.token, mission.nodeId, info); mission = mission && { ...mission, ended: true }; };
       try {
@@ -457,6 +458,16 @@ class Workbench {
 
   // Dev/test only (ignored in packaged builds): MERIDIAN_TEST_AGENT_BIN is searched first, so e2e
   // tests can stand in recorded/fake agent CLIs for the real ones.
+  // The first agent session: say that macOS will ask once about notifications (Mission Control uses them
+  // when an agent is waiting), so its permission prompt doesn't come out of nowhere.
+  notificationsHeadsUp() {
+    const marker = path.join(this.app.getPath('userData'), 'notifications-intro.json');
+    if (fs.existsSync(marker)) return;
+    try { fs.writeFileSync(marker, '{"shown":true}', { mode: 0o600 }); } catch {}
+    const w = this.getMainWindow?.();
+    if (w && !w.isDestroyed()) w.webContents.send('command', 'notice', 'When an agent needs you, Meridian will send a notification. macOS will ask once whether to allow notifications — click Allow.');
+  }
+
   agentSearchPath(base) {
     const extra = !this.app.isPackaged && process.env.MERIDIAN_TEST_AGENT_BIN;
     return extra && path.isAbsolute(extra) ? `${extra}${path.delimiter}${base}` : base;

@@ -216,7 +216,7 @@ registerSection({
     $('#make-default', el)?.addEventListener('click', async () => {
       const r = await S.setDefaultBrowser();
       if (!r.packaged) toast('Works from the built app (npm run dist), not from dev mode', { timeout: 4500 });
-      else { toast(r.ok ? 'Your system will ask you to confirm' : 'Could not set the default browser'); setTimeout(() => showSection('general'), 1500); }
+      else if (!r.cancelled) { if (!r.ok) toast('Could not set the default browser'); setTimeout(() => showSection('general'), 1500); }
     });
     $('#import', el)?.addEventListener('click', () => S.action('import-arc'));
     $('#import-logins', el)?.addEventListener('click', async (e) => {

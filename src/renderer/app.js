@@ -1752,8 +1752,10 @@ async function runSettingsAction(name, arg = {}) {
 
 async function setDefaultBrowser() {
   const r = await api.setDefaultBrowser();
+  if (r.cancelled) return r;
   if (!r.packaged) toast('Works from the built app (npm run dist), not from dev mode', { timeout: 4500 });
-  else toast(r.ok ? 'macOS will ask you to confirm' : 'Could not set default browser');
+  else if (!r.ok) toast('Could not set default browser');
+  return r;
 }
 
 async function importArc({ quiet = false } = {}) {
@@ -1881,6 +1883,7 @@ function runCommand(name, ...args) {
     case 'import-arc-logins': return EPHEMERAL ? null : api.importArcLogins().catch(() => null);
     case 'arc-profiles': return EPHEMERAL ? null : addArcProfiles(args[0]);
     case 'onboarding': return EPHEMERAL ? null : startOnboarding();
+    case 'notice': return toast(String(args[0] || '').slice(0, 300), { timeout: 9000 }); // a heads-up from main
     case 'private-window': return api.openWindow('private');
     case 'little-window': return api.openWindow('little');
     case 'duplicate-tab': { const t = activeTab(); if (t && !isWorkbenchTab(t)) openTab(tabUrl(t), { after: locate(t.id)?.zone === 'today' ? t.id : null }); return; }
