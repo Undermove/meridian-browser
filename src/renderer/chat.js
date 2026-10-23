@@ -2,7 +2,7 @@
  * content area, for people who want to talk to an AI rather than browse with it.
  *
  * It answers with whatever AI the user picked (state.settings.aiProvider): a local agent CLI on their
- * own subscription (Claude Code, Codex, …) or the Claude API key. Conversations live in main
+ * own account where its terms allow it (GitHub Copilot, local models, opt-in agents) or the Claude API key. Conversations live in main
  * (userData/chats.json, src/ai/chats-store.js); private windows keep them in memory only.
  * Each chat has its own AI session ('chat-' + id), so local agents resume their context; a chat
  * reopened after a restart sends its earlier turns once (`history`), since main forgot the session.
@@ -43,7 +43,7 @@ const chatListAgents = (fresh = false) => (typeof listAiAgents === 'function' ? 
 
 // The picker's choices: installed agents (signed-out ones shown, not choosable) and the API key.
 function chatAgentOptions() {
-  const opts = (chatUi.agents || []).filter((a) => a.installed).map((a) => ({
+  const opts = (chatUi.agents || []).filter((a) => a.installed && agentAllowed(a)).map((a) => ({
     id: a.id, label: a.label, ready: a.loggedIn !== false, sub: a.loggedIn === false ? 'Not signed in' : (a.account || a.vendor),
   }));
   if (chatUi.hasKey) opts.push({ id: 'api', label: 'Claude API key', ready: true, sub: 'Anthropic API' });

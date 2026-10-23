@@ -1,5 +1,13 @@
-// Local AI agents as chat providers: Claude Code, Codex, Gemini CLI, … run headless with the user's own
-// login/subscription, so Ask (⌘T), the ⌘J panel and the Chat view work without an API key.
+// Local AI agents as chat providers for Ask (⌘T), the ⌘J panel, Chat and the welcome tour.
+//
+// Only where the provider's terms allow it (checked October 2026):
+//  - policy 'default': fine for an app to use on the user's own account — GitHub Copilot (its official SDK
+//    drives the signed-in CLI the same way), and local model servers (Ollama, LM Studio).
+//  - policy 'optin': no explicit rule either way; shown only after the user turns on "Other agents" in
+//    Settings → AI, labelled as running under their own account and that provider's terms.
+// Claude Code and Gemini CLI aren't here on purpose: Anthropic and Google don't allow third-party apps to
+// run their features on a consumer subscription login. Claude works through an API key (the 'api'
+// provider in assistant.js); both CLIs remain available in the Workbench terminal, where the user runs them.
 //
 // Every run:
 //  - starts the CLI directly (no shell), with the user's login-shell environment (CLAUDE_CONFIG_DIR,
@@ -23,38 +31,8 @@ const MAX_OUTPUT = 4 << 20;
 // install: what a person runs to get the CLI (shown, copyable, or run in a Workbench terminal after
 // confirming). login: the interactive sign-in command, run in a terminal.
 const PROVIDERS = {
-  claude: {
-    label: 'Claude Code', vendor: 'Anthropic', bin: 'claude', stream: true, resume: true,
-    plan: 'Claude Pro or Max subscription, or an Anthropic API key',
-    install: { mac: 'curl -fsSL https://claude.ai/install.sh | bash', linux: 'curl -fsSL https://claude.ai/install.sh | bash', win: 'irm https://claude.ai/install.ps1 | iex' },
-    login: 'claude auth login',
-    docs: 'https://docs.claude.com/en/docs/claude-code/setup',
-    async auth(bin, env) {
-      const r = await run(bin, ['auth', 'status'], env, 4000);
-      try { const j = JSON.parse(r.stdout); return { loggedIn: !!j.loggedIn, account: j.email || null }; } catch { return { loggedIn: null }; }
-    },
-    command({ prompt, system, resume, model }) {
-      const args = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages',
-        '--tools', '', '--strict-mcp-config', '--setting-sources', '', '--disable-slash-commands',
-        '--permission-mode', 'dontAsk'];
-      if (system) args.push('--system-prompt', system);
-      if (resume) args.push('--resume', resume);
-      if (model) args.push('--model', model);
-      return { args, stdin: prompt };
-    },
-    parse: jsonLines((o, emit) => {
-      if (o.type === 'stream_event' && o.event?.type === 'content_block_delta' && o.event.delta?.type === 'text_delta') emit({ delta: o.event.delta.text });
-      else if (o.type === 'system' && o.subtype === 'init' && o.session_id) emit({ session: o.session_id });
-      else if (o.type === 'result') {
-        if (o.session_id) emit({ session: o.session_id });
-        if (o.is_error || (o.subtype && o.subtype !== 'success')) emit({ error: String(o.result || o.subtype || 'Claude Code failed') });
-        else emit({ final: String(o.result ?? '') });
-      }
-    }),
-  },
-
   codex: {
-    label: 'Codex', vendor: 'OpenAI', bin: 'codex', stream: false, resume: true,
+    label: 'Codex', vendor: 'OpenAI', bin: 'codex', stream: false, resume: true, policy: 'optin',
     plan: 'ChatGPT Plus/Pro/Business plan, or an OpenAI API key',
     install: { mac: [{ cmd: 'brew install --cask codex', needs: 'brew' }, { cmd: 'npm install -g @openai/codex', needs: 'npm' }], linux: [{ cmd: 'npm install -g @openai/codex', needs: 'npm' }], win: [{ cmd: 'npm install -g @openai/codex', needs: 'npm' }] },
     login: 'codex login',
@@ -81,36 +59,8 @@ const PROVIDERS = {
     }),
   },
 
-  gemini: {
-    label: 'Gemini CLI', vendor: 'Google', bin: 'gemini', stream: true, resume: true,
-    plan: 'a Google account (free tier), Google AI Pro, or a Gemini API key',
-    install: { mac: [{ cmd: 'brew install gemini-cli', needs: 'brew' }, { cmd: 'npm install -g @google/gemini-cli', needs: 'npm' }], linux: [{ cmd: 'npm install -g @google/gemini-cli', needs: 'npm' }], win: [{ cmd: 'npm install -g @google/gemini-cli', needs: 'npm' }] },
-    login: 'gemini',
-    docs: 'https://github.com/google-gemini/gemini-cli',
-    async auth(_bin, env) {
-      const home = env.GEMINI_CLI_HOME || os.homedir();
-      if (env.GEMINI_API_KEY || env.GOOGLE_API_KEY || fs.existsSync(path.join(home, '.gemini', 'oauth_creds.json'))) return { loggedIn: true };
-      return { loggedIn: null };
-    },
-    // No stdin flag needed: without a TTY and without -p, Gemini reads the prompt from stdin. A policy that
-    // denies every tool removes them from the model's context; our empty folder needs trusting explicitly.
-    command({ prompt, system, resume, model }) {
-      const args = ['--output-format', 'stream-json', '--policy', 'deny-all.toml', '--extensions', 'none', '--allowed-mcp-server-names', '__none__'];
-      if (resume) args.push('--resume', resume);
-      if (model) args.push('-m', model);
-      return { args, stdin: system && !resume ? `${system}\n\n${prompt}` : prompt, env: { GEMINI_CLI_TRUST_WORKSPACE: 'true' },
-        files: { 'deny-all.toml': '[[rule]]\ntoolName = "*"\ndecision = "deny"\npriority = 999\n' } };
-    },
-    parse: jsonLines((o, emit) => {
-      if (o.type === 'init' && o.session_id) emit({ session: o.session_id });
-      else if (o.type === 'message' && o.role === 'assistant' && typeof o.content === 'string') emit({ delta: o.content });
-      else if (o.type === 'error' && o.severity !== 'warning') emit({ error: String(o.message || 'Gemini failed') });
-      else if (o.type === 'result' && o.status === 'error') emit({ error: String(o.error?.message || 'Gemini failed') });
-    }),
-  },
-
   copilot: {
-    label: 'GitHub Copilot', vendor: 'GitHub', bin: 'copilot', stream: true, resume: false,
+    label: 'GitHub Copilot', vendor: 'GitHub', bin: 'copilot', stream: true, resume: false, policy: 'default',
     plan: 'a GitHub Copilot plan (your organization must allow Copilot CLI)',
     install: { mac: [{ cmd: 'brew install copilot-cli', needs: 'brew' }, { cmd: 'npm install -g @github/copilot', needs: 'npm' }], linux: [{ cmd: 'npm install -g @github/copilot', needs: 'npm' }], win: [{ cmd: 'npm install -g @github/copilot', needs: 'npm' }] },
     login: 'copilot',
@@ -126,7 +76,7 @@ const PROVIDERS = {
   },
 
   cursor: {
-    label: 'Cursor', vendor: 'Anysphere', bin: 'cursor-agent', altBins: ['agent'], stream: true, resume: true,
+    label: 'Cursor', vendor: 'Anysphere', bin: 'cursor-agent', altBins: ['agent'], stream: true, resume: true, policy: 'optin',
     plan: 'a Cursor plan',
     install: { mac: 'curl https://cursor.com/install -fsS | bash', linux: 'curl https://cursor.com/install -fsS | bash', win: null },
     login: 'cursor-agent login',
@@ -159,7 +109,7 @@ const PROVIDERS = {
   },
 
   opencode: {
-    label: 'OpenCode', vendor: 'SST', bin: 'opencode', stream: false, resume: true,
+    label: 'OpenCode', vendor: 'SST', bin: 'opencode', stream: false, resume: true, policy: 'optin',
     plan: 'any provider you set up in OpenCode (Claude, ChatGPT, Copilot, local models…)',
     install: { mac: [{ cmd: 'brew install opencode', needs: 'brew' }, { cmd: 'curl -fsSL https://opencode.ai/install | bash' }], linux: 'curl -fsSL https://opencode.ai/install | bash', win: [{ cmd: 'npm install -g opencode-ai', needs: 'npm' }] },
     login: 'opencode auth login',
@@ -186,7 +136,7 @@ const PROVIDERS = {
   },
 
   qwen: {
-    label: 'Qwen Code', vendor: 'Alibaba', bin: 'qwen', stream: true, resume: true,
+    label: 'Qwen Code', vendor: 'Alibaba', bin: 'qwen', stream: true, resume: true, policy: 'optin',
     plan: 'a free Qwen account or an API key',
     install: { mac: [{ cmd: 'brew install qwen-code', needs: 'brew' }, { cmd: 'npm install -g @qwen-code/qwen-code@latest', needs: 'npm' }], linux: [{ cmd: 'npm install -g @qwen-code/qwen-code@latest', needs: 'npm' }], win: [{ cmd: 'npm install -g @qwen-code/qwen-code@latest', needs: 'npm' }] },
     login: 'qwen',
@@ -210,7 +160,7 @@ const PROVIDERS = {
   },
 
   amp: {
-    label: 'Amp', vendor: 'Sourcegraph', bin: 'amp', stream: false, resume: false,
+    label: 'Amp', vendor: 'Sourcegraph', bin: 'amp', stream: false, resume: false, policy: 'optin',
     plan: 'an Amp account',
     install: { mac: 'curl -fsSL https://ampcode.com/install.sh | bash', linux: 'curl -fsSL https://ampcode.com/install.sh | bash', win: [{ cmd: 'npm install -g @sourcegraph/amp', needs: 'npm' }] },
     login: 'amp login',
@@ -229,7 +179,7 @@ const PROVIDERS = {
   },
 
   goose: {
-    label: 'Goose', vendor: 'Block', bin: 'goose', stream: true, resume: false,
+    label: 'Goose', vendor: 'Block', bin: 'goose', stream: true, resume: false, policy: 'optin',
     plan: 'any provider you set up in Goose',
     install: { mac: [{ cmd: 'brew install block-goose-cli', needs: 'brew' }, { cmd: 'curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash' }], linux: 'curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash', win: null },
     login: 'goose configure',
@@ -248,7 +198,7 @@ const PROVIDERS = {
   },
 
   droid: {
-    label: 'Droid', vendor: 'Factory', bin: 'droid', stream: false, resume: true,
+    label: 'Droid', vendor: 'Factory', bin: 'droid', stream: false, resume: true, policy: 'optin',
     plan: 'a Factory account',
     install: { mac: 'curl -fsSL https://app.factory.ai/cli | sh', linux: 'curl -fsSL https://app.factory.ai/cli | sh', win: [{ cmd: 'npm install -g droid', needs: 'npm' }] },
     login: 'droid',
@@ -271,14 +221,14 @@ const PROVIDERS = {
 
   // Local models over HTTP: nothing to sign in to; "installed" = the server answers and has a model.
   ollama: {
-    label: 'Ollama', vendor: 'local models', http: { base: 'http://127.0.0.1:11434', kind: 'ollama' }, stream: true, resume: false,
+    label: 'Ollama', vendor: 'local models', http: { base: 'http://127.0.0.1:11434', kind: 'ollama' }, stream: true, resume: false, policy: 'default',
     plan: 'models running on this computer, free and private',
     install: { mac: [{ cmd: 'brew install ollama && brew services start ollama && ollama pull llama3.2', needs: 'brew' }], linux: 'curl -fsSL https://ollama.com/install.sh | sh && ollama pull llama3.2', win: null },
     login: null,
     docs: 'https://ollama.com/download',
   },
   lmstudio: {
-    label: 'LM Studio', vendor: 'local models', http: { base: 'http://127.0.0.1:1234', kind: 'openai' }, stream: true, resume: false,
+    label: 'LM Studio', vendor: 'local models', http: { base: 'http://127.0.0.1:1234', kind: 'openai' }, stream: true, resume: false, policy: 'default',
     plan: 'models running on this computer, free and private',
     install: { mac: null, linux: null, win: null },
     login: null,
@@ -397,14 +347,14 @@ class LocalAgents {
     const list = await Promise.all(Object.entries(PROVIDERS).map(async ([id, p]) => {
       if (p.http) {
         const models = await httpModels(p.http).catch(() => null);
-        return { id, label: p.label, vendor: p.vendor, plan: p.plan, installed: !!models?.length, loggedIn: models?.length ? true : null, account: models?.[0] || null,
+        return { id, policy: p.policy, label: p.label, vendor: p.vendor, plan: p.plan, installed: !!models?.length, loggedIn: models?.length ? true : null, account: models?.[0] || null,
           install: installCommand(p, env.PATH), login: null, docs: p.docs, streams: true, local: true, running: models != null };
       }
       const bin = this.findBin(p, env.PATH);
       let auth = { loggedIn: null };
       if (bin && p.auth) auth = await p.auth(bin, env).catch(() => ({ loggedIn: null }));
       return {
-        id, label: p.label, vendor: p.vendor, plan: p.plan, installed: !!bin, loggedIn: auth.loggedIn, account: auth.account || null,
+        id, policy: p.policy, label: p.label, vendor: p.vendor, plan: p.plan, installed: !!bin, loggedIn: auth.loggedIn, account: auth.account || null,
         install: installCommand(p, env.PATH), login: p.login, docs: p.docs, streams: p.stream,
       };
     }));

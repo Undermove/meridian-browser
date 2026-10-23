@@ -1988,7 +1988,7 @@ async function boot() {
   if (PRIVATE) {
     // Only the search engine carries over; no tabs, history or archive in or out.
     const d = defaultState();
-    state = { ...d, settings: { ...d.settings, searchEngine: state.settings.searchEngine, sidebarRight: state.settings.sidebarRight }, onboarded: true, profiles: [{ id: 'private', name: 'Private' }], favorites: { private: [] } };
+    state = { ...d, settings: { ...d.settings, searchEngine: state.settings.searchEngine, sidebarRight: state.settings.sidebarRight, aiProvider: state.settings.aiProvider, aiOptInAgents: state.settings.aiOptInAgents }, onboarded: true, profiles: [{ id: 'private', name: 'Private' }], favorites: { private: [] } };
     state.spaces = [newSpace('Private', null, '#7d7d88', 'private')];
     state.activeSpaceId = state.spaces[0].id;
     document.body.classList.add('private');

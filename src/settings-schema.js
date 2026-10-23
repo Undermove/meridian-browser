@@ -26,7 +26,9 @@ function makeSchema(shortcutIds) {
     aiAskFromBar: bool,
     aiLinkPreview: bool,
     // Which AI answers Ask / ⌘J / Chat: '' = automatic, 'api' (Claude API key) or a local agent id (src/ai/local-agents.js).
-    aiProvider: oneOf('', 'api', 'claude', 'codex', 'gemini', 'copilot', 'cursor', 'opencode', 'qwen', 'amp', 'goose', 'droid', 'ollama', 'lmstudio'),
+    aiProvider: oneOf('', 'api', 'codex', 'copilot', 'cursor', 'opencode', 'qwen', 'amp', 'goose', 'droid', 'ollama', 'lmstudio'),
+    // "Other agents" (policy 'optin' in local-agents.js): the user's own account, under that provider's terms.
+    aiOptInAgents: bool,
     // How much of Meridian shows: everyday browsing, AI chat for designers/managers, or the developer tools.
     mode: oneOf('everyday', 'creative', 'developer'),
     // The name on the member card (Settings → General).

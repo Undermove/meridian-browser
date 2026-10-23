@@ -1,6 +1,7 @@
 // The Chat view (src/renderer/chat.js) against fake local agent CLIs: no real agent runs, nothing is paid for.
 // MERIDIAN_TEST_PATH (dev-only hook in src/dev/env.js) makes the app look for agents in a temp dir only;
-// the fakes there print the same stream formats as Claude Code / Codex and log what they were given.
+// the fakes there print the same stream formats as Qwen Code / Codex and log what they were given.
+// Those are opt-in agents ("Other agents" in Settings → AI), so the profiles here turn that on.
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -9,15 +10,15 @@ const S = require('../fixtures/state');
 
 const NODE = process.execPath;
 
-function fakeClaude(dir, log) {
-  fs.writeFileSync(path.join(dir, 'claude'), `#!${NODE}
+function fakeQwen(dir, log) {
+  fs.writeFileSync(path.join(dir, 'qwen'), `#!${NODE}
 const fs = require('fs');
 const args = process.argv.slice(2);
 if (args[0] === 'auth') { console.log(JSON.stringify({ loggedIn: true, email: 't@example.com' })); process.exit(0); }
 let input = '';
 process.stdin.on('data', (d) => { input += d; });
 process.stdin.on('end', async () => {
-  fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ bin: 'claude', args, input }) + '\\n');
+  fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ bin: 'qwen', args, input }) + '\\n');
   const out = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const said = input.trim().split('\\n').pop();
@@ -48,16 +49,18 @@ process.stdin.on('end', () => {
 const readLog = (log) => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
 
 // A profile + a bin dir with the given fake agents.
-async function setup({ agents = ['claude'], state, userDataDir } = {}) {
+async function setup({ agents = ['qwen'], state, userDataDir } = {}) {
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'mer-chat-'));
   const bin = path.join(work, 'bin');
   fs.mkdirSync(bin);
   const log = path.join(work, 'agents.log');
-  if (agents.includes('claude')) fakeClaude(bin, log);
+  if (agents.includes('qwen')) fakeQwen(bin, log);
   if (agents.includes('codex')) fakeCodex(bin, log);
   const dir = userDataDir || fs.mkdtempSync(path.join(os.tmpdir(), 'mer-e2e-'));
   const env = { MERIDIAN_TEST_PATH: bin, ANTHROPIC_API_KEY: '' };
-  const m = await launchMeridian({ userDataDir: dir, state: state || seedState(), env });
+  const st = state || seedState();
+  st.settings = { aiOptInAgents: true, ...st.settings };
+  const m = await launchMeridian({ userDataDir: dir, state: st, env });
   const h = {
     ...m, bin, log, userDataDir: dir, env,
     async relaunch() {
@@ -92,8 +95,8 @@ test('open from the command bar, send, streamed answer, copy, links, Esc; persis
     // Empty state: greeting, four suggestions, who answers.
     await expect(page.locator('.chat-hello')).toHaveText(/Good (morning|afternoon|evening)|Hello/);
     await expect(page.locator('.chat-suggestion')).toHaveCount(4);
-    await expect(page.locator('#chat-agent-btn')).toContainText('Claude Code');
-    await expect(page.locator('#chat-input')).toHaveAttribute('placeholder', 'Message Claude Code…');
+    await expect(page.locator('#chat-agent-btn')).toContainText('Qwen Code');
+    await expect(page.locator('#chat-input')).toHaveAttribute('placeholder', 'Message Qwen Code…');
     // Shift+Enter is a newline, Enter sends.
     await page.locator('#chat-input').fill('hello there');
     await page.locator('#chat-input').press('Shift+Enter');
@@ -103,7 +106,7 @@ test('open from the command bar, send, streamed answer, copy, links, Esc; persis
     const answer = page.locator('.chat-msg.assistant').last();
     await expect(answer.locator('.chat-md')).toContainText('You said: hello there', { timeout: 15_000 });
     await expect(answer.locator('.chat-md strong')).toHaveText('Claude');
-    await expect(answer.locator('.chat-who')).toContainText('Claude Code');
+    await expect(answer.locator('.chat-who')).toContainText('Qwen Code');
     await expect(page.locator('#chat-stop')).toBeHidden();
     // Safe Markdown: no images, ever; links open in a background tab.
     await expect(page.locator('#chat-thread img')).toHaveCount(0);
@@ -121,10 +124,10 @@ test('open from the command bar, send, streamed answer, copy, links, Esc; persis
     await expect(page.locator('.chat-list-group').first()).toHaveText('Today');
     // The agent got the prompt on stdin, with tools off.
     const first = readLog(m.log).at(-1);
-    expect(first.bin).toBe('claude');
+    expect(first.bin).toBe('qwen');
     expect(first.input).toContain('hello there');
     expect(first.input).not.toContain('<conversation_so_far>');
-    expect(first.args).toEqual(expect.arrayContaining(['--tools', '']));
+    expect(first.args).toEqual(expect.arrayContaining(['--approval-mode', 'plan', '--safe-mode']));
     // Esc returns to browsing.
     await page.locator('#chat-input').press('Escape');
     await expect(page.locator('#chat-view')).toBeHidden();
@@ -162,13 +165,13 @@ test('open from the command bar, send, streamed answer, copy, links, Esc; persis
 });
 
 test('switching the agent: picker lists installed agents, saves aiProvider, the next answer comes from it', async () => {
-  const m = await setup({ agents: ['claude', 'codex'] });
+  const m = await setup({ agents: ['qwen', 'codex'], state: seedState({ settings: { aiProvider: 'qwen' } }) });
   try {
     const { page } = m;
     await openChatView(page);
-    await expect(page.locator('#chat-agent-btn')).toContainText('Claude Code');
+    await expect(page.locator('#chat-agent-btn')).toContainText('Qwen Code');
     await page.locator('#chat-agent-btn').click();
-    await expect(page.locator('#chat-agent-menu .cam-label')).toHaveText(['Claude Code', 'Codex', 'Set up another AI…']);
+    await expect(page.locator('#chat-agent-menu .cam-label')).toHaveText(['Codex', 'Qwen Code', 'Set up another AI…']);
     await page.locator('#chat-agent-menu [data-pick="codex"]').click();
     await expect(page.locator('#chat-agent-menu')).toHaveCount(0);
     await expect(page.locator('#chat-agent-btn')).toContainText('Codex');
@@ -178,14 +181,14 @@ test('switching the agent: picker lists installed agents, saves aiProvider, the 
     await expect(answer.locator('.chat-md')).toContainText('Hello from Codex', { timeout: 15_000 });
     await expect(answer.locator('.chat-who')).toContainText('Codex');
     expect(readLog(m.log).at(-1).bin).toBe('codex');
-    // Back to Claude Code mid-chat: it gets the conversation so far (it has no session of its own yet).
+    // Back to Qwen Code mid-chat: it gets the conversation so far (it has no session of its own yet).
     await page.locator('#chat-agent-btn').click();
-    await page.locator('#chat-agent-menu [data-pick="claude"]').click();
+    await page.locator('#chat-agent-menu [data-pick="qwen"]').click();
     await send(page, 'and you');
-    await expect(page.locator('.chat-msg.assistant').last().locator('.chat-who')).toContainText('Claude Code', { timeout: 15_000 });
+    await expect(page.locator('.chat-msg.assistant').last().locator('.chat-who')).toContainText('Qwen Code', { timeout: 15_000 });
     await expect(page.locator('.chat-msg.assistant').last().locator('.chat-md')).toContainText('You said: and you', { timeout: 15_000 });
     const last = readLog(m.log).at(-1);
-    expect(last.bin).toBe('claude');
+    expect(last.bin).toBe('qwen');
     expect(last.input).toContain('Assistant: Hello from Codex');
   } finally { await m.cleanup(); }
 });
@@ -197,19 +200,19 @@ test('nothing set up: the setup card offers Install, and the chat unlocks once a
     await openChatView(page);
     const card = page.locator('#chat-thread .agent-setup-card');
     await expect(card).toBeVisible({ timeout: 15_000 });
-    await expect(card.locator('.asc-row[data-agent="claude"] .asc-status')).toHaveText('Not installed');
+    await expect(card.locator('.asc-row[data-agent="cursor"] .asc-status')).toHaveText('Not installed');
     await expect(page.locator('#chat-input')).toBeDisabled();
     await expect(page.locator('#chat-agent-btn')).toContainText('No AI set up');
     // Install asks first (native dialog, answered Cancel by the fixture) and runs nothing.
-    await card.locator('[data-setup="claude"][data-action="install"]').click();
-    await expect.poll(async () => (await e2eLog(m.app)).dialogs.map((d) => d.message)).toContain('Install Claude Code?');
+    await card.locator('[data-setup="cursor"][data-action="install"]').click();
+    await expect.poll(async () => (await e2eLog(m.app)).dialogs.map((d) => d.message)).toContain('Install Cursor?');
     // The user installs it in the terminal; the card picks it up.
-    fakeClaude(m.bin, m.log);
+    fakeQwen(m.bin, m.log);
     await card.locator('[data-act="recheck"]').click();
     await expect(page.locator('#chat-thread .agent-setup-card')).toHaveCount(0, { timeout: 15_000 });
     await expect(page.locator('.chat-suggestion')).toHaveCount(4);
     await expect(page.locator('#chat-input')).toBeEnabled();
-    await expect(page.locator('#chat-agent-btn')).toContainText('Claude Code');
+    await expect(page.locator('#chat-agent-btn')).toContainText('Qwen Code');
     await send(page, 'works now');
     await expect(page.locator('.chat-msg.assistant').last().locator('.chat-md')).toContainText('You said: works now', { timeout: 15_000 });
   } finally { await m.cleanup(); }

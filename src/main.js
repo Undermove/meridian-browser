@@ -15,7 +15,7 @@ const { detectClis, connectCli } = require('./mcp-connect');
 const { importFromArc, arcDataExists, arcRoot, setArcRootOverride } = require('./importers/arc');
 const { importArcCookies, findArcProfiles, keychainPassword } = require('./importers/arc-cookies');
 const { AgentHub } = require('./agent/hub');
-const { Assistant, MODEL: ASSISTANT_MODEL, describeError: describeAiError } = require('./ai/assistant');
+const { Assistant, QUICK_MODEL, describeError: describeAiError } = require('./ai/assistant');
 const { LocalAgents, PROVIDERS: AGENT_PROVIDERS } = require('./ai/local-agents');
 const { openInTerminal } = require('./ai/agent-setup');
 const { ChatsStore } = require('./ai/chats-store');
@@ -832,9 +832,17 @@ let localAgents = null;
 
 // The renderer picks the provider; only known ids get through ('api' = the Claude API key path).
 // `history` seeds a reopened Chat view conversation (main forgets sessions on restart): strings only, capped.
+// Opt-in agents only when the user turned on "Other agents" (main checks its own copy of the settings).
+function allowedProvider(id) {
+  if (id === 'api') return true;
+  const p = Object.prototype.hasOwnProperty.call(AGENT_PROVIDERS, id) ? AGENT_PROVIDERS[id] : null;
+  if (!p) return false;
+  return p.policy === 'default' || (p.policy === 'optin' && uiSnapshot?.settings?.aiOptInAgents === true);
+}
+
 function sanitizeAiRequest(req) {
   const r = req && typeof req === 'object' ? req : {};
-  const provider = r.provider === 'api' || Object.prototype.hasOwnProperty.call(AGENT_PROVIDERS, r.provider) ? r.provider : 'api';
+  const provider = allowedProvider(r.provider) ? r.provider : 'api';
   const out = { ...r, provider, mode: r.mode === 'ask' ? 'ask' : 'chat', text: String(r.text || '').slice(0, 100_000) };
   delete out.history;
   if (Array.isArray(r.history)) {
@@ -960,10 +968,10 @@ handle('setup:propose', async (_e, opts = {}) => {
   const apps = useApps ? setupProfile.installedApps() : [];
   let arc = null;
   if (useArc) { try { arc = setupProfile.arcSummary(importFromArc()); } catch {} }
-  const provider = typeof opts.provider === 'string' && (opts.provider === 'api' || Object.prototype.hasOwnProperty.call(AGENT_PROVIDERS, opts.provider)) ? opts.provider : null;
+  const provider = typeof opts.provider === 'string' && allowedProvider(opts.provider) ? opts.provider : null;
   const ask = !provider ? null : provider === 'api'
     ? async (text) => {
-      const msg = await assistant.client().messages.create({ model: ASSISTANT_MODEL, max_tokens: 2000, messages: [{ role: 'user', content: text }] });
+      const msg = await assistant.client().messages.create({ model: QUICK_MODEL, max_tokens: 2000, messages: [{ role: 'user', content: text }] });
       return msg.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
     }
     : (text) => new Promise((resolve) => {

@@ -9,7 +9,7 @@
 
 // ---------------------------------------------------------------- Ask (command bar)
 // Type a question in ⌘T and the answer streams right under it, from whichever AI is connected
-// (a local agent on the user's subscription or the Claude API key). It knows Meridian itself too
+// (the Claude API key, GitHub Copilot, a local model, or an opt-in agent). It knows Meridian itself too
 // ("how do I split the screen?"). "Continue in chat" carries the conversation over.
 
 const QUESTION_RE = /^(how|what|why|when|where|who|whom|which|whose|can|could|should|would|will|is|are|am|do|does|did|was|were|has|have|explain|tell me|help|compare|summari[sz]e|write|translate|suggest|recommend|как|что|чем|почему|зачем|когда|где|куда|откуда|кто|какой|какая|какое|какие|каким|сколько|можно|можешь|нужно|стоит|есть ли|объясни|расскажи|подскажи|помоги|сравни|напиши|переведи|посоветуй|придумай)\b/i;

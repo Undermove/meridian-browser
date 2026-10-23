@@ -10,6 +10,8 @@ const { safeStorage } = require('electron');
 const Anthropic = require('@anthropic-ai/sdk').default;
 
 const MODEL = 'claude-opus-5-5';
+// Quick answers (Ask in the command bar, the welcome tour's suggestion): fast and inexpensive on the user's key.
+const QUICK_MODEL = 'claude-haiku-5-5';
 const MAX_STEPS = 25;
 const PAGE_CHAR_LIMIT = 150_000;
 
@@ -127,7 +129,7 @@ class Assistant {
     });
   }
 
-  async apiChat(sender, { sessionId, text, page, useTools, history = null }) {
+  async apiChat(sender, { sessionId, text, page, useTools, history = null, mode = 'chat' }) {
     // Mission Control sees the run start and end (no prompt or answer text).
     const runId = typeof sessionId === 'string' ? sessionId : '';
     const send = (type, data = {}) => {
@@ -165,13 +167,20 @@ class Assistant {
 
     try {
       for (let step = 0; step < MAX_STEPS; step++) {
-        const stream = client.beta.messages.stream({
+        // Ask from the command bar: a quick, inexpensive model and Meridian's own guide; chat: the full model.
+        const quick = mode === 'ask' && !tools.length;
+        const stream = client.beta.messages.stream(quick ? {
+          model: QUICK_MODEL,
+          max_tokens: 4000,
+          system: LOCAL_SYSTEM(this.guide(), 'ask'),
+          messages: session.messages,
+        } : {
           model: MODEL,
           max_tokens: 64000,
           betas: ['server-side-fallback-2026-07-01'],
           fallbacks: 'default',
           output_config: { effort: 'medium' },
-          system: SYSTEM,
+          system: `${SYSTEM}\n\nFor questions about Meridian itself, use this guide:\n<meridian_guide>\n${this.guide()}\n</meridian_guide>`,
           messages: session.messages,
           ...(tools.length ? { tools } : {}),
         }, { signal: session.abort.signal });
@@ -252,4 +261,4 @@ function describeError(err) {
   return err.message || String(err);
 }
 
-module.exports = { Assistant, MODEL, describeError };
+module.exports = { Assistant, MODEL, QUICK_MODEL, describeError };

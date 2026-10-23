@@ -150,38 +150,50 @@ const OB_STEPS = {
       const [agents, hasKey] = await Promise.all([ob.agentsPromise || api.agentsList(true).catch(() => []), api.aiHasKey().catch(() => false)]);
       ob.agentsPromise = null; // a revisit (after signing in) checks again
       ob.agents = agents; ob.hasKey = hasKey;
-      const ready = agents.filter((a) => a.installed && a.loggedIn !== false);
       const p = pickAiProvider(agents, hasKey);
       ob.provider = p.ready ? p.id : null;
       if (p.ready) {
         const main = p.id === 'api' ? { id: 'api', label: 'Claude' } : agents.find((a) => a.id === p.id);
-        const others = ready.filter((a) => a.id !== main.id);
+        const others = agents.filter((a) => agentReady(a) && a.id !== main.id);
         return `
           <h2>Your AI is here</h2>
           <div class="ob-ai-hero">
             ${agentMark(main)}
-            <div class="ob-ai-name"><b>${esc(p.id === 'api' ? 'Claude API' : main.label)}</b><span class="ob-ready">${icon('check', 14)} Ready</span></div>
+            <div class="ob-ai-name"><b>${esc(p.id === 'api' ? 'Claude' : main.label)}</b><span class="ob-ready">${icon('check', 14)} Ready</span></div>
           </div>
           ${others.length ? `<div class="ob-ai-others">${others.map((a) => `<button class="ob-chip ob-ai-alt" data-use="${a.id}">${agentMark(a, 'small')} ${esc(a.label)}</button>`).join('')}</div>` : ''}
-          <p class="ob-whisper">Meridian uses it to answer, explain and set things up. No extra subscription.</p>`;
+          <p class="ob-whisper">Meridian uses it to answer, explain and set things up for you.</p>`;
       }
-      const signin = agents.filter((a) => a.installed && a.loggedIn === false);
-      const offer = signin.length ? signin : ['claude', 'codex', 'gemini'].map((id) => agents.find((a) => a.id === id)).filter(Boolean);
-      return `
-        <h2>Bring your AI</h2>
-        <p class="ob-whisper top">Use the one you already pay for — Claude, ChatGPT or Gemini.</p>
-        <div class="ob-ai-grid">${offer.map((a) => `
+      // Options that are fine to use from an app: a Claude API key, GitHub Copilot, a free local model.
+      const card = (a) => !a ? '' : `
           <div class="ob-ai-card">
             ${agentMark(a)}
             <b>${esc(a.label)}</b>
-            <span>${esc(a.vendor)}</span>
+            <span>${esc(a.id === 'ollama' ? 'Free, on this computer' : a.vendor)}</span>
             ${a.installed ? `<button class="ob-btn small primary" data-setup="login" data-id="${a.id}">Sign in</button>`
               : a.install?.cmd ? `<button class="ob-btn small" data-setup="install" data-id="${a.id}">Get it</button>` : `<span class="ob-tag">needs ${esc(a.install?.missing || 'setup')}</span>`}
-          </div>`).join('')}
+          </div>`;
+      return `
+        <h2>Bring your AI</h2>
+        <p class="ob-whisper top">Pick one — you can change it any time in Settings.</p>
+        <div class="ob-ai-grid">
+          ${card(agents.find((a) => a.id === 'ollama'))}
+          ${card(agents.find((a) => a.id === 'copilot'))}
+        </div>
+        <button class="ob-link ob-key-toggle" id="ob-key-toggle">I have a Claude API key</button>
+        <div class="ob-key-row" hidden>
+          <input class="ob-key-input" id="ob-key" type="password" placeholder="sk-ant-…" autocomplete="off" spellcheck="false">
+          <button class="ob-btn small primary" id="ob-key-save">Use it</button>
         </div>`;
     },
     cta: () => (ob.provider ? 'Continue' : 'Later'),
     bind(page) {
+      $('#ob-key-toggle', page)?.addEventListener('click', (e) => { e.currentTarget.hidden = true; $('.ob-key-row', page).hidden = false; $('#ob-key', page).focus(); });
+      $('#ob-key-save', page)?.addEventListener('click', async () => {
+        const v = $('#ob-key', page).value.trim();
+        if (!/^sk-ant-/.test(v)) return toast('That doesn’t look like an Anthropic API key (sk-ant-…)');
+        try { await api.aiSetKey(v); applySettingsPatch({ aiProvider: 'api' }); showObStep(ob.step, 0); } catch (err) { toast('Couldn’t save the key: ' + err.message); }
+      });
       page.addEventListener('click', async (e) => {
         const alt = e.target.closest('[data-use]');
         if (alt) { applySettingsPatch({ aiProvider: alt.dataset.use }); return showObStep(ob.step, 0); }

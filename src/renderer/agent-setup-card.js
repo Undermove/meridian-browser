@@ -1,6 +1,7 @@
 /* Meridian — the "set up an AI" card.
  *
- * Lists the local AI agents Meridian can talk to (Claude Code, Codex, Gemini CLI, …: src/ai/local-agents.js)
+ * Lists the AI apps Meridian may use on the person's own account (GitHub Copilot, local models; opt-in
+ * agents only with "Other agents" on — src/ai/local-agents.js), plus the Claude API key option,
  * with Install / Sign in buttons. Setting one up opens a terminal (main confirms the exact command first);
  * the card then re-checks every 3 seconds for up to 3 minutes and calls onReady once an agent is ready.
  *
@@ -15,7 +16,8 @@ const AGENT_POLL_MS = 3000;
 const AGENT_POLL_MAX = 60; // ~3 minutes
 
 // Usable for chatting: installed, and not known to be signed out (some CLIs can't tell us).
-const setupCardReady = (a) => !!a && a.installed && a.loggedIn !== false;
+const setupCardAllowed = (a) => !!a && (typeof agentAllowed === 'function' ? agentAllowed(a) : a.policy === 'default');
+const setupCardReady = (a) => setupCardAllowed(a) && a.installed && a.loggedIn !== false;
 
 function renderAgentSetupCard(el, { onReady, deps = {}, title = 'Choose an AI to chat with', intro } = {}) {
   const m = window.meridian || {};
@@ -49,7 +51,7 @@ function renderAgentSetupCard(el, { onReady, deps = {}, title = 'Choose an AI to
           <span class="asc-avatar">${h((a.label || '?')[0])}</span>
           <div class="asc-text">
             <div class="asc-name">${h(a.label)} <span class="asc-status ${cls}">${waiting === a.id ? 'Waiting…' : label}</span></div>
-            <div class="asc-plan">${h(a.vendor)}${a.plan ? ` · uses ${h(a.plan)}` : ''}</div>
+            <div class="asc-plan">${h(a.vendor)}${a.plan ? ` · ${h(a.plan)}` : ''}</div>
           </div>
           <div class="asc-action">${action(a)}</div>
         </div>`;
@@ -60,13 +62,13 @@ function renderAgentSetupCard(el, { onReady, deps = {}, title = 'Choose an AI to
           <div class="asc-ic">${icon('sparkles', 20)}</div>
           <div>
             <div class="asc-title">${h(title)}</div>
-            <div class="asc-intro">${h(intro || 'Meridian talks to an AI app on this computer, using your own subscription. Pick one and set it up — it takes about a minute.')}</div>
+            <div class="asc-intro">${h(intro || 'Add a Claude API key, use GitHub Copilot, or run a free model on this computer with Ollama. Setting one up takes about a minute.')}</div>
           </div>
         </div>
         <div class="asc-list">${rows}</div>
         ${message ? `<div class="asc-message">${h(message)}</div>` : ''}
         <div class="asc-foot">
-          <span>Have a Claude API key?</span> <button class="asc-link" data-act="key">Add it in Settings</button>
+          <span>Claude:</span> <button class="asc-link" data-act="key">add your API key</button>
           <div class="grow"></div>
           <button class="btn small" data-act="recheck">Check again</button>
         </div>
@@ -77,7 +79,7 @@ function renderAgentSetupCard(el, { onReady, deps = {}, title = 'Choose an AI to
     const [next, key] = await Promise.all([d.list(fresh).catch(() => []), d.hasKey().catch(() => false)]);
     if (dead) return;
     const before = waiting && list ? JSON.stringify(list.find((a) => a.id === waiting)) : null;
-    list = next || [];
+    list = (next || []).filter(setupCardAllowed);
     if (waiting && JSON.stringify(list.find((a) => a.id === waiting)) !== before) { waiting = null; message = ''; stopPolling(); }
     draw();
     if (key || list.some(setupCardReady)) { stopPolling(); onReady?.(list, { hasKey: !!key }); }

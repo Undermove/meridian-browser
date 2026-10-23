@@ -257,11 +257,14 @@ function renderAgentBar() {
 const ai = { sessionId: uid(), busy: false, el: null, current: null, includePage: true };
 
 // ---------------------------------------------------------------- which AI answers
-// Settings → AI picks it (state.settings.aiProvider): a local agent on the user's own subscription
-// (Claude Code, Codex, …) or 'api' (Claude API key). Unset = the first agent that's installed and
+// Settings → AI picks it (state.settings.aiProvider): 'api' (Claude API key) or an agent app the user
+// set up (GitHub Copilot, local models; opt-in agents with "Other agents" on). Unset = the first agent that's installed and
 // signed in, then the API key. Shared by ⌘J, Ask in the command bar and the Chat view.
 
-const AI_AUTO_ORDER = ['claude', 'codex', 'gemini', 'copilot', 'cursor', 'opencode', 'qwen', 'amp', 'goose', 'droid', 'ollama', 'lmstudio'];
+// Automatic order: the Claude API key first (when there is one), then agents that are fine to use on the
+// user's own account, then — only with "Other agents" on — the opt-in ones (see local-agents.js).
+const AI_AUTO_ORDER = ['copilot', 'ollama', 'lmstudio', 'codex', 'cursor', 'opencode', 'qwen', 'amp', 'goose', 'droid'];
+const agentAllowed = (a) => !!a && (a.policy === 'default' || (a.policy === 'optin' && state.settings.aiOptInAgents === true));
 const aiAgents = { list: null, at: 0, pending: null };
 
 async function listAiAgents(fresh = false) {
@@ -270,7 +273,7 @@ async function listAiAgents(fresh = false) {
   return aiAgents.pending;
 }
 
-const agentReady = (a) => !!a && a.installed && a.loggedIn !== false;
+const agentReady = (a) => agentAllowed(a) && a.installed && a.loggedIn !== false;
 
 // The one rule (⌘J, Ask and Chat all use it): the chosen agent if it's ready; else the first agent that's
 // signed in, then one that's installed with an unknown sign-in state; else the Claude API key.
@@ -282,13 +285,13 @@ function pickAiProvider(agents, hasKey) {
   const byId = (id) => agents.find((x) => x.id === id);
   const c = chosen && chosen !== 'api' ? byId(chosen) : null;
   if (agentReady(c)) return { id: c.id, label: c.label, ready: true, reason: null };
-  const ordered = AI_AUTO_ORDER.map(byId).filter(Boolean);
-  const pick = ordered.find((a) => a.installed && a.loggedIn === true) || ordered.find(agentReady);
-  if (pick) return { id: pick.id, label: pick.label, ready: true, reason: null };
   if (hasKey) return api_;
+  const ordered = AI_AUTO_ORDER.map(byId).filter(agentAllowed);
+  const pick = ordered.find((a) => agentReady(a) && a.loggedIn === true) || ordered.find(agentReady);
+  if (pick) return { id: pick.id, label: pick.label, ready: true, reason: null };
   if (chosen === 'api') return api_;
   if (c) return { id: c.id, label: c.label, ready: false, reason: !c.installed ? `${c.label} isn’t installed.` : `${c.label} isn’t signed in.` };
-  return { id: null, label: 'AI', ready: false, reason: 'Connect an AI in Settings → AI: Claude Code, Codex, Gemini and others work with the subscription you already have.' };
+  return { id: null, label: 'AI', ready: false, reason: 'Connect an AI in Settings → AI: a Claude API key, GitHub Copilot, or a free local model (Ollama, LM Studio).' };
 }
 
 async function resolveAiProvider() {
