@@ -345,7 +345,7 @@ function builtinCommands() {
     { id: 'secrets', title: 'Secrets: Open Vault', run: () => openPanel('secrets') },
     { id: 'secret-add', title: 'Secrets: Add a Secret…', run: () => editSecret() },
     { id: 'secret-scan', title: 'Secrets: Scan Project for Secret Files', run: () => scanSecrets({ announce: true }) },
-    { id: 'customize-claude', title: 'Customize Workbench with Claude', run: customizeWithClaude },
+    { id: 'customize-claude', title: 'Customize Workbench with AI', run: customizeWithClaude },
     { id: 'customize', title: 'Customize: Plugins, Safe Mode and History', run: () => openPanel('customize') },
     { id: 'reload-custom', title: 'Customize: Reload Customizations', run: () => { PRO.pluginSig = null; reloadCustom(); } },
     { id: 'safe-mode', title: PRO.custom?.safeMode ? 'Safe Mode: Turn Off (load customizations)' : 'Safe Mode: Turn On (no customizations)', run: () => setSafeMode(!PRO.custom?.safeMode) },
@@ -1080,7 +1080,7 @@ function renderCustomizePanel(el) {
   if (st.unavailable) { el.appendChild(h('p', 'warn-box', 'The customization folder is unavailable.')); return; }
   el.appendChild(h('p', 'muted small', 'Plugins, styles and settings for this Workbench live in one folder. Ask Claude to change them — every save applies live.'));
   const actions = h('div', 'row-actions');
-  actions.append(btn('Customize with Claude', 'accent', customizeWithClaude), btn('Open folder', '', async () => { try { await setProject(await wb.customOpen()); openPanel('customize'); } catch (err) { toast(cleanErr(err)); } }), btn(IS_MAC ? 'Finder' : 'Folder', '', () => wb.customReveal()));
+  actions.append(btn('Customize with AI', 'accent', customizeWithClaude), btn('Open folder', '', async () => { try { await setProject(await wb.customOpen()); openPanel('customize'); } catch (err) { toast(cleanErr(err)); } }), btn(IS_MAC ? 'Finder' : 'Folder', '', () => wb.customReveal()));
   el.appendChild(actions);
   el.appendChild(h('div', 'path mono small', st.root || ''));
 

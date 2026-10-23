@@ -268,17 +268,21 @@ const preparedSessions = new WeakSet();
 let blockerPromise = null;
 let adblockEnabled = true;
 
+const { SITE_FIXES } = require('./adblock-fixes');
+
 function getBlocker() {
   if (!blockerPromise) {
     blockerPromise = (async () => {
       const { ElectronBlocker } = require('@ghostery/adblocker-electron');
       const fetch = require('cross-fetch');
       const cache = path.join(app.getPath('userData'), 'adblock-engine.bin');
-      return ElectronBlocker.fromPrebuiltAdsAndTracking(fetch, {
+      const blocker = await ElectronBlocker.fromPrebuiltAdsAndTracking(fetch, {
         path: cache,
         read: fs.promises.readFile,
         write: fs.promises.writeFile,
       });
+      blocker.updateFromDiff({ added: SITE_FIXES });
+      return blocker;
     })().catch((err) => { console.error('adblock init failed', err); blockerPromise = null; return null; });
   }
   return blockerPromise;

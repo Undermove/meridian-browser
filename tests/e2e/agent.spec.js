@@ -135,6 +135,26 @@ test2.describe('MCP page tools (full access)', () => {
     expect(await meridian.page.evaluate((id) => ({ agent: locate(id).node.agent, active: space().activeTabId === id }), opened.tab_id)).toEqual({ agent: true, active: false });
   });
 
+  test2('web components: elements, typing, clicking, reading and waiting reach inside shadow roots', async ({ mcp, server }) => {
+    const { tab_id } = json(await call(mcp, 'open_tab', { url: server.url('/shadow') }));
+    const els = (await call(mcp, 'get_interactive_elements', { tab_id })).text.split('\n').slice(1).map((l) => JSON.parse(l));
+    const title = els.find((e) => e.tag === 'textarea');
+    expect(title).toMatchObject({ label: 'Title', in_shadow_dom: true });
+    expect(els.find((e) => e.label === 'Post it')).toMatchObject({ tag: 'button', in_shadow_dom: true }); // two shadow levels deep
+    // by visible label, by the custom element's selector (drills into its control), and by index
+    expect((await call(mcp, 'type_text', { tab_id, text: 'Title', value: 'Hello' })).isError).toBeFalsy();
+    expect((await call(mcp, 'type_text', { tab_id, selector: 'fp-input[name="title"]', value: ' world' })).isError).toBeFalsy();
+    expect((await call(mcp, 'click', { tab_id, text: 'Post it' })).isError).toBeFalsy();
+    expect((await call(mcp, 'read_page', { tab_id })).text).toContain('posted:Hello world');
+    const again = (await call(mcp, 'get_interactive_elements', { tab_id })).text.split('\n').slice(1).map((l) => JSON.parse(l));
+    expect((await call(mcp, 'click', { tab_id, element_index: again.find((e) => e.label === 'Post it').i })).isError).toBeFalsy();
+    // text that exists only inside a shadow tree
+    expect((await call(mcp, 'read_page', { tab_id })).text).toContain('Shadow hello');
+    expect(json(await call(mcp, 'wait_for', { tab_id, text: 'Shadow hello', timeout_ms: 3000 })).found).toBe(true);
+    expect(json(await call(mcp, 'wait_for', { tab_id, selector: 'fp-card fp-button', timeout_ms: 3000 })).found).toBe(false); // selectors don't cross shadow boundaries…
+    expect(json(await call(mcp, 'wait_for', { tab_id, selector: 'fp-button', timeout_ms: 3000 })).found).toBe(true); // …but each shadow root is searched
+  });
+
   test2('click by visible text and wait_for', async ({ mcp, server }) => {
     const { tab_id } = json(await call(mcp, 'open_tab', { url: server.url('/form') }));
     expect((await call(mcp, 'click', { tab_id, text: 'Linked page' })).isError).toBeFalsy();

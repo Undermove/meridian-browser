@@ -21,16 +21,33 @@ const RPC_TIMEOUT = 30_000;
 
 // ---------- scripts that run inside pages (isolated world) ----------
 
+// Pages built from web components (new Reddit, many design systems) keep their inputs and buttons inside
+// shadow roots, which document.querySelectorAll and innerText don't enter. Every page script starts with
+// these helpers, which walk open shadow roots too.
+const DEEP = `
+  const deepRoots = () => { const roots = [document]; for (let i = 0; i < roots.length && roots.length < 2000; i++) { for (const el of roots[i].querySelectorAll('*')) if (el.shadowRoot) roots.push(el.shadowRoot); } return roots; };
+  const deepAll = (sel) => { const out = []; for (const r of deepRoots()) out.push(...r.querySelectorAll(sel)); return out; };
+  const deepOne = (sel) => document.querySelector(sel) || deepAll(sel)[0] || null;
+  const hostOf = (el) => { const r = el.getRootNode && el.getRootNode(); return r && r.host ? r.host : null; };
+  // A custom element that only wraps the real control: act on the control inside it.
+  const FOCUSABLE = 'input:not([type=hidden]),textarea,select,button,a[href],[contenteditable=""],[contenteditable=true],[role=textbox],[role=button]';
+  const drill = (el) => { let cur = el; for (let k = 0; k < 4 && cur && cur.shadowRoot && !cur.matches(FOCUSABLE); k++) cur = cur.shadowRoot.querySelector(FOCUSABLE) || cur; return cur || el; };
+  const inside = (node, anc) => { for (let n = node; n; n = n.parentNode || n.host) if (n === anc) return true; return false; };
+  const deepHit = (x, y) => { let hit = document.elementFromPoint(x, y); for (let k = 0; k < 8 && hit && hit.shadowRoot; k++) { const inner = hit.shadowRoot.elementFromPoint(x, y); if (!inner || inner === hit) break; hit = inner; } return hit; };
+  const deepText = () => { let t = (document.body ? document.body.innerText : '') || ''; for (const r of deepRoots().slice(1)) for (const c of r.children) { if (c.tagName !== 'STYLE' && c.tagName !== 'SCRIPT' && c.innerText) t += '\\n' + c.innerText; } return t; };
+  const labelOf = (el) => el.getAttribute('aria-label') || el.innerText || el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('name') || (hostOf(el) && (hostOf(el).getAttribute('aria-label') || hostOf(el).getAttribute('label') || hostOf(el).getAttribute('placeholder') || hostOf(el).getAttribute('name'))) || '';
+`;
+
 const PAGE = {
-  read: (offset, max) => `(() => {
-    const raw = (document.body ? document.body.innerText : '') || '';
+  read: (offset, max) => `(() => {${DEEP}
+    const raw = deepText();
     const text = raw.replace(/[ \\t\\u00a0]+/g, ' ').replace(/\\n\\s*\\n\\s*\\n+/g, '\\n\\n').trim();
     return { url: location.href, title: document.title, total: text.length, offset: ${offset}, text: text.slice(${offset}, ${offset} + ${max}) };
   })()`,
 
-  elements: (onlyVisible) => `(() => {
-    const sel = 'a[href],button,input:not([type=hidden]),textarea,select,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=radio],[role=switch],[role=option],[contenteditable=""],[contenteditable=true],[onclick],[tabindex]:not([tabindex="-1"])';
-    const els = [...document.querySelectorAll(sel)].filter((el) => {
+  elements: (onlyVisible) => `(() => {${DEEP}
+    const sel = 'a[href],button,input:not([type=hidden]),textarea,select,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=radio],[role=switch],[role=option],[role=textbox],[contenteditable=""],[contenteditable=true],[onclick],[tabindex]:not([tabindex="-1"])';
+    const els = deepAll(sel).filter((el) => {
       const r = el.getBoundingClientRect();
       if (r.width < 2 || r.height < 2) return false;
       const cs = getComputedStyle(el);
@@ -44,8 +61,9 @@ const PAGE = {
       const r = el.getBoundingClientRect();
       const tag = el.tagName.toLowerCase();
       const type = el.getAttribute('type') || undefined;
-      const label = clip(el.getAttribute('aria-label') || el.innerText || el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('name') || el.querySelector?.('img')?.alt || el.value && type !== 'password' && el.value || '', 100);
+      const label = clip(labelOf(el) || el.querySelector?.('img')?.alt || el.value && type !== 'password' && el.value || '', 100);
       const out = { i, tag, label };
+      if (hostOf(el)) out.in_shadow_dom = true;
       // aria-label can say "Cancel" on a "Delete account" button: expose the visible text too when they differ.
       const visible = clip(el.innerText, 100);
       if (visible && visible.toLowerCase() !== label.toLowerCase()) out.visible_text = visible;
@@ -61,27 +79,29 @@ const PAGE = {
   })()`,
 
   // Locate an element and scroll it into view; returns its centre in CSS px.
-  locate: (spec) => `(() => {
+  locate: (spec) => `(() => {${DEEP}
     const spec = ${JSON.stringify(spec)};
     let el = null;
     if (Number.isInteger(spec.element_index)) {
       el = (window.__meridianEls || [])[spec.element_index];
       if (!el || !el.isConnected) return { error: 'element_index is stale — call get_interactive_elements again' };
     } else if (spec.selector) {
-      try { el = document.querySelector(spec.selector); } catch (e) { return { error: 'invalid selector' }; }
+      try { el = deepOne(spec.selector); } catch (e) { return { error: 'invalid selector' }; }
+      if (el) el = drill(el);
     } else if (spec.text) {
       const want = spec.text.toLowerCase().trim();
-      const cands = [...document.querySelectorAll('a,button,input[type=submit],input[type=button],[role=button],[role=link],[role=tab],[role=menuitem],summary,label')];
-      const label = (e) => (e.getAttribute('aria-label') || e.innerText || e.value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+      const cands = deepAll('a,button,input:not([type=hidden]),textarea,[role=button],[role=link],[role=tab],[role=menuitem],[role=textbox],[contenteditable=""],[contenteditable=true],summary,label');
+      const label = (e) => (labelOf(e) || e.value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
       el = cands.find((e) => label(e) === want) || cands.find((e) => label(e).includes(want));
+      if (el && el.tagName === 'LABEL' && el.control) el = el.control;
       if (!el) {
-        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
         let best = null;
-        while (walker.nextNode()) {
-          const n = walker.currentNode;
-          if (n.innerText && n.innerText.toLowerCase().includes(want) && (!best || n.innerText.length < best.innerText.length)) best = n;
+        for (const n of deepAll('*')) {
+          if (n.children.length > 50) continue;
+          const t = n.innerText;
+          if (t && t.toLowerCase().includes(want) && (!best || t.length < best.innerText.length)) best = n;
         }
-        el = best;
+        el = best && drill(best);
       }
     } else return { error: 'give element_index, selector or text' };
     if (!el) return { error: 'element not found' };
@@ -100,13 +120,13 @@ const PAGE = {
   })()`,
 
   // After the user approved: is our element still the one under that point?
-  verifyHit: `(() => {
+  verifyHit: `(() => {${DEEP}
     const el = window.__meridianTarget; if (!el || !el.isConnected) return { ok: false, why: 'element disappeared' };
     el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
     const r = el.getBoundingClientRect();
     const x = r.left + r.width / 2, y = r.top + r.height / 2;
-    const hit = document.elementFromPoint(x, y);
-    if (!hit || !(hit === el || el.contains(hit) || hit.contains(el))) return { ok: false, why: 'element is covered by something else' };
+    const hit = deepHit(x, y);
+    if (!hit || !(inside(hit, el) || inside(el, hit))) return { ok: false, why: 'element is covered by something else' };
     return { ok: true, x, y };
   })()`,
 
@@ -132,9 +152,9 @@ const PAGE = {
     return { scrollY: Math.round(scrollY), height: document.documentElement.scrollHeight, viewport: innerHeight };
   })()`,
 
-  has: (text, selector) => `(() => {
-    if (${JSON.stringify(selector || '')}) { try { if (document.querySelector(${JSON.stringify(selector || '')})) return true; } catch { return 'bad-selector'; } }
-    if (${JSON.stringify(text || '')}) return (document.body?.innerText || '').toLowerCase().includes(${JSON.stringify((text || '').toLowerCase())});
+  has: (text, selector) => `(() => {${DEEP}
+    if (${JSON.stringify(selector || '')}) { try { if (deepOne(${JSON.stringify(selector || '')})) return true; } catch { return 'bad-selector'; } }
+    if (${JSON.stringify(text || '')}) return deepText().toLowerCase().includes(${JSON.stringify((text || '').toLowerCase())});
     return false;
   })()`,
 };

@@ -122,7 +122,7 @@ function openWorkbench({ pickProject = false } = {}) {
   if (pickProject) sendWorkbench(target.id, { type: 'pick-project' });
 }
 
-// Workbench Pro: command bar entries (New Hub, Customize with Claude, Secrets, Safe Mode).
+// Workbench Pro: command bar entries (New Hub, Customize with AI, Secrets, Safe Mode).
 function workbenchCommand(name) {
   const type = { 'workbench-new-hub': 'new-hub', 'workbench-customize': 'customize', 'workbench-secrets': 'secrets', 'workbench-safe-mode': 'safe-mode' }[name];
   if (!type) return;

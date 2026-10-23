@@ -1334,7 +1334,7 @@ const COMMANDS = [
   { id: 'open-project', label: 'Open Project in Workbench…', icon: 'code' },
   // Workbench Pro integration (handled in dev/workbench-tab.js)
   { id: 'workbench-new-hub', label: 'New Hub… (Workbench)', icon: 'layers' },
-  { id: 'workbench-customize', label: 'Customize Workbench with Claude', icon: 'settings' },
+  { id: 'workbench-customize', label: 'Customize Workbench with AI', icon: 'settings' },
   { id: 'workbench-secrets', label: 'Workbench Secrets Vault', icon: 'lock' },
   { id: 'workbench-safe-mode', label: 'Workbench Safe Mode (no customizations)', icon: 'shield' },
 ];

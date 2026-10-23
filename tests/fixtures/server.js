@@ -42,6 +42,17 @@ function routes(base) {
       <button id="go" onclick="document.getElementById('result').textContent='clicked:'+document.getElementById('name').value">Submit form</button>
       <p id="result">not clicked</p>
       <a id="lnk" href="${base}/p/linked">Linked page</a>`),
+    // Web components with open shadow roots, like new Reddit (faceplate-*): the real controls live inside.
+    '/shadow': () => page('Shadow Fixture', `
+      <fp-input name="title" label="Title"></fp-input>
+      <fp-card><span slot="h">Card</span></fp-card>
+      <p id="out">idle</p>
+      <script>
+        customElements.define('fp-input', class extends HTMLElement { constructor() { super(); const r = this.attachShadow({ mode: 'open' }); r.innerHTML = '<label>' + this.getAttribute('label') + ' <textarea aria-label="' + this.getAttribute('label') + '"></textarea></label>'; } });
+        customElements.define('fp-button', class extends HTMLElement { constructor() { super(); const r = this.attachShadow({ mode: 'open' }); r.innerHTML = '<button>Post it</button>'; r.querySelector('button').onclick = () => { document.getElementById('out').textContent = 'posted:' + document.querySelector('fp-input').shadowRoot.querySelector('textarea').value; }; } });
+        // A component inside a component (two shadow levels), with text only in the shadow tree.
+        customElements.define('fp-card', class extends HTMLElement { constructor() { super(); const r = this.attachShadow({ mode: 'open' }); r.innerHTML = '<div><p>Shadow hello</p><fp-button></fp-button></div>'; } });
+      </script>`),
     '/aria': () => page('Aria Fixture', `
       <button id="danger" aria-label="Cancel" onclick="document.title='DELETED'">Delete account</button>
       <button id="plain">Plain button</button>`),
