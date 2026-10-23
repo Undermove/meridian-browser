@@ -37,9 +37,7 @@ const chatSid = (c) => `chat-${c.id}`;
 const chatBusy = (c) => !!c && chatUi.runs.has(chatSid(c));
 
 // ---------------------------------------------------------------- which AI answers
-// Same rule as the rest of Meridian: the agent picked in state.settings.aiProvider if it's ready, else the
-// first signed-in agent, else any usable one, else the Claude API key. The list comes from ai.js's
-// listAiAgents() when it has one (shared cache), else straight from main.
+// The list comes from ai.js's listAiAgents() (shared cache).
 
 const chatListAgents = (fresh = false) => (typeof listAiAgents === 'function' ? Promise.resolve(listAiAgents(fresh)) : api.agentsList(fresh)).catch(() => []);
 
@@ -52,11 +50,10 @@ function chatAgentOptions() {
   return opts;
 }
 
+// Same rule as ⌘J and Ask (pickAiProvider in ai.js), on the cached list so the picker can draw at once.
 function chatProvider() {
-  const ready = chatAgentOptions().filter((o) => o.ready);
-  const want = state.settings.aiProvider;
-  const pick = ready.find((o) => o.id === want) || ready.find((o) => (chatUi.agents || []).some((a) => a.id === o.id && a.loggedIn === true)) || ready[0];
-  return pick || null;
+  const p = pickAiProvider(chatUi.agents || [], chatUi.hasKey);
+  return p.ready ? chatAgentOptions().find((o) => o.id === p.id) || { id: p.id, label: p.label, ready: true } : null;
 }
 
 const chatAiReady = () => !!chatProvider();

@@ -272,19 +272,28 @@ async function listAiAgents(fresh = false) {
 
 const agentReady = (a) => !!a && a.installed && a.loggedIn !== false;
 
+// The one rule (⌘J, Ask and Chat all use it): the chosen agent if it's ready; else the first agent that's
+// signed in, then one that's installed with an unknown sign-in state; else the Claude API key.
 // → { id, label, ready, reason }
+function pickAiProvider(agents, hasKey) {
+  const chosen = state.settings.aiProvider;
+  const api_ = { id: 'api', label: 'Claude', ready: !!hasKey, reason: hasKey ? null : 'Add a Claude API key in Settings → AI.' };
+  if (chosen === 'api' && hasKey) return api_;
+  const byId = (id) => agents.find((x) => x.id === id);
+  const c = chosen && chosen !== 'api' ? byId(chosen) : null;
+  if (agentReady(c)) return { id: c.id, label: c.label, ready: true, reason: null };
+  const ordered = AI_AUTO_ORDER.map(byId).filter(Boolean);
+  const pick = ordered.find((a) => a.installed && a.loggedIn === true) || ordered.find(agentReady);
+  if (pick) return { id: pick.id, label: pick.label, ready: true, reason: null };
+  if (hasKey) return api_;
+  if (chosen === 'api') return api_;
+  if (c) return { id: c.id, label: c.label, ready: false, reason: !c.installed ? `${c.label} isn’t installed.` : `${c.label} isn’t signed in.` };
+  return { id: null, label: 'AI', ready: false, reason: 'Connect an AI in Settings → AI: Claude Code, Codex, Gemini and others work with the subscription you already have.' };
+}
+
 async function resolveAiProvider() {
   const [agents, hasKey] = await Promise.all([listAiAgents(), api.aiHasKey().catch(() => false)]);
-  const chosen = state.settings.aiProvider;
-  const api_ = { id: 'api', label: 'Claude', ready: hasKey, reason: hasKey ? null : 'Add a Claude API key in Settings → AI.' };
-  if (chosen === 'api') return api_;
-  if (chosen) {
-    const a = agents.find((x) => x.id === chosen);
-    if (a) return { id: a.id, label: a.label, ready: agentReady(a), reason: !a.installed ? `${a.label} isn’t installed.` : a.loggedIn === false ? `${a.label} isn’t signed in.` : null };
-  }
-  for (const id of AI_AUTO_ORDER) { const a = agents.find((x) => x.id === id); if (agentReady(a)) return { id: a.id, label: a.label, ready: true, reason: null }; }
-  if (hasKey) return api_;
-  return { id: null, label: 'AI', ready: false, reason: 'Connect an AI in Settings → AI: Claude Code, Codex, Gemini and others work with the subscription you already have.' };
+  return pickAiProvider(agents, hasKey);
 }
 
 function toggleAiPanel(force) {
