@@ -82,21 +82,29 @@ const PROVIDERS = {
   },
 
   gemini: {
-    label: 'Gemini CLI', vendor: 'Google', bin: 'gemini', stream: true, resume: false,
-    plan: 'a Google account (free tier) or a Gemini API key',
+    label: 'Gemini CLI', vendor: 'Google', bin: 'gemini', stream: true, resume: true,
+    plan: 'a Google account (free tier), Google AI Pro, or a Gemini API key',
     install: { mac: [{ cmd: 'brew install gemini-cli', needs: 'brew' }, { cmd: 'npm install -g @google/gemini-cli', needs: 'npm' }], linux: [{ cmd: 'npm install -g @google/gemini-cli', needs: 'npm' }], win: [{ cmd: 'npm install -g @google/gemini-cli', needs: 'npm' }] },
     login: 'gemini',
     docs: 'https://github.com/google-gemini/gemini-cli',
-    command({ prompt, system, model }) {
-      const args = ['--output-format', 'stream-json', '--approval-mode', 'default', '--allowed-mcp-server-names', '__none__', '--extensions', 'none'];
+    async auth(_bin, env) {
+      const home = env.GEMINI_CLI_HOME || os.homedir();
+      if (env.GEMINI_API_KEY || env.GOOGLE_API_KEY || fs.existsSync(path.join(home, '.gemini', 'oauth_creds.json'))) return { loggedIn: true };
+      return { loggedIn: null };
+    },
+    // No stdin flag needed: without a TTY and without -p, Gemini reads the prompt from stdin. A policy that
+    // denies every tool removes them from the model's context; our empty folder needs trusting explicitly.
+    command({ prompt, system, resume, model }) {
+      const args = ['--output-format', 'stream-json', '--policy', 'deny-all.toml', '--extensions', 'none', '--allowed-mcp-server-names', '__none__'];
+      if (resume) args.push('--resume', resume);
       if (model) args.push('-m', model);
-      // `-p` with an empty value makes Gemini read the prompt from stdin.
-      return { args: [...args, '-p', ''], stdin: system ? `${system}\n\n${prompt}` : prompt };
+      return { args, stdin: system && !resume ? `${system}\n\n${prompt}` : prompt, env: { GEMINI_CLI_TRUST_WORKSPACE: 'true' },
+        files: { 'deny-all.toml': '[[rule]]\ntoolName = "*"\ndecision = "deny"\npriority = 999\n' } };
     },
     parse: jsonLines((o, emit) => {
       if (o.type === 'init' && o.session_id) emit({ session: o.session_id });
       else if (o.type === 'message' && o.role === 'assistant' && typeof o.content === 'string') emit({ delta: o.content });
-      else if (o.type === 'error') emit({ error: String(o.message || 'Gemini failed') });
+      else if (o.type === 'error' && o.severity !== 'warning') emit({ error: String(o.message || 'Gemini failed') });
       else if (o.type === 'result' && o.status === 'error') emit({ error: String(o.error?.message || 'Gemini failed') });
     }),
   },
@@ -115,6 +123,166 @@ const PROVIDERS = {
       return { args, stdin: null };
     },
     parse: plainText(),
+  },
+
+  cursor: {
+    label: 'Cursor', vendor: 'Anysphere', bin: 'cursor-agent', altBins: ['agent'], stream: true, resume: true,
+    plan: 'a Cursor plan',
+    install: { mac: 'curl https://cursor.com/install -fsS | bash', linux: 'curl https://cursor.com/install -fsS | bash', win: null },
+    login: 'cursor-agent login',
+    docs: 'https://cursor.com/docs/cli/overview',
+    async auth(bin, env) {
+      const r = await run(bin, ['status'], env, 8000);
+      const out = `${r.stdout}${r.stderr}`;
+      if (/not logged in|log in|login required/i.test(out)) return { loggedIn: false };
+      const m = /logged in(?: as)?\s+([^\s]+@[^\s]+)/i.exec(out);
+      return { loggedIn: /logged in/i.test(out) ? true : null, account: m ? m[1] : null };
+    },
+    // "ask" mode is Cursor's read-only Q&A; prompt goes in argv (no documented stdin).
+    command({ prompt, system, resume, model }, cwd) {
+      const args = ['-p', system && !resume ? `${system}\n\n${prompt}` : prompt, '--output-format', 'stream-json', '--stream-partial-output',
+        '--mode', 'ask', '--trust', '--workspace', cwd];
+      if (resume) args.push('--resume', resume);
+      if (model) args.push('--model', model);
+      return { args, stdin: null };
+    },
+    // With partial output, a delta is an assistant event with timestamp_ms and no model_call_id; the others
+    // repeat text already sent.
+    parse: jsonLines((o, emit) => {
+      if (o.session_id && (o.type === 'system' || o.type === 'result')) emit({ session: o.session_id });
+      if (o.type === 'assistant' && o.timestamp_ms && !o.model_call_id) {
+        for (const c of o.message?.content || []) if (c.type === 'text' && c.text) emit({ delta: c.text });
+      } else if (o.type === 'result') {
+        if (o.is_error) emit({ error: String(o.result || 'Cursor failed') }); else emit({ final: String(o.result ?? '') });
+      }
+    }),
+  },
+
+  opencode: {
+    label: 'OpenCode', vendor: 'SST', bin: 'opencode', stream: false, resume: true,
+    plan: 'any provider you set up in OpenCode (Claude, ChatGPT, Copilot, local models…)',
+    install: { mac: [{ cmd: 'brew install opencode', needs: 'brew' }, { cmd: 'curl -fsSL https://opencode.ai/install | bash' }], linux: 'curl -fsSL https://opencode.ai/install | bash', win: [{ cmd: 'npm install -g opencode-ai', needs: 'npm' }] },
+    login: 'opencode auth login',
+    docs: 'https://opencode.ai/docs/cli',
+    async auth(bin, env) {
+      const r = await run(bin, ['auth', 'list'], env, 8000);
+      const m = /(\d+)\s+credentials?/i.exec(r.stdout.replace(/\x1b\[[0-9;]*m/g, ''));
+      return { loggedIn: m ? Number(m[1]) > 0 : null };
+    },
+    // Every permission denied, no project config / Claude Code files / plugins; prompt on stdin.
+    command({ prompt, system, resume, model }, cwd) {
+      const config = { permission: { '*': 'deny' }, ...(system ? { agent: { meridian: { prompt: system, mode: 'primary' } } } : {}) };
+      const args = ['run', '--format', 'json', '--dir', cwd];
+      if (system) args.push('--agent', 'meridian');
+      if (resume) args.push('--session', resume);
+      if (model) args.push('-m', model);
+      return { args, stdin: prompt, env: { OPENCODE_CONFIG_CONTENT: JSON.stringify(config), OPENCODE_DISABLE_PROJECT_CONFIG: '1', OPENCODE_DISABLE_CLAUDE_CODE: '1', OPENCODE_DISABLE_EXTERNAL_SKILLS: '1', OPENCODE_DISABLE_DEFAULT_PLUGINS: '1' } };
+    },
+    parse: jsonLines((o, emit) => {
+      if (o.sessionID) emit({ session: o.sessionID });
+      if (o.type === 'text' && o.part?.text) emit({ delta: o.part.text + '\n' });
+      else if (o.type === 'error') emit({ error: String(o.error?.data?.message || o.error?.message || 'OpenCode failed') });
+    }),
+  },
+
+  qwen: {
+    label: 'Qwen Code', vendor: 'Alibaba', bin: 'qwen', stream: true, resume: true,
+    plan: 'a free Qwen account or an API key',
+    install: { mac: [{ cmd: 'brew install qwen-code', needs: 'brew' }, { cmd: 'npm install -g @qwen-code/qwen-code@latest', needs: 'npm' }], linux: [{ cmd: 'npm install -g @qwen-code/qwen-code@latest', needs: 'npm' }], win: [{ cmd: 'npm install -g @qwen-code/qwen-code@latest', needs: 'npm' }] },
+    login: 'qwen',
+    docs: 'https://github.com/QwenLM/qwen-code',
+    // Same stream format as Claude Code. Plan mode is read-only; safe mode drops MCP, hooks, extensions.
+    command({ prompt, system, resume, model }) {
+      const args = ['-p', '', '-o', 'stream-json', '--include-partial-messages', '--approval-mode', 'plan', '--safe-mode'];
+      if (system) args.push('--system-prompt', system);
+      if (resume) args.push('--resume', resume);
+      if (model) args.push('-m', model);
+      return { args, stdin: prompt };
+    },
+    parse: jsonLines((o, emit) => {
+      if (o.type === 'stream_event' && o.event?.type === 'content_block_delta' && o.event.delta?.type === 'text_delta') emit({ delta: o.event.delta.text });
+      else if (o.type === 'system' && o.session_id) emit({ session: o.session_id });
+      else if (o.type === 'result') {
+        if (o.session_id) emit({ session: o.session_id });
+        if (o.is_error) emit({ error: String(o.error?.message || o.result || 'Qwen Code failed') }); else emit({ final: String(o.result ?? '') });
+      }
+    }),
+  },
+
+  amp: {
+    label: 'Amp', vendor: 'Sourcegraph', bin: 'amp', stream: false, resume: false,
+    plan: 'an Amp account',
+    install: { mac: 'curl -fsSL https://ampcode.com/install.sh | bash', linux: 'curl -fsSL https://ampcode.com/install.sh | bash', win: [{ cmd: 'npm install -g @sourcegraph/amp', needs: 'npm' }] },
+    login: 'amp login',
+    docs: 'https://ampcode.com/manual',
+    // An isolated settings file turns every tool off.
+    command({ prompt, system }) {
+      return { args: ['-x', '--stream-json', '--settings-file', 'amp-settings.json'], stdin: system ? `${system}\n\n${prompt}` : prompt,
+        files: { 'amp-settings.json': JSON.stringify({ 'amp.tools.disable': ['*'], 'amp.mcpServers': {} }) } };
+    },
+    parse: jsonLines((o, emit) => {
+      if (o.session_id && o.type === 'system') emit({ session: o.session_id });
+      if (o.type === 'assistant') { for (const c of o.message?.content || []) if (c.type === 'text' && c.text) emit({ delta: c.text }); }
+      else if (o.type === 'result' && o.is_error) emit({ error: String(o.error || o.result || 'Amp failed') });
+      else if (o.type === 'system' && o.subtype === 'error_during_execution') emit({ error: String(o.error || 'Amp failed') });
+    }),
+  },
+
+  goose: {
+    label: 'Goose', vendor: 'Block', bin: 'goose', stream: true, resume: false,
+    plan: 'any provider you set up in Goose',
+    install: { mac: [{ cmd: 'brew install block-goose-cli', needs: 'brew' }, { cmd: 'curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash' }], linux: 'curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash', win: null },
+    login: 'goose configure',
+    docs: 'https://block.github.io/goose/',
+    // No profile and no built-ins = no extensions or MCP tools.
+    command({ prompt, system, model }) {
+      const args = ['run', '-i', '-', '--output-format', 'stream-json', '--no-profile', '--no-session', '--quiet'];
+      if (system) args.push('--system', system);
+      if (model) args.push('--model', model);
+      return { args, stdin: prompt };
+    },
+    parse: jsonLines((o, emit) => {
+      if (o.type === 'message' && o.message?.role === 'assistant') { for (const c of o.message.content || []) if (c.type === 'text' && c.text) emit({ delta: c.text }); }
+      else if (o.type === 'error') emit({ error: String(o.error || 'Goose failed') });
+    }),
+  },
+
+  droid: {
+    label: 'Droid', vendor: 'Factory', bin: 'droid', stream: false, resume: true,
+    plan: 'a Factory account',
+    install: { mac: 'curl -fsSL https://app.factory.ai/cli | sh', linux: 'curl -fsSL https://app.factory.ai/cli | sh', win: [{ cmd: 'npm install -g droid', needs: 'npm' }] },
+    login: 'droid',
+    docs: 'https://docs.factory.ai/cli/droid-exec/overview',
+    // exec is read-only by default; drop the shell tool too.
+    command({ prompt, system, resume, model }, cwd) {
+      const args = ['exec', '-o', 'json', '--remove-tools', 'Execute', '--cwd', cwd];
+      if (system) args.push('--append-system-prompt', system);
+      if (resume) args.push('-s', resume);
+      if (model) args.push('-m', model);
+      return { args, stdin: prompt };
+    },
+    parse: jsonLines((o, emit) => {
+      if (o.type === 'result') {
+        if (o.session_id) emit({ session: o.session_id });
+        if (o.is_error) emit({ error: String(o.result || 'Droid failed') }); else emit({ final: String(o.result ?? '') });
+      }
+    }),
+  },
+
+  // Local models over HTTP: nothing to sign in to; "installed" = the server answers and has a model.
+  ollama: {
+    label: 'Ollama', vendor: 'local models', http: { base: 'http://127.0.0.1:11434', kind: 'ollama' }, stream: true, resume: false,
+    plan: 'models running on this computer, free and private',
+    install: { mac: [{ cmd: 'brew install ollama && brew services start ollama && ollama pull llama3.2', needs: 'brew' }], linux: 'curl -fsSL https://ollama.com/install.sh | sh && ollama pull llama3.2', win: null },
+    login: null,
+    docs: 'https://ollama.com/download',
+  },
+  lmstudio: {
+    label: 'LM Studio', vendor: 'local models', http: { base: 'http://127.0.0.1:1234', kind: 'openai' }, stream: true, resume: false,
+    plan: 'models running on this computer, free and private',
+    install: { mac: null, linux: null, win: null },
+    login: null,
+    docs: 'https://lmstudio.ai/docs/app',
   },
 };
 
@@ -209,12 +377,29 @@ class LocalAgents {
     return dir;
   }
 
+  // The CLI's path. Cursor also installs itself as `agent`, a name other tools use too, so that one
+  // only counts when it really is Cursor's.
+  findBin(p, searchPath) {
+    const direct = which(p.bin, searchPath);
+    if (direct) return direct;
+    for (const alt of p.altBins || []) {
+      const b = which(alt, searchPath);
+      try { if (b && /cursor/i.test(fs.realpathSync(b))) return b; } catch {}
+    }
+    return null;
+  }
+
   // Installed? Signed in? Cached for a minute; `fresh` re-checks (after the user installs or signs in).
   async list({ fresh = false } = {}) {
     if (!fresh && this.cache && Date.now() - this.cache.at < 60_000) return this.cache.list;
     const env = await this.env();
     const list = await Promise.all(Object.entries(PROVIDERS).map(async ([id, p]) => {
-      const bin = which(p.bin, env.PATH);
+      if (p.http) {
+        const models = await httpModels(p.http).catch(() => null);
+        return { id, label: p.label, vendor: p.vendor, plan: p.plan, installed: !!models?.length, loggedIn: models?.length ? true : null, account: models?.[0] || null,
+          install: installCommand(p, env.PATH), login: null, docs: p.docs, streams: true, local: true, running: models != null };
+      }
+      const bin = this.findBin(p, env.PATH);
       let auth = { loggedIn: null };
       if (bin && p.auth) auth = await p.auth(bin, env).catch(() => ({ loggedIn: null }));
       return {
@@ -228,18 +413,22 @@ class LocalAgents {
 
   stop(runId) {
     const c = this.runs.get(runId);
-    if (c) { try { c.kill(IS_WIN ? undefined : 'SIGTERM'); setTimeout(() => { try { c.kill('SIGKILL'); } catch {} }, 1500); } catch {} }
+    if (c) { try { c.kill(IS_WIN ? undefined : 'SIGTERM'); if (c.pid) setTimeout(() => { try { c.kill('SIGKILL'); } catch {} }, 1500); } catch {} }
   }
 
   // onEvent({ delta } | { session } | { done, text } | { error }) — always ends with done or error.
   async chat(runId, { provider, prompt, system = '', resume = null, model = null }, onEvent) {
     const p = PROVIDERS[provider];
     if (!p) return onEvent({ error: 'Unknown AI agent.' });
+    if (p.http) return this.httpChat(runId, p, { prompt, system, model }, onEvent);
     const env = await this.env();
-    const bin = which(p.bin, env.PATH);
+    const bin = this.findBin(p, env.PATH);
     if (!bin) return onEvent({ error: `${p.label} isn’t installed. Set it up in Settings → AI.`, code: 'not-installed' });
-    const { args, stdin } = p.command({ prompt, system, resume: p.resume ? resume : null, model });
-    const child = spawnSafe(bin, args, { env, cwd: this.workdir(provider) });
+    const cwd = this.workdir(provider);
+    const spec = p.command({ prompt, system, resume: p.resume ? resume : null, model }, cwd);
+    const { args, stdin } = spec;
+    for (const [name, content] of Object.entries(spec.files || {})) fs.writeFileSync(path.join(cwd, name), content, { mode: 0o600 });
+    const child = spawnSafe(bin, args, { env: { ...env, ...(spec.env || {}) }, cwd });
     if (!child) return onEvent({ error: `Couldn’t start ${p.label}.` });
     this.runs.set(runId, child);
     const parser = p.parse();
@@ -272,6 +461,54 @@ class LocalAgents {
     if (stdin != null) child.stdin.end(stdin); else child.stdin.end();
   }
 }
+
+// ---------------------------------------------------------------- local model servers (Ollama, LM Studio)
+
+async function httpModels({ base, kind }) {
+  const r = await fetch(base + (kind === 'ollama' ? '/api/tags' : '/v1/models'), { signal: AbortSignal.timeout(1200) });
+  if (!r.ok) return null;
+  const j = await r.json();
+  return kind === 'ollama' ? (j.models || []).map((m) => m.name) : (j.data || []).map((m) => m.id);
+}
+
+LocalAgents.prototype.httpChat = async function httpChat(runId, p, { prompt, system, model }, onEvent) {
+  const { base, kind } = p.http;
+  const models = await httpModels(p.http).catch(() => null);
+  if (!models) return onEvent({ error: `${p.label} isn’t running. Start it, then try again.` });
+  const use = model && models.includes(model) ? model : models[0];
+  if (!use) return onEvent({ error: `${p.label} has no models yet. Download one first.` });
+  const abort = new AbortController();
+  this.runs.set(runId, { kill: () => abort.abort() });
+  const messages = [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content: prompt }];
+  let text = '';
+  try {
+    const r = await fetch(base + (kind === 'ollama' ? '/api/chat' : '/v1/chat/completions'), {
+      method: 'POST', headers: { 'content-type': 'application/json' }, signal: abort.signal,
+      body: JSON.stringify({ model: use, messages, stream: true }),
+    });
+    if (!r.ok) throw new Error(`${p.label}: HTTP ${r.status}`);
+    const dec = new TextDecoder();
+    let buf = '';
+    for await (const chunk of r.body) {
+      buf += dec.decode(chunk, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        let line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (kind === 'openai') { if (!line.startsWith('data:')) continue; line = line.slice(5).trim(); if (line === '[DONE]') continue; }
+        if (!line.startsWith('{')) continue;
+        let o; try { o = JSON.parse(line); } catch { continue; }
+        if (o.error) throw new Error(String(o.error.message || o.error));
+        const d = kind === 'ollama' ? o.message?.content : o.choices?.[0]?.delta?.content;
+        if (d) { text += d; onEvent({ delta: d }); }
+      }
+    }
+    onEvent({ done: true, text: text.trim() });
+  } catch (err) {
+    if (abort.signal.aborted) onEvent({ done: true, stopped: true, text });
+    else onEvent({ error: err.message || `${p.label} failed` });
+  } finally { this.runs.delete(runId); }
+};
 
 function friendlyError(p, msg, stderr) {
   const all = `${msg}\n${stderr}`;

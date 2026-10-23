@@ -2,27 +2,125 @@
  *
  *  - Tidy Today: Claude proposes folders and shorter titles for the Today tabs; shown as a diff the
  *    user accepts (in parts) or rejects. Nothing changes until Apply.
- *  - Ask Claude from the command bar: type a question, choose "Ask Claude", and it opens in ⌘J.
+ *  - Ask from the command bar: type a question and the answer streams inside the command bar.
  *  - Link preview: hold Shift over a link (Settings → AI) → a card with a short summary of the page.
  * Toggles live in Settings → AI. Loaded after app.js / ai.js / panels.js and uses their globals.
  */
 
-// ---------------------------------------------------------------- Ask Claude (command bar)
+// ---------------------------------------------------------------- Ask (command bar)
+// Type a question in ⌘T and the answer streams right under it, from whichever AI is connected
+// (a local agent on the user's subscription or the Claude API key). It knows Meridian itself too
+// ("how do I split the screen?"). "Continue in chat" carries the conversation over.
+
+const QUESTION_RE = /^(how|what|why|when|where|who|whom|which|whose|can|could|should|would|will|is|are|am|do|does|did|was|were|has|have|explain|tell me|help|compare|summari[sz]e|write|translate|suggest|recommend|как|что|чем|почему|зачем|когда|где|куда|откуда|кто|какой|какая|какое|какие|каким|сколько|можно|можешь|нужно|стоит|есть ли|объясни|расскажи|подскажи|помоги|сравни|напиши|переведи|посоветуй|придумай)\b/i;
+
+function looksLikeQuestion(q) {
+  const words = q.split(/\s+/).filter(Boolean).length;
+  return /[?？]\s*$/.test(q) || (words >= 2 && QUESTION_RE.test(q)) || words >= 7;
+}
 
 function askClaudeResult(raw, isUrl) {
   if (state.settings.aiAskFromBar === false || isUrl || PRIVATE) return null;
   const q = String(raw || '').trim();
   if (q.length < 3) return null;
-  return { kind: 'ask', icon: 'sparkles', title: q, sub: 'Ask Claude', badge: 'Ask Claude', action: () => askClaude(q) };
+  const p = ai.provider;
+  const label = p?.ready ? `Ask ${p.label}` : 'Ask AI';
+  return { kind: 'ask', icon: 'sparkles', title: q, sub: p?.ready ? label : 'Connect an AI to get answers here', badge: label, first: looksLikeQuestion(q), keepOpen: true, action: () => startInlineAsk(q) };
 }
 
-async function askClaude(q) {
-  toggleAiPanel(true);
-  const hasKey = await api.aiHasKey().catch(() => false);
-  const input = $('#ai-input');
-  if (!hasKey || ai.busy) { if (input) { input.value = q; input.focus(); } return; }
-  setTimeout(() => sendAi(q), 60);
+const ask = { sessionId: null, q: '', text: '', provider: null, done: false };
+
+async function startInlineAsk(q) {
+  const p = await resolveAiProvider();
+  ai.provider = p;
+  const box = $('#cmd-answer');
+  $('#cmd-results').hidden = true;
+  box.hidden = false;
+  if (!p.ready) {
+    box.innerHTML = `
+      <div class="ca-head">${icon('sparkles', 15)}<span>Get answers right here</span></div>
+      <div class="ca-body"><p></p></div>
+      <div class="ca-foot"><button class="btn accent small" data-ca="connect">Connect an AI…</button><button class="btn small" data-ca="search">Search the web instead</button></div>`;
+    $('.ca-body p', box).textContent = p.reason;
+    bindAnswerFoot(box, q);
+    return;
+  }
+  if (ask.sessionId && !ask.done) api.aiStop(ask.sessionId);
+  Object.assign(ask, { sessionId: 'ask-' + uid(), q, text: '', provider: p, done: false });
+  box.innerHTML = `
+    <div class="ca-head">${icon('sparkles', 15)}<span></span><div class="grow"></div><span class="ca-status">Thinking…</span></div>
+    <div class="ca-body"><span class="ai-typing"></span></div>
+    <div class="ca-foot"><button class="btn small" data-ca="chat">${icon('bolt', 13)} Continue in chat</button><button class="btn small" data-ca="copy" disabled>Copy</button><button class="btn small" data-ca="search">Search the web</button><div class="grow"></div><span class="ca-hint">Esc to close</span></div>`;
+  $('.ca-head span', box).textContent = p.label;
+  bindAnswerFoot(box, q);
+  api.aiChat({ sessionId: ask.sessionId, text: q, page: null, provider: p.id, mode: 'ask', useTools: false });
 }
+
+function bindAnswerFoot(box, q) {
+  box.onclick = async (e) => {
+    const a = e.target.closest('[data-ca]')?.dataset.ca;
+    if (!a) return;
+    if (a === 'connect') { closeCommandBar(); return openSettings('ai'); }
+    if (a === 'search') { closeCommandBar(); return openTab(searchUrl(q)); }
+    if (a === 'copy') { await navigator.clipboard.writeText(ask.text).catch(() => {}); return toast('Answer copied'); }
+    if (a === 'chat') return continueAskInChat();
+    const link = e.target.closest('[data-ai-link]');
+    if (link) { e.preventDefault(); closeCommandBar(); openTab(link.dataset.aiLink); }
+  };
+}
+
+// The ⌘J panel picks up the same session, so the agent keeps the context.
+function continueAskInChat() {
+  const { sessionId, q, text } = ask;
+  if (!sessionId) return;
+  ask.handedOff = true;
+  closeCommandBar();
+  if (ai.busy) api.aiStop(ai.sessionId);
+  ai.sessionId = sessionId;
+  ai.busy = !ask.done;
+  $('#ai-messages').innerHTML = '';
+  addMsg('user', esc(q));
+  const el = addMsg('assistant', text ? renderMarkdown(text) : '<span class="ai-typing"></span>');
+  ai.current = ask.done ? null : { el, text };
+  setAiBusy(!ask.done);
+  toggleAiPanel(true);
+}
+
+function onAskEvent(ev) {
+  if (ev.sessionId !== ask.sessionId || ask.handedOff) return;
+  const box = $('#cmd-answer');
+  const body = $('.ca-body', box);
+  if (!body) return;
+  if (ev.type === 'text') {
+    ask.text += ev.delta;
+    body.innerHTML = renderMarkdown(ask.text);
+    $('.ca-status', box).textContent = '';
+    $('[data-ca="copy"]', box).disabled = false;
+  } else if (ev.type === 'error') {
+    ask.done = true;
+    body.innerHTML = '<p class="ca-error"></p>';
+    $('.ca-error', body).textContent = ev.message;
+    $('.ca-status', box).textContent = '';
+  } else if (ev.type === 'done') {
+    ask.done = true;
+    $('.ca-status', box).textContent = ev.stopped ? 'Stopped' : '';
+    if (!ask.text && !ev.stopped) body.innerHTML = '<p class="muted">No answer.</p>';
+  }
+}
+
+// Leaving answer mode (typing again, Esc, closing): stop a running answer unless it moved to chat.
+function endInlineAsk() {
+  const box = $('#cmd-answer');
+  if (!box || box.hidden) return;
+  if (ask.sessionId && !ask.done && !ask.handedOff) api.aiStop(ask.sessionId);
+  if (!ask.handedOff && ask.sessionId) api.aiReset(ask.sessionId);
+  ask.sessionId = null; ask.handedOff = false;
+  box.hidden = true;
+  box.innerHTML = '';
+  $('#cmd-results').hidden = false;
+}
+
+api.onAiEvent(onAskEvent);
 
 // ---------------------------------------------------------------- Tidy Today
 

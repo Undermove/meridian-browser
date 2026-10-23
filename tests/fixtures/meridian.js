@@ -20,6 +20,24 @@ function freshUserDataDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'mer-e2e-'));
 }
 
+// The app finds agent CLIs (Claude Code, Codex, …) on the login PATH. Tests get a PATH with only the
+// tools they need, so the developer's real, signed-in agents are never found (or billed). Specs that want
+// an agent pass their own MERIDIAN_TEST_PATH with a fake CLI in front.
+let testBin = null;
+function testPathDefault() {
+  if (!testBin) {
+    testBin = fs.mkdtempSync(path.join(os.tmpdir(), 'mer-e2e-bin-'));
+    const { execFileSync } = require('child_process');
+    for (const tool of ['node', 'git', 'docker']) {
+      try {
+        const p = tool === 'node' ? process.execPath : execFileSync('/usr/bin/which', [tool], { encoding: 'utf8' }).trim();
+        if (p) fs.symlinkSync(p, path.join(testBin, tool));
+      } catch {}
+    }
+  }
+  return [testBin, '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(path.delimiter);
+}
+
 // Launch Meridian. `state` (object) is written to state.json before launch unless `keepState` is set.
 async function launchMeridian({ userDataDir, state, keepState = false, env = {}, windowBounds } = {}) {
   if (!keepState) fs.writeFileSync(path.join(userDataDir, 'state.json'), JSON.stringify(state || seedState()));
@@ -33,6 +51,7 @@ async function launchMeridian({ userDataDir, state, keepState = false, env = {},
     env: {
       ...process.env,
       MERIDIAN_USER_DATA: userDataDir,
+      MERIDIAN_TEST_PATH: testPathDefault(),
       // Don't steal the user's focus (set MERIDIAN_E2E_FOCUS=1 to run with normal, focus-taking windows).
       ...(process.env.MERIDIAN_E2E_FOCUS === '1' ? {} : {
         MERIDIAN_E2E_NO_FOCUS: '1',
@@ -345,6 +364,7 @@ const focusInfo = (page) => page.evaluate(async () => {
 const nextFrames = (page) => page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
 
 module.exports = {
+  testPathDefault,
   test, expect, launchMeridian, runUnattached, press, e2eLog, setDialogResponse, chooseMenu, closeMeridian, flushState, snapshot, openTabDirect, waitTabLoaded, inTab,
   activeViewBox, clickIntoActivePage, clickInTab, realClick, realMove, focusInfo, nextFrames, seedState, ROOT,
 };

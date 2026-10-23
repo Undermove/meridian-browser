@@ -1,12 +1,13 @@
 /* Meridian — welcome tour (full window, Arc-style).
  *
- * Welcome → Make it yours (colour, live) → Import from Arc (only when Arc data exists) → Default
- * browser → The basics (try the shortcuts) → AI (agent access, connect Claude Code / Codex) → Done.
+ * Welcome → How you'll use it (mode) → Make it yours (colour, live) → Import from Arc (only when Arc
+ * data exists) → Default browser → The basics (try the shortcuts) → Connect your AI (Claude Code, Codex,
+ * Gemini… on the user's own subscription) → [Developer mode: agent access + MCP] → Done.
  * Re-runnable from Help → Welcome Tour and Settings → General. Completion is saved as state.onboarded.
  * Loaded after app.js / panels.js and shares their globals.
  */
 
-const ob = { el: null, step: 0, steps: [], tried: new Set(), arc: null, clis: null, imported: null };
+const ob = { el: null, step: 0, steps: [], tried: new Set(), arc: null, clis: null, imported: null, poll: null };
 
 const TOUR = [
   { cmd: 'command-bar', keys: '⌘T', title: 'Open anything', desc: 'The command bar searches your tabs, history and the web, and runs commands.' },
@@ -21,7 +22,7 @@ async function startOnboarding() {
   closePanels?.();
   ob.step = 0; ob.tried = new Set(); ob.imported = null;
   ob.arc = await api.arcPreview().catch(() => null);
-  ob.steps = ['welcome', 'theme', ...(ob.arc && !ob.arc.error && ob.arc.spaces ? ['arc'] : []), 'default', 'basics', 'ai', 'done'];
+  ob.steps = obSteps();
   const el = document.createElement('div');
   el.id = 'onboarding';
   el.innerHTML = `
@@ -46,11 +47,20 @@ async function startOnboarding() {
   showObStep(0);
 }
 
+// Developer mode adds the agent-access / MCP step; the others don't need it.
+function obSteps() {
+  return ['welcome', 'mode', 'theme', ...(ob.arc && !ob.arc.error && ob.arc.spaces ? ['arc'] : []), 'default', 'basics', 'ai',
+    ...(uiMode() === 'developer' && state.settings.mode ? ['devtools'] : []), 'done'];
+}
+
 function finishOnboarding() {
   state.onboarded = true; save();
   const el = ob.el;
   ob.el = null;
+  clearInterval(ob.poll);
+  if (!state.settings.mode) state.settings.mode = 'everyday';
   document.body.classList.remove('onboarding');
+  render();
   if (!el) return;
   el.classList.add('leaving');
   setTimeout(() => el.remove(), 380);
@@ -228,7 +238,84 @@ const OB_STEPS = {
     },
   },
 
+  mode: {
+    html: () => {
+      const cur = state.settings.mode || '';
+      const card = (v, ic, title, desc) => `<button class="ob-mode ${cur === v ? 'on' : ''}" data-mode="${v}"><span class="ob-mode-ic">${icon(ic, 22)}</span><b>${title}</b><span>${desc}</span></button>`;
+      return `
+        <h2>How will you use Meridian?</h2>
+        <p class="ob-lead">We’ll keep things simple and show what you need. You can switch any time in Settings.</p>
+        <div class="ob-modes">
+          ${card('everyday', 'globe', 'Everyday browsing', 'The calm Arc way to browse. Ask any question right in the command bar.')}
+          ${card('creative', 'sparkles', 'AI for work', 'For designers, managers and writers: chat with your AI next to your tabs, like the Claude or ChatGPT app.')}
+          ${card('developer', 'code', 'Developer', 'Everything above, plus a mini IDE with Claude Code and Codex, Mission Control and an MCP server.')}
+        </div>`;
+    },
+    bind(page) {
+      $('.ob-modes', page).onclick = (e) => {
+        const b = e.target.closest('[data-mode]'); if (!b) return;
+        $$('[data-mode]', page).forEach((x) => x.classList.toggle('on', x === b));
+        applySettingsPatch({ mode: b.dataset.mode });
+        ob.steps = obSteps();
+        $('.ob-dots', ob.el).innerHTML = ob.steps.map((st, j) => `<button class="ob-dot ${j === ob.step ? 'on' : ''} ${j < ob.step ? 'past' : ''}" data-ob="goto:${j}" title="${esc(st)}"></button>`).join('');
+        setTimeout(obNext, 260);
+      };
+    },
+  },
+
   ai: {
+    html: async () => {
+      const agents = await api.agentsList(true).catch(() => []);
+      const hasKey = await api.aiHasKey().catch(() => false);
+      const chosen = state.settings.aiProvider || '';
+      const ready = (a) => a.installed && a.loggedIn !== false;
+      const auto = !chosen && agents.find(ready);
+      const btn = (a) => !a.installed
+        ? (a.install?.cmd ? `<button class="ob-btn small" data-setup="install" data-id="${a.id}">Install</button>` : `<span class="ob-tag">needs ${esc(a.install?.missing || 'setup')}</span>`)
+        : a.loggedIn === false ? `<button class="ob-btn small primary" data-setup="login" data-id="${a.id}">Sign in</button>`
+        : `<span class="ob-ok small">${icon('check', 15)} Ready</span>`;
+      const on = (a) => chosen === a.id || (auto && auto.id === a.id);
+      return `
+        <h2>Connect your AI</h2>
+        <p class="ob-lead">For the full experience, connect the AI you already pay for. Meridian uses it to answer questions in the command bar${uiMode() !== 'everyday' ? ', in chat' : ''} and about any page. No extra subscription, no API key.</p>
+        <div class="ob-agents">${agents.map((a) => `
+          <div class="ob-agent ${on(a) ? 'on' : ''} ${ready(a) ? 'ready' : ''}" data-pick="${a.id}">
+            <span class="ob-agent-mark" style="--c:${({ claude: '#d97757', codex: '#10a37f', gemini: '#4285f4', copilot: '#8957e5' })[a.id] || '#777'}">${esc(a.label[0])}</span>
+            <div class="ob-agent-text"><b>${esc(a.label)}</b><span>${esc(a.vendor)} · ${esc(a.plan)}</span></div>
+            ${btn(a)}
+          </div>`).join('')}
+        </div>
+        <p class="ob-fine">${hasKey ? 'Your Claude API key works too. ' : 'Prefer an API key? Add it in Settings → AI. '}Agents answer as text here — they can’t run commands or change files.</p>`;
+    },
+    bind(page) {
+      page.addEventListener('click', async (e) => {
+        const setup = e.target.closest('[data-setup]');
+        if (setup) {
+          e.stopPropagation();
+          const r = await api.agentsSetup(setup.dataset.id, setup.dataset.setup).catch((err) => ({ ok: false, error: err.message }));
+          if (r.cancelled) return;
+          if (!r.ok) return toast(r.error || 'Couldn’t start setup', { timeout: 6000 });
+          setup.disabled = true; setup.textContent = setup.dataset.setup === 'install' ? 'Installing…' : 'Signing in…';
+          // Re-check every few seconds; redraw this step when something changes.
+          clearInterval(ob.poll);
+          const start = Date.now(), before = JSON.stringify(await api.agentsList().catch(() => []));
+          ob.poll = setInterval(async () => {
+            if (!ob.el || ob.steps[ob.step] !== 'ai' || Date.now() - start > 5 * 60_000) return clearInterval(ob.poll);
+            const now = JSON.stringify(await api.agentsList(true).catch(() => []));
+            if (now !== before) { clearInterval(ob.poll); aiAgents.at = 0; showObStep(ob.step, 0); }
+          }, 3000);
+          return;
+        }
+        const pick = e.target.closest('[data-pick].ready');
+        if (pick) {
+          $$('[data-pick]', page).forEach((x) => x.classList.toggle('on', x === pick));
+          applySettingsPatch({ aiProvider: pick.dataset.pick });
+        }
+      });
+    },
+  },
+
+  devtools: {
     html: async () => {
       ob.clis ||= await api.mcpDetect().catch(() => ({}));
       const access = state.settings.agentAccess || 'off';
@@ -241,8 +328,8 @@ const OB_STEPS = {
         </div>`;
       };
       return `
-        <h2>Meridian works with AI</h2>
-        <p class="ob-lead">Ask Claude about any page with ⌘J, and let agents like Claude Code read and drive your browser — only as much as you allow.</p>
+        <h2>Let agents use the browser</h2>
+        <p class="ob-lead">Coding agents like Claude Code can read and drive Meridian through its MCP server — only as much as you allow.</p>
         <div class="ob-ai">
           <div class="ob-access">${AGENT_ACCESS.map(([v, l, d]) => `<button class="ob-acc ${access === v ? 'on' : ''}" data-acc="${v}"><b>${esc(l)}</b><span>${esc(d)}</span></button>`).join('')}</div>
           ${cli('claude')}${cli('codex')}

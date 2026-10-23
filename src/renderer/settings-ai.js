@@ -33,6 +33,8 @@ registerSection({
         <div class="hero-ic">${icon('sparkles', 22)}</div>
         <div><h1>AI in Meridian</h1><p>Ask Claude about pages with ⌘J, and let coding agents like Claude Code read and drive your browser, within the access you choose.</p></div>
       </div>
+      ${group('Your AI', `<div id="agent-rows"><div class="row"><div class="row-text"><div class="row-desc">Looking for AI agents on this computer…</div></div></div></div>`,
+        'Ask in the command bar (⌘T), the ⌘J panel and Chat use this AI. Agents run on this computer with the subscription you already have — no API key needed. They answer as text only; they can’t run commands or change files from here.')}
       ${group('Claude API key', hasKey
         ? row('API key', `<span class="ok">${icon('check', 14)} Saved</span> ${button('ai-key-remove', 'Remove', 'small')}`, 'Stored encrypted in the system keychain. Pages and the UI never see it.')
         : `<div class="row"><input class="text" id="ai-key" type="password" placeholder="sk-ant-…" autocomplete="off" spellcheck="false">${button('ai-key-save', 'Save', 'primary')}</div>`,
@@ -55,6 +57,8 @@ registerSection({
       `, 'Mission Control shows Claude Code and Codex sessions started from the Workbench, MCP clients and ⌘J chats, live. It keeps a short history without tool inputs.')}
       ${group('Coding agents', `<div id="cli-rows"><div class="row"><div class="row-text"><div class="row-desc">Looking for Claude Code and Codex…</div></div></div></div>`,
         'Connect registers Meridian’s MCP server with that CLI. You’ll see the exact command and confirm before it runs. Agents only work while Meridian is running and agent access isn’t Off.')}`;
+
+    drawAgents(el, hasKey);
 
     S.mcpDetect().catch(() => ({})).then((found) => {
       clis = found || {};
@@ -96,3 +100,57 @@ registerSection({
     });
   },
 });
+
+// ---------------------------------------------------------------- Your AI (local agents)
+
+const AGENT_MARK = { claude: '#d97757', codex: '#10a37f', gemini: '#4285f4', copilot: '#8957e5', cursor: '#111111', opencode: '#4b5563', qwen: '#615ced', amp: '#f34e3f', goose: '#222222', droid: '#ff6b00', ollama: '#333333', lmstudio: '#4f46e5' };
+let agentPoll = null;
+
+async function drawAgents(root, hasKey, fresh = false) {
+  const box = $('#agent-rows', root);
+  if (!box) return;
+  const list = await withTimeout(S.agentsList(fresh), [], 15000);
+  if (!box.isConnected) return;
+  const chosen = ctx.settings.aiProvider || '';
+  const status = (a) => !a.installed ? '<span class="tag">Not installed</span>'
+    : a.loggedIn === false ? '<span class="tag warn-tag">Not signed in</span>'
+    : `<span class="tag ok-tag">${a.loggedIn ? 'Ready' : 'Installed'}</span>`;
+  const action = (a) => !a.installed
+    ? (a.install?.cmd ? `<button class="btn small" data-setup="install" data-id="${a.id}">Install…</button>` : `<a class="btn small" href="${esc(a.docs)}" data-ext="${esc(a.docs)}">How to install</a>`)
+    : a.loggedIn === false ? `<button class="btn small primary" data-setup="login" data-id="${a.id}">Sign in…</button>` : '';
+  const radio = (id, label, desc, extra = '', disabled = false) => `
+    <label class="row radio agent ${chosen === id ? 'on' : ''} ${disabled ? 'dim' : ''}">
+      <input type="radio" name="ai-provider" value="${esc(id)}" ${chosen === id ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+      ${extra}
+      <div class="row-text"><div class="row-label">${label}</div><div class="row-desc">${desc}</div></div>`;
+  box.innerHTML = [
+    radio('', 'Automatic', 'The first agent below that’s ready, then the Claude API key.') + '</label>',
+    ...list.map((a) => radio(a.id, `${esc(a.label)} ${status(a)}`, `${esc(a.vendor)} · works with ${esc(a.plan)}${a.account ? ` · ${esc(a.account)}` : ''}${!a.installed && a.install?.missing ? ` · needs ${esc(a.install.missing)}` : ''}`,
+      `<span class="agent-mark" style="--c:${AGENT_MARK[a.id] || '#888'}">${esc(a.label[0])}</span>`, !a.installed) + `<div class="row-control">${action(a)}</div></label>`),
+    radio('api', `Claude API key ${hasKey ? '<span class="tag ok-tag">Ready</span>' : '<span class="tag">No key</span>'}`, 'Pay-as-you-go with your Anthropic API key (below). The only option that can also act in the browser.',
+      `<span class="agent-mark" style="--c:#d97757">${icon('sparkles', 13)}</span>`, !hasKey) + '</label>',
+  ].join('');
+  $$('input[name="ai-provider"]', box).forEach((r) => r.addEventListener('change', () => {
+    ctx.set({ aiProvider: r.value });
+    $$('.row.radio', box).forEach((x) => x.classList.toggle('on', x.contains(r)));
+    toast(r.value ? `${r.closest('.row').querySelector('.row-label').firstChild.textContent.trim()} will answer` : 'Automatic');
+  }));
+  box.onclick = async (e) => {
+    const ext = e.target.closest('[data-ext]');
+    if (ext) { e.preventDefault(); S.openUrl(ext.dataset.ext); return; }
+    const b = e.target.closest('[data-setup]');
+    if (!b) return;
+    e.preventDefault();
+    const r = await S.agentsSetup(b.dataset.id, b.dataset.setup).catch((err) => ({ ok: false, error: err.message }));
+    if (r.cancelled) return;
+    if (!r.ok) return toast(r.error || 'Couldn’t start setup', { timeout: 6000 });
+    toast(b.dataset.setup === 'install' ? 'Installing in Terminal — this list updates when it’s done' : 'Finish signing in — this list updates when it’s done', { timeout: 5000 });
+    // Watch for the change for a few minutes.
+    clearInterval(agentPoll);
+    const start = Date.now();
+    agentPoll = setInterval(() => {
+      if (!box.isConnected || Date.now() - start > 5 * 60_000) return clearInterval(agentPoll);
+      drawAgents(root, hasKey, true);
+    }, 4000);
+  };
+}

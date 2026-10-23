@@ -189,6 +189,7 @@ registerSection({
       ${group('Appearance', `
         ${row('Theme', segmented('appearance', [['system', 'System', 'monitor'], ['light', 'Light', 'sun'], ['dark', 'Dark', 'moon']], s.appearance || 'system'))}
         ${row('Sidebar position', segmented('sidebar', [['left', 'Left'], ['right', 'Right']], s.sidebarRight ? 'right' : 'left'))}
+        ${row('Mode', segmented('mode', [['everyday', 'Everyday'], ['creative', 'AI for work'], ['developer', 'Developer']], s.mode || 'developer'), 'Everyday and AI for work hide the developer tools (Workbench, Mission Control). Nothing is removed — switch any time.')}
         ${row('Space colours', button('edit-theme', `${icon('palette', 14)} Edit Space Theme…`), 'Each space has its own colour, gradient and icon.')}
       `)}
       ${group('Browsing', `
@@ -207,6 +208,7 @@ registerSection({
       `)}`;
     onSegment(el, 'appearance', (v) => ctx.set({ appearance: v }));
     onSegment(el, 'sidebar', (v) => ctx.set({ sidebarRight: v === 'right' }));
+    onSegment(el, 'mode', (v) => ctx.set({ mode: v }));
     $('#engine', el).onchange = (e) => ctx.set({ searchEngine: e.target.value });
     $('#archive', el).onchange = (e) => ctx.set({ archiveAfterHours: Number(e.target.value) });
     $('#unload', el).onchange = (e) => ctx.set({ unloadAfterMinutes: Number(e.target.value) });

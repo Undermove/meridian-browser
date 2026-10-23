@@ -687,6 +687,7 @@ function render() {
   applyTheme(sp);
   document.body.classList.toggle('sidebar-hidden', !!state.settings.sidebarHidden && !MINI);
   document.body.classList.toggle('sidebar-right', !!state.settings.sidebarRight);
+  for (const m of ['everyday', 'creative', 'developer']) document.body.classList.toggle('mode-' + m, uiMode() === m);
   if (!MINI) {
     renderTopBar(sp);
     renderFavorites(sp);
@@ -1339,7 +1340,15 @@ function openCommandBar(mode = 'new') {
   const input = $('#cmd-input');
   const tab = activeTab();
   input.value = mode === 'edit' && tab ? tabUrl(tab) : '';
-  input.placeholder = mode === 'split' ? 'Open in split view…' : 'Search, enter URL, or type a command…';
+  input.placeholder = mode === 'split' ? 'Open in split view…' : 'Search, ask a question, enter a URL or a command…';
+  // Which AI would answer "Ask"; when it resolves after the user already typed, relabel the results.
+  if (mode === 'new' && typeof resolveAiProvider === 'function') {
+    resolveAiProvider().then((p) => {
+      const changed = ai.provider?.id !== p.id || ai.provider?.ready !== p.ready;
+      ai.provider = p;
+      if (changed && !$('#cmdbar-overlay').hidden && $('#cmd-answer').hidden && $('#cmd-input').value.trim()) updateCommandResults();
+    }).catch(() => {});
+  }
   $('#cmdbar-overlay').hidden = false;
   input.focus();
   input.select();
@@ -1347,6 +1356,7 @@ function openCommandBar(mode = 'new') {
 }
 
 function closeCommandBar() {
+  if (typeof endInlineAsk === 'function') endInlineAsk();
   $('#cmdbar-overlay').hidden = true;
   const tab = activeTab();
   if (tab) rt.views.get(tab.id)?.focus();
@@ -1359,6 +1369,10 @@ function score(text, q) {
   if (i < 0) return -1;
   return 100 - Math.min(i, 50) + (i === 0 ? 50 : 0);
 }
+
+// Settings → General → Mode (set in the welcome tour). Unset = everything visible, as before modes existed.
+const uiMode = () => state.settings.mode || 'developer';
+const DEV_COMMANDS = /^(workbench-|open-workbench$|open-project$|mission-control$)/;
 
 function updateCommandResults() {
   const raw = $('#cmd-input').value;
@@ -1377,7 +1391,8 @@ function updateCommandResults() {
       const engine = SEARCH_ENGINES[state.settings.searchEngine]?.name || 'Google';
       out.push({ kind: 'search', icon: 'search', title: raw.trim(), sub: `Search ${engine}`, action: () => go(searchUrl(raw.trim())) });
     }
-    if (typeof askClaudeResult === 'function' && mode === 'new' && !EPHEMERAL) { const r = askClaudeResult(raw, !!url); if (r) out.push(r); } // "Ask Claude" (ai-max.js)
+    // "Ask" (ai-max.js): first when the text reads like a question, otherwise after the search row.
+    if (typeof askClaudeResult === 'function' && mode === 'new' && !EPHEMERAL) { const r = askClaudeResult(raw, !!url); if (r) { if (r.first) out.unshift(r); else out.push(r); } }
   }
 
   if (mode !== 'split' && !MINI) {
@@ -1385,6 +1400,7 @@ function updateCommandResults() {
     const cmds = COMMANDS.map((c) => ({ c, s: score(c.label, q) })).filter((x) => q && x.s >= 0).sort((a, b) => b.s - a.s).slice(0, 3);
     for (const { c } of cmds) {
       if (PRIVATE && ['settings', 'import-arc', 'onboarding', 'edit-theme', 'ai-panel', 'ai-summarize', 'open-workbench', 'open-project', 'new-space', 'mission-control', 'ai-tidy'].includes(c.id)) continue;
+      if (uiMode() !== 'developer' && DEV_COMMANDS.test(c.id)) continue;
       out.push({ kind: 'cmd', icon: c.icon, title: c.label, sub: 'Command', keys: c.keys, action: () => runCommand(c.id) });
     }
   }
@@ -1458,7 +1474,7 @@ function go(url) {
 function drawCommandResults() {
   const box = $('#cmd-results');
   box.innerHTML = rt.cmd.results.map((r, i) => `
-    <div class="cmd-row" data-i="${i}">
+    <div class="cmd-row" data-i="${i}" data-kind="${r.kind}">
       <span class="cmd-ic">${r.favicon ? faviconImg(r.favicon, 16) : icon(r.icon, 16)}</span>
       <span class="cmd-title">${esc(r.title)}</span>
       <span class="cmd-sub">${esc(r.sub || '')}</span>
@@ -1481,13 +1497,14 @@ function selectCommandResult(i, { scroll = true } = {}) {
 
 function runResult(i) {
   const r = rt.cmd.results[i];
+  if (r?.keepOpen) return r.action(); // Ask: the answer appears inside the command bar (ai-max.js)
   closeCommandBar();
   if (r) r.action();
 }
 
 function initCommandBar() {
   const input = $('#cmd-input');
-  input.addEventListener('input', updateCommandResults);
+  input.addEventListener('input', () => { if (typeof endInlineAsk === 'function') endInlineAsk(); updateCommandResults(); });
   input.addEventListener('keydown', (e) => {
     if (e.isComposing || e.keyCode === 229) return; // IME candidate window owns these keys
     const n = rt.cmd.results.length;
@@ -1695,7 +1712,8 @@ function applySettingsPatch(patch) {
     api.agentConfig({ access: s.agentAccess || 'off', allowJs: !!s.agentAllowJs });
     renderAgentBar(); refreshAiPanel();
   }
-  if (changed.some((k) => k === 'sidebarRight' || k === 'sidebarHidden')) render();
+  if (changed.some((k) => k === 'sidebarRight' || k === 'sidebarHidden' || k === 'mode')) render();
+  if (changed.includes('aiProvider')) { aiAgents.at = 0; ai.provider = null; if (document.body.classList.contains('ai-open')) refreshAiPanel(); }
   if (changed.includes('archiveAfterHours')) autoArchive();
   save();
 }

@@ -256,6 +256,37 @@ function renderAgentBar() {
 
 const ai = { sessionId: uid(), busy: false, el: null, current: null, includePage: true };
 
+// ---------------------------------------------------------------- which AI answers
+// Settings → AI picks it (state.settings.aiProvider): a local agent on the user's own subscription
+// (Claude Code, Codex, …) or 'api' (Claude API key). Unset = the first agent that's installed and
+// signed in, then the API key. Shared by ⌘J, Ask in the command bar and the Chat view.
+
+const AI_AUTO_ORDER = ['claude', 'codex', 'gemini', 'copilot', 'cursor', 'opencode', 'qwen', 'amp', 'goose', 'droid', 'ollama', 'lmstudio'];
+const aiAgents = { list: null, at: 0, pending: null };
+
+async function listAiAgents(fresh = false) {
+  if (!fresh && aiAgents.list && Date.now() - aiAgents.at < 30_000) return aiAgents.list;
+  aiAgents.pending ||= api.agentsList(fresh).catch(() => []).then((l) => { aiAgents.list = l || []; aiAgents.at = Date.now(); aiAgents.pending = null; return aiAgents.list; });
+  return aiAgents.pending;
+}
+
+const agentReady = (a) => !!a && a.installed && a.loggedIn !== false;
+
+// → { id, label, ready, reason }
+async function resolveAiProvider() {
+  const [agents, hasKey] = await Promise.all([listAiAgents(), api.aiHasKey().catch(() => false)]);
+  const chosen = state.settings.aiProvider;
+  const api_ = { id: 'api', label: 'Claude', ready: hasKey, reason: hasKey ? null : 'Add a Claude API key in Settings → AI.' };
+  if (chosen === 'api') return api_;
+  if (chosen) {
+    const a = agents.find((x) => x.id === chosen);
+    if (a) return { id: a.id, label: a.label, ready: agentReady(a), reason: !a.installed ? `${a.label} isn’t installed.` : a.loggedIn === false ? `${a.label} isn’t signed in.` : null };
+  }
+  for (const id of AI_AUTO_ORDER) { const a = agents.find((x) => x.id === id); if (agentReady(a)) return { id: a.id, label: a.label, ready: true, reason: null }; }
+  if (hasKey) return api_;
+  return { id: null, label: 'AI', ready: false, reason: 'Connect an AI in Settings → AI: Claude Code, Codex, Gemini and others work with the subscription you already have.' };
+}
+
 function toggleAiPanel(force) {
   const open = force ?? !document.body.classList.contains('ai-open');
   document.body.classList.toggle('ai-open', open);
@@ -264,12 +295,18 @@ function toggleAiPanel(force) {
 }
 
 async function refreshAiPanel() {
-  const hasKey = await api.aiHasKey();
-  $('#ai-nokey').hidden = hasKey;
-  $('#ai-compose').hidden = !hasKey;
+  const p = await resolveAiProvider();
+  ai.provider = p;
+  $('#ai-nokey').hidden = p.ready;
+  $('#ai-nokey-text').textContent = p.reason || '';
+  $('#ai-compose').hidden = !p.ready;
+  $('#ai-title-text').textContent = `Ask ${p.label}`;
+  $('#ai-input').placeholder = p.id === 'api' ? 'Ask about this page or tell Claude what to do…' : `Ask ${p.label} about this page…`;
+  // Browser tools only with the Claude API path; local agents answer as text.
+  $('#ai-tools-label').hidden = p.id !== 'api';
   const access = state.settings.agentAccess || 'off';
   const tools = $('#ai-tools');
-  tools.disabled = access === 'off';
+  tools.disabled = access === 'off' || p.id !== 'api';
   tools.checked = access !== 'off' && state.settings.aiUseTools === true;
   $('#ai-tools-label').title = access === 'off' ? 'Turn on agent access in Settings → AI' : `Agent access: ${AGENT_ACCESS.find((x) => x[0] === access)[1]}`;
   const t = activeTab();
@@ -309,8 +346,9 @@ async function sendAi(text, { allowTools = true } = {}) {
   addMsg('user', esc(text));
   ai.current = { el: addMsg('assistant', '<span class="ai-typing"></span>'), text: '' };
   const page = await pageForAi();
-  const useTools = allowTools && !$('#ai-tools').disabled && $('#ai-tools').checked;
-  api.aiChat({ sessionId: ai.sessionId, text, page, useTools });
+  const provider = ai.provider?.id || 'api';
+  const useTools = provider === 'api' && allowTools && !$('#ai-tools').disabled && $('#ai-tools').checked;
+  api.aiChat({ sessionId: ai.sessionId, text, page, useTools, provider });
 }
 
 // Workbench Pro integration: secrets typed into chat end up with the model and in the transcript.
@@ -407,15 +445,15 @@ function initAiPanel() {
   panel.id = 'ai-panel';
   panel.innerHTML = `
     <div class="ai-head">
-      <span class="ai-title">${icon('bolt', 14)} Ask Claude</span>
+      <span class="ai-title">${icon('bolt', 14)} <span id="ai-title-text">Ask Claude</span></span>
       <div class="grow"></div>
       <button class="icon-btn small" id="ai-new" title="New chat">${icon('plus', 14)}</button>
       <button class="icon-btn small" id="ai-close" title="Close (⌘J)">${icon('x', 14)}</button>
     </div>
     <div id="ai-messages"></div>
     <div id="ai-nokey" hidden>
-      <p>Add your Anthropic API key to chat with Claude about pages and let it work in your browser.</p>
-      <button class="btn accent" id="ai-open-settings">Open AI settings</button>
+      <p id="ai-nokey-text"></p>
+      <button class="btn accent" id="ai-open-settings">Connect an AI…</button>
     </div>
     <div id="ai-compose">
       <div class="ai-chips">
@@ -424,7 +462,7 @@ function initAiPanel() {
         <button class="ai-chip" data-q="Explain this page simply, like I'm new to the topic.">Explain</button>
       </div>
       <div class="ai-input-wrap">
-        <textarea id="ai-input" rows="2" placeholder="Ask about this page or tell Claude what to do…"></textarea>
+        <textarea id="ai-input" rows="2" placeholder="Ask about this page…"></textarea>
         <div class="ai-input-row">
           <button class="ai-ctx" id="ai-page-chip" title="Include the current page as context"></button>
           <label class="ai-ctx-tools" id="ai-tools-label"><input type="checkbox" id="ai-tools"> use browser</label>
@@ -460,5 +498,7 @@ function initAiPanel() {
 function initAi() {
   initAgentRpc();
   initAiPanel();
+  // Warm up: finding agents asks each CLI whether it's signed in, which takes a moment.
+  if (!EPHEMERAL) setTimeout(() => resolveAiProvider().then((p) => { ai.provider ||= p; }).catch(() => {}), 1200);
   api.agentConfig({ access: state.settings.agentAccess || 'off', allowJs: !!state.settings.agentAllowJs });
 }

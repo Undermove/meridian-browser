@@ -25,8 +25,17 @@ function userShell() {
 
 let pathPromise = null;
 
+// Tests (dev builds only): MERIDIAN_TEST_PATH replaces the login-shell PATH and environment, so fake
+// agent CLIs are found and the developer's real ones aren't.
+const testPath = () => {
+  if (!process.env.MERIDIAN_TEST_PATH) return null;
+  try { if (require('electron').app?.isPackaged) return null; } catch {}
+  return process.env.MERIDIAN_TEST_PATH;
+};
+
 // PATH as the user's interactive login shell sees it. Falls back to our own PATH plus common dirs.
 function loginPath() {
+  if (testPath()) return Promise.resolve(testPath());
   if (pathPromise) return pathPromise;
   const fallback = () => {
     const extra = IS_WIN ? [] : ['/opt/homebrew/bin', '/usr/local/bin', path.join(os.homedir(), '.local', 'bin'), '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
@@ -51,6 +60,7 @@ let envPromise = null;
 // GUI-launched app doesn't inherit. Only plain identifiers; our own and session-specific ones are skipped.
 const SKIP_LOGIN_VARS = /^(PWD|OLDPWD|SHLVL|_|TERM|TERM_PROGRAM.*|COLORTERM|PS\d|PROMPT.*|RPROMPT|ZSH.*|P9K.*|POWERLEVEL.*|SSH_AUTH_SOCK|DISPLAY|ELECTRON_.*|MERIDIAN_.*|npm_.*|NODE_OPTIONS|TMPDIR|__CF.*|XPC_.*|LaunchInstanceID|SECURITYSESSIONID)$/;
 function loginEnv() {
+  if (testPath()) return Promise.resolve({});
   if (envPromise) return envPromise;
   if (IS_WIN) return (envPromise = Promise.resolve({}));
   envPromise = new Promise((resolve) => {
