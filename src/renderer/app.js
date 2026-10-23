@@ -1107,6 +1107,7 @@ function renderMiniBar() {
 function initSidebar() {
   $$('[data-cmd]').forEach((b) => { if (b.dataset.cmd && !b.innerHTML.trim()) b.innerHTML = icon({ 'toggle-sidebar': 'sidebar', back: 'back', forward: 'forward', reload: 'reload', 'copy-url': 'copy' }[b.dataset.cmd] || 'plus'); });
   $('#btn-downloads').innerHTML = icon('download');
+  $('#update-row .ic').innerHTML = icon('sparkles', 14);
   $('#btn-workbench').innerHTML = icon('code'); // Workbench: always one click away
   $('#btn-workbench').title = `Workbench (${keys('⇧⌘E')})`;
   $('#btn-chat').innerHTML = icon('chat');
@@ -1691,10 +1692,7 @@ function confirmBox(message, okLabel = 'OK') {
   });
 }
 
-function hideToast(el) { clearTimeout(el._t); el.classList.remove('show'); setTimeout(() => el.remove(), 300); }
-
-// `onClose` adds a × button: the toast stays until it's clicked (or the action handles it).
-function toast(text, { action, onClick, onClose, timeout = 2600, id } = {}) {
+function toast(text, { action, onClick, timeout = 2600, id } = {}) {
   let el = id && document.getElementById('toast-' + id);
   if (!el) {
     el = document.createElement('div');
@@ -1703,30 +1701,29 @@ function toast(text, { action, onClick, onClose, timeout = 2600, id } = {}) {
     $('#toasts').appendChild(el);
     requestAnimationFrame(() => el.classList.add('show'));
   }
-  el.innerHTML = `<span>${esc(text)}</span>${action ? `<button class="toast-action">${esc(action)}</button>` : ''}${onClose ? `<button class="toast-close" title="Close">${icon('x', 12)}</button>` : ''}`;
-  el.onclick = (e) => {
-    if (onClose && e.target.closest('.toast-close')) { hideToast(el); onClose(); }
-    else onClick?.(e);
-  };
+  el.innerHTML = `<span>${esc(text)}</span>${action ? `<button class="toast-action">${esc(action)}</button>` : ''}`;
+  if (onClick) el.onclick = onClick;
   clearTimeout(el._t);
-  if (timeout) el._t = setTimeout(() => hideToast(el), timeout);
+  if (timeout) el._t = setTimeout(() => { el.classList.remove('show'); setTimeout(() => el.remove(), 300); }, timeout);
   return el;
 }
 
 // ---------------------------------------------------------------- updates
 
-// The main process checks GitHub for a newer release (src/updates.js). On macOS "Update" runs the
-// installer, which restarts Meridian; elsewhere "Download" fetches the installer in a tab.
+// Like Arc: when the main process finds a newer release (src/updates.js), a row shows at the bottom of
+// the sidebar. Clicking it on macOS updates and restarts Meridian; elsewhere it downloads the installer.
 function showUpdate(info) {
-  if (!info || rt.updateDismissed === info.version) return;
-  const el = toast(`Meridian ${info.version} is available`, {
-    id: 'update', timeout: 0, action: info.inApp ? 'Update' : 'Download',
-    onClose: () => { rt.updateDismissed = info.version; },
-    onClick: async () => {
-      if (!info.inApp) { hideToast(el); rt.updateDismissed = info.version; return openTab(info.url); }
-      if (await api.updateInstall()) toast('Updating… Meridian will close and open again', { id: 'update', timeout: 0 });
-    },
-  });
+  if (!info) return;
+  const row = $('#update-row');
+  row.hidden = false;
+  row.title = info.inApp ? `Update to ${info.version} and restart` : `Download Meridian ${info.version}`;
+  row.onclick = async () => {
+    if (!info.inApp) return openTab(info.url);
+    if (row.dataset.busy) return;
+    row.dataset.busy = '1';
+    setText($('span', row), 'Updating…');
+    if (!(await api.updateInstall())) { delete row.dataset.busy; setText($('span', row), 'New Meridian version available'); toast('Could not start the update'); }
+  };
 }
 
 // ---------------------------------------------------------------- downloads

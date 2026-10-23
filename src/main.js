@@ -903,15 +903,7 @@ function setupUpdates() {
 }
 
 handleMain('update:latest', () => updates?.latest || null);
-handleMain('update:install', async () => {
-  if (!updates?.latest?.inApp) return false;
-  const { response } = await dialog.showMessageBox(mainWindow, {
-    type: 'question', buttons: ['Update and Restart', 'Later'], defaultId: 0, cancelId: 1,
-    message: `Update Meridian to ${updates.latest.version}?`,
-    detail: 'Meridian will close, install the new version and open again. Your tabs come back.',
-  });
-  return response === 0 && updates.install();
-});
+handleMain('update:install', () => !!updates?.latest?.inApp && updates.install());
 
 function mcpScript() {
   return app.isPackaged

@@ -232,6 +232,15 @@ test.describe('Air Traffic Control', () => {
 test.describe('onboarding', () => {
   test.use({ seed: async ({}, use) => { const s = S.seedState(); s.onboarded = false; use(s); } });
 
+  test('Windows/Linux: Skip stays clear of the native window buttons in the top-right corner', async ({ meridian }) => {
+    const { page } = meridian;
+    await expect(page.locator('#onboarding .ob-skip')).toBeVisible();
+    // The overlay (titleBarOverlay) is ~140px of minimize/maximize/close; plat-other is what Windows and Linux get.
+    await page.evaluate(() => { document.body.classList.remove('plat-mac'); document.body.classList.add('plat-other'); });
+    const { right, width } = await page.evaluate(() => ({ right: document.querySelector('#onboarding .ob-skip').getBoundingClientRect().right, width: innerWidth }));
+    expect(width - right).toBeGreaterThanOrEqual(140);
+  });
+
   test('a fresh profile gets the tour (no Arc → a local suggestion, then links); no AI in it; saves onboarded', async ({ meridian }) => {
     const { page } = meridian;
     await expect(page.locator('#onboarding')).toBeVisible();
