@@ -335,6 +335,7 @@ function activate(id, { focus = true } = {}) {
   rt.lastSeen.set(id, now());
   rt.mru = [id, ...rt.mru.filter((x) => x !== id)].slice(0, 50);
   if (l.parent?.collapsed) l.parent.collapsed = false;
+  if (focus && typeof closeChat === 'function') closeChat({ focus: false }); // picking a tab returns from the Chat view
   const wv = ensureView(l.node, sp);
   render();
   if (focus && $('#cmdbar-overlay').hidden) setTimeout(() => wv.focus(), 0);
@@ -693,6 +694,7 @@ function render() {
     renderFavorites(sp);
     renderSpacePages(sp);
     renderSpaceDots();
+    if (typeof renderChatButton === 'function') renderChatButton(); // chat.js
   } else {
     renderMiniBar();
   }
@@ -1082,6 +1084,7 @@ function renderMiniBar() {
 function initSidebar() {
   $$('[data-cmd]').forEach((b) => { if (b.dataset.cmd && !b.innerHTML.trim()) b.innerHTML = icon({ 'toggle-sidebar': 'sidebar', back: 'back', forward: 'forward', reload: 'reload', 'copy-url': 'copy' }[b.dataset.cmd] || 'plus'); });
   $('#btn-downloads').innerHTML = icon('download');
+  $('#btn-chat').innerHTML = icon('chat');
   $('#btn-add-space').innerHTML = icon('plus');
   $$('[data-icon]').forEach((el) => { el.innerHTML = icon(el.dataset.icon, 15); });
   if (EPHEMERAL) $$('.empty-act[data-cmd="ai-panel"], .empty-act[data-cmd="archive"]').forEach((el) => el.remove());
@@ -1321,6 +1324,7 @@ const COMMANDS = [
   { id: 'devtools', label: 'Developer Tools', icon: 'code', keys: '⌥⌘I' },
   { id: 'ai-panel', label: 'Ask AI about This Page', icon: 'sparkles', keys: '⌘J' },
   { id: 'ai-summarize', label: 'Summarize Page with AI', icon: 'sparkles' },
+  { id: 'open-chat', label: 'Open Chat', icon: 'chat', keys: '⌥⌘J' }, // Chat view (chat.js)
   // Mission Control + AI features (handled in mission.js / ai-max.js)
   { id: 'mission-control', label: 'Mission Control (agents)', icon: 'grid', keys: '⇧⌘M' },
   { id: 'ai-tidy', label: 'Tidy Today Tabs with AI', icon: 'wand' },
@@ -1870,6 +1874,7 @@ function runCommand(name, ...args) {
     case 'devtools': { if (wv) api.openDevTools(wv.getWebContentsId()); return; }
     case 'open-url-tab': return openTab(args[0]);
     case 'ai-panel': return EPHEMERAL ? null : toggleAiPanel();
+    case 'open-chat': return MINI ? null : toggleChat(); // chat.js; private windows chat without saving
     case 'open-workbench': return EPHEMERAL ? null : openWorkbench(); // Workbench integration
     case 'open-project': return EPHEMERAL ? null : openWorkbench({ pickProject: true });
     case 'workbench-new-hub': case 'workbench-customize': case 'workbench-secrets': case 'workbench-safe-mode': return EPHEMERAL ? null : workbenchCommand(name); // Workbench Pro integration
@@ -1982,6 +1987,7 @@ async function boot() {
       if (!$('#modal-overlay').hidden) { if (rt.modalDismiss) rt.modalDismiss(); else $('#modal-overlay').hidden = true; return; }
       if (rt.peek) return closePeek();
       if (!$('#findbar').hidden) return closeFind();
+      if (typeof chatUi !== 'undefined' && chatUi.open) return closeChat(); // Chat view (chat.js)
     }
   });
 

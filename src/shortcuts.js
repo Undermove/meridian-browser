@@ -35,6 +35,7 @@ function shortcutTable(isMac = IS_MAC, overrides = {}) {
     { id: 'find-prev', label: 'Find Previous', group: G.find, accel: 'CmdOrCtrl+Shift+G', cmd: ['find-prev'], repeat: true },
     { id: 'toggle-sidebar', label: 'Toggle Sidebar', group: G.view, accel: 'CmdOrCtrl+S', cmd: ['toggle-sidebar'] },
     { id: 'ai-panel', label: 'Ask AI', group: G.view, accel: 'CmdOrCtrl+J', cmd: ['ai-panel'] },
+    { id: 'open-chat', label: 'Chat', group: G.view, accel: 'CmdOrCtrl+Alt+J', cmd: ['open-chat'] },
     { id: 'open-workbench', label: 'Workbench', group: G.view, accel: 'CmdOrCtrl+Shift+E', cmd: ['open-workbench'] },
     { id: 'mission-control', label: 'Mission Control', group: G.view, accel: 'CmdOrCtrl+Shift+M', cmd: ['mission-control'] },
     { id: 'downloads', label: 'Downloads', group: G.view, accel: 'CmdOrCtrl+Shift+J', cmd: ['downloads'] },

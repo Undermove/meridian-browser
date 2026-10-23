@@ -86,7 +86,7 @@ class Assistant {
 
   // A turn with a local agent. Agents that can resume get only the new message; the others get the
   // conversation so far, so switching agents mid-chat keeps the context.
-  async localChat(sender, { sessionId, text, page, provider, mode = 'chat' }) {
+  async localChat(sender, { sessionId, text, page, provider, mode = 'chat', history = null }) {
     const runId = typeof sessionId === 'string' ? sessionId : '';
     const send = (type, data = {}) => {
       if (type === 'done' || type === 'error') { try { this.observer?.assistantRunEnd(runId, { error: type === 'error' ? data.message : null, stopped: !!data.stopped }); } catch {} }
@@ -96,6 +96,7 @@ class Assistant {
     let session = this.sessions.get(sessionId);
     if (!session) { session = { messages: [], history: [], resume: {} }; this.sessions.set(sessionId, session); }
     session.history ||= []; session.resume ||= {};
+    seedHistory(session, history);
     try { this.observer?.assistantRunStart(runId, { host: page?.url ? safeHost(page.url) : null }); } catch {}
 
     let prompt = '';
@@ -126,7 +127,7 @@ class Assistant {
     });
   }
 
-  async apiChat(sender, { sessionId, text, page, useTools }) {
+  async apiChat(sender, { sessionId, text, page, useTools, history = null }) {
     // Mission Control sees the run start and end (no prompt or answer text).
     const runId = typeof sessionId === 'string' ? sessionId : '';
     const send = (type, data = {}) => {
@@ -134,8 +135,12 @@ class Assistant {
       if (!sender.isDestroyed()) sender.send('ai:event', { sessionId, type, ...data });
     };
     let session = this.sessions.get(sessionId);
-    if (!session) { session = { messages: [] }; this.sessions.set(sessionId, session); }
+    if (!session) { session = { messages: [], history: [], resume: {} }; this.sessions.set(sessionId, session); }
+    session.history ||= []; session.resume ||= {};
     session.abort = new AbortController();
+    seedHistory(session, history);
+    // Earlier turns this conversation had with a local agent (or before a restart) become plain messages.
+    if (!session.messages.length && session.history.length) session.messages = historyToMessages(session.history);
 
     try { this.observer?.assistantRunStart(runId, { host: page?.url ? safeHost(page.url) : null }); } catch {}
     let client;
@@ -153,6 +158,7 @@ class Assistant {
     // Undo only our own prompt when nothing answered it yet; tool results must stay paired with their tool_use.
     const dropUnansweredPrompt = () => { if (session.messages.length - 1 === promptIndex) session.messages.pop(); };
 
+    let answer = '';
     const tools = useTools
       ? this.hub.availableTools().map(({ name, description, input_schema }) => ({ name, description, input_schema, eager_input_streaming: true }))
       : [];
@@ -169,7 +175,7 @@ class Assistant {
           messages: session.messages,
           ...(tools.length ? { tools } : {}),
         }, { signal: session.abort.signal });
-        stream.on('text', (delta) => send('text', { delta }));
+        stream.on('text', (delta) => { answer += delta; send('text', { delta }); });
         const msg = await stream.finalMessage();
         session.messages.push({ role: 'assistant', content: msg.content }); // append-only history
 
@@ -196,6 +202,8 @@ class Assistant {
         if (session.abort.signal.aborted) return send('done', { stopped: true });
         send('step');
       }
+      // The text-only record local agents get when the user switches to one mid-chat.
+      session.history.push({ role: 'user', text: String(text || '') }, { role: 'assistant', text: answer });
       send('done');
     } catch (err) {
       dropUnansweredPrompt();
@@ -203,6 +211,28 @@ class Assistant {
       send('error', { message: describeError(err) });
     }
   }
+}
+
+// A reopened Chat view conversation: main forgot it (restart), so the renderer sends the earlier turns.
+// Only used while this session has nothing of its own yet.
+function seedHistory(session, history) {
+  if (!Array.isArray(history) || !history.length || session.history.length || session.messages.length) return;
+  session.history = history.filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.text === 'string' && m.text)
+    .map((m) => ({ role: m.role, text: m.text }));
+}
+
+// Text turns -> Messages API history: starts with the user, roles alternate (neighbours merged), ends with the assistant
+// (the new prompt is appended after it).
+function historyToMessages(history) {
+  const out = [];
+  for (const m of history) {
+    if (!out.length && m.role !== 'user') continue;
+    const last = out[out.length - 1];
+    if (last && last.role === m.role) last.content[0].text += `\n\n${m.text}`;
+    else out.push({ role: m.role, content: [{ type: 'text', text: m.text }] });
+  }
+  if (out.length && out[out.length - 1].role === 'user') out.pop();
+  return out;
 }
 
 function toApiBlock(b) {
