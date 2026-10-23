@@ -1,9 +1,10 @@
 /* Meridian — welcome tour (full window, in the spirit of a new Mac's first launch).
  *
- * hello → Your AI → Make it yours → Here's your Meridian → All set.
- * Almost no reading: the person connects the AI they already use, allows a quick look at their apps
- * (and Arc), and their AI proposes a setup — mode, spaces, favorites, colour — that they tick and apply.
- * Without an AI, simple rules propose the same kind of setup (src/ai/setup-profile.js, in main).
+ * Meridian replaces Arc first, so the tour is about moving in — no AI here (that's offered days later,
+ * once the person has settled in: maybeOfferAi in app.js).
+ *   Arc found:    hello → Bring everything from Arc → Use Meridian for links → All set
+ *   no Arc:       hello → Make it yours (a setup from the apps on this computer, worked out locally)
+ *                 → Here's your Meridian → Use Meridian for links → All set
  * Re-runnable from Help → Welcome Tour and Settings → General. Completion is saved as state.onboarded.
  * Loaded after app.js / panels.js / ai.js and shares their globals.
  */
@@ -13,17 +14,19 @@ const ob = { el: null, step: 0, steps: [], agentsPromise: null, arc: null, arcLo
 const HELLOS = ['hello', 'привет', 'hola', 'bonjour', 'hallo', 'ciao', 'olá', 'გამარჯობა', 'merhaba', 'hej', 'こんにちは', '你好'];
 const AGENT_COLORS = { claude: '#d97757', codex: '#10a37f', gemini: '#4285f4', copilot: '#8957e5', cursor: '#1c1c1c', opencode: '#4b5563', qwen: '#615ced', amp: '#f34e3f', goose: '#222', droid: '#ff6b00', ollama: '#333', lmstudio: '#4f46e5' };
 
-function obSteps() { return ['hello', 'ai', 'tailor', 'preview', 'done']; }
+function obSteps() {
+  return ['hello', ...(ob.arc && !ob.fresh ? ['arc'] : ['tailor', 'preview']), ...(ob.isDefault ? [] : ['default']), 'done'];
+}
 
 async function startOnboarding() {
   if (EPHEMERAL || ob.el) return;
   closePanels?.();
   Object.assign(ob, { step: 0, proposal: null, picks: null, applying: false });
-  // Finding agents asks each CLI whether it's signed in (a few seconds the first time): start now, on hello.
-  ob.agentsPromise = api.agentsList(true).catch(() => []);
   ob.arc = await api.arcPreview().catch(() => null);
   if (ob.arc?.error || !ob.arc?.spaces) ob.arc = null;
   ob.arcLogins = !!(ob.arc && await api.arcLoginsAvailable().catch(() => false));
+  ob.isDefault = await api.isDefaultBrowser().catch(() => false);
+  ob.fresh = false; ob.withLogins = true; ob.imported = null;
   ob.steps = obSteps();
   const el = document.createElement('div');
   el.id = 'onboarding';
@@ -48,6 +51,7 @@ async function startOnboarding() {
 
 function finishOnboarding() {
   state.onboarded = true;
+  state.onboardedAt ||= Date.now();
   if (!state.settings.mode) state.settings.mode = 'everyday';
   save();
   const el = ob.el;
@@ -144,82 +148,41 @@ const OB_STEPS = {
     },
   },
 
-  // ------------------------------------------------------------ connect the AI they already use
-  ai: {
-    async html() {
-      const [agents, hasKey] = await Promise.all([ob.agentsPromise || api.agentsList(true).catch(() => []), api.aiHasKey().catch(() => false)]);
-      ob.agentsPromise = null; // a revisit (after signing in) checks again
-      ob.agents = agents; ob.hasKey = hasKey;
-      const p = pickAiProvider(agents, hasKey);
-      ob.provider = p.ready ? p.id : null;
-      if (p.ready) {
-        const main = p.id === 'api' ? { id: 'api', label: 'Claude' } : agents.find((a) => a.id === p.id);
-        const others = agents.filter((a) => agentReady(a) && a.id !== main.id);
-        return `
-          <h2>Your AI is here</h2>
-          <div class="ob-ai-hero">
-            ${agentMark(main)}
-            <div class="ob-ai-name"><b>${esc(p.id === 'api' ? 'Claude' : main.label)}</b><span class="ob-ready">${icon('check', 14)} Ready</span></div>
-          </div>
-          ${others.length ? `<div class="ob-ai-others">${others.map((a) => `<button class="ob-chip ob-ai-alt" data-use="${a.id}">${agentMark(a, 'small')} ${esc(a.label)}</button>`).join('')}</div>` : ''}
-          <p class="ob-whisper">Meridian uses it to answer, explain and set things up for you.</p>`;
-      }
-      // Options that are fine to use from an app: a Claude API key, GitHub Copilot, a free local model.
-      const card = (a) => !a ? '' : `
-          <div class="ob-ai-card">
-            ${agentMark(a)}
-            <b>${esc(a.label)}</b>
-            <span>${esc(a.id === 'ollama' ? 'Free, on this computer' : a.vendor)}</span>
-            ${a.installed && a.loggedIn == null ? `<button class="ob-btn small primary" data-check="${a.id}">Check</button>`
-              : a.installed ? `<button class="ob-btn small primary" data-setup="login" data-id="${a.id}">Sign in</button>`
-              : a.install?.cmd ? `<button class="ob-btn small" data-setup="install" data-id="${a.id}">Get it</button>` : `<span class="ob-tag">needs ${esc(a.install?.missing || 'setup')}</span>`}
-          </div>`;
+  // ------------------------------------------------------------ moving in from Arc
+  arc: {
+    html: () => {
+      const a = ob.arc;
+      const n = (x, one, many) => `${x.toLocaleString()} ${x === 1 ? one : many}`;
       return `
-        <h2>Bring your AI</h2>
-        <p class="ob-whisper top">Pick one — you can change it any time in Settings.</p>
-        <div class="ob-ai-grid">
-          ${card(agents.find((a) => a.id === 'ollama'))}
-          ${card(agents.find((a) => a.id === 'copilot'))}
+        <h2>Bring everything from Arc</h2>
+        <p class="ob-whisper top">Your spaces, pinned tabs and favorites move over as they are. Arc stays untouched.</p>
+        <div class="ob-arc-move">
+          <div class="ob-arc-stats"><b>${n(a.spaces, 'space', 'spaces')}</b><b>${n(a.pinned + a.today, 'tab', 'tabs')}</b><b>${n(a.favorites, 'favorite', 'favorites')}</b></div>
+          <div class="ob-arc-spaces">${a.names.map((sp) => `<span class="ob-space" style="--c:${esc(sp.color)}">${sp.icon ? `<em>${esc(sp.icon)}</em>` : '<i></i>'}${esc(sp.name)}</span>`).join('')}</div>
+          ${ob.arcLogins ? `<button class="ob-opt ${ob.withLogins ? 'on' : ''}" data-opt="logins"><span class="ob-opt-ic">${icon('lock', 16)}</span><span><b>Stay signed in to your sites</b><em>So you don’t have to log in everywhere again</em></span><span class="ob-tick">${icon('check', 13)}</span></button>` : ''}
         </div>
-        <button class="ob-link ob-key-toggle" id="ob-key-toggle">I have a Claude API key</button>
-        <div class="ob-key-row" hidden>
-          <input class="ob-key-input" id="ob-key" type="password" placeholder="sk-ant-…" autocomplete="off" spellcheck="false">
-          <button class="ob-btn small primary" id="ob-key-save">Use it</button>
-        </div>`;
+        <button class="ob-link" data-ob-fresh>Start fresh instead</button>`;
     },
-    cta: () => (ob.provider ? 'Continue' : 'Later'),
+    cta: () => 'Bring everything',
     bind(page) {
-      $('#ob-key-toggle', page)?.addEventListener('click', (e) => { e.currentTarget.hidden = true; $('.ob-key-row', page).hidden = false; $('#ob-key', page).focus(); });
-      $('#ob-key-save', page)?.addEventListener('click', async () => {
-        const v = $('#ob-key', page).value.trim();
-        if (!/^sk-ant-/.test(v)) return toast('That doesn’t look like an Anthropic API key (sk-ant-…)');
-        try { await api.aiSetKey(v); applySettingsPatch({ aiProvider: 'api' }); showObStep(ob.step, 0); } catch (err) { toast('Couldn’t save the key: ' + err.message); }
+      page.addEventListener('click', (e) => {
+        const o = e.target.closest('[data-opt="logins"]');
+        if (o) { ob.withLogins = !ob.withLogins; o.classList.toggle('on', ob.withLogins); return; }
+        if (e.target.closest('[data-ob-fresh]')) { ob.fresh = true; ob.steps = obSteps(); showObStep(ob.step, 1); }
       });
-      page.addEventListener('click', async (e) => {
-        const chk = e.target.closest('[data-check]');
-        if (chk) {
-          chk.disabled = true; chk.textContent = 'Checking…';
-          const r = await api.agentsCheck(chk.dataset.check).catch((err) => ({ ok: false, error: err.message }));
-          if (r.ok) { applySettingsPatch({ aiProvider: chk.dataset.check }); return showObStep(ob.step, 0); }
-          chk.disabled = false; chk.textContent = 'Check';
-          return toast(r.error || 'It didn’t answer.', { timeout: 7000 });
+    },
+    async next() {
+      if (ob.applying) return;
+      ob.applying = true;
+      setObNext('Moving in…', { disabled: true });
+      try {
+        ob.imported = await importArc({ quiet: true });
+        if (ob.imported && ob.withLogins && ob.arcLogins) {
+          const l = await api.importArcLogins().catch(() => null);
+          if (l?.ok && l.total) toast(`You’re still signed in to your sites (${l.total.toLocaleString()} logins brought over)`, { timeout: 5000 });
         }
-        const alt = e.target.closest('[data-use]');
-        if (alt) { applySettingsPatch({ aiProvider: alt.dataset.use }); return showObStep(ob.step, 0); }
-        const b = e.target.closest('[data-setup]');
-        if (!b) return;
-        const r = await api.agentsSetup(b.dataset.id, b.dataset.setup).catch((err) => ({ ok: false, error: err.message }));
-        if (r.cancelled) return;
-        if (!r.ok) return toast(r.error || 'Couldn’t start setup', { timeout: 6000 });
-        b.disabled = true; b.textContent = b.dataset.setup === 'install' ? 'Installing…' : 'Signing in…';
-        const before = JSON.stringify(ob.agents.map((a) => [a.id, a.installed, a.loggedIn]));
-        const start = Date.now();
-        ob.poll = setInterval(async () => {
-          if (!ob.el || ob.steps[ob.step] !== 'ai' || Date.now() - start > 5 * 60_000) return clearInterval(ob.poll);
-          const now = await api.agentsList(true).catch(() => []);
-          if (JSON.stringify(now.map((a) => [a.id, a.installed, a.loggedIn])) !== before) { clearInterval(ob.poll); aiAgents.at = 0; showObStep(ob.step, 0); }
-        }, 3000);
-      });
+      } finally { ob.applying = false; }
+      if (ob.el) showObStep(ob.step + 1, 1);
     },
   },
 
@@ -229,45 +192,39 @@ const OB_STEPS = {
       <h2>Let’s make it yours</h2>
       <div class="ob-tailor">
         <div class="ob-consent">
-          <button class="ob-pill on" data-c="apps">${icon('grid', 15)} Look at my apps</button>
-          ${ob.arc ? `<button class="ob-pill on" data-c="arc">${icon('download', 15)} Look at my Arc</button>` : ''}
+          <button class="ob-pill on" data-c="apps">${icon('grid', 15)} Look at the apps I use</button>
         </div>
-        <input class="ob-about" id="ob-about" maxlength="200" placeholder="Anything about you? e.g. “product designer at a startup” (optional)" spellcheck="false">
         <div class="ob-think" hidden><div class="ob-orb"><i></i><i></i><i></i></div><ul class="ob-lines"></ul></div>
       </div>
-      <p class="ob-whisper">${ob.provider ? `Only app names and space names go to ${esc(ob.provider === 'api' ? 'Claude' : (ob.agents.find((a) => a.id === ob.provider)?.label || 'your AI'))}. Nothing is changed until you say so.` : 'Nothing leaves your computer. Nothing is changed until you say so.'}</p>`,
-    cta: () => `${icon('sparkles', 16)} Make it mine`,
+      <p class="ob-whisper">Meridian suggests spaces and favorites that fit you. This happens on your computer — nothing is sent anywhere, and nothing changes until you say so.</p>`,
+    cta: () => `${icon('sparkles', 16)} Suggest a setup`,
     bind(page) {
       $('.ob-consent', page).onclick = (e) => { const b = e.target.closest('.ob-pill'); if (b) b.classList.toggle('on'); };
-      $('#ob-about', page).addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); obNext(); } });
     },
     async next() {
       const page = $('.ob-step-tailor', ob.el);
       if (!page || page.dataset.busy) return;
       page.dataset.busy = '1';
-      const useApps = !!$('[data-c="apps"].on', page), useArc = !!$('[data-c="arc"].on', page);
-      const about = $('#ob-about', page).value.trim();
-      $('.ob-consent', page).hidden = true; $('#ob-about', page).hidden = true;
-      const think = $('.ob-think', page);
-      think.hidden = false;
-      setObNext('Thinking…', { disabled: true });
+      const useApps = !!$('[data-c="apps"].on', page);
+      $('.ob-consent', page).hidden = true;
+      $('.ob-think', page).hidden = false;
+      setObNext('One moment…', { disabled: true });
       const lines = $('.ob-lines', page);
       const line = (text) => { const li = document.createElement('li'); li.textContent = text; lines.appendChild(li); li.animate([{ opacity: 0, transform: 'translateY(6px)' }, { opacity: 1, transform: 'none' }], { duration: 360, easing: 'ease-out' }); };
       if (useApps) line('Looking at your apps…');
-      if (useArc) setTimeout(() => line('Reading your Arc spaces…'), 500);
-      if (about) setTimeout(() => line('Reading what you told me…'), 900);
-      const minDelay = new Promise((r) => setTimeout(r, 1800));
-      const proposal = await api.setupPropose({ provider: ob.provider, useApps, useArc, about }).catch(() => null);
+      const minDelay = new Promise((r) => setTimeout(r, 1500));
+      // No AI here: simple rules on this computer (src/ai/setup-profile.js).
+      const proposal = await api.setupPropose({ provider: null, useApps, useArc: false }).catch(() => null);
       await minDelay;
       if (!ob.el || ob.steps[ob.step] !== 'tailor') return;
-      if (!proposal) { delete page.dataset.busy; toast('Couldn’t make a proposal. Try again or skip.'); return showObStep(ob.step, 0); }
+      if (!proposal) { delete page.dataset.busy; toast('Something went wrong. Try again or skip.'); return showObStep(ob.step, 0); }
       if (proposal.seen?.apps?.length) line(`Found ${proposal.seen.apps.slice(0, 4).join(', ')}${proposal.seen.apps.length > 4 ? '…' : ''}`);
-      await new Promise((r) => setTimeout(r, 700));
+      await new Promise((r) => setTimeout(r, 600));
       line(proposal.title);
       lines.lastChild?.classList.add('final');
       ob.proposal = proposal;
-      ob.picks = { spaces: proposal.spaces.map(() => true), favorites: proposal.favorites.map(() => true), arc: !!ob.arc && useArc, logins: ob.arcLogins, agents: false };
-      await new Promise((r) => setTimeout(r, 1100));
+      ob.picks = { spaces: proposal.spaces.map(() => true), favorites: proposal.favorites.map(() => true), agents: false };
+      await new Promise((r) => setTimeout(r, 1000));
       if (ob.el && ob.steps[ob.step] === 'tailor') showObStep(ob.step + 1, 1);
     },
   },
@@ -277,7 +234,7 @@ const OB_STEPS = {
     html: () => {
       const p = ob.proposal || { title: 'Your Meridian', spaces: [{ name: 'Personal', icon: '🏠', color: space().color }], favorites: [], mode: 'everyday', color: space().color, source: 'rules' };
       ob.proposal = p;
-      ob.picks ||= { spaces: p.spaces.map(() => true), favorites: p.favorites.map(() => true), arc: !!ob.arc, logins: ob.arcLogins, agents: false };
+      ob.picks ||= { spaces: p.spaces.map(() => true), favorites: p.favorites.map(() => true), agents: false };
       const k = ob.picks;
       const modeLabel = { developer: 'Developer tools', creative: 'AI chat', everyday: 'Everyday' }[p.mode];
       const sp0 = p.spaces[0] || {};
@@ -288,14 +245,13 @@ const OB_STEPS = {
             <div class="ob-pv-side">
               <div class="ob-pv-url"></div>
               <div class="ob-pv-favs">${p.favorites.map((f, i) => `<button class="ob-pv-fav ${k.favorites[i] ? '' : 'off'}" data-fav="${i}" title="${esc(f.title)}">${tile(f.title, FAV_COLORS[f.title] || p.color)}</button>`).join('')}</div>
-              <div class="ob-pv-spaces ${k.arc ? 'dim' : ''}">${p.spaces.map((s, i) => `<button class="ob-pv-space ${k.spaces[i] ? '' : 'off'}" data-space="${i}" style="--c:${esc(s.color)}"><em>${esc(s.icon)}</em>${esc(s.name)}</button>`).join('')}</div>
+              <div class="ob-pv-spaces">${p.spaces.map((s, i) => `<button class="ob-pv-space ${k.spaces[i] ? '' : 'off'}" data-space="${i}" style="--c:${esc(s.color)}"><em>${esc(s.icon)}</em>${esc(s.name)}</button>`).join('')}</div>
               <div class="ob-pv-rows"><i></i><i></i><i class="s"></i></div>
             </div>
             <div class="ob-pv-page"><div class="ob-pv-chip">${icon(p.mode === 'developer' ? 'code' : p.mode === 'creative' ? 'sparkles' : 'globe', 14)} ${esc(modeLabel)}</div><i class="w60"></i><i></i><i class="w80"></i></div>
           </div>
           <div class="ob-pv-opts">
-            ${ob.arc ? `<button class="ob-opt ${k.arc ? 'on' : ''}" data-opt="arc"><span class="ob-opt-ic">${icon('download', 16)}</span><span><b>Bring my Arc</b><em>${ob.arc.spaces} spaces${ob.arcLogins ? ', and logins' : ''}</em></span><span class="ob-tick">${icon('check', 13)}</span></button>` : ''}
-            ${p.mode === 'developer' ? `<button class="ob-opt ${k.agents ? 'on' : ''}" data-opt="agents"><span class="ob-opt-ic">${icon('terminal', 16)}</span><span><b>Let coding agents use the browser</b><em>They ask before every action</em></span><span class="ob-tick">${icon('check', 13)}</span></button>` : ''}
+            ${p.mode === 'developer' ? `<button class="ob-opt ${k.agents ? 'on' : ''}" data-opt="agents"><span class="ob-opt-ic">${icon('terminal', 16)}</span><span><b>Let coding agents use the browser</b><em>For developers. They ask before every action.</em></span><span class="ob-tick">${icon('check', 13)}</span></button>` : ''}
           </div>
         </div>
         <p class="ob-whisper">Tap anything to leave it out.</p>`;
@@ -307,7 +263,7 @@ const OB_STEPS = {
         const f = e.target.closest('[data-fav]'); if (f) { const i = +f.dataset.fav; k.favorites[i] = !k.favorites[i]; f.classList.toggle('off', !k.favorites[i]); return; }
         const s = e.target.closest('[data-space]'); if (s) { const i = +s.dataset.space; k.spaces[i] = !k.spaces[i]; s.classList.toggle('off', !k.spaces[i]); return; }
         const o = e.target.closest('[data-opt]');
-        if (o) { k[o.dataset.opt] = !k[o.dataset.opt]; o.classList.toggle('on', k[o.dataset.opt]); if (o.dataset.opt === 'arc') $('.ob-pv-spaces', page).classList.toggle('dim', k.arc); }
+        if (o) { k[o.dataset.opt] = !k[o.dataset.opt]; o.classList.toggle('on', k[o.dataset.opt]); }
       });
     },
     async next() {
@@ -319,21 +275,36 @@ const OB_STEPS = {
     },
   },
 
+  // ------------------------------------------------------------ links from other apps
+  default: {
+    html: () => `
+      <div class="ob-hero">
+        <div class="ob-mark">${icon('link', 46)}</div>
+        <h2>Open your links in Meridian?</h2>
+        <p class="ob-whisper">Links from Mail, Slack, Notion and other apps will open here instead of your old browser. You can change this any time.</p>
+        <button class="ob-btn primary big ob-default-btn" id="ob-default">${icon('check', 16)} Yes, use Meridian</button>
+      </div>`,
+    cta: () => 'Not now',
+    bind(page) {
+      $('#ob-default', page).addEventListener('click', async (e) => {
+        e.currentTarget.disabled = true;
+        const r = await setDefaultBrowser();
+        if (r?.cancelled) { e.currentTarget.disabled = false; return; }
+        if (ob.el) showObStep(ob.step + 1, 1);
+      });
+    },
+  },
+
   // ------------------------------------------------------------ done
   done: {
-    html: async () => {
-      const isDefault = await api.isDefaultBrowser().catch(() => false);
-      return `
+    html: () => `
         <div class="ob-hero">
           <div class="ob-mark done">${icon('check', 54)}</div>
           <h1>You’re all set</h1>
-          <p class="ob-whisper">Press <kbd>⌘</kbd><kbd>T</kbd> to open anything — or just ask it a question.</p>
-          ${isDefault ? '' : `<button class="ob-btn soft ob-default-btn" id="ob-default">${icon('globe', 15)} Make Meridian my default browser</button>`}
-        </div>`;
-    },
+          <p class="ob-whisper">Press <kbd>⌘</kbd><kbd>T</kbd> to open a new tab or find anything you had open.</p>
+        </div>`,
     cta: () => 'Start browsing',
     bind(page) {
-      $('#ob-default', page)?.addEventListener('click', async (e) => { e.currentTarget.disabled = true; await setDefaultBrowser(); e.currentTarget.innerHTML = `${icon('check', 15)} Asked macOS`; });
       $('.ob-mark', page).animate([{ transform: 'scale(0.4)', opacity: 0 }, { transform: 'scale(1.08)', opacity: 1, offset: 0.7 }, { transform: 'scale(1)' }], { duration: 700, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)' });
     },
   },
@@ -344,16 +315,9 @@ async function applyProposal() {
   const p = ob.proposal, k = ob.picks;
   if (!p) return;
   const patch = { mode: p.mode };
-  if (ob.provider && !state.settings.aiProvider) patch.aiProvider = ob.provider;
   if (k.agents) patch.agentAccess = 'ask';
   applySettingsPatch(patch);
-  if (k.arc && ob.arc) {
-    const r = await importArc({ quiet: true });
-    if (r && k.logins && ob.arcLogins) {
-      const l = await api.importArcLogins().catch(() => null);
-      if (l?.ok && l.total) toast(`Brought over ${l.total.toLocaleString()} logins from Arc`, { timeout: 5000 });
-    }
-  } else {
+  {
     const chosen = p.spaces.filter((_, i) => k.spaces[i]);
     const pristine = state.spaces.length === 1 && !state.spaces[0].pinned.length && !state.spaces[0].today.length;
     if (chosen.length) {

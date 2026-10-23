@@ -155,9 +155,10 @@ test.describe('in the app', () => {
       expect(r.total).toBe(6);
 
       const dialogs = (await e2eLog(m.app)).dialogs;
-      expect(dialogs[0].message).toMatch(/Arc logins/);
-      expect(dialogs[0].detail).toMatch(/Arc Safe Storage/);
-      expect(dialogs[0].detail).toMatch(/Nothing leaves this computer/);
+      // A plain-language heads-up before macOS's own permission window.
+      expect(dialogs[0].message).toBe('Your Mac will ask for permission');
+      expect(dialogs[0].detail).toMatch(/Always Allow/);
+      expect(dialogs[0].detail).toMatch(/Nothing leaves your computer/);
       expect(dialogs.at(-1).message).toBe('Imported 6 logins into 2 profiles.');
       expect(dialogs.at(-1).detail).toMatch(/signed in here too/);
 
@@ -222,20 +223,34 @@ test.describe('in the app', () => {
     } finally { await closeMeridian(m.app); }
   });
 
-  test('onboarding: "Bring my Arc" imports the sidebar and the logins in one go', async ({ userDataDir }) => {
+  test('onboarding: "Bring everything from Arc" brings the spaces and keeps you signed in', async ({ userDataDir }) => {
     const m = await launchMeridian({ userDataDir, state: seedState(), env: { MERIDIAN_ARC_DIR: arcRoot, MERIDIAN_ARC_SAFE_STORAGE: PASSWORD } });
     try {
       await setDialogResponse(m.app, 1);
       await m.page.evaluate(() => startOnboarding());
       await m.page.waitForFunction(() => ob.el && ob.arcLogins);
-      await m.page.evaluate(() => showObStep(ob.steps.indexOf('preview')));
-      const opt = m.page.locator('[data-opt="arc"]');
-      await expect(opt).toHaveClass(/\bon\b/);
-      await expect(opt).toContainText('and logins');
+      expect(await m.page.evaluate(() => ob.steps)).toEqual(['hello', 'arc', 'default', 'done']);
+      await m.page.evaluate(() => showObStep(ob.steps.indexOf('arc')));
+      await expect(m.page.locator('.ob-step-arc h2')).toHaveText('Bring everything from Arc');
+      await expect(m.page.locator('[data-opt="logins"]')).toHaveClass(/\bon\b/);
       await m.page.locator('#onboarding [data-ob="next"]').click();
-      await expect(m.page.locator('.ob-step-done')).toBeVisible({ timeout: 15_000 });
+      await expect(m.page.locator('.ob-step-default')).toBeVisible({ timeout: 15_000 });
       expect(await m.page.evaluate(() => state.spaces.map((s) => [s.name, s.profileId]))).toEqual([['Home', 'default'], ['Work', 'arc-profile-3']]);
       expect((await cookiesIn(m.app, 'persist:profile-arc-profile-3')).map((x) => x.value)).toEqual(['work-session']);
+      // The plain-language heads-up came before macOS's own window.
+      expect((await e2eLog(m.app)).dialogs.map((d) => d.message)).toContain('Your Mac will ask for permission');
+    } finally { await closeMeridian(m.app); }
+  });
+
+  test('onboarding: "Start fresh instead" skips the import', async ({ userDataDir }) => {
+    const m = await launchMeridian({ userDataDir, state: seedState(), env: { MERIDIAN_ARC_DIR: arcRoot } });
+    try {
+      await m.page.evaluate(() => startOnboarding());
+      await m.page.waitForFunction(() => ob.el && ob.steps.includes('arc'));
+      await m.page.evaluate(() => showObStep(ob.steps.indexOf('arc')));
+      await m.page.locator('[data-ob-fresh]').click();
+      await expect(m.page.locator('.ob-step-tailor')).toBeVisible();
+      expect(await m.page.evaluate(() => ob.steps)).toEqual(['hello', 'tailor', 'preview', 'default', 'done']);
     } finally { await closeMeridian(m.app); }
   });
 

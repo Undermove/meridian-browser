@@ -465,7 +465,7 @@ class Workbench {
     if (fs.existsSync(marker)) return;
     try { fs.writeFileSync(marker, '{"shown":true}', { mode: 0o600 }); } catch {}
     const w = this.getMainWindow?.();
-    if (w && !w.isDestroyed()) w.webContents.send('command', 'notice', 'When an agent needs you, Meridian will send a notification. macOS will ask once whether to allow notifications — click Allow.');
+    if (w && !w.isDestroyed()) w.webContents.send('command', 'notice', 'When an agent needs you, Meridian will let you know with a notification. Your Mac will ask once whether that’s OK — click Allow.');
   }
 
   agentSearchPath(base) {

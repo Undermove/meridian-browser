@@ -1813,6 +1813,24 @@ function mergeArcSpace(target, from) {
   for (const t of from.today || []) if (!urls.has(t.url)) { target.today.push(t); urls.add(t.url); }
 }
 
+// AI isn't part of moving in. Once the person has used Meridian for a couple of days, offer it once, gently.
+const AI_OFFER_AFTER_MS = 2 * 24 * 3600 * 1000;
+function maybeOfferAi() {
+  if (EPHEMERAL || !state?.onboarded || state.aiOfferShown || document.body.classList.contains('onboarding')) return;
+  if (!state.onboardedAt) { state.onboardedAt = Date.now(); save(); return; }
+  if (Date.now() - state.onboardedAt < AI_OFFER_AFTER_MS) return;
+  state.aiOfferShown = true; save();
+  showModal(`
+    <div class="ai-offer">
+      <div class="ai-offer-ic">${icon('sparkles', 26)}</div>
+      <h3>Meridian can also answer your questions</h3>
+      <p class="muted">Type a question where you open new tabs (<kbd>⌘</kbd><kbd>T</kbd>) and get the answer right there — or ask about the page you’re reading. To use it, connect an AI. It takes a minute.</p>
+      <div class="modal-actions"><button class="btn" data-a="later">Not now</button><button class="btn accent" data-a="show">Show me</button></div>
+    </div>`, (m, close) => {
+    m.addEventListener('click', (e) => { const a = e.target.closest('[data-a]')?.dataset.a; if (!a) return; close(); if (a === 'show') openSettings('ai'); });
+  });
+}
+
 // Profiles the Arc logins import wrote cookies into (main process, src/importers/arc-cookies.js):
 // make sure each exists here, named like the sidebar import names them.
 function addArcProfiles(list) {
@@ -2039,6 +2057,7 @@ async function boot() {
   setInterval(unloadIdleTabs, 60 * 1000);
   sendSnapshot();
   if (!state.onboarded && !PRIVATE) startOnboarding();
+  else if (!PRIVATE) setTimeout(maybeOfferAi, 4000);
 }
 
 // ai.js loads after this file; start once every script is in.

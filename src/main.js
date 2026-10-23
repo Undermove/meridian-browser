@@ -872,8 +872,8 @@ async function agentSetup(win, id, action) {
     type: 'question', buttons: ['Cancel', action === 'install' ? 'Open Terminal and Install' : 'Open Terminal and Sign In'], defaultId: 1, cancelId: 0,
     message: `${verb} ${p.label}?`,
     detail: action === 'install'
-      ? `A Terminal window will open and install ${p.label} with its official installer:\n\n${cmd}\n\nThat’s normal: it’s how ${p.label} is installed. Your Mac may ask for your password. When it says it’s done, come back — Meridian notices by itself.`
-      : `A Terminal window will open so you can sign in to ${p.label}:\n\n${cmd}\n\nYour browser may open a sign-in page — that’s ${p.vendor}’s own page. When you’re signed in, come back — Meridian notices by itself.`,
+      ? `A window with text (Terminal) will open and install ${p.label} by itself — you don’t need to type anything. Your Mac may ask for your password.\n\nWhen it says it’s done, come back here: Meridian notices on its own.\n\n(It runs: ${cmd})`
+      : `A window with text (Terminal) will open to connect ${p.label}. A ${p.vendor} page may open in your browser so you can sign in.\n\nWhen you’re done, come back here: Meridian notices on its own.\n\n(It runs: ${cmd})`,
   };
   const { response } = win && !win.isDestroyed() ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts);
   if (response !== 1) return { ok: false, cancelled: true };
@@ -1043,10 +1043,9 @@ async function importArcLogins(parent) {
   try {
     const { response } = await box({
       type: 'question', buttons: ['Cancel', 'Continue'], defaultId: 1, cancelId: 0,
-      message: 'Bring your Arc logins to Meridian?',
-      detail: 'Meridian will ask macOS for access to “Arc Safe Storage” to copy your Arc logins (cookies) to Meridian. '
-        + 'You’ll see a system dialog next: click Allow (or Always Allow) and enter your Mac password if asked.\n\n'
-        + 'Nothing leaves this computer, and Arc isn’t changed. Saved passwords aren’t copied.',
+      message: 'Your Mac will ask for permission',
+      detail: 'To keep you signed in to your sites, Meridian copies Arc’s sign-ins. Your Mac will ask once whether Meridian may read them: click “Always Allow” (and type your Mac password if asked).\n\n'
+        + 'Nothing leaves your computer, and Arc stays as it is. Saved passwords aren’t copied.',
     });
     if (response !== 1) return { ok: false, cancelled: true };
 
@@ -1089,7 +1088,7 @@ handleMain('import:arc-logins', () => importArcLogins(mainWindow));
 async function setDefaultBrowserAsked(win) {
   if (!app.isPackaged) return { ok: false, packaged: false };
   if (IS_MAC) {
-    const opts = { type: 'info', buttons: ['Cancel', 'Continue'], defaultId: 1, cancelId: 0, message: 'Make Meridian your default browser?', detail: 'macOS will show its own window to confirm. Choose “Use “Meridian”” there.\n\nLinks from Mail, Slack and other apps will then open in Meridian. You can switch back any time in System Settings → Desktop & Dock.' };
+    const opts = { type: 'info', buttons: ['Cancel', 'Continue'], defaultId: 1, cancelId: 0, message: 'Your Mac will ask you to confirm', detail: 'In the window that appears next, choose “Use “Meridian””.\n\nYou can switch back any time in System Settings.' };
     const { response } = win && !win.isDestroyed() ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts);
     if (response !== 1) return { ok: false, cancelled: true, packaged: true };
   }
@@ -1690,8 +1689,8 @@ async function warnBeforeKeychain() {
   if (!item.ok || !/Signature=adhoc/.test(sig.text)) return;
   await dialog.showMessageBox({
     type: 'info', buttons: ['Continue'], defaultId: 0,
-    message: 'macOS will ask about “Meridian Safe Storage”',
-    detail: 'That’s the key that keeps your logins and saved data encrypted on this Mac. Meridian was updated, so macOS checks once more that it’s really Meridian asking.\n\nClick “Always Allow” and it won’t ask again until the next update.',
+    message: 'Your Mac will ask for permission',
+    detail: 'Meridian keeps your saved logins locked on this Mac. Because Meridian was just updated, your Mac asks once whether Meridian may open them.\n\nIn the window that appears next, click “Always Allow”.',
   });
 }
 

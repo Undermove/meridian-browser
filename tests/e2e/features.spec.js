@@ -232,38 +232,49 @@ test.describe('Air Traffic Control', () => {
 test.describe('onboarding', () => {
   test.use({ seed: async ({}, use) => { const s = S.seedState(); s.onboarded = false; use(s); } });
 
-  test('a fresh profile gets the tour; going through it (no AI → simple rules) sets things up and saves onboarded', async ({ meridian }) => {
+  test('a fresh profile gets the tour (no Arc → a local suggestion, then links); no AI in it; saves onboarded', async ({ meridian }) => {
     const { page } = meridian;
     await expect(page.locator('#onboarding')).toBeVisible();
     await expect(page.locator('body')).toHaveClass(/onboarding/);
     await expect(page.locator('#onboarding .ob-hello-word')).toBeVisible();
-    await expect(page.locator('#onboarding .ob-dot')).toHaveCount(5);
+    expect(await page.evaluate(() => ob.steps)).toEqual(['hello', 'tailor', 'preview', 'default', 'done']);
     const next = page.locator('#onboarding [data-ob="next"]');
     await next.click();
-    // No agent on the test PATH and no key: "Bring your AI", continue with "Later".
-    await expect(page.locator('.ob-step-ai h2')).toHaveText('Bring your AI');
-    await expect(next).toHaveText('Later');
-    await next.click();
     await expect(page.locator('.ob-step-tailor h2')).toBeVisible();
+    await expect(page.locator('.ob-step-tailor')).toContainText('nothing is sent anywhere');
     await next.click();
     await expect(page.locator('.ob-step-preview h2')).toHaveText('Here’s your Meridian', { timeout: 20_000 });
     const proposal = await page.evaluate(() => ob.proposal);
     expect(proposal.source).toBe('rules');
-    // Leave the first favorite out.
-    await page.locator('.ob-pv-fav').first().click();
+    await page.locator('.ob-pv-fav').first().click(); // leave the first favorite out
+    await next.click();
+    await expect(page.locator('.ob-step-default h2')).toHaveText('Open your links in Meridian?');
+    await expect(next).toHaveText('Not now');
     await next.click();
     await expect(page.locator('.ob-step-done h1')).toHaveText('You’re all set');
-    await expect(next).toHaveText('Start browsing');
     await next.click();
     await expect(page.locator('#onboarding')).toHaveCount(0);
-    const st = await page.evaluate(() => ({ onboarded: state.onboarded, mode: state.settings.mode, favs: state.favorites.default.map((t) => t.url), name: state.spaces[0].name }));
+    const st = await page.evaluate(() => ({ onboarded: state.onboarded, at: state.onboardedAt, mode: state.settings.mode, favs: state.favorites.default.map((t) => t.url), name: state.spaces[0].name }));
     expect(st.onboarded).toBe(true);
+    expect(st.at).toBeGreaterThan(0);
     expect(st.mode).toBe(proposal.mode);
     expect(st.favs).toEqual(proposal.favorites.slice(1).map((f) => f.url));
     expect(st.name).toBe(proposal.spaces[0].name);
     const { page: p2 } = await meridian.relaunch();
     await p2.waitForTimeout(500);
     await expect(p2.locator('#onboarding')).toHaveCount(0);
+  });
+
+  test('AI is offered once, a couple of days after moving in — not during the tour', async ({ meridian }) => {
+    const { page } = meridian;
+    await page.locator('#onboarding [data-ob="skip"]').click();
+    await page.evaluate(() => maybeOfferAi());
+    await expect(page.locator('.ai-offer')).toHaveCount(0); // just moved in
+    await page.evaluate(() => { state.onboardedAt = Date.now() - 3 * 24 * 3600 * 1000; maybeOfferAi(); });
+    await expect(page.locator('.ai-offer h3')).toHaveText('Meridian can also answer your questions');
+    await page.locator('.ai-offer [data-a="later"]').click();
+    await page.evaluate(() => maybeOfferAi());
+    await expect(page.locator('.ai-offer')).toHaveCount(0); // only once
   });
 
   test('the tour can be skipped, and comes back from Help → Welcome Tour', async ({ meridian }) => {

@@ -134,7 +134,7 @@ async function drawAgents(root, hasKey, fresh = false) {
       `<span class="agent-mark" style="--c:${AGENT_MARK[a.id] || '#888'}">${esc(a.label[0])}</span>`, !a.installed) + `<div class="row-control">${action(a)}</div></label>`),
     radio('api', `Claude API key ${hasKey ? '<span class="tag ok-tag">Ready</span>' : '<span class="tag">No key</span>'}`, 'Pay-as-you-go with your Anthropic API key (below): a question in ⌘T costs a fraction of a cent. The only option that can also act in the browser.',
       `<span class="agent-mark" style="--c:#d97757">${icon('sparkles', 13)}</span>`, !hasKey) + '</label>',
-    `<div class="row optin-head"><div class="row-text"><div class="row-label">Other agents</div><div class="row-desc">Codex, Cursor, OpenCode, Qwen Code, Amp, Goose, Droid. They run with your own account in that app, under that provider’s terms — check that they allow use from other apps.</div></div><div class="row-control">${toggle('ai-optin', optIn)}</div></div>`,
+    `<div class="row optin-head"><div class="row-text"><div class="row-label">Other agents</div><div class="row-desc">GitHub Copilot, Codex, Cursor, OpenCode, Qwen Code, Amp, Goose, Droid. They use your own account in that app and follow that company’s rules.</div></div><div class="row-control">${toggle('ai-optin', optIn)}</div></div>`,
     ...(optIn ? others.map((a) => radio(a.id, `${esc(a.label)} ${status(a)}`, `${esc(a.vendor)} · ${esc(a.plan)}${a.account ? ` · ${esc(a.account)}` : ''}`,
       `<span class="agent-mark" style="--c:${AGENT_MARK[a.id] || '#888'}">${esc(a.label[0])}</span>`, !a.installed) + `<div class="row-control">${action(a)}</div></label>`) : []),
   ].join('');

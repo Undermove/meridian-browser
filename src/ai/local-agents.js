@@ -1,10 +1,10 @@
 // Local AI agents as chat providers for Ask (⌘T), the ⌘J panel, Chat and the welcome tour.
 //
 // Only where the provider's terms allow it (checked October 2026):
-//  - policy 'default': fine for an app to use on the user's own account — GitHub Copilot (its official SDK
-//    drives the signed-in CLI the same way), and local model servers (Ollama, LM Studio).
-//  - policy 'optin': no explicit rule either way; shown only after the user turns on "Other agents" in
-//    Settings → AI, labelled as running under their own account and that provider's terms.
+//  - policy 'default': local model servers (Ollama, LM Studio).
+//  - policy 'optin': shown only after the user turns on "Other agents" in Settings → AI, labelled as running
+//    under their own account and that provider's terms. GitHub Copilot is allowed by its terms (its official
+//    SDK drives the signed-in CLI the same way) but is often blocked by organizations, so it waits here too.
 // Claude Code and Gemini CLI aren't here on purpose: Anthropic and Google don't allow third-party apps to
 // run their features on a consumer subscription login. Claude works through an API key (the 'api'
 // provider in assistant.js); both CLIs remain available in the Workbench terminal, where the user runs them.
@@ -60,7 +60,7 @@ const PROVIDERS = {
   },
 
   copilot: {
-    label: 'GitHub Copilot', vendor: 'GitHub', bin: 'copilot', stream: true, resume: false, policy: 'default',
+    label: 'GitHub Copilot', vendor: 'GitHub', bin: 'copilot', stream: true, resume: false, policy: 'optin',
     plan: 'a GitHub Copilot plan (your organization must allow Copilot CLI)',
     install: { mac: [{ cmd: 'brew install copilot-cli', needs: 'brew' }, { cmd: 'npm install -g @github/copilot', needs: 'npm' }], linux: [{ cmd: 'npm install -g @github/copilot', needs: 'npm' }], win: [{ cmd: 'npm install -g @github/copilot', needs: 'npm' }] },
     login: 'copilot',
