@@ -1767,16 +1767,48 @@ async function importArc({ quiet = false } = {}) {
     const existing = new Set((state.favorites[pid] || []).map((t) => t.url));
     state.favorites[pid] = [...(state.favorites[pid] || []), ...list.filter((t) => !existing.has(t.url))];
   }
-  for (const sp of data.spaces) state.spaces.push({ ...sp, activeTabId: null, split: null });
-  state.activeSpaceId = state.spaces[0].id;
+  // Importing again merges: a space already brought from Arc (same arcId) gets only the tabs and folders
+  // it doesn't have yet; names, colours and anything the user changed stay as they are.
+  let added = 0, merged = 0;
+  for (const sp of data.spaces) {
+    const existing = sp.arcId && state.spaces.find((x) => x.arcId === sp.arcId);
+    if (!existing) { state.spaces.push({ ...sp, activeTabId: null, split: null }); added++; continue; }
+    mergeArcSpace(existing, sp);
+    merged++;
+  }
+  if (!state.spaces.some((x) => x.id === state.activeSpaceId)) state.activeSpaceId = state.spaces[0].id;
   render(); save();
   const tabs = data.spaces.reduce((a, s) => { let c = s.today.length; walk(s.pinned, (n) => { if (n.type === 'tab') c++; }); return a + c; }, 0);
+  if (merged && !added) {
+    if (!quiet) toast('Your Arc spaces were already here — added only what was new.', { timeout: 5000 });
+    return { spaces: 0, merged, tabs };
+  }
   if (!quiet) {
     const logins = await api.arcLoginsAvailable().catch(() => false);
-    if (logins) toast(`Imported ${data.spaces.length} spaces and ${tabs} tabs from Arc.`, { action: 'Import logins too', onClick: () => api.importArcLogins().catch(() => null), timeout: 9000 });
-    else toast(`Imported ${data.spaces.length} spaces and ${tabs} tabs from Arc.`, { timeout: 6000 });
+    if (logins) toast(`Imported ${added} ${added === 1 ? 'space' : 'spaces'} from Arc${merged ? `, updated ${merged}` : ''}.`, { action: 'Import logins too', onClick: () => api.importArcLogins().catch(() => null), timeout: 9000 });
+    else toast(`Imported ${added} ${added === 1 ? 'space' : 'spaces'} from Arc${merged ? `, updated ${merged}` : ''}.`, { timeout: 6000 });
   }
-  return { spaces: data.spaces.length, tabs };
+  return { spaces: added, merged, tabs };
+}
+
+function mergeArcSpace(target, from) {
+  const urls = new Set();
+  walk(target.pinned, (n) => { if (n.type === 'tab') urls.add(n.url); });
+  target.today.forEach((t) => urls.add(t.url));
+  const mergeList = (into, list) => {
+    for (const n of list) {
+      if (n.type === 'tab') { if (!urls.has(n.url)) { into.push(n); urls.add(n.url); } continue; }
+      const same = into.find((x) => x.type === 'folder' && x.title === n.title);
+      if (same) mergeList(same.children, n.children || []);
+      else {
+        const fresh = { ...n, children: [] };
+        mergeList(fresh.children, n.children || []);
+        if (fresh.children.length) into.push(fresh);
+      }
+    }
+  };
+  mergeList(target.pinned, from.pinned || []);
+  for (const t of from.today || []) if (!urls.has(t.url)) { target.today.push(t); urls.add(t.url); }
 }
 
 // Profiles the Arc logins import wrote cookies into (main process, src/importers/arc-cookies.js):

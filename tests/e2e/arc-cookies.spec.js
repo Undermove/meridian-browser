@@ -239,6 +239,31 @@ test.describe('in the app', () => {
     } finally { await closeMeridian(m.app); }
   });
 
+  test('importing from Arc again merges instead of duplicating spaces', async ({ userDataDir }) => {
+    const m = await launchMeridian({ userDataDir, state: seedState(), env: { MERIDIAN_ARC_DIR: arcRoot } });
+    try {
+      const spaces = () => m.page.evaluate(() => state.spaces.map((s) => ({ name: s.name, arcId: s.arcId || null, pinned: s.pinned.map((n) => n.url || n.title) })));
+      await m.page.evaluate(() => importArc({ quiet: true }));
+      expect((await spaces()).map((s) => s.name)).toEqual(['Home', 'Work']);
+      // The user renames a space; Arc gets a new pinned tab in Home.
+      await m.page.evaluate(() => { state.spaces[0].name = 'My Home'; save(); });
+      const sb = sidebar();
+      const items = sb.sidebar.containers[1].items;
+      items[1] = { childrenIds: ['t1'] };
+      items.push('t1', { title: 'Docs', data: { tab: { savedURL: 'https://docs.example/' } } });
+      fs.writeFileSync(path.join(arcRoot, 'StorableSidebar.json'), JSON.stringify(sb));
+      await m.page.evaluate(() => importArc({ quiet: true }));
+      let now = await spaces();
+      expect(now.map((s) => s.name)).toEqual(['My Home', 'Work']);
+      expect(now[0].pinned).toEqual(['https://docs.example/']);
+      // A third time changes nothing.
+      await m.page.evaluate(() => importArc({ quiet: true }));
+      now = await spaces();
+      expect(now).toHaveLength(2);
+      expect(now[0].pinned).toEqual(['https://docs.example/']);
+    } finally { await closeMeridian(m.app); }
+  });
+
   test('Settings → General has the "Import logins from Arc" row (macOS)', async ({ userDataDir }) => {
     test.skip(process.platform !== 'darwin', 'macOS only');
     const m = await launchMeridian({ userDataDir, state: seedState(), env: { MERIDIAN_ARC_DIR: arcRoot, MERIDIAN_ARC_SAFE_STORAGE: PASSWORD } });

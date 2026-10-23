@@ -18,7 +18,7 @@ function obSteps() { return ['hello', 'ai', 'tailor', 'preview', 'done']; }
 async function startOnboarding() {
   if (EPHEMERAL || ob.el) return;
   closePanels?.();
-  Object.assign(ob, { step: 0, proposal: null, picks: null });
+  Object.assign(ob, { step: 0, proposal: null, picks: null, applying: false });
   // Finding agents asks each CLI whether it's signed in (a few seconds the first time): start now, on hello.
   ob.agentsPromise = api.agentsList(true).catch(() => []);
   ob.arc = await api.arcPreview().catch(() => null);
@@ -290,8 +290,10 @@ const OB_STEPS = {
       });
     },
     async next() {
+      if (ob.applying) return; // a second click or Enter while applying would import Arc twice
+      ob.applying = true;
       setObNext('Setting up…', { disabled: true });
-      await applyProposal();
+      try { await applyProposal(); } finally { ob.applying = false; }
       if (ob.el) showObStep(ob.step + 1, 1);
     },
   },
