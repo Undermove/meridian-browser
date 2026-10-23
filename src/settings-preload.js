@@ -12,6 +12,8 @@ contextBridge.exposeInMainWorld('meridianSettings', {
   isDefaultBrowser: call('settings:is-default'),
   setDefaultBrowser: call('settings:set-default'),
   arcAvailable: call('settings:arc-available'),
+  arcLoginsAvailable: call('settings:arc-logins-available'),
+  importArcLogins: call('settings:import-arc-logins'),
   pickExtension: call('settings:pick-extension'),
   resetPermissions: call('settings:reset-permissions'),
   clearProfileData: call('settings:clear-profile-data'),

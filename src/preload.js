@@ -23,6 +23,8 @@ contextBridge.exposeInMainWorld('meridian', {
 
   arcAvailable: () => ipcRenderer.invoke('import:arc-available'),
   importArc: () => ipcRenderer.invoke('import:arc'),
+  arcLoginsAvailable: () => ipcRenderer.invoke('import:arc-logins-available'),
+  importArcLogins: () => ipcRenderer.invoke('import:arc-logins'),
 
   setDefaultBrowser: () => ipcRenderer.invoke('default-browser:set'),
   isDefaultBrowser: () => ipcRenderer.invoke('default-browser:is'),

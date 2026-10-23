@@ -6,7 +6,7 @@
  * Loaded after app.js / panels.js and shares their globals.
  */
 
-const ob = { el: null, step: 0, steps: [], tried: new Set(), arc: null, clis: null, imported: null };
+const ob = { el: null, step: 0, steps: [], tried: new Set(), arc: null, clis: null, imported: null, arcLogins: false, withLogins: true, logins: null };
 
 const TOUR = [
   { cmd: 'command-bar', keys: '⌘T', title: 'Open anything', desc: 'The command bar searches your tabs, history and the web, and runs commands.' },
@@ -21,6 +21,8 @@ async function startOnboarding() {
   closePanels?.();
   ob.step = 0; ob.tried = new Set(); ob.imported = null;
   ob.arc = await api.arcPreview().catch(() => null);
+  ob.arcLogins = !!(ob.arc && await api.arcLoginsAvailable().catch(() => false));
+  ob.withLogins = true; ob.logins = null;
   ob.steps = ['welcome', 'theme', ...(ob.arc && !ob.arc.error && ob.arc.spaces ? ['arc'] : []), 'default', 'basics', 'ai', 'done'];
   const el = document.createElement('div');
   el.id = 'onboarding';
@@ -112,6 +114,15 @@ async function showObStep(i, dir = 1) {
   setTimeout(() => next.focus(), 50);
 }
 
+// After the sidebar import: how the logins import went, or a button to (re)try it.
+function loginsStatus() {
+  if (!ob.arcLogins) return '';
+  const l = ob.logins;
+  if (l?.ok && l.total) return `<span class="ob-ok">${icon('check', 18)} ${l.total.toLocaleString('en-US')} ${l.total === 1 ? 'login' : 'logins'}</span>`;
+  if (l?.ok) return `<span class="ob-ok">${icon('check', 18)} No logins to copy</span>`;
+  return `<button class="ob-btn soft big" id="ob-import-logins">${icon('download', 16)} Import logins too</button>`;
+}
+
 const LOGO_SVG = (size) => `<svg width="${size}" height="${size}" viewBox="0 7 64 64" class="ob-logo"><path d="M10 50 A26 26 0 0 1 54 50" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="round"/><circle cx="32" cy="50" r="4.5" fill="currentColor"/></svg>`;
 
 const OB_STEPS = {
@@ -171,16 +182,27 @@ const OB_STEPS = {
         <div class="ob-arc">
           <div class="ob-stats">${stat(a.spaces, a.spaces === 1 ? 'space' : 'spaces')}${stat(a.pinned, 'pinned tabs')}${stat(a.favorites, 'favorites')}${stat(a.today, 'open tabs')}</div>
           <div class="ob-spaces">${a.names.map((s) => `<span class="ob-space" style="--c:${esc(s.color)}">${s.icon ? `<em>${esc(s.icon)}</em>` : '<i></i>'}${esc(s.name)}</span>`).join('')}${a.spaces > a.names.length ? `<span class="ob-space more">+${a.spaces - a.names.length} more</span>` : ''}</div>
-          <div class="ob-arc-act">${ob.imported ? `<span class="ob-ok">${icon('check', 18)} Imported</span>` : `<button class="ob-btn primary big" id="ob-import">${icon('download', 16)} Import from Arc</button>`}</div>
-          <p class="ob-fine">Logins don’t transfer (Arc encrypts them with its own key). You’ll sign in once per profile.</p>
+          <div class="ob-arc-act">${ob.imported ? `<span class="ob-ok">${icon('check', 18)} Imported</span>${loginsStatus()}` : `<button class="ob-btn primary big" id="ob-import">${icon('download', 16)} Import from Arc</button>`}</div>
+          ${ob.arcLogins && !ob.imported ? `<label class="ob-check-row"><input type="checkbox" id="ob-logins" ${ob.withLogins ? 'checked' : ''}> Also bring my logins (recommended)</label>` : ''}
+          <p class="ob-fine">${ob.arcLogins
+            ? 'Logins (cookies) come over too, so you stay signed in to your sites. macOS will ask you to allow access to Arc’s key; nothing leaves this computer. Saved passwords don’t transfer.'
+            : 'Logins come over on macOS only. Here you’ll sign in once per profile. Saved passwords don’t transfer.'}</p>
         </div>`;
     },
     bind(page) {
+      $('#ob-logins', page)?.addEventListener('change', (e) => { ob.withLogins = e.target.checked; });
       $('#ob-import', page)?.addEventListener('click', async (e) => {
         e.currentTarget.disabled = true;
         e.currentTarget.textContent = 'Importing…';
-        ob.imported = await importArc();
-        showObStep(ob.step, 0);
+        ob.imported = await importArc({ quiet: true });
+        if (ob.imported && ob.arcLogins && ob.withLogins) ob.logins = await api.importArcLogins().catch((err) => ({ ok: false, error: err.message }));
+        if (ob.el) showObStep(ob.step, 0);
+      });
+      $('#ob-import-logins', page)?.addEventListener('click', async (e) => {
+        e.currentTarget.disabled = true;
+        e.currentTarget.textContent = 'Waiting for macOS…';
+        ob.logins = await api.importArcLogins().catch((err) => ({ ok: false, error: err.message }));
+        if (ob.el) showObStep(ob.step, 0);
       });
     },
   },

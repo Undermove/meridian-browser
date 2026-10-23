@@ -21,7 +21,7 @@ Arc is being sunset. Meridian keeps the Arc workflow you're used to (spaces, pin
 - **Archive** view (`⌥⌘A`) to browse, search and restore archived tabs; a downloads popover; a space theme editor with gradients and icons.
 - Hide the sidebar (`⌘S`) and reveal it by hovering the window edge. Sidebar can sit on the right.
 - Drag and drop tabs between favorites, pinned, folders and Today.
-- **Import from Arc**: spaces, colours, icons, pinned tabs, folders, favorites and Today tabs, read locally from Arc's sidebar file on macOS and Windows.
+- **Import from Arc**: spaces, colours, icons, pinned tabs, folders, favorites and Today tabs, read locally from Arc's sidebar file on macOS and Windows. On macOS your **logins** come over too: Arc's cookies are copied into the matching Meridian profiles (after you allow access to Arc's key in the macOS keychain prompt), so sites you were signed in to stay signed in. Nothing leaves your computer and Arc isn't changed.
 
 **AI-centric**
 - **Ask Claude** panel (`⌘J`): summarize, ask about the current page, or let Claude act in the browser (open tabs, read pages, click, type).
@@ -140,7 +140,7 @@ Every shortcut can be changed in **Settings → Shortcuts**.
 
 ## Known limitations
 
-- Logins don't transfer from Arc (cookies are encrypted with Arc's keychain key). Sign in once per profile.
+- Arc logins (cookies) transfer on macOS only. Arc for Windows encrypts them in a way third-party apps can't read (App-Bound Encryption), so there you sign in once per profile. Saved passwords never transfer: export them from Arc into a password manager. Partitioned (CHIPS) cookies are skipped, and session cookies last until you quit Meridian.
 - No built-in password manager or sync yet. Use your password manager's desktop app.
 - Chrome extensions are experimental: background and content scripts load, but toolbar popups don't yet.
 - No Boosts, Easels or Notes.
