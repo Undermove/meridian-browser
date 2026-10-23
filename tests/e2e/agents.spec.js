@@ -21,7 +21,9 @@ process.stdin.on('end', () => {
   const question = stdin.split('\\n').filter(Boolean).pop();
   const out = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
   out({ type: 'system', subtype: 'init', session_id: 'sess-1', tools: [], mcp_servers: [] });
-  const answer = (resume ? '[resumed ' + resume + '] ' : '') + 'Answer to: ' + question;
+  const answer = stdin.includes('<signals>')
+    ? JSON.stringify({ persona: 'designer', mode: 'creative', title: 'Product designer', color: '#c471f5', spaces: [{ name: 'Design', icon: '🎨', color: '#c471f5' }, { name: 'Home', icon: '🏠', color: '#43cea2' }], favorites: ['figma', 'evil-site', 'gmail'] })
+    : (resume ? '[resumed ' + resume + '] ' : '') + 'Answer to: ' + question;
   for (const part of answer.match(/.{1,6}/g)) out({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: part } } });
   out({ type: 'result', subtype: 'success', is_error: false, result: answer, session_id: 'sess-1' });
 });
@@ -131,45 +133,44 @@ test('Settings → AI lists the agent as ready; choosing it is saved; signing in
   } finally { await m.cleanup(); }
 });
 
-test('modes: the welcome tour asks how you will use Meridian; everyday mode hides developer tools', async () => {
-  const m = await launch({ state: { ...seedState(), onboarded: false } });
+test('modes: everyday hides developer tools; developer brings them back', async () => {
+  const m = await launch({ state: seedState({ settings: { mode: 'everyday' } }) });
   try {
     const { page } = m;
-    await expect(page.locator('#onboarding')).toBeVisible({ timeout: 15_000 });
-    await page.locator('[data-ob="next"]').click();
-    await expect(page.locator('.ob-step-mode h2')).toHaveText('How will you use Meridian?');
-    await page.locator('[data-mode="everyday"]').click();
-    await expect.poll(() => page.evaluate(() => state.settings.mode)).toBe('everyday');
-    await expect(page.locator('.ob-step-theme')).toBeVisible();
-    // Everyday mode has no developer step in the tour.
-    expect(await page.evaluate(() => ob.steps)).not.toContain('devtools');
-    expect(await page.evaluate(() => ob.steps)).toContain('ai');
-    await page.locator('[data-ob="skip"]').click();
     await expect(page.locator('body')).toHaveClass(/mode-everyday/);
     await page.evaluate(() => openCommandBar());
     await page.locator('#cmd-input').fill('workbench');
     await expect(page.locator('#cmd-results')).not.toContainText('Open Workbench');
-    // Developer mode brings them back and adds the agent-access step.
     await page.evaluate(() => { closeCommandBar(); applySettingsPatch({ mode: 'developer' }); });
     await page.evaluate(() => openCommandBar());
     await page.locator('#cmd-input').fill('workbench');
     await expect(page.locator('#cmd-results')).toContainText('Open Workbench');
-    expect(await page.evaluate(() => obSteps())).toContain('devtools');
   } finally { await m.cleanup(); }
 });
 
-test('the connect-your-AI step shows the agent and picking it sets the provider', async () => {
+test('the tour: the agent is found, it proposes a setup from the apps, and applying it sets mode, spaces and favorites', async () => {
   const m = await launch({ state: { ...seedState(), onboarded: false } });
   try {
     const { page } = m;
     await expect(page.locator('#onboarding')).toBeVisible({ timeout: 15_000 });
-    const idx = await page.evaluate(() => ob.steps.indexOf('ai'));
-    await page.evaluate((i) => showObStep(i), idx);
-    const card = page.locator('.ob-agent', { hasText: 'Claude Code' });
-    await expect(card).toHaveClass(/ready/, { timeout: 15_000 });
-    await expect(card).toContainText('Ready');
-    await expect(page.locator('.ob-agent', { hasText: 'Gemini CLI' })).toContainText(/Install|needs/);
-    await card.click();
-    await expect.poll(() => page.evaluate(() => state.settings.aiProvider)).toBe('claude');
+    const next = page.locator('#onboarding [data-ob="next"]');
+    await next.click();
+    await expect(page.locator('.ob-step-ai h2')).toHaveText('Your AI is here', { timeout: 15_000 });
+    await expect(page.locator('.ob-ai-name')).toContainText('Claude Code');
+    await next.click();
+    await page.locator('#ob-about').fill('I design mobile apps');
+    await next.click();
+    await expect(page.locator('.ob-step-preview')).toBeVisible({ timeout: 20_000 });
+    await expect(page.locator('.ob-persona')).toHaveText('Product designer');
+    // The agent was asked once, with the signals, and its answer was validated: the made-up favorite id is gone.
+    const call = m.agent.calls().find((c) => c.stdin.includes('<signals>'));
+    expect(call.stdin).toContain('about_them: I design mobile apps');
+    expect(call.args[call.args.indexOf('--tools') + 1]).toBe('');
+    expect(await page.evaluate(() => ob.proposal.favorites.map((f) => f.id))).toEqual(['figma', 'gmail']);
+    await next.click();
+    await expect(page.locator('.ob-step-done')).toBeVisible({ timeout: 15_000 });
+    await next.click();
+    const st = await page.evaluate(() => ({ mode: state.settings.mode, provider: state.settings.aiProvider, spaces: state.spaces.map((s) => s.icon + ' ' + s.name), favs: state.favorites.default.map((t) => t.url) }));
+    expect(st).toEqual({ mode: 'creative', provider: 'claude', spaces: ['🎨 Design', '🏠 Home'], favs: ['https://www.figma.com/files', 'https://mail.google.com/'] });
   } finally { await m.cleanup(); }
 });

@@ -38,6 +38,9 @@ function testPathDefault() {
   return [testBin, '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(path.delimiter);
 }
 
+let emptyArc = null;
+const emptyArcDir = () => (emptyArc ||= fs.mkdtempSync(path.join(os.tmpdir(), 'mer-e2e-noarc-')));
+
 // Launch Meridian. `state` (object) is written to state.json before launch unless `keepState` is set.
 async function launchMeridian({ userDataDir, state, keepState = false, env = {}, windowBounds } = {}) {
   if (!keepState) fs.writeFileSync(path.join(userDataDir, 'state.json'), JSON.stringify(state || seedState()));
@@ -52,6 +55,8 @@ async function launchMeridian({ userDataDir, state, keepState = false, env = {},
       ...process.env,
       MERIDIAN_USER_DATA: userDataDir,
       MERIDIAN_TEST_PATH: testPathDefault(),
+      // Never the developer's real Arc data: an empty Arc folder unless a spec brings its own.
+      MERIDIAN_ARC_DIR: emptyArcDir(),
       // Don't steal the user's focus (set MERIDIAN_E2E_FOCUS=1 to run with normal, focus-taking windows).
       ...(process.env.MERIDIAN_E2E_FOCUS === '1' ? {} : {
         MERIDIAN_E2E_NO_FOCUS: '1',

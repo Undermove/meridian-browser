@@ -15,11 +15,12 @@ const { detectClis, connectCli } = require('./mcp-connect');
 const { importFromArc, arcDataExists, arcRoot, setArcRootOverride } = require('./importers/arc');
 const { importArcCookies, findArcProfiles, keychainPassword } = require('./importers/arc-cookies');
 const { AgentHub } = require('./agent/hub');
-const { Assistant, describeError: describeAiError } = require('./ai/assistant');
+const { Assistant, MODEL: ASSISTANT_MODEL, describeError: describeAiError } = require('./ai/assistant');
 const { LocalAgents, PROVIDERS: AGENT_PROVIDERS } = require('./ai/local-agents');
 const { openInTerminal } = require('./ai/agent-setup');
 const { ChatsStore } = require('./ai/chats-store');
 const { meridianGuide } = require('./ai/guide');
+const setupProfile = require('./ai/setup-profile');
 const { MissionControl } = require('./agents/mission'); // Mission Control
 const { tidyToday, LinkPreviews } = require('./ai/features');
 const { Workbench, isInternalContents, isWorkbenchResource } = require('./dev'); // Workbench (mini IDE), see src/dev/index.js
@@ -914,6 +915,30 @@ handleMain('ai:link-preview-test', async (_e, url) => { // dev/test only: same p
 
 handle('import:arc-available', () => arcDataExists());
 handle('import:arc', () => importFromArc());
+
+// Welcome tour → "Making Meridian yours": signals (only what the person allowed) → their AI → a proposal.
+const NOTABLE_APPS = /^(Figma|Sketch|Adobe \w+|Affinity \w+|Framer|Blender|Procreate|Xcode|Visual Studio Code|Cursor|Zed|IntelliJ IDEA|WebStorm|PyCharm|Rider|Android Studio|iTerm|Warp|Ghostty|Docker|OrbStack|Postman|Slack|Microsoft (Teams|Outlook|Excel|Word|PowerPoint)|Zoom|Notion|Linear|Keynote|Miro|Loom|Telegram|WhatsApp|Discord|Spotify|Obsidian|Logic Pro|Final Cut Pro|DaVinci Resolve|Ableton Live)/;
+handle('setup:propose', async (_e, opts = {}) => {
+  const useApps = opts.useApps !== false, useArc = opts.useArc !== false;
+  const apps = useApps ? setupProfile.installedApps() : [];
+  let arc = null;
+  if (useArc) { try { arc = setupProfile.arcSummary(importFromArc()); } catch {} }
+  const provider = typeof opts.provider === 'string' && (opts.provider === 'api' || Object.prototype.hasOwnProperty.call(AGENT_PROVIDERS, opts.provider)) ? opts.provider : null;
+  const ask = !provider ? null : provider === 'api'
+    ? async (text) => {
+      const msg = await assistant.client().messages.create({ model: ASSISTANT_MODEL, max_tokens: 2000, messages: [{ role: 'user', content: text }] });
+      return msg.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
+    }
+    : (text) => new Promise((resolve) => {
+      let out = '';
+      localAgents.chat(`setup-${Date.now()}`, { provider, prompt: text, system: 'You configure a web browser. Reply with only the JSON object requested.' }, (ev) => {
+        if (ev.delta) out += ev.delta;
+        if (ev.done || ev.error) resolve(ev.error ? null : (ev.text || out));
+      });
+    });
+  const proposal = await setupProfile.propose({ apps, arc, locale: app.getLocale(), about: String(opts.about || '') }, ask);
+  return { ...proposal, seen: { apps: apps.filter((a) => NOTABLE_APPS.test(a)).slice(0, 8), arcSpaces: arc?.spaces.length || 0 } };
+});
 // Counts for the onboarding ("12 spaces, 140 pinned tabs, 8 favorites") before anything is imported.
 handle('import:arc-preview', () => {
   if (!arcDataExists()) return null;

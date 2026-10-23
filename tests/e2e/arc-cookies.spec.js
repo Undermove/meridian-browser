@@ -222,18 +222,18 @@ test.describe('in the app', () => {
     } finally { await closeMeridian(m.app); }
   });
 
-  test('onboarding: "Also bring my logins" imports the sidebar and the logins in one go', async ({ userDataDir }) => {
+  test('onboarding: "Bring my Arc" imports the sidebar and the logins in one go', async ({ userDataDir }) => {
     const m = await launchMeridian({ userDataDir, state: seedState(), env: { MERIDIAN_ARC_DIR: arcRoot, MERIDIAN_ARC_SAFE_STORAGE: PASSWORD } });
     try {
       await setDialogResponse(m.app, 1);
       await m.page.evaluate(() => startOnboarding());
-      await m.page.waitForFunction(() => ob.steps.includes('arc'));
-      await m.page.evaluate(() => showObStep(ob.steps.indexOf('arc')));
-      const box = m.page.locator('#ob-logins');
-      await expect(box).toBeChecked();
-      await expect(m.page.locator('.ob-step-arc .ob-fine')).toContainText('Logins (cookies) come over too');
-      await m.page.locator('#ob-import').click();
-      await expect(m.page.locator('.ob-step-arc .ob-ok')).toHaveText(['Imported', '6 logins']);
+      await m.page.waitForFunction(() => ob.el && ob.arcLogins);
+      await m.page.evaluate(() => showObStep(ob.steps.indexOf('preview')));
+      const opt = m.page.locator('[data-opt="arc"]');
+      await expect(opt).toHaveClass(/\bon\b/);
+      await expect(opt).toContainText('and logins');
+      await m.page.locator('#onboarding [data-ob="next"]').click();
+      await expect(m.page.locator('.ob-step-done')).toBeVisible({ timeout: 15_000 });
       expect(await m.page.evaluate(() => state.spaces.map((s) => [s.name, s.profileId]))).toEqual([['Home', 'default'], ['Work', 'arc-profile-3']]);
       expect((await cookiesIn(m.app, 'persist:profile-arc-profile-3')).map((x) => x.value)).toEqual(['work-session']);
     } finally { await closeMeridian(m.app); }

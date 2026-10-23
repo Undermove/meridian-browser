@@ -232,21 +232,35 @@ test.describe('Air Traffic Control', () => {
 test.describe('onboarding', () => {
   test.use({ seed: async ({}, use) => { const s = S.seedState(); s.onboarded = false; use(s); } });
 
-  test('a fresh profile gets the full-window tour; completing it saves onboarded', async ({ meridian }) => {
+  test('a fresh profile gets the tour; going through it (no AI → simple rules) sets things up and saves onboarded', async ({ meridian }) => {
     const { page } = meridian;
     await expect(page.locator('#onboarding')).toBeVisible();
     await expect(page.locator('body')).toHaveClass(/onboarding/);
-    await expect(page.locator('#onboarding .ob-page h1')).toHaveText('Welcome to Meridian');
-    const steps = await page.locator('#onboarding .ob-dot').count();
-    expect(steps).toBeGreaterThanOrEqual(6);
-    for (let i = 0; i < steps - 1; i++) {
-      await page.locator('#onboarding [data-ob="next"]').click();
-      await expect(page.locator('#onboarding .ob-dot').nth(i + 1)).toHaveClass(/\bon\b/);
-    }
-    await expect(page.locator('#onboarding [data-ob="next"]')).toContainText('Start Browsing');
-    await page.locator('#onboarding [data-ob="next"]').click();
+    await expect(page.locator('#onboarding .ob-hello-word')).toBeVisible();
+    await expect(page.locator('#onboarding .ob-dot')).toHaveCount(5);
+    const next = page.locator('#onboarding [data-ob="next"]');
+    await next.click();
+    // No agent on the test PATH and no key: "Bring your AI", continue with "Later".
+    await expect(page.locator('.ob-step-ai h2')).toHaveText('Bring your AI');
+    await expect(next).toHaveText('Later');
+    await next.click();
+    await expect(page.locator('.ob-step-tailor h2')).toBeVisible();
+    await next.click();
+    await expect(page.locator('.ob-step-preview h2')).toHaveText('Here’s your Meridian', { timeout: 20_000 });
+    const proposal = await page.evaluate(() => ob.proposal);
+    expect(proposal.source).toBe('rules');
+    // Leave the first favorite out.
+    await page.locator('.ob-pv-fav').first().click();
+    await next.click();
+    await expect(page.locator('.ob-step-done h1')).toHaveText('You’re all set');
+    await expect(next).toHaveText('Start browsing');
+    await next.click();
     await expect(page.locator('#onboarding')).toHaveCount(0);
-    expect(await page.evaluate(() => state.onboarded)).toBe(true);
+    const st = await page.evaluate(() => ({ onboarded: state.onboarded, mode: state.settings.mode, favs: state.favorites.default.map((t) => t.url), name: state.spaces[0].name }));
+    expect(st.onboarded).toBe(true);
+    expect(st.mode).toBe(proposal.mode);
+    expect(st.favs).toEqual(proposal.favorites.slice(1).map((f) => f.url));
+    expect(st.name).toBe(proposal.spaces[0].name);
     const { page: p2 } = await meridian.relaunch();
     await p2.waitForTimeout(500);
     await expect(p2.locator('#onboarding')).toHaveCount(0);
@@ -264,18 +278,15 @@ test.describe('onboarding', () => {
       help.submenu.items.find((i) => i.label === 'Welcome Tour…').click();
     });
     await expect(page.locator('#onboarding')).toBeVisible();
-    await expect(page.locator('#onboarding .ob-page h1')).toHaveText('Welcome to Meridian');
+    await expect(page.locator('#onboarding .ob-hello-word')).toBeVisible();
   });
 
-  test('while on "The basics", the shortcuts it teaches become checkmarks instead of acting', async ({ meridian }) => {
+  test('app shortcuts don\'t act behind the open tour', async ({ meridian }) => {
     const { page } = meridian;
     await expect(page.locator('#onboarding')).toBeVisible();
-    const steps = await page.evaluate(() => ob.steps);
-    await page.evaluate((i) => showObStep(i), steps.indexOf('basics'));
-    await expect(page.locator('#onboarding .ob-key[data-cmd="toggle-sidebar"]')).toBeVisible();
     await press(meridian, 'Meta+S');
-    await expect(page.locator('#onboarding .ob-key[data-cmd="toggle-sidebar"]')).toHaveClass(/done/);
-    expect(await page.evaluate(() => state.settings.sidebarHidden)).toBe(false); // didn't act
+    await page.waitForTimeout(300);
+    expect(await page.evaluate(() => state.settings.sidebarHidden)).toBe(false);
     void e2eLog;
   });
 });
