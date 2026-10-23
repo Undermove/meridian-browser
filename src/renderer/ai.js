@@ -277,9 +277,10 @@ async function refreshAiPanel() {
   $('#ai-page-chip').classList.toggle('off', !ai.includePage || !t);
 }
 
-async function pageForAi() {
+// The active tab's text for the model (the ⌘J panel and the Chat view; `include` is their page toggle).
+async function pageForAi(include = ai.includePage) {
   const t = activeTab();
-  if (!t || !ai.includePage) return null;
+  if (!t || !include || isWorkbenchTab(t)) return null;
   const wv = rt.views.get(t.id);
   if (!wv) return null;
   try {
@@ -379,9 +380,10 @@ function newAiChat() {
 }
 
 // Tiny, escape-first markdown: paragraphs, headings, lists, **bold**, *italic*, `code`, ```blocks```, [links](url).
+// Images are never loaded: ![alt](url) shows just its alt text. Shared with the Chat view (chat.js).
 function renderMarkdown(src) {
   const blocks = [];
-  let s = esc(src).replace(/```(\w*)\n?([\s\S]*?)(```|$)/g, (_m, _l, code) => { blocks.push(code); return `\u0000${blocks.length - 1}\u0000`; });
+  let s = esc(String(src ?? '').replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')).replace(/```(\w*)\n?([\s\S]*?)(```|$)/g, (_m, _l, code) => { blocks.push(code); return `\u0000${blocks.length - 1}\u0000`; });
   const inline = (t) => t
     .replace(/`([^`]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')

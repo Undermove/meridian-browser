@@ -42,6 +42,11 @@ contextBridge.exposeInMainWorld('meridian', {
   aiStop: (sessionId) => ipcRenderer.send('ai:stop', sessionId),
   aiReset: (sessionId) => ipcRenderer.send('ai:reset', sessionId),
   onAiEvent: (fn) => ipcRenderer.on('ai:event', (_e, ev) => fn(ev)),
+  // Chat view conversations (main window only; see src/ai/chats-store.js)
+  chatsList: () => ipcRenderer.invoke('chats:list'),
+  chatsGet: (id) => ipcRenderer.invoke('chats:get', String(id)),
+  chatsSave: (chat) => ipcRenderer.invoke('chats:save', chat),
+  chatsDelete: (id) => ipcRenderer.invoke('chats:delete', String(id)),
 
   fetchFavicon: (url, partition) => ipcRenderer.invoke('favicon:fetch', url, partition),
   aiPageText: (wcId) => ipcRenderer.invoke('ai:page-text', wcId),

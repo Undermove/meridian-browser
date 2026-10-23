@@ -25,9 +25,18 @@ function userShell() {
 
 let pathPromise = null;
 
+// MERIDIAN_TEST_PATH (dev/test builds only, ignored when packaged): loginPath() returns it verbatim and
+// loginEnv() returns {}, so e2e tests find fake agent CLIs and never the developer's real ones.
+function testPath() {
+  if (!process.env.MERIDIAN_TEST_PATH) return null;
+  try { const { app } = require('electron'); if (app && !app.isPackaged) return process.env.MERIDIAN_TEST_PATH; } catch {}
+  return null;
+}
+
 // PATH as the user's interactive login shell sees it. Falls back to our own PATH plus common dirs.
 function loginPath() {
   if (pathPromise) return pathPromise;
+  if (testPath()) return (pathPromise = Promise.resolve(testPath()));
   const fallback = () => {
     const extra = IS_WIN ? [] : ['/opt/homebrew/bin', '/usr/local/bin', path.join(os.homedir(), '.local', 'bin'), '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
     return [...new Set([...(process.env.PATH || '').split(path.delimiter), ...extra].filter(Boolean))].join(path.delimiter);
@@ -52,6 +61,7 @@ let envPromise = null;
 const SKIP_LOGIN_VARS = /^(PWD|OLDPWD|SHLVL|_|TERM|TERM_PROGRAM.*|COLORTERM|PS\d|PROMPT.*|RPROMPT|ZSH.*|P9K.*|POWERLEVEL.*|SSH_AUTH_SOCK|DISPLAY|ELECTRON_.*|MERIDIAN_.*|npm_.*|NODE_OPTIONS|TMPDIR|__CF.*|XPC_.*|LaunchInstanceID|SECURITYSESSIONID)$/;
 function loginEnv() {
   if (envPromise) return envPromise;
+  if (testPath()) return (envPromise = Promise.resolve({}));
   if (IS_WIN) return (envPromise = Promise.resolve({}));
   envPromise = new Promise((resolve) => {
     const script = 'printf "__MERIDIAN_ENV__"; env -0; printf "__MERIDIAN_END__"';

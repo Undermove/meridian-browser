@@ -17,6 +17,7 @@ const { AgentHub } = require('./agent/hub');
 const { Assistant, describeError: describeAiError } = require('./ai/assistant');
 const { LocalAgents, PROVIDERS: AGENT_PROVIDERS } = require('./ai/local-agents');
 const { openInTerminal } = require('./ai/agent-setup');
+const { ChatsStore } = require('./ai/chats-store');
 const { meridianGuide } = require('./ai/guide');
 const { MissionControl } = require('./agents/mission'); // Mission Control
 const { tidyToday, LinkPreviews } = require('./ai/features');
@@ -194,10 +195,11 @@ function writeJsonAtomic(file, data) {
 
 // Async writes keep the main process (which routes all input) free; one chain per file keeps them in order.
 const writeChains = new Map();
-function writeJsonAtomicAsync(file, data) {
+function writeJsonAtomicAsync(file, data, { mode } = {}) {
   const run = async () => {
     const tmp = file + '.tmp';
-    await fs.promises.writeFile(tmp, typeof data === 'string' ? data : JSON.stringify(data));
+    await fs.promises.writeFile(tmp, typeof data === 'string' ? data : JSON.stringify(data), mode ? { mode } : undefined);
+    if (mode) await fs.promises.chmod(tmp, mode); // writeFile's mode only applies to a new file
     await fs.promises.rename(tmp, file);
   };
   const next = (writeChains.get(file) || Promise.resolve()).then(run, run);
@@ -788,10 +790,24 @@ let assistant = null;
 let localAgents = null;
 
 // The renderer picks the provider; only known ids get through ('api' = the Claude API key path).
+// `history` seeds a reopened Chat view conversation (main forgets sessions on restart): strings only, capped.
 function sanitizeAiRequest(req) {
   const r = req && typeof req === 'object' ? req : {};
   const provider = r.provider === 'api' || Object.prototype.hasOwnProperty.call(AGENT_PROVIDERS, r.provider) ? r.provider : 'api';
-  return { ...r, provider, mode: r.mode === 'ask' ? 'ask' : 'chat', text: String(r.text || '').slice(0, 100_000) };
+  const out = { ...r, provider, mode: r.mode === 'ask' ? 'ask' : 'chat', text: String(r.text || '').slice(0, 100_000) };
+  delete out.history;
+  if (Array.isArray(r.history)) {
+    let budget = 60_000;
+    const history = [];
+    for (const m of r.history.slice(-40).reverse()) {
+      if (!m || (m.role !== 'user' && m.role !== 'assistant') || typeof m.text !== 'string' || !m.text || budget <= 0) continue;
+      const text = m.text.slice(0, Math.min(20_000, budget));
+      budget -= text.length;
+      history.unshift({ role: m.role, text });
+    }
+    if (history.length) out.history = history;
+  }
+  return out;
 }
 
 // Install / sign in to a local AI agent: confirm the exact command, then run it in the system terminal.
@@ -850,6 +866,14 @@ handle('agents:list', (_e, fresh) => localAgents.list({ fresh: !!fresh }));
 handle('agents:setup', (e, id, action) => agentSetup(BrowserWindow.fromWebContents(e.sender), String(id), String(action)));
 on('ai:stop', (_e, sessionId) => assistant.stop(sessionId));
 on('ai:reset', (_e, sessionId) => assistant.reset(sessionId));
+
+// Chat view conversations (src/ai/chats-store.js). Main window only: private and Little windows never save chats.
+let chatsStore = null;
+const chats = () => (chatsStore ||= new ChatsStore({ userDataDir: app.getPath('userData'), writeAtomic: writeJsonAtomicAsync }));
+handleMain('chats:list', () => chats().list());
+handleMain('chats:get', (_e, id) => chats().get(String(id || '')));
+handleMain('chats:save', (_e, chat) => chats().save(chat));
+handleMain('chats:delete', (_e, id) => chats().delete(String(id || '')));
 
 // ---------- Mission Control + Arc Max-style AI features (src/agents/mission.js, src/ai/features.js) ----------
 
@@ -1363,6 +1387,7 @@ function buildMenu() {
       submenu: [
         sc('Toggle Sidebar', 'toggle-sidebar'),
         sc('Ask AI', 'ai-panel'),
+        sc('Chat', 'open-chat'),
         sc('Workbench', 'open-workbench'), // Workbench integration
         sc('Mission Control', 'mission-control'), // Mission Control
         sc('Downloads', 'downloads'),
