@@ -1691,7 +1691,10 @@ function confirmBox(message, okLabel = 'OK') {
   });
 }
 
-function toast(text, { action, onClick, timeout = 2600, id } = {}) {
+function hideToast(el) { clearTimeout(el._t); el.classList.remove('show'); setTimeout(() => el.remove(), 300); }
+
+// `onClose` adds a × button: the toast stays until it's clicked (or the action handles it).
+function toast(text, { action, onClick, onClose, timeout = 2600, id } = {}) {
   let el = id && document.getElementById('toast-' + id);
   if (!el) {
     el = document.createElement('div');
@@ -1700,11 +1703,30 @@ function toast(text, { action, onClick, timeout = 2600, id } = {}) {
     $('#toasts').appendChild(el);
     requestAnimationFrame(() => el.classList.add('show'));
   }
-  el.innerHTML = `<span>${esc(text)}</span>${action ? `<button class="toast-action">${esc(action)}</button>` : ''}`;
-  if (onClick) el.onclick = onClick;
+  el.innerHTML = `<span>${esc(text)}</span>${action ? `<button class="toast-action">${esc(action)}</button>` : ''}${onClose ? `<button class="toast-close" title="Close">${icon('x', 12)}</button>` : ''}`;
+  el.onclick = (e) => {
+    if (onClose && e.target.closest('.toast-close')) { hideToast(el); onClose(); }
+    else onClick?.(e);
+  };
   clearTimeout(el._t);
-  if (timeout) el._t = setTimeout(() => { el.classList.remove('show'); setTimeout(() => el.remove(), 300); }, timeout);
+  if (timeout) el._t = setTimeout(() => hideToast(el), timeout);
   return el;
+}
+
+// ---------------------------------------------------------------- updates
+
+// The main process checks GitHub for a newer release (src/updates.js). On macOS "Update" runs the
+// installer, which restarts Meridian; elsewhere "Download" fetches the installer in a tab.
+function showUpdate(info) {
+  if (!info || rt.updateDismissed === info.version) return;
+  const el = toast(`Meridian ${info.version} is available`, {
+    id: 'update', timeout: 0, action: info.inApp ? 'Update' : 'Download',
+    onClose: () => { rt.updateDismissed = info.version; },
+    onClick: async () => {
+      if (!info.inApp) { hideToast(el); rt.updateDismissed = info.version; return openTab(info.url); }
+      if (await api.updateInstall()) toast('Updating… Meridian will close and open again', { id: 'update', timeout: 0 });
+    },
+  });
 }
 
 // ---------------------------------------------------------------- downloads
@@ -2061,6 +2083,7 @@ async function boot() {
   api.onWebviewOpen(onWebviewOpen);
   api.onWebviewAction(onWebviewAction);
   api.onDownload(onDownload);
+  if (!MINI && !PRIVATE) { api.onUpdate(showUpdate); api.updateLatest().then(showUpdate).catch(() => {}); }
   api.onWebviewEscape(({ fromId }) => {
     const tabId = rt.wcToTab.get(fromId);
     if (tabId === '__peek__') return closePeek();

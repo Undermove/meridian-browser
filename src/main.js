@@ -3,7 +3,7 @@
 // even when a page has focus), persistence, sessions/profiles, downloads,
 // permissions, ad blocking and the Arc importer.
 
-const { app, BrowserWindow, Menu, ipcMain, session, shell, dialog, clipboard, nativeTheme, webContents, protocol } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain, session, shell, dialog, clipboard, nativeTheme, webContents, protocol, net } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -25,6 +25,7 @@ const setupProfile = require('./ai/setup-profile');
 const { MissionControl } = require('./agents/mission'); // Mission Control
 const { tidyToday, LinkPreviews } = require('./ai/features');
 const { Workbench, isInternalContents, isWorkbenchResource } = require('./dev'); // Workbench (mini IDE), see src/dev/index.js
+const { Updates } = require('./updates');
 
 const APP_NAME = 'Meridian';
 app.setName(APP_NAME);
@@ -885,6 +886,33 @@ async function agentSetup(win, id, action) {
 }
 let workbench = null;
 
+// ---------- updates (see src/updates.js) ----------
+
+let updates = null;
+
+function setupUpdates() {
+  // Dev builds never ask GitHub; tests point MERIDIAN_UPDATE_FEED at their own server and check at once.
+  const feed = DEV ? process.env.MERIDIAN_UPDATE_FEED : undefined;
+  if (DEV && !feed) return;
+  updates = new Updates({
+    app, net, feed,
+    send: (info) => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('update:available', info); },
+    log: (m) => console.warn(m),
+  });
+  updates.start(feed ? 0 : undefined);
+}
+
+handleMain('update:latest', () => updates?.latest || null);
+handleMain('update:install', async () => {
+  if (!updates?.latest?.inApp) return false;
+  const { response } = await dialog.showMessageBox(mainWindow, {
+    type: 'question', buttons: ['Update and Restart', 'Later'], defaultId: 0, cancelId: 1,
+    message: `Update Meridian to ${updates.latest.version}?`,
+    detail: 'Meridian will close, install the new version and open again. Your tabs come back.',
+  });
+  return response === 0 && updates.install();
+});
+
 function mcpScript() {
   return app.isPackaged
     ? path.join(process.resourcesPath, 'mcp', 'meridian-mcp.cjs')
@@ -1714,6 +1742,7 @@ app.whenReady().then(async () => {
   registerUiProtocol();
   buildMenu();
   createMainWindow();
+  setupUpdates();
   for (const url of pendingUrls) openExternalUrl(url);
   pendingUrls = [];
   const argUrl = process.argv.slice(1).find((a) => /^https?:\/\//i.test(a));
@@ -1722,7 +1751,7 @@ app.whenReady().then(async () => {
   app.on('activate', () => { if (!mainWindow) createMainWindow(); });
 });
 
-app.on('will-quit', () => { hub?.stopServer(); workbench?.dispose(); mission?.dispose(); });
+app.on('will-quit', () => { updates?.stop(); hub?.stopServer(); workbench?.dispose(); mission?.dispose(); });
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();

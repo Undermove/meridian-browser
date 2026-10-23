@@ -55,6 +55,8 @@ Arc is being sunset. Meridian keeps the Arc workflow you're used to (spaces, pin
 curl -fsSL https://undermove.github.io/meridian-browser/install.sh | bash
 ```
 
+Meridian tells you when a new version is out. On macOS, **Update** in that notice installs it and reopens Meridian with your tabs; on Windows and Linux, **Download** fetches the new installer.
+
 Or grab a build from **[Releases](https://github.com/Undermove/meridian-browser/releases/latest)**:
 
 | | Download |

@@ -10,6 +10,9 @@ contextBridge.exposeInMainWorld('meridian', {
   onWebviewAction: (fn) => ipcRenderer.on('webview:action', (_e, p) => fn(p)),
   onWebviewEscape: (fn) => ipcRenderer.on('webview:escape', (_e, p) => fn(p)),
   onDownload: (fn) => ipcRenderer.on('download', (_e, p) => fn(p)),
+  onUpdate: (fn) => ipcRenderer.on('update:available', (_e, info) => fn(info)),
+  updateLatest: () => ipcRenderer.invoke('update:latest'),
+  updateInstall: () => ipcRenderer.invoke('update:install'),
 
   popupMenu: (items) => ipcRenderer.invoke('menu:popup', items),
   copy: (text) => ipcRenderer.send('clipboard:write', text),

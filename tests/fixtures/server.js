@@ -90,6 +90,15 @@ function routes(base) {
     '/greedy': () => page('Greedy Keys', `<p>this page calls preventDefault on every keydown</p><input id="field">
       <script>window.__keys=[];addEventListener('keydown',(e)=>{__keys.push(e.key);e.preventDefault();e.stopPropagation();},true);</script>`),
 
+    // GitHub "latest release" stand-in for the update check: /release/<tag>.
+    '/release/': (url, _req, res) => {
+      const tag = decodeURIComponent(url.pathname.slice(9));
+      const v = tag.replace(/^v/, '');
+      res.setHeader('content-type', 'application/json');
+      const names = [`Meridian-${v}-win.exe`, `Meridian-${v}-mac-arm64.dmg`, `Meridian-${v}-mac-x64.dmg`, `Meridian-${v}-linux-amd64.deb`, 'Meridian-win.exe'];
+      return JSON.stringify({ tag_name: tag, assets: names.map((name) => ({ name, browser_download_url: `${base}/p/${name}` })) });
+    },
+
     // Slow page (for timing-sensitive checks).
     '/slow': async () => { await new Promise((r) => setTimeout(r, 1500)); return page('Slow', '<p>slow page</p>'); },
   };
