@@ -1084,6 +1084,8 @@ function renderMiniBar() {
 function initSidebar() {
   $$('[data-cmd]').forEach((b) => { if (b.dataset.cmd && !b.innerHTML.trim()) b.innerHTML = icon({ 'toggle-sidebar': 'sidebar', back: 'back', forward: 'forward', reload: 'reload', 'copy-url': 'copy' }[b.dataset.cmd] || 'plus'); });
   $('#btn-downloads').innerHTML = icon('download');
+  $('#btn-workbench').innerHTML = icon('code'); // Workbench: always one click away (hidden in Everyday mode)
+  $('#btn-workbench').title = `Workbench (${keys('⇧⌘E')})`;
   $('#btn-chat').innerHTML = icon('chat');
   $('#btn-add-space').innerHTML = icon('plus');
   $$('[data-icon]').forEach((el) => { el.innerHTML = icon(el.dataset.icon, 15); });

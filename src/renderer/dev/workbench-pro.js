@@ -1173,8 +1173,8 @@ async function proBoot() {
   initSidePane();
   initProKeys();
   $('#new-hub').addEventListener('click', newHubWizard);
-  $('#open-as-hub').addEventListener('click', openAsHub);
-  $('#welcome-customize').addEventListener('click', customizeWithClaude);
+  $('#open-as-hub')?.addEventListener('click', openAsHub);
+  $('#welcome-customize')?.addEventListener('click', customizeWithClaude);
   $('#status-custom').addEventListener('click', () => openPanel('customize'));
   $('#status-vault').addEventListener('click', () => openPanel('secrets'));
   wb.onCustomChange((p) => { if (p?.safeMode === true) reloadCustom({ quiet: true }).then(reloadForSafeMode); else reloadCustom(); });

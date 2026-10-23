@@ -893,6 +893,22 @@ function renderTermTabs() {
     return el;
   }));
   $('#term-empty').hidden = S.terms.length > 0;
+  renderTermStart();
+}
+
+// A project with no terminal yet: one big button for the agent that's installed (the first of Claude Code,
+// Codex, Gemini), so starting takes one click.
+function renderTermStart() {
+  const box = $('#term-start');
+  if (!box) return;
+  const kind = ['claude', 'codex', 'gemini'].find((id) => S.info?.agents?.[id]?.installed);
+  box.innerHTML = '';
+  if (!kind || S.terms.length) return;
+  const b = document.createElement('button');
+  b.className = 'btn accent big term-start-btn';
+  b.append(agentMark(kind), document.createTextNode(`Start ${AGENT_UI[kind].label}`));
+  b.addEventListener('click', () => launch(kind));
+  box.appendChild(b);
 }
 
 function layoutTerminals() { renderTermTabs(); fitActive(); }

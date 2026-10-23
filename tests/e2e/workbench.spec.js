@@ -104,3 +104,34 @@ test.describe('workbench', () => {
     expect(await tryAttach('meridian-internal')).toBe('refused');
   });
 });
+
+// Discoverability: an always-visible way in, and a first screen that says what it's for in plain words.
+test('the sidebar button opens the Workbench; its first screen leads with "Open a project folder"', async ({ userDataDir }) => {
+  const m = await launchMeridian({ userDataDir, state: seedState({ settings: { mode: 'developer' } }) });
+  try {
+    const { page } = m;
+    const btn = page.locator('#btn-workbench');
+    await expect(btn).toBeVisible();
+    await expect(btn).toHaveAttribute('title', /Workbench \(.+E\)/);
+    await expect(page.locator('#empty-state .ea-workbench')).toBeVisible();
+    await btn.click();
+    await expect.poll(() => wbTabId(page)).toBeTruthy();
+    await expect.poll(() => inWb(page, '!document.querySelector("#welcome").hidden').catch(() => false), { timeout: 15_000 }).toBe(true);
+    const ui = await inWb(page, `({
+      primary: document.querySelector('#open-folder').textContent.trim(),
+      ideas: [...document.querySelectorAll('.wb-idea')].map((p) => p.textContent.trim()),
+      hub: document.querySelector('.welcome-hub').textContent.replace(/\\s+/g, ' ').trim(),
+      secrets: document.querySelector('#btn-secrets').textContent.trim(),
+      mission: document.querySelector('#mission-chip') && !document.querySelector('#mission-chip').hidden ? document.querySelector('#mission-chip').textContent.trim() : null,
+    })`);
+    expect(ui.primary).toBe('Open a project folder');
+    expect(ui.ideas).toHaveLength(2);
+    expect(ui.ideas[0]).toMatch(/coding agent lives in a browser tab/);
+    expect(ui.hub).toMatch(/A hub is a folder set up for that\. Create one/);
+    expect(ui.secrets).toBe('Secrets');
+    expect(ui.mission).toBe('Mission Control');
+    // Everyday mode keeps it out of sight.
+    await page.evaluate(() => applySettingsPatch({ mode: 'everyday' }));
+    await expect(btn).toBeHidden();
+  } finally { await closeMeridian(m.app); }
+});
