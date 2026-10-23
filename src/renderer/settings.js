@@ -183,7 +183,7 @@ registerSection({
   id: 'general', label: 'General', icon: 'sliders', order: 10,
   async render(el) {
     const s = ctx.settings;
-    const [isDefault, arc] = await Promise.all([withTimeout(S.isDefaultBrowser(), false), withTimeout(S.arcAvailable(), false)]);
+    const [isDefault, arc, arcLogins] = await Promise.all([withTimeout(S.isDefaultBrowser(), false), withTimeout(S.arcAvailable(), false), S.platform === 'darwin' ? withTimeout(S.arcLoginsAvailable(), false) : false]);
     el.innerHTML = `
       ${memberCard()}
       ${group('Appearance', `
@@ -203,7 +203,8 @@ registerSection({
         ${row('Memory saver', select('unload', UNLOAD_OPTIONS, s.unloadAfterMinutes ?? 60), 'Pages you haven’t looked at for a while are put to sleep and reload when you come back.')}
       `)}
       ${group('Get started', `
-        ${row('Import from Arc', button('import', arc ? 'Import…' : 'Arc not found', '', arc ? '' : 'disabled'), 'Spaces, colours, pinned tabs, folders and favorites. Logins don’t transfer.')}
+        ${row('Import from Arc', button('import', arc ? 'Import…' : 'Arc not found', '', arc ? '' : 'disabled'), 'Spaces, colours, pinned tabs, folders and favorites.')}
+        ${S.platform === 'darwin' ? row('Import logins from Arc', button('import-logins', arcLogins ? 'Import…' : 'Arc not found', '', arcLogins ? '' : 'disabled'), 'Copies Arc’s cookies so you stay signed in to your sites, into the matching profiles. macOS asks you to allow access to Arc’s key. Saved passwords don’t transfer.') : ''}
         ${row('Welcome tour', button('tour', 'Show Again'), 'The onboarding: theme, import, default browser, basics and AI.')}
       `)}`;
     onSegment(el, 'appearance', (v) => ctx.set({ appearance: v }));
@@ -218,6 +219,13 @@ registerSection({
       else { toast(r.ok ? 'Your system will ask you to confirm' : 'Could not set the default browser'); setTimeout(() => showSection('general'), 1500); }
     });
     $('#import', el)?.addEventListener('click', () => S.action('import-arc'));
+    $('#import-logins', el)?.addEventListener('click', async (e) => {
+      const b = e.currentTarget;
+      b.disabled = true; b.textContent = 'Importing…';
+      // Main shows the confirmation, the result and any error as native dialogs.
+      await S.importArcLogins().catch(() => null);
+      b.disabled = false; b.textContent = 'Import…';
+    });
     mountMemberCard(el);
     $('#tour', el).onclick = () => S.action('onboarding');
     $('#edit-theme', el).onclick = () => S.action('edit-theme');

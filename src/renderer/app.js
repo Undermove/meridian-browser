@@ -1314,6 +1314,7 @@ const COMMANDS = [
   { id: 'little-window', label: 'New Little Window', icon: 'littleWindow', keys: '⌥⌘N' },
   { id: 'settings', label: 'Settings', icon: 'settings', keys: '⌘,' },
   { id: 'import-arc', label: 'Import from Arc', icon: 'download' },
+  ...(api.platform === 'darwin' ? [{ id: 'import-arc-logins', label: 'Import Logins from Arc', icon: 'download' }] : []),
   { id: 'onboarding', label: 'Welcome Tour', icon: 'sparkles' },
   { id: 'toggle-adblock', label: 'Toggle Ad Blocker', icon: 'shield' },
   { id: 'default-browser', label: 'Set Meridian as Default Browser', icon: 'globe' },
@@ -1399,7 +1400,7 @@ function updateCommandResults() {
     // Commands first when the query looks like one
     const cmds = COMMANDS.map((c) => ({ c, s: score(c.label, q) })).filter((x) => q && x.s >= 0).sort((a, b) => b.s - a.s).slice(0, 3);
     for (const { c } of cmds) {
-      if (PRIVATE && ['settings', 'import-arc', 'onboarding', 'edit-theme', 'ai-panel', 'ai-summarize', 'open-workbench', 'open-project', 'new-space', 'mission-control', 'ai-tidy'].includes(c.id)) continue;
+      if (PRIVATE && ['settings', 'import-arc', 'import-arc-logins', 'onboarding', 'edit-theme', 'ai-panel', 'ai-summarize', 'open-workbench', 'open-project', 'new-space', 'mission-control', 'ai-tidy'].includes(c.id)) continue;
       if (uiMode() !== 'developer' && DEV_COMMANDS.test(c.id)) continue;
       out.push({ kind: 'cmd', icon: c.icon, title: c.label, sub: 'Command', keys: c.keys, action: () => runCommand(c.id) });
     }
@@ -1751,7 +1752,7 @@ async function setDefaultBrowser() {
   else toast(r.ok ? 'macOS will ask you to confirm' : 'Could not set default browser');
 }
 
-async function importArc() {
+async function importArc({ quiet = false } = {}) {
   let data;
   try { data = await api.importArc(); } catch (err) { toast('Arc import failed: ' + err.message, { timeout: 5000 }); return null; }
   // Replace the pristine starter space; otherwise append.
@@ -1766,8 +1767,27 @@ async function importArc() {
   state.activeSpaceId = state.spaces[0].id;
   render(); save();
   const tabs = data.spaces.reduce((a, s) => { let c = s.today.length; walk(s.pinned, (n) => { if (n.type === 'tab') c++; }); return a + c; }, 0);
-  toast(`Imported ${data.spaces.length} spaces and ${tabs} tabs from Arc. Logins don’t transfer — sign in once per profile.`, { timeout: 7000 });
+  if (!quiet) {
+    const logins = await api.arcLoginsAvailable().catch(() => false);
+    if (logins) toast(`Imported ${data.spaces.length} spaces and ${tabs} tabs from Arc.`, { action: 'Import logins too', onClick: () => api.importArcLogins().catch(() => null), timeout: 9000 });
+    else toast(`Imported ${data.spaces.length} spaces and ${tabs} tabs from Arc.`, { timeout: 6000 });
+  }
   return { spaces: data.spaces.length, tabs };
+}
+
+// Profiles the Arc logins import wrote cookies into (main process, src/importers/arc-cookies.js):
+// make sure each exists here, named like the sidebar import names them.
+function addArcProfiles(list) {
+  if (!Array.isArray(list)) return;
+  let changed = false;
+  for (const p of list) {
+    const id = typeof p?.id === 'string' && /^[a-z0-9-]{1,64}$/.test(p.id) ? p.id : null;
+    if (!id || state.profiles.some((x) => x.id === id)) continue;
+    state.profiles.push({ id, name: String(p.name || 'Profile').slice(0, 60) });
+    state.favorites[id] ||= [];
+    changed = true;
+  }
+  if (changed) { render(); save(); }
 }
 
 // ---------------------------------------------------------------- commands (menu accelerators land here)
@@ -1822,6 +1842,8 @@ function runCommand(name, ...args) {
     case 'settings-patch': return EPHEMERAL ? null : applySettingsPatch(args[0] || {});
     case 'settings-action': return EPHEMERAL ? null : runSettingsAction(args[0], args[1] || {});
     case 'import-arc': return EPHEMERAL ? null : importArc();
+    case 'import-arc-logins': return EPHEMERAL ? null : api.importArcLogins().catch(() => null);
+    case 'arc-profiles': return EPHEMERAL ? null : addArcProfiles(args[0]);
     case 'onboarding': return EPHEMERAL ? null : startOnboarding();
     case 'private-window': return api.openWindow('private');
     case 'little-window': return api.openWindow('little');

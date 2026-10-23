@@ -12,7 +12,8 @@ const { shortcutTable, findShortcut, acceleratorFromInput, formatAccelerator } =
 const { routeLink, sanitizeAtc } = require('./atc');
 const { validatePatch } = require('./settings-schema');
 const { detectClis, connectCli } = require('./mcp-connect');
-const { importFromArc, arcDataExists } = require('./importers/arc');
+const { importFromArc, arcDataExists, arcRoot, setArcRootOverride } = require('./importers/arc');
+const { importArcCookies, findArcProfiles, keychainPassword } = require('./importers/arc-cookies');
 const { AgentHub } = require('./agent/hub');
 const { Assistant, describeError: describeAiError } = require('./ai/assistant');
 const { LocalAgents, PROVIDERS: AGENT_PROVIDERS } = require('./ai/local-agents');
@@ -28,6 +29,8 @@ app.setName(APP_NAME);
 // Dev/test hooks are ignored in packaged builds (they could otherwise inject code into the UI).
 const DEV = !app.isPackaged;
 if (DEV && process.env.MERIDIAN_USER_DATA) app.setPath('userData', process.env.MERIDIAN_USER_DATA);
+// Dev/test: a fake Arc data folder (StorableSidebar.json + "User Data") instead of the real one.
+if (DEV && process.env.MERIDIAN_ARC_DIR) setArcRootOverride(process.env.MERIDIAN_ARC_DIR);
 
 const STATE_FILE = () => path.join(app.getPath('userData'), 'state.json');
 const HISTORY_FILE = () => path.join(app.getPath('userData'), 'history.json');
@@ -900,6 +903,78 @@ handle('import:arc-preview', () => {
   } catch (err) { return { error: err.message }; }
 });
 
+// ---------- Arc logins (cookies) import, macOS only: src/importers/arc-cookies.js ----------
+// Profiles: cookies go into the same Meridian profiles the sidebar import uses ("Default" → default,
+// "Profile 3" → arc-profile-3). Profiles Meridian doesn't have yet are created in the UI state (as the
+// sidebar import would), so imported logins never end up in a session no profile points at. When
+// Arc's sidebar is readable, only profiles it still uses are imported (Arc leaves folders of deleted
+// profiles behind).
+
+// Dev/test only: MERIDIAN_ARC_SAFE_STORAGE is the "keychain" password; "__deny__" acts like Cancel.
+function arcPasswordSource() {
+  if (DEV && process.env.MERIDIAN_ARC_SAFE_STORAGE != null) {
+    const v = process.env.MERIDIAN_ARC_SAFE_STORAGE;
+    return async () => { if (v === '__deny__') throw Object.assign(new Error('You didn’t allow access to Arc’s logins, so nothing was imported.'), { code: 'denied' }); return v; };
+  }
+  return () => keychainPassword();
+}
+const arcUserDataDir = () => { const root = arcRoot(); return root ? path.join(root, 'User Data') : null; };
+function arcLoginsAvailable() {
+  if (process.platform !== 'darwin' && !(DEV && process.env.MERIDIAN_ARC_DIR)) return false;
+  const dir = arcUserDataDir();
+  return !!dir && findArcProfiles(dir).length > 0;
+}
+
+let arcLoginsBusy = false;
+async function importArcLogins(parent) {
+  const win = parent && !parent.isDestroyed() ? parent : mainWindow;
+  const box = (opts) => (win && !win.isDestroyed() ? dialog.showMessageBox(win, opts) : dialog.showMessageBox(opts));
+  if (!arcLoginsAvailable()) return { ok: false, error: process.platform === 'darwin' ? 'No Arc logins were found on this computer.' : 'Importing Arc logins works on macOS only.' };
+  if (arcLoginsBusy) return { ok: false, error: 'An import is already running.' };
+  arcLoginsBusy = true;
+  try {
+    const { response } = await box({
+      type: 'question', buttons: ['Cancel', 'Continue'], defaultId: 1, cancelId: 0,
+      message: 'Bring your Arc logins to Meridian?',
+      detail: 'Meridian will ask macOS for access to “Arc Safe Storage” to copy your Arc logins (cookies) to Meridian. '
+        + 'You’ll see a system dialog next: click Allow (or Always Allow) and enter your Mac password if asked.\n\n'
+        + 'Nothing leaves this computer, and Arc isn’t changed. Saved passwords aren’t copied.',
+    });
+    if (response !== 1) return { ok: false, cancelled: true };
+
+    // Profile names like the sidebar import gives them (named after their first space).
+    let known = null, names = new Map();
+    try { const d = importFromArc(); known = new Set(d.profiles.map((p) => p.id)); names = new Map(d.profiles.map((p) => [p.id, p.name])); } catch {}
+    let summary;
+    try {
+      summary = await importArcCookies({
+        userDataDir: arcUserDataDir(),
+        getPassword: arcPasswordSource(),
+        onlyProfileIds: known,
+        sessionFor: (id) => session.fromPartition(`persist:profile-${id}`),
+      });
+    } catch (err) {
+      const msg = err.code === 'denied' || err.code === 'not-found' || err.code === 'no-data' ? err.message : 'Arc’s logins couldn’t be read, so nothing was imported.';
+      await box({ type: 'info', buttons: ['OK'], message: 'Logins weren’t imported', detail: msg + (err.code === 'denied' ? ' You can try again any time from Settings → General.' : '') });
+      return { ok: false, denied: err.code === 'denied', error: msg };
+    }
+    const profiles = summary.profiles.filter((p) => p.imported > 0).map((p) => ({ id: p.profileId, name: names.get(p.profileId) || (p.dir === 'Default' ? 'Default' : p.dir) }));
+    if (profiles.length) deliverToMain('arc-profiles', profiles);
+    const n = summary.total, pc = profiles.length;
+    const failed = summary.profiles.reduce((a, p) => a + p.failed, 0);
+    await box({
+      type: 'info', buttons: ['OK'],
+      message: n ? `Imported ${n.toLocaleString('en-US')} ${n === 1 ? 'login' : 'logins'} into ${pc} ${pc === 1 ? 'profile' : 'profiles'}.` : 'No logins were imported.',
+      detail: n ? 'Sites where you were signed in to Arc are signed in here too. Open pages pick it up when they reload.'
+        + (failed ? ` ${failed.toLocaleString('en-US')} cookies couldn’t be copied.` : '')
+        : 'Arc had no current logins to copy.',
+    });
+    return { ok: true, total: n, profiles: summary.profiles.map(({ profileId, imported, skipped, failed: f }) => ({ profileId, imported, skipped, failed: f })) };
+  } finally { arcLoginsBusy = false; }
+}
+handle('import:arc-logins-available', () => arcLoginsAvailable());
+handleMain('import:arc-logins', () => importArcLogins(mainWindow));
+
 // ---------- default browser ----------
 
 handle('default-browser:set', () => {
@@ -1170,6 +1245,8 @@ handleSettings('settings:set-default', () => {
   return { ok, packaged: app.isPackaged };
 });
 handleSettings('settings:arc-available', () => arcDataExists());
+handleSettings('settings:arc-logins-available', () => arcLoginsAvailable());
+handleSettings('settings:import-arc-logins', () => importArcLogins(settingsWindow));
 handleSettings('settings:pick-extension', () => pickExtensionDir(settingsWindow));
 handleSettings('settings:reset-permissions', () => { permissionDecisions = {}; writeJsonAtomic(PERMS_FILE(), {}); return true; });
 handleSettings('settings:clear-profile-data', async (_e, profileId) => {
@@ -1342,6 +1419,7 @@ function buildMenu() {
         { label: 'Close Window', accelerator: 'CmdOrCtrl+Shift+W', role: 'close' },
         { type: 'separator' },
         { label: 'Import from Arc…', click: () => deliverToMain('import-arc') },
+        ...(IS_MAC ? [{ label: 'Import Logins from Arc…', click: () => importArcLogins(mainWindow) }] : []),
         ...(IS_MAC ? [] : [{ type: 'separator' }, settingsItem, { label: 'Set as Default Browser…', click: () => setDefaultBrowserFromMenu() }, { type: 'separator' }, { role: 'quit' }]),
       ],
     },

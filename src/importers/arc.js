@@ -7,10 +7,25 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 
+// Dev/test only (main.js sets it when !app.isPackaged and MERIDIAN_ARC_DIR is given): a fake Arc
+// data folder (StorableSidebar.json + "User Data") used instead of the real one.
+let arcRootOverride = null;
+function setArcRootOverride(dir) { arcRootOverride = dir || null; }
+
+// Arc's own data folder: ~/Library/Application Support/Arc on macOS. (Arc for Windows is an MSIX
+// package; its folder is found by findSidebarFile below.)
+function arcRoot() {
+  if (arcRootOverride) return arcRootOverride;
+  if (process.platform === 'darwin') return path.join(os.homedir(), 'Library', 'Application Support', 'Arc');
+  return null;
+}
+
 // Arc for macOS keeps its data in Application Support; Arc for Windows is an MSIX package.
 function findSidebarFile() {
   const candidates = [];
-  if (process.platform === 'darwin') {
+  if (arcRootOverride) {
+    candidates.push(path.join(arcRootOverride, 'StorableSidebar.json'));
+  } else if (process.platform === 'darwin') {
     candidates.push(path.join(os.homedir(), 'Library', 'Application Support', 'Arc', 'StorableSidebar.json'));
   } else if (process.platform === 'win32') {
     const local = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
@@ -38,10 +53,14 @@ function pairs(arr) {
   return out;
 }
 
+// Arc profile → Meridian profile id. Arc names a custom profile by its folder in "User Data"
+// ("Profile 3" → 'arc-profile-3'); the cookie importer maps those folders with profileIdForDir.
+function profileIdForDir(base) {
+  return base && base !== 'Default' ? 'arc-' + base.toLowerCase().replace(/\s+/g, '-') : 'default';
+}
 function profileIdFrom(profile) {
   if (!profile || profile.default) return 'default';
-  const base = profile.custom?._0?.directoryBasename;
-  return base ? 'arc-' + base.toLowerCase().replace(/\s+/g, '-') : 'default';
+  return profileIdForDir(profile.custom?._0?.directoryBasename);
 }
 
 function toHex(c) {
@@ -139,4 +158,4 @@ function importFromArc() {
   return { spaces, favorites, profiles: [...profiles.values()] };
 }
 
-module.exports = { importFromArc, arcDataExists };
+module.exports = { importFromArc, arcDataExists, arcRoot, setArcRootOverride, profileIdForDir };
