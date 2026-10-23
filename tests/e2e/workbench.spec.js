@@ -130,8 +130,8 @@ test('the sidebar button opens the Workbench; its first screen leads with "Open 
     expect(ui.hub).toMatch(/A hub is a folder set up for that\. Create one/);
     expect(ui.secrets).toBe('Secrets');
     expect(ui.mission).toBe('Mission Control');
-    // Everyday mode keeps it out of sight.
+    // In every mode — people end up in Everyday after an Arc import and still need to find it.
     await page.evaluate(() => applySettingsPatch({ mode: 'everyday' }));
-    await expect(btn).toBeHidden();
+    await expect(btn).toBeVisible();
   } finally { await closeMeridian(m.app); }
 });

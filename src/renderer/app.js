@@ -1084,7 +1084,7 @@ function renderMiniBar() {
 function initSidebar() {
   $$('[data-cmd]').forEach((b) => { if (b.dataset.cmd && !b.innerHTML.trim()) b.innerHTML = icon({ 'toggle-sidebar': 'sidebar', back: 'back', forward: 'forward', reload: 'reload', 'copy-url': 'copy' }[b.dataset.cmd] || 'plus'); });
   $('#btn-downloads').innerHTML = icon('download');
-  $('#btn-workbench').innerHTML = icon('code'); // Workbench: always one click away (hidden in Everyday mode)
+  $('#btn-workbench').innerHTML = icon('code'); // Workbench: always one click away
   $('#btn-workbench').title = `Workbench (${keys('⇧⌘E')})`;
   $('#btn-chat').innerHTML = icon('chat');
   $('#btn-add-space').innerHTML = icon('plus');
@@ -1379,7 +1379,8 @@ function score(text, q) {
 
 // Settings → General → Mode (set in the welcome tour). Unset = everything visible, as before modes existed.
 const uiMode = () => state.settings.mode || 'developer';
-const DEV_COMMANDS = /^(workbench-|open-workbench$|open-project$|mission-control$)/;
+// Opening the Workbench stays findable in every mode; only its finer tools and Mission Control are tucked away.
+const DEV_COMMANDS = /^(workbench-|mission-control$)/;
 
 function updateCommandResults() {
   const raw = $('#cmd-input').value;

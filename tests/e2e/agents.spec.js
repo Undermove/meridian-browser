@@ -146,7 +146,8 @@ test('modes: everyday hides developer tools; developer brings them back', async 
     await expect(page.locator('body')).toHaveClass(/mode-everyday/);
     await page.evaluate(() => openCommandBar());
     await page.locator('#cmd-input').fill('workbench');
-    await expect(page.locator('#cmd-results')).not.toContainText('Open Workbench');
+    await expect(page.locator('#cmd-results')).toContainText('Open Workbench'); // always findable
+    await expect(page.locator('#cmd-results')).not.toContainText('Workbench Safe Mode'); // finer tools tucked away
     await page.evaluate(() => { closeCommandBar(); applySettingsPatch({ mode: 'developer' }); });
     await page.evaluate(() => openCommandBar());
     await page.locator('#cmd-input').fill('workbench');
