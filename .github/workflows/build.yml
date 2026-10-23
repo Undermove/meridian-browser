@@ -1,5 +1,8 @@
 name: Build
 
+# Every push and PR: build Meridian for macOS, Windows and Linux and smoke-test it.
+# A tag like v0.1.0: the same builds, then a GitHub Release with all installers attached.
+
 on:
   push:
     branches: [main]
@@ -7,18 +10,29 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            dist: dist:mac
-          - os: windows-latest
-            dist: dist:win
-          - os: ubuntu-latest
-            dist: dist:linux
+          - name: macOS
+            os: macos-latest
+            dist: npx electron-builder --mac --publish never
+          - name: Windows
+            os: windows-latest
+            dist: npx electron-builder --win --publish never
+          - name: Linux-x64
+            os: ubuntu-latest
+            dist: npx electron-builder --linux --x64 --publish never
+          # node-pty has no Linux prebuilds, so arm64 is compiled on a native arm64 runner.
+          - name: Linux-arm64
+            os: ubuntu-24.04-arm
+            dist: npx electron-builder --linux --arm64 --publish never
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -41,19 +55,44 @@ jobs:
         run: MERIDIAN_USER_DATA="$RUNNER_TEMP/ud" MERIDIAN_SHOT=smoke.png MERIDIAN_STEPS='[{"wait":4000}]' npx electron .
       - uses: actions/upload-artifact@v4
         with:
-          name: smoke-${{ runner.os }}
+          name: smoke-${{ matrix.name }}
           path: smoke.png
 
-      - run: npm run ${{ matrix.dist }}
+      - run: npm run build:mcp
+      - run: ${{ matrix.dist }}
+        shell: bash
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
       - uses: actions/upload-artifact@v4
         with:
-          name: meridian-${{ runner.os }}
+          name: meridian-${{ matrix.name }}
           path: |
             dist/*.dmg
             dist/*.zip
             dist/*.exe
             dist/*.AppImage
             dist/*.deb
-          if-no-files-found: ignore
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: meridian-*
+          path: out
+          merge-multiple: true
+      - name: Checksums
+        run: cd out && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Meridian ${GITHUB_REF_NAME#v}" \
+            --generate-notes

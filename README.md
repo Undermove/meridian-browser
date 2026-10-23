@@ -44,16 +44,34 @@ Arc is being sunset. Meridian keeps the Arc workflow you're used to (spaces, pin
 
 ## Install
 
-Download a build from Releases (`.dmg` for macOS, `Setup.exe` for Windows, `.AppImage` / `.deb` for Linux), or build it yourself:
+Grab the latest build from **[Releases](https://github.com/Undermove/meridian-browser/releases/latest)**:
+
+| | Download |
+|---|---|
+| **macOS** | `Meridian-…-mac-arm64.dmg` (Apple silicon) or `…-mac-x64.dmg` (Intel) |
+| **Windows** | `Meridian-…-win….exe` (one installer for x64 and ARM) |
+| **Linux** | `Meridian-…-linux-….AppImage`, or the `.deb` for Debian/Ubuntu (x64 and arm64) |
+
+Meridian isn't signed with paid Apple/Microsoft certificates yet, so the first launch needs one extra step:
+
+- **macOS**: open the `.dmg`, drag Meridian to Applications, then run once in Terminal:
+  `xattr -dr com.apple.quarantine /Applications/Meridian.app`
+  (or try to open it, then System Settings → Privacy & Security → **Open Anyway**).
+- **Windows**: if SmartScreen says "Windows protected your PC", click **More info → Run anyway**.
+- **Linux**: `chmod +x Meridian-*.AppImage && ./Meridian-*.AppImage`, or `sudo apt install ./Meridian-*.deb`.
+
+`SHA256SUMS.txt` in every release lets you verify the download.
+
+### Build from source
 
 ```bash
-git clone https://github.com/<you>/meridian-browser && cd meridian-browser
+git clone https://github.com/Undermove/meridian-browser && cd meridian-browser
 npm install
 npm start            # run from source
 npm run dist:mac     # or dist:win / dist:linux → installers in dist/
 ```
 
-macOS builds are ad-hoc signed. To share them with other people, sign and notarize them with an Apple Developer ID.
+Releases are built by GitHub Actions from a `v*` tag (`.github/workflows/build.yml`).
 
 ## Connect Claude Code (MCP)
 
