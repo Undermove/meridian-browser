@@ -191,6 +191,19 @@ test.describe('spaces', () => {
     await expectConsistentView(page);
   });
 
+  test('after a two-finger swipe the new page takes clicks: "New Tab" opens the command bar', async ({ page }) => {
+    // Trackpad swipe: horizontal wheel deltas over the sidebar, then the wheel goes quiet.
+    await page.evaluate(() => {
+      const sb = $('#sidebar');
+      for (let i = 0; i < 6; i++) sb.dispatchEvent(new WheelEvent('wheel', { deltaX: 30, deltaY: 0, bubbles: true, cancelable: true }));
+    });
+    expect(await spaceIndex(page)).toBe(1);
+    await page.waitForTimeout(500); // slide animation and the swipe's idle timer
+    await expect(page.locator('.space-page.current')).not.toHaveClass(/moving/);
+    await page.locator('.space-page.current .row.new-tab').click();
+    await expect(page.locator('#cmdbar-overlay')).toBeVisible();
+  });
+
   test('command bar "Switch to tab" jumps to a tab in another space', async ({ page }) => {
     await page.evaluate(() => runCommand('space-index', 1)); // load Beta's tab
     await page.evaluate(() => runCommand('space-index', 0));

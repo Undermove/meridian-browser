@@ -938,6 +938,9 @@ function renderSpacePages(sp) {
   rt.slideDir = 0; rt.slideFrom = 0;
   endDrag(false);
   endSlide();
+  // A swipe leaves the incoming page as the drag's neighbour (`moving`: pointer-events off). It's the
+  // current page now, so it must take clicks and scroll again.
+  p.el.classList.remove('moving');
   if (prev && prev !== p && dir) slidePages(prev.el, p.el, dir, from);
   else { prev?.el.classList.remove('current'); p.el.classList.add('current'); }
 }
