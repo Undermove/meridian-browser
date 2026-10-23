@@ -155,6 +155,10 @@ Every shortcut can be changed in **Settings → Shortcuts**.
 
 Extension toolbar, a password manager integration, sync between devices, Boosts-style site tweaks.
 
+## Privacy
+
+No account, no server, no telemetry. Everything stays on your computer; AI features talk only to the AI you connect. Details: [privacy page](https://undermove.github.io/meridian-browser/privacy.html).
+
 ## License
 
-MIT. Meridian is an independent project, not affiliated with or endorsed by The Browser Company. "Arc" is a trademark of its respective owner and is used here only to describe compatibility.
+MIT. Third-party components and their licenses: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Meridian is an independent project, not affiliated with or endorsed by The Browser Company. "Arc" is a trademark of its respective owner and is used here only to describe compatibility.
