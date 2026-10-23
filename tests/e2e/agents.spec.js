@@ -32,7 +32,9 @@ process.exit(1);
   return { dir, log, calls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []) };
 }
 
-async function launch({ state = seedState(), agent = fakeAgentDir(), env = {} } = {}) {
+// Copilot can't report whether it's signed in, so it's never picked automatically: the profiles here choose
+// it (as "Check" in the tour or Settings would).
+async function launch({ state = seedState({ settings: { aiProvider: 'copilot' } }), agent = fakeAgentDir(), env = {} } = {}) {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mer-agents-'));
   const m = await launchMeridian({ userDataDir, state, env: { MERIDIAN_TEST_PATH: `${agent.dir}${path.delimiter}${testPathDefault()}`, ...env } });
   return { ...m, agent, userDataDir, cleanup: async () => { await closeMeridian(m.app); fs.rmSync(userDataDir, { recursive: true, force: true }); fs.rmSync(agent.dir, { recursive: true, force: true }); } };
@@ -99,7 +101,7 @@ test('"Continue in chat" carries the answer to ⌘J, and the follow-up keeps the
 
 test('with no AI connected, Ask explains how to connect one instead of failing', async () => {
   const empty = { dir: fs.mkdtempSync(path.join(os.tmpdir(), 'mer-noagent-')), calls: () => [] };
-  const m = await launch({ agent: empty });
+  const m = await launch({ agent: empty, state: seedState() });
   try {
     const { page } = m;
     await page.evaluate(() => openCommandBar());
@@ -118,7 +120,7 @@ test('Settings → AI: default agents always, "Other agents" only when turned on
     const winPromise = app.waitForEvent('window', (w) => w.url().startsWith('meridian://app/settings.html'));
     await page.evaluate(() => openSettings('ai'));
     const sw = await winPromise;
-    await expect(sw.locator('#agent-rows .row.agent', { hasText: 'GitHub Copilot' })).toContainText('Installed', { timeout: 15_000 });
+    await expect(sw.locator('#agent-rows .row.agent', { hasText: 'GitHub Copilot' })).toContainText('Installed · not checked', { timeout: 15_000 });
     // Opt-in agents stay hidden (and unusable) until "Other agents" is on.
     await expect(sw.locator('#agent-rows .row.agent', { hasText: 'Codex' })).toHaveCount(0);
     expect(await page.evaluate(() => agentAllowed(aiAgents.list?.find((a) => a.id === 'codex') || { policy: 'optin' }))).toBe(false);
@@ -158,7 +160,11 @@ test('the tour: the agent is found, it proposes a setup from the apps, and apply
     await expect(page.locator('#onboarding')).toBeVisible({ timeout: 15_000 });
     const next = page.locator('#onboarding [data-ob="next"]');
     await next.click();
+    // Copilot can't say whether it's signed in: it's offered with "Check", which sends one tiny request.
+    await expect(page.locator('.ob-step-ai h2')).toHaveText('Bring your AI', { timeout: 15_000 });
+    await page.locator('[data-check="copilot"]').click();
     await expect(page.locator('.ob-step-ai h2')).toHaveText('Your AI is here', { timeout: 15_000 });
+    expect(m.agent.calls()[0].prompt).toContain('Reply with exactly: OK');
     await expect(page.locator('.ob-ai-name')).toContainText('GitHub Copilot');
     await next.click();
     await page.locator('#ob-about').fill('I design mobile apps');

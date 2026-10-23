@@ -41,6 +41,7 @@ contextBridge.exposeInMainWorld('meridian', {
   aiChat: (req) => ipcRenderer.send('ai:chat', req),
   agentsList: (fresh) => ipcRenderer.invoke('agents:list', !!fresh),
   agentsSetup: (id, action) => ipcRenderer.invoke('agents:setup', id, action),
+  agentsCheck: (id) => ipcRenderer.invoke('agents:check', id),
   setupPropose: (opts) => ipcRenderer.invoke('setup:propose', opts),
   aiStop: (sessionId) => ipcRenderer.send('ai:stop', sessionId),
   aiReset: (sessionId) => ipcRenderer.send('ai:reset', sessionId),

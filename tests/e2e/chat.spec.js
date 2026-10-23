@@ -59,7 +59,7 @@ async function setup({ agents = ['qwen'], state, userDataDir } = {}) {
   const dir = userDataDir || fs.mkdtempSync(path.join(os.tmpdir(), 'mer-e2e-'));
   const env = { MERIDIAN_TEST_PATH: bin, ANTHROPIC_API_KEY: '' };
   const st = state || seedState();
-  st.settings = { aiOptInAgents: true, ...st.settings };
+  st.settings = { aiOptInAgents: true, ...(agents.includes('qwen') ? { aiProvider: 'qwen' } : {}), ...st.settings };
   const m = await launchMeridian({ userDataDir: dir, state: st, env });
   const h = {
     ...m, bin, log, userDataDir: dir, env,
@@ -209,6 +209,8 @@ test('nothing set up: the setup card offers Install, and the chat unlocks once a
     // The user installs it in the terminal; the card picks it up.
     fakeQwen(m.bin, m.log);
     await card.locator('[data-act="recheck"]').click();
+    // Qwen Code can't report its sign-in, so the card offers a one-request "Check".
+    await card.locator('[data-check="qwen"]').click();
     await expect(page.locator('#chat-thread .agent-setup-card')).toHaveCount(0, { timeout: 15_000 });
     await expect(page.locator('.chat-suggestion')).toHaveCount(4);
     await expect(page.locator('#chat-input')).toBeEnabled();

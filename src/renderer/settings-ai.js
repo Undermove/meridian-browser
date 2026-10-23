@@ -118,10 +118,11 @@ async function drawAgents(root, hasKey, fresh = false) {
   const chosen = ctx.settings.aiProvider || '';
   const status = (a) => !a.installed ? '<span class="tag">Not installed</span>'
     : a.loggedIn === false ? '<span class="tag warn-tag">Not signed in</span>'
-    : `<span class="tag ok-tag">${a.loggedIn ? 'Ready' : 'Installed'}</span>`;
+    : a.loggedIn ? '<span class="tag ok-tag">Ready</span>' : '<span class="tag">Installed · not checked</span>';
   const action = (a) => !a.installed
     ? (a.install?.cmd ? `<button class="btn small" data-setup="install" data-id="${a.id}">Install…</button>` : `<a class="btn small" href="${esc(a.docs)}" data-ext="${esc(a.docs)}">How to install</a>`)
-    : a.loggedIn === false ? `<button class="btn small primary" data-setup="login" data-id="${a.id}">Sign in…</button>` : '';
+    : a.loggedIn === false ? `<button class="btn small primary" data-setup="login" data-id="${a.id}">Sign in…</button>`
+    : a.loggedIn == null ? `<button class="btn small" data-check="${a.id}">Check</button>` : '';
   const radio = (id, label, desc, extra = '', disabled = false) => `
     <label class="row radio agent ${chosen === id ? 'on' : ''} ${disabled ? 'dim' : ''}">
       <input type="radio" name="ai-provider" value="${esc(id)}" ${chosen === id ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
@@ -147,6 +148,15 @@ async function drawAgents(root, hasKey, fresh = false) {
     toast(r.value ? `${r.closest('.row').querySelector('.row-label').firstChild.textContent.trim()} will answer` : 'Automatic');
   }));
   box.onclick = async (e) => {
+    const chk = e.target.closest('[data-check]');
+    if (chk) {
+      e.preventDefault();
+      chk.disabled = true; chk.textContent = 'Checking…';
+      const r = await S.agentsCheck(chk.dataset.check).catch((err) => ({ ok: false, error: err.message }));
+      chk.disabled = false; chk.textContent = 'Check';
+      if (r.ok) { ctx.set({ aiProvider: chk.dataset.check }); toast('It works — selected'); return drawAgents(root, hasKey); }
+      return toast(r.error || 'It didn’t answer.', { timeout: 7000 });
+    }
     const ext = e.target.closest('[data-ext]');
     if (ext) { e.preventDefault(); S.openUrl(ext.dataset.ext); return; }
     const b = e.target.closest('[data-setup]');

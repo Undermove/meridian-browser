@@ -170,7 +170,8 @@ const OB_STEPS = {
             ${agentMark(a)}
             <b>${esc(a.label)}</b>
             <span>${esc(a.id === 'ollama' ? 'Free, on this computer' : a.vendor)}</span>
-            ${a.installed ? `<button class="ob-btn small primary" data-setup="login" data-id="${a.id}">Sign in</button>`
+            ${a.installed && a.loggedIn == null ? `<button class="ob-btn small primary" data-check="${a.id}">Check</button>`
+              : a.installed ? `<button class="ob-btn small primary" data-setup="login" data-id="${a.id}">Sign in</button>`
               : a.install?.cmd ? `<button class="ob-btn small" data-setup="install" data-id="${a.id}">Get it</button>` : `<span class="ob-tag">needs ${esc(a.install?.missing || 'setup')}</span>`}
           </div>`;
       return `
@@ -195,6 +196,14 @@ const OB_STEPS = {
         try { await api.aiSetKey(v); applySettingsPatch({ aiProvider: 'api' }); showObStep(ob.step, 0); } catch (err) { toast('Couldn’t save the key: ' + err.message); }
       });
       page.addEventListener('click', async (e) => {
+        const chk = e.target.closest('[data-check]');
+        if (chk) {
+          chk.disabled = true; chk.textContent = 'Checking…';
+          const r = await api.agentsCheck(chk.dataset.check).catch((err) => ({ ok: false, error: err.message }));
+          if (r.ok) { applySettingsPatch({ aiProvider: chk.dataset.check }); return showObStep(ob.step, 0); }
+          chk.disabled = false; chk.textContent = 'Check';
+          return toast(r.error || 'It didn’t answer.', { timeout: 7000 });
+        }
         const alt = e.target.closest('[data-use]');
         if (alt) { applySettingsPatch({ aiProvider: alt.dataset.use }); return showObStep(ob.step, 0); }
         const b = e.target.closest('[data-setup]');

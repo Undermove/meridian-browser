@@ -287,7 +287,9 @@ function pickAiProvider(agents, hasKey) {
   if (agentReady(c)) return { id: c.id, label: c.label, ready: true, reason: null };
   if (hasKey) return api_;
   const ordered = AI_AUTO_ORDER.map(byId).filter(agentAllowed);
-  const pick = ordered.find((a) => agentReady(a) && a.loggedIn === true) || ordered.find(agentReady);
+  // Automatic only for agents known to work (signed in, or a local model server with a model). Ones that
+  // can't report their sign-in (Copilot) wait for the user to check them once (they may be blocked by an org).
+  const pick = ordered.find((a) => agentReady(a) && a.loggedIn === true);
   if (pick) return { id: pick.id, label: pick.label, ready: true, reason: null };
   if (chosen === 'api') return api_;
   if (c) return { id: c.id, label: c.label, ready: false, reason: !c.installed ? `${c.label} isn’t installed.` : `${c.label} isn’t signed in.` };

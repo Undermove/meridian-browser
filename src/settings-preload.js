@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld('meridianSettings', {
   mcpDetect: call('settings:mcp-detect'),
   agentsList: call('settings:agents-list'),
   agentsSetup: call('settings:agents-setup'),
+  agentsCheck: call('settings:agents-check'),
   mcpConnect: call('settings:mcp-connect'),
   routeTest: call('settings:route-test'),
   copy: call('settings:copy'),

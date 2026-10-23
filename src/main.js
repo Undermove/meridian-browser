@@ -912,6 +912,17 @@ handle('ai:has-key', () => assistant.hasKey());
 handle('ai:set-key', (_e, key) => { assistant.setKey(typeof key === 'string' ? key : ''); return assistant.hasKey(); });
 on('ai:chat', (e, req) => { assistant.chat(e.sender, sanitizeAiRequest(req)); });
 handle('agents:list', (_e, fresh) => localAgents.list({ fresh: !!fresh }));
+// "Check": one tiny request, only when the user clicks it, for agents that can't report their sign-in.
+const agentCheck = (id) => new Promise((resolve) => {
+  if (!allowedProvider(String(id)) || String(id) === 'api') return resolve({ ok: false, error: 'Not available' });
+  let text = '';
+  localAgents.chat(`check-${Date.now()}`, { provider: String(id), prompt: 'Reply with exactly: OK', system: 'Reply with one word.' }, (ev) => {
+    if (ev.delta) text += ev.delta;
+    if (ev.error) resolve({ ok: false, error: ev.error });
+    else if (ev.done) resolve(text.trim() ? { ok: true } : { ok: false, error: 'No answer came back.' });
+  });
+});
+handle('agents:check', (_e, id) => agentCheck(id));
 handle('agents:setup', (e, id, action) => agentSetup(BrowserWindow.fromWebContents(e.sender), String(id), String(action)));
 on('ai:stop', (_e, sessionId) => assistant.stop(sessionId));
 on('ai:reset', (_e, sessionId) => assistant.reset(sessionId));
@@ -1374,6 +1385,7 @@ handleSettings('settings:ai-set-key', (_e, key) => { assistant.setKey(typeof key
 handleSettings('settings:agent-status', () => ({ ...hub.status(), mcp: mcpCommand() }));
 handleSettings('settings:mcp-detect', () => detectClis(mcpScript()));
 handleSettings('settings:agents-list', (_e, fresh) => localAgents.list({ fresh: !!fresh }));
+handleSettings('settings:agents-check', (_e, id) => agentCheck(id));
 handleSettings('settings:agents-setup', (_e, id, action) => agentSetup(settingsWindow, String(id), String(action)));
 handleSettings('settings:mcp-connect', (_e, cli) => connectMcpCli(cli, settingsWindow));
 // "Where would this link go?" for Settings → Links, with the rules being edited (not yet saved).

@@ -17,7 +17,7 @@ const AGENT_POLL_MAX = 60; // ~3 minutes
 
 // Usable for chatting: installed, and not known to be signed out (some CLIs can't tell us).
 const setupCardAllowed = (a) => !!a && (typeof agentAllowed === 'function' ? agentAllowed(a) : a.policy === 'default');
-const setupCardReady = (a) => setupCardAllowed(a) && a.installed && a.loggedIn !== false;
+const setupCardReady = (a) => setupCardAllowed(a) && a.installed && a.loggedIn === true;
 
 function renderAgentSetupCard(el, { onReady, deps = {}, title = 'Choose an AI to chat with', intro } = {}) {
   const m = window.meridian || {};
@@ -31,13 +31,15 @@ function renderAgentSetupCard(el, { onReady, deps = {}, title = 'Choose an AI to
   const h = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   let list = null, waiting = null, polls = 0, timer = null, dead = false, message = '';
 
-  const status = (a) => !a.installed ? ['Not installed', 'off'] : a.loggedIn === false ? ['Sign-in needed', 'warn'] : ['Ready', 'ok'];
+  const status = (a) => !a.installed ? ['Not installed', 'off'] : a.loggedIn === false ? ['Sign-in needed', 'warn'] : a.loggedIn == null ? ['Installed', 'off'] : ['Ready', 'ok'];
   const action = (a) => {
     if (!a.installed) {
       if (!a.install?.cmd) return `<span class="asc-note">${a.install?.missing ? `Needs ${h(a.install.missing)}` : 'Not available here'}</span>`;
       return `<button class="btn small accent" data-setup="${h(a.id)}" data-action="install">Install</button>`;
     }
     if (a.loggedIn === false) return `<button class="btn small accent" data-setup="${h(a.id)}" data-action="login">Sign in</button>`;
+    // Can't report its sign-in (Copilot): one tiny request on click tells whether it works.
+    if (a.loggedIn == null) return `<button class="btn small accent" data-check="${h(a.id)}">Check</button>`;
     return `<span class="asc-ok">${icon('check', 14)}</span>`;
   };
 
@@ -96,6 +98,13 @@ function renderAgentSetupCard(el, { onReady, deps = {}, title = 'Choose an AI to
   }
 
   el.addEventListener('click', async (e) => {
+    const chk = e.target.closest('[data-check]');
+    if (chk && !dead) {
+      chk.disabled = true; chk.textContent = 'Checking…';
+      const r = await (d.check || m.agentsCheck)(chk.dataset.check).catch((err) => ({ ok: false, error: err.message }));
+      if (r?.ok) { d.choose ? d.choose(chk.dataset.check) : (typeof applySettingsPatch === 'function' && applySettingsPatch({ aiProvider: chk.dataset.check })); stopPolling(); onReady?.(list, { hasKey: false, chosen: chk.dataset.check }); return; }
+      message = r?.error || 'It didn’t answer.'; return draw();
+    }
     const b = e.target.closest('[data-setup], [data-act]');
     if (!b || dead) return;
     if (b.dataset.act === 'recheck') { message = ''; return refresh(true); }
