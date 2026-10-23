@@ -15,6 +15,9 @@ const { detectClis, connectCli } = require('./mcp-connect');
 const { importFromArc, arcDataExists } = require('./importers/arc');
 const { AgentHub } = require('./agent/hub');
 const { Assistant, describeError: describeAiError } = require('./ai/assistant');
+const { LocalAgents, PROVIDERS: AGENT_PROVIDERS } = require('./ai/local-agents');
+const { openInTerminal } = require('./ai/agent-setup');
+const { meridianGuide } = require('./ai/guide');
 const { MissionControl } = require('./agents/mission'); // Mission Control
 const { tidyToday, LinkPreviews } = require('./ai/features');
 const { Workbench, isInternalContents, isWorkbenchResource } = require('./dev'); // Workbench (mini IDE), see src/dev/index.js
@@ -782,6 +785,32 @@ handle('devtools:open', (_e, id) => { const wc = webContents.fromId(id); if (wc)
 
 let hub = null;
 let assistant = null;
+let localAgents = null;
+
+// The renderer picks the provider; only known ids get through ('api' = the Claude API key path).
+function sanitizeAiRequest(req) {
+  const r = req && typeof req === 'object' ? req : {};
+  const provider = r.provider === 'api' || Object.prototype.hasOwnProperty.call(AGENT_PROVIDERS, r.provider) ? r.provider : 'api';
+  return { ...r, provider, mode: r.mode === 'ask' ? 'ask' : 'chat', text: String(r.text || '').slice(0, 100_000) };
+}
+
+// Install / sign in to a local AI agent: confirm the exact command, then run it in the system terminal.
+async function agentSetup(win, id, action) {
+  const p = AGENT_PROVIDERS[id];
+  if (!p || !['install', 'login'].includes(action)) return { ok: false, error: 'Unknown agent' };
+  const info = (await localAgents.list()).find((x) => x.id === id);
+  const cmd = action === 'install' ? info?.install?.cmd : p.login;
+  if (!cmd) return { ok: false, error: info?.install?.missing ? `Install ${info.install.missing} first.` : 'No install command for this system.', docs: p.docs };
+  const verb = action === 'install' ? 'Install' : 'Sign in to';
+  const opts = {
+    type: 'question', buttons: ['Cancel', action === 'install' ? 'Open Terminal and Install' : 'Open Terminal and Sign In'], defaultId: 1, cancelId: 0,
+    message: `${verb} ${p.label}?`,
+    detail: `Meridian will open a terminal window and run:\n\n${cmd}\n\n${action === 'install' ? 'Follow any prompts there. ' : 'Your browser may open to finish signing in. '}This window updates by itself when it’s done.`,
+  };
+  const { response } = win && !win.isDestroyed() ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts);
+  if (response !== 1) return { ok: false, cancelled: true };
+  return openInTerminal(cmd, `${verb} ${p.label}`) ? { ok: true } : { ok: false, error: 'Couldn’t open a terminal. Run this yourself: ' + cmd };
+}
 let workbench = null;
 
 function mcpScript() {
@@ -816,7 +845,9 @@ on('agent:rpc-result', (e, payload) => hub.onRpcResult(e.sender, payload || {}))
 
 handle('ai:has-key', () => assistant.hasKey());
 handle('ai:set-key', (_e, key) => { assistant.setKey(typeof key === 'string' ? key : ''); return assistant.hasKey(); });
-on('ai:chat', (e, req) => { assistant.chat(e.sender, req || {}); });
+on('ai:chat', (e, req) => { assistant.chat(e.sender, sanitizeAiRequest(req)); });
+handle('agents:list', (_e, fresh) => localAgents.list({ fresh: !!fresh }));
+handle('agents:setup', (e, id, action) => agentSetup(BrowserWindow.fromWebContents(e.sender), String(id), String(action)));
 on('ai:stop', (_e, sessionId) => assistant.stop(sessionId));
 on('ai:reset', (_e, sessionId) => assistant.reset(sessionId));
 
@@ -1171,6 +1202,8 @@ handleSettings('settings:ai-has-key', () => assistant.hasKey());
 handleSettings('settings:ai-set-key', (_e, key) => { assistant.setKey(typeof key === 'string' ? key : ''); return assistant.hasKey(); });
 handleSettings('settings:agent-status', () => ({ ...hub.status(), mcp: mcpCommand() }));
 handleSettings('settings:mcp-detect', () => detectClis(mcpScript()));
+handleSettings('settings:agents-list', (_e, fresh) => localAgents.list({ fresh: !!fresh }));
+handleSettings('settings:agents-setup', (_e, id, action) => agentSetup(settingsWindow, String(id), String(action)));
 handleSettings('settings:mcp-connect', (_e, cli) => connectMcpCli(cli, settingsWindow));
 // "Where would this link go?" for Settings → Links, with the rules being edited (not yet saved).
 handleSettings('settings:route-test', (_e, atc, url) => {
@@ -1470,7 +1503,8 @@ app.whenReady().then(() => {
     website: REPO_URL, iconPath: path.join(__dirname, '..', 'build', 'icon-1024.png'),
   });
   hub = new AgentHub({ getWindow: () => mainWindow, userDataDir: app.getPath('userData'), isProtected: isInternalContents });
-  assistant = new Assistant({ userDataDir: app.getPath('userData'), hub });
+  localAgents = new LocalAgents({ userDataDir: app.getPath('userData') });
+  assistant = new Assistant({ userDataDir: app.getPath('userData'), hub, localAgents, guide: () => meridianGuide(shortcutRows()) });
   setupMission(); // Mission Control
   hub.observer = mission;
   assistant.observer = mission;

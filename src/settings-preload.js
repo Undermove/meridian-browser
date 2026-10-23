@@ -20,6 +20,8 @@ contextBridge.exposeInMainWorld('meridianSettings', {
   aiSetKey: call('settings:ai-set-key'),
   agentStatus: call('settings:agent-status'),
   mcpDetect: call('settings:mcp-detect'),
+  agentsList: call('settings:agents-list'),
+  agentsSetup: call('settings:agents-setup'),
   mcpConnect: call('settings:mcp-connect'),
   routeTest: call('settings:route-test'),
   copy: call('settings:copy'),

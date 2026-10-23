@@ -45,6 +45,34 @@ function loginPath() {
   return pathPromise;
 }
 
+let envPromise = null;
+
+// Variables the user's login shell exports (e.g. CLAUDE_CONFIG_DIR, CODEX_HOME, proxy settings) that a
+// GUI-launched app doesn't inherit. Only plain identifiers; our own and session-specific ones are skipped.
+const SKIP_LOGIN_VARS = /^(PWD|OLDPWD|SHLVL|_|TERM|TERM_PROGRAM.*|COLORTERM|PS\d|PROMPT.*|RPROMPT|ZSH.*|P9K.*|POWERLEVEL.*|SSH_AUTH_SOCK|DISPLAY|ELECTRON_.*|MERIDIAN_.*|npm_.*|NODE_OPTIONS|TMPDIR|__CF.*|XPC_.*|LaunchInstanceID|SECURITYSESSIONID)$/;
+function loginEnv() {
+  if (envPromise) return envPromise;
+  if (IS_WIN) return (envPromise = Promise.resolve({}));
+  envPromise = new Promise((resolve) => {
+    const script = 'printf "__MERIDIAN_ENV__"; env -0; printf "__MERIDIAN_END__"';
+    execFile(userShell(), ['-ilc', script], { timeout: 5000, env: { ...process.env, TERM: 'dumb' }, encoding: 'utf8', maxBuffer: 4 << 20 }, (_err, stdout) => {
+      const m = /__MERIDIAN_ENV__([\s\S]*?)__MERIDIAN_END__/.exec(stdout || '');
+      const out = {};
+      if (m) {
+        for (const entry of m[1].split('\0')) {
+          const i = entry.indexOf('=');
+          if (i <= 0) continue;
+          const k = entry.slice(0, i);
+          if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) || SKIP_LOGIN_VARS.test(k)) continue;
+          out[k] = entry.slice(i + 1);
+        }
+      }
+      resolve(out);
+    });
+  });
+  return envPromise;
+}
+
 // Absolute path of an executable on the given PATH, or null. No shell involved.
 function which(name, searchPath) {
   const exts = IS_WIN ? (process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';').map((e) => e.toLowerCase()) : [''];
@@ -67,7 +95,7 @@ function which(name, searchPath) {
 // own dev/Electron variables (they'd confuse child Node/Electron apps the user runs).
 async function childEnv(extra = {}) {
   const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
+  for (const [k, v] of Object.entries({ ...process.env, ...(await loginEnv()) })) {
     if (/^(ELECTRON_|MERIDIAN_|npm_|NODE_OPTIONS$|INIT_CWD$|CHROME_DESKTOP$)/i.test(k)) continue;
     env[k] = v;
   }
@@ -79,4 +107,4 @@ async function childEnv(extra = {}) {
   return { ...env, ...extra };
 }
 
-module.exports = { userShell, loginPath, which, childEnv, IS_WIN };
+module.exports = { userShell, loginPath, loginEnv, which, childEnv, IS_WIN };
