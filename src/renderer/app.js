@@ -1,7 +1,7 @@
 /* Meridian — renderer (browser chrome UI).
  *
  * Model (persisted to state.json by the main process):
- *   spaces[]     { id, name, icon, color, profileId, pinned: Node[], today: Tab[], activeTabId, split }
+ *   spaces[]     { id, name, icon, color, profileId, pinned: Node[], pinnedCollapsed?, today: Tab[], activeTabId, split }
  *   favorites    { [profileId]: Tab[] }          — shared by all spaces of a profile, like Arc
  *   Node = Tab   { id, type:'tab', url, title, customTitle?, favicon?, currentUrl?, lastActive? }
  *        | Folder{ id, type:'folder', title, collapsed, children: Node[] }
@@ -569,7 +569,7 @@ function visibleTabIds(sp = space()) {
       else if (!hidden || n.id === sp.activeTabId) ids.push(n.id);
     }
   };
-  add(sp.pinned, false);
+  add(sp.pinned, !!sp.pinnedCollapsed);
   return ids.concat(sp.today.map((t) => t.id));
 }
 
@@ -804,7 +804,7 @@ function pageFor(sp) {
   el.className = 'space-page';
   el.dataset.space = sp.id;
   el.innerHTML = `
-    <div class="space-header"><span class="space-icon"></span><span class="space-name"></span></div>
+    <div class="space-header" title="Collapse or expand pinned tabs"><span class="space-icon"></span><span class="space-name"></span><span class="space-chev">${icon('chevronDown', 12)}</span></div>
     <div class="zone" data-zone="pinned"></div>
     <div class="divider"><span>Today</span><button class="clear-today" title="${esc(keys('Clear Today (⇧⌘K)'))}">Clear</button></div>
     <button class="row new-tab" data-cmd="command-bar">${icon('plus', 14)}<span>New Tab</span></button>
@@ -824,7 +824,12 @@ function renderPage(sp) {
   setText(p.icon, sp.icon || '');
   setText(p.name, sp.name);
   const ctx = { sp, p, seen: new Set() };
-  if (sp.pinned.length) syncChildren(p.pinned, sp.pinned.map((n) => nodeEl(n, ctx, 0)));
+  // Clicking the space name collapses the whole pinned section (like Arc); the active pinned tab stays.
+  p.el.classList.toggle('pinned-collapsed', !!sp.pinnedCollapsed);
+  if (sp.pinnedCollapsed) {
+    const active = activeIn(sp.pinned, sp);
+    syncChildren(p.pinned, active ? [tabEl(active, ctx, 'pinned', 0)] : []);
+  } else if (sp.pinned.length) syncChildren(p.pinned, sp.pinned.map((n) => nodeEl(n, ctx, 0)));
   else if (!p.pinned.querySelector('.zone-hint')) p.pinned.innerHTML = '<div class="zone-hint">Drag tabs here to pin them</div>';
   syncChildren(p.today, sp.today.map((t) => tabEl(t, ctx, 'today', 0)));
   if (p.rows.size > ctx.seen.size) for (const id of p.rows.keys()) if (!ctx.seen.has(id)) p.rows.delete(id);
@@ -852,7 +857,7 @@ function folderEl(n, ctx, depth) {
   ctx.seen.add(n.id);
   // Patched in place (never innerHTML on the row): a click toggles `collapsed`, and replacing the nodes
   // under the pointer between the two clicks of a double-click would stop `dblclick` (rename) firing.
-  const active = n.collapsed ? activeInside(n, ctx.sp) : null;
+  const active = n.collapsed ? activeIn(n.children, ctx.sp) : null;
   const sig = `${n.collapsed}|${!!active}|${depth}|${n.title}`;
   if (w._sig !== sig) {
     w._sig = sig;
@@ -865,9 +870,9 @@ function folderEl(n, ctx, depth) {
   return w;
 }
 
-function activeInside(folder, sp) {
+function activeIn(nodes, sp) {
   let found = null;
-  if (sp.activeTabId) walk(folder.children, (c) => { if (c.id === sp.activeTabId) { found = c; return false; } });
+  if (sp.activeTabId) walk(nodes, (c) => { if (c.id === sp.activeTabId) { found = c; return false; } });
   return found;
 }
 
@@ -1146,6 +1151,12 @@ function initSidebar() {
       return;
     }
     if (e.target.closest('.clear-today')) return clearToday();
+    if (e.target.closest('.space-header')) {
+      const sp = space();
+      sp.pinnedCollapsed = !sp.pinnedCollapsed;
+      render(); save();
+      return;
+    }
     const dot = e.target.closest('.space-dot');
     if (dot) {
       const i = state.spaces.findIndex((s) => s.id === dot.dataset.space);

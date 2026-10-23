@@ -233,6 +233,33 @@ test.describe('folders', () => {
     await expect(row(ids[1])).toBeVisible();
   });
 
+  test('clicking the space name collapses the whole pinned section, keeping the active pinned tab', async ({ page, server }) => {
+    const ids = await page.evaluate((urls) => {
+      const [a, b] = urls.map((url, i) => ({ id: `p${i}`, type: 'tab', url, title: `P${i}` }));
+      space().pinned.unshift(a, { id: 'f1', type: 'folder', title: 'F', collapsed: false, children: [b] });
+      render();
+      return [a.id, b.id];
+    }, ['/p/a', '/p/b'].map((p) => server.url(p)));
+    const pinnedRow = (id) => page.locator(`#pinned .row[data-id="${id}"]`);
+    await expect(pinnedRow('f1')).toBeVisible();
+
+    await page.locator('.space-page.current .space-header').click();
+    expect(await page.evaluate(() => space().pinnedCollapsed)).toBe(true);
+    await expect(pinnedRow(ids[0])).toBeHidden();
+    await expect(pinnedRow('f1')).toBeHidden();
+    await expect(page.locator('.space-page.current .row.new-tab')).toBeVisible();
+
+    await page.evaluate((id) => activate(id), ids[1]); // the active pinned tab shows, the section stays collapsed
+    expect(await page.evaluate(() => space().pinnedCollapsed)).toBe(true);
+    await expect(pinnedRow(ids[1])).toBeVisible();
+    await expect(pinnedRow('f1')).toBeHidden();
+    expect(await page.evaluate((ids) => ids.map((id) => visibleTabIds().includes(id)), ids)).toEqual([false, true]);
+
+    await page.locator('.space-page.current .space-header').click();
+    await expect(pinnedRow(ids[0])).toBeVisible();
+    await expect(pinnedRow('f1')).toBeVisible();
+  });
+
   // Sidebar context menus are Meridian's own (menu.js ctxMenu), not native popups.
   test('rename a folder from its context menu', async ({ meridian, page }) => {
     await page.evaluate(() => { space().pinned.unshift({ id: 'f1', type: 'folder', title: 'F', collapsed: false, children: [] }); render(); });
