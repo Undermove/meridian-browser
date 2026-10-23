@@ -44,7 +44,13 @@ Arc is being sunset. Meridian keeps the Arc workflow you're used to (spaces, pin
 
 ## Install
 
-Grab the latest build from **[Releases](https://github.com/Undermove/meridian-browser/releases/latest)**:
+**Easiest: [undermove.github.io/meridian-browser](https://undermove.github.io/meridian-browser/)** picks the right download for your computer. On macOS and Linux you can also install or update with one line:
+
+```bash
+curl -fsSL https://undermove.github.io/meridian-browser/install.sh | bash
+```
+
+Or grab a build from **[Releases](https://github.com/Undermove/meridian-browser/releases/latest)**:
 
 | | Download |
 |---|---|
