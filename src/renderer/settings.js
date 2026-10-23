@@ -30,6 +30,9 @@ const ctx = {
   },
 };
 
+// IPC answers that might hang (they shouldn't) must not keep a section from drawing.
+const withTimeout = (p, fallback, ms = 3000) => Promise.race([Promise.resolve(p).catch(() => fallback), new Promise((r) => setTimeout(() => r(fallback), ms))]);
+
 // ---------------------------------------------------------------- sections registry
 
 const SECTIONS = [];
@@ -118,14 +121,71 @@ function askText(title, value = '', placeholder = '') {
 
 const spaceChip = (sp) => `<span class="chip"><span class="chip-dot" style="--c:${esc(sp.color)}">${sp.icon ? esc(sp.icon) : ''}</span>${esc(sp.name)}</span>`;
 
+// ---------------------------------------------------------------- member card
+// Like Arc's member card at the top of its settings: your name, since when you've used Meridian, in
+// your space's colours. It tilts toward the cursor with a holographic sheen; click the name to change it.
+
+const MERIDIAN_MARK = '<svg class="mc-mark" viewBox="230 400 564 330" aria-hidden="true"><path d="M260 680 A252 252 0 0 1 764 680" fill="none" stroke="currentColor" stroke-width="84" stroke-linecap="round"/><circle cx="512" cy="680" r="46" fill="currentColor"/></svg>';
+
+function memberCard() {
+  const { spaces = [], activeSpaceId, stats = {} } = ctx.snap;
+  const sp = spaces.find((x) => x.id === activeSpaceId) || spaces[0] || {};
+  const c1 = sp.color || '#8a8fe0';
+  const c2 = sp.color2 || spaces.find((x) => x.color && x.color !== c1)?.color || '#e48aa5';
+  const m = ctx.info?.member || { since: Date.now(), name: '' };
+  const name = ctx.settings.memberName || m.name || 'Meridian Member';
+  const since = new Date(m.since).toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+  // A stable member number from the profile's birth time.
+  const no = String(Math.floor(m.since / 1000) % 100000000).padStart(8, '0').replace(/(\d{4})(\d{4})/, '$1 $2');
+  const fig = (n, l) => `<div class="mc-stat"><b>${Number(n || 0).toLocaleString()}</b><span>${l}</span></div>`;
+  return `
+    <div class="member-wrap">
+      <div class="member-card" id="member-card" style="--c1:${esc(c1)};--c2:${esc(c2)}">
+        <div class="mc-sheen"></div>
+        <div class="mc-top">${MERIDIAN_MARK}<span class="mc-word">Meridian</span><span class="mc-no">No. ${no}</span></div>
+        <div class="mc-bottom">
+          <div>
+            <button class="mc-name" id="member-name" title="Change name">${esc(name)}</button>
+            <div class="mc-since">Member since ${esc(since)}</div>
+          </div>
+          <div class="mc-stats">${fig(spaces.length, spaces.length === 1 ? 'space' : 'spaces')}${fig(stats.tabs, 'tabs')}${fig(stats.history, 'visits')}</div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function mountMemberCard(root) {
+  const card = $('#member-card', root);
+  if (!card) return;
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  card.addEventListener('pointermove', (e) => {
+    if (reduce) return;
+    const r = card.getBoundingClientRect();
+    const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+    card.style.setProperty('--rx', `${(0.5 - y) * 14}deg`);
+    card.style.setProperty('--ry', `${(x - 0.5) * 18}deg`);
+    card.style.setProperty('--mx', `${x * 100}%`);
+    card.style.setProperty('--my', `${y * 100}%`);
+    card.classList.add('tilt');
+  });
+  card.addEventListener('pointerleave', () => { card.classList.remove('tilt'); card.style.setProperty('--rx', '0deg'); card.style.setProperty('--ry', '0deg'); });
+  $('#member-name', root).onclick = async () => {
+    const v = await askText('Name on your card', ctx.settings.memberName || ctx.info?.member?.name || '', 'Your name');
+    if (v === null) return;
+    await ctx.set({ memberName: v.slice(0, 40) });
+    showSection('general');
+  };
+}
+
 // ---------------------------------------------------------------- General
 
 registerSection({
   id: 'general', label: 'General', icon: 'sliders', order: 10,
   async render(el) {
     const s = ctx.settings;
-    const [isDefault, arc] = await Promise.all([S.isDefaultBrowser().catch(() => false), S.arcAvailable().catch(() => false)]);
+    const [isDefault, arc] = await Promise.all([withTimeout(S.isDefaultBrowser(), false), withTimeout(S.arcAvailable(), false)]);
     el.innerHTML = `
+      ${memberCard()}
       ${group('Appearance', `
         ${row('Theme', segmented('appearance', [['system', 'System', 'monitor'], ['light', 'Light', 'sun'], ['dark', 'Dark', 'moon']], s.appearance || 'system'))}
         ${row('Sidebar position', segmented('sidebar', [['left', 'Left'], ['right', 'Right']], s.sidebarRight ? 'right' : 'left'))}
@@ -156,6 +216,7 @@ registerSection({
       else { toast(r.ok ? 'Your system will ask you to confirm' : 'Could not set the default browser'); setTimeout(() => showSection('general'), 1500); }
     });
     $('#import', el)?.addEventListener('click', () => S.action('import-arc'));
+    mountMemberCard(el);
     $('#tour', el).onclick = () => S.action('onboarding');
     $('#edit-theme', el).onclick = () => S.action('edit-theme');
   },
@@ -431,7 +492,14 @@ async function showSection(id) {
   page.dataset.section = id;
   const old = el.querySelector('.page');
   if (old?.dataset.q && !changed) page.dataset.q = old.dataset.q;
-  await SECTIONS.find((s) => s.id === id).render(page, ctx);
+  try {
+    await SECTIONS.find((s) => s.id === id).render(page, ctx);
+  } catch (err) {
+    // Never leave a blank page: say what broke.
+    console.error(err);
+    page.innerHTML = group('', row('This section couldn’t load', button('retry-section', 'Try Again'), esc(err?.message || String(err))));
+    $('#retry-section', page).onclick = () => showSection(id);
+  }
   el.replaceChildren(page);
   if (changed) { el.scrollTop = 0; page.classList.add('enter'); }
   if (location.hash !== '#' + id) history.replaceState(null, '', '#' + id);

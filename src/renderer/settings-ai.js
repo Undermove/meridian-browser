@@ -11,7 +11,9 @@ registerSection({
   id: 'ai', label: 'AI', icon: 'sparkles', order: 50,
   async render(el) {
     const s = ctx.settings;
-    const [hasKey, status, clis] = await Promise.all([S.aiHasKey(), S.agentStatus(), S.mcpDetect().catch(() => ({}))]);
+    // Finding the CLIs goes through the login shell and can take seconds: draw the page first, fill them in after.
+    const [hasKey, status] = await Promise.all([withTimeout(S.aiHasKey(), false), withTimeout(S.agentStatus(), {})]);
+    let clis = {};
     const access = s.agentAccess || 'off';
     const cliRow = (id) => {
       const c = clis[id];
@@ -51,8 +53,14 @@ registerSection({
       ${group('Mission Control', `
         ${row('Notify me when an agent is waiting', toggle('mission-notify', s.missionNotify !== false), 'A notification (or a toast while Meridian is in front) when Claude Code needs your permission or input. Mission Control (⇧⌘M) always shows it.')}
       `, 'Mission Control shows Claude Code and Codex sessions started from the Workbench, MCP clients and ⌘J chats, live. It keeps a short history without tool inputs.')}
-      ${group('Coding agents', `${cliRow('claude')}${cliRow('codex')}`,
+      ${group('Coding agents', `<div id="cli-rows"><div class="row"><div class="row-text"><div class="row-desc">Looking for Claude Code and Codex…</div></div></div></div>`,
         'Connect registers Meridian’s MCP server with that CLI. You’ll see the exact command and confirm before it runs. Agents only work while Meridian is running and agent access isn’t Off.')}`;
+
+    S.mcpDetect().catch(() => ({})).then((found) => {
+      clis = found || {};
+      const box = $('#cli-rows', el);
+      if (box) box.innerHTML = cliRow('claude') + cliRow('codex') || '<div class="row"><div class="row-text"><div class="row-desc">Couldn’t look for coding agents.</div></div></div>';
+    });
 
     $('#ai-key-save', el)?.addEventListener('click', async () => {
       const v = $('#ai-key', el).value.trim();

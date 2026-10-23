@@ -140,8 +140,8 @@ function sendSnapshot() {
   if (EPHEMERAL || !state) return;
   const snap = {
     settings: state.settings, profiles: state.profiles, activeSpaceId: state.activeSpaceId,
-    spaces: state.spaces.map((s) => ({ id: s.id, name: s.name, icon: s.icon, color: s.color, profileId: s.profileId })),
-    stats: { archive: state.archive.length, history: rt.historyCount ?? Object.keys(state.history).length },
+    spaces: state.spaces.map((s) => ({ id: s.id, name: s.name, icon: s.icon, color: s.color, color2: s.color2 || null, profileId: s.profileId })),
+    stats: { tabs: state.spaces.reduce((n, s) => n + s.today.length + s.pinned.length, 0), archive: state.archive.length, history: rt.historyCount ?? Object.keys(state.history).length },
   };
   const json = JSON.stringify(snap);
   if (json === lastSnapshot) return;

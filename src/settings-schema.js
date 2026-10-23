@@ -25,6 +25,8 @@ function makeSchema(shortcutIds) {
     aiTidy: bool,
     aiAskFromBar: bool,
     aiLinkPreview: bool,
+    // The name on the member card (Settings → General).
+    memberName: (v) => (typeof v === 'string' && v.trim().length <= 40 ? v.trim().replace(/[\u0000-\u001f]/g, '') : undefined),
     // Only folders that really are unpacked extensions.
     extensions: (v) => {
       if (!Array.isArray(v) || v.length > 50) return undefined;

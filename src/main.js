@@ -267,12 +267,26 @@ function getBlocker() {
   return blockerPromise;
 }
 
+// Ghostery registers its cosmetic-filter IPC handlers process-wide on every enable (and removes them on
+// every disable), so a second profile session threw "second handler" and got no network blocking. The
+// handlers only call into the one shared blocker, so clear them before enabling and restore them after a
+// disable while other sessions still block.
+const GHOSTERY_CHANNELS = ['@ghostery/adblocker/inject-cosmetic-filters', '@ghostery/adblocker/is-mutation-observer-enabled'];
 async function applyAdblock(ses) {
   const blocker = await getBlocker();
   if (!blocker) return;
   const on = blocker.isBlockingEnabled(ses);
-  if (adblockEnabled && !on) blocker.enableBlockingInSession(ses);
-  if (!adblockEnabled && on) blocker.disableBlockingInSession(ses);
+  if (adblockEnabled && !on) {
+    GHOSTERY_CHANNELS.forEach((c) => ipcMain.removeHandler(c));
+    blocker.enableBlockingInSession(ses);
+  }
+  if (!adblockEnabled && on) {
+    blocker.disableBlockingInSession(ses);
+    if ([...knownSessions].some((x) => x !== ses && blocker.isBlockingEnabled(x))) {
+      ipcMain.handle(GHOSTERY_CHANNELS[0], (e, url, msg) => blocker.onInjectCosmeticFilters(e, url, msg));
+      ipcMain.handle(GHOSTERY_CHANNELS[1], (e) => blocker.onIsMutationObserverEnabled(e));
+    }
+  }
 }
 
 const knownSessions = new Set();
@@ -1041,6 +1055,18 @@ function shortcutRows() {
   }));
 }
 
+// For the member card: when this profile was created, and the user's name as a default for the card.
+let memberCache = null;
+function memberInfo() {
+  if (memberCache) return memberCache;
+  let since = Date.now();
+  try { const st = fs.statSync(app.getPath('userData')); since = (st.birthtimeMs > 0 ? st.birthtimeMs : st.mtimeMs) || since; } catch {}
+  let name = '';
+  try { name = os.userInfo().username; } catch {}
+  if (IS_MAC) { try { name = require('child_process').execFileSync('/usr/bin/id', ['-F'], { timeout: 1000, encoding: 'utf8' }).trim() || name; } catch {} }
+  return (memberCache = { since, name: name.slice(0, 40) });
+}
+
 function settingsState() {
   return { snapshot: uiSnapshot, shortcuts: shortcutRows() };
 }
@@ -1096,7 +1122,7 @@ on('settings:open', (_e, section) => openSettingsWindow(typeof section === 'stri
 handleSettings('settings:get', async () => ({
   ...settingsState(),
   platform: process.platform, version: app.getVersion(), electron: process.versions.electron, chrome: process.versions.chrome,
-  packaged: app.isPackaged, mcp: mcpCommand(), repo: REPO_URL,
+  packaged: app.isPackaged, mcp: mcpCommand(), repo: REPO_URL, member: memberInfo(),
 }));
 handleSettings('settings:set', (_e, patch) => {
   const clean = validatePatch(patch, shortcutIds());
