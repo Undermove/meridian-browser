@@ -281,6 +281,19 @@ test.describe('onboarding', () => {
     await expect(page.locator('#onboarding .ob-hello-word')).toBeVisible();
   });
 
+  // Synthetic clicks ignore window drag regions, so this checks the CSS instead: a drag region over the
+  // tour (or its full-size ::after layer) swallowed every real click on Continue in 0.2.0/0.2.1.
+  test('the tour only drags the window by its top strip, so real clicks reach the buttons', async ({ meridian }) => {
+    const { page } = meridian;
+    await expect(page.locator('#onboarding')).toBeVisible();
+    const regions = await page.evaluate(() => {
+      const r = (el, pseudo) => getComputedStyle(el, pseudo).webkitAppRegion;
+      const ob = document.querySelector('#onboarding');
+      return { root: r(ob), after: r(ob, '::after'), stage: r(document.querySelector('.ob-stage')), foot: r(document.querySelector('.ob-foot')), next: r(document.querySelector('[data-ob="next"]')), top: r(document.querySelector('.ob-top')) };
+    });
+    expect(regions).toEqual({ root: 'no-drag', after: 'no-drag', stage: 'no-drag', foot: 'no-drag', next: 'no-drag', top: 'drag' });
+  });
+
   test('app shortcuts don\'t act behind the open tour', async ({ meridian }) => {
     const { page } = meridian;
     await expect(page.locator('#onboarding')).toBeVisible();
