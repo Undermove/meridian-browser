@@ -46,6 +46,13 @@ const CHROME_UA = app.userAgentFallback
   .replace(/\smeridian-browser\/\S+/i, '');
 app.userAgentFallback = CHROME_UA;
 
+// Google's sign-in refuses Chromium-based apps it can't tell from embedded web views ("This browser or
+// app may not be secure"). On accounts.google.com only, Meridian presents itself as Firefox — the same
+// thing other independent browsers on this engine do — and everywhere else as Chrome.
+const SIGNIN_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:144.0) Gecko/20100101 Firefox/144.0'
+  .replace('Macintosh; Intel Mac OS X 10.15', process.platform === 'win32' ? 'Windows NT 10.0; Win64; x64' : process.platform === 'linux' ? 'X11; Linux x86_64' : 'Macintosh; Intel Mac OS X 10.15');
+const isGoogleSignIn = (url) => { try { return new URL(url).hostname === 'accounts.google.com'; } catch { return false; } };
+
 let mainWindow = null;
 const miniWindows = new Set();
 const privateWindows = new Map(); // BrowserWindow -> in-memory partition name
@@ -305,6 +312,12 @@ function prepareSession(ses) {
   preparedSessions.add(ses);
   knownSessions.add(ses);
   ses.setUserAgent(CHROME_UA);
+  ses.webRequest.onBeforeSendHeaders({ urls: ['*://accounts.google.com/*'] }, (details, callback) => {
+    const h = details.requestHeaders;
+    h['User-Agent'] = SIGNIN_UA;
+    for (const k of Object.keys(h)) if (/^sec-ch-ua/i.test(k)) delete h[k]; // Firefox sends no UA client hints
+    callback({ requestHeaders: h });
+  });
   ses.on('will-download', handleDownload);
   ses.setPermissionRequestHandler(handlePermissionRequest);
   ses.setDevicePermissionHandler(() => false); // WebUSB / WebHID / Web Serial: off
@@ -565,6 +578,30 @@ async function maybeOpenExternal(url, contents) {
 
 // Force safe settings on every <webview> no matter what the embedder asked for.
 app.on('web-contents-created', (_e, contents) => {
+  // navigator.userAgent has to match the header on Google's sign-in page (see SIGNIN_UA).
+  // setUserAgent alone leaves navigator.userAgentData (Chromium-only) in place, and Google spots the
+  // mismatch; a DevTools-protocol override replaces the whole UA identity, only while on that page.
+  if (contents.getType() === 'webview') {
+    contents.on('did-start-navigation', (details) => {
+      if (!details.isMainFrame || details.isSameDocument) return;
+      const dbg = contents.debugger;
+      if (isGoogleSignIn(details.url)) {
+        if (contents.__signinOverride) return;
+        contents.__signinOverride = true;
+        try {
+          if (!dbg.isAttached()) dbg.attach('1.3');
+          dbg.sendCommand('Runtime.runIfWaitingForDebugger').catch(() => {}); // a page attached mid-navigation waits for this
+          // Google's checks run as the page starts, so once this first load is done, reload it with the
+          // override already in place.
+          dbg.sendCommand('Emulation.setUserAgentOverride', { userAgent: SIGNIN_UA, platform: process.platform === 'darwin' ? 'MacIntel' : process.platform === 'win32' ? 'Win32' : 'Linux x86_64' }).catch(() => {});
+          contents.once('did-finish-load', () => { if (!contents.isDestroyed() && isGoogleSignIn(contents.getURL())) contents.reload(); });
+        } catch {}
+      } else if (contents.__signinOverride) {
+        contents.__signinOverride = false;
+        try { if (dbg.isAttached()) dbg.detach(); } catch {}
+      }
+    });
+  }
   contents.on('will-attach-webview', (event, webPreferences, params) => {
     // Workbench integration: the internal workbench page gets its own preload/partition; refuses misuse.
     if (workbench && workbench.attachPolicy(contents, event, webPreferences, params)) return;
