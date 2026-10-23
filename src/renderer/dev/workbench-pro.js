@@ -81,7 +81,7 @@ function applySettings(prev) {
   const changed = (k) => !prev || prev.layout[k] !== s.layout[k];
   if (changed('treeWidth') && (prev || s.layout.treeWidth !== DEFAULTS.layout.treeWidth)) root.setProperty('--tree-w', s.layout.treeWidth + 'px');
   if (changed('terminalHeight') && (prev || s.layout.terminalHeight !== DEFAULTS.layout.terminalHeight)) root.setProperty('--term-h', s.layout.terminalHeight);
-  root.setProperty('--side-w', s.layout.sidePanelWidth + 'px');
+  if (changed('sidePanelWidth') && (prev || s.layout.sidePanelWidth !== DEFAULTS.layout.sidePanelWidth)) root.setProperty('--side-w', s.layout.sidePanelWidth + 'px');
   $('#tree-pane').hidden = !s.layout.showTree;
   $('#tree-grip').hidden = !s.layout.showTree;
   if (s.ui.accent) applySpace(s.ui.accent);
@@ -474,10 +474,15 @@ function initSidePane() {
   $('#btn-secrets').addEventListener('click', () => (PRO.activePanel === 'secrets' ? closePanel() : openPanel('secrets')));
   $('#btn-customize').addEventListener('click', () => (PRO.activePanel === 'customize' ? closePanel() : openPanel('customize')));
   $('#side-close').addEventListener('click', closePanel);
+  const sw = Number(load('sideW')); if (sw) document.documentElement.style.setProperty('--side-w', sw + 'px');
   $('#side-grip').addEventListener('mousedown', (e) => {
     e.preventDefault();
     document.body.classList.add('resizing');
-    const move = (ev) => document.documentElement.style.setProperty('--side-w', Math.min(Math.max(220, window.innerWidth - ev.clientX), window.innerWidth * 0.6) + 'px');
+    const move = (ev) => {
+      const w = Math.round(Math.min(Math.max(220, window.innerWidth - ev.clientX), window.innerWidth * 0.6));
+      document.documentElement.style.setProperty('--side-w', w + 'px');
+      store('sideW', w);
+    };
     const up = () => { document.body.classList.remove('resizing'); window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); fitActive(); };
     window.addEventListener('mousemove', move);
     window.addEventListener('mouseup', up);
@@ -1180,7 +1185,7 @@ async function proBoot() {
   wb.onCustomChange((p) => { if (p?.safeMode === true) reloadCustom({ quiet: true }).then(reloadForSafeMode); else reloadCustom(); });
   wb.onVaultChange(() => refreshVault());
   bus.addEventListener('info', (e) => { PRO.info = e.detail; });
-  bus.addEventListener('editor-ready', () => applySettings(null));
+  bus.addEventListener('editor-ready', () => applySettings(PRO.settings)); // editor options only; keep the dragged layout
   bus.addEventListener('project', () => { refreshVault(); scanSecrets(); refreshHub(); hideNotice(PRO.noticeKey?.startsWith('pasted:') ? PRO.noticeKey : null); });
   await reloadCustom({ quiet: true });
   refreshVault();

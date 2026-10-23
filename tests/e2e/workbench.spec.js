@@ -84,6 +84,29 @@ test.describe('workbench', () => {
     expect(fs.readFileSync(outside, 'utf8')).toBe('OUTSIDE-SECRET');
   });
 
+  test('a dragged side panel keeps its width when customizations reload', async () => {
+    test.setTimeout(60_000);
+    const { page } = launched;
+    await page.evaluate(() => runCommand('open-project'));
+    await expect.poll(() => inWb(page, 'S.project && S.project.root').catch(() => null), { timeout: 15_000 }).toBe(project);
+    await inWb(page, `openPanel('secrets'); true`);
+    const width = () => inWb(page, `Math.round(document.querySelector('#side-pane').getBoundingClientRect().width)`);
+    // drag the grip 150px to the left
+    await inWb(page, `(() => {
+      const g = document.querySelector('#side-grip'), r = g.getBoundingClientRect(), x = r.left + 2, y = r.top + 50;
+      g.dispatchEvent(new MouseEvent('mousedown', { clientX: x, clientY: y, bubbles: true }));
+      window.dispatchEvent(new MouseEvent('mousemove', { clientX: x - 150, clientY: y }));
+      window.dispatchEvent(new MouseEvent('mouseup', { clientX: x - 150, clientY: y }));
+      return true;
+    })()`);
+    const dragged = await width();
+    expect(dragged).toBeGreaterThan(400);
+    // any change in the customizations folder re-applies settings; that used to snap the panel back to 320px
+    await inWb(page, `reloadCustom({ quiet: true }).then(() => true)`);
+    expect(await width()).toBe(dragged);
+    expect(Number(await inWb(page, `localStorage.getItem('wb.sideW')`))).toBe(dragged);
+  });
+
   test('web pages cannot load the workbench or use its partition', async ({ server }) => {
     const { page } = launched;
     const id = await openTabDirect(page, server.url('/p/wb-attacker'));
