@@ -108,7 +108,7 @@ const TOOLS = [
   },
   {
     name: 'split_view', access: 'write',
-    description: 'Show two tabs side by side in the current space.',
+    description: 'Show two tabs side by side in their space. Either id may be "workbench": the Meridian Workbench tab (where a coding agent session runs), e.g. to show the page you are working on next to it.',
     input_schema: { type: 'object', properties: { left_tab_id: { type: 'string' }, right_tab_id: { type: 'string' } }, required: ['left_tab_id', 'right_tab_id'] },
   },
   {

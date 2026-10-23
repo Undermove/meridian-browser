@@ -155,6 +155,24 @@ test2.describe('MCP page tools (full access)', () => {
     expect(json(await call(mcp, 'wait_for', { tab_id, selector: 'fp-button', timeout_ms: 3000 })).found).toBe(true); // …but each shadow root is searched
   });
 
+  test2('the Workbench tab is listed (marked) and can be split with, but never read or driven', async ({ meridian, mcp, server }) => {
+    await meridian.page.evaluate(() => runCommand('open-workbench'));
+    await expect.poll(() => meridian.page.evaluate(() => state.spaces.flatMap((s) => s.today).find((x) => x.kind === 'workbench')?.id)).toBeTruthy();
+    const wbId = await meridian.page.evaluate(() => state.spaces.flatMap((s) => s.today).find((x) => x.kind === 'workbench').id);
+    const tabs = json(await call(mcp, 'list_tabs'));
+    const wb = tabs.find((t) => t.id === wbId);
+    expect(wb).toMatchObject({ workbench: true });
+    expect(wb.note).toMatch(/split_view/);
+    for (const [tool, args] of [['read_page', {}], ['click', { text: 'Open a project folder' }], ['type_text', { selector: 'input', value: 'x' }], ['close_tab', {}]]) {
+      const r = await call(mcp, tool, { tab_id: wbId, ...args });
+      expect(r.isError, tool).toBe(true);
+      expect(r.text, tool).toMatch(/Workbench/);
+    }
+    const { tab_id } = json(await call(mcp, 'open_tab', { url: server.url('/p/site') }));
+    expect((await call(mcp, 'split_view', { left_tab_id: 'workbench', right_tab_id: tab_id })).isError).toBeFalsy();
+    expect(await meridian.page.evaluate(() => space().split?.ids)).toEqual([wbId, tab_id]);
+  });
+
   test2('click by visible text and wait_for', async ({ mcp, server }) => {
     const { tab_id } = json(await call(mcp, 'open_tab', { url: server.url('/form') }));
     expect((await call(mcp, 'click', { tab_id, text: 'Linked page' })).isError).toBeFalsy();

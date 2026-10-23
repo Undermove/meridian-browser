@@ -9,8 +9,10 @@
 
 // ---------------------------------------------------------------- 1. agent RPC
 
-// Workbench tabs (terminals, local files) are invisible and untouchable for agents.
+// Workbench tabs (terminals, local files) can't be read or driven by agents. They are listed, marked as
+// such, so an agent started in one can put the page it's working on next to it (split_view).
 const agentVisible = (t) => !isWorkbenchTab(t);
+const WORKBENCH_NOTE = 'Meridian Workbench: the coding agent session and its project files run here. You can show a page next to it with split_view (left_tab_id or right_tab_id = this id, or "workbench"); you cannot read, click or type in it.';
 
 function tabInfo(t, sp, zone, folder) {
   return {
@@ -18,6 +20,7 @@ function tabInfo(t, sp, zone, folder) {
     ...(folder ? { folder } : {}),
     loaded: rt.views.has(t.id), active: sp.id === state.activeSpaceId && sp.activeTabId === t.id,
     space_id: sp.id, space: sp.name,
+    ...(isWorkbenchTab(t) ? { workbench: true, note: WORKBENCH_NOTE } : {}),
   };
 }
 
@@ -30,14 +33,26 @@ function allTabs(sp) {
     }
   };
   visit(sp.pinned, []);
-  for (const t of sp.today) if (agentVisible(t)) out.push(tabInfo(t, sp, 'today'));
+  for (const t of sp.today) out.push(tabInfo(t, sp, 'today')); // Workbench tabs included, marked (see tabInfo)
   return out;
 }
 
-function mustLocate(tabId) {
+// The Workbench tab an agent most likely means: in the active space first, the active one if several.
+function workbenchTabFor() {
+  for (const sp of [space(), ...state.spaces.filter((x) => x !== space())]) {
+    const all = sp.today.filter(isWorkbenchTab);
+    const t = all.find((x) => x.id === sp.activeTabId || sp.split?.ids?.includes(x.id)) || all[0];
+    if (t) return t.id;
+  }
+  return null;
+}
+
+// allowWorkbench: only for arranging tabs (split view) — never for reading or acting in one.
+function mustLocate(tabId, { allowWorkbench = false } = {}) {
+  if (allowWorkbench && tabId === 'workbench') tabId = workbenchTabFor() || '';
   const l = tabId ? locateAnywhere(tabId) : (space().activeTabId ? locate(space().activeTabId) : null);
   if (!l) throw new Error(tabId ? `no tab with id ${tabId}` : 'no active tab — pass tab_id or open_tab first');
-  if (!agentVisible(l.node)) throw new Error(tabId ? `no tab with id ${tabId}` : 'the active tab is not available to agents — pass tab_id');
+  if (!allowWorkbench && !agentVisible(l.node)) throw new Error(tabId ? 'that tab is the Meridian Workbench: agents can show a page next to it (split_view) but can’t read or control it' : 'the active tab is the Workbench, which agents can’t read or control — pass tab_id');
   return l;
 }
 
@@ -172,11 +187,12 @@ const AGENT_OPS = {
   },
 
   split: ({ left_tab_id, right_tab_id }) => {
-    const a = mustLocate(left_tab_id), b = mustLocate(right_tab_id);
+    const a = mustLocate(left_tab_id, { allowWorkbench: true }), b = mustLocate(right_tab_id, { allowWorkbench: true });
+    if (a.node.id === b.node.id) throw new Error('pick two different tabs');
     if (a.space !== b.space) throw new Error('both tabs must be in the same space');
     ensureSpaceActive(a.space);
-    a.space.split = { ids: [left_tab_id, right_tab_id], ratio: 0.5 };
-    activate(right_tab_id, { focus: false });
+    a.space.split = { ids: [a.node.id, b.node.id], ratio: 0.5 };
+    activate(b.node.id, { focus: false });
     return { ok: true };
   },
 
