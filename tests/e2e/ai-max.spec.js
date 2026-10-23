@@ -40,7 +40,7 @@ test('⌘J assistant run shows up in Mission Control with its browser tool call'
   } finally { await m.cleanup(); }
 });
 
-test('Ask Claude from the command bar opens ⌘J with the question', async () => {
+test('Ask from the command bar (API key, no local agents) answers inline; Continue in chat opens ⌘J', async () => {
   const m = await launch(seedState());
   try {
     const { page } = m;
@@ -48,10 +48,13 @@ test('Ask Claude from the command bar opens ⌘J with the question', async () =>
     await page.locator('#cmd-input').fill('how do spaces and profiles work');
     const row = page.locator('#cmd-results .cmd-row', { hasText: 'Ask Claude' });
     await expect(row).toHaveCount(1);
+    await expect(page.locator('#cmd-results .cmd-row').first()).toHaveAttribute('data-kind', 'ask');
     await row.dispatchEvent('mousedown');
+    await expect(page.locator('#cmd-answer .ca-body')).toContainText('Mock answer: how do spaces and profiles work', { timeout: 15_000 });
+    await page.locator('[data-ca="chat"]').click();
     await expect(page.locator('body')).toHaveClass(/ai-open/);
     await expect(page.locator('#ai-messages .ai-msg.user')).toHaveText('how do spaces and profiles work');
-    await expect(page.locator('#ai-messages .ai-msg.assistant').last()).toContainText('Mock answer: how do spaces and profiles work', { timeout: 15_000 });
+    await expect(page.locator('#ai-messages .ai-msg.assistant').last()).toContainText('Mock answer: how do spaces and profiles work');
     // URLs don't offer it, and it can be turned off.
     await page.evaluate(() => openCommandBar('new'));
     await page.locator('#cmd-input').fill('example.com');
