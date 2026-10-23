@@ -334,7 +334,6 @@ function activate(id, { focus = true } = {}) {
   l.node.lastActive = now();
   rt.lastSeen.set(id, now());
   rt.mru = [id, ...rt.mru.filter((x) => x !== id)].slice(0, 50);
-  if (l.parent?.collapsed) l.parent.collapsed = false;
   if (focus && typeof closeChat === 'function') closeChat({ focus: false }); // picking a tab returns from the Chat view
   const wv = ensureView(l.node, sp);
   render();
@@ -563,7 +562,14 @@ function deleteNode(id) {
 
 function visibleTabIds(sp = space()) {
   const ids = favs(sp).map((t) => t.id);
-  walk(sp.pinned, (n, _l, parent) => { if (n.type === 'tab' && !(parent && parent.collapsed)) ids.push(n.id); });
+  // A collapsed folder hides its tabs at any depth, except the active one it keeps showing (folderEl).
+  const add = (nodes, hidden) => {
+    for (const n of nodes) {
+      if (n.type === 'folder') add(n.children, hidden || n.collapsed);
+      else if (!hidden || n.id === sp.activeTabId) ids.push(n.id);
+    }
+  };
+  add(sp.pinned, false);
   return ids.concat(sp.today.map((t) => t.id));
 }
 
@@ -829,7 +835,8 @@ function nodeEl(n, ctx, depth) {
   return n.type === 'tab' ? tabEl(n, ctx, 'pinned', depth) : folderEl(n, ctx, depth);
 }
 
-// Children of collapsed folders aren't built until the folder opens.
+// Children of collapsed folders aren't built until the folder opens. Like Arc, a collapsed folder still
+// shows the active tab when it's inside (at any depth), and activating a tab never opens its folder.
 function folderEl(n, ctx, depth) {
   let w = ctx.p.rows.get(n.id);
   if (!w || !w.classList.contains('folder-wrap')) {
@@ -845,15 +852,23 @@ function folderEl(n, ctx, depth) {
   ctx.seen.add(n.id);
   // Patched in place (never innerHTML on the row): a click toggles `collapsed`, and replacing the nodes
   // under the pointer between the two clicks of a double-click would stop `dblclick` (rename) firing.
-  const sig = `${n.collapsed}|${depth}|${n.title}`;
+  const active = n.collapsed ? activeInside(n, ctx.sp) : null;
+  const sig = `${n.collapsed}|${!!active}|${depth}|${n.title}`;
   if (w._sig !== sig) {
     w._sig = sig;
-    w.className = `folder-wrap${n.collapsed ? ' collapsed' : ''}`;
+    w.className = `folder-wrap${n.collapsed ? ' collapsed' : ''}${active ? ' peek' : ''}`;
     w._row.style.setProperty('--depth', depth);
     setText(w._title, n.title);
   }
   if (!n.collapsed) syncChildren(w._children, n.children.map((c) => nodeEl(c, ctx, depth + 1)));
+  else if (active) syncChildren(w._children, [tabEl(active, ctx, 'pinned', depth + 1)]);
   return w;
+}
+
+function activeInside(folder, sp) {
+  let found = null;
+  if (sp.activeTabId) walk(folder.children, (c) => { if (c.id === sp.activeTabId) { found = c; return false; } });
+  return found;
 }
 
 function tabEl(t, ctx, zone, depth) {

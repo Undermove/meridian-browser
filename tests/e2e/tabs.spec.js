@@ -198,6 +198,41 @@ test.describe('folders', () => {
     await expect(page.locator(`.folder-wrap .children .row.tab[data-id="${id}"]`)).toBeVisible();
   });
 
+  test('a folder holding the active tab collapses and stays collapsed, showing only that tab (like Arc)', async ({ page, server }) => {
+    const ids = await page.evaluate((urls) => {
+      const [a, b, c] = urls.map((url, i) => ({ id: `t${i}`, type: 'tab', url, title: `T${i}` }));
+      const sub = { id: 'sub', type: 'folder', title: 'Sub', collapsed: true, children: [c] };
+      space().pinned.unshift({ id: 'f1', type: 'folder', title: 'Dodo', collapsed: false, children: [a, b, sub] });
+      state.spaces.push({ ...space(), id: 'sp2', name: 'Other', pinned: [], today: [], activeTabId: null, split: null });
+      render();
+      return [a.id, b.id, c.id];
+    }, ['/p/a', '/p/b', '/p/c'].map((p) => server.url(p)));
+    const row = (id) => page.locator(`.folder-wrap .children .row.tab[data-id="${id}"]`);
+    await page.locator(`.row.tab[data-id="${ids[0]}"]`).click();
+
+    await page.locator('.row.folder[data-id="f1"]').click();
+    expect(await page.evaluate(() => locate('f1').node.collapsed)).toBe(true);
+    await expect(row(ids[0])).toBeVisible(); // the active tab stays under the collapsed folder
+    await expect(row(ids[1])).toBeHidden();
+    expect(await page.evaluate((ids) => ids.map((id) => visibleTabIds().includes(id)), ids)).toEqual([true, false, false]);
+
+    // Coming back to the space re-activates the tab; that used to open its folder again.
+    await page.evaluate(() => switchSpace('sp2'));
+    await page.evaluate(() => switchSpace(state.spaces[0].id));
+    expect(await page.evaluate(() => locate('f1').node.collapsed)).toBe(true);
+    await expect(row(ids[0])).toBeVisible();
+
+    // A tab deeper inside (in a collapsed subfolder) shows up under the collapsed folder too, folders stay shut.
+    await page.evaluate((id) => activate(id), ids[2]);
+    expect(await page.evaluate(() => [locate('f1').node.collapsed, locate('sub').node.collapsed])).toEqual([true, true]);
+    await expect(row(ids[2])).toBeVisible();
+    await expect(row(ids[0])).toBeHidden();
+
+    await page.locator('.row.folder[data-id="f1"]').click(); // expand: the whole tree is back
+    await expect(row(ids[0])).toBeVisible();
+    await expect(row(ids[1])).toBeVisible();
+  });
+
   // Sidebar context menus are Meridian's own (menu.js ctxMenu), not native popups.
   test('rename a folder from its context menu', async ({ meridian, page }) => {
     await page.evaluate(() => { space().pinned.unshift({ id: 'f1', type: 'folder', title: 'F', collapsed: false, children: [] }); render(); });
