@@ -36,7 +36,7 @@ esac
 
 say "Looking up the latest Meridian release…"
 RELEASE="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$API")" || fail "Couldn't reach GitHub. Check your internet connection and try again."
-URL="$(printf '%s' "$RELEASE" | grep -o '"browser_download_url": *"[^"]*'"$PATTERN"'"' | head -1 | sed 's/.*"\(https[^"]*\)"/\1/')"
+URL="$(printf '%s' "$RELEASE" | grep -o '"browser_download_url": *"[^"]*/Meridian-[0-9][^"/]*'"$PATTERN"'"' | head -1 | sed 's/.*"\(https[^"]*\)"/\1/')"
 SUMS_URL="$(printf '%s' "$RELEASE" | grep -o '"browser_download_url": *"[^"]*SHA256SUMS.txt"' | head -1 | sed 's/.*"\(https[^"]*\)"/\1/')"
 [ -n "$URL" ] || fail "Couldn't find a download for your computer ($PATTERN) in the latest release."
 FILE="${URL##*/}"
