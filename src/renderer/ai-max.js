@@ -25,7 +25,7 @@ function askClaudeResult(raw, isUrl) {
   if (q.length < 3) return null;
   const p = ai.provider;
   const label = p?.ready ? `Ask ${p.label}` : 'Ask AI';
-  return { kind: 'ask', icon: 'sparkles', title: q, sub: p?.ready ? label : 'Connect an AI to get answers here', badge: label, first: looksLikeQuestion(q), keepOpen: true, action: () => startInlineAsk(q) };
+  return { kind: 'ask', icon: 'sparkles', title: q, sub: p?.ready ? 'Answer right here' : 'Connect an AI to get answers here', badge: label, first: looksLikeQuestion(q), keepOpen: true, action: () => startInlineAsk(q) };
 }
 
 const ask = { sessionId: null, q: '', text: '', provider: null, done: false };
