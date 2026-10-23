@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Re-sign a local macOS build with a stable self-signed identity ("Meridian Local Signing"), so the
+# Re-sign a local macOS build with a stable self-signed identity ("Meridian Signing", shared with the release builds), so the
 # Keychain's "Always Allow" for "Meridian Safe Storage" survives rebuilds. Ad-hoc builds are identified
 # by their code hash, which changes on every build, so macOS asks again each time.
 #   Create the identity once: Keychain Access → Certificate Assistant → Create a Certificate…
@@ -7,7 +7,7 @@
 # Usage: scripts/sign-local.sh [path/to/Meridian.app]
 set -euo pipefail
 APP="${1:-dist-next/mac-arm64/Meridian.app}"
-ID="Meridian Local Signing"
+ID="${MERIDIAN_SIGN_ID:-Meridian Signing}"
 if ! security find-identity -p codesigning | grep -q "\"$ID\""; then
   echo "No \"$ID\" code-signing identity in your keychain; leaving the ad-hoc signature." >&2
   exit 0

@@ -1671,31 +1671,11 @@ async function loadExtensionFromMenu() {
 
 // ---------- lifecycle ----------
 
-// macOS asks again for the "Meridian Safe Storage" keychain item whenever a differently signed build
-// opens it (every update of an ad-hoc-signed release). Say so first, before anything reads cookies, so the
-// system dialog doesn't come out of nowhere. Not shown on a first install (the item is created silently).
-async function warnBeforeKeychain() {
-  if (!IS_MAC || !app.isPackaged) return;
-  const marker = path.join(app.getPath('userData'), 'keychain-build.json');
-  let build = app.getVersion();
-  try { build += ':' + fs.statSync(process.execPath).mtimeMs; } catch {}
-  if (readJson(marker, null)?.build === build) return;
-  const run = (args) => new Promise((resolve) => execFile(args[0], args.slice(1), { timeout: 4000, encoding: 'utf8' }, (err, out, errOut) => resolve({ ok: !err, text: `${out || ''}${errOut || ''}` })));
-  const [item, sig] = await Promise.all([
-    run(['/usr/bin/security', 'find-generic-password', '-s', 'Meridian Safe Storage']), // metadata only: no prompt
-    run(['/usr/bin/codesign', '-dv', path.dirname(path.dirname(path.dirname(process.execPath)))]),
-  ]);
-  writeJsonAtomic(marker, { build });
-  if (!item.ok || !/Signature=adhoc/.test(sig.text)) return;
-  await dialog.showMessageBox({
-    type: 'info', buttons: ['Continue'], defaultId: 0,
-    message: 'Your Mac will ask for permission',
-    detail: 'Meridian keeps your saved logins locked on this Mac. Because Meridian was just updated, your Mac asks once whether Meridian may open them.\n\nIn the window that appears next, click “Always Allow”.',
-  });
-}
+// The "Meridian Safe Storage" keychain prompt: Chromium reads that key as the app starts, before any of our
+// code could warn first. Releases are signed with one stable certificate (scripts/build-mac-release.sh), so
+// macOS remembers "Always Allow" across updates; a first install creates the key silently.
 
 app.whenReady().then(async () => {
-  await warnBeforeKeychain().catch(() => {});
   permissionDecisions = readJson(PERMS_FILE(), {});
   const saved = readJson(STATE_FILE(), null);
   if (saved && saved.settings) {
