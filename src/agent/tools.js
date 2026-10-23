@@ -107,6 +107,11 @@ const TOOLS = [
     input_schema: { type: 'object', properties: { tab_id: { type: 'string' }, action: { type: 'string', enum: ['pin', 'unpin', 'favorite', 'rename', 'move_to_space'] }, title: { type: 'string', description: 'For rename.' }, space_id: { type: 'string', description: 'For move_to_space.' } }, required: ['tab_id', 'action'] },
   },
   {
+    name: 'upload_file', access: 'write',
+    description: 'Attach a local file (e.g. an image or video for a post) to a file field on the page: an <input type=file> by element_index or selector; with neither, the only file field on the page. Open the site\'s attach/upload dialog first if needed. The user always confirms the exact file in a native dialog; files with keys or credentials are refused.',
+    input_schema: { type: 'object', properties: { tab_id: tabId, path: { type: 'string', description: 'Absolute path of the local file.' }, element_index: { type: 'integer' }, selector: { type: 'string' } }, required: ['path'] },
+  },
+  {
     name: 'split_view', access: 'write',
     description: 'Show two tabs side by side in their space. Either id may be "workbench": the Meridian Workbench tab (where a coding agent session runs), e.g. to show the page you are working on next to it.',
     input_schema: { type: 'object', properties: { left_tab_id: { type: 'string' }, right_tab_id: { type: 'string' } }, required: ['left_tab_id', 'right_tab_id'] },
@@ -132,7 +137,8 @@ const byName = Object.fromEntries(TOOLS.map((t) => [t.name, t]));
 function validateInput(tool, input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return 'input must be an object';
   const { properties = {}, required = [] } = tool.input_schema;
-  for (const key of required) if (input[key] === undefined || input[key] === null || input[key] === '') return `missing required field: ${key}`;
+  // Empty text is a real value for type_text (clear: true + value '' empties a field).
+  for (const key of required) if (input[key] === undefined || input[key] === null || (input[key] === '' && !(tool.name === 'type_text' && key === 'value'))) return `missing required field: ${key}`;
   for (const [key, value] of Object.entries(input)) {
     const spec = properties[key];
     if (!spec) return `unknown field: ${key}`;

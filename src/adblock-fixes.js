@@ -11,6 +11,10 @@ const SITE_FIXES = [
   // same functions and recurse until the stack overflows, which kills Reddit's own components: the compose
   // form's Send never enables, settings render empty. No scriptlets on Reddit; network blocking stays on.
   'reddit.com#@#+js()',
+  // Same on X: the lists inject ten scriptlets there (five json-prune ones among them); with them the composer
+  // never renders (/compose/post shows "Something went wrong"). Promoted-post requests are still blocked.
+  'x.com#@#+js()',
+  'twitter.com#@#+js()',
 ];
 
 module.exports = { SITE_FIXES };

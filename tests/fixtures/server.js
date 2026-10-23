@@ -37,6 +37,12 @@ function routes(base) {
     '/cookie/show': (_url, req) => page('Cookie Show', `<p id="out">cookie=[${(req.headers.cookie || '').replace(/[<>]/g, '')}]</p>`),
 
     // Agent fixtures.
+    '/upload': () => page('Upload Fixture', `
+      <button id="attach" onclick="document.getElementById('file').click()">Add photos or video</button>
+      <input id="file" type="file" accept="image/*,video/*" style="display:none"
+        onchange="const f=this.files[0]; document.getElementById('got').textContent='got:'+f.name+':'+f.size">
+      <p id="got">nothing</p>
+      <div id="ed" contenteditable="true" role="textbox" aria-label="Post text"></div>`),
     '/form': () => page('Form Fixture', `
       <label>Name <input id="name" name="name" placeholder="Your name"></label>
       <button id="go" onclick="document.getElementById('result').textContent='clicked:'+document.getElementById('name').value">Submit form</button>

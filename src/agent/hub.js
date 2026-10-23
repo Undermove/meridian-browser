@@ -132,12 +132,38 @@ const PAGE = {
 
   clickFallback: `(() => { const el = window.__meridianTarget; if (el) { el.click(); return true; } return false; })()`,
 
+  // Find the file input to upload into: the element itself, or the nearest <input type=file> inside/near it
+  // (sites often hide the real input behind a button). Marked with a random attribute for the DevTools call.
+  markFileInput: (spec) => `(() => {${DEEP}
+    const spec = ${JSON.stringify(spec)};
+    let el = null;
+    if (Number.isInteger(spec.element_index)) el = (window.__meridianEls || [])[spec.element_index];
+    else if (spec.selector) { try { el = deepOne(spec.selector); } catch (e) { return { error: 'invalid selector' }; } }
+    const files = deepAll('input[type=file]');
+    const isFile = (e) => e && e.tagName === 'INPUT' && e.type === 'file';
+    if (el && !isFile(el)) el = (el.shadowRoot && el.shadowRoot.querySelector('input[type=file]')) || el.querySelector?.('input[type=file]') || (el.closest && el.closest('label')?.querySelector('input[type=file]')) || null;
+    if (!el && !spec.selector && !Number.isInteger(spec.element_index)) el = files.length === 1 ? files[0] : null;
+    if (!isFile(el)) return { error: files.length ? 'pick the file field: element_index or selector of an <input type=file> (' + files.length + ' on the page)' : 'no file field on this page — open the attach/upload dialog first' };
+    if (el.disabled) return { error: 'that file field is disabled' };
+    const mark = Math.random().toString(36).slice(2);
+    el.setAttribute('data-meridian-upload', mark);
+    window.__meridianUpload = el;
+    const lab = el.getAttribute('aria-label') || el.closest('label')?.innerText || el.getAttribute('name') || el.getAttribute('accept') || '';
+    return { mark, label: lab.replace(/\\s+/g, ' ').trim().slice(0, 80), multiple: el.multiple, accept: el.accept || '' };
+  })()`,
+
+  unmarkFileInput: `(() => { const el = window.__meridianUpload; if (el) el.removeAttribute('data-meridian-upload'); window.__meridianUpload = null; return true; })()`,
+
+  // What the field we typed into holds now (inputs: value; rich editors: their text).
+  readTarget: `(() => { const el = window.__meridianTarget; if (!el || !el.isConnected) return null; return 'value' in el && typeof el.value === 'string' ? el.value : (el.innerText || '').replace(/\\n$/, ''); })()`,
+
   focusForTyping: (clear) => `(() => {
     const el = window.__meridianTarget; if (!el) return false;
     el.focus();
     if (${clear}) {
       if ('value' in el) { el.select?.(); }
-      else if (el.isContentEditable) { const r = document.createRange(); r.selectNodeContents(el); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }
+      // execCommand goes through the editor's own input events; rich editors (Draft.js on X) ignore a bare DOM range.
+      else if (el.isContentEditable) { if (!document.execCommand('selectAll')) { const r = document.createRange(); r.selectNodeContents(el); const s = getSelection(); s.removeAllRanges(); s.addRange(r); } }
     } else if ('value' in el && typeof el.setSelectionRange === 'function') {
       try { el.setSelectionRange(el.value.length, el.value.length); } catch {}
     }
@@ -243,13 +269,14 @@ class AgentHub {
     }
   }
 
-  async confirm(ctx, summary, tabInfo) {
-    if (this.config.access !== 'ask') return;
+  // always: ask even in "full" mode (handing a local file to a website is never automatic).
+  async confirm(ctx, summary, tabInfo, { always = false, allowLabel = 'Allow', denyLabel = 'Deny' } = {}) {
+    if (this.config.access !== 'ask' && !always) return;
     const win = this.getWindow();
     const who = ctx.source === 'assistant' ? 'The Meridian assistant' : 'An AI agent (MCP)';
     const { response } = await dialog.showMessageBox(win, {
       type: 'question',
-      buttons: ['Allow', 'Deny'],
+      buttons: [allowLabel, denyLabel],
       defaultId: 1, // a stray Enter must not approve
       cancelId: 1,
       message: `${who} wants to ${summary.split('\n')[0]}`,
@@ -326,10 +353,18 @@ class AgentHub {
   }
 
   async t_screenshot({ tab_id }, ctx) {
-    const { wc } = await this.page(tab_id, ctx);
-    // A hidden (background) page has no frames to capture; capturePage() can then wait forever.
-    const img = await Promise.race([wc.capturePage().catch(() => null), sleep(3000).then(() => null)]);
-    if (!img || img.isEmpty()) throw new Error('This tab is in the background, so it has no picture yet. Call activate_tab first, then screenshot.');
+    const { wc, info } = await this.page(tab_id, ctx);
+    const grab = () => Promise.race([wc.capturePage().catch(() => null), sleep(3000).then(() => null)]);
+    // A hidden (background) page has no frames to capture. Render it behind the visible page for a moment
+    // (the same "live" state clicks use) instead of switching the user's tab.
+    let img = await grab();
+    if (!img || img.isEmpty()) {
+      img = await this.withLiveTab(info.tabId, wc, async () => {
+        for (let i = 0; i < 6; i++) { await sleep(250); const shot = await grab(); if (shot && !shot.isEmpty()) return shot; }
+        return null;
+      });
+    }
+    if (!img || img.isEmpty()) throw new Error('Couldn’t get a picture of this background tab. Call activate_tab first, then screenshot.');
     const size = img.getSize();
     const scaled = size.width > 1600 ? img.resize({ width: 1600 }) : img;
     return [{ type: 'image', data: scaled.toJPEG(70).toString('base64'), mimeType: 'image/jpeg' }];
@@ -411,6 +446,7 @@ class AgentHub {
   }
 
   async t_type_text({ tab_id, value, clear = false, submit = false, ...spec }, ctx) {
+    let located = false;
     if (this.config.access === 'ask' && value.length > 2000) throw new Error('Text over 2000 characters is too long to review; split it up.');
     const { wc, info } = await this.page(tab_id, ctx);
     if (spec.element_index !== undefined || spec.selector || spec.text) {
@@ -418,12 +454,29 @@ class AgentHub {
       if (t.error) throw new Error(t.error);
       await this.confirm(ctx, `type into ${t.password ? 'a PASSWORD field' : `“${t.label || t.tag}”`}${submit ? ' and SUBMIT it (Enter)' : ''}\nText (${value.length} characters):\n${value}${t.form ? `\n\nForm submits to: ${t.form}` : ''}`, info);
       await this.run(wc, PAGE.focusForTyping(!!clear));
+      located = true;
     } else {
       await this.confirm(ctx, `type into the focused field${submit ? ' and SUBMIT it (Enter)' : ''}\nText (${value.length} characters):\n${value}`, info);
     }
     await this.withLiveTab(info.tabId, wc, async () => {
-      if (clear) { wc.sendInputEvent({ type: 'keyDown', keyCode: 'Backspace' }); wc.sendInputEvent({ type: 'keyUp', keyCode: 'Backspace' }); }
+      if (clear) {
+        const deleted = located && await this.run(wc, `document.execCommand('delete')`).catch(() => false);
+        if (!deleted) { wc.sendInputEvent({ type: 'keyDown', keyCode: 'Backspace' }); wc.sendInputEvent({ type: 'keyUp', keyCode: 'Backspace' }); }
+        await sleep(50);
+      }
+      const before = located && !clear ? await this.run(wc, PAGE.readTarget).catch(() => null) : '';
+      // insertText commits text like an input method: independent of the keyboard layout.
       await wc.insertText(value);
+      await sleep(150);
+      // Fast-re-rendering (React) fields sometimes drop the tail: type whatever didn't arrive.
+      if (located && typeof before === 'string') {
+        const want = before + value;
+        const now = await this.run(wc, PAGE.readTarget).catch(() => null);
+        if (typeof now === 'string' && now !== want && want.startsWith(now) && now.length >= before.length) {
+          await wc.insertText(want.slice(now.length));
+          await sleep(150);
+        }
+      }
       if (submit) {
         wc.sendInputEvent({ type: 'keyDown', keyCode: 'Return' });
         wc.sendInputEvent({ type: 'char', keyCode: '\r' });
@@ -438,12 +491,51 @@ class AgentHub {
     return json({ typed: value.length + ' characters', submitted: submit, url: wc.getURL() });
   }
 
+  // Attach a local file to a file input (uploading an image or video to a post, say). Always confirmed in a
+  // native dialog that shows the exact file, its size and the site, whatever the access level; key and
+  // credential locations are refused outright.
+  async t_upload_file({ tab_id, path: filePath, ...spec }, ctx) {
+    const resolved = path.resolve(String(filePath || ''));
+    if (!path.isAbsolute(String(filePath || ''))) throw new Error('path must be an absolute path to a file');
+    let st;
+    try { st = fs.statSync(resolved); } catch { throw new Error('no such file'); }
+    if (!st.isFile()) throw new Error('not a file');
+    if (st.size > 1024 * 1024 * 1024) throw new Error('file is over 1 GB');
+    const real = fs.realpathSync(resolved);
+    const home = os.homedir();
+    const forbidden = [path.join(home, '.ssh'), path.join(home, '.aws'), path.join(home, '.gnupg'), path.join(home, '.config', 'gh'), path.join(home, 'Library', 'Keychains'), path.join(home, '.docker'), path.join(home, '.kube'), this.dir];
+    if (forbidden.some((d) => real === d || real.startsWith(d + path.sep)) || /(^|[\\/])\.env(\.|$)|\.(pem|key|p12|pfx|keychain-db)$/i.test(real)) throw new Error('that file holds keys or credentials; agents can’t upload it');
+    const { wc, info } = await this.page(tab_id, ctx);
+    const t = await this.run(wc, PAGE.markFileInput(spec));
+    if (t.error) throw new Error(t.error);
+    const mb = st.size >= 1024 * 1024 ? `${(st.size / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(st.size / 1024))} KB`;
+    await this.confirm(ctx, `upload a file from your computer to ${hostOf(wc.getURL())}\nFile: ${real}\nSize: ${mb}\nInto: “${t.label || 'file field'}”`, info, { always: true, allowLabel: 'Upload this file', denyLabel: 'Don’t upload' });
+    const dbg = wc.debugger;
+    const attachedHere = !dbg.isAttached();
+    try {
+      if (attachedHere) dbg.attach('1.3');
+      await dbg.sendCommand('DOM.getDocument', { depth: -1, pierce: true });
+      const { searchId, resultCount } = await dbg.sendCommand('DOM.performSearch', { query: `[data-meridian-upload="${t.mark}"]`, includeUserAgentShadowDOM: false });
+      if (!resultCount) throw new Error('the file field disappeared — call get_interactive_elements again');
+      const { nodeIds } = await dbg.sendCommand('DOM.getSearchResults', { searchId, fromIndex: 0, toIndex: 1 });
+      await dbg.sendCommand('DOM.discardSearchResults', { searchId }).catch(() => {});
+      await dbg.sendCommand('DOM.setFileInputFiles', { files: [real], nodeId: nodeIds[0] });
+    } finally {
+      await this.run(wc, PAGE.unmarkFileInput).catch(() => {});
+      if (attachedHere) { try { dbg.detach(); } catch {} }
+    }
+    return json({ uploaded: path.basename(real), size: mb, into: t.label || 'file field' });
+  }
+
   async t_press_key({ tab_id, key }, ctx) {
     const { wc, info } = await this.page(tab_id, ctx);
     await this.confirm(ctx, `press ${key}`, info);
     const map = { Enter: 'Return', Esc: 'Escape' };
     const keyCode = map[key] || key;
     await this.withLiveTab(info.tabId, wc, async () => {
+      // A single printable character is text, not a physical key: key events are turned into characters by
+      // the OS keyboard layout ("o" on a Russian layout types "щ").
+      if ([...key].length === 1 && key !== ' ' && !/[\x00-\x1f]/.test(key)) { await wc.insertText(key); await sleep(100); return; }
       wc.sendInputEvent({ type: 'keyDown', keyCode });
       if (keyCode === 'Return') wc.sendInputEvent({ type: 'char', keyCode: '\r' });
       wc.sendInputEvent({ type: 'keyUp', keyCode });

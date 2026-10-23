@@ -287,7 +287,7 @@ test2.describe('MCP page tools (full access)', () => {
 // Background tabs are genuinely hidden to their pages (document.visibilityState 'hidden', no animation
 // frames). Under Playwright every page counts as "being captured" and stays visible, so this runs Meridian
 // without Playwright attached (runUnattached) and drives it over MCP like a real agent.
-test('agent tools work on a hidden background tab; screenshot asks to activate it instead of hanging', async ({ userDataDir, server }) => {
+test('agent tools work on a hidden background tab, screenshots included, without switching the user\'s tab', async ({ userDataDir, server }) => {
   test.setTimeout(90_000);
   const home = S.tab(server.url('/p/home'));
   const sp = S.space('Main', { today: [home], activeTabId: home.id });
@@ -321,6 +321,8 @@ test('agent tools work on a hidden background tab; screenshot asks to activate i
         const t0 = Date.now();
         r.shot = await call(mcp, 'screenshot', { tab_id: opened.tab_id });
         r.shotMs = Date.now() - t0;
+        await new Promise((res) => setTimeout(res, 500));
+        r.hiddenAfter = (await call(mcp, 'run_javascript', { tab_id: opened.tab_id, code: 'document.visibilityState' })).text;
       } finally { await mcp.close().catch(() => {}); }
     },
   });
@@ -336,7 +338,43 @@ test('agent tools work on a hidden background tab; screenshot asks to activate i
   expect(r.link2.isError).toBeFalsy();
   expect(r.wait2.found).toBe(true);
   expect(r.stillHidden).toBe('"hidden"');
-  expect(r.shot.isError).toBe(true);
-  expect(textOf(r.shot)).toMatch(/activate_tab/);
+  expect(r.shot.isError).toBeFalsy();
+  expect(r.shot.content.some((c) => c.type === 'image' && c.data.length > 1000)).toBe(true);
   expect(r.shotMs).toBeLessThan(10_000);
+  expect(r.hiddenAfter).toBe('"hidden"'); // the user's tab stayed in front
+});
+
+test2('upload_file attaches a local file only after the user confirms that exact file; key files are refused', async ({ meridian, mcp, server }) => {
+  await setAccess(meridian, 'full', true); // full control: uploading still asks
+  const pic = path.join(meridian.userDataDir, '..', `mer-upload-${Date.now()}.png`);
+  fs.writeFileSync(pic, Buffer.alloc(2048, 7));
+  try {
+    const { tab_id } = json(await call(mcp, 'open_tab', { url: server.url('/upload') }));
+    expect(textOf(await call(mcp, 'upload_file', { tab_id, path: 'pic.png' }))).toMatch(/absolute path/);
+    expect((await call(mcp, 'upload_file', { tab_id, path: path.join(require('os').homedir(), '.ssh', 'id_ed25519') })).isError).toBe(true);
+    // denied by default in the dialog
+    const denied = await call(mcp, 'upload_file', { tab_id, path: pic });
+    expect(denied.isError).toBe(true);
+    const d = (await e2eLog(meridian.app)).dialogs.at(-1);
+    expect(d.message).toContain('upload a file from your computer');
+    expect(d.detail).toContain(fs.realpathSync(pic));
+    expect(d.detail).toContain('2 KB');
+    expect(d.buttons).toEqual(['Upload this file', 'Don’t upload']);
+    await setDialogResponse(meridian.app, 0);
+    const up = await call(mcp, 'upload_file', { tab_id, path: pic }); // the only file field (hidden behind a button)
+    await setDialogResponse(meridian.app, null);
+    expect(up.isError).toBeFalsy();
+    const js = async (code) => (await call(mcp, 'run_javascript', { tab_id, code })).text;
+    expect(await js('document.getElementById("got").textContent')).toBe(`"got:${path.basename(pic)}:2048"`);
+    expect(await js('!!document.querySelector("[data-meridian-upload]")')).toBe('false');
+    // rich editor (contenteditable) keeps every character; a single key is text, whatever the keyboard layout
+    expect((await call(mcp, 'type_text', { tab_id, selector: '#ed', value: 'Dmitry Afonchenko' })).isError).toBeFalsy();
+    expect(await js('document.getElementById("ed").innerText')).toBe('"Dmitry Afonchenko"');
+    expect((await call(mcp, 'press_key', { tab_id, key: 'o' })).isError).toBeFalsy();
+    expect(await js('document.getElementById("ed").innerText')).toBe('"Dmitry Afonchenkoo"');
+    expect((await call(mcp, 'type_text', { tab_id, selector: '#ed', value: '', clear: true })).isError).toBeFalsy();
+    expect(await js('document.getElementById("ed").innerText.trim()')).toBe('""');
+    await call(mcp, 'type_text', { tab_id, selector: '#ed', value: 'fresh', clear: true });
+    expect(await js('document.getElementById("ed").innerText')).toBe('"fresh"');
+  } finally { fs.rmSync(pic, { force: true }); }
 });

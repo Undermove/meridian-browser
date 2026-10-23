@@ -3,6 +3,8 @@
 <h1 align="center">Meridian</h1>
 <p align="center"><b>The open-source Arc browser alternative for macOS, Windows and Linux, built for AI agents.</b></p>
 
+<p align="center"><img src="docs/demo.gif" width="820" alt="Meridian: spaces, pinned tabs and split view, with an AI agent working next to the page"></p>
+
 Arc is being sunset. Meridian keeps the Arc workflow you're used to (spaces, pinned tabs, a Today list that tidies itself, split view, Peek, the command bar) and imports your Arc sidebar in one click. It's also built around AI from the start: a built-in Claude assistant, and an **MCP server** so Claude Code, Claude Desktop or any MCP client can read and drive your browser, with access you control.
 
 ## Features
