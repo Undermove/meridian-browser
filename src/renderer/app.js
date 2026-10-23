@@ -1,7 +1,7 @@
 /* Meridian — renderer (browser chrome UI).
  *
  * Model (persisted to state.json by the main process):
- *   spaces[]     { id, name, icon, color, profileId, pinned: Node[], today: Tab[], activeTabId, split }
+ *   spaces[]     { id, name, icon, color, profileId, pinned: Node[], pinnedCollapsed?, today: Tab[], activeTabId, split }
  *   favorites    { [profileId]: Tab[] }          — shared by all spaces of a profile, like Arc
  *   Node = Tab   { id, type:'tab', url, title, customTitle?, favicon?, currentUrl?, lastActive? }
  *        | Folder{ id, type:'folder', title, collapsed, children: Node[] }
@@ -334,7 +334,6 @@ function activate(id, { focus = true } = {}) {
   l.node.lastActive = now();
   rt.lastSeen.set(id, now());
   rt.mru = [id, ...rt.mru.filter((x) => x !== id)].slice(0, 50);
-  if (l.parent?.collapsed) l.parent.collapsed = false;
   if (focus && typeof closeChat === 'function') closeChat({ focus: false }); // picking a tab returns from the Chat view
   const wv = ensureView(l.node, sp);
   render();
@@ -563,7 +562,14 @@ function deleteNode(id) {
 
 function visibleTabIds(sp = space()) {
   const ids = favs(sp).map((t) => t.id);
-  walk(sp.pinned, (n, _l, parent) => { if (n.type === 'tab' && !(parent && parent.collapsed)) ids.push(n.id); });
+  // A collapsed folder hides its tabs at any depth, except the active one it keeps showing (folderEl).
+  const add = (nodes, hidden) => {
+    for (const n of nodes) {
+      if (n.type === 'folder') add(n.children, hidden || n.collapsed);
+      else if (!hidden || n.id === sp.activeTabId) ids.push(n.id);
+    }
+  };
+  add(sp.pinned, !!sp.pinnedCollapsed);
   return ids.concat(sp.today.map((t) => t.id));
 }
 
@@ -798,7 +804,7 @@ function pageFor(sp) {
   el.className = 'space-page';
   el.dataset.space = sp.id;
   el.innerHTML = `
-    <div class="space-header"><span class="space-icon"></span><span class="space-name"></span></div>
+    <div class="space-header" title="Collapse or expand pinned tabs"><span class="space-icon"></span><span class="space-name"></span><span class="space-chev">${icon('chevronDown', 12)}</span></div>
     <div class="zone" data-zone="pinned"></div>
     <div class="divider"><span>Today</span><button class="clear-today" title="${esc(keys('Clear Today (⇧⌘K)'))}">Clear</button></div>
     <button class="row new-tab" data-cmd="command-bar">${icon('plus', 14)}<span>New Tab</span></button>
@@ -818,7 +824,12 @@ function renderPage(sp) {
   setText(p.icon, sp.icon || '');
   setText(p.name, sp.name);
   const ctx = { sp, p, seen: new Set() };
-  if (sp.pinned.length) syncChildren(p.pinned, sp.pinned.map((n) => nodeEl(n, ctx, 0)));
+  // Clicking the space name collapses the whole pinned section (like Arc); the active pinned tab stays.
+  p.el.classList.toggle('pinned-collapsed', !!sp.pinnedCollapsed);
+  if (sp.pinnedCollapsed) {
+    const active = activeIn(sp.pinned, sp);
+    syncChildren(p.pinned, active ? [tabEl(active, ctx, 'pinned', 0)] : []);
+  } else if (sp.pinned.length) syncChildren(p.pinned, sp.pinned.map((n) => nodeEl(n, ctx, 0)));
   else if (!p.pinned.querySelector('.zone-hint')) p.pinned.innerHTML = '<div class="zone-hint">Drag tabs here to pin them</div>';
   syncChildren(p.today, sp.today.map((t) => tabEl(t, ctx, 'today', 0)));
   if (p.rows.size > ctx.seen.size) for (const id of p.rows.keys()) if (!ctx.seen.has(id)) p.rows.delete(id);
@@ -829,7 +840,8 @@ function nodeEl(n, ctx, depth) {
   return n.type === 'tab' ? tabEl(n, ctx, 'pinned', depth) : folderEl(n, ctx, depth);
 }
 
-// Children of collapsed folders aren't built until the folder opens.
+// Children of collapsed folders aren't built until the folder opens. Like Arc, a collapsed folder still
+// shows the active tab when it's inside (at any depth), and activating a tab never opens its folder.
 function folderEl(n, ctx, depth) {
   let w = ctx.p.rows.get(n.id);
   if (!w || !w.classList.contains('folder-wrap')) {
@@ -845,15 +857,23 @@ function folderEl(n, ctx, depth) {
   ctx.seen.add(n.id);
   // Patched in place (never innerHTML on the row): a click toggles `collapsed`, and replacing the nodes
   // under the pointer between the two clicks of a double-click would stop `dblclick` (rename) firing.
-  const sig = `${n.collapsed}|${depth}|${n.title}`;
+  const active = n.collapsed ? activeIn(n.children, ctx.sp) : null;
+  const sig = `${n.collapsed}|${!!active}|${depth}|${n.title}`;
   if (w._sig !== sig) {
     w._sig = sig;
-    w.className = `folder-wrap${n.collapsed ? ' collapsed' : ''}`;
+    w.className = `folder-wrap${n.collapsed ? ' collapsed' : ''}${active ? ' peek' : ''}`;
     w._row.style.setProperty('--depth', depth);
     setText(w._title, n.title);
   }
   if (!n.collapsed) syncChildren(w._children, n.children.map((c) => nodeEl(c, ctx, depth + 1)));
+  else if (active) syncChildren(w._children, [tabEl(active, ctx, 'pinned', depth + 1)]);
   return w;
+}
+
+function activeIn(nodes, sp) {
+  let found = null;
+  if (sp.activeTabId) walk(nodes, (c) => { if (c.id === sp.activeTabId) { found = c; return false; } });
+  return found;
 }
 
 function tabEl(t, ctx, zone, depth) {
@@ -918,6 +938,9 @@ function renderSpacePages(sp) {
   rt.slideDir = 0; rt.slideFrom = 0;
   endDrag(false);
   endSlide();
+  // A swipe leaves the incoming page as the drag's neighbour (`moving`: pointer-events off). It's the
+  // current page now, so it must take clicks and scroll again.
+  p.el.classList.remove('moving');
   if (prev && prev !== p && dir) slidePages(prev.el, p.el, dir, from);
   else { prev?.el.classList.remove('current'); p.el.classList.add('current'); }
 }
@@ -1131,6 +1154,12 @@ function initSidebar() {
       return;
     }
     if (e.target.closest('.clear-today')) return clearToday();
+    if (e.target.closest('.space-header')) {
+      const sp = space();
+      sp.pinnedCollapsed = !sp.pinnedCollapsed;
+      render(); save();
+      return;
+    }
     const dot = e.target.closest('.space-dot');
     if (dot) {
       const i = state.spaces.findIndex((s) => s.id === dot.dataset.space);
