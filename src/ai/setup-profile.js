@@ -89,23 +89,27 @@ function arcSummary(arc) {
 
 const has = (apps, re) => apps.some((a) => re.test(a));
 
-function heuristic({ apps = [], arc = null, locale = 'en' }) {
+const PERSONAS = ['developer', 'designer', 'manager', 'everyday'];
+
+// persona: a preset picked by the user (the home page's "Set up for me"); otherwise guessed from the apps.
+function heuristic({ apps = [], arc = null, locale = 'en', persona = null }) {
   const dev = has(apps, /^(Xcode|Visual Studio Code|Cursor|Zed|IntelliJ|WebStorm|PyCharm|Rider|GoLand|Android Studio|iTerm|Warp|Ghostty|Docker|OrbStack|Postman|TablePlus|Sublime Text|Nova|Tower|Fork|GitHub Desktop)/i);
   const design = has(apps, /^(Figma|Sketch|Adobe (Photoshop|Illustrator|XD|InDesign|After Effects|Premiere)|Affinity|Pixelmator|Framer|Principle|Blender|Cinema 4D|Procreate|Spline|Rive)/i);
   const office = has(apps, /^(Slack|Microsoft (Teams|Outlook|Excel|Word|PowerPoint)|Zoom|Notion|Linear|Keynote|Numbers|Pages|Miro|Loom|Superhuman|Spark)/i);
   const ru = /^(ru|uk|be|kk)/i.test(locale);
   const fav = (ids) => ids.filter((id) => CATALOG[id]);
-  if (dev) return {
+  const pick = PERSONAS.includes(persona) ? persona : dev ? 'developer' : design ? 'designer' : office ? 'manager' : 'everyday';
+  if (pick === 'developer') return {
     persona: 'developer', mode: 'developer', color: '#7f7fd5', title: ru ? 'Для разработчика' : 'Set up for building things',
     spaces: [{ name: ru ? 'Работа' : 'Work', icon: '💼', color: '#7f7fd5' }, { name: ru ? 'Личное' : 'Personal', icon: '🏠', color: '#43cea2' }],
     favorites: fav(['github', 'linear', has(apps, /^Slack/i) ? 'slack' : 'gmail', 'claude']),
   };
-  if (design) return {
+  if (pick === 'designer') return {
     persona: 'designer', mode: 'creative', color: '#c471f5', title: ru ? 'Для дизайнера' : 'Set up for design work',
     spaces: [{ name: ru ? 'Проекты' : 'Projects', icon: '🎨', color: '#c471f5' }, { name: ru ? 'Вдохновение' : 'Inspiration', icon: '💡', color: '#f7b267' }, { name: ru ? 'Личное' : 'Personal', icon: '🏠', color: '#43cea2' }],
     favorites: fav(['figma', 'dribbble', 'pinterest', has(apps, /^Slack/i) ? 'slack' : 'gmail']),
   };
-  if (office) return {
+  if (pick === 'manager') return {
     persona: 'manager', mode: 'creative', color: '#4facfe', title: ru ? 'Для работы с командой' : 'Set up for teamwork',
     spaces: [{ name: ru ? 'Работа' : 'Work', icon: '💼', color: '#4facfe' }, { name: ru ? 'Личное' : 'Personal', icon: '🏠', color: '#43cea2' }],
     favorites: fav([has(apps, /Outlook/i) ? 'outlook' : 'gmail', 'calendar', has(apps, /^Slack/i) ? 'slack' : 'teams', has(apps, /^Notion/i) ? 'notion' : 'docs']),
@@ -166,8 +170,8 @@ function validate(raw, fallback) {
 }
 
 // ask(promptText) → Promise<string> (the AI's full answer), or null when no AI is connected.
-async function propose({ apps = [], arc = null, locale = 'en', about = '' }, ask) {
-  const fallback = heuristic({ apps, arc, locale });
+async function propose({ apps = [], arc = null, locale = 'en', about = '', persona = null }, ask) {
+  const fallback = heuristic({ apps, arc, locale, persona });
   let proposal = null, source = 'rules';
   if (ask) {
     try {
@@ -184,4 +188,4 @@ async function propose({ apps = [], arc = null, locale = 'en', about = '' }, ask
   };
 }
 
-module.exports = { installedApps, arcSummary, heuristic, propose, validate, extractJson, CATALOG, COLORS, EMOJI };
+module.exports = { PERSONAS, installedApps, arcSummary, heuristic, propose, validate, extractJson, CATALOG, COLORS, EMOJI };

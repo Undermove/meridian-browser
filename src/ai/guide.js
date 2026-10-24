@@ -15,9 +15,11 @@ Sidebar & tabs
 - Hide the sidebar for full-width pages; hover the window edge to bring it back. The sidebar can be on the right (Settings → General).
 - Private windows keep nothing after closing. Reopen Closed Tab brings back the last closed tab.
 - Import from Arc (Settings → General or the welcome tour): spaces, colours, pinned tabs, folders, favorites, Today tabs, and — on macOS — logins (cookies) after you allow access in the system dialog.
+- Home page (shown when no tab is open): a search field, what Meridian can do for different people, and "Set up for me" presets that add spaces and favorites. In ⌘T, ⇧↵ opens a result in split view, and the bar shows the keys for what's selected.
 - Built-in ad and tracker blocking (Settings → Advanced). Downloads popover, find in page, zoom, session restore.
 
 AI
+- "Power Up Meridian with AI" (home page or ⌘T) connects a Claude API key: Meridian checks it with Anthropic before saving it, encrypted.
 - Ask from the command bar, the ⌘J side panel and the Chat view use the AI you connect in Settings → AI: a Claude API key, GitHub Copilot, or a free local model (Ollama, LM Studio). With "Other agents" on: Codex, Cursor, OpenCode, Qwen Code, Amp, Goose, Droid, with your own account under their terms. Claude Code and Gemini CLI run in the Workbench terminal.
 - With a Claude API key and agent access enabled, ⌘J can also act in the browser (open tabs, read pages, click, type) — always within the access level you set (Off / Read only / Ask before acting / Full control).
 - Developers: the Workbench is a small IDE (file tree, editor, terminals) that starts Claude Code / Codex in a project; Mission Control shows every running agent and subagent; Meridian has an MCP server so external agents can use the browser.

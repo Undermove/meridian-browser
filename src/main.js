@@ -937,6 +937,13 @@ on('agent:rpc-result', (e, payload) => hub.onRpcResult(e.sender, payload || {}))
 
 handle('ai:has-key', () => assistant.hasKey());
 handle('ai:set-key', (_e, key) => { assistant.setKey(typeof key === 'string' ? key : ''); return assistant.hasKey(); });
+// The power-up ceremony on the home page: check the key, and only save it once Anthropic accepts it.
+handle('ai:connect-key', async (_e, key) => {
+  const r = await assistant.testKey(key);
+  if (!r.ok) return r;
+  try { assistant.setKey(String(key).trim()); } catch (err) { return { ok: false, error: err.message }; }
+  return { ok: true };
+});
 on('ai:chat', (e, req) => { assistant.chat(e.sender, sanitizeAiRequest(req)); });
 handle('agents:list', (_e, fresh) => localAgents.list({ fresh: !!fresh }));
 // "Check": one tiny request, only when the user clicks it, for agents that can't report their sign-in.
@@ -1019,7 +1026,8 @@ handle('setup:propose', async (_e, opts = {}) => {
         if (ev.done || ev.error) resolve(ev.error ? null : (ev.text || out));
       });
     });
-  const proposal = await setupProfile.propose({ apps, arc, locale: app.getLocale(), about: String(opts.about || '') }, ask);
+  const persona = setupProfile.PERSONAS.includes(opts.persona) ? opts.persona : null;
+  const proposal = await setupProfile.propose({ apps, arc, locale: app.getLocale(), about: String(opts.about || ''), persona }, persona ? null : ask);
   return { ...proposal, seen: { apps: apps.filter((a) => NOTABLE_APPS.test(a)).slice(0, 8), arcSpaces: arc?.spaces.length || 0 } };
 });
 // Counts for the onboarding ("12 spaces, 140 pinned tabs, 8 favorites") before anything is imported.

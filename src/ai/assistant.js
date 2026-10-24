@@ -61,6 +61,21 @@ class Assistant {
     fs.writeFileSync(this.keyFile, safeStorage.encryptString(key.trim()), { mode: 0o600 });
   }
 
+  // Check a key before saving it: one tiny request (a one-token reply, a tiny fraction of a cent).
+  async testKey(key) {
+    key = String(key || '').trim();
+    if (!/^sk-ant-[A-Za-z0-9_-]{20,}$/.test(key)) return { ok: false, error: 'That doesn’t look like an Anthropic API key. It starts with “sk-ant-”.' };
+    try {
+      const stream = new Anthropic({ apiKey: key, maxRetries: 0, timeout: 20_000 }).messages.stream({ model: QUICK_MODEL, max_tokens: 1, messages: [{ role: 'user', content: 'Hi' }] });
+      await stream.finalMessage();
+      return { ok: true };
+    } catch (err) {
+      if (err instanceof Anthropic.AuthenticationError) return { ok: false, error: 'Anthropic didn’t accept this key. Copy it again from the Anthropic Console.' };
+      if (err instanceof Anthropic.PermissionDeniedError) return { ok: false, error: 'This key can’t use Claude yet. Check billing in the Anthropic Console.' };
+      return { ok: false, error: describeError(err) };
+    }
+  }
+
   client() {
     let apiKey;
     if (fs.existsSync(this.keyFile)) apiKey = safeStorage.decryptString(fs.readFileSync(this.keyFile));

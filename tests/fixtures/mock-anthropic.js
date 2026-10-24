@@ -55,6 +55,11 @@ async function startMockAnthropic() {
       let body = {};
       try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch {}
       requests.push({ url: req.url, headers: req.headers, body });
+      // A key with "bad" in it is rejected (the power-up ceremony's key check).
+      if (String(req.headers['x-api-key'] || req.headers.authorization || '').includes('bad')) {
+        res.writeHead(401, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'invalid x-api-key' } }));
+      }
       const { blocks, stop } = respond(body);
       setTimeout(() => sse(res, blocks, stop), 150);
     });

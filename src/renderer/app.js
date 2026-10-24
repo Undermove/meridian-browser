@@ -1085,6 +1085,7 @@ function layoutViews() {
   if (split) handle.style.left = `calc(${split.ratio * 100}% - 3px)`;
   document.body.classList.toggle('is-split', !!split);
   $('#empty-state').hidden = visible.length > 0;
+  if (!$('#empty-state').hidden && typeof refreshHome === 'function') refreshHome();
 
   const err = activeId && rt.nav.get(activeId)?.error;
   const box = $('#load-error');
@@ -1147,7 +1148,7 @@ function initSidebar() {
       }
       return;
     }
-    if (row) return activate(row.dataset.id);
+    if (row) { if (typeof noteMouseSwitch === 'function' && row.dataset.id !== space().activeTabId) noteMouseSwitch('tab'); return activate(row.dataset.id); }
     const folder = e.target.closest('.row.folder');
     if (folder) {
       const l = locate(folder.dataset.id);
@@ -1165,6 +1166,7 @@ function initSidebar() {
     if (dot) {
       const i = state.spaces.findIndex((s) => s.id === dot.dataset.space);
       const cur = state.spaces.findIndex((s) => s.id === state.activeSpaceId);
+      if (i !== cur && typeof noteMouseSwitch === 'function') noteMouseSwitch('space');
       switchSpace(dot.dataset.space, Math.sign(i - cur));
     }
   });
@@ -1354,6 +1356,7 @@ const COMMANDS = [
   { id: 'toggle-adblock', label: 'Toggle Ad Blocker', icon: 'shield' },
   { id: 'default-browser', label: 'Set Meridian as Default Browser', icon: 'globe' },
   { id: 'devtools', label: 'Developer Tools', icon: 'code', keys: '⌥⌘I' },
+  { id: 'power-up', label: 'Power Up Meridian with AI', icon: 'sparkles' }, // home.js
   { id: 'ai-panel', label: 'Ask AI about This Page', icon: 'sparkles', keys: '⌘J' },
   { id: 'ai-summarize', label: 'Summarize Page with AI', icon: 'sparkles' },
   { id: 'open-chat', label: 'Open Chat', icon: 'chat', keys: '⌥⌘J' }, // Chat view (chat.js)
@@ -1373,7 +1376,7 @@ const COMMANDS = [
 
 function openCommandBar(mode = 'new') {
   if (MINI) mode = 'edit';
-  rt.cmd = { mode, results: [], index: 0 };
+  rt.cmd = { mode, results: [], index: 0, enter: true };
   const input = $('#cmd-input');
   const tab = activeTab();
   input.value = mode === 'edit' && tab ? tabUrl(tab) : '';
@@ -1390,6 +1393,15 @@ function openCommandBar(mode = 'new') {
   input.focus();
   input.select();
   updateCommandResults();
+  // Opened from the home page's search pill: grow out of it.
+  const from = rt.cmdFrom; rt.cmdFrom = null;
+  if (from && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    const a = from.getBoundingClientRect(), b = $('#cmdbar').getBoundingClientRect();
+    $('#cmdbar').animate([
+      { transform: `translate(${a.left + a.width / 2 - (b.left + b.width / 2)}px, ${a.top + a.height / 2 - (b.top + 28)}px) scale(${a.width / b.width}, ${Math.max(0.3, a.height / 56)})`, opacity: 0.6, borderRadius: '24px' },
+      { transform: 'none', opacity: 1, borderRadius: '16px' },
+    ], { duration: 280, easing: 'cubic-bezier(0.2, 0.9, 0.25, 1)' });
+  }
 }
 
 function closeCommandBar() {
@@ -1424,10 +1436,11 @@ function updateCommandResults() {
     if (mode === 'edit' && tab && raw.trim() === tabUrl(tab)) {
       out.push({ kind: 'nav', icon: 'reload', title: 'Reload page', sub: hostOf(raw), action: () => rt.views.get(tab.id)?.reload() });
     } else if (url) {
-      out.push({ kind: 'url', icon: 'globe', title: url, sub: 'Open URL', action: () => go(url) });
+      out.push({ kind: 'url', icon: 'globe', title: url, sub: 'Open URL', url, action: () => go(url) });
     } else {
       const engine = SEARCH_ENGINES[state.settings.searchEngine]?.name || 'Google';
-      out.push({ kind: 'search', icon: 'search', title: raw.trim(), sub: `Search ${engine}`, action: () => go(searchUrl(raw.trim())) });
+      const u = searchUrl(raw.trim());
+      out.push({ kind: 'search', icon: 'search', title: raw.trim(), sub: `Search ${engine}`, url: u, action: () => go(u) });
     }
     // "Ask" (ai-max.js): first when the text reads like a question, otherwise after the search row.
     if (typeof askClaudeResult === 'function' && mode === 'new' && !EPHEMERAL) { const r = askClaudeResult(raw, !!url); if (r) { if (r.first) out.unshift(r); else out.push(r); } }
@@ -1437,9 +1450,9 @@ function updateCommandResults() {
     // Commands first when the query looks like one
     const cmds = COMMANDS.map((c) => ({ c, s: score(c.label, q) })).filter((x) => q && x.s >= 0).sort((a, b) => b.s - a.s).slice(0, 3);
     for (const { c } of cmds) {
-      if (PRIVATE && ['settings', 'import-arc', 'import-arc-logins', 'onboarding', 'edit-theme', 'ai-panel', 'ai-summarize', 'open-workbench', 'open-project', 'new-space', 'mission-control', 'ai-tidy'].includes(c.id)) continue;
+      if (PRIVATE && ['power-up', 'settings', 'import-arc', 'import-arc-logins', 'onboarding', 'edit-theme', 'ai-panel', 'ai-summarize', 'open-workbench', 'open-project', 'new-space', 'mission-control', 'ai-tidy'].includes(c.id)) continue;
       if (uiMode() !== 'developer' && DEV_COMMANDS.test(c.id)) continue;
-      out.push({ kind: 'cmd', icon: c.icon, title: c.label, sub: 'Command', keys: c.keys, action: () => runCommand(c.id) });
+      out.push({ kind: 'cmd', group: 'Commands', icon: c.icon, title: c.label, sub: 'Command', keys: c.keys, action: () => { runCommand(c.id); if (c.keys && typeof teachShortcut === 'function') teachShortcut(c); } });
     }
   }
 
@@ -1460,7 +1473,8 @@ function updateCommandResults() {
     tabs.sort((a, b) => b.s - a.s || (b.t.lastActive || 0) - (a.t.lastActive || 0));
     for (const { t, sp } of tabs.slice(0, q ? 6 : 8)) {
       out.push({
-        kind: 'tab', favicon: t, title: titleOf(t), sub: (sp.id !== state.activeSpaceId ? sp.name + ' · ' : '') + hostOf(tabUrl(t)), badge: 'Switch to tab',
+        kind: 'tab', group: q ? 'Open tabs' : 'Recent tabs', favicon: t, title: titleOf(t), sub: (sp.id !== state.activeSpaceId ? sp.name + ' · ' : '') + hostOf(tabUrl(t)), badge: 'Switch',
+        split: sp.id === state.activeSpaceId && mode !== 'split' && t.id !== space().activeTabId ? () => splitWith(t.id) : null,
         action: () => {
           if (mode === 'split') { if (sp.id === state.activeSpaceId) return splitWith(t.id); }
           if (sp.id !== state.activeSpaceId) switchSpace(sp.id);
@@ -1476,11 +1490,11 @@ function updateCommandResults() {
       .filter((x) => x.s >= 0)
       .sort((a, b) => (b.s + Math.log2(1 + b.h.count) * 8) - (a.s + Math.log2(1 + a.h.count) * 8) || b.h.last - a.h.last)
       .slice(0, 6);
-    for (const { h } of hist) out.push({ kind: 'history', icon: 'history', title: h.title || h.url, sub: hostOf(h.url), action: () => go(h.url) });
+    for (const { h } of hist) out.push({ kind: 'history', group: 'History', icon: 'history', title: h.title || h.url, sub: hostOf(h.url), url: h.url, action: () => go(h.url) });
 
     if (!MINI) {
       const arch = state.archive.filter((a) => score(a.title, q) >= 0 || score(a.url, q) >= 0 || 'archive'.startsWith(q)).slice(0, 5);
-      for (const a of arch) out.push({ kind: 'archive', icon: 'archive', title: a.title, sub: 'Archived · ' + hostOf(a.url), action: () => go(a.url) });
+      for (const a of arch) out.push({ kind: 'archive', group: 'Archive', icon: 'archive', title: a.title, sub: 'Archived · ' + hostOf(a.url), url: a.url, action: () => go(a.url) });
     }
   }
 
@@ -1509,32 +1523,68 @@ function go(url) {
   openTab(url);
 }
 
+// A result can also open next to the current page (⇧↵): links in split view, an open tab beside this one.
+function splitActionOf(r) {
+  if (!r || rt.cmd.mode !== 'new' || MINI) return null;
+  if (r.split) return r.split;
+  if (r.url && activeTab()) return () => { rt.cmd.mode = 'split'; go(r.url); };
+  return null;
+}
+
 function drawCommandResults() {
   const box = $('#cmd-results');
-  box.innerHTML = rt.cmd.results.map((r, i) => `
-    <div class="cmd-row" data-i="${i}" data-kind="${r.kind}">
+  let last = null;
+  // Rows animate in when the bar opens (rt.cmd.enter); typing just swaps them.
+  box.classList.toggle('enter', !!rt.cmd.enter);
+  box.innerHTML = '<div class="cmd-hl" aria-hidden="true"></div>' + rt.cmd.results.map((r, i) => {
+    const head = r.group && r.group !== last ? `<div class="cmd-group">${esc(r.group)}</div>` : '';
+    last = r.group || null;
+    return `${head}
+    <div class="cmd-row" data-i="${i}" data-kind="${r.kind}" style="--i:${Math.min(i, 10)}">
       <span class="cmd-ic">${r.favicon ? faviconImg(r.favicon, 16) : icon(r.icon, 16)}</span>
       <span class="cmd-title">${esc(r.title)}</span>
       <span class="cmd-sub">${esc(r.sub || '')}</span>
       ${r.keys ? `<span class="cmd-keys">${esc(keys(r.keys))}</span>` : ''}
       ${r.badge ? `<span class="cmd-badge">${esc(r.badge)} ↵</span>` : ''}
-    </div>`).join('');
+    </div>`;
+  }).join('');
+  box.classList.add('no-glide');
   selectCommandResult(rt.cmd.index);
+  requestAnimationFrame(() => box.classList.remove('no-glide'));
 }
 
-// Moving the selection only restyles two rows; the list isn't rebuilt.
+// Moving the selection glides one highlight; the list isn't rebuilt.
 function selectCommandResult(i, { scroll = true } = {}) {
   const box = $('#cmd-results');
   rt.cmd.index = i;
   box.querySelector('.cmd-row.sel')?.classList.remove('sel');
-  const row = box.children[i];
-  if (!row) return;
+  const row = box.querySelector(`.cmd-row[data-i="${i}"]`);
+  const hl = box.querySelector('.cmd-hl');
+  if (!row) { if (hl) hl.style.opacity = '0'; drawCommandFoot(); return; }
   row.classList.add('sel');
+  if (hl) { hl.style.opacity = '1'; hl.style.height = row.offsetHeight + 'px'; hl.style.transform = `translateY(${row.offsetTop}px)`; }
   if (scroll) row.scrollIntoView({ block: 'nearest' });
+  drawCommandFoot();
 }
 
-function runResult(i) {
+// The key hints under the results follow what's selected, so the keys teach themselves.
+function drawCommandFoot() {
+  const foot = $('#cmd-foot');
+  if (!foot) return;
+  const r = rt.cmd.results[rt.cmd.index];
+  const k = (label, ...ks) => `<span class="cf-hint">${ks.map((x) => `<kbd>${esc(keys(x))}</kbd>`).join('')}<span>${esc(label)}</span></span>`;
+  const main = !r ? '' : r.kind === 'tab' ? k('Switch', '↵') : r.kind === 'cmd' ? k('Run', '↵') : r.kind === 'ask' ? k('Ask', '↵') : k('Open', '↵');
+  const split = splitActionOf(r) ? k('Open in split view', '⇧', '↵') : '';
+  const tip = !r && !$('#cmd-input').value.trim()
+    ? '<span class="cf-try">Type a site, a tab’s name, a command like “split”, or a question</span>'
+    : r?.kind === 'tab' ? `<span class="cf-tip">Without this bar: <kbd>${esc(keys('^'))}</kbd><kbd>⇥</kbd> next tab</span>`
+      : r?.kind === 'cmd' && r.keys ? `<span class="cf-tip">Next time: <kbd>${esc(keys(r.keys))}</kbd></span>` : '';
+  foot.innerHTML = `${main}${split}${rt.cmd.results.length > 1 ? k('Move', '↑', '↓') : ''}${k('Close', 'esc')}<span class="grow"></span>${tip}`;
+}
+
+function runResult(i, { split = false } = {}) {
   const r = rt.cmd.results[i];
+  if (split) { const fn = splitActionOf(r); if (!fn) return; closeCommandBar(); return fn(); }
   if (r?.keepOpen) return r.action(); // Ask: the answer appears inside the command bar (ai-max.js)
   closeCommandBar();
   if (r) r.action();
@@ -1542,18 +1592,18 @@ function runResult(i) {
 
 function initCommandBar() {
   const input = $('#cmd-input');
-  input.addEventListener('input', () => { if (typeof endInlineAsk === 'function') endInlineAsk(); updateCommandResults(); });
+  input.addEventListener('input', () => { rt.cmd.enter = false; if (typeof endInlineAsk === 'function') endInlineAsk(); updateCommandResults(); });
   input.addEventListener('keydown', (e) => {
     if (e.isComposing || e.keyCode === 229) return; // IME candidate window owns these keys
     const n = rt.cmd.results.length;
     if (e.key === 'ArrowDown' || (e.key === 'n' && e.ctrlKey)) { e.preventDefault(); if (n) selectCommandResult((rt.cmd.index + 1) % n); }
     else if (e.key === 'ArrowUp' || (e.key === 'p' && e.ctrlKey)) { e.preventDefault(); if (n) selectCommandResult((rt.cmd.index - 1 + n) % n); }
-    else if (e.key === 'Enter') { e.preventDefault(); runResult(rt.cmd.index); }
+    else if (e.key === 'Enter') { e.preventDefault(); runResult(rt.cmd.index, { split: e.shiftKey }); }
     else if (e.key === 'Escape') { e.preventDefault(); closeCommandBar(); }
   });
   $('#cmd-results').addEventListener('mousedown', (e) => {
     const row = e.target.closest('.cmd-row');
-    if (row) { e.preventDefault(); runResult(Number(row.dataset.i)); }
+    if (row) { e.preventDefault(); runResult(Number(row.dataset.i), { split: e.shiftKey }); }
   });
   // Hover selects (only on real pointer movement, so rows scrolling under a still pointer don't steal it).
   $('#cmd-results').addEventListener('mousemove', (e) => {
@@ -1878,7 +1928,7 @@ function maybeOfferAi() {
       <p class="muted">Type a question where you open new tabs (<kbd>⌘</kbd><kbd>T</kbd>) and get the answer right there — or ask about the page you’re reading. To use it, connect an AI. It takes a minute.</p>
       <div class="modal-actions"><button class="btn" data-a="later">Not now</button><button class="btn accent" data-a="show">Show me</button></div>
     </div>`, (m, close) => {
-    m.addEventListener('click', (e) => { const a = e.target.closest('[data-a]')?.dataset.a; if (!a) return; close(); if (a === 'show') openSettings('ai'); });
+    m.addEventListener('click', (e) => { const a = e.target.closest('[data-a]')?.dataset.a; if (!a) return; close(); if (a === 'show') { if (typeof openPowerUp === 'function') openPowerUp(); else openSettings('ai'); } });
   });
 }
 
@@ -1907,6 +1957,8 @@ function runCommand(name, ...args) {
   if (typeof onboardingIntercept === 'function' && onboardingIntercept(name, ...args)) return;
   switch (name) {
     case 'command-bar': return openCommandBar('new');
+    case 'power-up': return typeof openPowerUp === 'function' && openPowerUp();
+    case 'home-preset': return typeof openPreset === 'function' && openPreset(args[0]);
     case 'edit-url': return openCommandBar('edit');
     case 'close-tab':
       if (!$('#cmdbar-overlay').hidden) return closeCommandBar();
@@ -2100,6 +2152,7 @@ async function boot() {
   if (!PRIVATE) initAi(); // agents never see private windows
   initSpaceSwipe();
   initPolish();
+  if (typeof initHome === 'function') initHome(); // home.js
 
   const sp = space();
   if (sp.activeTabId && locate(sp.activeTabId)) activate(sp.activeTabId, { focus: true }); else render();
