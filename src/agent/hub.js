@@ -13,6 +13,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
+const { execFile } = require('child_process');
 const { dialog, webContents } = require('electron');
 const { byName, TOOLS, ACCESS_RANK, validateInput } = require('./tools');
 
@@ -38,6 +39,8 @@ const DEEP = `
   const labelOf = (el) => el.getAttribute('aria-label') || el.innerText || el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('name') || (hostOf(el) && (hostOf(el).getAttribute('aria-label') || hostOf(el).getAttribute('label') || hostOf(el).getAttribute('placeholder') || hostOf(el).getAttribute('name'))) || '';
 `;
 
+const LIVE_GRACE_MS = 1500;
+
 const PAGE = {
   read: (offset, max) => `(() => {${DEEP}
     const raw = deepText();
@@ -45,7 +48,10 @@ const PAGE = {
     return { url: location.href, title: document.title, total: text.length, offset: ${offset}, text: text.slice(${offset}, ${offset} + ${max}) };
   })()`,
 
-  elements: (onlyVisible) => `(() => {${DEEP}
+  elements: (onlyVisible, query = '', within = '') => `(() => {${DEEP}
+    const query = ${JSON.stringify(String(query).toLowerCase())}, within = ${JSON.stringify(String(within))};
+    let scope = null;
+    if (within) { try { scope = deepOne(within); } catch { return { error: 'invalid within selector' }; } if (!scope) return { error: 'nothing on the page matches within: ' + within }; }
     const sel = 'a[href],button,input:not([type=hidden]),textarea,select,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=radio],[role=switch],[role=option],[role=textbox],[contenteditable=""],[contenteditable=true],[onclick],[tabindex]:not([tabindex="-1"])';
     const els = deepAll(sel).filter((el) => {
       const r = el.getBoundingClientRect();
@@ -53,8 +59,12 @@ const PAGE = {
       const cs = getComputedStyle(el);
       if (cs.visibility === 'hidden' || cs.display === 'none' || Number(cs.opacity) === 0) return false;
       if (${onlyVisible} && (r.bottom < 0 || r.top > innerHeight)) return false;
+      if (scope && !inside(el, scope)) return false;
+      if (query && !((labelOf(el) + ' ' + (el.innerText || '') + ' ' + (el.href || '')).toLowerCase().includes(query))) return false;
       return true;
-    }).slice(0, 400);
+    });
+    const capped = els.length > 400;
+    els.length = Math.min(els.length, 400);
     window.__meridianEls = els;
     const clip = (s, n) => (s || '').replace(/\\s+/g, ' ').trim().slice(0, n);
     return els.map((el, i) => {
@@ -75,7 +85,7 @@ const PAGE = {
       if (el.disabled) out.disabled = true;
       if (r.bottom < 0 || r.top > innerHeight) out.offscreen = true;
       return out;
-    });
+    }).concat(capped ? [{ note: 'only the first 400 are listed: narrow it down with query or within' }] : []);
   })()`,
 
   // Locate an element and scroll it into view; returns its centre in CSS px.
@@ -168,6 +178,16 @@ const PAGE = {
       try { el.setSelectionRange(el.value.length, el.value.length); } catch {}
     }
     return true;
+  })()`,
+
+  scrollTo: (spec) => `(() => {${DEEP}
+    const spec = ${JSON.stringify(spec)};
+    let el = null;
+    if (Number.isInteger(spec.element_index)) el = (window.__meridianEls || [])[spec.element_index];
+    else if (spec.selector) { try { el = deepOne(spec.selector); } catch { return { error: 'invalid selector' }; } }
+    if (!el || !el.isConnected) return { error: Number.isInteger(spec.element_index) ? 'element_index is stale — call get_interactive_elements again' : 'nothing on the page matches that selector' };
+    el.scrollIntoView({ block: 'center', inline: 'nearest' });
+    return { scrolled_to: (labelOf(el) || el.tagName.toLowerCase()).replace(/\\s+/g, ' ').trim().slice(0, 80), scrollY: Math.round(scrollY) };
   })()`,
 
   scroll: (direction, screens) => `(() => {
@@ -301,13 +321,29 @@ class AgentHub {
   // Real input (sendInputEvent / insertText) only reaches a page that has painted a frame; a tab opened in
   // the background never has. For the duration of an input action the tab is rendered underneath the
   // shown page (invisible to the user), then hidden again.
-  async withLiveTab(tabId, wc, fn) {
+  // settle: extra ms to let lazily-built parts of the page appear once it renders (Reddit builds a comment's
+  // Reply row only when it's drawn). The tab stays live a moment after the action, so what the action started
+  // (an opening reply form, an animation) can finish.
+  async withLiveTab(tabId, wc, fn, { settle = 0 } = {}) {
+    this.live ||= new Map();
+    const cur = this.live.get(tabId) || { n: 0, timer: null };
+    clearTimeout(cur.timer);
+    cur.n++;
+    this.live.set(tabId, cur);
     const on = await this.rpc('live', { tab_id: tabId, on: true }).catch(() => false);
     try {
-      if (on) await this.run(wc, `new Promise((r) => { const t = setTimeout(r, 1500); requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(t); r(); })); })`).catch(() => {});
+      if (on) {
+        await this.run(wc, `new Promise((r) => { const t = setTimeout(r, 1500); requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(t); r(); })); })`).catch(() => {});
+        if (settle) await sleep(settle);
+      }
       return await fn();
     } finally {
-      if (on) this.rpc('live', { tab_id: tabId, on: false }).catch(() => {});
+      cur.n--;
+      if (on && cur.n === 0) {
+        cur.timer = setTimeout(() => {
+          if (cur.n === 0) { this.live.delete(tabId); this.rpc('live', { tab_id: tabId, on: false }).catch(() => {}); }
+        }, LIVE_GRACE_MS);
+      }
     }
   }
 
@@ -346,9 +382,11 @@ class AgentHub {
       `Title: ${neutralize(oneLine(r.title))}\n\n${neutralize(r.text)}${more}\n</untrusted_page_content>`);
   }
 
-  async t_get_interactive_elements({ tab_id, only_visible = false }, ctx) {
-    const { wc } = await this.page(tab_id, ctx);
-    const list = await this.run(wc, PAGE.elements(!!only_visible));
+  async t_get_interactive_elements({ tab_id, only_visible = false, query = '', within = '' }, ctx) {
+    const { wc, info } = await this.page(tab_id, ctx);
+    // Rendered, not just loaded: background pages often build buttons only once they're drawn.
+    const list = await this.withLiveTab(info.tabId, wc, () => this.run(wc, PAGE.elements(!!only_visible, query, within)), { settle: 400 });
+    if (list && list.error) throw new Error(list.error);
     return text(`Interactive elements on ${hostOf(wc.getURL())} (labels are untrusted page text):\n` + list.map((e) => JSON.stringify(e)).join('\n'));
   }
 
@@ -364,7 +402,16 @@ class AgentHub {
         return null;
       });
     }
-    if (!img || img.isEmpty()) throw new Error('Couldn’t get a picture of this background tab. Call activate_tab first, then screenshot.');
+    if ((!img || img.isEmpty()) && process.platform === 'darwin') {
+      // Nothing is drawn while the Mac's display sleeps (an agent driven from a phone, say). Wake the display
+      // the way any user activity does; a locked screen stays locked, but pages render again behind it.
+      await new Promise((r) => { try { execFile('/usr/bin/caffeinate', ['-u', '-t', '3'], () => {}); } catch {} setTimeout(r, 1500); });
+      img = await this.withLiveTab(info.tabId, wc, async () => {
+        for (let i = 0; i < 8; i++) { await sleep(250); const shot = await grab(); if (shot && !shot.isEmpty()) return shot; }
+        return null;
+      });
+    }
+    if (!img || img.isEmpty()) throw new Error('Couldn’t get a picture of this tab: nothing is being drawn (the computer’s display may be off, or Meridian’s window is minimized). Use read_page / get_interactive_elements instead.');
     const size = img.getSize();
     const scaled = size.width > 1600 ? img.resize({ width: 1600 }) : img;
     return [{ type: 'image', data: scaled.toJPEG(70).toString('base64'), mimeType: 'image/jpeg' }];
@@ -545,8 +592,16 @@ class AgentHub {
     return json({ pressed: key });
   }
 
-  async t_scroll({ tab_id, direction, screens = 1 }, ctx) {
+  async t_scroll({ tab_id, direction, screens = 1, selector, element_index }, ctx) {
     const { wc, info } = await this.page(tab_id, ctx);
+    if (selector || element_index !== undefined) {
+      await this.confirm(ctx, 'scroll to an element', info);
+      // Rendered while it scrolls, so lazily-built parts around the element (Reddit's Reply row) appear.
+      const r = await this.withLiveTab(info.tabId, wc, async () => { const out = await this.run(wc, PAGE.scrollTo({ selector, element_index })); await sleep(600); return out; });
+      if (r.error) throw new Error(r.error);
+      return json(r);
+    }
+    if (!direction) throw new Error('pass direction, or selector / element_index to scroll an element into view');
     await this.confirm(ctx, `scroll ${direction}`, info);
     return json(await this.run(wc, PAGE.scroll(direction, Math.min(20, Math.max(0.1, screens)))));
   }

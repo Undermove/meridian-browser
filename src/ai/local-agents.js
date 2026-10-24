@@ -415,7 +415,14 @@ class LocalAgents {
 
 // ---------------------------------------------------------------- local model servers (Ollama, LM Studio)
 
+// Tests (dev builds with MERIDIAN_TEST_PATH) never see the developer's own Ollama / LM Studio.
+const testIsolated = () => {
+  if (!process.env.MERIDIAN_TEST_PATH) return false;
+  try { return !require('electron').app?.isPackaged; } catch { return true; }
+};
+
 async function httpModels({ base, kind }) {
+  if (testIsolated()) return null;
   const r = await fetch(base + (kind === 'ollama' ? '/api/tags' : '/v1/models'), { signal: AbortSignal.timeout(1200) });
   if (!r.ok) return null;
   const j = await r.json();

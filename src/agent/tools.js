@@ -42,7 +42,7 @@ const TOOLS = [
   {
     name: 'get_interactive_elements', access: 'read',
     description: 'List clickable/typeable elements on the page (links, buttons, inputs) with an index to use in click / type_text. Password values are never returned.',
-    input_schema: { type: 'object', properties: { tab_id: tabId, only_visible: { type: 'boolean', description: 'Only elements in the viewport (default false).' } } },
+    input_schema: { type: 'object', properties: { tab_id: tabId, only_visible: { type: 'boolean', description: 'Only elements in the viewport (default false).' }, query: { type: 'string', description: 'Only elements whose label, text or link contains this (case-insensitive), e.g. "reply".' }, within: { type: 'string', description: 'CSS selector: only elements inside the first match (shadow DOM included), e.g. a comment.' } } },
   },
   {
     name: 'screenshot', access: 'read',
@@ -93,8 +93,8 @@ const TOOLS = [
   },
   {
     name: 'scroll', access: 'write',
-    description: 'Scroll the page up/down by a number of screens, or to the top/bottom.',
-    input_schema: { type: 'object', properties: { tab_id: tabId, direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'] }, screens: { type: 'number', description: 'Default 1.' } }, required: ['direction'] },
+    description: 'Scroll the page up/down by a number of screens, or to the top/bottom; or bring one element into view (selector or element_index), which also makes pages build parts they only show on screen (e.g. a comment\'s Reply button).',
+    input_schema: { type: 'object', properties: { tab_id: tabId, direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'] }, screens: { type: 'number', description: 'Default 1.' }, selector: { type: 'string' }, element_index: { type: 'integer' } } },
   },
   {
     name: 'wait_for', access: 'read',
@@ -138,6 +138,7 @@ function validateInput(tool, input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return 'input must be an object';
   const { properties = {}, required = [] } = tool.input_schema;
   // Empty text is a real value for type_text (clear: true + value '' empties a field).
+  if (tool.name === 'type_text' && input.value === undefined && typeof input.text === 'string') return 'type_text needs value: the text to type. (text finds the field by its visible text.)';
   for (const key of required) if (input[key] === undefined || input[key] === null || (input[key] === '' && !(tool.name === 'type_text' && key === 'value'))) return `missing required field: ${key}`;
   for (const [key, value] of Object.entries(input)) {
     const spec = properties[key];

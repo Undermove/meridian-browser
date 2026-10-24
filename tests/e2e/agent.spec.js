@@ -317,11 +317,12 @@ test('agent tools work on a hidden background tab, screenshots included, without
         r.value2 = (await call(mcp, 'run_javascript', { tab_id: opened.tab_id, code: 'document.querySelector("#field").value' })).text;
         r.link2 = await call(mcp, 'click', { tab_id: opened.tab_id, selector: '#same' });
         r.wait2 = json(await call(mcp, 'wait_for', { tab_id: opened.tab_id, text: 'content-linked-next', timeout_ms: 5000 }));
+        await new Promise((res) => setTimeout(res, 2500)); // after the short after-action grace
         r.stillHidden = (await call(mcp, 'run_javascript', { tab_id: opened.tab_id, code: 'document.visibilityState' })).text;
         const t0 = Date.now();
         r.shot = await call(mcp, 'screenshot', { tab_id: opened.tab_id });
         r.shotMs = Date.now() - t0;
-        await new Promise((res) => setTimeout(res, 500));
+        await new Promise((res) => setTimeout(res, 2500)); // the tab stays live briefly after an action
         r.hiddenAfter = (await call(mcp, 'run_javascript', { tab_id: opened.tab_id, code: 'document.visibilityState' })).text;
       } finally { await mcp.close().catch(() => {}); }
     },
@@ -377,4 +378,28 @@ test2('upload_file attaches a local file only after the user confirms that exact
     await call(mcp, 'type_text', { tab_id, selector: '#ed', value: 'fresh', clear: true });
     expect(await js('document.getElementById("ed").innerText')).toBe('"fresh"');
   } finally { fs.rmSync(pic, { force: true }); }
+});
+
+test2('lazily built buttons (Reddit-style) appear for agents in a background tab; animations started by a click finish', async ({ meridian, mcp, server }) => {
+  await setAccess(meridian, 'full', true);
+  await meridian.page.evaluate((u) => openTab(u), server.url('/p/home')); // the user's own tab stays in front
+  const { tab_id } = json(await call(mcp, 'open_tab', { url: server.url('/lazy') })); // background
+  const js = async (code) => (await call(mcp, 'run_javascript', { tab_id, code })).text;
+  const scrolled = await call(mcp, 'scroll', { tab_id, selector: '#c2' });
+  expect(scrolled.isError).toBeFalsy();
+  const els = (await call(mcp, 'get_interactive_elements', { tab_id, within: '#c2', query: 'reply' })).text.split('\n').slice(1).map((l) => JSON.parse(l));
+  expect(els).toHaveLength(1);
+  expect(els[0]).toMatchObject({ tag: 'button', label: 'Reply' });
+  expect((await call(mcp, 'click', { tab_id, element_index: els[0].i })).isError).toBeFalsy();
+  await expect.poll(() => js('document.querySelector("#c2 form").dataset.open || ""'), { timeout: 5000 }).toBe('"1"');
+  const box = (await call(mcp, 'get_interactive_elements', { tab_id, within: '#c2 form' })).text.split('\n').slice(1).map((l) => JSON.parse(l));
+  expect(box[0].tag).toBe('textarea');
+  expect((await call(mcp, 'type_text', { tab_id, element_index: box[0].i, value: 'hi there' })).isError).toBeFalsy();
+  expect(await js('document.querySelector("#c2 textarea").value')).toBe('"hi there"');
+  // filters and parameter help
+  expect((await call(mcp, 'get_interactive_elements', { tab_id, within: '#nope' })).text).toMatch(/nothing on the page matches/);
+  expect((await call(mcp, 'type_text', { tab_id, text: 'x' })).text).toMatch(/needs value/);
+  // never brought to the front: back to hidden once the short after-action grace is over
+  await expect.poll(() => meridian.page.evaluate((id) => rt.views.get(id).classList.contains('agent-live'), tab_id), { timeout: 5000 }).toBe(false);
+  expect(await meridian.page.evaluate((id) => space().activeTabId !== id, tab_id)).toBe(true);
 });

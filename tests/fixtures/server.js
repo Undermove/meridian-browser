@@ -43,6 +43,19 @@ function routes(base) {
         onchange="const f=this.files[0]; document.getElementById('got').textContent='got:'+f.name+':'+f.size">
       <p id="got">nothing</p>
       <div id="ed" contenteditable="true" role="textbox" aria-label="Post text"></div>`),
+    // Like Reddit: a comment's Reply row is built only once the comment is drawn on screen (IntersectionObserver),
+    // and the reply form slides open with a frame-by-frame animation.
+    '/lazy': () => page('Lazy Fixture', `
+      <div style="height:1600px">top filler</div>
+      <div id="c2" class="comment"><p>Second comment</p><div class="row"></div><form class="reply" style="display:none;height:0;overflow:hidden"><textarea name="text"></textarea></form></div>
+      <script>
+        const c = document.getElementById('c2');
+        new IntersectionObserver((es) => { if (es.some((e) => e.isIntersecting) && !c.querySelector('.row button')) {
+          const b = document.createElement('button'); b.textContent = 'Reply'; c.querySelector('.row').appendChild(b);
+          b.onclick = () => { const f = c.querySelector('form'); f.style.display = 'block'; let h = 0;
+            const step = () => { h += 8; f.style.height = h + 'px'; if (h < 80) requestAnimationFrame(step); else f.dataset.open = '1'; }; requestAnimationFrame(step); };
+        } }).observe(c);
+      </script>`),
     '/form': () => page('Form Fixture', `
       <label>Name <input id="name" name="name" placeholder="Your name"></label>
       <button id="go" onclick="document.getElementById('result').textContent='clicked:'+document.getElementById('name').value">Submit form</button>
