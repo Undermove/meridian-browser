@@ -116,6 +116,20 @@ test.describe('command bar', () => {
     expect(await page.evaluate(() => space().today.map((t) => t.url))).toContain(server.url('/p/gamma'));
   });
 
+  test('the empty bar suggests frequent sites and things to try', async ({ page, server }) => {
+    await waitTabLoaded(page, await page.evaluate(() => space().activeTabId));
+    await page.evaluate((u) => { state.history[u] = { url: u, title: 'Gamma docs', count: 5, last: Date.now() }; }, server.url('/p/gamma').replace('127.0.0.1', 'localhost'));
+    await page.evaluate(() => openCommandBar('new'));
+    await expect(page.locator('#cmd-results .cmd-group', { hasText: 'Frequent sites' })).toBeVisible();
+    await expect(page.locator('#cmd-results .cmd-row[data-kind="history"]')).toContainText(['Gamma docs']);
+    await expect(page.locator('#cmd-results .cmd-group', { hasText: 'Try' })).toBeVisible();
+    await expect(page.locator('#cmd-results .cmd-row[data-kind="cmd"]').first()).toContainText('Split View');
+    await expect(page.locator('#cmd-results')).toContainText('Two pages side by side');
+    await expect(page.locator('#cmd-foot')).toContainText('Type a site');
+    await page.locator('#cmd-input').fill('x');
+    await expect(page.locator('#cmd-results .cmd-group', { hasText: 'Try' })).toHaveCount(0);
+  });
+
   test('switching tabs with the mouse a few times earns a keyboard tip, once', async ({ page }) => {
     await waitTabLoaded(page, await page.evaluate(() => space().activeTabId));
     const rows = page.locator('#space-pages .row.tab');

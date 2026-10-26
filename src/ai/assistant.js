@@ -53,12 +53,19 @@ class Assistant {
 
   setKey(key) {
     if (!key) { try { fs.unlinkSync(this.keyFile); } catch {} return; }
-    if (!safeStorage.isEncryptionAvailable()) throw new Error('OS keychain encryption is not available');
+    // On macOS this also happens when Meridian started while the screen was locked: the keychain said no
+    // then, and Chromium remembers that until the app restarts.
+    const restart = process.platform === 'darwin'
+      ? 'Meridian couldn’t reach your Mac’s keychain to store the key safely. Quit Meridian (⌘Q), open it again and set the key once more — if macOS asks, allow Meridian to use its keychain item.'
+      : 'Meridian couldn’t reach the system keychain to store the key safely. Restart Meridian and try again, or set ANTHROPIC_API_KEY.';
+    if (!safeStorage.isEncryptionAvailable()) throw new Error(restart);
     // On Linux without a keyring Electron silently falls back to a hard-coded key — refuse instead.
     if (process.platform === 'linux' && safeStorage.getSelectedStorageBackend?.() === 'basic_text') {
       throw new Error('No system keyring found (install GNOME Keyring or KWallet), or set ANTHROPIC_API_KEY.');
     }
-    fs.writeFileSync(this.keyFile, safeStorage.encryptString(key.trim()), { mode: 0o600 });
+    let sealed;
+    try { sealed = safeStorage.encryptString(key.trim()); } catch { throw new Error(restart); }
+    fs.writeFileSync(this.keyFile, sealed, { mode: 0o600 });
   }
 
   // Check a key before saving it: one tiny request (a one-token reply, a tiny fraction of a cent).

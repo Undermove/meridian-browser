@@ -1386,7 +1386,7 @@ function openCommandBar(mode = 'new') {
     resolveAiProvider().then((p) => {
       const changed = ai.provider?.id !== p.id || ai.provider?.ready !== p.ready;
       ai.provider = p;
-      if (changed && !$('#cmdbar-overlay').hidden && $('#cmd-answer').hidden && $('#cmd-input').value.trim()) updateCommandResults();
+      if (changed && !$('#cmdbar-overlay').hidden && $('#cmd-answer').hidden) updateCommandResults();
     }).catch(() => {});
   }
   $('#cmdbar-overlay').hidden = false;
@@ -1449,11 +1449,7 @@ function updateCommandResults() {
   if (mode !== 'split' && !MINI) {
     // Commands first when the query looks like one
     const cmds = COMMANDS.map((c) => ({ c, s: score(c.label, q) })).filter((x) => q && x.s >= 0).sort((a, b) => b.s - a.s).slice(0, 3);
-    for (const { c } of cmds) {
-      if (PRIVATE && ['power-up', 'settings', 'import-arc', 'import-arc-logins', 'onboarding', 'edit-theme', 'ai-panel', 'ai-summarize', 'open-workbench', 'open-project', 'new-space', 'mission-control', 'ai-tidy'].includes(c.id)) continue;
-      if (uiMode() !== 'developer' && DEV_COMMANDS.test(c.id)) continue;
-      out.push({ kind: 'cmd', group: 'Commands', icon: c.icon, title: c.label, sub: 'Command', keys: c.keys, action: () => { runCommand(c.id); if (c.keys && typeof teachShortcut === 'function') teachShortcut(c); } });
-    }
+    for (const { c } of cmds) if (commandAllowed(c)) out.push(commandRow(c, 'Commands'));
   }
 
   if (!MINI) {
@@ -1484,6 +1480,9 @@ function updateCommandResults() {
     }
   }
 
+  // Nothing typed yet: sites you keep coming back to, and a few things worth trying right now.
+  if (!q && mode === 'new' && !MINI) out.push(...frequentSiteRows(out), ...suggestedCommandRows());
+
   if (q) {
     const hist = Object.values(state.history)
       .map((h) => ({ h, s: Math.max(score(h.title, q), score(h.url.replace(/^https?:\/\/(www\.)?/, ''), q)) }))
@@ -1508,6 +1507,40 @@ function updateCommandResults() {
   }).slice(0, 14);
   rt.cmd.index = 0;
   drawCommandResults();
+}
+
+const PRIVATE_HIDDEN = ['power-up', 'settings', 'import-arc', 'import-arc-logins', 'onboarding', 'edit-theme', 'ai-panel', 'ai-summarize', 'open-workbench', 'open-project', 'new-space', 'mission-control', 'ai-tidy'];
+const commandAllowed = (c) => !(PRIVATE && PRIVATE_HIDDEN.includes(c.id)) && !(uiMode() !== 'developer' && DEV_COMMANDS.test(c.id));
+const commandRow = (c, group, sub = 'Command') => ({ kind: 'cmd', group, icon: c.icon, title: c.label, sub, keys: c.keys, action: () => { runCommand(c.id); if (c.keys && typeof teachShortcut === 'function') teachShortcut(c); } });
+
+function frequentSiteRows(rows) {
+  const open = new Set(rows.filter((r) => r.kind === 'tab').map((r) => r.sub));
+  const tab = activeTab();
+  if (tab) open.add(hostOf(tabUrl(tab)));
+  const seen = new Set();
+  return Object.values(state.history)
+    .filter((h) => h.count >= 2 && /^https?:/.test(h.url))
+    .sort((a, b) => (Math.log2(1 + b.count) * 10 + b.last / 864e5) - (Math.log2(1 + a.count) * 10 + a.last / 864e5))
+    .filter((h) => { const host = hostOf(h.url); if (open.has(host) || seen.has(host)) return false; seen.add(host); return true; })
+    .slice(0, 4)
+    .map((h) => ({ kind: 'history', group: 'Frequent sites', favicon: { url: h.url, title: h.title }, title: h.title || hostOf(h.url), sub: hostOf(h.url), url: h.url, action: () => go(h.url) }));
+}
+
+// What the bar can do for you here, with a line on why — the empty bar shouldn't be an empty box.
+function suggestedCommandRows() {
+  const tab = activeTab();
+  const aiReady = !!ai.provider?.ready;
+  const ideas = [
+    tab && !space().split && ['split', 'Two pages side by side'],
+    tab && aiReady && ['ai-summarize', 'The gist of this page in a few lines'],
+    !aiReady && ['power-up', 'Answers and help with any page, right in this bar'],
+    state.archive.length && ['reopen-archived', 'Bring back the tab you closed last'],
+    ['little-window', 'A small floating window for a quick look'],
+    ['edit-theme', 'Give this space its own colour'],
+    ['toggle-sidebar', 'More room for the page'],
+  ].filter(Boolean);
+  const byId = Object.fromEntries(COMMANDS.map((c) => [c.id, c]));
+  return ideas.map(([id, why]) => byId[id] && commandAllowed(byId[id]) && commandRow(byId[id], 'Try', why)).filter(Boolean).slice(0, 4);
 }
 
 function go(url) {
@@ -1575,8 +1608,8 @@ function drawCommandFoot() {
   const k = (label, ...ks) => `<span class="cf-hint">${ks.map((x) => `<kbd>${esc(keys(x))}</kbd>`).join('')}<span>${esc(label)}</span></span>`;
   const main = !r ? '' : r.kind === 'tab' ? k('Switch', '↵') : r.kind === 'cmd' ? k('Run', '↵') : r.kind === 'ask' ? k('Ask', '↵') : k('Open', '↵');
   const split = splitActionOf(r) ? k('Open in split view', '⇧', '↵') : '';
-  const tip = !r && !$('#cmd-input').value.trim()
-    ? '<span class="cf-try">Type a site, a tab’s name, a command like “split”, or a question</span>'
+  const tip = !$('#cmd-input').value.trim()
+    ? '<span class="cf-try">Type a site, a tab or a question</span>'
     : r?.kind === 'tab' ? `<span class="cf-tip">Without this bar: <kbd>${esc(keys('^'))}</kbd><kbd>⇥</kbd> next tab</span>`
       : r?.kind === 'cmd' && r.keys ? `<span class="cf-tip">Next time: <kbd>${esc(keys(r.keys))}</kbd></span>` : '';
   foot.innerHTML = `${main}${split}${rt.cmd.results.length > 1 ? k('Move', '↑', '↓') : ''}${k('Close', 'esc')}<span class="grow"></span>${tip}`;
