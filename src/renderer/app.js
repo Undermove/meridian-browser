@@ -298,6 +298,7 @@ function bindView(wv, id) {
   wv.addEventListener('did-navigate', (e) => onNav(e.url, false));
   wv.addEventListener('did-navigate-in-page', (e) => { if (e.isMainFrame) onNav(e.url, true); });
   wv.addEventListener('did-start-loading', () => { navOf(id).loading = true; update(); });
+  wv.addEventListener('ipc-message', (e) => { if (e.channel === 'swipe') onPageSwipe(id, e.args[0] || {}); });
   wv.addEventListener('did-stop-loading', () => {
     const n = navOf(id); n.loading = false; n.canBack = wv.canGoBack(); n.canFwd = wv.canGoForward();
     const l = findTab(); if (l) recordHistory(wv.getURL(), wv.getTitle());
@@ -341,9 +342,10 @@ function activate(id, { focus = true } = {}) {
   save();
 }
 
-function openTab(url, { background = false, after = null } = {}) {
+function openTab(url, { background = false, after = null, opener = null } = {}) {
   const sp = space();
   const tab = { id: uid(), type: 'tab', url, title: hostOf(url), lastActive: now() };
+  if (opener && opener !== '__peek__') tab.openerId = opener; // swiping back from its first page returns there
   // Arc puts new tabs at the top of Today; links opened from a page go right below their opener.
   const idx = after ? sp.today.findIndex((t) => t.id === after) : -1;
   if (idx >= 0) sp.today.splice(idx + 1, 0, tab); else sp.today.unshift(tab);
@@ -750,7 +752,7 @@ function renderTopBar(sp) {
   setHtml($('#urlbar .lock'), url.startsWith('https:') ? icon('lock', 12) : '');
   $('#urlbar').classList.toggle('empty', !tab);
   $('#urlbar').classList.toggle('loading', !!nav.loading);
-  $('[data-cmd="back"]').disabled = !nav.canBack;
+  $('[data-cmd="back"]').disabled = !nav.canBack && !(tab && openerOf(tab.id));
   $('[data-cmd="forward"]').disabled = !nav.canFwd;
 }
 
@@ -983,6 +985,68 @@ function prebuildPages() {
     if (todo.length) requestIdleCallback(step, { timeout: 2000 });
   };
   requestIdleCallback(step, { timeout: 2000 });
+}
+
+// ---------------------------------------------------------------- back, and the two-finger swipe on a page
+// Arc: swipe right on a page goes back, left goes forward. Back from the first page of a tab opened from
+// a link closes it and returns to the tab it came from (also the Back button and ⌘[). The swipe itself is
+// reported by guest-preload.js; a hint at the page's edge follows the fingers and fires at SWIPE_DIST.
+
+const SWIPE_DIST = 150;
+// Arc's arrow: a shaft with a round-capped head, white on the disc.
+const SWIPE_ARROW = (back) => `<svg width="58" height="58" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.8" stroke-linecap="round" stroke-linejoin="round"><path d="${back ? 'M19.5 12h-15M11 5.5L4.5 12l6.5 6.5' : 'M4.5 12h15M13 5.5l6.5 6.5-6.5 6.5'}"/></svg>`;
+
+// The open tab this one was opened from, if it's still there.
+function openerOf(id) {
+  const to = locate(id)?.node.openerId;
+  return to && to !== id && locate(to) ? to : null;
+}
+
+function goBack(id = space().activeTabId) {
+  const wv = rt.views.get(id);
+  if (!wv) return false;
+  if (wv.canGoBack()) { wv.goBack(); return true; }
+  const to = openerOf(id);
+  if (!to) return false;
+  closeTab(id);
+  activate(to);
+  return true;
+}
+
+function onPageSwipe(id, { dx = 0, end = false }) {
+  const hint = $('#swipe-hint');
+  const wv = rt.views.get(id);
+  if (end || !wv || id !== space().activeTabId || !$('#cmdbar-overlay').hidden) {
+    const was = rt.swipe;
+    rt.swipe = null;
+    if (was && !was.done) hint.classList.remove('show');
+    return;
+  }
+  const s = rt.swipe?.id === id ? rt.swipe : (rt.swipe = { id, done: false });
+  if (s.done) return;
+  const back = dx < 0;
+  const how = back ? (wv.canGoBack() ? 'history' : openerOf(id) ? 'opener' : null) : (wv.canGoForward() ? 'history' : null);
+  const p = Math.min(1, Math.abs(dx) / SWIPE_DIST);
+  const box = wv.getBoundingClientRect();
+  const host = $('#content').getBoundingClientRect();
+  hint.style.top = `${box.top - host.top + box.height / 2}px`;
+  hint.style.left = back ? `${box.left - host.left}px` : `${box.right - host.left}px`;
+  hint.classList.toggle('fwd', !back);
+  hint.classList.toggle('off', !how);
+  // Arc's timing: the disc is fully out at 60% of the swipe, then only darkens; a swipe that can't go
+  // anywhere never darkens past that.
+  const x = Math.min(1, p / 0.6);
+  const a = !how ? 0.3 + 0.12 * x : p < 0.6 ? 0.3 + 0.12 * x : 0.42 + 0.58 * ((p - 0.6) / 0.4);
+  hint.style.setProperty('--x', x.toFixed(3));
+  hint.style.setProperty('--a', a.toFixed(3));
+  if (hint.dataset.dir !== String(back)) { hint.dataset.dir = String(back); setHtml(hint, SWIPE_ARROW(back)); }
+  hint.classList.remove('go');
+  hint.classList.add('show');
+  if (p < 1 || !how) return;
+  s.done = true;
+  hint.classList.add('go');
+  setTimeout(() => { if (!rt.swipe || rt.swipe.done) hint.classList.remove('show', 'go'); }, 260);
+  if (back) goBack(id); else wv.goForward();
 }
 
 // ---------------------------------------------------------------- two-finger swipe between spaces
@@ -1999,7 +2063,7 @@ function runCommand(name, ...args) {
       if (MINI) return window.close();
       return closeTab();
     case 'reopen-tab': return reopenTab();
-    case 'back': return wv?.canGoBack() && wv.goBack();
+    case 'back': return goBack();
     case 'forward': return wv?.canGoForward() && wv.goForward();
     case 'reload': return wv?.reload();
     case 'hard-reload': return wv?.reloadIgnoringCache();
@@ -2082,19 +2146,19 @@ function onWebviewOpen({ url, disposition, fromId }) {
   const l = fromTab && locate(fromTab);
   // Arc behaviour: links leaving a pinned tab / favorite to another site open in Peek.
   if (l && isPinnedZone(l.zone) && disposition === 'foreground-tab' && hostOf(url) !== hostOf(tabUrl(l.node))) return openPeek(url);
-  openTab(url, { background: disposition === 'background-tab', after: l?.zone === 'today' ? fromTab : null });
+  openTab(url, { background: disposition === 'background-tab', after: l?.zone === 'today' ? fromTab : null, opener: l ? fromTab : null });
 }
 
 function onWebviewAction({ action, url, text, fromId }) {
   const fromTab = rt.wcToTab.get(fromId);
-  if (action === 'open-tab') return MINI ? api.promoteMini(url) : openTab(url, { background: true, after: fromTab });
+  if (action === 'open-tab') return MINI ? api.promoteMini(url) : openTab(url, { background: true, after: fromTab, opener: fromTab });
   if (action === 'open-peek') return MINI ? webview()?.loadURL(url) : openPeek(url);
   if (action === 'open-split') {
     if (MINI) return api.promoteMini(url);
     if (fromTab && fromTab !== '__peek__' && space().activeTabId !== fromTab) activate(fromTab);
     rt.cmd.mode = 'split'; return go(url);
   }
-  if (action === 'search') return MINI ? webview()?.loadURL(searchUrl(text)) : openTab(searchUrl(text), { after: fromTab });
+  if (action === 'search') return MINI ? webview()?.loadURL(searchUrl(text)) : openTab(searchUrl(text), { after: fromTab, opener: fromTab });
 }
 
 // ---------------------------------------------------------------- Little (mini) window

@@ -612,7 +612,8 @@ app.on('web-contents-created', (_e, contents) => {
   contents.on('will-attach-webview', (event, webPreferences, params) => {
     // Workbench integration: the internal workbench page gets its own preload/partition; refuses misuse.
     if (workbench && workbench.attachPolicy(contents, event, webPreferences, params)) return;
-    delete webPreferences.preload;
+    // Only our own preload (two-finger swipe), never one a page asked for.
+    webPreferences.preload = path.join(__dirname, 'guest-preload.js');
     webPreferences.nodeIntegration = false;
     webPreferences.nodeIntegrationInSubFrames = false;
     webPreferences.contextIsolation = true;
