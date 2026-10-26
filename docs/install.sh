@@ -71,8 +71,14 @@ if [ "$OS" = "Darwin" ]; then
   mv "$TMP/app/Meridian.app" "$DEST/"
   # Files fetched with curl aren't quarantined, but clear the flag in case something added it.
   xattr -dr com.apple.quarantine "$DEST/Meridian.app" 2>/dev/null || true
-  say "Installed Meridian $VERSION to $DEST. Opening it…"
-  [ -n "${MERIDIAN_NO_OPEN:-}" ] || open "$DEST/Meridian.app"
+  # Opened while the screen is locked, Meridian can't read its keychain key (your saved sign-ins), so
+  # it would only ask for a restart: leave the opening to you.
+  if ioreg -n Root -d1 2>/dev/null | grep -q '"CGSSessionScreenIsLocked" = Yes'; then
+    say "Installed Meridian $VERSION to $DEST. Your screen is locked, so it isn't opened: open it when you're back."
+  else
+    say "Installed Meridian $VERSION to $DEST. Opening it…"
+    [ -n "${MERIDIAN_NO_OPEN:-}" ] || open "$DEST/Meridian.app"
+  fi
 else
   DIR="$HOME/.local/share/meridian"
   mkdir -p "$DIR" "$HOME/.local/share/applications" "$HOME/.local/share/icons/hicolor/512x512/apps"

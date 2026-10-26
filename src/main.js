@@ -84,7 +84,7 @@ app.on('open-url', (event, url) => {
 // Links clicked in other apps go where Air Traffic Control says (Settings → Links): the Little window
 // (like Little Arc) by default, or a tab in a chosen space.
 function openExternalUrl(url) {
-  if (!/^https?:\/\//i.test(String(url))) return;
+  if (global.__keychainBlocked || !/^https?:\/\//i.test(String(url))) return; // keychainReady() is waiting
   const settings = uiSnapshot?.settings || {};
   const spaceIds = (uiSnapshot?.spaces || []).map((s) => s.id);
   const route = routeLink(settings.atc, url, spaceIds);
@@ -1747,7 +1747,33 @@ async function loadExtensionFromMenu() {
 // code could warn first. Releases are signed with one stable certificate (scripts/build-mac-release.sh), so
 // macOS remembers "Always Allow" across updates; a first install creates the key silently.
 
+// Saved sign-ins (cookies) are encrypted with the "Meridian Safe Storage" keychain key. When Chromium
+// can't read that key (the Mac was locked when Meridian started, e.g. an update relaunched it while you
+// were away, or the keychain prompt was dismissed) it can't decrypt the cookies and drops them: you're
+// signed out everywhere. So nothing that loads cookies starts until the key is readable; Meridian asks
+// for a restart instead. (macOS only: Windows and Linux keep the key elsewhere.)
+async function keychainReady() {
+  if (process.platform !== 'darwin') return true;
+  const forcedLocked = DEV && process.env.MERIDIAN_E2E_KEYCHAIN === 'locked';
+  if (!forcedLocked && safeStorage.isEncryptionAvailable()) return true;
+  global.__keychainBlocked = true;
+  // The suite can't click a native alert (it blocks the main thread): it answers via __keychainAnswer.
+  const ask = forcedLocked ? (opts) => new Promise((resolve) => { global.__keychainDialog = opts; global.__keychainAnswer = (response) => resolve({ response }); }) : (opts) => dialog.showMessageBox(opts);
+  const { response } = await ask({
+    type: 'warning',
+    message: 'Meridian can’t unlock your saved sign-ins yet',
+    detail: 'Your sign-ins are encrypted with a key in the macOS keychain, and Meridian couldn’t read it. This usually means your Mac was locked when Meridian started.\n\n'
+      + 'Meridian is waiting instead of opening your tabs, because opening them now would sign you out of every site.\n\n'
+      + 'Unlock your Mac and click Restart. If macOS asks about “Meridian Safe Storage”, choose Always Allow.',
+    buttons: ['Restart Meridian', 'Quit'], defaultId: 0, cancelId: 1,
+  });
+  if (response === 0) app.relaunch();
+  app.exit(0);
+  return false;
+}
+
 app.whenReady().then(async () => {
+  if (!(await keychainReady())) return;
   permissionDecisions = readJson(PERMS_FILE(), {});
   const saved = readJson(STATE_FILE(), null);
   if (saved && saved.settings) {
