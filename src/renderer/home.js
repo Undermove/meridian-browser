@@ -243,6 +243,29 @@ const POWERS = [
   ['eye', 'Link previews', 'Hold Shift over a link to see what’s behind it.'],
 ];
 
+// Getting a key, step by step, for the providers most people already have an account with.
+const KEY_GUIDES = [
+  { id: 'gemini', name: 'Gemini', tag: 'free to start', site: 'Google AI Studio', url: 'https://aistudio.google.com/apikey',
+    steps: ['Sign in with your Google account.', 'Click “Create API key”.', 'Copy the key. Meridian picks it up by itself.'],
+    note: 'Google gives a free allowance every day: enough to try everything.' },
+  { id: 'openai', name: 'ChatGPT', tag: 'from $5', site: 'the OpenAI Platform', url: 'https://platform.openai.com/api-keys',
+    steps: ['Sign in: your ChatGPT login works.', 'Add $5 of credit under Billing.', 'Click “Create new secret key” and copy it.'],
+    note: 'A ChatGPT subscription doesn’t include API use; the credit is separate.' },
+  { id: 'claude', name: 'Claude', tag: 'can act for you', site: 'the Anthropic Console', url: 'https://console.anthropic.com/settings/keys',
+    steps: ['Sign in or create an account.', 'Add $5 of credit under Billing.', 'Click “Create Key” and copy it.'],
+    note: 'The only one that can also click and type in the browser for you, when you allow it.' },
+  { id: 'openrouter', name: 'OpenRouter', tag: 'hundreds of models', site: 'OpenRouter', url: 'https://openrouter.ai/settings/keys',
+    steps: ['Sign in with Google or GitHub.', 'Add credit (some models are free).', 'Click “Create API Key” and copy it.'],
+    note: 'One key for models from every company.' },
+];
+
+const KEY_FAQ = [
+  ['What is a key?', 'A code, like a pass, that lets Meridian use an AI on your account with that company. It isn’t your password and it can’t open your account.'],
+  ['What do I get?', 'Answers to any question right in ⌘T, and any page summarised or explained in ⌘J and Chat.'],
+  ['Is it safe?', 'The key stays on this computer, locked with your Mac’s keychain. Meridian sends it only to that company: never to us, never to websites. Remove it any time in Settings → AI.'],
+  ['What does it cost?', 'You pay that company for what you use: usually a fraction of a cent per question. Gemini has a free allowance. You can set a spending limit on their site.'],
+];
+
 function openPowerUp() {
   if (EPHEMERAL || $('#power')) return;
   const el = document.createElement('div');
@@ -260,24 +283,28 @@ function openPowerUp() {
       </div>
       <div class="pw-copy">
         <h2 id="pw-title">Give Meridian a gem</h2>
-        <p class="pw-lead" id="pw-lead">A Claude API key is the gem. Set it into Meridian and the browser starts answering questions, explaining pages and tidying your tabs.</p>
+        <p class="pw-lead" id="pw-lead">Connect the AI you like (ChatGPT, Gemini, Claude and others) and the browser starts answering your questions and explaining pages. The gem is an API key from that company.</p>
       </div>
       <form class="pw-form" id="pw-form" autocomplete="off">
         <div class="pw-gemslot">${GEM_SVG('pw-gem')}</div>
+        <div class="pw-found" id="pw-found" hidden></div>
         <div class="pw-field">
-          <input id="pw-key" type="password" spellcheck="false" placeholder="Paste your key: sk-ant-…" aria-label="Claude API key">
+          <input id="pw-key" type="password" spellcheck="false" placeholder="Paste your API key here" aria-label="API key">
           <button type="submit" class="btn accent" id="pw-go">Set the gem</button>
         </div>
         <div class="pw-error" id="pw-error" role="alert"></div>
-        <div class="pw-help">
-          <button type="button" class="home-link" data-a="console">Get a key in the Anthropic Console</button>
-          <span>·</span>
-          <button type="button" class="home-link" data-a="local">Rather free and private? Use a local model</button>
+        <div class="pw-get">
+          <div class="pw-get-head">No key yet? Get one in a minute:</div>
+          <div class="pw-chips">${KEY_GUIDES.map((g, i) => `<button type="button" class="pw-chip" data-a="guide" data-i="${i}"><b>${esc(g.name)}</b><small>${esc(g.tag)}</small></button>`).join('')}</div>
+          <div class="pw-guide" id="pw-guide" hidden></div>
         </div>
-        <p class="pw-fine">Pay as you go on your own Anthropic account: a question in ⌘T costs a fraction of a cent. The key is encrypted with your computer’s keychain and only ever sent to Anthropic.</p>
+        <details class="pw-faq"><summary>What’s a key, and is it safe?</summary>
+          ${KEY_FAQ.map(([q, a]) => `<div class="pw-qa"><b>${esc(q)}</b><span>${esc(a)}</span></div>`).join('')}
+          <div class="pw-qa"><b>Rather not pay anyone?</b><span><button type="button" class="home-link" data-a="local">Use a free local model</button> that runs on this Mac. Slower, but private.</span></div>
+        </details>
       </form>
       <div class="pw-powers" id="pw-powers" hidden>
-        ${POWERS.map(([ic, t, d], i) => `<div class="pw-power" style="--i:${i}"><span class="pwp-ic">${icon(ic, 18)}</span><span><b>${esc(t)}</b><small>${esc(d)}</small></span></div>`).join('')}
+        <div class="pw-power-list"></div>
         <div class="pw-done"><button class="btn accent" data-a="try">Ask something in ⌘T</button><button class="btn" data-a="close">Done</button></div>
       </div>
     </div>`;
@@ -285,34 +312,25 @@ function openPowerUp() {
   requestAnimationFrame(() => el.classList.add('open'));
   const input = $('#pw-key', el);
   setTimeout(() => input.focus(), 250);
-  const close = () => { el.classList.remove('open'); el.classList.add('closing'); document.removeEventListener('keydown', onKey, true); setTimeout(() => el.remove(), 260); };
-  const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+  let waitTimer = null, waitPill = null, guide = null;
+  const stopWaiting = () => { clearInterval(waitTimer); waitTimer = null; waitPill?.remove(); waitPill = null; el.classList.remove('away'); };
+  const close = () => { stopWaiting(); window.removeEventListener('focus', checkClipboard); el.classList.remove('open'); el.classList.add('closing'); document.removeEventListener('keydown', onKey, true); setTimeout(() => el.remove(), 260); };
+  const onKey = (e) => { if (e.key === 'Escape' && !el.classList.contains('away')) { e.stopPropagation(); close(); } };
   document.addEventListener('keydown', onKey, true);
   input.addEventListener('input', () => {
     el.classList.toggle('has-key', input.value.trim().length > 0);
     $('#pw-error', el).textContent = '';
     el.classList.remove('cracked');
   });
-  el.addEventListener('click', (e) => {
-    const a = e.target.closest('[data-a]')?.dataset.a;
-    if (e.target === el) return close();
-    if (!a) return;
-    if (a === 'close') return close();
-    if (a === 'console') { openTab('https://console.anthropic.com/settings/keys', { background: true }); toast('Opened the Anthropic Console in a new tab'); return; }
-    if (a === 'local') { close(); return openSettings('ai'); }
-    if (a === 'try') {
-      close();
-      setTimeout(() => { openCommandBar('new'); const i = $('#cmd-input'); i.value = 'What can you help me with?'; updateCommandResults(); }, 280);
-    }
-  });
-  $('#pw-form', el).addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const key = input.value.trim();
-    if (!key || el.classList.contains('checking')) return;
-    el.classList.add('checking');
+
+  // Check a key (typed, or the one on the clipboard: that one never passes through this page) and set it.
+  const connect = async (fromClipboard) => {
+    if (el.classList.contains('checking') || el.classList.contains('powered')) return;
+    if (!fromClipboard && !input.value.trim()) return input.focus();
+    el.classList.add('checking', 'has-key');
     $('#pw-go', el).disabled = true;
-    $('#pw-lead', el).textContent = 'Checking the gem with Anthropic…';
-    const r = await api.aiConnectKey(key).catch((err) => ({ ok: false, error: err.message }));
+    $('#pw-lead', el).textContent = 'Checking the gem with its maker…';
+    const r = await (fromClipboard ? api.aiConnectClipboardKey() : api.aiConnectKey(input.value.trim())).catch((err) => ({ ok: false, error: err.message }));
     el.classList.remove('checking');
     $('#pw-go', el).disabled = false;
     if (!r?.ok) {
@@ -322,15 +340,84 @@ function openPowerUp() {
       return;
     }
     input.value = '';
-    applySettingsPatch({ aiProvider: 'api' });
-    if (typeof resolveAiProvider === 'function' && typeof ai !== 'undefined') resolveAiProvider().then((p) => { ai.provider = p; }).catch(() => {});
-    await setGem(el);
+    $('#pw-found', el).hidden = true;
+    applySettingsPatch({ aiProvider: r.provider || 'api' });
+    if (typeof resolveAiProvider === 'function' && typeof ai !== 'undefined') listAiAgents(true).then(() => resolveAiProvider()).then((p) => { ai.provider = p; }).catch(() => {});
+    await setGem(el, r);
     refreshHome();
+  };
+
+  // A key-shaped text on the clipboard (only its maker and a few characters come back from main).
+  const clipboardKey = () => api.aiClipboardKey().catch(() => null);
+  async function checkClipboard() {
+    if (el.classList.contains('powered') || el.classList.contains('checking') || waitTimer) return;
+    const k = await clipboardKey();
+    const box = $('#pw-found', el);
+    if (!k || !box) return;
+    box.innerHTML = `${icon('sparkles', 14)}<span>A ${esc(k.label)} key is on your clipboard <code>${esc(k.hint)}</code></span><button type="button" class="btn small accent" data-a="use-clip">Use it</button>`;
+    box.hidden = false;
+  }
+  window.addEventListener('focus', checkClipboard);
+  checkClipboard();
+
+  // Off to get a key: the overlay steps aside, a small pill waits, and the copied key comes back on its own.
+  const goGetKey = (g) => {
+    openTab(g.url);
+    el.classList.add('away');
+    waitPill = document.createElement('div');
+    waitPill.className = 'pw-wait';
+    waitPill.innerHTML = `${GEM_SVG('pw-wait-gem')}<span><b>Waiting for your ${esc(g.name)} key</b><small>${esc(g.steps.join(' '))}</small></span><button class="btn small" data-w="back">Back</button><button class="pw-wait-x" data-w="close" title="Stop">${icon('x', 12)}</button>`;
+    document.body.appendChild(waitPill);
+    requestAnimationFrame(() => waitPill?.classList.add('show'));
+    waitPill.onclick = (e) => {
+      const w = e.target.closest('[data-w]')?.dataset.w;
+      if (w === 'back') { stopWaiting(); checkClipboard(); }
+      if (w === 'close') close();
+    };
+    const started = Date.now();
+    waitTimer = setInterval(async () => {
+      if (Date.now() - started > 10 * 60_000) return stopWaiting();
+      const k = await clipboardKey();
+      if (!k || !waitTimer) return;
+      stopWaiting();
+      $('#pw-lead', el).textContent = `Found your ${k.label} key.`;
+      connect(true);
+    }, 1200);
+  };
+
+  el.addEventListener('click', (e) => {
+    const a = e.target.closest('[data-a]')?.dataset.a;
+    if (e.target === el) return close();
+    if (!a) return;
+    if (a === 'close') return close();
+    if (a === 'use-clip') return connect(true);
+    if (a === 'guide') {
+      const g = KEY_GUIDES[+e.target.closest('[data-i]').dataset.i];
+      const box = $('#pw-guide', el);
+      $$('.pw-chip', el).forEach((c) => c.classList.toggle('on', c === e.target.closest('.pw-chip') && guide !== g));
+      if (guide === g) { guide = null; box.hidden = true; return; }
+      guide = g;
+      box.innerHTML = `<ol>${g.steps.map((s) => `<li>${esc(s)}</li>`).join('')}</ol><p>${esc(g.note)}</p><button type="button" class="btn accent" data-a="go">Open ${esc(g.site)}</button>`;
+      box.hidden = false;
+      return;
+    }
+    if (a === 'go' && guide) return goGetKey(guide);
+    if (a === 'local') { close(); return openSettings('ai'); }
+    if (a === 'try') {
+      close();
+      setTimeout(() => { openCommandBar('new'); const i = $('#cmd-input'); i.value = 'What can you help me with?'; updateCommandResults(); }, 280);
+    }
   });
+  $('#pw-form', el).addEventListener('submit', (e) => { e.preventDefault(); connect(false); });
 }
 
 // The gem flies into the socket, the arc lights up, and the new powers appear one by one.
-async function setGem(el) {
+async function setGem(el, r = {}) {
+  // Acting in the browser, Tidy Today and link previews run on Claude; other keys answer and explain.
+  const claude = !r.provider || r.provider === 'api';
+  const powers = claude ? POWERS : [POWERS[0], ['sparkles', 'Help with any page', '⌘J and Chat summarise and explain the page you’re on.']];
+  $('.pw-power-list', el).innerHTML = powers.map(([ic, t, d], i) => `<div class="pw-power" style="--i:${i}"><span class="pwp-ic">${icon(ic, 18)}</span><span><b>${esc(t)}</b><small>${esc(d)}</small></span></div>`).join('')
+    + (claude ? '' : '<p class="pw-note">Acting in the browser for you, Tidy Today and link previews need a Claude key for now.</p>');
   const gem = $('.pw-gem', el), socket = $('#pw-socket', el);
   const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
   if (!reduce) {
@@ -344,7 +431,7 @@ async function setGem(el) {
   socket.innerHTML = GEM_SVG('pw-set');
   el.classList.add('powered');
   $('#pw-title', el).textContent = 'Meridian is powered up';
-  $('#pw-lead', el).textContent = 'Here’s what you can do now:';
+  $('#pw-lead', el).textContent = r.label ? `${r.label} is set in. Here’s what you can do now:` : 'Here’s what you can do now:';
   $('#pw-form', el).hidden = true;
   $('#pw-powers', el).hidden = false;
   celebrate('#b48cff');

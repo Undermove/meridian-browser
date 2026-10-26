@@ -19,12 +19,22 @@ const AGENT_UI = {
   claude: { label: 'Claude Code', mark: 'C', color: '#d97757' },
   codex: { label: 'Codex', mark: 'X', color: '#3c3c46' },
   gemini: { label: 'Gemini', mark: 'G', color: '#4c8df6' },
+  copilot: { label: 'Copilot', mark: 'P', color: '#8957e5' },
+  opencode: { label: 'OpenCode', mark: 'O', color: '#4b5563' },
+  cursor: { label: 'Cursor', mark: 'U', color: '#1c1c1c' },
+  qwen: { label: 'Qwen Code', mark: 'Q', color: '#615ced' },
+  amp: { label: 'Amp', mark: 'A', color: '#f34e3f' },
+  goose: { label: 'Goose', mark: 'G', color: '#222222' },
+  droid: { label: 'Droid', mark: 'D', color: '#ff6b00' },
   shell: { label: 'Shell', mark: '$', color: '#7a808c' },
   // Workbench Pro: sandboxed agents (Docker / OrbStack)
   'sandbox-claude': { label: 'Claude Code (sandbox)', mark: 'C', color: '#d97757' },
   'sandbox-codex': { label: 'Codex (sandbox)', mark: 'X', color: '#3c3c46' },
   'sandbox-shell': { label: 'Shell (sandbox)', mark: '$', color: '#7a808c' },
 };
+
+// Claude Code, Codex and Gemini always show (with an install hint); the other agents once they're installed.
+const agentKinds = () => ['claude', 'codex', 'gemini', ...Object.keys(S.info?.agents || {}).filter((id) => S.info.agents[id]?.extra && S.info.agents[id].installed && AGENT_UI[id])];
 
 // Workbench Pro: events for workbench-pro.js and plugins ('project', 'file-open', 'file-save', 'info').
 const bus = new EventTarget();
@@ -218,7 +228,7 @@ function renderWelcome() {
   }
   const agents = $('#welcome-agents');
   agents.innerHTML = '<h2>Agents on this computer</h2>';
-  for (const id of ['claude', 'codex', 'gemini']) {
+  for (const id of agentKinds()) {
     const a = info.agents?.[id];
     const row = document.createElement('div');
     row.className = 'agent-row';
@@ -249,7 +259,7 @@ function renderLauncher() {
   const bar = $('#launcher');
   bar.innerHTML = '';
   const agents = S.info?.agents || {};
-  for (const kind of ['claude', 'codex', 'gemini', 'shell']) {
+  for (const kind of [...agentKinds(), 'shell']) {
     const a = agents[kind];
     const installed = kind === 'shell' || !!a?.installed;
     const b = document.createElement('button');
@@ -901,7 +911,7 @@ function renderTermTabs() {
 function renderTermStart() {
   const box = $('#term-start');
   if (!box) return;
-  const kind = ['claude', 'codex', 'gemini'].find((id) => S.info?.agents?.[id]?.installed);
+  const kind = agentKinds().find((id) => S.info?.agents?.[id]?.installed);
   box.innerHTML = '';
   if (!kind || S.terms.length) return;
   const b = document.createElement('button');

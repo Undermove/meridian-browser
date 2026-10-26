@@ -279,7 +279,7 @@ const ai = { sessionId: uid(), busy: false, el: null, current: null, includePage
 
 // Automatic order: the Claude API key first (when there is one), then agents that are fine to use on the
 // user's own account, then — only with "Other agents" on — the opt-in ones (see local-agents.js).
-const AI_AUTO_ORDER = ['copilot', 'ollama', 'lmstudio', 'codex', 'cursor', 'opencode', 'qwen', 'amp', 'goose', 'droid'];
+const AI_AUTO_ORDER = ['openai', 'gemini', 'openrouter', 'xai', 'mistral', 'deepseek', 'groq', 'copilot', 'ollama', 'lmstudio', 'codex', 'cursor', 'opencode', 'qwen', 'amp', 'goose', 'droid'];
 const agentAllowed = (a) => !!a && (a.policy === 'default' || (a.policy === 'optin' && state.settings.aiOptInAgents === true));
 const aiAgents = { list: null, at: 0, pending: null };
 
@@ -309,7 +309,7 @@ function pickAiProvider(agents, hasKey) {
   if (pick) return { id: pick.id, label: pick.label, ready: true, reason: null };
   if (chosen === 'api') return api_;
   if (c) return { id: c.id, label: c.label, ready: false, reason: !c.installed ? `${c.label} isn’t installed.` : `${c.label} isn’t signed in.` };
-  return { id: null, label: 'AI', ready: false, reason: 'Connect an AI in Settings → AI: a Claude API key, GitHub Copilot, or a free local model (Ollama, LM Studio).' };
+  return { id: null, label: 'AI', ready: false, reason: 'Connect an AI in Settings → AI: an API key (Claude, OpenAI, Gemini and others), GitHub Copilot, or a free local model (Ollama, LM Studio).' };
 }
 
 async function resolveAiProvider() {

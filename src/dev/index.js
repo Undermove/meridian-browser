@@ -33,7 +33,7 @@ const fs = require('fs');
 const { ProjectFs } = require('./files');
 const { PtyManager } = require('./pty');
 const { loginPath, childEnv } = require('./env');
-const { detect, launchSpec } = require('./agents');
+const { AGENTS, detect, launchSpec } = require('./agents');
 // Workbench Pro
 const { Vault, scanProject, parseDotenv, DOTENV_FILE, RESERVED } = require('./vault');
 const { SecretGuard, hookSettings } = require('./guard');
@@ -334,7 +334,7 @@ class Workbench {
 
     handle('wb:pty-create', async (owner, opts = {}) => {
       const p = project(owner);
-      const kind = ['shell', 'claude', 'codex', 'gemini', ...Object.keys(SANDBOX_KINDS)].includes(opts.kind) ? opts.kind : 'shell';
+      const kind = ['shell', ...Object.keys(AGENTS), ...Object.keys(SANDBOX_KINDS)].includes(opts.kind) ? opts.kind : 'shell';
       const searchPath = this.agentSearchPath(await loginPath());
       const extra = {};
       let names = [];
@@ -380,6 +380,7 @@ class Workbench {
           names = Object.keys(extra).sort();
           let claudeSettings = null;
           const node = (kind === 'claude' || kind === 'codex') ? which('node', searchPath) : null;
+          const lockedVault = this.vault.unavailableReason() && this.vault.load().some((i) => i.scope === 'global' || i.scope === p.root);
           if (kind === 'claude') {
             const hook = this.guard.hookScript();
             if (hook.error === 'tampered') throw new Error('Claude Code was not started: Meridian’s secret-guard hook script failed its integrity check (it was changed on disk). Reinstall Meridian.');
@@ -397,7 +398,10 @@ class Workbench {
           }
           const codexNotify = kind === 'codex' && mission?.env.MERIDIAN_MISSION_SOCKET ? this.mission.codexNotifyArg(node) : null;
           if (mission) Object.assign(extra, mission.env);
-          spec = launchSpec(kind, { searchPath, mcp: this.mcpCommand(), dataDir: this.app.getPath('userData'), claudeSettings, codexNotify });
+          spec = launchSpec(kind, { searchPath, mcp: this.mcpCommand(), dataDir: this.app.getPath('userData'), claudeSettings, codexNotify, secretNames: names });
+          Object.assign(extra, spec.env || {});
+          // The vault has secrets for this project but can't open them (the keychain said no): say so, or scripts just see blanks.
+          if (lockedVault) spec.notes.push('Your vault secrets are NOT in this session: Meridian couldn’t open its keychain item. Quit Meridian (⌘Q), open it again, then start a new terminal.');
           if (kind === 'claude' && !guardToken) spec.notes.push('Secret-file guard is off for this session (Node.js was not found on your PATH).');
         }
       } catch (err) { missionDone({ code: 1 }); throw err; }

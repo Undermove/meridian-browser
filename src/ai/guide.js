@@ -19,10 +19,10 @@ Sidebar & tabs
 - Built-in ad and tracker blocking (Settings → Advanced). Downloads popover, find in page, zoom, session restore.
 
 AI
-- "Power Up Meridian with AI" (home page or ⌘T) connects a Claude API key: Meridian checks it with Anthropic before saving it, encrypted.
-- Ask from the command bar, the ⌘J side panel and the Chat view use the AI you connect in Settings → AI: a Claude API key, GitHub Copilot, or a free local model (Ollama, LM Studio). With "Other agents" on: Codex, Cursor, OpenCode, Qwen Code, Amp, Goose, Droid, with your own account under their terms. Claude Code and Gemini CLI run in the Workbench terminal.
+- "Power Up Meridian with AI" (home page or ⌘T) connects an API key from Anthropic (Claude), OpenAI, Google Gemini, OpenRouter, xAI, Mistral, DeepSeek or Groq. Meridian recognises whose key it is, checks it with that company before saving it, encrypted. It has step-by-step help for getting a key (Gemini has a free allowance) and picks up a key you just copied.
+- Ask from the command bar, the ⌘J side panel and the Chat view use the AI you connect in Settings → AI: an API key (Claude, OpenAI, Gemini and others; the model can be picked per key), GitHub Copilot, or a free local model (Ollama, LM Studio). With "Other agents" on: Codex, Cursor, OpenCode, Qwen Code, Amp, Goose, Droid, with your own account under their terms. Claude Code and Gemini CLI run in the Workbench terminal.
 - With a Claude API key and agent access enabled, ⌘J can also act in the browser (open tabs, read pages, click, type) — always within the access level you set (Off / Read only / Ask before acting / Full control).
-- Developers: the Workbench is a small IDE (file tree, editor, terminals) that starts Claude Code / Codex in a project; Mission Control shows every running agent and subagent; Meridian has an MCP server so external agents can use the browser.
+- Developers: the Workbench is a small IDE (file tree, editor, terminals) that starts Claude Code, Codex, Gemini, Copilot, OpenCode and other agent CLIs in a project (Claude Code, Codex, Copilot and OpenCode with the browser tools); secrets in the Workbench vault are set as environment variables for terminals and agents it starts, and agents are told their names; Mission Control shows every running agent and subagent; Meridian has an MCP server so external agents can use the browser.
 - Tidy Today suggests folders and shorter titles for Today tabs; Link previews: hold Shift over a link (Settings → AI).
 
 Settings are under the Settings shortcut (General, Profiles, Links, Shortcuts, AI, Advanced). Every shortcut can be changed in Settings → Shortcuts. The welcome tour is in the Help menu.`;

@@ -36,10 +36,11 @@ registerSection({
       </div>
       ${group('Your AI', `<div id="agent-rows"><div class="row"><div class="row-text"><div class="row-desc">Looking for AI agents on this computer…</div></div></div></div>`,
         'Ask in the command bar (⌘T), the ⌘J panel and Chat use this AI. Agents answer as text only; they can’t run commands or change files from here. Claude Code and Gemini CLI run in the Workbench terminal (their terms don’t allow apps to power features with a subscription login).')}
-      ${group('Claude API key', hasKey
-        ? row('API key', `<span class="ok">${icon('check', 14)} Saved</span> ${button('ai-key-remove', 'Remove', 'small')}`, 'Stored encrypted in the system keychain. Pages and the UI never see it.')
-        : `<div class="row"><input class="text" id="ai-key" type="password" placeholder="sk-ant-…" autocomplete="off" spellcheck="false">${button('ai-key-save', 'Save', 'primary')}</div>`,
-      'Used by the ⌘J assistant. Get a key at console.anthropic.com.')}
+      ${group('API keys', `
+        ${hasKey ? row('Claude (Anthropic)', `<span class="ok">${icon('check', 14)} Saved</span> ${button('ai-key-remove', 'Remove', 'small')}`, 'The only one that can also act in the browser for you, and the one Tidy Today and link previews use.') : ''}
+        <div id="cloud-key-rows"></div>
+        <div class="row"><input class="text" id="ai-key" type="password" placeholder="Paste an API key…" autocomplete="off" spellcheck="false">${button('ai-key-save', 'Add', 'primary')}</div>`,
+      'Anthropic, OpenAI, Google Gemini, OpenRouter, xAI, Mistral, DeepSeek or Groq: Meridian recognises the key, checks it with that company and only then saves it, encrypted in the system keychain. Pages and the UI never see it. You pay that company for what you use.')}
       ${group('Agent access', `
         ${AGENT_ACCESS.map(([v, l, d]) => `
           <label class="row radio ${access === v ? 'on' : ''}">
@@ -67,11 +68,20 @@ registerSection({
       if (box) box.innerHTML = cliRow('claude') + cliRow('codex') || '<div class="row"><div class="row-text"><div class="row-desc">Couldn’t look for coding agents.</div></div></div>';
     });
 
-    $('#ai-key-save', el)?.addEventListener('click', async () => {
-      const v = $('#ai-key', el).value.trim();
-      if (!/^sk-ant-/.test(v)) return toast('That doesn’t look like an Anthropic API key (sk-ant-…)');
-      try { await S.aiSetKey(v); toast('API key saved'); showSection('ai'); } catch (err) { toast('Could not save the key: ' + err.message); }
-    });
+    const saveKey = async () => {
+      const input = $('#ai-key', el), btn = $('#ai-key-save', el);
+      const v = input.value.trim();
+      if (!v) return input.focus();
+      btn.disabled = true; btn.textContent = 'Checking…';
+      const r = await S.aiConnectKey(v).catch((err) => ({ ok: false, error: err.message }));
+      btn.disabled = false; btn.textContent = 'Add';
+      if (!r.ok) return toast(r.error || 'Couldn’t check the key', { timeout: 7000 });
+      ctx.set({ aiProvider: r.provider });
+      toast(`${r.label} key saved — ${r.label} answers now`, { timeout: 4500 });
+      showSection('ai');
+    };
+    $('#ai-key-save', el)?.addEventListener('click', saveKey);
+    $('#ai-key', el)?.addEventListener('keydown', (e) => { if (e.key === 'Enter') saveKey(); });
     $('#ai-key-remove', el)?.addEventListener('click', async () => {
       if (!(await confirmBox('Remove your Claude API key?', 'The ⌘J assistant stops working until you add one again.', 'Remove', true))) return;
       await S.aiSetKey(''); toast('API key removed'); showSection('ai');
@@ -104,7 +114,23 @@ registerSection({
 
 // ---------------------------------------------------------------- Your AI (local agents)
 
-const AGENT_MARK = { claude: '#d97757', codex: '#10a37f', gemini: '#4285f4', copilot: '#8957e5', cursor: '#111111', opencode: '#4b5563', qwen: '#615ced', amp: '#f34e3f', goose: '#222222', droid: '#ff6b00', ollama: '#333333', lmstudio: '#4f46e5' };
+// Saved keys for the other providers, each with Remove (the add field is shared, above).
+function drawCloudKeys(root, saved) {
+  const box = $('#cloud-key-rows', root);
+  if (!box) return;
+  box.innerHTML = saved.map((a) => row(esc(a.vendor), `<span class="ok">${icon('check', 14)} Saved</span> <button class="btn small" data-key-remove="${esc(a.id)}">Remove</button>`, `Answers in ⌘T, ⌘J and Chat as ${esc(a.label)}${a.account ? ` (${esc(a.account)})` : ''}.`)).join('');
+  box.onclick = async (e) => {
+    const b = e.target.closest('[data-key-remove]');
+    if (!b) return;
+    const a = saved.find((x) => x.id === b.dataset.keyRemove);
+    if (!(await confirmBox(`Remove your ${a.vendor} key?`, `${a.label} stops answering until you add a key again.`, 'Remove', true))) return;
+    await S.aiCloudRemove(a.id);
+    if (ctx.settings.aiProvider === a.id) ctx.set({ aiProvider: '' });
+    toast('Key removed'); showSection('ai');
+  };
+}
+
+const AGENT_MARK = { openai: '#10a37f', gemini: '#4285f4', openrouter: '#6467f2', xai: '#111111', mistral: '#fa520f', deepseek: '#4d6bfe', groq: '#f55036', claude: '#d97757', codex: '#10a37f', gemini: '#4285f4', copilot: '#8957e5', cursor: '#111111', opencode: '#4b5563', qwen: '#615ced', amp: '#f34e3f', goose: '#222222', droid: '#ff6b00', ollama: '#333333', lmstudio: '#4f46e5' };
 let agentPoll = null;
 
 async function drawAgents(root, hasKey, fresh = false) {
@@ -113,7 +139,8 @@ async function drawAgents(root, hasKey, fresh = false) {
   const all = await withTimeout(S.agentsList(fresh), [], 15000);
   if (!box.isConnected) return;
   const optIn = ctx.settings.aiOptInAgents === true;
-  const list = all.filter((a) => a.policy === 'default');
+  const list = all.filter((a) => a.policy === 'default' && (!a.cloud || a.installed));
+  drawCloudKeys(root, all.filter((a) => a.cloud && a.installed));
   const others = all.filter((a) => a.policy === 'optin');
   const chosen = ctx.settings.aiProvider || '';
   const status = (a) => !a.installed ? '<span class="tag">Not installed</span>'
@@ -130,14 +157,25 @@ async function drawAgents(root, hasKey, fresh = false) {
       <div class="row-text"><div class="row-label">${label}</div><div class="row-desc">${desc}</div></div>`;
   box.innerHTML = [
     radio('', 'Automatic', 'Your Claude API key if you added one, otherwise the first ready option below.') + '</label>',
-    ...list.map((a) => radio(a.id, `${esc(a.label)} ${status(a)}`, `${esc(a.vendor)} · works with ${esc(a.plan)}${a.account ? ` · ${esc(a.account)}` : ''}${!a.installed && a.install?.missing ? ` · needs ${esc(a.install.missing)}` : ''}`,
-      `<span class="agent-mark" style="--c:${AGENT_MARK[a.id] || '#888'}">${esc(a.label[0])}</span>`, !a.installed) + `<div class="row-control">${action(a)}</div></label>`),
-    radio('api', `Claude API key ${hasKey ? '<span class="tag ok-tag">Ready</span>' : '<span class="tag">No key</span>'}`, 'Pay-as-you-go with your Anthropic API key (below): a question in ⌘T costs a fraction of a cent. The only option that can also act in the browser.',
+    ...list.map((a) => radio(a.id, `${esc(a.label)} ${status(a)}`, a.cloud ? `${esc(a.vendor)} · your API key, pay as you go · model <select class="select small" data-model="${esc(a.id)}"><option>${esc(a.account || 'default')}</option></select>`
+      : `${esc(a.vendor)} · works with ${esc(a.plan)}${a.account ? ` · ${esc(a.account)}` : ''}${!a.installed && a.install?.missing ? ` · needs ${esc(a.install.missing)}` : ''}`,
+      `<span class="agent-mark" style="--c:${AGENT_MARK[a.id] || '#888'}">${esc(a.label[0])}</span>`, !a.installed) + `<div class="row-control">${a.cloud ? '' : action(a)}</div></label>`),
+    radio('api', `Claude ${hasKey ? '<span class="tag ok-tag">Ready</span>' : '<span class="tag">No key</span>'}`, 'Pay-as-you-go with your Anthropic API key (below): a question in ⌘T costs a fraction of a cent. The only option that can also act in the browser.' + (all.some((a) => a.cloud && a.installed) ? '' : ' Keys from OpenAI, Gemini and others work too: add one below.'),
       `<span class="agent-mark" style="--c:#d97757">${icon('sparkles', 13)}</span>`, !hasKey) + '</label>',
     `<div class="row optin-head"><div class="row-text"><div class="row-label">Other agents</div><div class="row-desc">GitHub Copilot, Codex, Cursor, OpenCode, Qwen Code, Amp, Goose, Droid. They use your own account in that app and follow that company’s rules.</div></div><div class="row-control">${toggle('ai-optin', optIn)}</div></div>`,
     ...(optIn ? others.map((a) => radio(a.id, `${esc(a.label)} ${status(a)}`, `${esc(a.vendor)} · ${esc(a.plan)}${a.account ? ` · ${esc(a.account)}` : ''}`,
       `<span class="agent-mark" style="--c:${AGENT_MARK[a.id] || '#888'}">${esc(a.label[0])}</span>`, !a.installed) + `<div class="row-control">${action(a)}</div></label>`) : []),
   ].join('');
+  // Model pickers for cloud keys: filled from the provider's own list.
+  $$('select[data-model]', box).forEach(async (sel) => {
+    const id = sel.dataset.model;
+    const r = await S.aiCloudModels(id).catch(() => ({ models: [] }));
+    if (!sel.isConnected || !r.models?.length) return;
+    const chosen = ctx.settings.aiModels?.[id] || '';
+    sel.innerHTML = `<option value="">Default${list.find((a) => a.id === id)?.account ? ` (${esc(list.find((a) => a.id === id).account)})` : ''}</option>` + r.models.map((m) => `<option value="${esc(m)}" ${m === chosen ? 'selected' : ''}>${esc(m)}</option>`).join('');
+    sel.onclick = (e) => e.stopPropagation();
+    sel.onchange = () => { ctx.set({ aiModels: { ...(ctx.settings.aiModels || {}), [id]: sel.value } }); toast(sel.value ? `${sel.value} will answer` : 'Default model'); };
+  });
   $('#ai-optin', box).onchange = (e) => {
     ctx.set({ aiOptInAgents: e.target.checked, ...(e.target.checked ? {} : others.some((a) => a.id === chosen) ? { aiProvider: '' } : {}) });
     drawAgents(root, hasKey);

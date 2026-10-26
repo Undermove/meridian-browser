@@ -3,7 +3,7 @@
 // even when a page has focus), persistence, sessions/profiles, downloads,
 // permissions, ad blocking and the Arc importer.
 
-const { app, BrowserWindow, Menu, ipcMain, session, shell, dialog, clipboard, nativeTheme, webContents, protocol, net } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain, session, shell, dialog, clipboard, nativeTheme, webContents, protocol, net, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -18,6 +18,7 @@ const { importArcCookies, findArcProfiles, keychainPassword } = require('./impor
 const { AgentHub } = require('./agent/hub');
 const { Assistant, QUICK_MODEL, describeError: describeAiError } = require('./ai/assistant');
 const { LocalAgents, PROVIDERS: AGENT_PROVIDERS } = require('./ai/local-agents');
+const { CloudKeys, CLOUD, detect: detectKeyProvider } = require('./ai/cloud-keys');
 const { openInTerminal } = require('./ai/agent-setup');
 const { ChatsStore } = require('./ai/chats-store');
 const { meridianGuide } = require('./ai/guide');
@@ -835,6 +836,7 @@ handle('devtools:open', (_e, id) => { const wc = webContents.fromId(id); if (wc)
 let hub = null;
 let assistant = null;
 let localAgents = null;
+let cloudKeys = null;
 
 // The renderer picks the provider; only known ids get through ('api' = the Claude API key path).
 // `history` seeds a reopened Chat view conversation (main forgets sessions on restart): strings only, capped.
@@ -937,13 +939,47 @@ on('agent:rpc-result', (e, payload) => hub.onRpcResult(e.sender, payload || {}))
 
 handle('ai:has-key', () => assistant.hasKey());
 handle('ai:set-key', (_e, key) => { assistant.setKey(typeof key === 'string' ? key : ''); return assistant.hasKey(); });
-// The power-up ceremony on the home page: check the key, and only save it once Anthropic accepts it.
-handle('ai:connect-key', async (_e, key) => {
-  const r = await assistant.testKey(key);
+// The power-up ceremony on the home page and Settings → AI: any supported provider's key. Find whose it
+// is, check it with that provider, and only save it once they accept it. → { ok, provider, label } | { ok: false, error }
+async function connectKey(key) {
+  key = String(key || '').trim().slice(0, 400);
+  if (detectKeyProvider(key)[0] === 'anthropic') {
+    const r = await assistant.testKey(key);
+    if (!r.ok) return r;
+    try { assistant.setKey(key); } catch (err) { return { ok: false, error: err.message }; }
+    return { ok: true, provider: 'api', label: 'Claude' };
+  }
+  const r = await cloudKeys.test(key);
   if (!r.ok) return r;
-  try { assistant.setKey(String(key).trim()); } catch (err) { return { ok: false, error: err.message }; }
-  return { ok: true };
+  try { cloudKeys.set(r.provider, key); } catch (err) { return { ok: false, error: err.message }; }
+  localAgents.cache = null;
+  return r;
+}
+function removeCloudKey(id) {
+  if (!Object.prototype.hasOwnProperty.call(CLOUD, id)) return false;
+  cloudKeys.set(id, '');
+  localAgents.cache = null;
+  return true;
+}
+// The models a saved key can use, for the picker in Settings → AI.
+async function cloudModels(id) {
+  if (!Object.prototype.hasOwnProperty.call(CLOUD, id) || !cloudKeys.has(id)) return { models: [] };
+  try { return { models: await cloudKeys.modelList(id) }; } catch (err) { return { models: [], error: err.message }; }
+}
+handle('ai:connect-key', (_e, key) => connectKey(key));
+// The power-up picks up a key the user just copied on the provider's site. Only key-shaped text counts,
+// and the page gets back whose key it is and a few characters, never the key itself.
+function clipboardKey() {
+  const t = String(clipboard.readText() || '').trim();
+  return t.length >= 20 && t.length <= 400 && !/\s/.test(t) && detectKeyProvider(t).length ? t : null;
+}
+handleMain('ai:clipboard-key', () => {
+  const k = clipboardKey();
+  if (!k) return null;
+  const id = detectKeyProvider(k)[0];
+  return { label: id === 'anthropic' ? 'Claude' : CLOUD[id].label, hint: `${k.slice(0, 6)}…${k.slice(-4)}` };
 });
+handleMain('ai:connect-clipboard-key', () => { const k = clipboardKey(); return k ? connectKey(k) : { ok: false, error: 'There’s no API key on the clipboard any more. Copy it again.' }; });
 on('ai:chat', (e, req) => { assistant.chat(e.sender, sanitizeAiRequest(req)); });
 handle('agents:list', (_e, fresh) => localAgents.list({ fresh: !!fresh }));
 // "Check": one tiny request, only when the user clicks it, for agents that can't report their sign-in.
@@ -1421,6 +1457,9 @@ handleSettings('settings:action', (_e, name, arg) => {
 });
 handleSettings('settings:ai-has-key', () => assistant.hasKey());
 handleSettings('settings:ai-set-key', (_e, key) => { assistant.setKey(typeof key === 'string' ? key : ''); return assistant.hasKey(); });
+handleSettings('settings:ai-connect-key', (_e, key) => connectKey(key));
+handleSettings('settings:ai-cloud-remove', (_e, id) => removeCloudKey(String(id)));
+handleSettings('settings:ai-cloud-models', (_e, id) => cloudModels(String(id)));
 handleSettings('settings:agent-status', () => ({ ...hub.status(), mcp: mcpCommand() }));
 handleSettings('settings:mcp-detect', () => detectClis(mcpScript()));
 handleSettings('settings:agents-list', (_e, fresh) => localAgents.list({ fresh: !!fresh }));
@@ -1731,7 +1770,8 @@ app.whenReady().then(async () => {
     website: REPO_URL, iconPath: path.join(__dirname, '..', 'build', 'icon-1024.png'),
   });
   hub = new AgentHub({ getWindow: () => mainWindow, userDataDir: app.getPath('userData'), isProtected: isInternalContents });
-  localAgents = new LocalAgents({ userDataDir: app.getPath('userData') });
+  cloudKeys = new CloudKeys({ userDataDir: app.getPath('userData'), safeStorage });
+  localAgents = new LocalAgents({ userDataDir: app.getPath('userData'), keys: cloudKeys, model: (id) => uiSnapshot?.settings?.aiModels?.[id] || null });
   assistant = new Assistant({ userDataDir: app.getPath('userData'), hub, localAgents, guide: () => meridianGuide(shortcutRows()) });
   setupMission(); // Mission Control
   hub.observer = mission;

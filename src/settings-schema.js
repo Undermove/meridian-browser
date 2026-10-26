@@ -6,6 +6,7 @@ const path = require('path');
 const { isValidAccelerator } = require('./shortcuts');
 const { sanitizeAtc } = require('./atc');
 
+const CLOUD_IDS = Object.keys(require('./ai/cloud-keys').CLOUD);
 const oneOf = (...vals) => (v) => (vals.includes(v) ? v : undefined);
 const bool = (v) => (typeof v === 'boolean' ? v : undefined);
 
@@ -26,7 +27,14 @@ function makeSchema(shortcutIds) {
     aiAskFromBar: bool,
     aiLinkPreview: bool,
     // Which AI answers Ask / ⌘J / Chat: '' = automatic, 'api' (Claude API key) or a local agent id (src/ai/local-agents.js).
-    aiProvider: oneOf('', 'api', 'codex', 'copilot', 'cursor', 'opencode', 'qwen', 'amp', 'goose', 'droid', 'ollama', 'lmstudio'),
+    aiProvider: oneOf('', 'api', 'codex', 'copilot', 'cursor', 'opencode', 'qwen', 'amp', 'goose', 'droid', 'ollama', 'lmstudio', ...CLOUD_IDS),
+    // The model picked for each cloud provider (Settings → AI); missing = Meridian's default for it.
+    aiModels: (v) => {
+      if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+      const out = {};
+      for (const [id, m] of Object.entries(v)) if (CLOUD_IDS.includes(id) && typeof m === 'string' && m.length <= 120 && /^[\w./:@-]*$/.test(m)) out[id] = m;
+      return out;
+    },
     // "Other agents" (policy 'optin' in local-agents.js): the user's own account, under that provider's terms.
     aiOptInAgents: bool,
     // How much of Meridian shows: everyday browsing, AI chat for designers/managers, or the developer tools.

@@ -42,6 +42,8 @@ contextBridge.exposeInMainWorld('meridian', {
   aiHasKey: () => ipcRenderer.invoke('ai:has-key'),
   aiSetKey: (key) => ipcRenderer.invoke('ai:set-key', key),
   aiConnectKey: (key) => ipcRenderer.invoke('ai:connect-key', String(key || '')),
+  aiClipboardKey: () => ipcRenderer.invoke('ai:clipboard-key'),
+  aiConnectClipboardKey: () => ipcRenderer.invoke('ai:connect-clipboard-key'),
   aiChat: (req) => ipcRenderer.send('ai:chat', req),
   agentsList: (fresh) => ipcRenderer.invoke('agents:list', !!fresh),
   agentsSetup: (id, action) => ipcRenderer.invoke('agents:setup', id, action),

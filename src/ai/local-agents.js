@@ -1,7 +1,8 @@
 // Local AI agents as chat providers for Ask (⌘T), the ⌘J panel, Chat and the welcome tour.
 //
 // Only where the provider's terms allow it (checked October 2026):
-//  - policy 'default': local model servers (Ollama, LM Studio).
+//  - policy 'default': local model servers (Ollama, LM Studio) and cloud models on the user's own API key
+//    (OpenAI, Gemini, OpenRouter, xAI, Mistral, DeepSeek, Groq — see cloud-keys.js).
 //  - policy 'optin': shown only after the user turns on "Other agents" in Settings → AI, labelled as running
 //    under their own account and that provider's terms. GitHub Copilot is allowed by its terms (its official
 //    SDK drives the signed-in CLI the same way) but is often blocked by organizations, so it waits here too.
@@ -24,6 +25,7 @@ const os = require('os');
 const path = require('path');
 const { loginPath, loginEnv, which, IS_WIN } = require('../dev/env');
 const { installCommand } = require('./agent-setup');
+const { CLOUD, pickModel, baseOf, headersFor } = require('./cloud-keys');
 
 const RUN_TIMEOUT_MS = 5 * 60_000;
 const MAX_OUTPUT = 4 << 20;
@@ -234,6 +236,12 @@ const PROVIDERS = {
     login: null,
     docs: 'https://lmstudio.ai/docs/app',
   },
+
+  // Cloud models on the user's own API key: "installed" = a key is saved.
+  ...Object.fromEntries(Object.entries(CLOUD).map(([id, c]) => [id, {
+    label: c.short, vendor: c.label, http: { kind: 'openai', cloud: id }, stream: true, resume: false, policy: 'default',
+    plan: 'your own API key, pay as you go', install: { mac: null, linux: null, win: null }, login: null, docs: c.console,
+  }])),
 };
 
 // ---------------------------------------------------------------- output parsers
@@ -307,7 +315,10 @@ function spawnSafe(bin, args, opts) {
 }
 
 class LocalAgents {
-  constructor({ userDataDir }) {
+  // keys: CloudKeys (cloud-keys.js); model(id): the model the user picked for a cloud provider, if any.
+  constructor({ userDataDir, keys = null, model = () => null }) {
+    this.keys = keys;
+    this.model = model;
     this.base = path.join(userDataDir, 'agent-chat');
     this.runs = new Map();      // runId -> child
     this.cache = null;          // { at, list }
@@ -345,6 +356,12 @@ class LocalAgents {
     if (!fresh && this.cache && Date.now() - this.cache.at < 60_000) return this.cache.list;
     const env = await this.env();
     const list = await Promise.all(Object.entries(PROVIDERS).map(async ([id, p]) => {
+      if (p.http?.cloud) {
+        const has = !!this.keys?.has(id);
+        const cached = has ? this.keys.models.get(id)?.list : null;
+        return { id, policy: p.policy, label: p.label, vendor: p.vendor, plan: p.plan, installed: has, loggedIn: has ? true : null,
+          account: cached ? pickModel(id, cached, this.model(id)) : null, install: { cmd: null }, login: null, docs: p.docs, streams: true, cloud: true };
+      }
       if (p.http) {
         const models = await httpModels(p.http).catch(() => null);
         return { id, policy: p.policy, label: p.label, vendor: p.vendor, plan: p.plan, installed: !!models?.length, loggedIn: models?.length ? true : null, account: models?.[0] || null,
@@ -430,21 +447,36 @@ async function httpModels({ base, kind }) {
 }
 
 LocalAgents.prototype.httpChat = async function httpChat(runId, p, { prompt, system, model }, onEvent) {
-  const { base, kind } = p.http;
-  const models = await httpModels(p.http).catch(() => null);
-  if (!models) return onEvent({ error: `${p.label} isn’t running. Start it, then try again.` });
-  const use = model && models.includes(model) ? model : models[0];
-  if (!use) return onEvent({ error: `${p.label} has no models yet. Download one first.` });
+  const { base, kind, cloud } = p.http;
+  let use, url, headers = { 'content-type': 'application/json' };
+  if (cloud) {
+    const key = this.keys?.get(cloud);
+    if (!key) return onEvent({ error: `Add your ${p.vendor} API key in Settings → AI.`, code: 'not-installed' });
+    let models;
+    try { models = await this.keys.modelList(cloud); } catch (err) {
+      return onEvent({ error: err.rejected ? `${p.vendor} rejected the API key. Add it again in Settings → AI.` : `Couldn’t reach ${p.vendor}: ${err.message}` });
+    }
+    use = pickModel(cloud, models, model || this.model(cloud));
+    if (!use) return onEvent({ error: `${p.vendor} didn’t list any chat models for this key.` });
+    url = `${baseOf(cloud)}/chat/completions`;
+    headers = { ...headers, ...headersFor(cloud, key) };
+  } else {
+    const models = await httpModels(p.http).catch(() => null);
+    if (!models) return onEvent({ error: `${p.label} isn’t running. Start it, then try again.` });
+    use = model && models.includes(model) ? model : models[0];
+    if (!use) return onEvent({ error: `${p.label} has no models yet. Download one first.` });
+    url = base + (kind === 'ollama' ? '/api/chat' : '/v1/chat/completions');
+  }
   const abort = new AbortController();
   this.runs.set(runId, { kill: () => abort.abort() });
   const messages = [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content: prompt }];
   let text = '';
   try {
-    const r = await fetch(base + (kind === 'ollama' ? '/api/chat' : '/v1/chat/completions'), {
-      method: 'POST', headers: { 'content-type': 'application/json' }, signal: abort.signal,
+    const r = await fetch(url, {
+      method: 'POST', headers, signal: abort.signal,
       body: JSON.stringify({ model: use, messages, stream: true }),
     });
-    if (!r.ok) throw new Error(`${p.label}: HTTP ${r.status}`);
+    if (!r.ok) throw new Error(await httpError(p, r));
     const dec = new TextDecoder();
     let buf = '';
     for await (const chunk of r.body) {
@@ -467,6 +499,16 @@ LocalAgents.prototype.httpChat = async function httpChat(runId, p, { prompt, sys
     else onEvent({ error: err.message || `${p.label} failed` });
   } finally { this.runs.delete(runId); }
 };
+
+async function httpError(p, r) {
+  let detail = '';
+  try { const j = await r.json(); detail = String(j.error?.message || j.message || j.error || '').slice(0, 300); } catch {}
+  const who = p.http?.cloud ? p.vendor : p.label;
+  if (r.status === 401 || r.status === 403) return `${who} rejected the API key${detail ? `: ${detail}` : ''}.`;
+  if (r.status === 402) return `${who}: the account is out of credit. Top it up on their site.`;
+  if (r.status === 429) return `${who} says: too many requests or no quota left${detail ? ` (${detail})` : ''}.`;
+  return `${who}: HTTP ${r.status}${detail ? ` — ${detail}` : ''}`;
+}
 
 function friendlyError(p, msg, stderr) {
   const all = `${msg}\n${stderr}`;

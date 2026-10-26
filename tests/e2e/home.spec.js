@@ -63,7 +63,7 @@ test.describe('AI power-up', () => {
       await expect(page.locator('#power')).toBeVisible();
       await page.locator('#pw-key').fill('not a key');
       await page.locator('#pw-go').click();
-      await expect(page.locator('#pw-error')).toContainText('sk-ant-');
+      await expect(page.locator('#pw-error')).toContainText('doesn’t look like an API key');
       await page.locator('#pw-key').fill('sk-ant-api03-badbadbadbadbadbadbadbadbad');
       await page.locator('#pw-go').click();
       await expect(page.locator('#pw-error')).toContainText('didn’t accept this key');
