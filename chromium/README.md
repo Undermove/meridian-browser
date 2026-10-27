@@ -54,7 +54,8 @@ commit on the `meridian` branch, run `build.sh`, then `export.sh` and commit `pa
 - [x] Edit Space Theme, private window theme
 - [x] Home page (new tab): search, feature cards, "Set up for me" presets, tips
 - [x] Ad and tracker blocking: EasyList + EasyPrivacy through Chromium's subresource filter on every site (tools/adblock.sh), toggle in Settings, per-site exceptions in Site settings
-- [ ] Swipe, Electron migration
+- [x] Move in from the earlier (Electron) Meridian, in the welcome tour and Settings: everything incl. sign-ins
+- [ ] Swipe (Arc disc; needs a check on a real trackpad)
 - [ ] MCP server, AI (Ask/chat/keys/vault), local agents, Mission Control, Workbench, sandboxes, hubs
 - [ ] Updater, packaging, signing
 - [ ] Windows and Linux builds

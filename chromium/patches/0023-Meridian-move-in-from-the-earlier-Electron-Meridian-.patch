@@ -1,0 +1,1179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 27 Oct 2026 20:53:42 +0400
+Subject: [PATCH 24/24] Meridian: move in from the earlier (Electron) Meridian:
+ spaces, pins, favorites, open tabs, archive, settings, link rules, sign-ins
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   3 +
+ chrome/browser/meridian/arc_logins.cc         |  63 ++++--
+ chrome/browser/meridian/arc_logins.h          |  21 +-
+ chrome/browser/meridian/arc_logins_mac.mm     |   6 +-
+ chrome/browser/meridian/electron_import.cc    | 207 ++++++++++++++++++
+ chrome/browser/meridian/electron_import.h     |  64 ++++++
+ .../meridian/electron_import_unittest.cc      |  79 +++++++
+ chrome/browser/meridian/sidebar.mojom         |   6 +
+ chrome/browser/meridian/sidebar_handler.cc    | 186 ++++++++++++----
+ chrome/browser/meridian/sidebar_handler.h     |   8 +
+ chrome/browser/resources/webui_browser/app.ts |   2 +-
+ .../webui_browser/meridian/onboarding.html.ts |  32 ++-
+ .../webui_browser/meridian/onboarding.ts      |  76 +++++--
+ .../webui_browser/meridian/settings.html.ts   |   9 +
+ .../webui_browser/meridian/settings.ts        |   5 +
+ 15 files changed, 684 insertions(+), 83 deletions(-)
+ create mode 100644 chrome/browser/meridian/electron_import.cc
+ create mode 100644 chrome/browser/meridian/electron_import.h
+ create mode 100644 chrome/browser/meridian/electron_import_unittest.cc
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 63866f2d08..ff91439a44 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -24,6 +24,8 @@ source_set("model") {
+     "archive_service.h",
+     "atc.cc",
+     "atc.h",
++    "electron_import.cc",
++    "electron_import.h",
+     "prefs.cc",
+     "prefs.h",
+     "setup_profile.cc",
+@@ -114,6 +116,7 @@ test("meridian_unittests") {
+     "arc_import_unittest.cc",
+     "archive_service_unittest.cc",
+     "atc_unittest.cc",
++    "electron_import_unittest.cc",
+     "setup_profile_unittest.cc",
+     "sidebar_service_unittest.cc",
+   ]
+diff --git a/chrome/browser/meridian/arc_logins.cc b/chrome/browser/meridian/arc_logins.cc
+index a4f1419dde..45cfd11f7a 100644
+--- a/chrome/browser/meridian/arc_logins.cc
++++ b/chrome/browser/meridian/arc_logins.cc
+@@ -23,6 +23,7 @@
+ #include "base/task/thread_pool.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/meridian/arc_import.h"
++#include "chrome/browser/meridian/electron_import.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "content/public/browser/storage_partition.h"
+ #include "crypto/aes_cbc.h"
+@@ -46,6 +47,8 @@ namespace {
+ // "__deny__" acts like the person clicking Deny.
+ constexpr char kArcSafeStorageSwitch[] = "meridian-arc-safe-storage";
+ constexpr char kArcDirSwitch[] = "meridian-arc-dir";
++constexpr char kElectronSafeStorageSwitch[] = "meridian-electron-safe-storage";
++constexpr char kElectronDirSwitch[] = "meridian-electron-dir";
+ 
+ struct ArcProfile {
+   std::string dir;
+@@ -54,6 +57,33 @@ struct ArcProfile {
+ 
+ // "Default" first, then "Profile N" in order; "Guest Profile" and the like
+ // are not real profiles.
++std::vector<ArcProfile> FindArcProfiles();
++
++// The earlier Meridian: one cookie database per profile partition,
++// "Partitions/profile-<id>", the default profile first.
++std::vector<ArcProfile> FindElectronProfiles() {
++  std::vector<ArcProfile> out;
++  base::FileEnumerator dirs(ElectronDataDir().Append("Partitions"), false,
++                            base::FileEnumerator::DIRECTORIES, "profile-*");
++  for (base::FilePath dir = dirs.Next(); !dir.empty(); dir = dirs.Next()) {
++    for (const char* rel : {"Network/Cookies", "Cookies"}) {
++      if (base::PathExists(dir.Append(rel))) {
++        out.push_back({dir.BaseName().value(), dir.Append(rel)});
++        break;
++      }
++    }
++  }
++  std::ranges::sort(out, {}, [](const ArcProfile& p) {
++    return std::make_pair(p.dir != "profile-default", p.dir);
++  });
++  return out;
++}
++
++std::vector<ArcProfile> FindProfiles(LoginsSource source) {
++  return source == LoginsSource::kArc ? FindArcProfiles()
++                                      : FindElectronProfiles();
++}
++
+ std::vector<ArcProfile> FindArcProfiles() {
+   std::vector<ArcProfile> out;
+   base::FilePath user_data = ArcDataDir().Append("User Data");
+@@ -83,11 +113,15 @@ std::vector<ArcProfile> FindArcProfiles() {
+   return out;
+ }
+ 
+-// The "Arc Safe Storage" password, or the error code.
+-std::string ArcPassword(std::string* error) {
++// The source's Safe Storage password, or the error code.
++std::string Password(LoginsSource source, std::string* error) {
++  const bool arc = source == LoginsSource::kArc;
++  const char* password_switch =
++      arc ? kArcSafeStorageSwitch : kElectronSafeStorageSwitch;
+   const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
+-  if (cl->HasSwitch(kArcSafeStorageSwitch) && cl->HasSwitch(kArcDirSwitch)) {
+-    std::string pw = cl->GetSwitchValueASCII(kArcSafeStorageSwitch);
++  if (cl->HasSwitch(password_switch) &&
++      cl->HasSwitch(arc ? kArcDirSwitch : kElectronDirSwitch)) {
++    std::string pw = cl->GetSwitchValueASCII(password_switch);
+     if (pw == "__deny__") {
+       *error = "denied";
+       return std::string();
+@@ -95,7 +129,9 @@ std::string ArcPassword(std::string* error) {
+     return pw;
+   }
+ #if BUILDFLAG(IS_MAC)
+-  return internal::ReadArcKeychainPassword(error);
++  return arc ? internal::ReadKeychainPassword("Arc Safe Storage", "Arc", error)
++             : internal::ReadKeychainPassword("Meridian Safe Storage",
++                                              "Meridian Key", error);
+ #else
+   *error = "no-data";
+   return std::string();
+@@ -289,14 +325,14 @@ struct ReadResult {
+   ArcLoginsResult result;
+ };
+ 
+-ReadResult ReadArcCookies() {
++ReadResult ReadCookies(LoginsSource source) {
+   ReadResult out;
+-  std::vector<ArcProfile> profiles = FindArcProfiles();
++  std::vector<ArcProfile> profiles = FindProfiles(source);
+   if (profiles.empty()) {
+     out.result.error = "no-data";
+     return out;
+   }
+-  std::string password = ArcPassword(&out.result.error);
++  std::string password = Password(source, &out.result.error);
+   if (password.empty()) {
+     if (out.result.error.empty()) {
+       out.result.error = "denied";
+@@ -387,15 +423,16 @@ void WriteCookies(base::WeakPtr<Profile> profile,
+ 
+ }  // namespace
+ 
+-bool ArcLoginsAvailable() {
+-  return !FindArcProfiles().empty();
++bool LoginsAvailable(LoginsSource source) {
++  return !FindProfiles(source).empty();
+ }
+ 
+-void ImportArcLogins(Profile* profile,
+-                     base::OnceCallback<void(ArcLoginsResult)> done) {
++void ImportLogins(Profile* profile,
++                  LoginsSource source,
++                  base::OnceCallback<void(ArcLoginsResult)> done) {
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+-      base::BindOnce(&ReadArcCookies),
++      base::BindOnce(&ReadCookies, source),
+       base::BindOnce(&WriteCookies, profile->GetWeakPtr(), std::move(done)));
+ }
+ 
+diff --git a/chrome/browser/meridian/arc_logins.h b/chrome/browser/meridian/arc_logins.h
+index 3200f926e8..297ad4d45b 100644
+--- a/chrome/browser/meridian/arc_logins.h
++++ b/chrome/browser/meridian/arc_logins.h
+@@ -36,16 +36,23 @@ struct ArcLoginsResult {
+   std::string error;
+ };
+ 
+-// Whether Arc's cookie databases are there (blocking: file IO).
+-bool ArcLoginsAvailable();
++// Where the cookies come from: Arc, or the earlier (Electron) Meridian, whose
++// cookies are encrypted the same way with "Meridian Safe Storage".
++enum class LoginsSource { kArc, kElectron };
+ 
+-void ImportArcLogins(Profile* profile,
+-                     base::OnceCallback<void(ArcLoginsResult)> done);
++// Whether the source's cookie databases are there (blocking: file IO).
++bool LoginsAvailable(LoginsSource source);
++
++void ImportLogins(Profile* profile,
++                  LoginsSource source,
++                  base::OnceCallback<void(ArcLoginsResult)> done);
+ 
+ namespace internal {
+-// macOS: "Arc Safe Storage" from the login keychain (macOS asks first);
+-// empty with `error` set if it isn't there or the person said no.
+-std::string ReadArcKeychainPassword(std::string* error);
++// macOS: a password from the login keychain (macOS asks first); empty with
++// `error` set if it isn't there or the person said no.
++std::string ReadKeychainPassword(const char* service,
++                                 const char* account,
++                                 std::string* error);
+ }  // namespace internal
+ 
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/arc_logins_mac.mm b/chrome/browser/meridian/arc_logins_mac.mm
+index 96439c6813..a813516ec8 100644
+--- a/chrome/browser/meridian/arc_logins_mac.mm
++++ b/chrome/browser/meridian/arc_logins_mac.mm
+@@ -10,9 +10,11 @@
+ 
+ namespace meridian::internal {
+ 
+-std::string ReadArcKeychainPassword(std::string* error) {
++std::string ReadKeychainPassword(const char* service,
++                                 const char* account,
++                                 std::string* error) {
+   auto result = crypto::apple::KeychainV2::GetInstance().FindGenericPassword(
+-      "Arc Safe Storage", "Arc");
++      service, account);
+   if (!result.has_value()) {
+     *error = result.error() == errSecItemNotFound ? "not-found" : "denied";
+     return std::string();
+diff --git a/chrome/browser/meridian/electron_import.cc b/chrome/browser/meridian/electron_import.cc
+new file mode 100644
+index 0000000000..283ad19581
+--- /dev/null
++++ b/chrome/browser/meridian/electron_import.cc
+@@ -0,0 +1,207 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/electron_import.h"
++
++#include <algorithm>
++
++#include "base/base_paths.h"
++#include "base/command_line.h"
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
++#include "base/no_destructor.h"
++#include "base/path_service.h"
++
++namespace meridian {
++
++namespace {
++
++constexpr char kElectronDirSwitch[] = "meridian-electron-dir";
++
++const std::string& Str(const base::DictValue& d, const char* key) {
++  static const base::NoDestructor<std::string> empty;
++  const std::string* s = d.FindString(key);
++  return s ? *s : *empty;
++}
++
++// A pinned tab or folder; nullopt for anything else.
++std::optional<Item> ToItem(const base::DictValue& node, int depth = 0) {
++  if (depth > 32) {
++    return std::nullopt;
++  }
++  const std::string& type = Str(node, "type");
++  Item item;
++  if (type == "folder") {
++    item.is_folder = true;
++    item.title = Str(node, "title").empty() ? "Folder" : Str(node, "title");
++    item.open = !node.FindBool("collapsed").value_or(false);
++    if (const base::ListValue* children = node.FindList("children")) {
++      for (const base::Value& child : *children) {
++        if (const base::DictValue* c = child.GetIfDict()) {
++          if (std::optional<Item> i = ToItem(*c, depth + 1)) {
++            item.children.push_back(std::move(*i));
++          }
++        }
++      }
++    }
++    return item;
++  }
++  if (type != "tab") {
++    return std::nullopt;
++  }
++  // For pinned tabs and favorites, `url` is the home URL.
++  GURL url(Str(node, "url"));
++  if (!url.is_valid()) {
++    return std::nullopt;
++  }
++  item.url = url;
++  item.title = !Str(node, "customTitle").empty() ? Str(node, "customTitle")
++               : !Str(node, "title").empty()     ? Str(node, "title")
++                                                 : url.spec();
++  return item;
++}
++
++std::vector<Item> ToItems(const base::ListValue* list) {
++  std::vector<Item> out;
++  if (list) {
++    for (const base::Value& v : *list) {
++      if (const base::DictValue* d = v.GetIfDict()) {
++        if (std::optional<Item> item = ToItem(*d)) {
++          out.push_back(std::move(*item));
++        }
++      }
++    }
++  }
++  return out;
++}
++
++}  // namespace
++
++ElectronState::ElectronState() = default;
++ElectronState::ElectronState(ElectronState&&) = default;
++ElectronState& ElectronState::operator=(ElectronState&&) = default;
++ElectronState::~ElectronState() = default;
++
++base::FilePath ElectronDataDir() {
++  const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++  if (cl->HasSwitch(kElectronDirSwitch)) {
++    return cl->GetSwitchValuePath(kElectronDirSwitch);
++  }
++  base::FilePath home;
++  if (!base::PathService::Get(base::DIR_HOME, &home)) {
++    return base::FilePath();
++  }
++  return home.Append("Library/Application Support/Meridian");
++}
++
++std::optional<ElectronState> ParseElectronState(const base::DictValue& root) {
++  const base::ListValue* spaces = root.FindList("spaces");
++  if (!spaces) {
++    return std::nullopt;
++  }
++  ElectronState out;
++  const std::string& active_id = Str(root, "activeSpaceId");
++  std::vector<std::string> space_ids;
++  for (const base::Value& v : *spaces) {
++    const base::DictValue* s = v.GetIfDict();
++    if (!s) {
++      continue;
++    }
++    Space space;
++    space.name = Str(*s, "name").empty() ? "Space" : Str(*s, "name");
++    space.icon = Str(*s, "icon");
++    space.color = Str(*s, "color");
++    space.color2 = Str(*s, "color2").empty() ? space.color : Str(*s, "color2");
++    space.pinned = ToItems(s->FindList("pinned"));
++    std::vector<ArcSidebar::Tab> today;
++    if (const base::ListValue* tabs = s->FindList("today")) {
++      for (const base::Value& t : *tabs) {
++        const base::DictValue* tab = t.GetIfDict();
++        GURL url = tab ? GURL(Str(*tab, "url")) : GURL();
++        if (url.is_valid() && url.SchemeIsHTTPOrHTTPS()) {
++          today.push_back({url, Str(*tab, "title")});
++        }
++      }
++    }
++    if (Str(*s, "id") == active_id) {
++      out.active_space = out.sidebar.spaces.size();
++    }
++    space_ids.push_back(Str(*s, "id"));
++    out.sidebar.spaces.push_back(std::move(space));
++    out.sidebar.today.push_back(std::move(today));
++  }
++  if (out.sidebar.spaces.empty()) {
++    return std::nullopt;
++  }
++  out.space_ids = space_ids;
++  // Favorites of every profile, the default one first, without duplicates.
++  if (const base::DictValue* favorites = root.FindDict("favorites")) {
++    std::vector<const base::ListValue*> lists;
++    if (const base::ListValue* def = favorites->FindList("default")) {
++      lists.push_back(def);
++    }
++    for (const auto [id, list] : *favorites) {
++      if (id != "default" && list.is_list()) {
++        lists.push_back(&list.GetList());
++      }
++    }
++    for (const base::ListValue* list : lists) {
++      for (Item& item : ToItems(list)) {
++        bool known = item.is_folder ||
++                     std::ranges::any_of(out.sidebar.favorites,
++                                         [&](const Item& f) {
++                                           return f.url == item.url;
++                                         });
++        if (!known) {
++          out.sidebar.favorites.push_back(std::move(item));
++        }
++      }
++    }
++  }
++  if (const base::ListValue* archive = root.FindList("archive")) {
++    for (const base::Value& v : *archive) {
++      const base::DictValue* a = v.GetIfDict();
++      GURL url = a ? GURL(Str(*a, "url")) : GURL();
++      if (!url.is_valid() || out.archive.size() >= 5000) {
++        continue;
++      }
++      ElectronState::ArchivedTab tab;
++      tab.url = url;
++      tab.title = Str(*a, "title");
++      auto it = std::ranges::find(space_ids, Str(*a, "spaceId"));
++      tab.space = it == space_ids.end() ? -1 : it - space_ids.begin();
++      tab.closed_at = base::Time::FromMillisecondsSinceUnixEpoch(
++          a->FindDouble("closedAt").value_or(0));
++      out.archive.push_back(std::move(tab));
++    }
++  }
++  if (const base::DictValue* settings = root.FindDict("settings")) {
++    out.sidebar_right = settings->FindBool("sidebarRight");
++    out.adblock = settings->FindBool("adblock");
++    out.archive_after_hours = settings->FindInt("archiveAfterHours");
++    if (const std::string* mode = settings->FindString("mode")) {
++      out.mode = *mode;
++    }
++    if (const base::DictValue* atc = settings->FindDict("atc")) {
++      out.atc = atc->Clone();
++    }
++  }
++  return out;
++}
++
++std::optional<ElectronState> ReadElectronState() {
++  base::FilePath dir = ElectronDataDir();
++  std::string json;
++  if (dir.empty() ||
++      !base::ReadFileToString(dir.Append("state.json"), &json)) {
++    return std::nullopt;
++  }
++  std::optional<base::Value> root = base::JSONReader::Read(json, 0);
++  if (!root || !root->is_dict()) {
++    return std::nullopt;
++  }
++  return ParseElectronState(root->GetDict());
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/electron_import.h b/chrome/browser/meridian/electron_import.h
+new file mode 100644
+index 0000000000..02f466ef79
+--- /dev/null
++++ b/chrome/browser/meridian/electron_import.h
+@@ -0,0 +1,64 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_ELECTRON_IMPORT_H_
++#define CHROME_BROWSER_MERIDIAN_ELECTRON_IMPORT_H_
++
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/time/time.h"
++#include "base/values.h"
++#include "chrome/browser/meridian/arc_import.h"
++#include "url/gurl.h"
++
++namespace meridian {
++
++// The earlier Meridian (Electron) kept everything in
++// ~/Library/Application Support/Meridian/state.json: spaces with pinned tabs,
++// folders and open tabs, favorites per profile, the archive and settings.
++// Moving to this Meridian brings it all over; the old files are only read.
++struct ElectronState {
++  ElectronState();
++  ElectronState(ElectronState&&);
++  ElectronState& operator=(ElectronState&&);
++  ~ElectronState();
++
++  struct ArchivedTab {
++    GURL url;
++    std::string title;
++    // Index into sidebar.spaces, or -1.
++    int space = -1;
++    base::Time closed_at;
++  };
++
++  // Spaces, open (Today) tabs and favorites, in the Arc import's shape.
++  ArcSidebar sidebar;
++  // The space that was open.
++  int active_space = 0;
++  // The old ids of sidebar.spaces (link rules point at them).
++  std::vector<std::string> space_ids;
++  std::vector<ArchivedTab> archive;
++  // Settings worth keeping (only the keys present).
++  std::optional<bool> sidebar_right;
++  std::optional<bool> adblock;
++  std::optional<int> archive_after_hours;
++  std::optional<std::string> mode;
++  std::optional<base::DictValue> atc;
++};
++
++// The Electron Meridian's folder, or the one given with
++// --meridian-electron-dir (tests).
++base::FilePath ElectronDataDir();
++
++std::optional<ElectronState> ParseElectronState(const base::DictValue& root);
++
++// Reads and parses state.json; blocking (file IO).
++std::optional<ElectronState> ReadElectronState();
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_ELECTRON_IMPORT_H_
+diff --git a/chrome/browser/meridian/electron_import_unittest.cc b/chrome/browser/meridian/electron_import_unittest.cc
+new file mode 100644
+index 0000000000..2acff44722
+--- /dev/null
++++ b/chrome/browser/meridian/electron_import_unittest.cc
+@@ -0,0 +1,79 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/electron_import.h"
++
++#include "base/json/json_reader.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace meridian {
++namespace {
++
++constexpr char kState[] = R"({
++  "activeSpaceId": "s2",
++  "spaces": [
++    {"id": "s1", "name": "Personal", "icon": "H", "color": "#8a8fe0",
++     "pinned": [
++       {"type": "tab", "url": "https://mail.example.com/", "title": "Inbox",
++        "customTitle": "Mail"},
++       {"type": "folder", "title": "Reading", "collapsed": true, "children": [
++         {"type": "tab", "url": "https://news.example.com/", "title": "News"}]},
++       {"type": "tab", "url": "not a url"}
++     ],
++     "today": [{"url": "https://a.example/", "title": "A"},
++               {"url": "chrome://settings", "title": "skip"}]},
++    {"id": "s2", "name": "Work", "color": "#4facfe", "color2": "#00f2fe"}
++  ],
++  "favorites": {
++    "work": [{"type": "tab", "url": "https://github.com/", "title": "GitHub"}],
++    "default": [{"type": "tab", "url": "https://cal.example/", "title": "Cal"},
++                {"type": "tab", "url": "https://github.com/", "title": "Dup"}]
++  },
++  "archive": [{"url": "https://old.example/", "title": "Old",
++               "closedAt": 1760000000000, "spaceId": "s1"}],
++  "settings": {"sidebarRight": true, "adblock": false,
++               "archiveAfterHours": 24, "mode": "developer",
++               "atc": {"fallback": "main", "rules": []}}
++})";
++
++TEST(ElectronImportTest, ReadsSpacesFavoritesArchiveAndSettings) {
++  std::optional<base::Value> root = base::JSONReader::Read(kState, 0);
++  std::optional<ElectronState> state = ParseElectronState(root->GetDict());
++  ASSERT_TRUE(state);
++  const ArcSidebar& s = state->sidebar;
++  ASSERT_EQ(s.spaces.size(), 2u);
++  EXPECT_EQ(state->active_space, 1);
++  EXPECT_EQ(state->space_ids, (std::vector<std::string>{"s1", "s2"}));
++  EXPECT_EQ(s.spaces[0].icon, "H");
++  EXPECT_EQ(s.spaces[0].color2, "#8a8fe0");
++  EXPECT_EQ(s.spaces[1].color2, "#00f2fe");
++  ASSERT_EQ(s.spaces[0].pinned.size(), 2u);
++  EXPECT_EQ(s.spaces[0].pinned[0].title, "Mail");
++  EXPECT_TRUE(s.spaces[0].pinned[1].is_folder);
++  EXPECT_FALSE(s.spaces[0].pinned[1].open);
++  EXPECT_EQ(s.spaces[0].pinned[1].children[0].title, "News");
++  ASSERT_EQ(s.today[0].size(), 1u);
++  EXPECT_EQ(s.today[0][0].title, "A");
++  // Default profile's favorites first, then the others, no duplicates.
++  ASSERT_EQ(s.favorites.size(), 2u);
++  EXPECT_EQ(s.favorites[0].title, "Cal");
++  EXPECT_EQ(s.favorites[1].title, "Dup");
++  ASSERT_EQ(state->archive.size(), 1u);
++  EXPECT_EQ(state->archive[0].space, 0);
++  EXPECT_EQ(state->archive[0].closed_at.InMillisecondsSinceUnixEpoch(),
++            1760000000000);
++  EXPECT_EQ(state->sidebar_right, true);
++  EXPECT_EQ(state->adblock, false);
++  EXPECT_EQ(state->archive_after_hours, 24);
++  EXPECT_EQ(state->mode, "developer");
++  ASSERT_TRUE(state->atc);
++}
++
++TEST(ElectronImportTest, RejectsOtherFiles) {
++  std::optional<base::Value> root = base::JSONReader::Read(R"({"x": 1})", 0);
++  EXPECT_FALSE(ParseElectronState(root->GetDict()));
++}
++
++}  // namespace
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 6075afc701..fe4c66d942 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -249,6 +249,12 @@ interface SidebarHandler {
+   // "not-found", "denied" or "read".
+   ImportArcLogins() => (int32 imported, string error);
+ 
++  // The same for the earlier (Electron) Meridian on this computer: its
++  // spaces, pinned tabs, favorites, open tabs, archive, settings and sign-ins.
++  GetElectronPreview() => (ArcPreview? preview);
++  ImportElectron() => (bool ok);
++  ImportElectronLogins() => (int32 imported, string error);
++
+   // Welcome tour. `use_apps`: look at the installed apps (else a plain
+   // everyday setup); `persona` (developer, designer, manager, everyday)
+   // picks one outright (the home page's "Set up for me").
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 3eb3ac4fb2..c6e52e3850 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -441,46 +441,54 @@ void SidebarHandler::OpenInMeridian() {
+   target->GetWindow()->Show();
+ }
+ 
++namespace {
++
++// Preview counts for an import (Arc or the Electron Meridian).
++mojom::ArcPreviewPtr PreviewOf(const ArcSidebar& sidebar, bool logins) {
++  auto preview = mojom::ArcPreview::New();
++  preview->space_count = sidebar.spaces.size();
++  preview->favorite_count = sidebar.favorites.size();
++  preview->logins_available = logins;
++  std::function<int(const std::vector<Item>&)> count =
++      [&](const std::vector<Item>& items) {
++        int n = 0;
++        for (const Item& item : items) {
++          n += item.is_folder ? count(item.children) : 1;
++        }
++        return n;
++      };
++  for (size_t i = 0; i < sidebar.spaces.size(); ++i) {
++    const Space& space = sidebar.spaces[i];
++    preview->pinned_count += count(space.pinned);
++    preview->today_count += sidebar.today[i].size();
++    if (i < 8) {
++      auto s = mojom::Space::New();
++      s->name = space.name;
++      s->icon = space.icon;
++      s->color = space.color;
++      s->color2 = space.color2;
++      preview->spaces.push_back(std::move(s));
++    }
++  }
++  return preview;
++}
++
++}  // namespace
++
+ void SidebarHandler::GetArcPreview(GetArcPreviewCallback callback) {
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+       base::BindOnce([] {
+-        return std::make_pair(ReadArcSidebar(), ArcLoginsAvailable());
++        return std::make_pair(ReadArcSidebar(),
++                              LoginsAvailable(LoginsSource::kArc));
+       }),
+       base::BindOnce(
+           [](GetArcPreviewCallback callback,
+              std::pair<std::optional<ArcSidebar>, bool> read) {
+             std::optional<ArcSidebar>& arc = read.first;
+-            if (!arc || arc->spaces.empty()) {
+-              std::move(callback).Run(nullptr);
+-              return;
+-            }
+-            auto preview = mojom::ArcPreview::New();
+-            preview->space_count = arc->spaces.size();
+-            preview->favorite_count = arc->favorites.size();
+-            preview->logins_available = read.second;
+-            std::function<int(const std::vector<Item>&)> count =
+-                [&](const std::vector<Item>& items) {
+-                  int n = 0;
+-                  for (const Item& item : items) {
+-                    n += item.is_folder ? count(item.children) : 1;
+-                  }
+-                  return n;
+-                };
+-            for (size_t i = 0; i < arc->spaces.size(); ++i) {
+-              const Space& space = arc->spaces[i];
+-              preview->pinned_count += count(space.pinned);
+-              preview->today_count += arc->today[i].size();
+-              if (i < 8) {
+-                auto s = mojom::Space::New();
+-                s->name = space.name;
+-                s->icon = space.icon;
+-                s->color = space.color;
+-                s->color2 = space.color2;
+-                preview->spaces.push_back(std::move(s));
+-              }
+-            }
+-            std::move(callback).Run(std::move(preview));
++            std::move(callback).Run(arc && !arc->spaces.empty()
++                                        ? PreviewOf(*arc, read.second)
++                                        : nullptr);
+           },
+           std::move(callback)));
+ }
+@@ -494,8 +502,8 @@ void SidebarHandler::ImportArc(ImportArcCallback callback) {
+ }
+ 
+ void SidebarHandler::ImportArcLogins(ImportArcLoginsCallback callback) {
+-  meridian::ImportArcLogins(
+-      browser_->GetProfile(),
++  meridian::ImportLogins(
++      browser_->GetProfile(), LoginsSource::kArc,
+       base::BindOnce(
+           [](ImportArcLoginsCallback callback, ArcLoginsResult result) {
+             std::move(callback).Run(result.imported, result.error);
+@@ -727,9 +735,15 @@ void SidebarHandler::OnArcRead(ImportArcCallback callback,
+     return;
+   }
+   service_->Import(arc->spaces, std::move(arc->favorites));
+-  // Arc's open tabs: Today tabs of their space, loaded when first opened.
+-  for (size_t i = 0; i < arc->spaces.size(); ++i) {
+-    for (const ArcSidebar::Tab& tab : arc->today[i]) {
++  AddLazyTabs(*arc);
++  ActivateSpace(service_->active_space_id());
++  ScheduleNotify();
++  std::move(callback).Run(true);
++}
++
++void SidebarHandler::AddLazyTabs(const ArcSidebar& sidebar) {
++  for (size_t i = 0; i < sidebar.spaces.size(); ++i) {
++    for (const ArcSidebar::Tab& tab : sidebar.today[i]) {
+       sessions::SerializedNavigationEntry entry;
+       entry.set_index(0);
+       entry.set_virtual_url(tab.url);
+@@ -747,15 +761,113 @@ void SidebarHandler::OnArcRead(ImportArcCallback callback,
+           /*extra_data=*/{}, /*from_session_restore=*/false,
+           /*is_active_browser=*/std::nullopt);
+       if (contents) {
+-        TabData::Set(contents, arc->spaces[i].id, std::string());
++        TabData::Set(contents, sidebar.spaces[i].id, std::string());
++      }
++    }
++  }
++}
++
++void SidebarHandler::GetElectronPreview(GetElectronPreviewCallback callback) {
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce([] {
++        return std::make_pair(ReadElectronState(),
++                              LoginsAvailable(LoginsSource::kElectron));
++      }),
++      base::BindOnce(
++          [](GetElectronPreviewCallback callback,
++             std::pair<std::optional<ElectronState>, bool> read) {
++            std::move(callback).Run(
++                read.first ? PreviewOf(read.first->sidebar, read.second)
++                           : nullptr);
++          },
++          std::move(callback)));
++}
++
++void SidebarHandler::ImportElectron(ImportElectronCallback callback) {
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&ReadElectronState),
++      base::BindOnce(&SidebarHandler::OnElectronRead,
++                     weak_factory_.GetWeakPtr(), std::move(callback)));
++}
++
++void SidebarHandler::OnElectronRead(ImportElectronCallback callback,
++                                    std::optional<ElectronState> state) {
++  if (!state) {
++    std::move(callback).Run(false);
++    return;
++  }
++  ArcSidebar& sidebar = state->sidebar;
++  service_->Import(sidebar.spaces, std::move(sidebar.favorites));
++  AddLazyTabs(sidebar);
++  base::Time now = base::Time::Now();
++  for (const ElectronState::ArchivedTab& tab : state->archive) {
++    archive_->Add(tab.url, tab.title,
++                  tab.space >= 0 ? sidebar.spaces[tab.space].id
++                                 : service_->active_space_id(),
++                  tab.closed_at.is_null() ? now : tab.closed_at);
++  }
++  // Settings worth keeping; link rules point at the new space ids.
++  PrefService* prefs = browser_->GetProfile()->GetPrefs();
++  if (state->sidebar_right) {
++    prefs->SetBoolean(prefs::kSidebarRight, *state->sidebar_right);
++  }
++  if (state->archive_after_hours) {
++    int hours = *state->archive_after_hours;
++    if (hours == 0 || hours == 12 || hours == 24 || hours == 168 ||
++        hours == 720) {
++      prefs->SetInteger(prefs::kArchiveAfterHours, hours);
++    }
++  }
++  if (state->mode && (*state->mode == "everyday" ||
++                      *state->mode == "creative" ||
++                      *state->mode == "developer")) {
++    prefs->SetString(prefs::kMode, *state->mode);
++  }
++  if (state->adblock) {
++    HostContentSettingsMapFactory::GetForProfile(browser_->GetProfile())
++        ->SetDefaultContentSetting(ContentSettingsType::ADS,
++                                   *state->adblock ? CONTENT_SETTING_BLOCK
++                                                   : CONTENT_SETTING_ALLOW);
++  }
++  if (state->atc) {
++    if (base::ListValue* rules = state->atc->FindList("rules")) {
++      for (base::Value& rule : *rules) {
++        std::string* target =
++            rule.is_dict() ? rule.GetDict().FindString("target") : nullptr;
++        if (!target || !target->starts_with("space:")) {
++          continue;
++        }
++        auto it = std::ranges::find(state->space_ids, target->substr(6));
++        *target = it == state->space_ids.end()
++                      ? std::string("main")
++                      : "space:" + sidebar.spaces[it - state->space_ids.begin()].id;
+       }
+     }
++    if (std::optional<base::DictValue> atc = SanitizeAtc(*state->atc)) {
++      prefs->SetDict(prefs::kAtc, std::move(*atc));
++    }
++  }
++  if (state->active_space < static_cast<int>(sidebar.spaces.size())) {
++    service_->SetActiveSpace(sidebar.spaces[state->active_space].id);
+   }
+   ActivateSpace(service_->active_space_id());
+   ScheduleNotify();
+   std::move(callback).Run(true);
+ }
+ 
++void SidebarHandler::ImportElectronLogins(
++    ImportElectronLoginsCallback callback) {
++  meridian::ImportLogins(
++      browser_->GetProfile(), LoginsSource::kElectron,
++      base::BindOnce(
++          [](ImportElectronLoginsCallback callback, ArcLoginsResult result) {
++            std::move(callback).Run(result.imported, result.error);
++          },
++          std::move(callback)));
++}
++
+ void SidebarHandler::ClearToday() {
+   std::vector<content::WebContents*> today;
+   for (int i = 0; i < model()->count(); ++i) {
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 4ca3a8eb8f..99ccd629cd 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -15,6 +15,7 @@
+ #include "components/prefs/pref_change_registrar.h"
+ #include "chrome/browser/meridian/archive_service.h"
+ #include "chrome/browser/meridian/arc_import.h"
++#include "chrome/browser/meridian/electron_import.h"
+ #include "chrome/browser/meridian/sidebar.mojom.h"
+ #include "chrome/browser/meridian/sidebar_service.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+@@ -99,6 +100,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void GetArcPreview(GetArcPreviewCallback callback) override;
+   void ImportArc(ImportArcCallback callback) override;
+   void ImportArcLogins(ImportArcLoginsCallback callback) override;
++  void GetElectronPreview(GetElectronPreviewCallback callback) override;
++  void ImportElectron(ImportElectronCallback callback) override;
++  void ImportElectronLogins(ImportElectronLoginsCallback callback) override;
+   void ProposeSetup(bool use_apps,
+                     const std::string& persona,
+                     ProposeSetupCallback callback) override;
+@@ -144,6 +148,10 @@ class SidebarHandler : public mojom::SidebarHandler,
+   TabStripModel* model();
+   mojom::SidebarStatePtr BuildState();
+   void OnArcRead(ImportArcCallback callback, std::optional<ArcSidebar> arc);
++  void OnElectronRead(ImportElectronCallback callback,
++                      std::optional<ElectronState> state);
++  // Imported open tabs: Today tabs of their space that load when opened.
++  void AddLazyTabs(const ArcSidebar& sidebar);
+   // Coalesces notifications into one OnStateChanged per task.
+   void ScheduleNotify();
+   void Notify();
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 8e602c3985..2b1ea28142 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -505,7 +505,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.statusText_ = e.detail;
+   }
+ 
+-  protected onMeridianOnboarding_(e: CustomEvent<'tour'|'arc'>) {
++  protected onMeridianOnboarding_(e: CustomEvent<'tour'|'arc'|'electron'>) {
+     this.$.onboarding.show(e.detail);
+   }
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+index 0dd60deee8..a794c9a122 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+@@ -35,15 +35,21 @@ export function getHtml(this: MeridianOnboardingElement) {
+             </div>
+           </div>` : ''}
+ 
+-        ${this.step_ === 'arc' && this.arc_ ? html`
++        ${this.step_ === 'electron' && this.moving_ ? html`
++          <h2>Welcome to the new Meridian</h2>
++          <p class="whisper top">Your spaces, pinned tabs, favorites, archive
++            and settings come over from the previous Meridian. It stays as it
++            is.</p>` : ''}
++        ${this.step_ === 'arc' && this.moving_ ? html`
+           <h2>Bring everything from Arc</h2>
+           <p class="whisper top">Your spaces, pinned tabs and favorites move
+-            over as they are. Arc stays untouched.</p>
++            over as they are. Arc stays untouched.</p>` : ''}
++        ${(this.step_ === 'arc' || this.step_ === 'electron') && this.moving_ ? html`
+           <div class="arc-move">
+             <div class="arc-stats">
+-              <b>${this.arc_.spaceCount} spaces</b>
++              <b>${this.moving_.spaceCount} spaces</b>
+               <b>${this.arcTabs_} tabs</b>
+-              <b>${this.arc_.favoriteCount} favorites</b>
++              <b>${this.moving_.favoriteCount} favorites</b>
+             </div>
+             <div class="arc-spaces">
+               ${this.arcSpaces_.map(s => html`
+@@ -52,7 +58,7 @@ export function getHtml(this: MeridianOnboardingElement) {
+                   ${s.name}
+                 </span>`)}
+             </div>
+-            ${this.arc_.loginsAvailable ? html`
++            ${this.moving_.loginsAvailable ? html`
+               <button id="logins" class="opt ${this.withLogins_ ? 'on' : ''}"
+                   @click="${this.onLoginsClick_}">
+                 <span class="opt-ic">${icon('lock', 16)}</span>
+@@ -168,11 +174,17 @@ export function getHtml(this: MeridianOnboardingElement) {
+     <div class="confirm" role="dialog" aria-modal="true">
+       <div class="card">
+         <h3>Your Mac will ask for permission</h3>
+-        <p>To keep you signed in to your sites, Meridian copies Arc’s sign-ins.
+-          Your Mac will ask once whether Meridian may read them: click
+-          <b>Always Allow</b> (and type your Mac password if asked).</p>
+-        <p>Nothing leaves your computer, and Arc stays as it is. Saved
+-          passwords aren’t copied.</p>
++        ${this.confirmFor_ === 'arc' ? html`
++          <p>To keep you signed in to your sites, Meridian copies Arc’s
++            sign-ins. Your Mac will ask once whether Meridian may read them:
++            click <b>Always Allow</b> (and type your Mac password if asked).</p>
++          <p>Nothing leaves your computer, and Arc stays as it is. Saved
++            passwords aren’t copied.</p>` : html`
++          <p>To keep you signed in to your sites, Meridian copies the previous
++            Meridian’s sign-ins. Your Mac may ask once whether this Meridian
++            may use its key: click <b>Always Allow</b>.</p>
++          <p>Nothing leaves your computer, and the previous Meridian stays as
++            it is.</p>`}
+         <div class="card-actions">
+           <button id="confirmCancel" class="btn ghost"
+               @click="${this.onConfirmCancelClick_}">Cancel</button>
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+index 0f138d1b7b..82ea07a84f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+@@ -18,7 +18,8 @@ import type {ArcPreview, Item, SetupProposal, SidebarHandlerInterface, Space} fr
+ import {getCss} from './onboarding.css.js';
+ import {getHtml} from './onboarding.html.js';
+ 
+-export type StepName = 'hello'|'arc'|'tailor'|'preview'|'default'|'done';
++export type StepName =
++    'hello'|'electron'|'arc'|'tailor'|'preview'|'default'|'done';
+ 
+ const HELLOS = [
+   'hello', 'привет', 'hola', 'bonjour', 'hallo', 'ciao', 'olá', 'გამარჯობა',
+@@ -85,6 +86,8 @@ export class MeridianOnboardingElement extends CrLitElement {
+       step_: {state: true, type: String},
+       steps_: {state: true, type: Array},
+       arc_: {state: true, type: Object},
++      electron_: {state: true, type: Object},
++      confirmFor_: {state: true, type: String},
+       withLogins_: {state: true, type: Boolean},
+       confirmLogins_: {state: true, type: Boolean},
+       proposal_: {state: true, type: Object},
+@@ -105,6 +108,7 @@ export class MeridianOnboardingElement extends CrLitElement {
+       persona_: {state: true, type: String},
+       arcTabs_: {state: true, type: Number},
+       canStartFresh_: {state: true, type: Boolean},
++      moving_: {state: true, type: Object},
+     };
+   }
+ 
+@@ -112,6 +116,10 @@ export class MeridianOnboardingElement extends CrLitElement {
+   protected accessor step_: StepName = 'hello';
+   protected accessor steps_: StepName[] = [];
+   protected accessor arc_: ArcPreview|null = null;
++  // The earlier (Electron) Meridian's data on this computer.
++  protected accessor electron_: ArcPreview|null = null;
++  // Which import the "macOS will ask" card is for.
++  protected accessor confirmFor_: 'arc'|'electron' = 'arc';
+   protected accessor withLogins_: boolean = true;
+   protected accessor confirmLogins_: boolean = false;
+   protected accessor proposal_: SetupProposal|null = null;
+@@ -136,6 +144,8 @@ export class MeridianOnboardingElement extends CrLitElement {
+   protected accessor persona_: string = '';
+   protected accessor arcTabs_: number = 0;
+   protected accessor canStartFresh_: boolean = false;
++  // What the import step on screen brings (Arc's or the old Meridian's).
++  protected accessor moving_: ArcPreview|null = null;
+ 
+   private readonly handler_: SidebarHandlerInterface =
+       browserProxyFactory.getInstance().handler;
+@@ -143,20 +153,23 @@ export class MeridianOnboardingElement extends CrLitElement {
+   private fresh_: boolean = false;
+   private helloTimer_: number|null = null;
+ 
+-  // `start`: 'arc' opens straight at the Arc step (File > Import from Arc);
+-  // 'preset' shows the setup for `persona` (the home page's "Set up for me").
+-  async show(start: 'tour'|'arc'|'preset' = 'tour', persona = '') {
++  // `start`: 'arc' / 'electron' open straight at that import step (File >
++  // Import from Arc, Settings); 'preset' shows the setup for `persona` (the
++  // home page's "Set up for me").
++  async show(start: 'tour'|'arc'|'electron'|'preset' = 'tour', persona = '') {
+     if (this.open) {
+       return;
+     }
+-    const [{preview}, {isDefault}] = await Promise.all([
++    const [{preview}, electron, {isDefault}] = await Promise.all([
+       this.handler_.getArcPreview(),
++      this.handler_.getElectronPreview(),
+       this.handler_.isDefaultBrowser(),
+     ]);
+     this.arc_ = preview;
++    this.electron_ = electron.preview;
+     this.isDefault_ = isDefault;
+     this.fresh_ = false;
+-    this.withLogins_ = !!preview?.loginsAvailable;
++    this.withLogins_ = true;
+     this.confirmLogins_ = false;
+     this.proposal_ = null;
+     this.lines_ = [];
+@@ -171,7 +184,9 @@ export class MeridianOnboardingElement extends CrLitElement {
+       this.pickedFavorites_ = proposal.favorites.map(() => true);
+       this.steps_ = ['preview', 'done'];
+     } else {
+-      this.steps_ = start === 'arc' ? ['arc', 'done'] : this.tourSteps_();
++      this.steps_ = start === 'arc' ? ['arc', 'done'] :
++          start === 'electron'      ? ['electron', 'done'] :
++                                      this.tourSteps_();
+     }
+     this.step_ = this.steps_[0]!;
+     this.open = true;
+@@ -180,9 +195,13 @@ export class MeridianOnboardingElement extends CrLitElement {
+ 
+   private tourSteps_(): StepName[] {
+     const steps: StepName[] = ['hello'];
+-    steps.push(...(this.arc_ && !this.fresh_ ? ['arc' as const] :
+-                                             ['tailor' as const,
+-                                              'preview' as const]));
++    if (this.electron_ && !this.fresh_) {
++      steps.push('electron');
++    } else if (this.arc_ && !this.fresh_) {
++      steps.push('arc');
++    } else {
++      steps.push('tailor', 'preview');
++    }
+     if (!this.isDefault_) {
+       steps.push('default');
+     }
+@@ -202,14 +221,17 @@ export class MeridianOnboardingElement extends CrLitElement {
+     this.nextLabel_ = this.busy_ || {
+       hello: '',
+       arc: this.arc_ ? 'Bring everything' : 'Continue',
++      electron: this.electron_ ? 'Bring everything' : 'Continue',
+       tailor: 'Suggest a setup',
+       preview: 'Looks great',
+       default: 'Not now',
+       done: 'Start browsing',
+     }[this.step_];
+-    this.arcTabs_ = (this.arc_?.pinnedCount || 0) + (this.arc_?.todayCount || 0);
++    const moving = this.step_ === 'electron' ? this.electron_ : this.arc_;
++    this.moving_ = moving;
++    this.arcTabs_ = (moving?.pinnedCount || 0) + (moving?.todayCount || 0);
+     this.canStartFresh_ = this.steps_.includes('hello');
+-    this.arcSpaces_ = (this.arc_?.spaces || []).map(
++    this.arcSpaces_ = (moving?.spaces || []).map(
+         (s, index) => ({index, name: s.name, icon: s.icon,
+                         color: s.color || '#8a8fe0', off: false}));
+     const p = this.proposal_;
+@@ -307,6 +329,8 @@ export class MeridianOnboardingElement extends CrLitElement {
+     switch (this.step_) {
+       case 'arc':
+         return this.arc_ ? this.bringArc_() : this.advance_();
++      case 'electron':
++        return this.electron_ ? this.bringElectron_() : this.advance_();
+       case 'tailor':
+         return this.suggest_();
+       case 'preview':
+@@ -362,7 +386,11 @@ export class MeridianOnboardingElement extends CrLitElement {
+ 
+   protected onConfirmContinueClick_() {
+     this.confirmLogins_ = false;
+-    this.bringArc_(/*confirmed=*/ true);
++    if (this.confirmFor_ === 'electron') {
++      this.bringElectron_(/*confirmed=*/ true);
++    } else {
++      this.bringArc_(/*confirmed=*/ true);
++    }
+   }
+ 
+   // ------------------------------------------------------------ actions
+@@ -370,6 +398,7 @@ export class MeridianOnboardingElement extends CrLitElement {
+   private async bringArc_(confirmed = false) {
+     // Reading Arc's sign-ins makes macOS ask; say so first.
+     if (this.withLogins_ && this.arc_?.loginsAvailable && !confirmed) {
++      this.confirmFor_ = 'arc';
+       this.confirmLogins_ = true;
+       return;
+     }
+@@ -386,6 +415,27 @@ export class MeridianOnboardingElement extends CrLitElement {
+     this.advance_();
+   }
+ 
++  // The earlier Meridian: everything, and sign-ins with its own key (macOS
++  // may ask once whether this Meridian may use it).
++  private async bringElectron_(confirmed = false) {
++    if (this.withLogins_ && this.electron_?.loginsAvailable && !confirmed) {
++      this.confirmFor_ = 'electron';
++      this.confirmLogins_ = true;
++      return;
++    }
++    this.busy_ = 'Moving in…';
++    const {ok} = await this.handler_.importElectron();
++    if (ok && this.withLogins_ && this.electron_?.loginsAvailable) {
++      const {imported, error} = await this.handler_.importElectronLogins();
++      this.note_ = error === 'denied' ?
++          'Sign-ins weren’t brought over. You can try again from Settings.' :
++          error ? 'The old Meridian’s sign-ins couldn’t be read.' :
++                  `You’re still signed in to your sites (${
++                      imported.toLocaleString()} sign-ins brought over).`;
++    }
++    this.advance_();
++  }
++
+   private async suggest_() {
+     this.busy_ = 'One moment…';
+     this.thinking_ = true;
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index b313ec8252..3e31899d62 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -149,6 +149,15 @@ export function getHtml(this: MeridianSettingsElement) {
+                 <button id="importArc" class="btn"
+                     @click="${this.onImportArcClick_}">Import…</button>
+               </div>
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Move from the previous Meridian</div>
++                  <div class="row-desc">Spaces, pinned tabs, favorites, archive,
++                    settings and sign-ins from the earlier version.</div>
++                </div>
++                <button id="importElectron" class="btn"
++                    @click="${this.onImportElectronClick_}">Import…</button>
++              </div>
+               <div class="row">
+                 <div class="row-text">
+                   <div class="row-label">Welcome tour</div>
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 13ece09d24..28b272f724 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -203,6 +203,11 @@ export class MeridianSettingsElement extends CrLitElement {
+     this.fire('meridian-edit-theme', null);
+   }
+ 
++  protected onImportElectronClick_() {
++    this.hide();
++    this.fire('meridian-onboarding', 'electron');
++  }
++
+   protected onTourClick_() {
+     this.hide();
+     this.fire('meridian-onboarding', 'tour');
