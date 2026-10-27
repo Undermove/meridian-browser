@@ -112,6 +112,12 @@ test('Ask (⌘J): key check, an answer about the page, a browser tool, Stop', as
     const assistantTurn = followUp[followUp.length - 2];
     assert.equal(assistantTurn.content[0].signature, 'sig123');
     assert.equal(followUp[followUp.length - 1].content[0].tool_use_id, 'toolu_1');
+    // Mission Control sees the chat and its browser tool call (never the prompt).
+    const mission = JSON.parse((await b.eval(`${H}.getMissionState()`)).snapshotJson);
+    const chat = mission.nodes.find((n) => n.kind === 'assistant');
+    assert.equal(chat.label, '⌘J Assistant');
+    assert.equal(chat.log.at(-1).name, 'list_tabs');
+    assert.ok(!JSON.stringify(mission).includes('count my tabs'));
 
     // Ask in the command bar (⌘↵): a quick model, the answer right there.
     await b.eval('app.$.tabstrip.runCommand(14, 0)');

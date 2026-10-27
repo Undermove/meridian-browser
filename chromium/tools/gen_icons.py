@@ -23,10 +23,17 @@ import type {TemplateResult} from '//resources/lit/v3_0/lit.rollup.js';
 '''
 
 
+# Icons the Electron build defines elsewhere (Mission Control's own).
+EXTRA = {
+    'agents': '<circle cx="12" cy="12" r="2.2"/><path d="M12 4.5a7.5 7.5 0 0 1 7.5 7.5"/><path d="M4.5 12A7.5 7.5 0 0 1 12 4.5" opacity=".55"/><path d="M19.5 12A7.5 7.5 0 0 1 12 19.5"/><path d="M12 19.5A7.5 7.5 0 0 1 4.5 12" opacity=".55"/><circle cx="19.5" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="4.5" cy="12" r="1.3" fill="currentColor" stroke="none"/>',
+}
+
+
 def main():
   src, out, names = sys.argv[1], sys.argv[2], sys.argv[3:]
   js = open(src, encoding='utf-8').read()
   paths = dict(re.findall(r"^  (\w+): '(.*)',$", js, re.M))
+  paths.update(EXTRA)
   missing = [n for n in names if n not in paths]
   if missing:
     sys.exit('not in icons.js: ' + ', '.join(missing))

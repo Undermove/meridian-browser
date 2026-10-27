@@ -60,6 +60,7 @@ commit on the `meridian` branch, run `build.sh`, then `export.sh` and commit `pa
 - [x] Other AIs for Ask: Ollama, LM Studio, API keys (OpenAI, Gemini, OpenRouter, xAI, Mistral, DeepSeek, Groq) with a model picker, and agent CLIs (Codex, Copilot, Cursor, OpenCode, Qwen Code, Amp, Goose, Droid) behind "Other agents"
 - [x] Tidy Today, link previews (⇧ over a link), Chat view (⌥⌘J) with saved chats
 - [x] Workbench (⇧⌘E, chrome://workbench): project files, Monaco, terminals on a pty, coding agents with Meridian's browser tools
-- [ ] Workbench Pro (vault, secret guard, sandboxes, customizations, hubs), Mission Control
+- [x] Mission Control (⇧⌘M): Workbench agent sessions and subagents (hooks via `Meridian --mission-hook`, no Node needed), MCP clients, ⌘J runs; redacted summaries, history, notifications
+- [ ] Workbench Pro (vault, secret guard, sandboxes, customizations, hubs)
 - [ ] Updater, packaging, signing
 - [ ] Windows and Linux builds
