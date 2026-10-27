@@ -47,3 +47,25 @@ test('the close button closes a tab', async () => {
     assert.equal((await b.tabs())[0].title, 'One');
   } finally { await b.close(); }
 });
+
+test('a loading page pulses its row and runs a bar along the URL pill', async () => {
+  const http = await import('node:http');
+  const server = http.createServer((req, res) => {
+    if (req.url === '/slow') {
+      setTimeout(() => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<title>Slow</title>done'); }, 2500);
+    } else {
+      res.writeHead(200, { 'content-type': 'text/html' }); res.end('<title>Fast</title>x');
+    }
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const b = await launch([`${base}/fast`]);
+  try {
+    await b.waitFor(count(1));
+    await b.eval(`app.$.tabstrip.tabStripService_.createTabAt(null, ${JSON.stringify(`${base}/slow`)})`);
+    await b.waitFor(`!!${tabEl(0)}.shadowRoot.querySelector('.row.loading')`);
+    await b.waitFor(`app.shadowRoot.getElementById('urlPill').classList.contains('loading')`);
+    await b.waitFor(`${tabEl(0)}.tab.title === 'Slow' && !${tabEl(0)}.shadowRoot.querySelector('.row.loading')`);
+    await b.waitFor(`!app.shadowRoot.getElementById('urlPill').classList.contains('loading')`);
+  } finally { await b.close(); server.close(); }
+});
