@@ -28,8 +28,9 @@ class Cdp {
   close() { this.ws?.close(); }
 }
 
-export async function launch(urls = []) {
-  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+// `profile`: reuse a profile dir (to test what survives a restart); it's then left for the caller to delete.
+export async function launch(urls = [], { profile: keep } = {}) {
+  const profile = keep || fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
   const port = 9400 + Math.floor(Math.random() * 500);
   const proc = spawn(APP, [
     `--user-data-dir=${profile}`, `--remote-debugging-port=${port}`, '--use-mock-keychain',
@@ -43,6 +44,8 @@ export async function launch(urls = []) {
   }
   if (!ui) { proc.kill(); throw new Error('browser UI target never appeared'); }
   const cdp = await new Cdp(ui.webSocketDebuggerUrl).open();
+  const exited = () => proc.exitCode !== null || proc.signalCode !== null ?
+      Promise.resolve() : new Promise((r) => proc.once('exit', r));
   const b = {
     proc, profile, base, cdp,
     // Evaluates an expression in the browser UI page; `app` is the <webui-browser-app> element.
@@ -56,12 +59,40 @@ export async function launch(urls = []) {
     },
     async waitFor(expr, timeout = 10000) {
       const end = Date.now() + timeout; let last;
-      while (Date.now() < end) { try { last = await b.eval(expr); if (last) return last; } catch (e) { last = e.message; } await sleep(100); }
+      // A DOM node can't be returned by value; it just means "found".
+      const probe = `(() => { const v = (${expr}); return v instanceof Node ? true : v; })()`;
+      while (Date.now() < end) { try { last = await b.eval(probe); if (last) return last; } catch (e) { last = e.message; } await sleep(100); }
       throw new Error(`timed out waiting for: ${expr} (last: ${JSON.stringify(last)})`);
     },
-    // Tabs as the sidebar shows them.
+    // Today tabs as the sidebar shows them, top to bottom.
     tabs() {
-      return b.eval(`[...app.$.tabstrip.shadowRoot.querySelectorAll('webui-browser-tab')].map((t) => ({ id: t.tabData.id, title: t.tabData.title, url: t.tabData.url, active: t.hasAttribute('active') }))`);
+      return b.eval(`[...${SB}.querySelectorAll('meridian-tab-row')].map((r) => ({ id: r.tab.id, title: r.tab.title, url: r.tab.url, active: r.tab.isActive }))`);
+    },
+    // Pinned rows of the active space (depth-first), and favorites.
+    pinned() {
+      return b.eval(`(() => { const out = []; const walk = (root, depth) => { for (const el of root.querySelectorAll(':scope > meridian-item')) { const row = el.shadowRoot.querySelector('.row'); out.push({ id: el.item.id, title: el.item.title, folder: el.item.isFolder, depth, loaded: !row.classList.contains('unloaded') && !el.item.isFolder, active: row.classList.contains('active') }); const kids = el.shadowRoot.querySelector('.children'); if (kids && !el.shadowRoot.querySelector('.folder-wrap.collapsed')) walk(kids, depth + 1); } }; walk(${SB}.getElementById('pinned'), 0); return out; })()`);
+    },
+    favorites() {
+      return b.eval(`[...${SB}.querySelectorAll('meridian-fav')].map((f) => ({ id: f.item.id, title: f.item.title, active: !!f.shadowRoot.querySelector('.fav.active') }))`);
+    },
+    // The sidebar model as the C++ service pushed it.
+    state() {
+      return b.eval(`(() => { const s = app.$.tabstrip.state_; return s && { spaces: s.spaces.map((x) => ({ id: x.id, name: x.name, color: x.color, pinned: x.pinned.length })), active: s.activeSpaceId, favorites: s.favorites.length, tabs: s.tabs.map((t) => ({ space: t.spaceId, item: t.itemId })) }; })()`);
+    },
+    // Opens a row's context menu and picks an entry by its label.
+    async menu(elExpr, label) {
+      const r = await b.waitFor(`(() => { const el = ${elExpr}; if (!el) return null; const r = el.getBoundingClientRect(); return r.width ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null; })()`);
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: r.x, y: r.y, button: 'none' });
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: r.x, y: r.y, button: 'right', clickCount: 1 });
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: r.x, y: r.y, button: 'right', clickCount: 1 });
+      await b.click(`[...${SB}.querySelectorAll('#menu .menu-item')].find((m) => m.textContent.trim() === ${JSON.stringify(label)})`);
+    },
+    async type(text) {
+      await cdp.send('Input.insertText', { text });
+    },
+    async key(key, code = key, keyCode = 0) {
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, windowsVirtualKeyCode: keyCode });
+      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: keyCode });
     },
     // A real mouse click at the centre of an element found by a JS expression in the UI page.
     async click(elExpr, { button = 'left' } = {}) {
@@ -74,13 +105,25 @@ export async function launch(urls = []) {
       const { data } = await cdp.send('Page.captureScreenshot', { format: 'png' });
       fs.writeFileSync(file, Buffer.from(data, 'base64'));
     },
+    // Quits like the user does (⌘Q), so the session and the sidebar are saved.
+    async quit() {
+      const done = exited();
+      cdp.send('Browser.close').catch(() => {});  // never answers: the process exits
+      await Promise.race([done, sleep(15000)]);
+      cdp.close();
+      if (proc.exitCode === null) { proc.kill(); await exited(); }
+    },
     async close() {
-      cdp.close(); proc.kill();
-      await new Promise((r) => proc.once('exit', r));
-      fs.rmSync(profile, { recursive: true, force: true });
+      cdp.close();
+      if (proc.exitCode === null && proc.signalCode === null) { proc.kill(); await exited(); }
+      if (!keep) fs.rmSync(profile, { recursive: true, force: true });
     },
   };
   return b;
 }
 
-export const tabEl = (i) => `app.$.tabstrip.shadowRoot.querySelectorAll('webui-browser-tab')[${i}]`;
+// The sidebar's shadow root, and its rows.
+export const SB = `app.$.tabstrip.shadowRoot`;
+export const tabEl = (i) => `${SB}.querySelectorAll('meridian-tab-row')[${i}]`;
+export const itemEl = (title) => `(() => { const all = []; const walk = (root) => { for (const el of root.querySelectorAll('meridian-item')) { all.push(el); walk(el.shadowRoot); } }; walk(${SB}); return all.find((el) => el.item.title === ${JSON.stringify(title)}); })()`;
+export const favEl = (i) => `${SB}.querySelectorAll('meridian-fav')[${i}]`;

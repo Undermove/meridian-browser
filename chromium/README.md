@@ -39,7 +39,8 @@ commit on the `meridian` branch, run `build.sh`, then `export.sh` and commit `pa
 
 - [x] Stock Chromium build; Google sign-in passes
 - [x] WebUI browser on by default, sidebar layout: address field, vertical tabs, page as a card
-- [ ] Meridian name and icon
+- [x] Meridian name, icon, bundle id, keychain item, strings in 81 languages
+- [x] Spaces, pinned tabs, folders, favorites, Today (C++ SidebarService + sidebar UI), survive restart
 - [ ] Spaces, pinned tabs, command bar, split view, Mission Control, MCP, vault: port from `src/renderer`
 - [ ] Tab drag reordering in the vertical list (the stock drag delegate is horizontal)
 - [ ] Windows and Linux builds
