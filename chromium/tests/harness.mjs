@@ -41,9 +41,9 @@ async function evalUi(cdp, expr) {
 export async function launch(urls = [], { profile: keep, args = [] } = {}) {
   const profile = keep || fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
   const port = 9400 + Math.floor(Math.random() * 500);
-  // Never the real Arc or the real earlier Meridian: empty folders unless a test gives its own.
+  // Never the real Arc: an empty folder unless a test gives its own.
   const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-empty-'));
-  for (const sw of ['--meridian-arc-dir', '--meridian-electron-dir']) {
+  for (const sw of ['--meridian-arc-dir']) {
     if (!args.some((a) => a.startsWith(sw + '='))) args = [...args, `${sw}=${empty}`];
   }
   const proc = spawn(APP, [
