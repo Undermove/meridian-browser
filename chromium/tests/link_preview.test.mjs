@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { launch } from './harness.mjs';
+import { launch, SB } from './harness.mjs';
 
 const KEY = 'sk-ant-test-000000000000000000000000';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -46,6 +46,7 @@ test('link previews: Shift over a link, no cookies, no local addresses, cached',
   const bubble = `app.shadowRoot.getElementById('statusBubble')`;
   let ws;
   try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
     assert.equal((await b.eval(`app.$.tabstrip.handler_.setAiKey(${JSON.stringify(KEY)})`)).ok, true);
     let t;
     for (let i = 0; i < 50 && !t; i++) {

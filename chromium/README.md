@@ -58,6 +58,7 @@ commit on the `meridian` branch, run `build.sh`, then `export.sh` and commit `pa
 - [x] MCP server in C++ (`Meridian --mcp-bridge`, 20 browser tools, off/read/ask/full, JS opt-in, activity bar + Stop, Connect Claude Code/Codex)
 - [x] AI: Claude API key (encrypted), Ask panel ⌘J with page context and browser tools, quick answers in ⌘T
 - [x] Other AIs for Ask: Ollama, LM Studio, API keys (OpenAI, Gemini, OpenRouter, xAI, Mistral, DeepSeek, Groq) with a model picker, and agent CLIs (Codex, Copilot, Cursor, OpenCode, Qwen Code, Amp, Goose, Droid) behind "Other agents"
-- [ ] Tidy Today, link previews, chats; Mission Control, Workbench, sandboxes, hubs
+- [x] Tidy Today, link previews (⇧ over a link), Chat view (⌥⌘J) with saved chats
+- [ ] Mission Control, Workbench, sandboxes, hubs
 - [ ] Updater, packaging, signing
 - [ ] Windows and Linux builds
