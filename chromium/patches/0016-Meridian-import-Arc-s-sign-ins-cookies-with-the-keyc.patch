@@ -1,0 +1,652 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 27 Oct 2026 18:37:11 +0400
+Subject: [PATCH 17/17] Meridian: import Arc's sign-ins (cookies), with the
+ keychain asked first
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn           |  16 +-
+ chrome/browser/meridian/arc_logins.cc      | 402 +++++++++++++++++++++
+ chrome/browser/meridian/arc_logins.h       |  53 +++
+ chrome/browser/meridian/arc_logins_mac.mm  |  28 ++
+ chrome/browser/meridian/sidebar.mojom      |   6 +
+ chrome/browser/meridian/sidebar_handler.cc |  20 +-
+ chrome/browser/meridian/sidebar_handler.h  |   1 +
+ 7 files changed, 522 insertions(+), 4 deletions(-)
+ create mode 100644 chrome/browser/meridian/arc_logins.cc
+ create mode 100644 chrome/browser/meridian/arc_logins.h
+ create mode 100644 chrome/browser/meridian/arc_logins_mac.mm
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 8f0f48341e..7d4a50fcc0 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -38,6 +38,8 @@ source_set("model") {
+ 
+ source_set("meridian") {
+   sources = [
++    "arc_logins.cc",
++    "arc_logins.h",
+     "little_window.cc",
+     "little_window.h",
+     "sidebar_handler.cc",
+@@ -50,8 +52,14 @@ source_set("meridian") {
+     "tab_data.h",
+   ]
+   if (is_mac) {
+-    sources += [ "sidebar_handler_mac.mm" ]
+-    frameworks = [ "AppKit.framework" ]
++    sources += [
++      "arc_logins_mac.mm",
++      "sidebar_handler_mac.mm",
++    ]
++    frameworks = [
++      "AppKit.framework",
++      "Security.framework",
++    ]
+   }
+   public_deps = [
+     ":mojo_bindings",
+@@ -79,6 +87,10 @@ source_set("meridian") {
+     "//components/split_tabs",
+     "//components/tabs:public",
+     "//components/url_formatter",
++    "//crypto",
++    "//services/network/public/mojom",
++    "//sql",
++    "//third_party/boringssl",
+     "//net",
+     "//ui/base",
+     "//ui/display",
+diff --git a/chrome/browser/meridian/arc_logins.cc b/chrome/browser/meridian/arc_logins.cc
+new file mode 100644
+index 0000000000..a4f1419dde
+--- /dev/null
++++ b/chrome/browser/meridian/arc_logins.cc
+@@ -0,0 +1,402 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/arc_logins.h"
++
++#include <algorithm>
++#include <memory>
++#include <set>
++#include <tuple>
++#include <vector>
++
++#include "base/barrier_closure.h"
++#include "base/command_line.h"
++#include "base/containers/span.h"
++#include "base/files/file_enumerator.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/memory/ref_counted.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/cstring_view.h"
++#include "base/strings/string_util.h"
++#include "base/task/thread_pool.h"
++#include "build/build_config.h"
++#include "chrome/browser/meridian/arc_import.h"
++#include "chrome/browser/profiles/profile.h"
++#include "content/public/browser/storage_partition.h"
++#include "crypto/aes_cbc.h"
++#include "crypto/hash.h"
++#include "net/cookies/canonical_cookie.h"
++#include "net/cookies/cookie_access_result.h"
++#include "net/cookies/cookie_options.h"
++#include "services/network/public/mojom/cookie_manager.mojom.h"
++#include "sql/database.h"
++#include "sql/statement.h"
++#include "third_party/boringssl/src/include/openssl/evp.h"
++#include "third_party/boringssl/src/include/openssl/mem.h"
++#include "url/gurl.h"
++#include "url/url_constants.h"
++
++namespace meridian {
++
++namespace {
++
++// Tests: the keychain password for a fake Arc folder (--meridian-arc-dir);
++// "__deny__" acts like the person clicking Deny.
++constexpr char kArcSafeStorageSwitch[] = "meridian-arc-safe-storage";
++constexpr char kArcDirSwitch[] = "meridian-arc-dir";
++
++struct ArcProfile {
++  std::string dir;
++  base::FilePath db;
++};
++
++// "Default" first, then "Profile N" in order; "Guest Profile" and the like
++// are not real profiles.
++std::vector<ArcProfile> FindArcProfiles() {
++  std::vector<ArcProfile> out;
++  base::FilePath user_data = ArcDataDir().Append("User Data");
++  base::FileEnumerator dirs(user_data, false, base::FileEnumerator::DIRECTORIES);
++  for (base::FilePath dir = dirs.Next(); !dir.empty(); dir = dirs.Next()) {
++    std::string name = dir.BaseName().value();
++    int n = 0;
++    bool real = name == "Default" ||
++                (name.starts_with("Profile ") &&
++                 base::StringToInt(name.substr(8), &n));
++    if (!real) {
++      continue;
++    }
++    for (const char* rel : {"Network/Cookies", "Cookies"}) {
++      if (base::PathExists(dir.Append(rel))) {
++        out.push_back({name, dir.Append(rel)});
++        break;
++      }
++    }
++  }
++  auto rank = [](const ArcProfile& p) {
++    int n = 0;
++    base::StringToInt(p.dir.substr(std::min<size_t>(8, p.dir.size())), &n);
++    return p.dir == "Default" ? -1 : n;
++  };
++  std::ranges::sort(out, {}, rank);
++  return out;
++}
++
++// The "Arc Safe Storage" password, or the error code.
++std::string ArcPassword(std::string* error) {
++  const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++  if (cl->HasSwitch(kArcSafeStorageSwitch) && cl->HasSwitch(kArcDirSwitch)) {
++    std::string pw = cl->GetSwitchValueASCII(kArcSafeStorageSwitch);
++    if (pw == "__deny__") {
++      *error = "denied";
++      return std::string();
++    }
++    return pw;
++  }
++#if BUILDFLAG(IS_MAC)
++  return internal::ReadArcKeychainPassword(error);
++#else
++  *error = "no-data";
++  return std::string();
++#endif
++}
++
++struct Row {
++  std::string host_key, name, value, path;
++  std::vector<uint8_t> encrypted;
++  int64_t creation = 0, expires = 0, last_access = 0;
++  bool secure = false, httponly = false, persistent = true;
++  int samesite = -1, priority = 1, source_scheme = 0, source_port = -1;
++  bool partitioned = false;
++};
++
++std::optional<std::string> Decrypt(base::span<const uint8_t> enc,
++                                   base::span<const uint8_t> key,
++                                   const std::string& host_key,
++                                   int version) {
++  if (enc.size() < 3 || enc[0] != 'v' || enc[1] != '1' || enc[2] != '0') {
++    return std::string(enc.begin(), enc.end());  // legacy clear text
++  }
++  std::array<uint8_t, crypto::aes_cbc::kBlockSize> iv;
++  iv.fill(' ');
++  std::optional<std::vector<uint8_t>> plain =
++      crypto::aes_cbc::Decrypt(key, iv, enc.subspan(3u));
++  if (!plain) {
++    return std::nullopt;
++  }
++  std::optional<std::string> out;
++  if (version >= 24) {
++    auto hash = crypto::hash::Sha256(base::as_byte_span(host_key));
++    if (plain->size() >= hash.size() &&
++        std::equal(hash.begin(), hash.end(), plain->begin())) {
++      out = std::string(plain->begin() + hash.size(), plain->end());
++    }
++  } else {
++    out = std::string(plain->begin(), plain->end());
++  }
++  OPENSSL_cleanse(plain->data(), plain->size());
++  return out;
++}
++
++net::CookieSameSite SameSite(int v) {
++  switch (v) {
++    case 0:
++      return net::CookieSameSite::NO_RESTRICTION;
++    case 1:
++      return net::CookieSameSite::LAX_MODE;
++    case 2:
++      return net::CookieSameSite::STRICT_MODE;
++    default:
++      return net::CookieSameSite::UNSPECIFIED;
++  }
++}
++
++// Reads one Arc cookie database (from a private copy) into cookies.
++bool ReadProfile(const base::FilePath& db_file,
++                 base::span<const uint8_t> key,
++                 std::set<std::tuple<std::string, std::string, std::string>>&
++                     seen,
++                 std::vector<net::CanonicalCookie>& cookies,
++                 int& failed) {
++  base::ScopedTempDir tmp;
++  if (!tmp.CreateUniqueTempDir()) {
++    return false;
++  }
++  base::FilePath copy = tmp.GetPath().Append("Cookies");
++  if (!base::CopyFile(db_file, copy)) {
++    return false;
++  }
++  for (const char* ext : {"-wal", "-journal"}) {
++    base::FilePath side(db_file.value() + ext);
++    if (base::PathExists(side)) {
++      base::CopyFile(side, base::FilePath(copy.value() + ext));
++    }
++  }
++  sql::Database db(sql::Database::Tag("Cookie"));
++  if (!db.Open(copy) || !db.DoesTableExist("cookies")) {
++    return false;
++  }
++  int version = 0;
++  {
++    sql::Statement meta(
++        db.GetUniqueStatement("SELECT value FROM meta WHERE key='version'"));
++    if (meta.Step()) {
++      base::StringToInt(meta.ColumnString(0), &version);
++    }
++  }
++  static constexpr base::cstring_view kColumns[] = {
++      "host_key",     "name",          "value",          "encrypted_value",
++      "path",         "creation_utc",  "expires_utc",    "last_access_utc",
++      "is_secure",    "is_httponly",   "is_persistent",  "samesite",
++      "priority",     "source_scheme", "source_port",    "top_frame_site_key"};
++  std::string select = "SELECT ";
++  bool first = true;
++  for (base::cstring_view column : kColumns) {
++    if (!first) {
++      select += ", ";
++    }
++    first = false;
++    select += db.DoesColumnExist("cookies", column) ? std::string(column)
++                                                    : std::string("NULL");
++  }
++  select += " FROM cookies";
++  sql::Statement s(db.GetUniqueStatement(select));
++  base::Time now = base::Time::Now();
++  while (s.Step()) {
++    Row r;
++    r.host_key = s.ColumnString(0);
++    r.name = s.ColumnString(1);
++    r.value = s.ColumnString(2);
++    base::span<const uint8_t> enc = s.ColumnBlob(3);
++    r.path = s.ColumnString(4);
++    r.creation = s.ColumnInt64(5);
++    r.expires = s.ColumnInt64(6);
++    r.last_access = s.ColumnInt64(7);
++    r.secure = s.ColumnInt64(8);
++    r.httponly = s.ColumnInt64(9);
++    r.persistent = s.GetColumnType(10) == sql::ColumnType::kNull ||
++                   s.ColumnInt64(10);
++    r.samesite = s.GetColumnType(11) == sql::ColumnType::kNull
++                     ? -1
++                     : s.ColumnInt64(11);
++    r.priority = s.GetColumnType(12) == sql::ColumnType::kNull
++                     ? 1
++                     : s.ColumnInt64(12);
++    r.source_scheme = s.ColumnInt64(13);
++    r.source_port = s.GetColumnType(14) == sql::ColumnType::kNull
++                        ? -1
++                        : s.ColumnInt64(14);
++    r.partitioned = !s.ColumnString(15).empty();
++    if (r.partitioned || r.host_key.empty()) {
++      continue;  // CHIPS cookies stay behind
++    }
++    if (!enc.empty()) {
++      std::optional<std::string> value =
++          Decrypt(enc, key, r.host_key, version);
++      if (!value) {
++        ++failed;
++        continue;
++      }
++      r.value = std::move(*value);
++    }
++    auto from_windows = [](int64_t us) {
++      return us ? base::Time::FromDeltaSinceWindowsEpoch(base::Microseconds(us))
++                : base::Time();
++    };
++    base::Time expiry = r.persistent ? from_windows(r.expires) : base::Time();
++    if (!expiry.is_null() && expiry <= now) {
++      continue;
++    }
++    if (!seen.insert({r.name, r.host_key, r.path}).second) {
++      continue;  // an earlier Arc profile already has it
++    }
++    base::Time creation = from_windows(r.creation);
++    if (creation.is_null()) {
++      creation = now;
++    }
++    base::Time last_access = from_windows(r.last_access);
++    if (last_access < creation) {
++      last_access = creation;
++    }
++    net::CookiePriority priority =
++        r.priority == 0   ? net::COOKIE_PRIORITY_LOW
++        : r.priority == 2 ? net::COOKIE_PRIORITY_HIGH
++                          : net::COOKIE_PRIORITY_MEDIUM;
++    net::CookieSourceScheme scheme =
++        r.source_scheme == 2   ? net::CookieSourceScheme::kSecure
++        : r.source_scheme == 1 ? net::CookieSourceScheme::kNonSecure
++                               : net::CookieSourceScheme::kUnset;
++    std::unique_ptr<net::CanonicalCookie> cookie =
++        net::CanonicalCookie::FromStorage(
++            r.name, std::move(r.value), r.host_key, r.path, creation, expiry,
++            last_access, creation, r.secure, r.httponly, SameSite(r.samesite),
++            priority, std::nullopt, scheme, r.source_port,
++            net::CookieSourceType::kOther,
++            net::CanonicalCookieFromStorageCallSite::
++                kSqlitePersistentCookieStore);
++    if (cookie) {
++      cookies.push_back(std::move(*cookie));
++    } else {
++      ++failed;
++    }
++  }
++  return true;
++}
++
++struct ReadResult {
++  std::vector<net::CanonicalCookie> cookies;
++  ArcLoginsResult result;
++};
++
++ReadResult ReadArcCookies() {
++  ReadResult out;
++  std::vector<ArcProfile> profiles = FindArcProfiles();
++  if (profiles.empty()) {
++    out.result.error = "no-data";
++    return out;
++  }
++  std::string password = ArcPassword(&out.result.error);
++  if (password.empty()) {
++    if (out.result.error.empty()) {
++      out.result.error = "denied";
++    }
++    return out;
++  }
++  std::array<uint8_t, 16> key;
++  static constexpr char kSalt[] = "saltysalt";
++  bool derived = PKCS5_PBKDF2_HMAC_SHA1(
++      password.data(), password.size(),
++      reinterpret_cast<const uint8_t*>(kSalt), sizeof(kSalt) - 1, 1003,
++      key.size(), key.data());
++  OPENSSL_cleanse(password.data(), password.size());
++  if (!derived) {
++    out.result.error = "read";
++    return out;
++  }
++  std::set<std::tuple<std::string, std::string, std::string>> seen;
++  bool any = false;
++  for (const ArcProfile& p : profiles) {
++    any |= ReadProfile(p.db, key, seen, out.cookies, out.result.failed);
++  }
++  OPENSSL_cleanse(key.data(), key.size());
++  if (!any) {
++    out.result.error = "read";
++  }
++  return out;
++}
++
++// Counts what the cookie manager accepts, then reports.
++class Writer : public base::RefCounted<Writer> {
++ public:
++  Writer(ArcLoginsResult result,
++         base::OnceCallback<void(ArcLoginsResult)> done)
++      : result_(std::move(result)), done_(std::move(done)) {}
++
++  void Accepted(net::CookieAccessResult access) {
++    if (access.status.IsInclude()) {
++      ++result_.imported;
++    } else {
++      ++result_.failed;
++    }
++  }
++
++  void Finish() { std::move(done_).Run(result_); }
++
++ private:
++  friend class base::RefCounted<Writer>;
++  ~Writer() = default;
++
++  ArcLoginsResult result_;
++  base::OnceCallback<void(ArcLoginsResult)> done_;
++};
++
++void WriteCookies(base::WeakPtr<Profile> profile,
++                  base::OnceCallback<void(ArcLoginsResult)> done,
++                  ReadResult read) {
++  if (!profile || !read.result.error.empty() || read.cookies.empty()) {
++    if (read.result.error.empty() && read.cookies.empty()) {
++      read.result.error = "no-data";
++    }
++    std::move(done).Run(read.result);
++    return;
++  }
++  network::mojom::CookieManager* manager =
++      profile->GetDefaultStoragePartition()
++          ->GetCookieManagerForBrowserProcess();
++  auto writer =
++      base::MakeRefCounted<Writer>(std::move(read.result), std::move(done));
++  base::RepeatingClosure barrier = base::BarrierClosure(
++      read.cookies.size(), base::BindOnce(&Writer::Finish, writer));
++  for (net::CanonicalCookie& cookie : read.cookies) {
++    std::string host = cookie.DomainWithoutDot();
++    GURL source(std::string(cookie.SecureAttribute() ? url::kHttpsScheme
++                                                     : url::kHttpScheme) +
++                url::kStandardSchemeSeparator + host + cookie.Path());
++    manager->SetCanonicalCookie(
++        cookie, source, net::CookieOptions::MakeAllInclusive(),
++        base::BindOnce(
++            [](scoped_refptr<Writer> writer, base::RepeatingClosure barrier,
++               net::CookieAccessResult access) {
++              writer->Accepted(access);
++              barrier.Run();
++            },
++            writer, barrier));
++  }
++}
++
++}  // namespace
++
++bool ArcLoginsAvailable() {
++  return !FindArcProfiles().empty();
++}
++
++void ImportArcLogins(Profile* profile,
++                     base::OnceCallback<void(ArcLoginsResult)> done) {
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&ReadArcCookies),
++      base::BindOnce(&WriteCookies, profile->GetWeakPtr(), std::move(done)));
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/arc_logins.h b/chrome/browser/meridian/arc_logins.h
+new file mode 100644
+index 0000000000..3200f926e8
+--- /dev/null
++++ b/chrome/browser/meridian/arc_logins.h
+@@ -0,0 +1,53 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_ARC_LOGINS_H_
++#define CHROME_BROWSER_MERIDIAN_ARC_LOGINS_H_
++
++#include <string>
++
++#include "base/functional/callback.h"
++
++class Profile;
++
++namespace meridian {
++
++// Brings Arc's cookies (the sites you're signed in to) into this profile, so
++// you stay signed in. macOS only.
++//
++// Arc is Chromium: each profile folder in Arc's "User Data" has a Cookies
++// database whose values are encrypted with a key derived from the
++// "Arc Safe Storage" password in the login keychain:
++//   key   = PBKDF2-HMAC-SHA1(password, "saltysalt", 1003 iterations, 16 bytes)
++//   value = "v10" + AES-128-CBC(key, IV = 16 spaces)
++//   meta.version >= 24: the plaintext starts with SHA256(host_key), stripped.
++// Reading the password makes macOS ask the person first.
++//
++// Nothing leaves the machine and Arc is never written to: each database is
++// copied to a private temp folder, read, and the copy deleted. Cookie values
++// and the key are never logged. Arc's other profiles are folded into this one;
++// the first profile wins when two have the same cookie.
++struct ArcLoginsResult {
++  int imported = 0;
++  int failed = 0;
++  // Empty on success, else "no-data", "not-found" (no key in the keychain),
++  // "denied" (the person said no) or "read".
++  std::string error;
++};
++
++// Whether Arc's cookie databases are there (blocking: file IO).
++bool ArcLoginsAvailable();
++
++void ImportArcLogins(Profile* profile,
++                     base::OnceCallback<void(ArcLoginsResult)> done);
++
++namespace internal {
++// macOS: "Arc Safe Storage" from the login keychain (macOS asks first);
++// empty with `error` set if it isn't there or the person said no.
++std::string ReadArcKeychainPassword(std::string* error);
++}  // namespace internal
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_ARC_LOGINS_H_
+diff --git a/chrome/browser/meridian/arc_logins_mac.mm b/chrome/browser/meridian/arc_logins_mac.mm
+new file mode 100644
+index 0000000000..96439c6813
+--- /dev/null
++++ b/chrome/browser/meridian/arc_logins_mac.mm
+@@ -0,0 +1,28 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include <Security/Security.h>
++
++#include "chrome/browser/meridian/arc_logins.h"
++#include "crypto/apple/keychain_v2.h"
++#include "third_party/boringssl/src/include/openssl/mem.h"
++
++namespace meridian::internal {
++
++std::string ReadArcKeychainPassword(std::string* error) {
++  auto result = crypto::apple::KeychainV2::GetInstance().FindGenericPassword(
++      "Arc Safe Storage", "Arc");
++  if (!result.has_value()) {
++    *error = result.error() == errSecItemNotFound ? "not-found" : "denied";
++    return std::string();
++  }
++  std::string password(result->begin(), result->end());
++  OPENSSL_cleanse(result->data(), result->size());
++  if (password.empty()) {
++    *error = "denied";
++  }
++  return password;
++}
++
++}  // namespace meridian::internal
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 533dbfaf2f..003e85ea7b 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -80,6 +80,8 @@ struct ArcPreview {
+   int32 favorite_count;
+   // The first few spaces: name, icon and colour only.
+   array<Space> spaces;
++  // Arc's cookies are there to bring over (ImportArcLogins).
++  bool logins_available;
+ };
+ 
+ // Where an item goes. `container` is a space id, or "favorites".
+@@ -190,6 +192,10 @@ interface SidebarHandler {
+   // Brings Arc's spaces, pinned tabs, folders and favorites in; Arc's open
+   // tabs come in as Today tabs that load when first opened.
+   ImportArc() => (bool ok);
++  // Arc's sign-ins (cookies). macOS asks the person before Meridian may read
++  // Arc's key, so the page says so first. `error`: empty, "no-data",
++  // "not-found", "denied" or "read".
++  ImportArcLogins() => (int32 imported, string error);
+ 
+   // Turns a Peek into an ordinary Today tab.
+   ExpandPeek(tabs_api.mojom.NodeId tab_id);
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 05dd984dd9..9b555fe9b9 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -15,6 +15,7 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/meridian/arc_logins.h"
+ #include "chrome/browser/meridian/little_window.h"
+ #include "chrome/browser/ui/browser_tabrestore.h"
+ #include "components/sessions/core/serialized_navigation_entry.h"
+@@ -388,9 +389,13 @@ void SidebarHandler::OpenInMeridian() {
+ void SidebarHandler::GetArcPreview(GetArcPreviewCallback callback) {
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+-      base::BindOnce(&ReadArcSidebar),
++      base::BindOnce([] {
++        return std::make_pair(ReadArcSidebar(), ArcLoginsAvailable());
++      }),
+       base::BindOnce(
+-          [](GetArcPreviewCallback callback, std::optional<ArcSidebar> arc) {
++          [](GetArcPreviewCallback callback,
++             std::pair<std::optional<ArcSidebar>, bool> read) {
++            std::optional<ArcSidebar>& arc = read.first;
+             if (!arc || arc->spaces.empty()) {
+               std::move(callback).Run(nullptr);
+               return;
+@@ -398,6 +403,7 @@ void SidebarHandler::GetArcPreview(GetArcPreviewCallback callback) {
+             auto preview = mojom::ArcPreview::New();
+             preview->space_count = arc->spaces.size();
+             preview->favorite_count = arc->favorites.size();
++            preview->logins_available = read.second;
+             std::function<int(const std::vector<Item>&)> count =
+                 [&](const std::vector<Item>& items) {
+                   int n = 0;
+@@ -432,6 +438,16 @@ void SidebarHandler::ImportArc(ImportArcCallback callback) {
+                      std::move(callback)));
+ }
+ 
++void SidebarHandler::ImportArcLogins(ImportArcLoginsCallback callback) {
++  meridian::ImportArcLogins(
++      browser_->GetProfile(),
++      base::BindOnce(
++          [](ImportArcLoginsCallback callback, ArcLoginsResult result) {
++            std::move(callback).Run(result.imported, result.error);
++          },
++          std::move(callback)));
++}
++
+ void SidebarHandler::OnArcRead(ImportArcCallback callback,
+                                std::optional<ArcSidebar> arc) {
+   if (!arc || arc->spaces.empty()) {
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 0eaba0deb6..0d5a7e6694 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -97,6 +97,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void OpenInMeridian() override;
+   void GetArcPreview(GetArcPreviewCallback callback) override;
+   void ImportArc(ImportArcCallback callback) override;
++  void ImportArcLogins(ImportArcLoginsCallback callback) override;
+   void ExpandPeek(const tabs_api::NodeId& tab_id) override;
+ 
+   // ArchiveService::Observer:

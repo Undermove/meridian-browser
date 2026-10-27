@@ -7,6 +7,8 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { launch, SB } from './harness.mjs';
 
 const ARC = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures/arc');
@@ -44,4 +46,55 @@ test('Arc import: preview, then spaces, pins, folders, favorites and Today', asy
     for (let i = 0; i < 50 && !hits.includes('/hn'); i++) await new Promise((r) => setTimeout(r, 100));
     assert.ok(hits.includes('/hn'), 'an Arc tab loads when opened');
   } finally { await b.close(); server.close(); fs.rmSync(arcDir, { recursive: true, force: true }); }
+});
+
+// A fake Arc profile's Cookies database, encrypted the way Arc (Chromium on macOS) does it.
+function writeArcCookies(dir, password, rows) {
+  fs.mkdirSync(path.join(dir, 'Network'), { recursive: true });
+  const db = new DatabaseSync(path.join(dir, 'Network', 'Cookies'));
+  db.exec(`CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT); INSERT INTO meta VALUES('version', '24');
+    CREATE TABLE cookies(creation_utc INTEGER, host_key TEXT, top_frame_site_key TEXT, name TEXT, value TEXT,
+      encrypted_value BLOB, path TEXT, expires_utc INTEGER, is_secure INTEGER, is_httponly INTEGER,
+      last_access_utc INTEGER, has_expires INTEGER, is_persistent INTEGER, priority INTEGER, samesite INTEGER,
+      source_scheme INTEGER, source_port INTEGER)`);
+  const key = crypto.pbkdf2Sync(password, 'saltysalt', 1003, 16, 'sha1');
+  const toChrome = (ms) => BigInt(ms) * 1000n + 11644473600000000n;
+  const insert = db.prepare('INSERT INTO cookies VALUES (?, ?, \'\', ?, \'\', ?, \'/\', ?, 0, 0, ?, 1, 1, 1, 1, 1, ?)');
+  for (const r of rows) {
+    const c = crypto.createCipheriv('aes-128-cbc', key, Buffer.alloc(16, 0x20));
+    const plain = Buffer.concat([crypto.createHash('sha256').update(r.host).digest(), Buffer.from(r.value)]);
+    const enc = Buffer.concat([Buffer.from('v10'), c.update(plain), c.final()]);
+    insert.run(toChrome(Date.now() - 1000), r.host, r.name, enc, toChrome(r.expires ?? Date.now() + 86400000), toChrome(Date.now()), r.port);
+  }
+  db.close();
+}
+
+test('Arc logins: cookies come over, so sites stay signed in; Deny imports nothing', async () => {
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(`<title>cookie:${req.headers.cookie || ''}</title>`); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+  const arcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-arc-'));
+  fs.copyFileSync(path.join(ARC, 'StorableSidebar.json'), path.join(arcDir, 'StorableSidebar.json'));
+  writeArcCookies(path.join(arcDir, 'User Data', 'Default'), 'test-pass', [
+    { host: '127.0.0.1', name: 'sid', value: 'signed-in', port },
+    { host: '127.0.0.1', name: 'old', value: 'expired', port, expires: Date.now() - 1000 },
+  ]);
+  // Another Arc profile with the same cookie: the first profile's wins.
+  writeArcCookies(path.join(arcDir, 'User Data', 'Profile 2'), 'test-pass', [{ host: '127.0.0.1', name: 'sid', value: 'other', port }]);
+  try {
+    let b = await launch(['about:blank'], { args: [`--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=__deny__'] });
+    try {
+      await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+      assert.equal((await b.eval(`${H}.getArcPreview()`)).preview.loginsAvailable, true);
+      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 0, error: 'denied' });
+    } finally { await b.close(); }
+
+    b = await launch(['about:blank'], { args: [`--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=test-pass'] });
+    try {
+      await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 1, error: '' });
+      await b.eval(`app.$.tabstrip.tabStripService_.createTabAt(null, 'http://127.0.0.1:${port}/')`);
+      await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'cookie:sid=signed-in')`);
+    } finally { await b.close(); }
+  } finally { server.close(); fs.rmSync(arcDir, { recursive: true, force: true }); }
 });

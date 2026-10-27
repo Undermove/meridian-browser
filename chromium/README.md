@@ -48,7 +48,8 @@ commit on the `meridian` branch, run `build.sh`, then `export.sh` and commit `pa
 - [x] Restore last session by default, loading indicators, link status bubble
 - [x] Little window for links from other apps (Open in Meridian)
 - [x] Air Traffic Control (rules; editor comes with Settings)
-- [ ] private window theme, swipe, settings, home, ad blocking, Arc import, Electron migration
+- [x] Import from Arc: spaces, pins, folders, favorites, open tabs (lazy), sign-ins (cookies)
+- [ ] Onboarding, private window theme, swipe, settings, home, ad blocking, Electron migration
 - [ ] MCP server, AI (Ask/chat/keys/vault), local agents, Mission Control, Workbench, sandboxes, hubs
 - [ ] Updater, packaging, signing
 - [ ] Windows and Linux builds
