@@ -59,6 +59,7 @@ commit on the `meridian` branch, run `build.sh`, then `export.sh` and commit `pa
 - [x] AI: Claude API key (encrypted), Ask panel ⌘J with page context and browser tools, quick answers in ⌘T
 - [x] Other AIs for Ask: Ollama, LM Studio, API keys (OpenAI, Gemini, OpenRouter, xAI, Mistral, DeepSeek, Groq) with a model picker, and agent CLIs (Codex, Copilot, Cursor, OpenCode, Qwen Code, Amp, Goose, Droid) behind "Other agents"
 - [x] Tidy Today, link previews (⇧ over a link), Chat view (⌥⌘J) with saved chats
-- [ ] Mission Control, Workbench, sandboxes, hubs
+- [x] Workbench (⇧⌘E, chrome://workbench): project files, Monaco, terminals on a pty, coding agents with Meridian's browser tools
+- [ ] Workbench Pro (vault, secret guard, sandboxes, customizations, hubs), Mission Control
 - [ ] Updater, packaging, signing
 - [ ] Windows and Linux builds

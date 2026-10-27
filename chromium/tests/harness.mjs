@@ -81,6 +81,28 @@ export async function launch(urls = [], { profile: keep, args = [] } = {}) {
         };
       }));
     },
+    // A tab's page (the first target whose URL starts with `prefix`), with eval/waitFor/cdp/close.
+    async page(prefix, timeout = 15000) {
+      const end = Date.now() + timeout;
+      let t;
+      while (!t && Date.now() < end) {
+        try { t = (await (await fetch(`${base}/json/list`)).json()).find((x) => x.type === 'page' && x.url.startsWith(prefix)); } catch {}
+        if (!t) await sleep(150);
+      }
+      if (!t) throw new Error(`no page at ${prefix}`);
+      const c = await new Cdp(t.webSocketDebuggerUrl).open();
+      const p = {
+        cdp: c,
+        eval: (expr) => evalUi(c, expr),
+        async waitFor(expr, ms = 10000) {
+          const stop = Date.now() + ms; let last;
+          while (Date.now() < stop) { try { last = await p.eval(expr); if (last) return last; } catch (e) { last = e.message; } await sleep(100); }
+          throw new Error(`timed out waiting for: ${expr} (last: ${JSON.stringify(last)})`);
+        },
+        close: () => c.close(),
+      };
+      return p;
+    },
     async waitFor(expr, timeout = 10000) {
       const end = Date.now() + timeout; let last;
       // A DOM node can't be returned by value; it just means "found".
