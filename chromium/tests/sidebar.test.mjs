@@ -69,3 +69,33 @@ test('a loading page pulses its row and runs a bar along the URL pill', async ()
     await b.waitFor(`!app.shadowRoot.getElementById('urlPill').classList.contains('loading')`);
   } finally { await b.close(); server.close(); }
 });
+
+test('hovering a link shows its address at the bottom of the page', async () => {
+  const http = await import('node:http');
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<title>Links</title><a href="https://example.org/some/where" style="display:block;font-size:80px;padding:60px">a link</a>');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const b = await launch([`http://127.0.0.1:${server.address().port}/links`]);
+  try {
+    await b.waitFor(`${tabEl(0)}?.tab.title === 'Links'`);
+    // The pointer over the page itself (the tab's own DevTools target): the
+    // UI target's input never reaches guest pages.
+    const t = (await (await fetch(`${b.base}/json/list`)).json()).find((x) => x.type === 'page' && x.url.endsWith('/links'));
+    const ws = new WebSocket(t.webSocketDebuggerUrl);
+    await new Promise((r) => ws.onopen = r);
+    let id = 0;
+    const move = (x, y) => ws.send(JSON.stringify({ id: ++id, method: 'Input.dispatchMouseEvent', params: { type: 'mouseMoved', x, y } }));
+    const bubble = `app.shadowRoot.getElementById('statusBubble')`;
+    // Keep moving until the page has laid out and reports the link.
+    for (let i = 0; i < 20 && !(await b.eval(`${bubble}.textContent.includes('example.org/some/where')`)); i++) {
+      move(100 + i, 100);
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    await b.waitFor(`!${bubble}.hidden && ${bubble}.textContent.includes('example.org/some/where')`);
+    move(700, 550);
+    await b.waitFor(`${bubble}.hidden`);
+    ws.close();
+  } finally { await b.close(); server.close(); }
+});

@@ -35,6 +35,8 @@ export async function launch(urls = [], { profile: keep, args = [] } = {}) {
   const proc = spawn(APP, [
     `--user-data-dir=${profile}`, `--remote-debugging-port=${port}`, '--use-mock-keychain',
     '--no-first-run', '--no-default-browser-check', '--window-size=1280,860',
+    // Keep drawing when the window is covered or the display sleeps (input waits for frames).
+    '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
     ...args, ...urls,
   ], { stdio: 'ignore' });
   const base = `http://127.0.0.1:${port}`;
@@ -82,7 +84,7 @@ export async function launch(urls = [], { profile: keep, args = [] } = {}) {
     },
     // Opens a row's context menu and picks an entry by its label.
     async menu(elExpr, label) {
-      const r = await b.waitFor(`(() => { const el = ${elExpr}; if (!el) return null; const r = el.getBoundingClientRect(); return r.width ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null; })()`);
+      const r = await b.point(elExpr);
       await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: r.x, y: r.y, button: 'none' });
       await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: r.x, y: r.y, button: 'right', clickCount: 1 });
       await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: r.x, y: r.y, button: 'right', clickCount: 1 });
@@ -124,8 +126,20 @@ export async function launch(urls = [], { profile: keep, args = [] } = {}) {
       await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: keyCode });
     },
     // A real mouse click at the centre of an element found by a JS expression in the UI page.
+    // The centre of an element once it has stopped moving (menus place themselves after opening).
+    async point(elExpr) {
+      const at = () => b.waitFor(`(() => { const el = ${elExpr}; if (!el) return null; const r = el.getBoundingClientRect(); return r.width ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null; })()`);
+      let r = await at();
+      for (let i = 0; i < 20; i++) {
+        await sleep(50);
+        const next = await at();
+        if (next.x === r.x && next.y === r.y) return r;
+        r = next;
+      }
+      return r;
+    },
     async click(elExpr, { button = 'left' } = {}) {
-      const r = await b.waitFor(`(() => { const el = ${elExpr}; if (!el) return null; const r = el.getBoundingClientRect(); return r.width ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null; })()`);
+      const r = await b.point(elExpr);
       for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
         await cdp.send('Input.dispatchMouseEvent', { type, x: r.x, y: r.y, button: type === 'mouseMoved' ? 'none' : button, clickCount: 1 });
       }

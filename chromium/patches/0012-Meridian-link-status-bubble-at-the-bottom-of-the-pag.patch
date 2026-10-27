@@ -1,0 +1,434 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 27 Oct 2026 17:27:53 +0400
+Subject: [PATCH 13/13] Meridian: link status bubble at the bottom of the page
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |  4 ++
+ chrome/browser/meridian/sidebar.mojom         |  3 +
+ chrome/browser/meridian/sidebar_handler.cc    |  9 +++
+ chrome/browser/meridian/sidebar_handler.h     |  4 ++
+ chrome/browser/meridian/status_bubble.cc      | 55 +++++++++++++++++++
+ chrome/browser/meridian/status_bubble.h       | 44 +++++++++++++++
+ .../browser/resources/webui_browser/app.css   | 24 ++++++++
+ .../resources/webui_browser/app.html.ts       |  4 +-
+ chrome/browser/resources/webui_browser/app.ts |  6 ++
+ .../webui_browser/meridian/sidebar.ts         |  5 +-
+ .../ui/browser_web_contents_delegate/BUILD.gn |  1 +
+ .../browser_web_contents_delegate.cc          | 22 ++++++++
+ .../ui/webui_browser/webui_browser_window.cc  |  8 ++-
+ .../ui/webui_browser/webui_browser_window.h   |  1 +
+ 14 files changed, 186 insertions(+), 4 deletions(-)
+ create mode 100644 chrome/browser/meridian/status_bubble.cc
+ create mode 100644 chrome/browser/meridian/status_bubble.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 93f24c8f38..0b4c933048 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -37,6 +37,8 @@ source_set("meridian") {
+     "sidebar_handler.h",
+     "sidebar_service_factory.cc",
+     "sidebar_service_factory.h",
++    "status_bubble.cc",
++    "status_bubble.h",
+     "tab_data.cc",
+     "tab_data.h",
+   ]
+@@ -57,6 +59,7 @@ source_set("meridian") {
+     "//chrome/app:command_ids",
+     "//chrome/browser/profiles:profile",
+     "//chrome/browser/sessions",
++    "//chrome/browser/ui:status_bubble",
+     "//chrome/browser/ui/navigator",
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/tabs",
+@@ -66,6 +69,7 @@ source_set("meridian") {
+     "//components/sessions",
+     "//components/split_tabs",
+     "//components/tabs:public",
++    "//components/url_formatter",
+     "//net",
+     "//ui/base",
+     "//ui/gfx",
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 13fe893a00..55c1efc6b5 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -115,6 +115,9 @@ interface SidebarPage {
+ 
+   // Something was archived or restored.
+   OnArchiveChanged();
++
++  // The link under the pointer, or the page's status; empty hides it.
++  SetStatusText(string text);
+ };
+ 
+ interface SidebarHandler {
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 9bd2686abc..37e721e2dc 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -185,6 +185,15 @@ void SidebarHandler::Adopt(tabs::TabInterface* tab) {
+   TabData::Set(contents, service_->active_space_id(), std::string());
+ }
+ 
++// static
++void SidebarHandler::SetStatusText(BrowserWindowInterface* browser,
++                                   const std::string& text) {
++  auto it = Handlers().find(browser);
++  if (it != Handlers().end() && it->second->page_.is_connected()) {
++    it->second->page_->SetStatusText(text);
++  }
++}
++
+ // static
+ bool SidebarHandler::HandleCommand(BrowserWindowInterface* browser,
+                                    int id) {
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index cfa9f3ae15..742a04569b 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -50,6 +50,10 @@ class SidebarHandler : public mojom::SidebarHandler,
+   // Meridian sidebar.
+   static bool HandleCommand(BrowserWindowInterface* browser, int command_id);
+ 
++  // Shows `text` at the bottom of `browser`'s page (StatusBubble).
++  static void SetStatusText(BrowserWindowInterface* browser,
++                            const std::string& text);
++
+   // mojom::SidebarHandler:
+   void GetState(GetStateCallback callback) override;
+   void CreateSpace(const std::string& name,
+diff --git a/chrome/browser/meridian/status_bubble.cc b/chrome/browser/meridian/status_bubble.cc
+new file mode 100644
+index 0000000000..51df447298
+--- /dev/null
++++ b/chrome/browser/meridian/status_bubble.cc
+@@ -0,0 +1,55 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/status_bubble.h"
++
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/meridian/sidebar_handler.h"
++#include "components/url_formatter/url_formatter.h"
++
++namespace meridian {
++
++StatusBubble::StatusBubble(BrowserWindowInterface* browser)
++    : browser_(browser) {}
++
++StatusBubble::~StatusBubble() = default;
++
++void StatusBubble::SetStatus(const std::u16string& status) {
++  status_ = status;
++  Show();
++}
++
++void StatusBubble::SetURL(const GURL& url) {
++  url_text_ = url.is_empty() ? std::u16string()
++                             : url_formatter::FormatUrl(
++                                   url, url_formatter::kFormatUrlOmitDefaults,
++                                   base::UnescapeRule::SPACES, nullptr,
++                                   nullptr, nullptr);
++  Show();
++}
++
++void StatusBubble::Hide() {
++  status_.clear();
++  url_text_.clear();
++  Show();
++}
++
++void StatusBubble::MouseMoved(bool left_content) {
++  if (left_content) {
++    url_text_.clear();
++    Show();
++  }
++}
++
++void StatusBubble::Show() {
++  // A hovered link wins over the page's status text, like Chrome.
++  const std::u16string& text = url_text_.empty() ? status_ : url_text_;
++  if (text == shown_) {
++    return;
++  }
++  shown_ = text;
++  SidebarHandler::SetStatusText(browser_, base::UTF16ToUTF8(text));
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/status_bubble.h b/chrome/browser/meridian/status_bubble.h
+new file mode 100644
+index 0000000000..82045ebc35
+--- /dev/null
++++ b/chrome/browser/meridian/status_bubble.h
+@@ -0,0 +1,44 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_STATUS_BUBBLE_H_
++#define CHROME_BROWSER_MERIDIAN_STATUS_BUBBLE_H_
++
++#include <string>
++
++#include "base/memory/raw_ptr.h"
++#include "chrome/browser/ui/status_bubble.h"
++#include "url/gurl.h"
++
++class BrowserWindowInterface;
++
++namespace meridian {
++
++// The link-hover / status text at the bottom of the page, drawn by the
++// Meridian UI (the WebUI browser has no views status bubble).
++class StatusBubble : public ::StatusBubble {
++ public:
++  explicit StatusBubble(BrowserWindowInterface* browser);
++  StatusBubble(const StatusBubble&) = delete;
++  StatusBubble& operator=(const StatusBubble&) = delete;
++  ~StatusBubble() override;
++
++  // ::StatusBubble:
++  void SetStatus(const std::u16string& status) override;
++  void SetURL(const GURL& url) override;
++  void Hide() override;
++  void MouseMoved(bool left_content) override;
++
++ private:
++  void Show();
++
++  raw_ptr<BrowserWindowInterface> browser_;
++  std::u16string status_;
++  std::u16string url_text_;
++  std::u16string shown_;
++};
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_STATUS_BUBBLE_H_
+diff --git a/chrome/browser/resources/webui_browser/app.css b/chrome/browser/resources/webui_browser/app.css
+index 1258be062c..4079bf5c1a 100644
+--- a/chrome/browser/resources/webui_browser/app.css
++++ b/chrome/browser/resources/webui_browser/app.css
+@@ -232,6 +232,7 @@ meridian-sidebar {
+ }
+ 
+ #main {
++  position: relative;
+   flex: 1;
+   min-width: 0;
+   display: flex;
+@@ -307,3 +308,26 @@ cr-icon-button[hidden] {
+ :host([sidebar-hidden]:not([sidebar-peek])) #sidebar {
+   pointer-events: none;
+ }
++
++/* The hovered link's address, bottom left of the page (status bubble). */
++#statusBubble {
++  position: absolute;
++  left: calc(var(--meridian-gap) + 6px);
++  bottom: calc(var(--meridian-gap) + 6px);
++  max-width: 60%;
++  padding: 3px 8px;
++  border-radius: 6px;
++  background: color-mix(in srgb, var(--meridian-surface) 92%, transparent);
++  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18), 0 0 0 0.5px var(--meridian-border);
++  color: var(--meridian-text);
++  font-size: 12px;
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  pointer-events: none;
++  z-index: 10;
++}
++
++#statusBubble[hidden] {
++  display: none;
++}
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index eea0032f61..0cefe96121 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -63,7 +63,8 @@ export function getHtml(this: WebuiBrowserAppElement) {
+         @meridian-toggle-sidebar="${this.onMeridianToggleSidebar_}"
+         @meridian-splits-changed="${this.onMeridianSplitsChanged_}"
+         @meridian-show-archive="${this.onMeridianShowArchive_}"
+-        @meridian-peeks-changed="${this.onMeridianPeeksChanged_}">
++        @meridian-peeks-changed="${this.onMeridianPeeksChanged_}"
++        @meridian-status="${this.onMeridianStatus_}">
+       <cr-icon-button slot="bottom-start" id="appMenuButton"
+           iron-icon="cr:more-vert" title="$i18n{appMenuTooltip}"
+           @click="${this.onAppMenuClick_}">
+@@ -90,6 +91,7 @@ export function getHtml(this: WebuiBrowserAppElement) {
+     </content-region>
+     <side-panel id="sidePanel" @side-panel-closed="${this.onSidePanelClosed_}">
+     </side-panel>
++    <div id="statusBubble" ?hidden="${!this.statusText_}">${this.statusText_}</div>
+   </div>
+ </div>
+ 
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 847c5afe00..1eaeeabcd5 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -102,6 +102,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       locationIcon_: {state: true, type: String},
+       tabStripInset_: {state: true, type: Number},
+       urlHost_: {state: true, type: String},
++      statusText_: {state: true, type: String},
+       sidebarHidden_: {type: Boolean, reflect: true, attribute: 'sidebar-hidden'},
+       sidebarPeek_: {type: Boolean, reflect: true, attribute: 'sidebar-peek'},
+       inactive_: {
+@@ -129,6 +130,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   // The active tab's URL, and what the sidebar's URL pill shows of it.
+   private url_: string = '';
+   protected accessor urlHost_: string = '';
++  protected accessor statusText_: string = '';
+   // ⌘S hides the sidebar; it slides back over the page from the window edge.
+   protected accessor sidebarHidden_: boolean = readSidebarHidden();
+   protected accessor sidebarPeek_: boolean = false;
+@@ -471,6 +473,10 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.$.tabstrip.activateTab(e.detail);
+   }
+ 
++  protected onMeridianStatus_(e: CustomEvent<string>) {
++    this.statusText_ = e.detail;
++  }
++
+   protected onMeridianShowArchive_() {
+     this.$.archive.show();
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 28a1de0f40..2ae5b70560 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -106,6 +106,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+   private listenerId_: number|null = null;
+   private commandBarListenerId_: number|null = null;
+   private commandListenerId_: number|null = null;
++  private statusListenerId_: number|null = null;
+ 
+   constructor() {
+     super();
+@@ -117,6 +118,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.commandBarListenerId_ =
+         proxy.callbackRouter.showCommandBar.addListener(
+             () => this.fire('meridian-show-command-bar'));
++    this.statusListenerId_ = proxy.callbackRouter.setStatusText.addListener(
++        (text: string) => this.fire('meridian-status', text));
+     this.commandListenerId_ = proxy.callbackRouter.runCommand.addListener(
+         (command: Command, arg: number) => this.runCommand(command, arg));
+   }
+@@ -138,7 +141,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+     super.disconnectedCallback();
+     this.observation_ = undefined;
+     for (const id of [this.listenerId_, this.commandBarListenerId_,
+-                      this.commandListenerId_]) {
++                      this.commandListenerId_, this.statusListenerId_]) {
+       if (id !== null) {
+         sidebarProxyFactory.getInstance().callbackRouter.removeListener(id);
+       }
+diff --git a/chrome/browser/ui/browser_web_contents_delegate/BUILD.gn b/chrome/browser/ui/browser_web_contents_delegate/BUILD.gn
+index 7dbf9fb2fd..e57acd0095 100644
+--- a/chrome/browser/ui/browser_web_contents_delegate/BUILD.gn
++++ b/chrome/browser/ui/browser_web_contents_delegate/BUILD.gn
+@@ -12,6 +12,7 @@ if (!is_android) {
+       "browser_web_contents_delegate.h",
+     ]
+     deps = [
++      "//chrome/browser/ui/webui_browser:headers",
+       "//base",
+       "//chrome/browser:file_select_helper",
+       "//chrome/browser:repost_form_warning_controller",
+diff --git a/chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.cc b/chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.cc
+index e4d0061b0e..2b2bd2b172 100644
+--- a/chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.cc
++++ b/chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.cc
+@@ -2,6 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include "chrome/browser/ui/webui_browser/webui_browser.h"
+ #include "chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.h"
+ 
+ #include "base/check_deref.h"
+@@ -843,6 +844,16 @@ void BrowserWebContentsDelegate::UpdateTargetURL(content::WebContents* source,
+                                                  const GURL& url) {
+   std::vector<StatusBubble*> status_bubbles =
+       browser_ui_controller_->GetStatusBubbles();
++  // Meridian: the WebUI browser's status bubble is not a StatusBubbleViews;
++  // it shows the active tab's link.
++  if (webui_browser::IsWebUIBrowserEnabled()) {
++    if (source == browser_->GetTabStripModel()->GetActiveWebContents()) {
++      for (StatusBubble* status_bubble : status_bubbles) {
++        status_bubble->SetURL(url);
++      }
++    }
++    return;
++  }
+   for (StatusBubble* status_bubble : status_bubbles) {
+     StatusBubbleViews* status_bubble_views =
+         static_cast<StatusBubbleViews*>(status_bubble);
+@@ -870,6 +881,17 @@ void BrowserWebContentsDelegate::ContentsMouseEvent(
+   // Mouse motion events update the status bubble, if it exists.
+   std::vector<StatusBubble*> status_bubbles =
+       browser_ui_controller_->GetStatusBubbles();
++  if (webui_browser::IsWebUIBrowserEnabled()) {  // Meridian: see above.
++    if (type == ui::EventType::kMouseMoved || exited) {
++      for (StatusBubble* status_bubble : status_bubbles) {
++        status_bubble->MouseMoved(exited);
++        if (exited) {
++          status_bubble->SetURL(GURL());
++        }
++      }
++    }
++    return;
++  }
+   for (StatusBubble* status_bubble : status_bubbles) {
+     StatusBubbleViews* status_bubble_views =
+         static_cast<StatusBubbleViews*>(status_bubble);
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index c74deffe6e..cdb580c47e 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -2,6 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include "chrome/browser/meridian/status_bubble.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser_window.h"
+ 
+ #include "base/check.h"
+@@ -754,8 +755,11 @@ void WebUIBrowserWindow::SetTopControlsGestureScrollInProgress(
+ }
+ 
+ std::vector<StatusBubble*> WebUIBrowserWindow::GetStatusBubbles() {
+-  NOTIMPLEMENTED_LOG_ONCE();
+-  return {};
++  // Meridian draws it in the page (meridian::StatusBubble).
++  if (!status_bubble_) {
++    status_bubble_ = std::make_unique<meridian::StatusBubble>(browser());
++  }
++  return {status_bubble_.get()};
+ }
+ 
+ void WebUIBrowserWindow::UpdateTitleBar() {
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.h b/chrome/browser/ui/webui_browser/webui_browser_window.h
+index 28d3177f68..d4a5cbd25f 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.h
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.h
+@@ -293,6 +293,7 @@ class WebUIBrowserWindow : public BrowserWindow,
+   std::unique_ptr<views::Widget> widget_;
+   raw_ptr<views::WebView> web_view_ = nullptr;
+   std::unique_ptr<WebUIStubLocationBar> location_bar_;
++  std::unique_ptr<StatusBubble> status_bubble_;
+ 
+   // A mapping between accelerators and Chrome command IDs as defined in
+   // //chrome/app/chrome_command_ids.h.

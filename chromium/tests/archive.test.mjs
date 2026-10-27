@@ -32,13 +32,14 @@ test('a closed tab lands in the archive; the archive searches and reopens it', a
 test('Today tabs left alone past the archive time are archived; pinned and active ones stay', async () => {
   const site = await startServer();
   const b = await launch([site.url('/p/Active'), site.url('/p/Stale'), site.url('/p/Pinned')],
-                         { args: ['--meridian-archive-after-seconds=3'] });
+                         { args: ['--meridian-archive-after-seconds=8'] });
   try {
     await b.waitFor(today(3));
-    const space = (await b.state()).spaces[0].name;
-    await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Pinned')`, `Pin to ${space}`);
-    await b.click(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Active')`);
-    await b.waitFor(today(1), 20000);
+    // Pinning has to happen before the tabs go stale, so through the model (the
+    // menu and clicks have their own tests; mouse input can lag while the screen sleeps).
+    await b.eval(`(() => { const s = app.$.tabstrip; const row = [...${SB}.querySelectorAll('meridian-tab-row')]; s.handler_.pinTab(row.find((r) => r.tab.title === 'Pinned').tab.id, { container: s.state_.activeSpaceId, parentId: '', index: 0 }); s.tabStripService_.activateTab(row.find((r) => r.tab.title === 'Active').tab.id); })()`);
+    await b.waitFor(today(2));
+    await b.waitFor(today(1), 30000);
     assert.equal((await b.tabs())[0].title, 'Active');
     assert.equal((await b.pinned())[0].loaded, true, 'the pinned tab stays open');
     await b.eval(`app.$.tabstrip.runCommand(${C.showArchive}, 0)`);

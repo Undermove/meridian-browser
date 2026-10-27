@@ -88,7 +88,7 @@ test('folders hold pins; favorites are shared by every space', async () => {
     await b.click(`${SB}.getElementById('addSpace')`);
     await b.waitFor(`${SB}.querySelector('.space-header input.rename')`);
     await b.key('Escape', 'Escape', 27);
-    await b.waitFor(`app.$.tabstrip.state_.spaces.length === 2`);
+    await b.waitFor(`app.$.tabstrip.state_.spaces.length === 2 && app.$.tabstrip.state_.activeSpaceId === app.$.tabstrip.state_.spaces[1].id`);
     assert.equal((await b.favorites()).length, 1, 'favorites are there in the new space too');
     // Opening the favorite doesn't switch back to the first space.
     const before = (await b.state()).active;

@@ -41,6 +41,12 @@ commit on the `meridian` branch, run `build.sh`, then `export.sh` and commit `pa
 - [x] WebUI browser on by default, sidebar layout: address field, vertical tabs, page as a card
 - [x] Meridian name, icon, bundle id, keychain item, strings in 81 languages
 - [x] Spaces, pinned tabs, folders, favorites, Today (C++ SidebarService + sidebar UI), survive restart
-- [ ] Spaces, pinned tabs, command bar, split view, Mission Control, MCP, vault: port from `src/renderer`
-- [ ] Tab drag reordering in the vertical list (the stock drag delegate is horizontal)
+- [x] Command bar (⌘T / ⌘L / New Tab / URL pill) on the omnibox
+- [x] Keyboard: tabs and spaces through the sidebar order, ⌘D pin, ⌘S hide sidebar (edge reveal, traffic lights hide), Spaces menu
+- [x] Drag and drop in the sidebar (pin, reorder, folders, favorites, Today, other spaces)
+- [x] Split view (Chromium split tabs), Peek, archive (auto-archive + ⌥⌘A + Clear Today)
+- [x] Restore last session by default, loading indicators, link status bubble
+- [ ] Little window, Air Traffic Control, private window theme, swipe, settings, home, ad blocking, Arc import, Electron migration
+- [ ] MCP server, AI (Ask/chat/keys/vault), local agents, Mission Control, Workbench, sandboxes, hubs
+- [ ] Updater, packaging, signing
 - [ ] Windows and Linux builds
