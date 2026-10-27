@@ -87,6 +87,34 @@ export async function launch(urls = [], { profile: keep } = {}) {
       await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: r.x, y: r.y, button: 'right', clickCount: 1 });
       await b.click(`[...${SB}.querySelectorAll('#menu .menu-item')].find((m) => m.textContent.trim() === ${JSON.stringify(label)})`);
     },
+    // A real mouse drag from one element to a point in another (fraction fx/fy of its box), through
+    // Chromium's drag and drop: intercept the drag the press-and-move starts, then replay it as drag events.
+    async drag(fromExpr, toExpr, { fx = 0.5, fy = 0.5 } = {}) {
+      const box = (expr) => b.waitFor(`(() => { const el = ${expr}; if (!el) return null; const r = el.getBoundingClientRect(); return r.width ? { x: r.x, y: r.y, w: r.width, h: r.height } : null; })()`);
+      const a = await box(fromExpr);
+      const from = { x: a.x + a.w / 2, y: a.y + a.h / 2 };
+      await cdp.send('Input.setInterceptDrags', { enabled: true });
+      const intercepted = new Promise((resolve) => {
+        const on = (e) => { const m = JSON.parse(e.data); if (m.method === 'Input.dragIntercepted') { cdp.ws.removeEventListener('message', on); resolve(m.params.data); } };
+        cdp.ws.addEventListener('message', on);
+      });
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y });
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', clickCount: 1 });
+      for (let i = 1; i <= 3; i++) {
+        await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y + i * 4, button: 'left', buttons: 1 });
+      }
+      const data = await Promise.race([intercepted, sleep(3000).then(() => null)]);
+      if (!data) throw new Error('the drag never started');
+      await cdp.send('Input.dispatchDragEvent', { type: 'dragEnter', x: from.x, y: from.y + 12, data });
+      await sleep(50);  // drop zones that open on dragstart
+      const z = await box(toExpr);
+      const to = { x: z.x + z.w * fx, y: z.y + z.h * fy };
+      for (const type of ['dragOver', 'drop']) {
+        await cdp.send('Input.dispatchDragEvent', { type, x: to.x, y: to.y, data });
+      }
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', clickCount: 1 });
+      await cdp.send('Input.setInterceptDrags', { enabled: false });
+    },
     async type(text) {
       await cdp.send('Input.insertText', { text });
     },

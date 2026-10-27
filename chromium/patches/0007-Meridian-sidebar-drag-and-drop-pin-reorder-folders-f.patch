@@ -1,0 +1,424 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 27 Oct 2026 13:01:54 +0400
+Subject: [PATCH 8/8] Meridian: sidebar drag and drop (pin, reorder, folders,
+ favorites, Today, other spaces)
+
+---
+ .../webui_browser/meridian/fav.html.ts        |   3 +-
+ .../webui_browser/meridian/item.html.ts       |   9 +-
+ .../resources/webui_browser/meridian/item.ts  |   3 +
+ .../resources/webui_browser/meridian/rows.css |  37 ++++
+ .../webui_browser/meridian/sidebar.css        |  29 +++
+ .../webui_browser/meridian/sidebar.ts         | 209 +++++++++++++++++-
+ .../webui_browser/meridian/tab_row.html.ts    |   2 +-
+ 7 files changed, 285 insertions(+), 7 deletions(-)
+
+diff --git a/chrome/browser/resources/webui_browser/meridian/fav.html.ts b/chrome/browser/resources/webui_browser/meridian/fav.html.ts
+index 779387283e..6819d0369b 100644
+--- a/chrome/browser/resources/webui_browser/meridian/fav.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/fav.html.ts
+@@ -10,7 +10,8 @@ export function getHtml(this: MeridianFavElement) {
+   return html`<!--_html_template_start_-->
+ ${this.item ? html`
+   <div class="fav ${this.tab_ ? 'loaded' : ''} ${
+-      this.tab_?.isActive ? 'active' : ''}" data-item="${this.item.id}"
++      this.tab_?.isActive ? 'active' : ''}" draggable="true"
++      data-item="${this.item.id}" data-fav="1"
+       title="${this.item.title}" @mousedown="${this.onTileMousedown_}"
+       @contextmenu="${this.onTileContextmenu_}">
+     <img src="${this.favicon_}" width="20" height="20" alt="">
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.html.ts b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+index b70294dc9f..1f3a5cfb92 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+@@ -11,8 +11,9 @@ export function getHtml(this: MeridianItemElement) {
+   return html`<!--_html_template_start_-->
+ ${this.item?.isFolder ? html`
+   <div class="folder-wrap ${this.item.open ? '' : 'collapsed'}">
+-    <div class="row folder" style="--depth:${this.depth}"
+-        data-item="${this.item.id}" @mousedown="${this.onRowMousedown_}"
++    <div class="row folder" style="--depth:${this.depth}" draggable="true"
++        data-item="${this.item.id}" data-parent="${this.parentId}"
++        @mousedown="${this.onRowMousedown_}"
+         @contextmenu="${this.onRowContextmenu_}">
+       <span class="folder-ic">
+         ${icon(this.item.open ? 'folderOpen' : 'folder')}
+@@ -25,6 +26,7 @@ ${this.item?.isFolder ? html`
+     <div class="children">
+       ${repeat(this.item.children, c => c.id, c => html`
+         <meridian-item .item="${c}" .depth="${this.depth + 1}"
++            .parentId="${this.item!.id}"
+             .container="${this.container}" .host="${this.host}"
+             .rev="${this.rev}" .renaming="${this.renaming}">
+         </meridian-item>`)}
+@@ -34,7 +36,8 @@ ${this.item?.isFolder ? html`
+ ${this.item && !this.item.isFolder ? html`
+   <div class="row pinned ${this.tab_ ? '' : 'unloaded'} ${
+       this.tab_?.isActive ? 'active' : ''}" style="--depth:${this.depth}"
+-      data-item="${this.item.id}" title="${this.title_}"
++      draggable="true" data-item="${this.item.id}"
++      data-parent="${this.parentId}" title="${this.title_}"
+       @mousedown="${this.onRowMousedown_}"
+       @contextmenu="${this.onRowContextmenu_}">
+     ${this.away_ ? html`
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.ts b/chrome/browser/resources/webui_browser/meridian/item.ts
+index b4c2fcec95..b4fb0043cd 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.ts
+@@ -36,6 +36,7 @@ export class MeridianItemElement extends CrLitElement {
+       host: {type: Object},
+       rev: {type: Number},
+       renaming: {type: String},
++      parentId: {type: String},
+       tab_: {state: true, type: Object},
+       away_: {state: true, type: Boolean},
+       favicon_: {state: true, type: String},
+@@ -49,6 +50,8 @@ export class MeridianItemElement extends CrLitElement {
+   accessor host: MeridianSidebarElement|null = null;
+   accessor rev: number = 0;
+   accessor renaming: string = '';
++  // The folder this item is in; empty at the top level.
++  accessor parentId: string = '';
+   protected accessor tab_: Tab|null = null;
+   protected accessor away_: boolean = false;
+   protected accessor favicon_: string = '';
+diff --git a/chrome/browser/resources/webui_browser/meridian/rows.css b/chrome/browser/resources/webui_browser/meridian/rows.css
+index f0d3fbe85f..f29ae0560b 100644
+--- a/chrome/browser/resources/webui_browser/meridian/rows.css
++++ b/chrome/browser/resources/webui_browser/meridian/rows.css
+@@ -156,3 +156,40 @@ input.rename {
+   padding: 2px 5px;
+ }
+ 
++
++/* Drag and drop (Electron: .row.drop-*, .fav.drop-*). */
++.row.dragging,
++.fav.dragging {
++  opacity: 0.4;
++}
++
++.row.drop-before::before,
++.row.drop-after::after {
++  content: '';
++  position: absolute;
++  left: 8px;
++  right: 8px;
++  height: 2px;
++  border-radius: 2px;
++  background: var(--meridian-space);
++}
++
++.row.drop-before::before {
++  top: -1px;
++}
++
++.row.drop-after::after {
++  bottom: -1px;
++}
++
++.row.drop-into {
++  background: color-mix(in srgb, var(--meridian-space) 30%, transparent);
++}
++
++.fav.drop-before {
++  box-shadow: -3px 0 0 var(--meridian-space);
++}
++
++.fav.drop-after {
++  box-shadow: 3px 0 0 var(--meridian-space);
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.css b/chrome/browser/resources/webui_browser/meridian/sidebar.css
+index 1cd1b4758c..20c2612b23 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.css
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.css
+@@ -205,3 +205,32 @@ button {
+   margin: 4px 6px;
+   background: var(--meridian-border);
+ }
++
++#favorites.drop-target,
++#today.drop-target,
++.space-dot.drop-target {
++  background: var(--meridian-row-hover);
++  outline: 2px dashed color-mix(in srgb, var(--meridian-space) 70%, transparent);
++  border-radius: 10px;
++}
++
++/* While something is dragged, empty favorites open up as a drop zone. */
++:host([dragging]) #favorites.empty {
++  min-height: 44px;
++  margin-bottom: 10px;
++  border-radius: 10px;
++  outline: 2px dashed color-mix(in srgb, var(--meridian-space) 35%, transparent);
++}
++
++:host([dragging]) #favorites.empty::before {
++  content: 'Drop here to add to Favorites';
++  grid-column: 1 / -1;
++  align-self: center;
++  justify-self: center;
++  font-size: 11.5px;
++  color: var(--meridian-text-muted);
++}
++
++#today {
++  min-height: 34px;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index e0a10d1b5c..a549ddc42d 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -128,6 +128,10 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.handler_.getState().then(({state}) => this.setState_(state));
+     document.addEventListener('mousedown', this.onDocumentMouseDown_, true);
+     window.addEventListener('blur', this.closeMenu_);
++    this.shadowRoot.addEventListener('dragstart', this.onDragStart_ as EventListener);
++    this.shadowRoot.addEventListener('dragend', this.onDragEnd_);
++    this.shadowRoot.addEventListener('dragover', this.onDragOver_ as EventListener);
++    this.shadowRoot.addEventListener('drop', this.onDrop_ as EventListener);
+   }
+ 
+   override disconnectedCallback() {
+@@ -317,6 +321,208 @@ export class MeridianSidebarElement extends CrLitElement implements
+         encodeURIComponent(url)}`;
+   }
+ 
++  // -------------------------------------------------------- drag & drop
++
++  // What is being dragged: a Today tab or a pinned item / favorite.
++  private drag_: {tab?: NodeId, item?: string, el: HTMLElement}|null = null;
++  private dropMarker_: HTMLElement|null = null;
++
++  private onDragStart_ = (e: DragEvent) => {
++    const el = this.dragSource_(e);
++    if (!el) {
++      return;
++    }
++    this.drag_ = {
++      tab: el.dataset['tab'] || undefined,
++      item: el.dataset['item'] || undefined,
++      el,
++    };
++    el.classList.add('dragging');
++    // Opens the drop zone of empty favorites. Deferred: a layout change in
++    // dragstart can cancel the drag.
++    setTimeout(() => this.toggleAttribute('dragging', !!this.drag_), 0);
++    e.dataTransfer!.effectAllowed = 'move';
++    const url = this.drag_.tab ? this.tabs_.get(this.drag_.tab)?.url :
++                                 this.liveTab(this.drag_.item!)?.url;
++    if (url) {
++      e.dataTransfer!.setData('text/uri-list', url);
++    }
++    e.dataTransfer!.setData('text/x-meridian', '1');
++  };
++
++  private onDragEnd_ = () => {
++    this.drag_?.el.classList.remove('dragging');
++    this.drag_ = null;
++    this.removeAttribute('dragging');
++    this.clearDropMarker_();
++  };
++
++  private dragSource_(e: Event): HTMLElement|null {
++    for (const el of e.composedPath()) {
++      if (el instanceof HTMLElement && el.draggable &&
++          (el.dataset['tab'] || el.dataset['item'])) {
++        return el;
++      }
++    }
++    return null;
++  }
++
++  // Where a drop at the pointer would go.
++  private dropTarget_(e: DragEvent):
++      {el: HTMLElement, pos?: 'before'|'after'|'into', zone?: string}|null {
++    for (const el of e.composedPath()) {
++      if (!(el instanceof HTMLElement)) {
++        continue;
++      }
++      if (el.dataset['fav']) {
++        const r = el.getBoundingClientRect();
++        return {el, pos: e.clientX < r.left + r.width / 2 ? 'before' : 'after'};
++      }
++      if (el.dataset['item'] && el.classList.contains('row')) {
++        const r = el.getBoundingClientRect();
++        const y = (e.clientY - r.top) / r.height;
++        if (el.classList.contains('folder')) {
++          return {el, pos: y < 0.3 ? 'before' : y > 0.7 ? 'after' : 'into'};
++        }
++        return {el, pos: y < 0.5 ? 'before' : 'after'};
++      }
++      if (el.dataset['space'] && el.classList.contains('space-dot')) {
++        return {el, zone: 'space'};
++      }
++      if (el.id === 'favorites') {
++        return {el, zone: 'favorites'};
++      }
++      if (el.id === 'today' || el.id === 'newTabButton' ||
++          el.classList.contains('divider') || el.dataset['tab']) {
++        return {el: this.shadowRoot.getElementById('today')!, zone: 'today'};
++      }
++      if (el.id === 'pinned' || el.classList.contains('space-header')) {
++        return {el: this.shadowRoot.getElementById('pinned')!, zone: 'pinned'};
++      }
++    }
++    return null;
++  }
++
++  private clearDropMarker_() {
++    const m = this.dropMarker_;
++    if (m) {
++      m.classList.remove('drop-before', 'drop-after', 'drop-into',
++                         'drop-target');
++    }
++    this.dropMarker_ = null;
++  }
++
++  private onDragOver_ = (e: DragEvent) => {
++    if (!this.drag_) {
++      return;
++    }
++    const t = this.dropTarget_(e);
++    this.clearDropMarker_();
++    if (!t || t.el === this.drag_.el) {
++      return;
++    }
++    e.preventDefault();
++    e.dataTransfer!.dropEffect = 'move';
++    this.dropMarker_ = t.el;
++    t.el.classList.add(t.pos ? 'drop-' + t.pos : 'drop-target');
++  };
++
++  // The list and index an item sits at, for dropping next to it.
++  private locate_(itemId: string):
++      {container: string, parentId: string, index: number}|null {
++    const find = (items: Item[], container: string, parentId: string):
++        {container: string, parentId: string, index: number}|null => {
++      for (let i = 0; i < items.length; ++i) {
++        if (items[i]!.id === itemId) {
++          return {container, parentId, index: i};
++        }
++        if (items[i]!.isFolder) {
++          const found = find(items[i]!.children, container, items[i]!.id);
++          if (found) {
++            return found;
++          }
++        }
++      }
++      return null;
++    };
++    const state = this.state_;
++    if (!state) {
++      return null;
++    }
++    const fav = find(state.favorites, FAVORITES, '');
++    if (fav) {
++      return fav;
++    }
++    for (const space of state.spaces) {
++      const found = find(space.pinned, space.id, '');
++      if (found) {
++        return found;
++      }
++    }
++    return null;
++  }
++
++  private onDrop_ = (e: DragEvent) => {
++    const drag = this.drag_;
++    if (!drag) {
++      return;
++    }
++    e.preventDefault();
++    const t = this.dropTarget_(e);
++    this.clearDropMarker_();
++    this.removeAttribute('dragging');
++    const space = this.activeSpace();
++    if (!t || !space || t.el === drag.el) {
++      return;
++    }
++    let position: {container: string, parentId: string, index: number}|null =
++        null;
++    if (t.zone === 'today') {
++      // Back to Today: unpin (the tab, if open, stays).
++      if (drag.item) {
++        this.handler_.removeItem(drag.item);
++      }
++      return;
++    }
++    if (t.zone === 'space') {
++      const target = t.el.dataset['space']!;
++      if (drag.tab) {
++        this.handler_.moveTabToSpace(drag.tab, target);
++      } else if (drag.item) {
++        this.handler_.moveItem(
++            drag.item, {container: target, parentId: '', index: -1});
++      }
++      return;
++    }
++    if (t.zone === 'favorites') {
++      position = {container: FAVORITES, parentId: '', index: -1};
++    } else if (t.zone === 'pinned') {
++      position = {container: space.id, parentId: '', index: -1};
++    } else if (t.pos === 'into') {
++      position = {container: space.id, parentId: t.el.dataset['item']!,
++                  index: 0};
++    } else {
++      const ref = this.locate_(t.el.dataset['item']!);
++      if (!ref) {
++        return;
++      }
++      position = {...ref, index: ref.index + (t.pos === 'after' ? 1 : 0)};
++      // Moving down within the same list: the item leaves its old slot first.
++      if (drag.item) {
++        const from = this.locate_(drag.item);
++        if (from && from.container === ref.container &&
++            from.parentId === ref.parentId && from.index < position.index) {
++          position.index--;
++        }
++      }
++    }
++    if (drag.tab) {
++      this.handler_.pinTab(drag.tab, position);
++    } else if (drag.item && drag.item !== t.el.dataset['item']) {
++      this.handler_.moveItem(drag.item, position);
++    }
++  };
++
+   // ----------------------------------------------------------- commands
+ 
+   // What ⌘1-9 and ⌃Tab walk through, top to bottom: favorites, the space's
+@@ -427,10 +633,10 @@ export class MeridianSidebarElement extends CrLitElement implements
+   // ------------------------------------------------------------ actions
+ 
+   onTabMouseDown(e: MouseEvent, tab: Tab) {
++    // No preventDefault(): it would stop the row from being dragged.
+     if (e.button !== 0 || this.isButton_(e)) {
+       return;
+     }
+-    e.preventDefault();
+     this.tabStripService_.activateTab(tab.id);
+   }
+ 
+@@ -438,7 +644,6 @@ export class MeridianSidebarElement extends CrLitElement implements
+     if (e.button !== 0 || this.isButton_(e) || this.renaming_ === item.id) {
+       return;
+     }
+-    e.preventDefault();
+     if (item.isFolder) {
+       this.handler_.setFolderOpen(item.id, !item.open);
+       return;
+diff --git a/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts b/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
+index c53d6ffbfe..1e90070929 100644
+--- a/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
+@@ -10,7 +10,7 @@ import type {MeridianTabRowElement} from './tab_row.js';
+ export function getHtml(this: MeridianTabRowElement) {
+   return html`<!--_html_template_start_-->
+ ${this.tab ? html`
+-  <div class="row tab ${this.tab.isActive ? 'active' : ''}"
++  <div class="row tab ${this.tab.isActive ? 'active' : ''}" draggable="true"
+       data-tab="${this.tab.id}" title="${this.tab.title}"
+       @mousedown="${this.onRowMousedown_}"
+       @contextmenu="${this.onRowContextmenu_}">
