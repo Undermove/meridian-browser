@@ -74,7 +74,9 @@ test('⌘S hides the sidebar; the window edge brings it back over the page', asy
     await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 400, y: 300 });
     await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 2, y: 300 });
     await b.waitFor(`app.hasAttribute('sidebar-peek')`);
-    await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 900, y: 300 });
+    // Leaving the card (through the margin around it, as a real pointer does) hides it again.
+    await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 120, y: 300 });
+    await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 272, y: 300 });
     await b.waitFor(`!app.hasAttribute('sidebar-peek')`);
     await b.eval(`app.$.tabstrip.runCommand(${C.toggleSidebar}, 0)`);
     await b.waitFor(`!app.hasAttribute('sidebar-hidden')`);
