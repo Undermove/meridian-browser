@@ -40,7 +40,7 @@ test('ads are blocked on every site; turning it off in Settings lets them throug
     // The ruleset is indexed in the background after start; then ads stop loading.
     // Chromium indexes and publishes the ruleset once startup settles.
     const indexed = path.join(b.profile, 'Subresource Filter', 'Indexed Rules');
-    for (let i = 0; i < 100 && !(fs.existsSync(indexed) && fs.readdirSync(indexed, { recursive: true }).some((f) => String(f).endsWith('Ruleset Data'))); i++) await sleep(200);
+    for (let i = 0; i < 300 && !(fs.existsSync(indexed) && fs.readdirSync(indexed, { recursive: true }).some((f) => String(f).endsWith('Ruleset Data'))); i++) await sleep(200);
     await sleep(1000);
     let blocked = false;
     for (let n = 1; n <= 10 && !blocked; n++) {

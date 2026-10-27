@@ -52,7 +52,9 @@ export async function launch(urls = [], { profile: keep, args = [] } = {}) {
     // Keep drawing when the window is covered or the display sleeps (input waits for frames).
     '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
     ...args, ...urls,
-  ], { stdio: 'ignore' });
+    // MERIDIAN_LOG=<file>: the browser's log there (debugging).
+  ].concat(process.env.MERIDIAN_LOG ? ['--enable-logging=stderr'] : []),
+  { stdio: process.env.MERIDIAN_LOG ? ['ignore', 'ignore', fs.openSync(process.env.MERIDIAN_LOG, 'a')] : 'ignore' });
   const base = `http://127.0.0.1:${port}`;
   let ui;
   for (let i = 0; i < 100 && !ui; i++) {
