@@ -1,0 +1,540 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 27 Oct 2026 18:20:27 +0400
+Subject: [PATCH 15/15] Meridian: Air Traffic Control (route links from other
+ apps by rule)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/app_controller_mac.mm       |   4 +-
+ chrome/browser/meridian/BUILD.gn           |   6 +
+ chrome/browser/meridian/atc.cc             | 136 +++++++++++++++++++++
+ chrome/browser/meridian/atc.h              |  52 ++++++++
+ chrome/browser/meridian/atc_unittest.cc    |  71 +++++++++++
+ chrome/browser/meridian/little_window.cc   |  59 +++++++++
+ chrome/browser/meridian/little_window.h    |   9 ++
+ chrome/browser/meridian/sidebar_handler.cc |  25 +---
+ chrome/browser/prefs/BUILD.gn              |   1 +
+ chrome/browser/prefs/browser_prefs.cc      |   2 +
+ 10 files changed, 341 insertions(+), 24 deletions(-)
+ create mode 100644 chrome/browser/meridian/atc.cc
+ create mode 100644 chrome/browser/meridian/atc.h
+ create mode 100644 chrome/browser/meridian/atc_unittest.cc
+
+diff --git a/chrome/browser/app_controller_mac.mm b/chrome/browser/app_controller_mac.mm
+index 62fce18198..0e9a8df311 100644
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -2651,11 +2651,11 @@ void OpenStartupTabsInBrowserWithProfile(const StartupTabs& tabs,
+     profile = ProfileManager::MaybeForceOffTheRecordMode(
+         profile->GetOriginalProfile());
+   }
+-  // Meridian: web links from other apps open in a Little window.
++  // Meridian: web links from other apps go where Air Traffic Control says.
+   StartupTabs other_tabs;
+   for (const StartupTab& tab : tabs) {
+     if (tab.url.SchemeIsHTTPOrHTTPS() && !profile->IsOffTheRecord()) {
+-      meridian::OpenLittleWindow(profile, tab.url);
++      meridian::OpenExternalLink(profile, tab.url);
+     } else {
+       other_tabs.push_back(tab);
+     }
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index bf28ddcfc9..1ec7c7d3d0 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -18,6 +18,8 @@ mojom("mojo_bindings") {
+ # The sidebar model alone (no browser deps), so its tests stay small.
+ source_set("model") {
+   sources = [
++    "atc.cc",
++    "atc.h",
+     "archive_service.cc",
+     "archive_service.h",
+     "sidebar_service.cc",
+@@ -29,6 +31,7 @@ source_set("model") {
+     "//components/keyed_service/core",
+     "//url",
+   ]
++  deps = [ "//components/pref_registry" ]
+ }
+ 
+ source_set("meridian") {
+@@ -68,6 +71,7 @@ source_set("meridian") {
+     "//chrome/browser/ui/tabs:tab_strip",
+     "//chrome/browser/ui/tabs:tab_strip_model_observer",
+     "//components/browser_apis/tab_strip/types",
++    "//components/prefs",
+     "//components/sessions",
+     "//components/split_tabs",
+     "//components/tabs:public",
+@@ -85,6 +89,7 @@ import("//testing/test.gni")
+ test("meridian_unittests") {
+   sources = [
+     "archive_service_unittest.cc",
++    "atc_unittest.cc",
+     "sidebar_service_unittest.cc",
+   ]
+   deps = [
+@@ -92,5 +97,6 @@ test("meridian_unittests") {
+     "//base/test:run_all_unittests",
+     "//base/test:test_support",
+     "//testing/gtest",
++    "//url",
+   ]
+ }
+diff --git a/chrome/browser/meridian/atc.cc b/chrome/browser/meridian/atc.cc
+new file mode 100644
+index 0000000000..27044b9f89
+--- /dev/null
++++ b/chrome/browser/meridian/atc.cc
+@@ -0,0 +1,136 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/atc.h"
++
++#include <algorithm>
++
++#include "base/strings/string_util.h"
++#include "components/pref_registry/pref_registry_syncable.h"
++#include "url/gurl.h"
++#include "url/url_constants.h"
++
++namespace meridian {
++
++namespace {
++
++// Lower case, without a scheme or a leading "www.".
++std::string NormalizePattern(std::string_view pattern) {
++  std::string p = base::ToLowerASCII(
++      base::TrimWhitespaceASCII(pattern, base::TRIM_ALL));
++  size_t scheme_end = p.find("://");
++  if (scheme_end != std::string::npos && scheme_end > 0 &&
++      base::IsAsciiAlpha(p[0]) &&
++      p.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789+.-") ==
++          scheme_end) {
++    p = p.substr(scheme_end + 3);
++  }
++  if (p.starts_with("www.")) {
++    p = p.substr(4);
++  }
++  return p;
++}
++
++// `*` matches any run of characters; everything else is literal.
++bool GlobMatches(std::string_view glob, std::string_view text) {
++  size_t g = 0, t = 0;
++  size_t star = std::string_view::npos, resume = 0;
++  while (t < text.size()) {
++    if (g < glob.size() && glob[g] == '*') {
++      star = g++;
++      resume = t;
++    } else if (g < glob.size() && glob[g] == text[t]) {
++      ++g;
++      ++t;
++    } else if (star != std::string_view::npos) {
++      g = star + 1;
++      t = ++resume;
++    } else {
++      return false;
++    }
++  }
++  while (g < glob.size() && glob[g] == '*') {
++    ++g;
++  }
++  return g == glob.size();
++}
++
++AtcRoute ResolveTarget(const std::string* target,
++                       const std::vector<std::string>& space_ids) {
++  AtcRoute route;
++  if (!target) {
++    return route;
++  }
++  if (target->starts_with("space:")) {
++    std::string space_id = target->substr(6);
++    if (std::ranges::find(space_ids, space_id) != space_ids.end()) {
++      route.target = AtcRoute::Target::kSpace;
++      route.space_id = space_id;
++    } else {
++      route.target = AtcRoute::Target::kMain;
++    }
++  } else if (*target == "main") {
++    route.target = AtcRoute::Target::kMain;
++  }
++  return route;
++}
++
++}  // namespace
++
++void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
++  registry->RegisterDictionaryPref(kAtcPref);
++}
++
++bool AtcRuleMatches(std::string_view pattern, const GURL& url) {
++  if (!url.SchemeIsHTTPOrHTTPS()) {
++    return false;
++  }
++  std::string p = NormalizePattern(pattern);
++  if (p.empty()) {
++    return false;
++  }
++  std::string host = base::ToLowerASCII(url.host());
++  if (host.starts_with("www.")) {
++    host = host.substr(4);
++  }
++  if (p.find('/') == std::string::npos) {
++    if (p.starts_with("*.")) {
++      return host.ends_with(p.substr(1));
++    }
++    if (p.find('*') != std::string::npos) {
++      return GlobMatches(p, host);
++    }
++    return host == p || host.ends_with("." + p);
++  }
++  std::string target = host + base::ToLowerASCII(url.path());
++  if (url.has_query()) {
++    target += "?" + base::ToLowerASCII(url.query());
++  }
++  if (p.find('*') != std::string::npos) {
++    if (GlobMatches(p, target)) {
++      return true;
++    }
++    return p.ends_with("/*") &&
++           GlobMatches(p.substr(0, p.size() - 2), target);
++  }
++  return target == p || target.starts_with(p.ends_with('/') ? p : p + "/") ||
++         target.starts_with(p + "?");
++}
++
++AtcRoute RouteLink(const base::DictValue& atc,
++                   const GURL& url,
++                   const std::vector<std::string>& space_ids) {
++  if (const base::ListValue* rules = atc.FindList("rules")) {
++    for (const base::Value& rule : *rules) {
++      const base::DictValue* dict = rule.GetIfDict();
++      const std::string* pattern = dict ? dict->FindString("pattern") : nullptr;
++      if (pattern && AtcRuleMatches(*pattern, url)) {
++        return ResolveTarget(dict->FindString("target"), space_ids);
++      }
++    }
++  }
++  return ResolveTarget(atc.FindString("fallback"), space_ids);
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/atc.h b/chrome/browser/meridian/atc.h
+new file mode 100644
+index 0000000000..81c71de799
+--- /dev/null
++++ b/chrome/browser/meridian/atc.h
+@@ -0,0 +1,52 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_ATC_H_
++#define CHROME_BROWSER_MERIDIAN_ATC_H_
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/values.h"
++
++class GURL;
++
++namespace user_prefs {
++class PrefRegistrySyncable;
++}
++
++namespace meridian {
++
++// Air Traffic Control: where a link opened from another app goes (like Arc's).
++//
++// The pref is { "fallback": "little" | "main",
++//               "rules": [{ "id", "pattern", "target" }] }
++//   pattern  "github.com"        the domain and its subdomains
++//            "*.google.com"      subdomains only
++//            "notion.so/acme/*"  a URL prefix or glob (host + path, scheme
++//                                ignored)
++//   target   "little"            the Little window
++//            "main"              a new tab in the space you're in
++//            "space:<id>"        a new tab in that space ("main" if it's gone)
++// Rules are checked top to bottom; the first match wins.
++inline constexpr char kAtcPref[] = "meridian.atc";
++
++void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
++
++bool AtcRuleMatches(std::string_view pattern, const GURL& url);
++
++struct AtcRoute {
++  enum class Target { kLittle, kMain, kSpace };
++  Target target = Target::kLittle;
++  std::string space_id;
++};
++
++AtcRoute RouteLink(const base::DictValue& atc,
++                   const GURL& url,
++                   const std::vector<std::string>& space_ids);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_ATC_H_
+diff --git a/chrome/browser/meridian/atc_unittest.cc b/chrome/browser/meridian/atc_unittest.cc
+new file mode 100644
+index 0000000000..f9114c8633
+--- /dev/null
++++ b/chrome/browser/meridian/atc_unittest.cc
+@@ -0,0 +1,71 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/atc.h"
++
++#include "base/json/json_reader.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++namespace meridian {
++namespace {
++
++bool Matches(const char* pattern, const char* url) {
++  return AtcRuleMatches(pattern, GURL(url));
++}
++
++TEST(AtcTest, DomainMatchesItselfAndSubdomains) {
++  EXPECT_TRUE(Matches("github.com", "https://github.com/x"));
++  EXPECT_TRUE(Matches("github.com", "https://www.github.com/"));
++  EXPECT_TRUE(Matches("github.com", "https://gist.github.com/"));
++  EXPECT_TRUE(Matches("https://GitHub.com", "https://github.com/"));
++  EXPECT_FALSE(Matches("github.com", "https://notgithub.com/"));
++  EXPECT_FALSE(Matches("github.com", "file:///github.com"));
++  EXPECT_FALSE(Matches("", "https://github.com/"));
++}
++
++TEST(AtcTest, WildcardSubdomainsOnly) {
++  EXPECT_TRUE(Matches("*.google.com", "https://docs.google.com/"));
++  EXPECT_FALSE(Matches("*.google.com", "https://google.com/"));
++  EXPECT_TRUE(Matches("mail.*.com", "https://mail.example.com/"));
++}
++
++TEST(AtcTest, PathPrefixesAndGlobs) {
++  EXPECT_TRUE(Matches("notion.so/acme", "https://notion.so/acme"));
++  EXPECT_TRUE(Matches("notion.so/acme", "https://www.notion.so/acme/page"));
++  EXPECT_TRUE(Matches("notion.so/acme", "https://notion.so/acme?p=1"));
++  EXPECT_FALSE(Matches("notion.so/acme", "https://notion.so/acmeco"));
++  EXPECT_TRUE(Matches("notion.so/acme/*", "https://notion.so/acme/page"));
++  EXPECT_TRUE(Matches("notion.so/acme/*", "https://notion.so/acme"));
++  EXPECT_FALSE(Matches("notion.so/acme/*", "https://notion.so/other"));
++  EXPECT_TRUE(Matches("example.com/a?b", "https://example.com/a?b"));
++}
++
++TEST(AtcTest, RoutesByFirstMatchingRuleThenFallback) {
++  base::DictValue atc = std::move(*base::JSONReader::Read(R"({
++    "fallback": "main",
++    "rules": [
++      {"id": "1", "pattern": "figma.com", "target": "space:work"},
++      {"id": "2", "pattern": "figma.com", "target": "little"},
++      {"id": "3", "pattern": "gone.com", "target": "space:deleted"},
++      {"id": "4", "pattern": "x.com", "target": "little"}
++    ]})", 0)).TakeDict();
++  std::vector<std::string> spaces = {"home", "work"};
++
++  AtcRoute r = RouteLink(atc, GURL("https://figma.com/f"), spaces);
++  EXPECT_EQ(r.target, AtcRoute::Target::kSpace);
++  EXPECT_EQ(r.space_id, "work");
++  EXPECT_EQ(RouteLink(atc, GURL("https://gone.com"), spaces).target,
++            AtcRoute::Target::kMain);
++  EXPECT_EQ(RouteLink(atc, GURL("https://x.com"), spaces).target,
++            AtcRoute::Target::kLittle);
++  EXPECT_EQ(RouteLink(atc, GURL("https://other.org"), spaces).target,
++            AtcRoute::Target::kMain);
++  // Without settings, links go to the Little window.
++  EXPECT_EQ(RouteLink(base::DictValue(), GURL("https://a.b"), spaces).target,
++            AtcRoute::Target::kLittle);
++}
++
++}  // namespace
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/little_window.cc b/chrome/browser/meridian/little_window.cc
+index 95c66d29dc..6ea8c51202 100644
+--- a/chrome/browser/meridian/little_window.cc
++++ b/chrome/browser/meridian/little_window.cc
+@@ -8,11 +8,18 @@
+ 
+ #include "base/callback_list.h"
+ #include "base/no_destructor.h"
++#include "chrome/browser/meridian/atc.h"
++#include "chrome/browser/meridian/sidebar_service.h"
++#include "chrome/browser/meridian/sidebar_service_factory.h"
++#include "chrome/browser/meridian/tab_data.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "chrome/browser/ui/browser_window/public/browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
++#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "components/prefs/pref_service.h"
+ #include "ui/base/base_window.h"
+ #include "ui/base/page_transition_types.h"
+ #include "ui/display/screen.h"
+@@ -67,4 +74,56 @@ bool IsLittleWindow(const BrowserWindowInterface* browser) {
+   return LittleWindows().contains(browser);
+ }
+ 
++BrowserWindowInterface* FindOrCreateMainWindow(
++    Profile* profile,
++    const BrowserWindowInterface* except) {
++  BrowserWindowInterface* found = nullptr;
++  ProfileBrowserCollection::GetForProfile(profile)->ForEach(
++      [&](BrowserWindowInterface* browser) {
++        if (browser != except &&
++            browser->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
++            !IsLittleWindow(browser)) {
++          found = browser;
++          return false;
++        }
++        return true;
++      },
++      BrowserCollection::Order::kActivation);
++  if (found) {
++    return found;
++  }
++  BrowserWindowCreateParams params(*profile, /*from_user_gesture=*/true);
++  params.should_trigger_session_restore = false;
++  return CreateBrowserWindow(std::move(params));
++}
++
++void OpenExternalLink(Profile* profile, const GURL& url) {
++  SidebarService* service = SidebarServiceFactory::GetForProfile(profile);
++  std::vector<std::string> space_ids;
++  for (const Space& space : service->spaces()) {
++    space_ids.push_back(space.id);
++  }
++  AtcRoute route =
++      RouteLink(profile->GetPrefs()->GetDict(kAtcPref), url, space_ids);
++  if (route.target == AtcRoute::Target::kLittle) {
++    OpenLittleWindow(profile, url);
++    return;
++  }
++  BrowserWindowInterface* browser = FindOrCreateMainWindow(profile);
++  if (!browser) {
++    return;
++  }
++  std::string space_id = route.target == AtcRoute::Target::kSpace
++                             ? route.space_id
++                             : service->active_space_id();
++  service->SetActiveSpace(space_id);
++  NavigateParams nav(browser, url, ui::PAGE_TRANSITION_LINK);
++  nav.disposition = WindowOpenDisposition::kNewForegroundTab;
++  Navigate(&nav);
++  if (nav.navigated_or_inserted_contents) {
++    TabData::Set(nav.navigated_or_inserted_contents, space_id, std::string());
++  }
++  browser->GetWindow()->Show();
++}
++
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/little_window.h b/chrome/browser/meridian/little_window.h
+index fcaf8669f1..48d44bccda 100644
+--- a/chrome/browser/meridian/little_window.h
++++ b/chrome/browser/meridian/little_window.h
+@@ -18,6 +18,15 @@ BrowserWindowInterface* OpenLittleWindow(Profile* profile, const GURL& url);
+ 
+ bool IsLittleWindow(const BrowserWindowInterface* browser);
+ 
++// The most recently used normal window that isn't a Little window (other than
++// `except`), or a new one.
++BrowserWindowInterface* FindOrCreateMainWindow(
++    Profile* profile,
++    const BrowserWindowInterface* except = nullptr);
++
++// A web link from another app: where Air Traffic Control says (atc.h).
++void OpenExternalLink(Profile* profile, const GURL& url);
++
+ }  // namespace meridian
+ 
+ #endif  // CHROME_BROWSER_MERIDIAN_LITTLE_WINDOW_H_
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 52e74ef988..a39868079e 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -18,10 +18,7 @@
+ #include "chrome/browser/meridian/sidebar_service_factory.h"
+ #include "chrome/browser/meridian/tab_data.h"
+ #include "chrome/browser/profiles/profile.h"
+-#include "chrome/browser/ui/browser_window/public/browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+-#include "chrome/browser/ui/browser_window/public/create_browser_window.h"
+-#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+@@ -368,26 +365,10 @@ void SidebarHandler::OpenInMeridian() {
+   if (!IsLittleWindow(browser_) || !tab) {
+     return;
+   }
+-  Profile* profile = browser_->GetProfile();
+-  BrowserWindowInterface* target = nullptr;
+-  ProfileBrowserCollection::GetForProfile(profile)->ForEach(
+-      [&](BrowserWindowInterface* browser) {
+-        if (browser != browser_ &&
+-            browser->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
+-            !IsLittleWindow(browser)) {
+-          target = browser;
+-          return false;
+-        }
+-        return true;
+-      },
+-      BrowserCollection::Order::kActivation);
++  BrowserWindowInterface* target =
++      FindOrCreateMainWindow(browser_->GetProfile(), browser_);
+   if (!target) {
+-    BrowserWindowCreateParams params(*profile, /*from_user_gesture=*/true);
+-    params.should_trigger_session_restore = false;
+-    target = CreateBrowserWindow(std::move(params));
+-    if (!target) {
+-      return;
+-    }
++    return;
+   }
+   // The last tab leaving closes this window (and this handler), so nothing
+   // touches `this` after the detach.
+diff --git a/chrome/browser/prefs/BUILD.gn b/chrome/browser/prefs/BUILD.gn
+index f73a22f476..323f852347 100644
+--- a/chrome/browser/prefs/BUILD.gn
++++ b/chrome/browser/prefs/BUILD.gn
+@@ -85,6 +85,7 @@ source_set("impl") {
+     "//chrome/browser/login_detection",
+     "//chrome/browser/media",
+     "//chrome/browser/media/prefs",
++    "//chrome/browser/meridian:model",
+     "//chrome/browser/media/router:media_router_feature",
+     "//chrome/browser/media/router/discovery/access_code:access_code_cast_feature",
+     "//chrome/browser/media/webrtc",
+diff --git a/chrome/browser/prefs/browser_prefs.cc b/chrome/browser/prefs/browser_prefs.cc
+index fdd05fad32..8b4e319512 100644
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -42,6 +42,7 @@
+ #include "chrome/browser/lifetime/browser_shutdown.h"
+ #include "chrome/browser/login_detection/login_detection_prefs.h"
+ #include "chrome/browser/media/media_engagement_service.h"
++#include "chrome/browser/meridian/atc.h"
+ #include "chrome/browser/media/media_storage_id_salt.h"
+ #include "chrome/browser/media/prefs/capture_device_ranking.h"
+ #include "chrome/browser/media/unified_autoplay_config.h"
+@@ -2053,6 +2054,7 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry,
+   AccessibilityLabelsService::RegisterProfilePrefs(registry);
+   registry->RegisterBooleanPref(prefs::kRendererAccessibilityEnabled, true);
+   AccessibilityUIMessageHandler::RegisterProfilePrefs(registry);
++  meridian::RegisterProfilePrefs(registry);
+ #if !BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_DESKTOP_ANDROID)  // nocheck
+   ttc::AiOverlayDialogController::RegisterProfilePrefs(registry);
+ #endif
