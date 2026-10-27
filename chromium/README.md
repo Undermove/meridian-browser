@@ -55,6 +55,7 @@ commit on the `meridian` branch, run `build.sh`, then `export.sh` and commit `pa
 - [x] Home page (new tab): search, feature cards, "Set up for me" presets, tips
 - [x] Ad and tracker blocking: EasyList + EasyPrivacy through Chromium's subresource filter on every site (tools/adblock.sh), toggle in Settings, per-site exceptions in Site settings
 - [ ] Swipe (Arc disc; needs a check on a real trackpad)
-- [ ] MCP server, AI (Ask/chat/keys/vault), local agents, Mission Control, Workbench, sandboxes, hubs
+- [x] MCP server in C++ (`Meridian --mcp-bridge`, 20 browser tools, off/read/ask/full, JS opt-in, activity bar + Stop, Connect Claude Code/Codex)
+- [ ] AI (Ask/chat/keys/vault), local agents, Mission Control, Workbench, sandboxes, hubs
 - [ ] Updater, packaging, signing
 - [ ] Windows and Linux builds

@@ -76,3 +76,35 @@ test('Links: a rule, then Try it says where a link goes; Chromium settings open 
     await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.url.startsWith('chrome://settings'))`);
   } finally { await b.close(); }
 });
+
+test('AI: choosing an access level starts the agent socket; Connect shows the exact command first', async () => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  const b = await launch(['about:blank'], { profile });
+  const endpoint = path.join(profile, 'Meridian Agent.json');
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    assert.equal(fs.existsSync(endpoint), false, 'off by default');
+    await open(b);
+    await b.eval(`[...${ST}.querySelectorAll('.tab')].find((t) => t.dataset.id === 'ai').click()`);
+    await b.waitFor(`!!${ST}.getElementById('agentsAsk')`);
+    await b.eval(`${ST}.getElementById('agentsAsk').click()`);
+    for (let i = 0; i < 50 && !fs.existsSync(endpoint); i++) await new Promise((r) => setTimeout(r, 100));
+    assert.ok(fs.existsSync(endpoint), 'the socket is up');
+    assert.equal((await settings(b)).agentAccess, 'ask');
+    // The CLIs, with the command Connect would run (never run here).
+    await b.waitFor(`${ST}.querySelectorAll('.row-desc.mono').length === 2`);
+    assert.match(await b.eval(`${ST}.querySelector('.row-desc.mono').textContent`), /mcp add -s user meridian -- .*Meridian --mcp-bridge/);
+    const found = await b.eval(`[...${ST}.querySelectorAll('#ai .card .btn')].find((x) => !x.disabled)?.dataset.id || ''`);
+    if (found) {
+      await b.eval(`${ST}.querySelector('#ai .card .btn[data-id="${found}"]').click()`);
+      await b.waitFor(`!!${ST}.querySelector('.command')`);
+      assert.match(await b.eval(`${ST}.querySelector('.command').textContent`), /--mcp-bridge/);
+      await b.eval(`[...${ST}.querySelectorAll('.confirm .btn')].find((x) => x.textContent.trim() === 'Cancel').click()`);
+      await b.waitFor(`!${ST}.querySelector('.command')`);
+    }
+    // Off again: the socket and its token file go.
+    await b.eval(`[...${ST}.querySelectorAll('.seg')].find((x) => x.dataset.name === 'agents' && x.dataset.value === 'off').click()`);
+    for (let i = 0; i < 50 && fs.existsSync(endpoint); i++) await new Promise((r) => setTimeout(r, 100));
+    assert.equal(fs.existsSync(endpoint), false);
+  } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
