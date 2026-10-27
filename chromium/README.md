@@ -50,7 +50,8 @@ commit on the `meridian` branch, run `build.sh`, then `export.sh` and commit `pa
 - [x] Air Traffic Control (rules; editor comes with Settings)
 - [x] Import from Arc: spaces, pins, folders, favorites, open tabs (lazy), sign-ins (cookies)
 - [x] Welcome tour (Arc move-in or a setup from the installed apps, default browser), Help > Welcome Tour
-- [ ] Private window theme, swipe, settings, home, ad blocking, Electron migration
+- [x] Settings (⌘,): theme, sidebar left/right, mode, archive time, default browser, Air Traffic Control editor, links to Chromium settings
+- [ ] Private window theme, swipe, home, ad blocking, Electron migration, space theme editor
 - [ ] MCP server, AI (Ask/chat/keys/vault), local agents, Mission Control, Workbench, sandboxes, hubs
 - [ ] Updater, packaging, signing
 - [ ] Windows and Linux builds

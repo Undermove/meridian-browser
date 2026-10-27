@@ -1,0 +1,1836 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 27 Oct 2026 19:11:21 +0400
+Subject: [PATCH 19/19] =?UTF-8?q?Meridian:=20settings=20(General,=20Links/?=
+ =?UTF-8?q?Air=20Traffic=20Control,=20Advanced),=20sidebar=20on=20the=20ri?=
+ =?UTF-8?q?ght,=20=E2=8C=98,=20opens=20them?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/app_controller_mac.mm          |   6 +-
+ chrome/browser/meridian/BUILD.gn              |   2 +
+ chrome/browser/meridian/atc.cc                |  42 +-
+ chrome/browser/meridian/atc.h                 |   7 +
+ chrome/browser/meridian/prefs.cc              |   2 +
+ chrome/browser/meridian/prefs.h               |   4 +
+ chrome/browser/meridian/sidebar.mojom         |  44 ++
+ chrome/browser/meridian/sidebar_handler.cc    | 185 +++++++-
+ chrome/browser/meridian/sidebar_handler.h     |  20 +-
+ .../browser/resources/webui_browser/BUILD.gn  |   3 +
+ .../browser/resources/webui_browser/app.css   |  48 ++
+ .../resources/webui_browser/app.html.ts       |   7 +-
+ chrome/browser/resources/webui_browser/app.ts |  13 +
+ .../resources/webui_browser/meridian/icons.ts |   3 +
+ .../webui_browser/meridian/settings.css       | 424 ++++++++++++++++++
+ .../webui_browser/meridian/settings.html.ts   | 320 +++++++++++++
+ .../webui_browser/meridian/settings.ts        | 302 +++++++++++++
+ .../webui_browser/meridian/sidebar.ts         |   9 +
+ 18 files changed, 1430 insertions(+), 11 deletions(-)
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/settings.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/settings.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/settings.ts
+
+diff --git a/chrome/browser/app_controller_mac.mm b/chrome/browser/app_controller_mac.mm
+index 0e9a8df311..d10c9dcfaf 100644
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -84,6 +84,7 @@
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/meridian/little_window.h"
++#include "chrome/browser/meridian/sidebar_handler.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+ #include "chrome/browser/ui/chrome_pages.h"
+ #include "chrome/browser/ui/cocoa/apps/quit_with_apps_controller_mac.h"
+@@ -2102,7 +2103,10 @@ class AppControllerProfileObserver : public ProfileAttributesStorage::Observer,
+   }
+   // Re-use an existing browser, or create a new one.
+   if (BrowserWindowInterface* browser = ActivateBrowser(profile)) {
+-    chrome::ShowSettings(browser);
++    // Meridian: its own settings, which link to Chromium's.
++    if (!meridian::SidebarHandler::ShowSettings(browser)) {
++      chrome::ShowSettings(browser);
++    }
+   } else {
+     chrome::OpenOptionsWindow(profile);
+   }
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 679ff7f518..c073af2b5b 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -78,6 +78,7 @@ source_set("meridian") {
+     "//chrome/app:command_ids",
+     "//chrome/browser/profiles:profile",
+     "//chrome/browser/sessions",
++    "//chrome/browser/themes",
+     "//chrome/browser/ui:status_bubble",
+     "//chrome/browser/ui:browser_tabrestore",
+     "//chrome/browser/ui/navigator",
+@@ -91,6 +92,7 @@ source_set("meridian") {
+     "//components/split_tabs",
+     "//components/tabs:public",
+     "//components/url_formatter",
++    "//components/version_info",
+     "//crypto",
+     "//services/network/public/mojom",
+     "//sql",
+diff --git a/chrome/browser/meridian/atc.cc b/chrome/browser/meridian/atc.cc
+index 72d4f9bd37..ab6b08b6d7 100644
+--- a/chrome/browser/meridian/atc.cc
++++ b/chrome/browser/meridian/atc.cc
+@@ -121,11 +121,51 @@ AtcRoute RouteLink(const base::DictValue& atc,
+       const base::DictValue* dict = rule.GetIfDict();
+       const std::string* pattern = dict ? dict->FindString("pattern") : nullptr;
+       if (pattern && AtcRuleMatches(*pattern, url)) {
+-        return ResolveTarget(dict->FindString("target"), space_ids);
++        AtcRoute route = ResolveTarget(dict->FindString("target"), space_ids);
++        route.pattern = *pattern;
++        return route;
+       }
+     }
+   }
+   return ResolveTarget(atc.FindString("fallback"), space_ids);
+ }
+ 
++std::optional<base::DictValue> SanitizeAtc(const base::DictValue& atc) {
++  auto valid_target = [](const std::string& t) {
++    if (t == "little" || t == "main") {
++      return true;
++    }
++    if (!t.starts_with("space:") || t.size() > 6 + 64 || t.size() == 6) {
++      return false;
++    }
++    return std::ranges::all_of(t.substr(6), [](char c) {
++      return base::IsAsciiAlphaNumeric(c) || c == '-' || c == '_';
++    });
++  };
++  base::DictValue out;
++  const std::string* fallback = atc.FindString("fallback");
++  out.Set("fallback", fallback && *fallback == "main" ? "main" : "little");
++  base::ListValue rules;
++  if (const base::ListValue* in = atc.FindList("rules")) {
++    for (const base::Value& rule : *in) {
++      const base::DictValue* dict = rule.GetIfDict();
++      const std::string* pattern = dict ? dict->FindString("pattern") : nullptr;
++      const std::string* target = dict ? dict->FindString("target") : nullptr;
++      if (!pattern || !target || !valid_target(*target) ||
++          NormalizePattern(*pattern).empty() || rules.size() >= 200) {
++        continue;
++      }
++      const std::string* id = dict->FindString("id");
++      base::DictValue clean;
++      clean.Set("id", id && !id->empty() && id->size() <= 64 ? *id : "rule");
++      clean.Set("pattern", std::string(base::TrimWhitespaceASCII(
++                               pattern->substr(0, 300), base::TRIM_ALL)));
++      clean.Set("target", *target);
++      rules.Append(std::move(clean));
++    }
++  }
++  out.Set("rules", std::move(rules));
++  return out;
++}
++
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/atc.h b/chrome/browser/meridian/atc.h
+index d1312a8f4a..8fb11f9586 100644
+--- a/chrome/browser/meridian/atc.h
++++ b/chrome/browser/meridian/atc.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_MERIDIAN_ATC_H_
+ #define CHROME_BROWSER_MERIDIAN_ATC_H_
+ 
++#include <optional>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -35,8 +36,14 @@ struct AtcRoute {
+   enum class Target { kLittle, kMain, kSpace };
+   Target target = Target::kLittle;
+   std::string space_id;
++  // The rule's pattern that matched; empty for the fallback.
++  std::string pattern;
+ };
+ 
++// Cleans rules from the settings page: at most 200, valid targets and
++// non-empty patterns. nullopt if `atc` isn't usable at all.
++std::optional<base::DictValue> SanitizeAtc(const base::DictValue& atc);
++
+ AtcRoute RouteLink(const base::DictValue& atc,
+                    const GURL& url,
+                    const std::vector<std::string>& space_ids);
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index 0a6f033f4f..e6bdbb8eb4 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -12,6 +12,8 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterDictionaryPref(kAtc);
+   registry->RegisterBooleanPref(kOnboarded, false);
+   registry->RegisterStringPref(kMode, "everyday");
++  registry->RegisterBooleanPref(kSidebarRight, false);
++  registry->RegisterIntegerPref(kArchiveAfterHours, 12);
+ }
+ 
+ }  // namespace meridian::prefs
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index e53f4cd4e8..fa8d1a1274 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -17,6 +17,10 @@ inline constexpr char kAtc[] = "meridian.atc";
+ inline constexpr char kOnboarded[] = "meridian.onboarded";
+ // "everyday", "creative" or "developer": which tools Meridian offers.
+ inline constexpr char kMode[] = "meridian.mode";
++// The sidebar on the right of the window.
++inline constexpr char kSidebarRight[] = "meridian.sidebar_right";
++// Hours a Today tab may go unvisited before it is archived; 0 = never.
++inline constexpr char kArchiveAfterHours[] = "meridian.archive_after_hours";
+ 
+ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
+ 
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 0009481490..d0c89b9057 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -69,6 +69,8 @@ struct SidebarState {
+   array<Split> splits;
+   // The welcome tour should open (first start of this profile).
+   bool onboarding;
++  // Settings that change how every window looks.
++  bool sidebar_right;
+   // A Little window (a link from another app): no sidebar, a bar with
+   // "Open in Meridian".
+   bool little;
+@@ -115,6 +117,35 @@ enum Command {
+   // Help > Welcome Tour, File > Import from Arc (the tour's Arc step).
+   kWelcomeTour,
+   kImportArc,
++  // Meridian > Settings (⌘,).
++  kShowSettings,
++};
++
++// Air Traffic Control (atc.h): where links from other apps go.
++struct AtcRule {
++  string id;
++  string pattern;
++  // "little", "main" or "space:<id>".
++  string target;
++};
++
++struct Atc {
++  // "little" or "main".
++  string fallback;
++  array<AtcRule> rules;
++};
++
++// Meridian's own settings (Chromium's are at chrome://settings).
++struct Settings {
++  string mode;
++  bool sidebar_right;
++  // "system", "light" or "dark": Chromium's own colour scheme setting.
++  string appearance;
++  // 0 = never.
++  int32 archive_after_hours;
++  Atc atc;
++  bool is_default_browser;
++  string version;
+ };
+ 
+ // A starting setup for the welcome tour (setup_profile.h).
+@@ -225,6 +256,19 @@ interface SidebarHandler {
+   // macOS asks the person to confirm.
+   SetDefaultBrowser() => (bool is_default);
+ 
++  // Settings. SetSettings validates; `is_default_browser` and `version` are
++  // ignored there.
++  GetSettings() => (Settings settings);
++  SetSettings(Settings settings);
++  // Where `url` would go under `atc` (the Links page's "Try it"): "little",
++  // "main" or "space", and the rule that matched (empty for the fallback).
++  TestLinkRoute(Atc atc, string url)
++      => (string target, string space_id, string pattern);
++  // Chromium's settings in a new tab: "" or one of passwords, autofill,
++  // privacy, content, search, clearBrowserData, help.
++  OpenBrowserSettings(string page);
++  ClearArchive();
++
+   // Turns a Peek into an ordinary Today tab.
+   ExpandPeek(tabs_api.mojom.NodeId tab_id);
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 7f4eeb2eee..2c75d47a42 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -18,6 +18,10 @@
+ #include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/meridian/arc_logins.h"
++#include "chrome/browser/meridian/atc.h"
++#include "chrome/browser/themes/theme_service.h"
++#include "chrome/browser/themes/theme_service_factory.h"
++#include "components/version_info/version_info.h"
+ #include "chrome/browser/meridian/little_window.h"
+ #include "chrome/browser/meridian/prefs.h"
+ #include "chrome/browser/meridian/setup_profile.h"
+@@ -83,10 +87,16 @@ SidebarHandler::SidebarHandler(
+       receiver_(this, std::move(receiver)) {
+   service_observation_.Observe(service_.get());
+   archive_observation_.Observe(archive_.get());
+-  // Checked often enough that a tab goes within minutes of its time.
+-  base::TimeDelta sweep = std::min(base::Minutes(5), ArchiveAfter() / 4);
+-  archive_timer_.Start(FROM_HERE, sweep, this,
+-                       &SidebarHandler::ArchiveStaleTabs);
++  StartArchiveTimer();
++  prefs_.Init(browser->GetProfile()->GetPrefs());
++  for (const char* pref :
++       {prefs::kSidebarRight, prefs::kOnboarded, prefs::kMode}) {
++    prefs_.Add(pref, base::BindRepeating(&SidebarHandler::ScheduleNotify,
++                                         base::Unretained(this)));
++  }
++  prefs_.Add(prefs::kArchiveAfterHours,
++             base::BindRepeating(&SidebarHandler::StartArchiveTimer,
++                                 base::Unretained(this)));
+   model()->AddObserver(this);
+   Handlers()[browser_] = this;
+   if (service_->loaded()) {
+@@ -298,7 +308,6 @@ void SidebarHandler::OnActiveTabChanged(tabs::TabInterface* tab) {
+   }
+ }
+ 
+-// static
+ base::TimeDelta SidebarHandler::ArchiveAfter() {
+   // For tests: --meridian-archive-after-seconds=N.
+   const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
+@@ -309,7 +318,38 @@ base::TimeDelta SidebarHandler::ArchiveAfter() {
+       seconds > 0) {
+     return base::Seconds(seconds);
+   }
+-  return base::Hours(12);
++  int hours =
++      browser_->GetProfile()->GetPrefs()->GetInteger(prefs::kArchiveAfterHours);
++  return hours > 0 ? base::Hours(hours) : base::TimeDelta();
++}
++
++void SidebarHandler::StartArchiveTimer() {
++  archive_timer_.Stop();
++  base::TimeDelta after = ArchiveAfter();
++  if (after.is_zero()) {
++    return;
++  }
++  // Checked often enough that a tab goes within minutes of its time.
++  archive_timer_.Start(FROM_HERE, std::min(base::Minutes(5), after / 4), this,
++                       &SidebarHandler::ArchiveStaleTabs);
++}
++
++std::vector<std::string> SidebarHandler::SpaceIds() {
++  std::vector<std::string> ids;
++  for (const Space& space : service_->spaces()) {
++    ids.push_back(space.id);
++  }
++  return ids;
++}
++
++// static
++bool SidebarHandler::ShowSettings(BrowserWindowInterface* browser) {
++  auto it = Handlers().find(browser);
++  if (it == Handlers().end() || !it->second->page_.is_connected()) {
++    return false;
++  }
++  it->second->page_->RunCommand(mojom::Command::kShowSettings, 0);
++  return true;
+ }
+ 
+ bool SidebarHandler::IsTodayTab(tabs::TabInterface* tab) {
+@@ -318,6 +358,9 @@ bool SidebarHandler::IsTodayTab(tabs::TabInterface* tab) {
+ }
+ 
+ void SidebarHandler::ArchiveStaleTabs() {
++  if (ArchiveAfter().is_zero()) {
++    return;
++  }
+   base::Time cutoff = base::Time::Now() - ArchiveAfter();
+   tabs::TabInterface* active = model()->GetActiveTab();
+   std::vector<content::WebContents*> stale;
+@@ -531,6 +574,134 @@ void SidebarHandler::ApplySetup(std::vector<mojom::SpacePtr> spaces,
+   ScheduleNotify();
+ }
+ 
++namespace {
++
++mojom::AtcPtr AtcToMojo(const base::DictValue& dict) {
++  auto atc = mojom::Atc::New();
++  const std::string* fallback = dict.FindString("fallback");
++  atc->fallback = fallback && *fallback == "main" ? "main" : "little";
++  if (const base::ListValue* rules = dict.FindList("rules")) {
++    for (const base::Value& rule : *rules) {
++      const base::DictValue* r = rule.GetIfDict();
++      if (!r) {
++        continue;
++      }
++      auto m = mojom::AtcRule::New();
++      const std::string* id = r->FindString("id");
++      const std::string* pattern = r->FindString("pattern");
++      const std::string* target = r->FindString("target");
++      m->id = id ? *id : std::string();
++      m->pattern = pattern ? *pattern : std::string();
++      m->target = target ? *target : std::string();
++      atc->rules.push_back(std::move(m));
++    }
++  }
++  return atc;
++}
++
++base::DictValue AtcFromMojo(const mojom::Atc& atc) {
++  base::DictValue dict;
++  dict.Set("fallback", atc.fallback);
++  base::ListValue rules;
++  for (const mojom::AtcRulePtr& rule : atc.rules) {
++    base::DictValue r;
++    r.Set("id", rule->id);
++    r.Set("pattern", rule->pattern);
++    r.Set("target", rule->target);
++    rules.Append(std::move(r));
++  }
++  dict.Set("rules", std::move(rules));
++  return dict;
++}
++
++}  // namespace
++
++void SidebarHandler::GetSettings(GetSettingsCallback callback) {
++  PrefService* prefs = browser_->GetProfile()->GetPrefs();
++  auto settings = mojom::Settings::New();
++  settings->mode = prefs->GetString(prefs::kMode);
++  settings->sidebar_right = prefs->GetBoolean(prefs::kSidebarRight);
++  using Scheme = ThemeService::BrowserColorScheme;
++  Scheme scheme = ThemeServiceFactory::GetForProfile(browser_->GetProfile())
++                      ->GetBrowserColorScheme();
++  settings->appearance = scheme == Scheme::kLight  ? "light"
++                         : scheme == Scheme::kDark ? "dark"
++                                                   : "system";
++  settings->archive_after_hours = prefs->GetInteger(prefs::kArchiveAfterHours);
++  settings->atc = AtcToMojo(prefs->GetDict(prefs::kAtc));
++  settings->version = std::string(version_info::GetVersionNumber());
++  IsDefaultBrowser(base::BindOnce(
++      [](GetSettingsCallback callback, mojom::SettingsPtr settings,
++         bool is_default) {
++        settings->is_default_browser = is_default;
++        std::move(callback).Run(std::move(settings));
++      },
++      std::move(callback), std::move(settings)));
++}
++
++void SidebarHandler::SetSettings(mojom::SettingsPtr settings) {
++  PrefService* prefs = browser_->GetProfile()->GetPrefs();
++  const std::string& mode = settings->mode;
++  if (mode == "everyday" || mode == "creative" || mode == "developer") {
++    prefs->SetString(prefs::kMode, mode);
++  }
++  using Scheme = ThemeService::BrowserColorScheme;
++  const std::string& appearance = settings->appearance;
++  if (appearance == "system" || appearance == "light" ||
++      appearance == "dark") {
++    Scheme scheme = appearance == "light"  ? Scheme::kLight
++                    : appearance == "dark" ? Scheme::kDark
++                                           : Scheme::kSystem;
++    ThemeService* themes =
++        ThemeServiceFactory::GetForProfile(browser_->GetProfile());
++    if (themes->GetBrowserColorScheme() != scheme) {
++      themes->SetBrowserColorScheme(scheme);
++    }
++  }
++  prefs->SetBoolean(prefs::kSidebarRight, settings->sidebar_right);
++  int hours = settings->archive_after_hours;
++  if (hours == 0 || hours == 12 || hours == 24 || hours == 168 ||
++      hours == 720) {
++    prefs->SetInteger(prefs::kArchiveAfterHours, hours);
++  }
++  if (settings->atc) {
++    if (std::optional<base::DictValue> atc =
++            SanitizeAtc(AtcFromMojo(*settings->atc))) {
++      prefs->SetDict(prefs::kAtc, std::move(*atc));
++    }
++  }
++}
++
++void SidebarHandler::TestLinkRoute(mojom::AtcPtr atc,
++                                   const std::string& url,
++                                   TestLinkRouteCallback callback) {
++  AtcRoute route =
++      RouteLink(SanitizeAtc(AtcFromMojo(*atc)).value_or(base::DictValue()),
++                GURL(url), SpaceIds());
++  const char* target = route.target == AtcRoute::Target::kSpace ? "space"
++                       : route.target == AtcRoute::Target::kMain ? "main"
++                                                                 : "little";
++  std::move(callback).Run(target, route.space_id, route.pattern);
++}
++
++void SidebarHandler::OpenBrowserSettings(const std::string& page) {
++  static constexpr const char* kPages[] = {
++      "", "passwords", "autofill", "privacy", "content", "search",
++      "clearBrowserData", "help"};
++  if (std::ranges::find(kPages, page) == std::end(kPages)) {
++    return;
++  }
++  GURL url(page == "passwords" ? std::string("chrome://password-manager/")
++                               : "chrome://settings/" + page);
++  NavigateParams params(browser_, url, ui::PAGE_TRANSITION_AUTO_BOOKMARK);
++  params.disposition = WindowOpenDisposition::kNewForegroundTab;
++  Navigate(&params);
++}
++
++void SidebarHandler::ClearArchive() {
++  archive_->Clear();
++}
++
+ void SidebarHandler::FinishOnboarding() {
+   browser_->GetProfile()->GetPrefs()->SetBoolean(prefs::kOnboarded, true);
+   ScheduleNotify();
+@@ -690,6 +861,8 @@ mojom::SidebarStatePtr SidebarHandler::BuildState() {
+     }
+   }
+   state->little = IsLittleWindow(browser_);
++  state->sidebar_right =
++      browser_->GetProfile()->GetPrefs()->GetBoolean(prefs::kSidebarRight);
+   // Tests open the tour with --meridian-onboarding; --no-first-run (what
+   // automation passes) keeps it closed.
+   const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 37ee5af85c..f90e0cc295 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -12,6 +12,7 @@
+ #include "base/memory/weak_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "base/timer/timer.h"
++#include "components/prefs/pref_change_registrar.h"
+ #include "chrome/browser/meridian/archive_service.h"
+ #include "chrome/browser/meridian/arc_import.h"
+ #include "chrome/browser/meridian/sidebar.mojom.h"
+@@ -105,13 +106,25 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void FinishOnboarding() override;
+   void IsDefaultBrowser(IsDefaultBrowserCallback callback) override;
+   void SetDefaultBrowser(SetDefaultBrowserCallback callback) override;
++  void GetSettings(GetSettingsCallback callback) override;
++  void SetSettings(mojom::SettingsPtr settings) override;
++  void TestLinkRoute(mojom::AtcPtr atc,
++                     const std::string& url,
++                     TestLinkRouteCallback callback) override;
++  void OpenBrowserSettings(const std::string& page) override;
++  void ClearArchive() override;
+   void ExpandPeek(const tabs_api::NodeId& tab_id) override;
+ 
+   // ArchiveService::Observer:
+   void OnArchiveChanged() override;
+ 
+-  // How long a Today tab may go unvisited before it is archived (Arc: 12 h).
+-  static base::TimeDelta ArchiveAfter();
++  // How long a Today tab may go unvisited before it is archived (Arc: 12 h);
++  // zero: never.
++  base::TimeDelta ArchiveAfter();
++
++  // Meridian > Settings: opens Meridian's settings in `browser`'s window.
++  // False if that window has no Meridian page.
++  static bool ShowSettings(BrowserWindowInterface* browser);
+ 
+   // SidebarService::Observer:
+   void OnSidebarChanged() override;
+@@ -141,6 +154,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+   // Closes (and so archives) Today tabs not visited for ArchiveAfter().
+   void ArchiveStaleTabs();
+   bool IsTodayTab(tabs::TabInterface* tab);
++  void StartArchiveTimer();
++  std::vector<std::string> SpaceIds();
+ 
+   raw_ptr<BrowserWindowInterface> browser_;
+   raw_ptr<SidebarService> service_;
+@@ -152,6 +167,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   // Last active tab per space id.
+   std::map<std::string, tabs::TabHandle> last_active_;
+   bool notify_pending_ = false;
++  PrefChangeRegistrar prefs_;
+ 
+   mojo::Remote<mojom::SidebarPage> page_;
+   mojo::Receiver<mojom::SidebarHandler> receiver_;
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index 81a8ca4bd7..e41e5d131f 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -38,6 +38,8 @@ build_webui("build") {
+     "meridian/item.ts",
+     "meridian/onboarding.html.ts",
+     "meridian/onboarding.ts",
++    "meridian/settings.html.ts",
++    "meridian/settings.ts",
+     "meridian/sidebar.html.ts",
+     "meridian/sidebar.ts",
+     "meridian/tab_row.html.ts",
+@@ -72,6 +74,7 @@ build_webui("build") {
+     "meridian/archive.css",
+     "meridian/command_bar.css",
+     "meridian/onboarding.css",
++    "meridian/settings.css",
+     "meridian/rows.css",
+     "meridian/sidebar.css",
+     "side_panel.css",
+diff --git a/chrome/browser/resources/webui_browser/app.css b/chrome/browser/resources/webui_browser/app.css
+index b733509c76..c59ef3f256 100644
+--- a/chrome/browser/resources/webui_browser/app.css
++++ b/chrome/browser/resources/webui_browser/app.css
+@@ -401,3 +401,51 @@ cr-icon-button[hidden] {
+ :host([little]) #main {
+   padding: 0 var(--meridian-gap) var(--meridian-gap);
+ }
++
++/* Sidebar on the right (Settings > General). The traffic lights stay top
++ * left, so the page leaves them a strip; the window drags by it. */
++:host([sidebar-right]) #rootContainer {
++  flex-direction: row-reverse;
++}
++
++:host([sidebar-right]) #sidebar {
++  padding: 10px 10px 8px 8px;
++}
++
++:host([sidebar-right]) #sidebarTop {
++  padding-left: 0;
++}
++
++:host([sidebar-right]) #main {
++  padding: 36px 0 var(--meridian-gap) var(--meridian-gap);
++}
++
++:host([sidebar-right]) #main::before {
++  content: '';
++  position: absolute;
++  top: 0;
++  left: 0;
++  right: 0;
++  height: 36px;
++  app-region: drag;
++  -webkit-app-region: drag;
++}
++
++:host([sidebar-right]) #edgeHotzone {
++  left: auto;
++  right: 0;
++}
++
++:host([sidebar-right][sidebar-hidden]) #sidebar {
++  left: auto;
++  right: var(--meridian-gap);
++  transform: translateX(calc(100% + 20px));
++}
++
++:host([sidebar-right][sidebar-hidden][sidebar-peek]) #sidebar {
++  transform: none;
++}
++
++:host([sidebar-right][sidebar-hidden]) #main {
++  padding: var(--meridian-gap);
++}
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 5e1ba04d07..bb6035b227 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -67,7 +67,9 @@ export function getHtml(this: WebuiBrowserAppElement) {
+         @meridian-peeks-changed="${this.onMeridianPeeksChanged_}"
+         @meridian-status="${this.onMeridianStatus_}"
+         @meridian-little-changed="${this.onMeridianLittleChanged_}"
+-        @meridian-onboarding="${this.onMeridianOnboarding_}">
++        @meridian-onboarding="${this.onMeridianOnboarding_}"
++        @meridian-show-settings="${this.onMeridianShowSettings_}"
++        @meridian-sidebar-side="${this.onMeridianSidebarSide_}">
+       <cr-icon-button slot="bottom-start" id="appMenuButton"
+           iron-icon="cr:more-vert" title="$i18n{appMenuTooltip}"
+           @click="${this.onAppMenuClick_}">
+@@ -86,6 +88,9 @@ export function getHtml(this: WebuiBrowserAppElement) {
+   <meridian-command-bar id="commandBar"></meridian-command-bar>
+   <meridian-archive id="archive"></meridian-archive>
+   <meridian-onboarding id="onboarding"></meridian-onboarding>
++  <meridian-settings id="settings"
++      @meridian-onboarding="${this.onMeridianOnboarding_}">
++  </meridian-settings>
+   <div id="littleBar" ?hidden="${!this.little_}">
+     <span class="host">${this.urlHost_}</span>
+     <button id="openInMeridian" title="Open in Meridian"
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 7aa38e82dd..130f611cf6 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -13,6 +13,7 @@ import './webview.js';
+ import './meridian/archive.js';
+ import './meridian/command_bar.js';
+ import './meridian/onboarding.js';
++import './meridian/settings.js';
+ import 'chrome://resources/cr_elements/cr_button/cr_button.js';
+ import 'chrome://resources/cr_elements/cr_icon_button/cr_icon_button.js';
+ import 'chrome://resources/cr_elements/cr_icon/cr_icon.js';
+@@ -34,6 +35,7 @@ import type {TabAdded, TabClosed, TabUpdated} from './tab_strip/events.js';
+ import type {MeridianArchiveElement} from './meridian/archive.js';
+ import type {MeridianCommandBarElement} from './meridian/command_bar.js';
+ import type {MeridianOnboardingElement} from './meridian/onboarding.js';
++import type {MeridianSettingsElement} from './meridian/settings.js';
+ import type {MeridianSidebarElement} from './meridian/sidebar.js';
+ import type {Split} from './sidebar.mojom-webui.js';
+ 
+@@ -68,6 +70,7 @@ export interface WebuiBrowserAppElement {
+     archive: MeridianArchiveElement,
+     commandBar: MeridianCommandBarElement,
+     onboarding: MeridianOnboardingElement,
++    settings: MeridianSettingsElement,
+     urlPill: HTMLElement,
+     appMenuButton: HTMLElement,
+     avatarButton: HTMLElement,
+@@ -108,6 +111,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       statusText_: {state: true, type: String},
+       sidebarHidden_: {type: Boolean, reflect: true, attribute: 'sidebar-hidden'},
+       little_: {type: Boolean, reflect: true, attribute: 'little'},
++      sidebarRight_: {type: Boolean, reflect: true, attribute: 'sidebar-right'},
+       sidebarPeek_: {type: Boolean, reflect: true, attribute: 'sidebar-peek'},
+       inactive_: {
+         type: Boolean,
+@@ -140,6 +144,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   protected accessor sidebarPeek_: boolean = false;
+   // A Little window: a link from another app, without the sidebar.
+   protected accessor little_: boolean = false;
++  protected accessor sidebarRight_: boolean = false;
+ 
+   constructor() {
+     super();
+@@ -494,6 +499,14 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.$.onboarding.show(e.detail);
+   }
+ 
++  protected onMeridianShowSettings_() {
++    this.$.settings.show(this.$.tabstrip.spaces());
++  }
++
++  protected onMeridianSidebarSide_(e: CustomEvent<boolean>) {
++    this.sidebarRight_ = e.detail;
++  }
++
+   protected onMeridianLittleChanged_(e: CustomEvent<boolean>) {
+     this.little_ = e.detail;
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/icons.ts b/chrome/browser/resources/webui_browser/meridian/icons.ts
+index 3c51f44a34..0706a9386f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/icons.ts
++++ b/chrome/browser/resources/webui_browser/meridian/icons.ts
+@@ -21,6 +21,7 @@ export type IconName =
+     'folderOpen'|
+     'chevronDown'|
+     'chevronRight'|
++    'chevronUp'|
+     'slash'|
+     'pin'|
+     'unpin'|
+@@ -67,6 +68,8 @@ export function icon(name: IconName, size = 16): TemplateResult {
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 9.5l5 5 5-5"/></svg>`;
+     case 'chevronRight':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.5 7l5 5-5 5"/></svg>`;
++    case 'chevronUp':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 14.5l5-5 5 5"/></svg>`;
+     case 'slash':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.5 5l-5 14"/></svg>`;
+     case 'pin':
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.css b/chrome/browser/resources/webui_browser/meridian/settings.css
+new file mode 100644
+index 0000000000..313f7fd69c
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/settings.css
+@@ -0,0 +1,424 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #css_wrapper_metadata_end */
++
++/* Settings, in the style of the Electron build's settings window
++ * (src/renderer/settings.css). */
++
++:host {
++  position: fixed;
++  inset: 0;
++  z-index: 60;
++  display: none;
++  color: var(--meridian-text);
++  font-size: 13px;
++}
++
++:host([open]) {
++  display: block;
++}
++
++[hidden] {
++  display: none !important;
++}
++
++button,
++select,
++input {
++  font: inherit;
++  color: inherit;
++}
++
++button {
++  background: none;
++  border: 0;
++  padding: 0;
++  cursor: default;
++}
++
++#overlay {
++  position: absolute;
++  inset: 0;
++  display: grid;
++  place-items: center;
++  background: var(--meridian-overlay);
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
++  animation: fade 0.18s ease;
++}
++
++@keyframes fade {
++  from {
++    opacity: 0;
++  }
++}
++
++#panel {
++  position: relative;
++  width: min(820px, 92vw);
++  height: min(620px, 86vh);
++  display: flex;
++  border-radius: 14px;
++  background: var(--meridian-surface);
++  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35),
++      0 0 0 0.5px var(--meridian-border);
++  overflow: hidden;
++  outline: none;
++}
++
++/* ------------------------------------------------------------ tabs */
++
++#tabs {
++  width: 180px;
++  flex: none;
++  padding: 16px 10px;
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++  background: color-mix(in srgb, var(--meridian-space) 10%, transparent);
++  border-right: 1px solid var(--meridian-border);
++}
++
++#tabs .title {
++  font-size: 15px;
++  font-weight: 650;
++  margin: 0 10px 12px;
++}
++
++.tab {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  height: 34px;
++  padding: 0 10px;
++  border-radius: 8px;
++  color: var(--meridian-text-muted);
++  font-weight: 500;
++}
++
++.tab:hover {
++  background: var(--meridian-row-hover);
++  color: var(--meridian-text);
++}
++
++.tab.on {
++  background: color-mix(in srgb, var(--meridian-space) 18%, transparent);
++  color: var(--meridian-text);
++}
++
++/* ------------------------------------------------------------ body */
++
++#body {
++  position: relative;
++  flex: 1;
++  min-width: 0;
++  overflow-y: auto;
++  padding: 22px 26px 30px;
++}
++
++#close {
++  position: absolute;
++  top: 12px;
++  right: 12px;
++}
++
++.icon-btn {
++  width: 28px;
++  height: 28px;
++  border-radius: 7px;
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  color: var(--meridian-text-muted);
++  flex: none;
++}
++
++.icon-btn:hover:not(:disabled) {
++  background: var(--meridian-row-hover);
++  color: var(--meridian-text);
++}
++
++.icon-btn:disabled {
++  opacity: 0.35;
++}
++
++.icon-btn.danger:hover {
++  color: #d13c3c;
++}
++
++.hero {
++  display: flex;
++  gap: 14px;
++  align-items: center;
++  margin: 0 2px 20px;
++}
++
++.hero h1 {
++  font-size: 17px;
++  margin: 0 0 3px;
++}
++
++.hero p {
++  margin: 0;
++  color: var(--meridian-text-muted);
++  line-height: 1.45;
++}
++
++.hero-ic {
++  width: 42px;
++  height: 42px;
++  border-radius: 12px;
++  display: grid;
++  place-items: center;
++  flex: none;
++  color: #fff;
++  background: var(--meridian-space);
++}
++
++.banner {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  padding: 10px 12px;
++  margin-bottom: 18px;
++  border-radius: 10px;
++  background: color-mix(in srgb, #e0b27a 22%, transparent);
++}
++
++.banner span {
++  flex: 1;
++}
++
++.group {
++  margin-bottom: 22px;
++}
++
++.group h2 {
++  font-size: 12px;
++  font-weight: 600;
++  color: var(--meridian-text-muted);
++  margin: 0 0 7px 12px;
++}
++
++.card {
++  border-radius: 12px;
++  background: color-mix(in srgb, var(--meridian-text) 4%, transparent);
++  box-shadow: 0 0 0 0.5px var(--meridian-border);
++}
++
++.note {
++  color: var(--meridian-text-muted);
++  font-size: 11.5px;
++  margin: 8px 12px 0;
++  line-height: 1.4;
++}
++
++.row {
++  position: relative;
++  display: flex;
++  align-items: center;
++  gap: 12px;
++  width: 100%;
++  box-sizing: border-box;
++  min-height: 46px;
++  padding: 10px 12px;
++  text-align: left;
++}
++
++.row + .row::before {
++  content: '';
++  position: absolute;
++  top: 0;
++  left: 12px;
++  right: 0;
++  height: 1px;
++  background: var(--meridian-border);
++}
++
++.row-text {
++  flex: 1;
++  min-width: 0;
++}
++
++.row-label {
++  font-weight: 500;
++}
++
++.row-desc {
++  color: var(--meridian-text-muted);
++  font-size: 11.5px;
++  margin-top: 2px;
++  line-height: 1.4;
++}
++
++.link-row .row-label {
++  flex: 1;
++}
++
++.link-row:hover {
++  background: var(--meridian-row-hover);
++}
++
++.ok {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  color: #2f9e5a;
++  font-weight: 500;
++}
++
++.muted {
++  color: var(--meridian-text-muted);
++}
++
++.empty {
++  padding: 14px 12px;
++  color: var(--meridian-text-muted);
++}
++
++.grow {
++  flex: 1;
++}
++
++/* ------------------------------------------------------------ controls */
++
++.btn {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  height: 28px;
++  padding: 0 12px;
++  border-radius: 7px;
++  font-weight: 500;
++  background: var(--meridian-surface);
++  box-shadow: 0 0 0 0.5px var(--meridian-border), 0 1px 2px rgba(0, 0, 0, 0.06);
++  flex: none;
++}
++
++.btn:hover {
++  background: color-mix(in srgb, var(--meridian-surface) 90%,
++                        var(--meridian-text) 6%);
++}
++
++.btn.small {
++  height: 24px;
++  padding: 0 9px;
++  font-size: 12px;
++}
++
++.btn.primary {
++  background: color-mix(in oklab, var(--meridian-space) 78%, #141420);
++  color: #fff;
++  box-shadow: none;
++}
++
++.btn.danger {
++  background: #d13c3c;
++  color: #fff;
++  box-shadow: none;
++}
++
++.segmented {
++  display: inline-flex;
++  padding: 2px;
++  border-radius: 8px;
++  background: color-mix(in srgb, var(--meridian-text) 7%, transparent);
++  flex: none;
++}
++
++.seg {
++  height: 24px;
++  padding: 0 10px;
++  border-radius: 6px;
++  font-size: 12px;
++  font-weight: 500;
++  color: var(--meridian-text-muted);
++}
++
++.seg.on {
++  background: var(--meridian-surface);
++  color: var(--meridian-text);
++  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
++}
++
++select,
++.text {
++  height: 28px;
++  padding: 0 8px;
++  border-radius: 7px;
++  border: 0;
++  background: var(--meridian-surface);
++  box-shadow: 0 0 0 0.5px var(--meridian-border), 0 1px 2px rgba(0, 0, 0, 0.06);
++  outline: none;
++}
++
++.text:focus,
++select:focus {
++  box-shadow: 0 0 0 2px color-mix(in srgb, var(--meridian-space) 55%,
++                                  transparent);
++}
++
++/* ------------------------------------------------------------ rules */
++
++.rule {
++  gap: 8px;
++}
++
++.rule-if {
++  color: var(--meridian-text-muted);
++  white-space: nowrap;
++}
++
++.rule-pattern {
++  flex: 1;
++  min-width: 0;
++}
++
++.rule-target {
++  max-width: 170px;
++}
++
++.rule-arrow {
++  display: inline-flex;
++  color: var(--meridian-text-muted);
++}
++
++/* ------------------------------------------------------------ confirm */
++
++.confirm {
++  position: absolute;
++  inset: 0;
++  display: grid;
++  place-items: center;
++  background: rgba(0, 0, 0, 0.2);
++}
++
++.confirm-card {
++  width: 340px;
++  padding: 18px 20px 14px;
++  border-radius: 12px;
++  background: var(--meridian-surface);
++  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
++}
++
++.confirm-card h3 {
++  margin: 0 0 8px;
++  font-size: 15px;
++}
++
++.confirm-card p {
++  margin: 0;
++  color: var(--meridian-text-muted);
++  line-height: 1.45;
++}
++
++.confirm-actions {
++  display: flex;
++  justify-content: flex-end;
++  gap: 8px;
++  margin-top: 16px;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+new file mode 100644
+index 0000000000..567eec0e68
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -0,0 +1,320 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {icon} from './icons.js';
++import type {MeridianSettingsElement} from './settings.js';
++
++export function getHtml(this: MeridianSettingsElement) {
++  return html`<!--_html_template_start_-->
++<div id="overlay" @click="${this.onOverlayClick_}">
++  <div id="panel" role="dialog" aria-label="Settings" tabindex="-1"
++      @keydown="${this.onPanelKeydown_}">
++    <nav id="tabs" role="tablist">
++      <div class="title">Settings</div>
++      <button class="tab ${this.section_ === 'general' ? 'on' : ''}"
++          data-id="general" role="tab" @click="${this.onTabClick_}">
++        ${icon('palette', 18)}<span>General</span>
++      </button>
++      <button class="tab ${this.section_ === 'links' ? 'on' : ''}"
++          data-id="links" role="tab" @click="${this.onTabClick_}">
++        ${icon('link', 18)}<span>Links</span>
++      </button>
++      <button class="tab ${this.section_ === 'advanced' ? 'on' : ''}"
++          data-id="advanced" role="tab" @click="${this.onTabClick_}">
++        ${icon('more', 18)}<span>Advanced</span>
++      </button>
++    </nav>
++    <div id="body">
++      <button id="close" class="icon-btn" title="Close"
++          @click="${this.onCloseClick_}">${icon('x', 16)}</button>
++      ${this.settings_ && this.section_ === 'general' ? html`
++        <section id="general">
++          <div class="group">
++            <h2>Appearance</h2>
++            <div class="card">
++              <div class="row">
++                <div class="row-text"><div class="row-label">Theme</div></div>
++                <div class="segmented">
++                  <button class="seg ${this.settings_.appearance === 'system' ? 'on' : ''}"
++                      data-name="appearance" data-value="system"
++                      @click="${this.onSegmentClick_}">System</button>
++                  <button class="seg ${this.settings_.appearance === 'light' ? 'on' : ''}"
++                      data-name="appearance" data-value="light"
++                      @click="${this.onSegmentClick_}">Light</button>
++                  <button class="seg ${this.settings_.appearance === 'dark' ? 'on' : ''}"
++                      data-name="appearance" data-value="dark"
++                      @click="${this.onSegmentClick_}">Dark</button>
++                </div>
++              </div>
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Sidebar position</div>
++                </div>
++                <div class="segmented">
++                  <button id="sidebarLeft"
++                      class="seg ${this.settings_.sidebarRight ? '' : 'on'}"
++                      data-name="sidebar" data-value="left"
++                      @click="${this.onSegmentClick_}">Left</button>
++                  <button id="sidebarRight"
++                      class="seg ${this.settings_.sidebarRight ? 'on' : ''}"
++                      data-name="sidebar" data-value="right"
++                      @click="${this.onSegmentClick_}">Right</button>
++                </div>
++              </div>
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Mode</div>
++                  <div class="row-desc">Everyday and AI for work hide the
++                    developer tools. Nothing is removed — switch any time.</div>
++                </div>
++                <div class="segmented">
++                  <button class="seg ${this.settings_.mode === 'everyday' ? 'on' : ''}"
++                      data-name="mode" data-value="everyday"
++                      @click="${this.onSegmentClick_}">Everyday</button>
++                  <button class="seg ${this.settings_.mode === 'creative' ? 'on' : ''}"
++                      data-name="mode" data-value="creative"
++                      @click="${this.onSegmentClick_}">AI for work</button>
++                  <button class="seg ${this.settings_.mode === 'developer' ? 'on' : ''}"
++                      data-name="mode" data-value="developer"
++                      @click="${this.onSegmentClick_}">Developer</button>
++                </div>
++              </div>
++            </div>
++          </div>
++          <div class="group">
++            <h2>Browsing</h2>
++            <div class="card">
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Default browser</div>
++                  <div class="row-desc">Links from other apps open in Meridian,
++                    routed by Air Traffic Control (Links).</div>
++                </div>
++                ${this.settings_.isDefaultBrowser ? html`
++                  <span class="ok">${icon('check', 14)} Meridian is your
++                    default browser</span>` : html`
++                  <button id="makeDefault" class="btn primary"
++                      @click="${this.onMakeDefaultClick_}">Make Default</button>`}
++              </div>
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Search engine</div>
++                  <div class="row-desc">Used by the command bar.</div>
++                </div>
++                <button class="btn" data-page="search"
++                    @click="${this.onBrowserSettingsClick_}">Change…</button>
++              </div>
++            </div>
++          </div>
++          <div class="group">
++            <h2>Tabs</h2>
++            <div class="card">
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Archive Today tabs after</div>
++                  <div class="row-desc">Unpinned tabs you haven’t looked at
++                    move to the archive. Pinned tabs and favorites stay.</div>
++                </div>
++                <select id="archiveAfter" @change="${this.onArchiveChange_}">
++                  ${this.archiveChoices_.map(c => html`
++                    <option value="${c.value}"
++                        ?selected="${c.value === this.archiveValue_}">
++                      ${c.label}</option>`)}
++                </select>
++              </div>
++            </div>
++          </div>
++          <div class="group">
++            <h2>Get started</h2>
++            <div class="card">
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Import from Arc</div>
++                  <div class="row-desc">Spaces, pinned tabs, folders, favorites
++                    and sign-ins.</div>
++                </div>
++                <button id="importArc" class="btn"
++                    @click="${this.onImportArcClick_}">Import…</button>
++              </div>
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Welcome tour</div>
++                </div>
++                <button id="tour" class="btn" @click="${this.onTourClick_}">
++                  Show Again</button>
++              </div>
++            </div>
++          </div>
++          <div class="group">
++            <h2>Chromium</h2>
++            <div class="card">
++              <button class="row link-row" data-page="passwords"
++                  @click="${this.onBrowserSettingsClick_}">
++                <span class="row-label">Passwords and passkeys</span>
++                ${icon('chevronRight', 14)}
++              </button>
++              <button class="row link-row" data-page="privacy"
++                  @click="${this.onBrowserSettingsClick_}">
++                <span class="row-label">Privacy and security</span>
++                ${icon('chevronRight', 14)}
++              </button>
++              <button class="row link-row" data-page="content"
++                  @click="${this.onBrowserSettingsClick_}">
++                <span class="row-label">Site settings</span>
++                ${icon('chevronRight', 14)}
++              </button>
++              <button class="row link-row" data-page="clearBrowserData"
++                  @click="${this.onBrowserSettingsClick_}">
++                <span class="row-label">Clear browsing data</span>
++                ${icon('chevronRight', 14)}
++              </button>
++              <button id="allSettings" class="row link-row" data-page=""
++                  @click="${this.onBrowserSettingsClick_}">
++                <span class="row-label">All Chromium settings</span>
++                ${icon('chevronRight', 14)}
++              </button>
++            </div>
++          </div>
++        </section>` : ''}
++
++      ${this.settings_ && this.section_ === 'links' ? html`
++        <section id="links">
++          <div class="hero">
++            <div class="hero-ic">${icon('link', 22)}</div>
++            <div>
++              <h1>Air Traffic Control</h1>
++              <p>Send links you open in other apps (Slack, Mail, Notion…) to the
++                right place automatically.</p>
++            </div>
++          </div>
++          ${!this.settings_.isDefaultBrowser ? html`
++            <div class="banner">
++              <span>Meridian isn’t your default browser yet, so links from
++                other apps open elsewhere.</span>
++              <button class="btn small" @click="${this.onMakeDefaultClick_}">
++                Make Default</button>
++            </div>` : ''}
++          <div class="group">
++            <h2>Rules</h2>
++            <div class="card">
++              ${this.rules_.map(r => html`
++                <div class="row rule">
++                  <span class="rule-if">If link is on</span>
++                  <input class="text rule-pattern" .value="${r.pattern}"
++                      data-index="${r.index}" spellcheck="false"
++                      placeholder="github.com or notion.so/acme/*"
++                      @change="${this.onRulePatternChange_}">
++                  <span class="rule-arrow">${icon('arrowRight', 14)}</span>
++                  <select class="rule-target" data-index="${r.index}"
++                      @change="${this.onRuleTargetChange_}">
++                    ${this.targets_.map(t => html`
++                      <option value="${t.value}"
++                          ?selected="${t.value === r.target}">${t.label}
++                      </option>`)}
++                  </select>
++                  <button class="icon-btn" title="Move up"
++                      data-index="${r.index}" ?disabled="${r.first}"
++                      @click="${this.onRuleUpClick_}">
++                    ${icon('chevronUp', 14)}</button>
++                  <button class="icon-btn danger" title="Remove rule"
++                      data-index="${r.index}"
++                      @click="${this.onRuleDeleteClick_}">
++                    ${icon('trash', 15)}</button>
++                </div>`)}
++              ${this.noRules_ ? html`
++                <div class="empty">No rules yet. Add one to send, say,
++                  <b>github.com</b> to your Work space.</div>` : ''}
++              <div class="row add-row">
++                <button id="addRule" class="btn" @click="${this.onAddRuleClick_}">
++                  ${icon('plus', 14)} Add Rule</button>
++              </div>
++            </div>
++            <p class="note">Rules are checked top to bottom. “github.com”
++              covers its subdomains; use * for wildcards, or add a path like
++              notion.so/acme/*.</p>
++          </div>
++          <div class="group">
++            <h2>Everything else</h2>
++            <div class="card">
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Other links open in</div>
++                  <div class="row-desc">The Little window is for a quick look;
++                    “Open in Meridian” moves the page into your sidebar.</div>
++                </div>
++                <select id="fallback" @change="${this.onFallbackChange_}">
++                  <option value="little"
++                      ?selected="${this.settings_.atc.fallback === 'little'}">
++                    Little Window</option>
++                  <option value="main"
++                      ?selected="${this.settings_.atc.fallback === 'main'}">
++                    Current Space</option>
++                </select>
++              </div>
++            </div>
++          </div>
++          <div class="group">
++            <h2>Try it</h2>
++            <div class="card">
++              <div class="row">
++                <input id="tryUrl" class="text grow" spellcheck="false"
++                    placeholder="Paste a link to see where it would go"
++                    @input="${this.onTryInput_}">
++                <span id="tryResult" class="muted">${this.tryResult_}</span>
++              </div>
++            </div>
++          </div>
++        </section>` : ''}
++
++      ${this.settings_ && this.section_ === 'advanced' ? html`
++        <section id="advanced">
++          <div class="group">
++            <h2>Data</h2>
++            <div class="card">
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Archive</div>
++                  <div class="row-desc">Closed and archived tabs. Open it from
++                    the Spaces menu (⌥⌘A).</div>
++                </div>
++                <button id="clearArchive" class="btn"
++                    @click="${this.onClearArchiveClick_}">Clear Archive…</button>
++              </div>
++            </div>
++          </div>
++          <div class="group">
++            <h2>About</h2>
++            <div class="card">
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Meridian ${this.settings_.version}</div>
++                  <div class="row-desc">Built on Chromium. MIT licensed, not
++                    affiliated with The Browser Company.</div>
++                </div>
++                <button class="btn" data-page="help"
++                    @click="${this.onBrowserSettingsClick_}">Details</button>
++              </div>
++            </div>
++          </div>
++        </section>` : ''}
++    </div>
++    ${this.confirmClear_ ? html`
++      <div class="confirm">
++        <div class="confirm-card">
++          <h3>Clear the archive?</h3>
++          <p>Every archived tab is forgotten. Open tabs aren’t touched.</p>
++          <div class="confirm-actions">
++            <button class="btn" @click="${this.onConfirmCancelClick_}">
++              Cancel</button>
++            <button id="confirmClear" class="btn danger"
++                @click="${this.onConfirmClearClick_}">Clear</button>
++          </div>
++        </div>
++      </div>` : ''}
++  </div>
++</div>
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+new file mode 100644
+index 0000000000..db19375db9
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -0,0 +1,302 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Meridian's settings (⌘,): General, Links (Air Traffic Control) and
++// Advanced. Passwords, privacy and site settings are Chromium's own, one click
++// away at chrome://settings.
++
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {browserProxyFactory} from '../sidebar.mojom-webui.js';
++import type {Atc, Settings, SidebarHandlerInterface, Space} from '../sidebar.mojom-webui.js';
++
++import {getCss} from './settings.css.js';
++import {getHtml} from './settings.html.js';
++
++export type SectionId = 'general'|'links'|'advanced';
++
++export interface Choice {
++  value: string;
++  label: string;
++}
++
++export interface RuleRow {
++  index: number;
++  pattern: string;
++  target: string;
++  first: boolean;
++}
++
++const ARCHIVE_CHOICES: Choice[] = [
++  {value: '12', label: '12 hours'},
++  {value: '24', label: '1 day'},
++  {value: '168', label: '1 week'},
++  {value: '720', label: '30 days'},
++  {value: '0', label: 'Never'},
++];
++
++export class MeridianSettingsElement extends CrLitElement {
++  static get is() {
++    return 'meridian-settings';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      open: {type: Boolean, reflect: true},
++      section_: {state: true, type: String},
++      settings_: {state: true, type: Object},
++      spaces_: {state: true, type: Array},
++      tryResult_: {state: true, type: String},
++      confirmClear_: {state: true, type: Boolean},
++      rules_: {state: true, type: Array},
++      targets_: {state: true, type: Array},
++      archiveChoices_: {state: true, type: Array},
++      archiveValue_: {state: true, type: String},
++      noRules_: {state: true, type: Boolean},
++    };
++  }
++
++  accessor open: boolean = false;
++  protected accessor section_: SectionId = 'general';
++  protected accessor settings_: Settings|null = null;
++  protected accessor spaces_: Space[] = [];
++  protected accessor tryResult_: string = '';
++  protected accessor confirmClear_: boolean = false;
++  // Derived in willUpdate().
++  protected accessor rules_: RuleRow[] = [];
++  protected accessor targets_: Choice[] = [];
++  protected accessor archiveChoices_: Choice[] = ARCHIVE_CHOICES;
++  protected accessor archiveValue_: string = '12';
++  protected accessor noRules_: boolean = true;
++
++  private readonly handler_: SidebarHandlerInterface =
++      browserProxyFactory.getInstance().handler;
++  private tryUrl_: string = '';
++
++  async show(spaces: Space[], section: SectionId = 'general') {
++    this.spaces_ = spaces;
++    this.section_ = section;
++    this.tryResult_ = '';
++    this.confirmClear_ = false;
++    const {settings} = await this.handler_.getSettings();
++    this.settings_ = settings;
++    this.open = true;
++  }
++
++  hide() {
++    this.open = false;
++  }
++
++  override willUpdate(changed: PropertyValues<this>) {
++    super.willUpdate(changed);
++    const rules = this.settings_?.atc.rules || [];
++    this.rules_ = rules.map((r, index) => ({
++                              index,
++                              pattern: r.pattern,
++                              target: r.target,
++                              first: index === 0,
++                            }));
++    this.noRules_ = rules.length === 0;
++    this.archiveValue_ = `${this.settings_?.archiveAfterHours ?? 12}`;
++    this.targets_ = [
++      {value: 'little', label: 'Little Window'},
++      {value: 'main', label: 'Current Space'},
++      ...this.spaces_.map(s => ({
++                            value: `space:${s.id}`,
++                            label: `${s.icon ? s.icon + ' ' : ''}${s.name}`,
++                          })),
++    ];
++  }
++
++  // Saves the whole settings object (the handler validates it).
++  private save_(change: Partial<Settings>) {
++    if (!this.settings_) {
++      return;
++    }
++    this.settings_ = {...this.settings_, ...change};
++    this.handler_.setSettings(this.settings_);
++  }
++
++  private saveAtc_(atc: Atc) {
++    this.save_({atc});
++    this.runTry_();
++  }
++
++  // ------------------------------------------------------------ events
++
++  protected onOverlayClick_(e: Event) {
++    if (e.target === e.currentTarget) {
++      this.hide();
++    }
++  }
++
++  protected onPanelKeydown_(e: KeyboardEvent) {
++    if (e.key === 'Escape') {
++      e.preventDefault();
++      if (this.confirmClear_) {
++        this.confirmClear_ = false;
++      } else {
++        this.hide();
++      }
++    }
++  }
++
++  protected onCloseClick_() {
++    this.hide();
++  }
++
++  protected onTabClick_(e: Event) {
++    this.section_ =
++        (e.currentTarget as HTMLElement).dataset['id'] as SectionId;
++  }
++
++  protected onSegmentClick_(e: Event) {
++    const el = e.currentTarget as HTMLElement;
++    const name = el.dataset['name'];
++    const value = el.dataset['value']!;
++    if (name === 'appearance') {
++      this.save_({appearance: value});
++    } else if (name === 'sidebar') {
++      this.save_({sidebarRight: value === 'right'});
++    } else if (name === 'mode') {
++      this.save_({mode: value});
++    }
++  }
++
++  protected onArchiveChange_(e: Event) {
++    this.save_(
++        {archiveAfterHours: Number((e.target as HTMLSelectElement).value)});
++  }
++
++  protected async onMakeDefaultClick_() {
++    const {isDefault} = await this.handler_.setDefaultBrowser();
++    this.save_({isDefaultBrowser: isDefault});
++  }
++
++  protected onBrowserSettingsClick_(e: Event) {
++    this.handler_.openBrowserSettings(
++        (e.currentTarget as HTMLElement).dataset['page'] || '');
++    this.hide();
++  }
++
++  protected onImportArcClick_() {
++    this.hide();
++    this.fire('meridian-onboarding', 'arc');
++  }
++
++  protected onTourClick_() {
++    this.hide();
++    this.fire('meridian-onboarding', 'tour');
++  }
++
++  protected onClearArchiveClick_() {
++    this.confirmClear_ = true;
++  }
++
++  protected onConfirmCancelClick_() {
++    this.confirmClear_ = false;
++  }
++
++  protected onConfirmClearClick_() {
++    this.confirmClear_ = false;
++    this.handler_.clearArchive();
++  }
++
++  // Links: Air Traffic Control.
++
++  protected onAddRuleClick_() {
++    const atc = this.settings_!.atc;
++    const first = this.spaces_[0];
++    this.saveAtc_({
++      ...atc,
++      rules: [
++        ...atc.rules,
++        {
++          id: Math.random().toString(36).slice(2, 10),
++          pattern: '',
++          target: first ? `space:${first.id}` : 'main',
++        },
++      ],
++    });
++  }
++
++  private editRule_(index: number, change: {pattern?: string, target?: string}) {
++    const atc = this.settings_!.atc;
++    this.saveAtc_({
++      ...atc,
++      rules: atc.rules.map((r, i) => i === index ? {...r, ...change} : r),
++    });
++  }
++
++  protected onRulePatternChange_(e: Event) {
++    const el = e.target as HTMLInputElement;
++    this.editRule_(Number(el.dataset['index']), {pattern: el.value.trim()});
++  }
++
++  protected onRuleTargetChange_(e: Event) {
++    const el = e.target as HTMLSelectElement;
++    this.editRule_(Number(el.dataset['index']), {target: el.value});
++  }
++
++  protected onRuleUpClick_(e: Event) {
++    const i = Number((e.currentTarget as HTMLElement).dataset['index']);
++    const rules = [...this.settings_!.atc.rules];
++    if (i > 0) {
++      [rules[i - 1], rules[i]] = [rules[i]!, rules[i - 1]!];
++      this.saveAtc_({...this.settings_!.atc, rules});
++    }
++  }
++
++  protected onRuleDeleteClick_(e: Event) {
++    const i = Number((e.currentTarget as HTMLElement).dataset['index']);
++    const atc = this.settings_!.atc;
++    this.saveAtc_({...atc, rules: atc.rules.filter((_, j) => j !== i)});
++  }
++
++  protected onFallbackChange_(e: Event) {
++    this.saveAtc_({
++      ...this.settings_!.atc,
++      fallback: (e.target as HTMLSelectElement).value,
++    });
++  }
++
++  protected onTryInput_(e: Event) {
++    this.tryUrl_ = (e.target as HTMLInputElement).value.trim();
++    this.runTry_();
++  }
++
++  private async runTry_() {
++    const value = this.tryUrl_;
++    if (!value || !this.settings_) {
++      this.tryResult_ = '';
++      return;
++    }
++    const url = /^https?:\/\//i.test(value) ? value : `https://${value}`;
++    const {target, spaceId, pattern} =
++        await this.handler_.testLinkRoute(this.settings_.atc, url);
++    const space = this.spaces_.find(s => s.id === spaceId);
++    const where = target === 'little' ? 'Little Window' :
++        target === 'space'            ? space?.name || 'Space' :
++                                        'Current Space';
++    this.tryResult_ = `→ ${where} ${
++        pattern ? `(rule “${pattern}”)` : '(no rule matched)'}`;
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-settings': MeridianSettingsElement;
++  }
++}
++
++customElements.define(MeridianSettingsElement.is, MeridianSettingsElement);
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 4f3ac80b6f..342f9ec4cf 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -248,6 +248,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.rev_++;
+     this.fire('meridian-splits-changed', state.splits);
+     this.fire('meridian-little-changed', state.little);
++    this.fire('meridian-sidebar-side', state.sidebarRight);
+     // First start of this profile: the welcome tour, once per window.
+     if (state.onboarding && !this.onboardingShown_) {
+       this.onboardingShown_ = true;
+@@ -664,6 +665,9 @@ export class MeridianSidebarElement extends CrLitElement implements
+       case Command.kImportArc:
+         this.fire('meridian-onboarding', 'arc');
+         break;
++      case Command.kShowSettings:
++        this.fire('meridian-show-settings');
++        break;
+       case Command.kNewFolder:
+         if (space) {
+           this.addFolder_(space.id, '');
+@@ -736,6 +740,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.handler_.setWindowControlsVisible(visible);
+   }
+ 
++  // The profile's spaces (for the settings page's link rules).
++  spaces(): Space[] {
++    return this.state_?.spaces || [];
++  }
++
+   openInMeridian() {
+     this.handler_.openInMeridian();
+   }
