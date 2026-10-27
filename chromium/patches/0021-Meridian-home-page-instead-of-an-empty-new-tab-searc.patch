@@ -1,0 +1,1143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 27 Oct 2026 19:22:56 +0400
+Subject: [PATCH 22/22] Meridian: home page instead of an empty new tab
+ (search, what Meridian can do, presets, tips)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar.mojom         |   5 +-
+ chrome/browser/meridian/sidebar_handler.cc    |   7 +-
+ chrome/browser/meridian/sidebar_handler.h     |   4 +-
+ .../browser/resources/webui_browser/BUILD.gn  |   3 +
+ .../browser/resources/webui_browser/app.css   |  14 +
+ .../resources/webui_browser/app.html.ts       |   4 +
+ chrome/browser/resources/webui_browser/app.ts |  27 +
+ .../resources/webui_browser/meridian/home.css | 560 ++++++++++++++++++
+ .../webui_browser/meridian/home.html.ts       |  87 +++
+ .../resources/webui_browser/meridian/home.ts  | 212 +++++++
+ .../webui_browser/meridian/onboarding.ts      |  17 +-
+ .../webui_browser/meridian/sidebar.ts         |   7 +-
+ 12 files changed, 936 insertions(+), 11 deletions(-)
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/home.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/home.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/home.ts
+
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 42a17666a6..427166a37b 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -248,8 +248,9 @@ interface SidebarHandler {
+   ImportArcLogins() => (int32 imported, string error);
+ 
+   // Welcome tour. `use_apps`: look at the installed apps (else a plain
+-  // everyday setup).
+-  ProposeSetup(bool use_apps) => (SetupProposal proposal);
++  // everyday setup); `persona` (developer, designer, manager, everyday)
++  // picks one outright (the home page's "Set up for me").
++  ProposeSetup(bool use_apps, string persona) => (SetupProposal proposal);
+   // Adds the chosen spaces (or renames the untouched first one) and
+   // favorites, and remembers the mode.
+   ApplySetup(array<Space> spaces, array<Item> favorites, string mode);
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 1c4a7b201c..f42933cba7 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -502,16 +502,17 @@ void SidebarHandler::ImportArcLogins(ImportArcLoginsCallback callback) {
+ }
+ 
+ void SidebarHandler::ProposeSetup(bool use_apps,
++                                  const std::string& persona,
+                                   ProposeSetupCallback callback) {
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+       base::BindOnce(
+-          [](bool use_apps, std::string locale) {
++          [](bool use_apps, std::string locale, std::string persona) {
+             return meridian::ProposeSetup(
+                 use_apps ? InstalledApps() : std::vector<std::string>(),
+-                locale);
++                locale, persona);
+           },
+-          use_apps, base::i18n::GetConfiguredLocale()),
++          use_apps, base::i18n::GetConfiguredLocale(), persona),
+       base::BindOnce(
+           [](ProposeSetupCallback callback, SetupProposal p) {
+             auto out = mojom::SetupProposal::New();
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index f90e0cc295..4ca3a8eb8f 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -99,7 +99,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void GetArcPreview(GetArcPreviewCallback callback) override;
+   void ImportArc(ImportArcCallback callback) override;
+   void ImportArcLogins(ImportArcLoginsCallback callback) override;
+-  void ProposeSetup(bool use_apps, ProposeSetupCallback callback) override;
++  void ProposeSetup(bool use_apps,
++                    const std::string& persona,
++                    ProposeSetupCallback callback) override;
+   void ApplySetup(std::vector<mojom::SpacePtr> spaces,
+                   std::vector<mojom::ItemPtr> favorites,
+                   const std::string& mode) override;
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index 267299047c..6bc8fc5ba1 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -33,6 +33,8 @@ build_webui("build") {
+     "meridian/command_bar.ts",
+     "meridian/fav.html.ts",
+     "meridian/fav.ts",
++    "meridian/home.html.ts",
++    "meridian/home.ts",
+     "meridian/icons.ts",
+     "meridian/item.html.ts",
+     "meridian/item.ts",
+@@ -75,6 +77,7 @@ build_webui("build") {
+     "extensions_bar.css",
+     "meridian/archive.css",
+     "meridian/command_bar.css",
++    "meridian/home.css",
+     "meridian/onboarding.css",
+     "meridian/settings.css",
+     "meridian/theme_editor.css",
+diff --git a/chrome/browser/resources/webui_browser/app.css b/chrome/browser/resources/webui_browser/app.css
+index c023adc967..401f451107 100644
+--- a/chrome/browser/resources/webui_browser/app.css
++++ b/chrome/browser/resources/webui_browser/app.css
+@@ -485,3 +485,17 @@ cr-icon-button[hidden] {
+ .private-badge[hidden] {
+   display: none;
+ }
++
++/* The home page lies exactly over the page card. */
++#home {
++  inset: var(--meridian-gap) var(--meridian-gap) var(--meridian-gap) 0;
++}
++
++:host([sidebar-hidden]) #home,
++:host([sidebar-right][sidebar-hidden]) #home {
++  inset: var(--meridian-gap);
++}
++
++:host([sidebar-right]:not([sidebar-hidden])) #home {
++  inset: 36px 0 var(--meridian-gap) var(--meridian-gap);
++}
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 93d8d72e8f..0003601767 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -112,6 +112,10 @@ export function getHtml(this: WebuiBrowserAppElement) {
+     </content-region>
+     <side-panel id="sidePanel" @side-panel-closed="${this.onSidePanelClosed_}">
+     </side-panel>
++    <meridian-home id="home" ?shown="${this.showHome_}"
++        @meridian-home-action="${this.onMeridianHomeAction_}"
++        @meridian-preset="${this.onMeridianPreset_}">
++    </meridian-home>
+     <div id="statusBubble" ?hidden="${!this.statusText_}">${this.statusText_}</div>
+   </div>
+ </div>
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 658a2b4488..8e602c3985 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -15,6 +15,7 @@ import './meridian/command_bar.js';
+ import './meridian/onboarding.js';
+ import './meridian/settings.js';
+ import './meridian/theme_editor.js';
++import './meridian/home.js';
+ import 'chrome://resources/cr_elements/cr_button/cr_button.js';
+ import 'chrome://resources/cr_elements/cr_icon_button/cr_icon_button.js';
+ import 'chrome://resources/cr_elements/cr_icon/cr_icon.js';
+@@ -116,6 +117,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       little_: {type: Boolean, reflect: true, attribute: 'little'},
+       sidebarRight_: {type: Boolean, reflect: true, attribute: 'sidebar-right'},
+       private_: {type: Boolean, reflect: true, attribute: 'private'},
++      showHome_: {state: true, type: Boolean},
+       sidebarPeek_: {type: Boolean, reflect: true, attribute: 'sidebar-peek'},
+       inactive_: {
+         type: Boolean,
+@@ -150,6 +152,8 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   protected accessor little_: boolean = false;
+   protected accessor sidebarRight_: boolean = false;
+   protected accessor private_: boolean = false;
++  // The active tab is a new tab: the home page shows instead.
++  protected accessor showHome_: boolean = false;
+ 
+   constructor() {
+     super();
+@@ -364,6 +368,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       }
+     }
+     this.showLocationIconButton_ = !isNTP;
++    this.showHome_ = isNTP && !this.private_;
+     this.url_ = displayUrl;
+     this.urlHost_ = hostForPill(displayUrl);
+     this.$.contentRegion.classList.toggle('modalScrim', active.isBlocked);
+@@ -516,6 +521,28 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.$.settings.show(this.$.tabstrip.spaces());
+   }
+ 
++  protected onMeridianHomeAction_(e: CustomEvent<string>) {
++    switch (e.detail) {
++      case 'command-bar':
++        this.$.commandBar.show(/*newTab=*/ false, '');
++        break;
++      case 'edit-theme': {
++        const space = this.$.tabstrip.activeSpace();
++        if (space) {
++          this.$.themeEditor.show(space);
++        }
++        break;
++      }
++      case 'new-space':
++        this.$.tabstrip.addSpace();
++        break;
++    }
++  }
++
++  protected onMeridianPreset_(e: CustomEvent<string>) {
++    this.$.onboarding.show('preset', e.detail);
++  }
++
+   protected onMeridianPrivate_(e: CustomEvent<boolean>) {
+     this.private_ = e.detail;
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/home.css b/chrome/browser/resources/webui_browser/meridian/home.css
+new file mode 100644
+index 0000000000..589d2f3ffe
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/home.css
+@@ -0,0 +1,560 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #css_wrapper_metadata_end */
++
++/* The home page, from the Electron build (src/renderer/home.css). */
++
++:host {
++  position: absolute;
++  inset: 0;
++  z-index: 5;
++  display: none;
++  color: var(--meridian-text-muted);
++  border-radius: var(--meridian-radius);
++  background: var(--meridian-surface);
++  overflow: hidden;
++}
++
++:host([shown]) {
++  display: block;
++}
++
++[hidden] {
++  display: none !important;
++}
++
++button {
++  font: inherit;
++  color: inherit;
++  background: none;
++  border: 0;
++  padding: 0;
++  cursor: default;
++}
++
++kbd {
++  display: inline-block;
++  min-width: 1.4em;
++  padding: 1px 5px;
++  margin-right: 2px;
++  border-radius: 5px;
++  font: 600 11px system-ui;
++  text-align: center;
++  color: var(--meridian-text);
++  background: color-mix(in srgb, var(--meridian-text) 7%, transparent);
++  box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--meridian-text) 15%,
++                                       transparent);
++}
++
++#scroller {
++  position: absolute;
++  inset: 0;
++  overflow-y: auto;
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  justify-content: safe center;
++  padding: 40px 24px 28px;
++  box-sizing: border-box;
++}
++
++@keyframes rise {
++  from {
++    opacity: 0;
++    transform: translateY(10px);
++  }
++}
++
++/* ------------------------------------------------------------ hero */
++
++.hero {
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  gap: 14px;
++  width: 100%;
++}
++
++.greet {
++  font-size: 30px;
++  font-weight: 650;
++  letter-spacing: -0.02em;
++  color: var(--meridian-text);
++  animation: rise 0.5s cubic-bezier(0.2, 0.8, 0.2, 1) both;
++}
++
++.search {
++  display: flex;
++  align-items: center;
++  gap: 12px;
++  width: min(560px, 100%);
++  height: 52px;
++  padding: 0 12px 0 18px;
++  box-sizing: border-box;
++  border-radius: 26px;
++  background: var(--meridian-surface);
++  color: var(--meridian-text-muted);
++  font-size: 15px;
++  text-align: left;
++  border: 1px solid var(--meridian-border);
++  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.05);
++  transition: transform 0.18s ease, box-shadow 0.18s ease,
++      border-color 0.18s ease;
++  animation: rise 0.5s 0.05s cubic-bezier(0.2, 0.8, 0.2, 1) both;
++}
++
++.search:hover {
++  transform: translateY(-1px);
++  border-color: color-mix(in srgb, var(--meridian-space) 55%, transparent);
++  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.12),
++      0 0 0 4px color-mix(in srgb, var(--meridian-space) 14%, transparent);
++}
++
++.search-ic {
++  display: inline-flex;
++  color: var(--meridian-space);
++}
++
++.search-text {
++  flex: 1;
++}
++
++.link {
++  color: var(--meridian-space);
++  font-size: 12.5px;
++  font-weight: 550;
++  padding: 2px 4px;
++  border-radius: 6px;
++}
++
++.link:hover {
++  text-decoration: underline;
++}
++
++/* ------------------------------------------------------------ cards */
++
++#more {
++  width: min(1040px, 100%);
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  gap: 18px;
++  margin-top: 34px;
++}
++
++.section {
++  width: 100%;
++}
++
++.head {
++  display: flex;
++  align-items: baseline;
++  justify-content: space-between;
++  margin: 0 4px 12px;
++}
++
++.head h2 {
++  margin: 0;
++  font-size: 15px;
++  font-weight: 650;
++  color: var(--meridian-text);
++}
++
++.cards {
++  display: grid;
++  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
++  gap: 14px;
++}
++
++.card {
++  position: relative;
++  display: flex;
++  flex-direction: column;
++  border-radius: 18px;
++  overflow: hidden;
++  outline: none;
++  background: var(--meridian-surface);
++  border: 1px solid var(--meridian-border);
++  color: var(--meridian-text);
++  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.05);
++  transition: transform 0.25s cubic-bezier(0.2, 0.8, 0.2, 1),
++      box-shadow 0.25s ease, border-color 0.25s ease;
++  animation: rise 0.55s calc(0.15s + var(--i) * 0.06s)
++      cubic-bezier(0.2, 0.8, 0.2, 1) both;
++}
++
++.card:hover,
++.card:focus-within {
++  transform: translateY(-3px);
++  border-color: color-mix(in srgb, var(--c) 45%, transparent);
++  box-shadow: 0 18px 44px color-mix(in srgb, var(--c) 22%, rgba(0, 0, 0, 0.1));
++}
++
++.demo {
++  height: 118px;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  background: radial-gradient(120% 100% at 30% 0%,
++      color-mix(in srgb, var(--c) 34%, var(--meridian-surface)) 0%,
++      color-mix(in srgb, var(--c) 10%, var(--meridian-surface)) 70%);
++}
++
++.body {
++  padding: 14px 16px 16px;
++  display: flex;
++  flex-direction: column;
++  gap: 4px;
++  flex: 1;
++}
++
++.title {
++  font-size: 12px;
++  font-weight: 650;
++  text-transform: uppercase;
++  letter-spacing: 0.06em;
++  color: color-mix(in srgb, var(--c) 75%, var(--meridian-text));
++}
++
++.tagline {
++  font-size: 17px;
++  font-weight: 650;
++  letter-spacing: -0.01em;
++  margin-bottom: 6px;
++}
++
++.points {
++  list-style: none;
++  margin: 0 0 12px;
++  padding: 0;
++  display: flex;
++  flex-direction: column;
++  gap: 7px;
++  font-size: 12.5px;
++  color: var(--meridian-text-muted);
++}
++
++.points li {
++  display: flex;
++  align-items: baseline;
++  gap: 8px;
++}
++
++.k {
++  flex: none;
++  min-width: 52px;
++}
++
++.k kbd {
++  font-size: 10.5px;
++  padding: 1px 4px;
++}
++
++.k em {
++  font-style: normal;
++  font-size: 10.5px;
++  font-weight: 650;
++  color: var(--c);
++  background: color-mix(in srgb, var(--c) 14%, transparent);
++  padding: 2px 6px;
++  border-radius: 5px;
++}
++
++.actions {
++  margin-top: auto;
++  display: flex;
++  flex-wrap: wrap;
++  gap: 8px;
++}
++
++.btn {
++  height: 26px;
++  padding: 0 10px;
++  border-radius: 7px;
++  font-size: 12px;
++  font-weight: 550;
++  white-space: nowrap;
++}
++
++.btn.accent {
++  background: color-mix(in oklab, var(--c) 80%, #141420);
++  color: #fff;
++}
++
++.btn.ghost:hover {
++  background: color-mix(in srgb, var(--meridian-text) 7%, transparent);
++}
++
++/* ------------------------------------------------------------ miniatures */
++
++/* They act out the feature while the card is hovered or focused. */
++.hd {
++  position: relative;
++  width: 150px;
++  height: 88px;
++  border-radius: 9px;
++  background: var(--meridian-surface);
++  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14), 0 0 0 0.5px var(--meridian-border);
++  overflow: hidden;
++}
++
++.hd i,
++.hd b {
++  position: absolute;
++  display: block;
++}
++
++.hd * {
++  animation-play-state: paused !important;
++}
++
++.card:hover .hd *,
++.card:focus-within .hd * {
++  animation-play-state: running !important;
++}
++
++.hd-side {
++  left: 0;
++  top: 0;
++  bottom: 0;
++  width: 34px;
++  box-sizing: border-box;
++  background: color-mix(in srgb, var(--c) 22%, var(--meridian-surface));
++  padding: 8px 5px;
++}
++
++.hd .hd-side b {
++  position: relative;
++  height: 5px;
++  border-radius: 3px;
++  background: color-mix(in srgb, var(--meridian-text) 18%, transparent);
++  margin-bottom: 5px;
++}
++
++.hd .hd-side b.on {
++  background: color-mix(in srgb, var(--c) 80%, var(--meridian-surface));
++}
++
++.hd-page {
++  left: 40px;
++  right: 6px;
++  top: 6px;
++  bottom: 6px;
++  border-radius: 5px;
++  background: linear-gradient(
++      color-mix(in srgb, var(--meridian-text) 9%, transparent) 0 8px,
++      transparent 8px 14px,
++      color-mix(in srgb, var(--meridian-text) 6%, transparent) 14px 40px,
++      transparent 40px);
++}
++
++.hd-find .hd-bar {
++  left: 30px;
++  right: 18px;
++  top: 14px;
++  height: 56px;
++  box-sizing: border-box;
++  border-radius: 6px;
++  background: var(--meridian-surface);
++  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18), 0 0 0 0.5px var(--meridian-border);
++  padding: 7px 7px 0;
++  animation: hd-pop 3.2s infinite cubic-bezier(0.2, 0.8, 0.2, 1);
++}
++
++.hd-find .hd-q {
++  position: relative;
++  height: 7px;
++  width: 0;
++  border-radius: 3px;
++  background: color-mix(in srgb, var(--c) 70%, var(--meridian-surface));
++  margin-bottom: 7px;
++  animation: hd-type 3.2s infinite steps(6);
++}
++
++.hd-find .hd-bar b {
++  position: relative;
++  height: 6px;
++  border-radius: 3px;
++  margin: 0 0 5px;
++  background: color-mix(in srgb, var(--meridian-text) 12%, transparent);
++}
++
++.hd-find .hd-bar b.hit {
++  animation: hd-hit 3.2s infinite;
++}
++
++@keyframes hd-pop {
++  0%,
++  8% {
++    transform: translateY(-6px) scale(0.92);
++    opacity: 0;
++  }
++  18%,
++  82% {
++    transform: none;
++    opacity: 1;
++  }
++  92%,
++  100% {
++    transform: scale(0.96);
++    opacity: 0;
++  }
++}
++
++@keyframes hd-type {
++  0%,
++  18% {
++    width: 0;
++  }
++  50%,
++  100% {
++    width: 60%;
++  }
++}
++
++@keyframes hd-hit {
++  0%,
++  52% {
++    background: color-mix(in srgb, var(--meridian-text) 12%, transparent);
++  }
++  60%,
++  100% {
++    background: color-mix(in srgb, var(--c) 55%, transparent);
++  }
++}
++
++.hd-split .hd-page.a {
++  right: 6px;
++  animation: hd-split-a 3.4s infinite cubic-bezier(0.6, 0, 0.2, 1);
++}
++
++.hd-split .hd-page.b {
++  left: auto;
++  right: 6px;
++  width: 0;
++  opacity: 0;
++  background: linear-gradient(
++      color-mix(in srgb, var(--c) 30%, transparent) 0 24px,
++      transparent 24px 30px,
++      color-mix(in srgb, var(--meridian-text) 6%, transparent) 30px);
++  animation: hd-split-b 3.4s infinite cubic-bezier(0.6, 0, 0.2, 1);
++}
++
++@keyframes hd-split-a {
++  0%,
++  20% {
++    right: 6px;
++  }
++  45%,
++  85% {
++    right: 58px;
++  }
++  100% {
++    right: 6px;
++  }
++}
++
++@keyframes hd-split-b {
++  0%,
++  20% {
++    width: 0;
++    opacity: 0;
++  }
++  45%,
++  85% {
++    width: 48px;
++    opacity: 1;
++  }
++  100% {
++    width: 0;
++    opacity: 0;
++  }
++}
++
++.hd-spaces .hd-side.s2 {
++  --c: #43cea2;
++  transform: translateX(-100%);
++  animation: hd-space-in 3.6s infinite cubic-bezier(0.6, 0, 0.2, 1);
++}
++
++.hd-spaces .hd-side.s1 {
++  animation: hd-space-out 3.6s infinite cubic-bezier(0.6, 0, 0.2, 1);
++}
++
++.hd-spaces .hd-dots {
++  left: 9px;
++  bottom: 6px;
++  display: flex;
++  gap: 4px;
++}
++
++.hd-spaces .hd-dots b {
++  position: relative;
++  width: 5px;
++  height: 5px;
++  border-radius: 50%;
++  background: color-mix(in srgb, var(--meridian-text) 25%, transparent);
++}
++
++@keyframes hd-space-in {
++  0%,
++  35% {
++    transform: translateX(-100%);
++  }
++  50%,
++  85% {
++    transform: none;
++  }
++  100% {
++    transform: translateX(-100%);
++  }
++}
++
++@keyframes hd-space-out {
++  0%,
++  35% {
++    transform: none;
++  }
++  50%,
++  85% {
++    transform: translateX(100%);
++    opacity: 0;
++  }
++  100% {
++    transform: none;
++  }
++}
++
++/* ------------------------------------------------------------ tip */
++
++.tip {
++  display: flex;
++  align-items: center;
++  gap: 4px;
++  font-size: 12.5px;
++  color: var(--meridian-text-muted);
++  min-height: 24px;
++  animation: rise 0.4s ease both;
++}
++
++.tip-label {
++  font-size: 10.5px;
++  font-weight: 700;
++  text-transform: uppercase;
++  letter-spacing: 0.08em;
++  color: var(--meridian-space);
++  margin-right: 4px;
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .greet,
++  .search,
++  .card,
++  .tip {
++    animation: none;
++  }
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/home.html.ts b/chrome/browser/resources/webui_browser/meridian/home.html.ts
+new file mode 100644
+index 0000000000..decd795f85
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/home.html.ts
+@@ -0,0 +1,87 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html, repeat} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {MeridianHomeElement} from './home.js';
++import {icon} from './icons.js';
++
++export function getHtml(this: MeridianHomeElement) {
++  return html`<!--_html_template_start_-->
++<div id="scroller">
++  <div class="hero">
++    <div class="greet">${this.greeting_}</div>
++    <button id="search" class="search" @click="${this.onSearchClick_}">
++      <span class="search-ic">${icon('search', 18)}</span>
++      <span class="search-text">Search or open a site</span>
++      <span class="search-keys"><kbd>⌘</kbd><kbd>T</kbd></span>
++    </button>
++    ${this.compact_ ? html`
++      <button id="expand" class="link" @click="${this.onExpandClick_}">
++        What can Meridian do?</button>` : ''}
++  </div>
++  <div id="more" ?hidden="${this.compact_}">
++    <section class="section">
++      <div class="head">
++        <h2>What Meridian can do</h2>
++        <button id="compact" class="link" @click="${this.onCompactClick_}">
++          Show less</button>
++      </div>
++      <div class="cards">
++        ${this.cards_.map(c => html`
++          <article class="card" data-card="${c.id}"
++              style="--c:${c.color};--i:${c.index}" tabindex="0">
++            <div class="demo">
++              ${c.demo === 'find' ? html`
++                <div class="hd hd-find">
++                  <i class="hd-side"><b></b><b></b><b class="on"></b><b></b></i>
++                  <i class="hd-page"></i>
++                  <i class="hd-bar"><i class="hd-q"></i><b></b><b class="hit"></b>
++                    <b></b></i>
++                </div>` : ''}
++              ${c.demo === 'split' ? html`
++                <div class="hd hd-split">
++                  <i class="hd-side"><b></b><b></b><b class="on"></b><b></b></i>
++                  <i class="hd-page a"></i><i class="hd-page b"></i>
++                </div>` : ''}
++              ${c.demo === 'spaces' ? html`
++                <div class="hd hd-spaces">
++                  <i class="hd-side s1"><b></b><b class="on"></b><b></b></i>
++                  <i class="hd-side s2"><b class="on"></b><b></b></i>
++                  <i class="hd-page"></i><i class="hd-dots"><b></b><b></b></i>
++                </div>` : ''}
++            </div>
++            <div class="body">
++              <div class="title">${c.title}</div>
++              <div class="tagline">${c.tagline}</div>
++              <ul class="points">
++                ${c.points.map(p => html`
++                  <li>
++                    <span class="k">
++                      ${p.label ? html`<em>${p.label}</em>` : ''}
++                      ${p.keys.map(k => html`<kbd>${k}</kbd>`)}
++                    </span>
++                    <span>${p.text}</span>
++                  </li>`)}
++              </ul>
++              <div class="actions">
++                <button class="btn accent" data-action="${c.tryAction}"
++                    @click="${this.onTryClick_}">${c.tryLabel}</button>
++                <button class="btn ghost" data-persona="${c.id}"
++                    @click="${this.onPresetClick_}">Set up for me</button>
++              </div>
++            </div>
++          </article>`)}
++      </div>
++    </section>
++    ${repeat([this.tipIndex_], i => i, () => html`
++      <div id="tip" class="tip" aria-live="polite">
++        <span class="tip-label">Tip</span>
++        ${this.tipKeys_.map(k => html`<kbd>${k}</kbd>`)}
++        <span>${this.tipText_}</span>
++      </div>`)}
++  </div>
++</div>
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/home.ts b/chrome/browser/resources/webui_browser/meridian/home.ts
+new file mode 100644
+index 0000000000..49aa5a61b7
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/home.ts
+@@ -0,0 +1,212 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The home page, shown instead of an empty new tab: a greeting, a big search
++// field that opens ⌘T, what Meridian can do (a card per kind of person, each
++// with something to try and a preset), and shortcut tips.
++
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {getCss} from './home.css.js';
++import {getHtml} from './home.html.js';
++
++export interface HomePoint {
++  // Keys ("⌘T") show as keycaps; words ("Peek") as a label.
++  keys: string[];
++  label: string;
++  text: string;
++}
++
++export interface HomeCard {
++  id: string;
++  index: number;
++  title: string;
++  tagline: string;
++  color: string;
++  demo: 'find'|'split'|'spaces';
++  points: HomePoint[];
++  tryLabel: string;
++  tryAction: 'command-bar'|'edit-theme'|'new-space';
++}
++
++const keys = (k: string) => k.split(' ');
++
++const CARDS: HomeCard[] = [
++  {
++    id: 'everyday',
++    index: 0,
++    title: 'For every day',
++    tagline: 'Tabs that tidy themselves.',
++    color: '#8a8fe0',
++    demo: 'find',
++    points: [
++      {keys: keys('⌘ T'), label: '', text: 'Find any open tab by typing a few letters'},
++      {keys: [], label: 'Today', text: 'Tabs you don’t pin are archived after a while'},
++      {keys: keys('⌘ D'), label: '', text: 'Pinned tabs always return to their home page'},
++    ],
++    tryLabel: 'Try ⌘T',
++    tryAction: 'command-bar',
++  },
++  {
++    id: 'designer',
++    index: 1,
++    title: 'For designers',
++    tagline: 'Two pages at a glance.',
++    color: '#c471f5',
++    demo: 'split',
++    points: [
++      {keys: keys('⌃ ⇧ ='), label: '', text: 'Split view: two pages side by side'},
++      {keys: [], label: 'Peek', text: 'Links from pinned tabs open in a preview'},
++      {keys: [], label: 'Theme', text: 'Every space gets its own colour'},
++    ],
++    tryLabel: 'Pick a colour',
++    tryAction: 'edit-theme',
++  },
++  {
++    id: 'manager',
++    index: 2,
++    title: 'For managers',
++    tagline: 'Work and life, kept apart.',
++    color: '#4facfe',
++    demo: 'spaces',
++    points: [
++      {keys: keys('⌃ 1–9'), label: '', text: 'Spaces for work and personal'},
++      {keys: [], label: 'Links', text: 'A little window for links from other apps'},
++      {keys: keys('⌥ ⌘ A'), label: '', text: 'Everything you closed, in the Archive'},
++    ],
++    tryLabel: 'Make a space',
++    tryAction: 'new-space',
++  },
++];
++
++const TIPS: Array<[string[], string]> = [
++  [keys('⌘ T'), 'finds any open tab, in any space'],
++  [keys('⌃ ⇥'), 'jumps to the next tab without the mouse'],
++  [keys('⌃ 1–9'), 'switches straight to a space'],
++  [keys('⇧ ⌘ C'), 'copies the address of the page'],
++  [keys('⌘ S'), 'hides the sidebar for a full-width page'],
++  [keys('⌥ ⌘ A'), 'shows every tab you closed'],
++  [keys('⌘ D'), 'pins the tab so it’s always there'],
++];
++
++const COMPACT_KEY = 'meridian.homeCompact';
++
++function readCompact(): boolean {
++  try {
++    return localStorage.getItem(COMPACT_KEY) === '1';
++  } catch {
++    return false;
++  }
++}
++
++export class MeridianHomeElement extends CrLitElement {
++  static get is() {
++    return 'meridian-home';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      shown: {type: Boolean, reflect: true},
++      compact_: {type: Boolean, reflect: true, attribute: 'compact'},
++      greeting_: {state: true, type: String},
++      tipKeys_: {state: true, type: Array},
++      tipText_: {state: true, type: String},
++      tipIndex_: {state: true, type: Number},
++      cards_: {state: true, type: Array},
++    };
++  }
++
++  accessor shown: boolean = false;
++  protected accessor compact_: boolean = readCompact();
++  protected accessor greeting_: string = '';
++  protected accessor tipKeys_: string[] = [];
++  protected accessor tipText_: string = '';
++  protected accessor tipIndex_: number = 0;
++  protected accessor cards_: HomeCard[] = CARDS;
++
++  private tipTimer_: number|null = null;
++
++  override willUpdate(changed: PropertyValues<this>) {
++    super.willUpdate(changed);
++    if (changed.has('shown' as keyof MeridianHomeElement)) {
++      if (this.shown) {
++        this.greeting_ = this.greet_();
++        this.startTips_();
++      } else {
++        this.stopTips_();
++      }
++    }
++    const [tipKeys, tipText] = TIPS[this.tipIndex_ % TIPS.length]!;
++    this.tipKeys_ = tipKeys;
++    this.tipText_ = tipText;
++  }
++
++  private greet_(): string {
++    const h = new Date().getHours();
++    return h < 5 ? 'Good night' :
++        h < 12   ? 'Good morning' :
++        h < 18   ? 'Good afternoon' :
++                   'Good evening';
++  }
++
++  private startTips_() {
++    this.stopTips_();
++    this.tipTimer_ = setInterval(() => this.tipIndex_++, 7000);
++  }
++
++  private stopTips_() {
++    if (this.tipTimer_ !== null) {
++      clearInterval(this.tipTimer_);
++      this.tipTimer_ = null;
++    }
++  }
++
++  private setCompact_(compact: boolean) {
++    this.compact_ = compact;
++    try {
++      localStorage.setItem(COMPACT_KEY, compact ? '1' : '');
++    } catch {
++      // Storage unavailable: the choice lasts until the window closes.
++    }
++  }
++
++  protected onSearchClick_() {
++    this.fire('meridian-home-action', 'command-bar');
++  }
++
++  protected onTryClick_(e: Event) {
++    this.fire('meridian-home-action',
++              (e.currentTarget as HTMLElement).dataset['action']);
++  }
++
++  protected onPresetClick_(e: Event) {
++    this.fire('meridian-preset',
++              (e.currentTarget as HTMLElement).dataset['persona']);
++  }
++
++  protected onCompactClick_() {
++    this.setCompact_(true);
++  }
++
++  protected onExpandClick_() {
++    this.setCompact_(false);
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-home': MeridianHomeElement;
++  }
++}
++
++customElements.define(MeridianHomeElement.is, MeridianHomeElement);
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+index 066a576e9b..0f138d1b7b 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+@@ -143,8 +143,9 @@ export class MeridianOnboardingElement extends CrLitElement {
+   private fresh_: boolean = false;
+   private helloTimer_: number|null = null;
+ 
+-  // `start`: 'arc' opens straight at the Arc step (File > Import from Arc).
+-  async show(start: 'tour'|'arc' = 'tour') {
++  // `start`: 'arc' opens straight at the Arc step (File > Import from Arc);
++  // 'preset' shows the setup for `persona` (the home page's "Set up for me").
++  async show(start: 'tour'|'arc'|'preset' = 'tour', persona = '') {
+     if (this.open) {
+       return;
+     }
+@@ -163,7 +164,15 @@ export class MeridianOnboardingElement extends CrLitElement {
+     this.useApps_ = true;
+     this.note_ = '';
+     this.busy_ = '';
+-    this.steps_ = start === 'arc' ? ['arc', 'done'] : this.tourSteps_();
++    if (start === 'preset') {
++      const {proposal} = await this.handler_.proposeSetup(false, persona);
++      this.proposal_ = proposal;
++      this.pickedSpaces_ = proposal.spaces.map(() => true);
++      this.pickedFavorites_ = proposal.favorites.map(() => true);
++      this.steps_ = ['preview', 'done'];
++    } else {
++      this.steps_ = start === 'arc' ? ['arc', 'done'] : this.tourSteps_();
++    }
+     this.step_ = this.steps_[0]!;
+     this.open = true;
+     this.startHello_();
+@@ -382,7 +391,7 @@ export class MeridianOnboardingElement extends CrLitElement {
+     this.thinking_ = true;
+     this.lines_ = this.useApps_ ? ['Looking at your apps…'] : [];
+     const [{proposal}] = await Promise.all([
+-      this.handler_.proposeSetup(this.useApps_),
++      this.handler_.proposeSetup(this.useApps_, ''),
+       new Promise(r => setTimeout(r, 1500)),
+     ]);
+     if (!this.open || this.step_ !== 'tailor') {
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 9862453923..fc8378eaf0 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -797,7 +797,12 @@ export class MeridianSidebarElement extends CrLitElement implements
+     }
+   }
+ 
+-  protected async onAddSpaceClick_() {
++  protected onAddSpaceClick_() {
++    this.addSpace();
++  }
++
++  // A new space, named in place.
++  async addSpace() {
+     const n = (this.state_?.spaces.length || 0);
+     const [color, color2] = SPACE_COLORS[n % SPACE_COLORS.length]!;
+     const {spaceId} = await this.handler_.createSpace(
