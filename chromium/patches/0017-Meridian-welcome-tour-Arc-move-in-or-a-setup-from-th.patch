@@ -1,0 +1,2624 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 27 Oct 2026 19:01:23 +0400
+Subject: [PATCH 18/18] Meridian: welcome tour (Arc move-in or a setup from the
+ installed apps, default browser), Help > Welcome Tour, Import from Arc
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/app/chrome_command_ids.h               |   2 +
+ chrome/app/meridian_strings.grdp              |   6 +
+ chrome/browser/meridian/BUILD.gn              |   5 +
+ chrome/browser/meridian/atc.cc                |   5 -
+ chrome/browser/meridian/atc.h                 |   8 +-
+ chrome/browser/meridian/little_window.cc      |   3 +-
+ chrome/browser/meridian/prefs.cc              |  17 +
+ chrome/browser/meridian/prefs.h               |  25 +
+ chrome/browser/meridian/setup_profile.cc      | 203 ++++
+ chrome/browser/meridian/setup_profile.h       |  44 +
+ .../meridian/setup_profile_unittest.cc        |  52 +
+ chrome/browser/meridian/sidebar.mojom         |  28 +
+ chrome/browser/meridian/sidebar_handler.cc    | 108 +-
+ chrome/browser/meridian/sidebar_handler.h     |   7 +
+ .../browser/meridian/sidebar_handler_mac.mm   |  46 +
+ chrome/browser/prefs/browser_prefs.cc         |   4 +-
+ .../browser/resources/webui_browser/BUILD.gn  |   3 +
+ .../resources/webui_browser/app.html.ts       |   4 +-
+ chrome/browser/resources/webui_browser/app.ts |   7 +
+ .../resources/webui_browser/meridian/icons.ts |  31 +-
+ .../webui_browser/meridian/onboarding.css     | 925 ++++++++++++++++++
+ .../webui_browser/meridian/onboarding.html.ts | 186 ++++
+ .../webui_browser/meridian/onboarding.ts      | 430 ++++++++
+ .../webui_browser/meridian/sidebar.ts         |  12 +
+ .../browser/ui/browser_command_controller.cc  |   3 +-
+ chrome/browser/ui/cocoa/main_menu_builder.mm  |   5 +
+ 26 files changed, 2144 insertions(+), 25 deletions(-)
+ create mode 100644 chrome/browser/meridian/prefs.cc
+ create mode 100644 chrome/browser/meridian/prefs.h
+ create mode 100644 chrome/browser/meridian/setup_profile.cc
+ create mode 100644 chrome/browser/meridian/setup_profile.h
+ create mode 100644 chrome/browser/meridian/setup_profile_unittest.cc
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/onboarding.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/onboarding.ts
+
+diff --git a/chrome/app/chrome_command_ids.h b/chrome/app/chrome_command_ids.h
+index cfc0e3edf0..b52c435d14 100644
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -125,6 +125,8 @@
+ #define IDC_MERIDIAN_UNSPLIT          39708
+ #define IDC_MERIDIAN_ARCHIVE          39709
+ #define IDC_MERIDIAN_CLEAR_TODAY      39719
++#define IDC_MERIDIAN_WELCOME_TOUR     39720
++#define IDC_MERIDIAN_IMPORT_ARC       39721
+ // Spaces 1-9: IDC_MERIDIAN_SPACE_1 + n.
+ #define IDC_MERIDIAN_SPACE_1          39710
+ #define IDC_MERIDIAN_SPACE_9          39718
+diff --git a/chrome/app/meridian_strings.grdp b/chrome/app/meridian_strings.grdp
+index e9ca709c14..c4d7ef27c0 100644
+--- a/chrome/app/meridian_strings.grdp
++++ b/chrome/app/meridian_strings.grdp
+@@ -25,4 +25,10 @@
+   <message name="IDS_MERIDIAN_CLEAR_TODAY_MAC" desc="Menu item: archive all Today tabs of the current space.">
+     Clear Today
+   </message>
++  <message name="IDS_MERIDIAN_WELCOME_TOUR_MAC" desc="Help menu item: open Meridian's welcome tour again.">
++    Welcome Tour
++  </message>
++  <message name="IDS_MERIDIAN_IMPORT_ARC_MAC" desc="App menu item: bring spaces, tabs and sign-ins over from the Arc browser.">
++    Import from Arc…
++  </message>
+ </grit-part>
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 7d4a50fcc0..679ff7f518 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -24,6 +24,10 @@ source_set("model") {
+     "archive_service.h",
+     "atc.cc",
+     "atc.h",
++    "prefs.cc",
++    "prefs.h",
++    "setup_profile.cc",
++    "setup_profile.h",
+     "sidebar_service.cc",
+     "sidebar_service.h",
+   ]
+@@ -106,6 +110,7 @@ test("meridian_unittests") {
+     "arc_import_unittest.cc",
+     "archive_service_unittest.cc",
+     "atc_unittest.cc",
++    "setup_profile_unittest.cc",
+     "sidebar_service_unittest.cc",
+   ]
+   deps = [
+diff --git a/chrome/browser/meridian/atc.cc b/chrome/browser/meridian/atc.cc
+index 27044b9f89..72d4f9bd37 100644
+--- a/chrome/browser/meridian/atc.cc
++++ b/chrome/browser/meridian/atc.cc
+@@ -7,7 +7,6 @@
+ #include <algorithm>
+ 
+ #include "base/strings/string_util.h"
+-#include "components/pref_registry/pref_registry_syncable.h"
+ #include "url/gurl.h"
+ #include "url/url_constants.h"
+ 
+@@ -78,10 +77,6 @@ AtcRoute ResolveTarget(const std::string* target,
+ 
+ }  // namespace
+ 
+-void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+-  registry->RegisterDictionaryPref(kAtcPref);
+-}
+-
+ bool AtcRuleMatches(std::string_view pattern, const GURL& url) {
+   if (!url.SchemeIsHTTPOrHTTPS()) {
+     return false;
+diff --git a/chrome/browser/meridian/atc.h b/chrome/browser/meridian/atc.h
+index 81c71de799..d1312a8f4a 100644
+--- a/chrome/browser/meridian/atc.h
++++ b/chrome/browser/meridian/atc.h
+@@ -13,10 +13,6 @@
+ 
+ class GURL;
+ 
+-namespace user_prefs {
+-class PrefRegistrySyncable;
+-}
+-
+ namespace meridian {
+ 
+ // Air Traffic Control: where a link opened from another app goes (like Arc's).
+@@ -31,9 +27,7 @@ namespace meridian {
+ //            "main"              a new tab in the space you're in
+ //            "space:<id>"        a new tab in that space ("main" if it's gone)
+ // Rules are checked top to bottom; the first match wins.
+-inline constexpr char kAtcPref[] = "meridian.atc";
+-
+-void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
++// The rules live in the prefs::kAtc pref.
+ 
+ bool AtcRuleMatches(std::string_view pattern, const GURL& url);
+ 
+diff --git a/chrome/browser/meridian/little_window.cc b/chrome/browser/meridian/little_window.cc
+index 6ea8c51202..17d5cc1069 100644
+--- a/chrome/browser/meridian/little_window.cc
++++ b/chrome/browser/meridian/little_window.cc
+@@ -9,6 +9,7 @@
+ #include "base/callback_list.h"
+ #include "base/no_destructor.h"
+ #include "chrome/browser/meridian/atc.h"
++#include "chrome/browser/meridian/prefs.h"
+ #include "chrome/browser/meridian/sidebar_service.h"
+ #include "chrome/browser/meridian/sidebar_service_factory.h"
+ #include "chrome/browser/meridian/tab_data.h"
+@@ -104,7 +105,7 @@ void OpenExternalLink(Profile* profile, const GURL& url) {
+     space_ids.push_back(space.id);
+   }
+   AtcRoute route =
+-      RouteLink(profile->GetPrefs()->GetDict(kAtcPref), url, space_ids);
++      RouteLink(profile->GetPrefs()->GetDict(prefs::kAtc), url, space_ids);
+   if (route.target == AtcRoute::Target::kLittle) {
+     OpenLittleWindow(profile, url);
+     return;
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+new file mode 100644
+index 0000000000..0a6f033f4f
+--- /dev/null
++++ b/chrome/browser/meridian/prefs.cc
+@@ -0,0 +1,17 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/prefs.h"
++
++#include "components/pref_registry/pref_registry_syncable.h"
++
++namespace meridian::prefs {
++
++void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
++  registry->RegisterDictionaryPref(kAtc);
++  registry->RegisterBooleanPref(kOnboarded, false);
++  registry->RegisterStringPref(kMode, "everyday");
++}
++
++}  // namespace meridian::prefs
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+new file mode 100644
+index 0000000000..e53f4cd4e8
+--- /dev/null
++++ b/chrome/browser/meridian/prefs.h
+@@ -0,0 +1,25 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_PREFS_H_
++#define CHROME_BROWSER_MERIDIAN_PREFS_H_
++
++namespace user_prefs {
++class PrefRegistrySyncable;
++}
++
++namespace meridian::prefs {
++
++// Air Traffic Control rules (atc.h).
++inline constexpr char kAtc[] = "meridian.atc";
++// The welcome tour was finished or skipped.
++inline constexpr char kOnboarded[] = "meridian.onboarded";
++// "everyday", "creative" or "developer": which tools Meridian offers.
++inline constexpr char kMode[] = "meridian.mode";
++
++void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
++
++}  // namespace meridian::prefs
++
++#endif  // CHROME_BROWSER_MERIDIAN_PREFS_H_
+diff --git a/chrome/browser/meridian/setup_profile.cc b/chrome/browser/meridian/setup_profile.cc
+new file mode 100644
+index 0000000000..20119adddd
+--- /dev/null
++++ b/chrome/browser/meridian/setup_profile.cc
+@@ -0,0 +1,203 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/setup_profile.h"
++
++#include <algorithm>
++#include <map>
++#include <set>
++
++#include "base/base_paths.h"
++#include "base/no_destructor.h"
++#include "base/files/file_enumerator.h"
++#include "base/path_service.h"
++#include "base/strings/string_util.h"
++
++namespace meridian {
++
++namespace {
++
++struct WebApp {
++  const char* title;
++  const char* url;
++};
++
++// Web apps a proposal can put in Favorites.
++const std::map<std::string_view, WebApp>& Catalog() {
++  static const base::NoDestructor<std::map<std::string_view, WebApp>> catalog({
++      {"gmail", {"Gmail", "https://mail.google.com/"}},
++      {"calendar", {"Google Calendar", "https://calendar.google.com/"}},
++      {"docs", {"Google Docs", "https://docs.google.com/"}},
++      {"maps", {"Google Maps", "https://maps.google.com/"}},
++      {"outlook", {"Outlook", "https://outlook.office.com/"}},
++      {"teams", {"Microsoft Teams", "https://teams.microsoft.com/"}},
++      {"notion", {"Notion", "https://www.notion.so/"}},
++      {"slack", {"Slack", "https://app.slack.com/"}},
++      {"linear", {"Linear", "https://linear.app/"}},
++      {"figma", {"Figma", "https://www.figma.com/files"}},
++      {"dribbble", {"Dribbble", "https://dribbble.com/"}},
++      {"pinterest", {"Pinterest", "https://www.pinterest.com/"}},
++      {"github", {"GitHub", "https://github.com/"}},
++      {"claude", {"Claude", "https://claude.ai/"}},
++      {"telegram", {"Telegram", "https://web.telegram.org/"}},
++      {"whatsapp", {"WhatsApp", "https://web.whatsapp.com/"}},
++      {"youtube", {"YouTube", "https://www.youtube.com/"}},
++  });
++  return *catalog;
++}
++
++// Case-insensitive "starts with any of".
++bool HasApp(const std::vector<std::string>& apps,
++            std::initializer_list<std::string_view> prefixes) {
++  return std::ranges::any_of(apps, [&](const std::string& app) {
++    return std::ranges::any_of(prefixes, [&](std::string_view prefix) {
++      return base::StartsWith(app, prefix,
++                              base::CompareCase::INSENSITIVE_ASCII);
++    });
++  });
++}
++
++constexpr std::initializer_list<std::string_view> kDevApps = {
++    "Xcode",      "Visual Studio Code", "Cursor",         "Zed",
++    "IntelliJ",   "WebStorm",           "PyCharm",        "Rider",
++    "GoLand",     "Android Studio",     "iTerm",          "Warp",
++    "Ghostty",    "Docker",             "OrbStack",       "Postman",
++    "TablePlus",  "Sublime Text",       "Nova",           "Tower",
++    "Fork",       "GitHub Desktop"};
++constexpr std::initializer_list<std::string_view> kDesignApps = {
++    "Figma",           "Sketch",
++    "Adobe Photoshop", "Adobe Illustrator",
++    "Adobe XD",        "Adobe InDesign",
++    "Adobe After Effects", "Adobe Premiere",
++    "Affinity",        "Pixelmator",
++    "Framer",          "Principle",
++    "Blender",         "Cinema 4D",
++    "Procreate",       "Spline",
++    "Rive"};
++constexpr std::initializer_list<std::string_view> kOfficeApps = {
++    "Slack",    "Microsoft Teams", "Microsoft Outlook", "Microsoft Excel",
++    "Microsoft Word", "Microsoft PowerPoint", "Zoom", "Notion",
++    "Linear",   "Keynote",  "Numbers", "Pages", "Miro", "Loom",
++    "Superhuman", "Spark"};
++// Shown back to the person ("Found Figma, Slack…").
++constexpr std::initializer_list<std::string_view> kNotableApps = {
++    "Figma",   "Sketch",   "Adobe ",   "Affinity ", "Framer",  "Blender",
++    "Procreate", "Xcode",  "Visual Studio Code", "Cursor", "Zed",
++    "IntelliJ IDEA", "WebStorm", "PyCharm", "Rider", "Android Studio",
++    "iTerm",   "Warp",     "Ghostty",  "Docker",    "OrbStack", "Postman",
++    "Slack",   "Microsoft Teams", "Microsoft Outlook", "Microsoft Excel",
++    "Microsoft Word", "Microsoft PowerPoint", "Zoom", "Notion", "Linear",
++    "Keynote", "Miro",     "Loom",     "Telegram",  "WhatsApp", "Discord",
++    "Spotify", "Obsidian", "Logic Pro", "Final Cut Pro", "DaVinci Resolve",
++    "Ableton Live"};
++
++Space MakeSpace(const char* name, const char* icon, const char* color) {
++  Space space;
++  space.name = name;
++  space.icon = icon;
++  space.color = color;
++  space.color2 = color;
++  return space;
++}
++
++}  // namespace
++
++SetupProposal::SetupProposal() = default;
++SetupProposal::SetupProposal(const SetupProposal&) = default;
++SetupProposal& SetupProposal::operator=(const SetupProposal&) = default;
++SetupProposal::~SetupProposal() = default;
++
++std::vector<std::string> InstalledApps() {
++  std::set<std::string> names;
++  base::FilePath home;
++  base::PathService::Get(base::DIR_HOME, &home);
++  for (const base::FilePath& dir :
++       {base::FilePath("/Applications"),
++        base::FilePath("/Applications/Utilities"), home.Append("Applications"),
++        base::FilePath("/System/Applications")}) {
++    base::FileEnumerator apps(dir, false, base::FileEnumerator::DIRECTORIES,
++                              "*.app");
++    for (base::FilePath app = apps.Next(); !app.empty(); app = apps.Next()) {
++      std::string name = app.BaseName().RemoveExtension().value();
++      if (!name.empty() && name.size() <= 60 && name[0] != '.') {
++        names.insert(name);
++      }
++      if (names.size() >= 250) {
++        break;
++      }
++    }
++  }
++  return std::vector<std::string>(names.begin(), names.end());
++}
++
++SetupProposal ProposeSetup(const std::vector<std::string>& apps,
++                           std::string_view locale,
++                           std::string_view persona) {
++  bool ru = base::StartsWith(locale, "ru") || base::StartsWith(locale, "uk") ||
++            base::StartsWith(locale, "be") || base::StartsWith(locale, "kk");
++  auto t = [ru](const char* en, const char* ru_text) {
++    return ru ? ru_text : en;
++  };
++  std::string pick(persona);
++  if (pick != "developer" && pick != "designer" && pick != "manager" &&
++      pick != "everyday") {
++    pick = HasApp(apps, kDevApps)        ? "developer"
++           : HasApp(apps, kDesignApps)   ? "designer"
++           : HasApp(apps, kOfficeApps)   ? "manager"
++                                         : "everyday";
++  }
++  bool slack = HasApp(apps, {"Slack"});
++  SetupProposal p;
++  p.persona = pick;
++  std::vector<std::string_view> favorites;
++  if (pick == "developer") {
++    p.mode = "developer";
++    p.color = "#7f7fd5";
++    p.title = t("Set up for building things", "Для разработчика");
++    p.spaces = {MakeSpace(t("Work", "Работа"), "💼", "#7f7fd5"),
++                MakeSpace(t("Personal", "Личное"), "🏠", "#43cea2")};
++    favorites = {"github", "linear", slack ? "slack" : "gmail", "claude"};
++  } else if (pick == "designer") {
++    p.mode = "creative";
++    p.color = "#c471f5";
++    p.title = t("Set up for design work", "Для дизайнера");
++    p.spaces = {MakeSpace(t("Projects", "Проекты"), "🎨", "#c471f5"),
++                MakeSpace(t("Inspiration", "Вдохновение"), "💡", "#f7b267"),
++                MakeSpace(t("Personal", "Личное"), "🏠", "#43cea2")};
++    favorites = {"figma", "dribbble", "pinterest", slack ? "slack" : "gmail"};
++  } else if (pick == "manager") {
++    p.mode = "creative";
++    p.color = "#4facfe";
++    p.title = t("Set up for teamwork", "Для работы с командой");
++    p.spaces = {MakeSpace(t("Work", "Работа"), "💼", "#4facfe"),
++                MakeSpace(t("Personal", "Личное"), "🏠", "#43cea2")};
++    bool outlook = std::ranges::any_of(apps, [](const std::string& a) {
++      return a.find("Outlook") != std::string::npos;
++    });
++    favorites = {outlook ? "outlook" : "gmail", "calendar",
++                 slack ? "slack" : "teams",
++                 HasApp(apps, {"Notion"}) ? "notion" : "docs"};
++  } else {
++    p.mode = "everyday";
++    p.color = "#8a8fe0";
++    p.title = t("Set up for everyday browsing", "Для каждого дня");
++    p.spaces = {MakeSpace(t("Personal", "Личное"), "🏠", "#8a8fe0")};
++    favorites = {"gmail", "youtube", "maps", ru ? "telegram" : "whatsapp"};
++  }
++  for (std::string_view id : favorites) {
++    const WebApp& app = Catalog().at(id);
++    Item item;
++    item.title = app.title;
++    item.url = GURL(app.url);
++    p.favorites.push_back(std::move(item));
++  }
++  for (const std::string& app : apps) {
++    if (p.seen.size() < 8 && HasApp({app}, kNotableApps)) {
++      p.seen.push_back(app);
++    }
++  }
++  return p;
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/setup_profile.h b/chrome/browser/meridian/setup_profile.h
+new file mode 100644
+index 0000000000..ebb05c15b2
+--- /dev/null
++++ b/chrome/browser/meridian/setup_profile.h
+@@ -0,0 +1,44 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_SETUP_PROFILE_H_
++#define CHROME_BROWSER_MERIDIAN_SETUP_PROFILE_H_
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "chrome/browser/meridian/sidebar_service.h"
++
++namespace meridian {
++
++// "Let's make it yours" in the welcome tour: a starting setup (spaces and
++// favorites) guessed from the apps installed on this computer, with simple
++// rules. It runs locally; nothing is sent anywhere.
++struct SetupProposal {
++  SetupProposal();
++  SetupProposal(const SetupProposal&);
++  SetupProposal& operator=(const SetupProposal&);
++  ~SetupProposal();
++
++  std::string persona;  // developer, designer, manager or everyday
++  std::string mode;     // developer, creative or everyday
++  std::string title;
++  std::string color;
++  std::vector<Space> spaces;      // name, icon and colour only
++  std::vector<Item> favorites;    // links
++  std::vector<std::string> seen;  // notable apps found, to show back
++};
++
++// Names of the installed apps (blocking: reads /Applications and the like).
++std::vector<std::string> InstalledApps();
++
++// `persona` empty: guessed from `apps`. `locale` picks Russian names.
++SetupProposal ProposeSetup(const std::vector<std::string>& apps,
++                           std::string_view locale,
++                           std::string_view persona = {});
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_SETUP_PROFILE_H_
+diff --git a/chrome/browser/meridian/setup_profile_unittest.cc b/chrome/browser/meridian/setup_profile_unittest.cc
+new file mode 100644
+index 0000000000..4fb6402e9a
+--- /dev/null
++++ b/chrome/browser/meridian/setup_profile_unittest.cc
+@@ -0,0 +1,52 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/setup_profile.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace meridian {
++namespace {
++
++std::vector<std::string> Titles(const std::vector<Item>& items) {
++  std::vector<std::string> out;
++  for (const Item& item : items) {
++    out.push_back(item.title);
++  }
++  return out;
++}
++
++TEST(SetupProfileTest, GuessesFromInstalledApps) {
++  SetupProposal dev =
++      ProposeSetup({"Calculator", "Slack", "Visual Studio Code"}, "en-US");
++  EXPECT_EQ(dev.persona, "developer");
++  EXPECT_EQ(dev.mode, "developer");
++  EXPECT_EQ(Titles(dev.favorites),
++            (std::vector<std::string>{"GitHub", "Linear", "Slack", "Claude"}));
++  EXPECT_EQ(dev.seen, (std::vector<std::string>{"Slack", "Visual Studio Code"}));
++
++  EXPECT_EQ(ProposeSetup({"Figma"}, "en").persona, "designer");
++  SetupProposal manager = ProposeSetup({"Microsoft Outlook", "Zoom"}, "en");
++  EXPECT_EQ(manager.persona, "manager");
++  EXPECT_EQ(manager.favorites[0].title, "Outlook");
++  EXPECT_EQ(manager.favorites[2].title, "Microsoft Teams");
++}
++
++TEST(SetupProfileTest, EverydayInTheirLanguage) {
++  SetupProposal p = ProposeSetup({"Calculator"}, "ru-RU");
++  EXPECT_EQ(p.persona, "everyday");
++  ASSERT_EQ(p.spaces.size(), 1u);
++  EXPECT_EQ(p.spaces[0].name, "Личное");
++  EXPECT_EQ(p.favorites.back().title, "Telegram");
++  EXPECT_EQ(p.favorites[0].url, GURL("https://mail.google.com/"));
++  EXPECT_TRUE(p.seen.empty());
++}
++
++TEST(SetupProfileTest, PersonaOverridesTheGuess) {
++  EXPECT_EQ(ProposeSetup({"Xcode"}, "en", "designer").persona, "designer");
++  EXPECT_EQ(ProposeSetup({"Xcode"}, "en", "bogus").persona, "developer");
++}
++
++}  // namespace
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 003e85ea7b..0009481490 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -67,6 +67,8 @@ struct SidebarState {
+   array<Item> favorites;
+   array<TabInfo> tabs;
+   array<Split> splits;
++  // The welcome tour should open (first start of this profile).
++  bool onboarding;
+   // A Little window (a link from another app): no sidebar, a bar with
+   // "Open in Meridian".
+   bool little;
+@@ -110,6 +112,21 @@ enum Command {
+   kUnsplit,
+   kShowArchive,
+   kClearToday,
++  // Help > Welcome Tour, File > Import from Arc (the tour's Arc step).
++  kWelcomeTour,
++  kImportArc,
++};
++
++// A starting setup for the welcome tour (setup_profile.h).
++struct SetupProposal {
++  string title;
++  // "everyday", "creative" or "developer".
++  string mode;
++  // Name, icon and colour only.
++  array<Space> spaces;
++  array<Item> favorites;
++  // Notable apps it was based on, to show back.
++  array<string> seen_apps;
+ };
+ 
+ interface SidebarHandlerFactory {
+@@ -197,6 +214,17 @@ interface SidebarHandler {
+   // "not-found", "denied" or "read".
+   ImportArcLogins() => (int32 imported, string error);
+ 
++  // Welcome tour. `use_apps`: look at the installed apps (else a plain
++  // everyday setup).
++  ProposeSetup(bool use_apps) => (SetupProposal proposal);
++  // Adds the chosen spaces (or renames the untouched first one) and
++  // favorites, and remembers the mode.
++  ApplySetup(array<Space> spaces, array<Item> favorites, string mode);
++  FinishOnboarding();
++  IsDefaultBrowser() => (bool is_default);
++  // macOS asks the person to confirm.
++  SetDefaultBrowser() => (bool is_default);
++
+   // Turns a Peek into an ordinary Today tab.
+   ExpandPeek(tabs_api.mojom.NodeId tab_id);
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 9b555fe9b9..7f4eeb2eee 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -9,21 +9,22 @@
+ #include <vector>
+ 
+ #include "base/command_line.h"
++#include "base/i18n/rtl.h"
+ #include "base/no_destructor.h"
+ #include "base/strings/string_number_conversions.h"
+-#include "build/build_config.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/meridian/arc_logins.h"
+ #include "chrome/browser/meridian/little_window.h"
+-#include "chrome/browser/ui/browser_tabrestore.h"
+-#include "components/sessions/core/serialized_navigation_entry.h"
+-#include "components/sessions/core/serialized_user_agent_override.h"
+-#include "base/task/thread_pool.h"
++#include "chrome/browser/meridian/prefs.h"
++#include "chrome/browser/meridian/setup_profile.h"
+ #include "chrome/browser/meridian/sidebar_service_factory.h"
+ #include "chrome/browser/meridian/tab_data.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_tabrestore.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+@@ -32,12 +33,15 @@
+ #include "chrome/browser/ui/tabs/tab_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "components/browser_apis/tab_strip/types/node_id.h"
++#include "components/prefs/pref_service.h"
++#include "components/sessions/core/serialized_navigation_entry.h"
++#include "components/sessions/core/serialized_user_agent_override.h"
+ #include "components/split_tabs/split_tab_id.h"
+ #include "components/split_tabs/split_tab_visual_data.h"
+ #include "components/tabs/public/split_tab_data.h"
+ #include "content/public/browser/navigation_controller.h"
+-#include "net/base/registry_controlled_domains/registry_controlled_domain.h"
+ #include "content/public/browser/web_contents.h"
++#include "net/base/registry_controlled_domains/registry_controlled_domain.h"
+ #include "ui/base/base_window.h"
+ #include "ui/base/page_transition_types.h"
+ #include "ui/base/window_open_disposition.h"
+@@ -261,6 +265,12 @@ bool SidebarHandler::HandleCommand(BrowserWindowInterface* browser,
+       case IDC_MERIDIAN_CLEAR_TODAY:
+         command = mojom::Command::kClearToday;
+         break;
++      case IDC_MERIDIAN_WELCOME_TOUR:
++        command = mojom::Command::kWelcomeTour;
++        break;
++      case IDC_MERIDIAN_IMPORT_ARC:
++        command = mojom::Command::kImportArc;
++        break;
+       default:
+         return false;
+     }
+@@ -448,6 +458,84 @@ void SidebarHandler::ImportArcLogins(ImportArcLoginsCallback callback) {
+           std::move(callback)));
+ }
+ 
++void SidebarHandler::ProposeSetup(bool use_apps,
++                                  ProposeSetupCallback callback) {
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(
++          [](bool use_apps, std::string locale) {
++            return meridian::ProposeSetup(
++                use_apps ? InstalledApps() : std::vector<std::string>(),
++                locale);
++          },
++          use_apps, base::i18n::GetConfiguredLocale()),
++      base::BindOnce(
++          [](ProposeSetupCallback callback, SetupProposal p) {
++            auto out = mojom::SetupProposal::New();
++            out->title = p.title;
++            out->mode = p.mode;
++            for (const Space& space : p.spaces) {
++              auto s = mojom::Space::New();
++              s->name = space.name;
++              s->icon = space.icon;
++              s->color = space.color;
++              s->color2 = space.color2;
++              out->spaces.push_back(std::move(s));
++            }
++            for (const Item& item : p.favorites) {
++              out->favorites.push_back(ToMojo(item));
++            }
++            out->seen_apps = p.seen;
++            std::move(callback).Run(std::move(out));
++          },
++          std::move(callback)));
++}
++
++void SidebarHandler::ApplySetup(std::vector<mojom::SpacePtr> spaces,
++                                std::vector<mojom::ItemPtr> favorites,
++                                const std::string& mode) {
++  std::vector<Space> chosen;
++  for (const mojom::SpacePtr& s : spaces) {
++    Space space;
++    space.name = s->name.substr(0, 40);
++    space.icon = s->icon.substr(0, 16);
++    space.color = s->color;
++    space.color2 = s->color2;
++    chosen.push_back(std::move(space));
++  }
++  std::vector<Item> links;
++  for (const mojom::ItemPtr& f : favorites) {
++    if (!f->is_folder && f->url.SchemeIsHTTPOrHTTPS()) {
++      Item item;
++      item.title = f->title.substr(0, 200);
++      item.url = f->url;
++      links.push_back(std::move(item));
++    }
++  }
++  // The tour's spaces replace the untouched first space; tabs already open
++  // in it follow to the first new space.
++  std::string old_active = service_->active_space_id();
++  service_->Import(chosen, std::move(links));
++  if (!chosen.empty() && !service_->FindSpace(old_active)) {
++    for (int i = 0; i < model()->count(); ++i) {
++      content::WebContents* contents = model()->GetWebContentsAt(i);
++      const TabData* data = TabData::Get(contents);
++      if (data && data->space_id() == old_active) {
++        TabData::Set(contents, chosen[0].id, data->item_id());
++      }
++    }
++  }
++  if (mode == "everyday" || mode == "creative" || mode == "developer") {
++    browser_->GetProfile()->GetPrefs()->SetString(prefs::kMode, mode);
++  }
++  ScheduleNotify();
++}
++
++void SidebarHandler::FinishOnboarding() {
++  browser_->GetProfile()->GetPrefs()->SetBoolean(prefs::kOnboarded, true);
++  ScheduleNotify();
++}
++
+ void SidebarHandler::OnArcRead(ImportArcCallback callback,
+                                std::optional<ArcSidebar> arc) {
+   if (!arc || arc->spaces.empty()) {
+@@ -602,6 +690,14 @@ mojom::SidebarStatePtr SidebarHandler::BuildState() {
+     }
+   }
+   state->little = IsLittleWindow(browser_);
++  // Tests open the tour with --meridian-onboarding; --no-first-run (what
++  // automation passes) keeps it closed.
++  const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++  Profile* profile = browser_->GetProfile();
++  state->onboarding =
++      !state->little && !profile->IsOffTheRecord() &&
++      !profile->GetPrefs()->GetBoolean(prefs::kOnboarded) &&
++      (cl->HasSwitch("meridian-onboarding") || !cl->HasSwitch("no-first-run"));
+   return state;
+ }
+ 
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 0d5a7e6694..37ee5af85c 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -98,6 +98,13 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void GetArcPreview(GetArcPreviewCallback callback) override;
+   void ImportArc(ImportArcCallback callback) override;
+   void ImportArcLogins(ImportArcLoginsCallback callback) override;
++  void ProposeSetup(bool use_apps, ProposeSetupCallback callback) override;
++  void ApplySetup(std::vector<mojom::SpacePtr> spaces,
++                  std::vector<mojom::ItemPtr> favorites,
++                  const std::string& mode) override;
++  void FinishOnboarding() override;
++  void IsDefaultBrowser(IsDefaultBrowserCallback callback) override;
++  void SetDefaultBrowser(SetDefaultBrowserCallback callback) override;
+   void ExpandPeek(const tabs_api::NodeId& tab_id) override;
+ 
+   // ArchiveService::Observer:
+diff --git a/chrome/browser/meridian/sidebar_handler_mac.mm b/chrome/browser/meridian/sidebar_handler_mac.mm
+index 24cf1032a1..85aa0d32bc 100644
+--- a/chrome/browser/meridian/sidebar_handler_mac.mm
++++ b/chrome/browser/meridian/sidebar_handler_mac.mm
+@@ -5,6 +5,11 @@
+ #include <AppKit/AppKit.h>
+ 
+ #include "chrome/browser/meridian/sidebar_handler.h"
++
++#include "base/functional/bind.h"
++#include "base/functional/callback.h"
++#include "content/public/browser/browser_task_traits.h"
++#include "content/public/browser/browser_thread.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "ui/base/base_window.h"
+ #include "ui/gfx/native_ui_types.h"
+@@ -20,4 +25,45 @@ void SidebarHandler::SetWindowControlsVisible(bool visible) {
+   }
+ }
+ 
++namespace {
++
++bool IsDefault() {
++  NSURL* handler = [NSWorkspace.sharedWorkspace
++      URLForApplicationToOpenURL:[NSURL URLWithString:@"https://example.com/"]];
++  return handler &&
++         [handler.URLByStandardizingPath.path
++             isEqualToString:NSBundle.mainBundle.bundleURL
++                                 .URLByStandardizingPath.path];
++}
++
++}  // namespace
++
++void SidebarHandler::IsDefaultBrowser(IsDefaultBrowserCallback callback) {
++  std::move(callback).Run(IsDefault());
++}
++
++void SidebarHandler::SetDefaultBrowser(SetDefaultBrowserCallback callback) {
++  // macOS shows its own "Use Meridian as your default browser?" prompt for
++  // http; https follows the same choice.
++  __block SetDefaultBrowserCallback block_callback = std::move(callback);
++  NSURL* app = NSBundle.mainBundle.bundleURL;
++  [NSWorkspace.sharedWorkspace
++      setDefaultApplicationAtURL:app
++           toOpenURLsWithScheme:@"http"
++              completionHandler:^(NSError* http_error) {
++                [NSWorkspace.sharedWorkspace
++                    setDefaultApplicationAtURL:app
++                         toOpenURLsWithScheme:@"https"
++                            completionHandler:^(NSError* https_error) {
++                              content::GetUIThreadTaskRunner({})->PostTask(
++                                  FROM_HERE,
++                                  base::BindOnce(
++                                      [](SetDefaultBrowserCallback cb) {
++                                        std::move(cb).Run(IsDefault());
++                                      },
++                                      std::move(block_callback)));
++                            }];
++              }];
++}
++
+ }  // namespace meridian
+diff --git a/chrome/browser/prefs/browser_prefs.cc b/chrome/browser/prefs/browser_prefs.cc
+index 8b4e319512..d50ea51c2c 100644
+--- a/chrome/browser/prefs/browser_prefs.cc
++++ b/chrome/browser/prefs/browser_prefs.cc
+@@ -42,7 +42,7 @@
+ #include "chrome/browser/lifetime/browser_shutdown.h"
+ #include "chrome/browser/login_detection/login_detection_prefs.h"
+ #include "chrome/browser/media/media_engagement_service.h"
+-#include "chrome/browser/meridian/atc.h"
++#include "chrome/browser/meridian/prefs.h"
+ #include "chrome/browser/media/media_storage_id_salt.h"
+ #include "chrome/browser/media/prefs/capture_device_ranking.h"
+ #include "chrome/browser/media/unified_autoplay_config.h"
+@@ -2054,7 +2054,7 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry,
+   AccessibilityLabelsService::RegisterProfilePrefs(registry);
+   registry->RegisterBooleanPref(prefs::kRendererAccessibilityEnabled, true);
+   AccessibilityUIMessageHandler::RegisterProfilePrefs(registry);
+-  meridian::RegisterProfilePrefs(registry);
++  meridian::prefs::RegisterProfilePrefs(registry);
+ #if !BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_DESKTOP_ANDROID)  // nocheck
+   ttc::AiOverlayDialogController::RegisterProfilePrefs(registry);
+ #endif
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index fd4ba9afe8..81a8ca4bd7 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -36,6 +36,8 @@ build_webui("build") {
+     "meridian/icons.ts",
+     "meridian/item.html.ts",
+     "meridian/item.ts",
++    "meridian/onboarding.html.ts",
++    "meridian/onboarding.ts",
+     "meridian/sidebar.html.ts",
+     "meridian/sidebar.ts",
+     "meridian/tab_row.html.ts",
+@@ -69,6 +71,7 @@ build_webui("build") {
+     "extensions_bar.css",
+     "meridian/archive.css",
+     "meridian/command_bar.css",
++    "meridian/onboarding.css",
+     "meridian/rows.css",
+     "meridian/sidebar.css",
+     "side_panel.css",
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index fb8c5582a4..5e1ba04d07 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -66,7 +66,8 @@ export function getHtml(this: WebuiBrowserAppElement) {
+         @meridian-show-archive="${this.onMeridianShowArchive_}"
+         @meridian-peeks-changed="${this.onMeridianPeeksChanged_}"
+         @meridian-status="${this.onMeridianStatus_}"
+-        @meridian-little-changed="${this.onMeridianLittleChanged_}">
++        @meridian-little-changed="${this.onMeridianLittleChanged_}"
++        @meridian-onboarding="${this.onMeridianOnboarding_}">
+       <cr-icon-button slot="bottom-start" id="appMenuButton"
+           iron-icon="cr:more-vert" title="$i18n{appMenuTooltip}"
+           @click="${this.onAppMenuClick_}">
+@@ -84,6 +85,7 @@ export function getHtml(this: WebuiBrowserAppElement) {
+   </div>
+   <meridian-command-bar id="commandBar"></meridian-command-bar>
+   <meridian-archive id="archive"></meridian-archive>
++  <meridian-onboarding id="onboarding"></meridian-onboarding>
+   <div id="littleBar" ?hidden="${!this.little_}">
+     <span class="host">${this.urlHost_}</span>
+     <button id="openInMeridian" title="Open in Meridian"
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index b118ea2d23..7aa38e82dd 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -12,6 +12,7 @@ import './meridian/sidebar.js';
+ import './webview.js';
+ import './meridian/archive.js';
+ import './meridian/command_bar.js';
++import './meridian/onboarding.js';
+ import 'chrome://resources/cr_elements/cr_button/cr_button.js';
+ import 'chrome://resources/cr_elements/cr_icon_button/cr_icon_button.js';
+ import 'chrome://resources/cr_elements/cr_icon/cr_icon.js';
+@@ -32,6 +33,7 @@ import type {SidePanelElement} from './side_panel.js';
+ import type {TabAdded, TabClosed, TabUpdated} from './tab_strip/events.js';
+ import type {MeridianArchiveElement} from './meridian/archive.js';
+ import type {MeridianCommandBarElement} from './meridian/command_bar.js';
++import type {MeridianOnboardingElement} from './meridian/onboarding.js';
+ import type {MeridianSidebarElement} from './meridian/sidebar.js';
+ import type {Split} from './sidebar.mojom-webui.js';
+ 
+@@ -65,6 +67,7 @@ export interface WebuiBrowserAppElement {
+   $: {
+     archive: MeridianArchiveElement,
+     commandBar: MeridianCommandBarElement,
++    onboarding: MeridianOnboardingElement,
+     urlPill: HTMLElement,
+     appMenuButton: HTMLElement,
+     avatarButton: HTMLElement,
+@@ -487,6 +490,10 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.statusText_ = e.detail;
+   }
+ 
++  protected onMeridianOnboarding_(e: CustomEvent<'tour'|'arc'>) {
++    this.$.onboarding.show(e.detail);
++  }
++
+   protected onMeridianLittleChanged_(e: CustomEvent<boolean>) {
+     this.little_ = e.detail;
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/icons.ts b/chrome/browser/resources/webui_browser/meridian/icons.ts
+index b69a689cc4..3c51f44a34 100644
+--- a/chrome/browser/resources/webui_browser/meridian/icons.ts
++++ b/chrome/browser/resources/webui_browser/meridian/icons.ts
+@@ -5,7 +5,7 @@
+ // Meridian icons (from the Electron build's src/renderer/icons.js): 24x24,
+ // 2px round strokes in currentColor. Each is a whole <svg> in one template,
+ // because Lit only parses SVG children inside an <svg> of the same template.
+-// Generated; to add one, copy its paths from icons.js.
++// Generated by chromium/tools/gen_icons.py; to add one, rerun it with the name.
+ 
+ import {html} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {TemplateResult} from '//resources/lit/v3_0/lit.rollup.js';
+@@ -34,7 +34,16 @@ export type IconName =
+     'search'|
+     'smile'|
+     'palette'|
+-    'check';
++    'check'|
++    'arrowRight'|
++    'arrowLeft'|
++    'sparkles'|
++    'grid'|
++    'lock'|
++    'link'|
++    'terminal'|
++    'code'|
++    'globe';
+ 
+ export function icon(name: IconName, size = 16): TemplateResult {
+   switch (name) {
+@@ -86,5 +95,23 @@ export function icon(name: IconName, size = 16): TemplateResult {
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5a8.5 8.5 0 0 0 0 17c1.1 0 1.8-.8 1.8-1.8 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.2 0-1 .8-1.8 1.8-1.8h2.1a4.3 4.3 0 0 0 4.3-4.3C21 6.9 17 3.5 12 3.5z"/><circle cx="7.8" cy="11.5" r="1.1"/><circle cx="10.5" cy="7.6" r="1.1"/><circle cx="15" cy="7.8" r="1.1"/></svg>`;
+     case 'check':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>`;
++    case 'arrowRight':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13.5 6.5L19 12l-5.5 5.5"/></svg>`;
++    case 'arrowLeft':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M10.5 6.5L5 12l5.5 5.5"/></svg>`;
++    case 'sparkles':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 4.5l1.5 4 4 1.5-4 1.5-1.5 4-1.5-4-4-1.5 4-1.5z"/><path d="M17.5 14l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z"/></svg>`;
++    case 'grid':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4.5" y="4.5" width="6" height="6" rx="1.5"/><rect x="13.5" y="4.5" width="6" height="6" rx="1.5"/><rect x="4.5" y="13.5" width="6" height="6" rx="1.5"/><rect x="13.5" y="13.5" width="6" height="6" rx="1.5"/></svg>`;
++    case 'lock':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="10.5" width="14" height="9.5" rx="2.2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/></svg>`;
++    case 'link':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.5 13.5a3.6 3.6 0 0 0 5.1 0l2.9-2.9a3.6 3.6 0 0 0-5.1-5.1l-.9.9"/><path d="M13.5 10.5a3.6 3.6 0 0 0-5.1 0l-2.9 2.9a3.6 3.6 0 0 0 5.1 5.1l.9-.9"/></svg>`;
++    case 'terminal':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 16.5l5-4.5-5-4.5M12.5 18h7"/></svg>`;
++    case 'code':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15.5 17.5L21 12l-5.5-5.5M8.5 6.5L3 12l5.5 5.5"/></svg>`;
++    case 'globe':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.3 2.4 3.4 5.2 3.4 8.5s-1.1 6.1-3.4 8.5c-2.3-2.4-3.4-5.2-3.4-8.5s1.1-6.1 3.4-8.5z"/></svg>`;
+   }
+ }
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.css b/chrome/browser/resources/webui_browser/meridian/onboarding.css
+new file mode 100644
+index 0000000000..7732789db7
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.css
+@@ -0,0 +1,925 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #css_wrapper_metadata_end */
++
++/* The welcome tour, from the Electron build (src/renderer/chrome.css). */
++
++:host {
++  display: none;
++  position: fixed;
++  inset: 0;
++  z-index: 200;
++  color: #fff;
++  font-family: system-ui, -apple-system, sans-serif;
++}
++
++:host([open]) {
++  display: block;
++}
++
++[hidden] {
++  display: none !important;
++}
++
++button {
++  font: inherit;
++  color: inherit;
++  background: none;
++  border: 0;
++  padding: 0;
++  cursor: default;
++}
++
++#root {
++  position: absolute;
++  inset: 0;
++  display: flex;
++  flex-direction: column;
++  overflow: hidden;
++  background: color-mix(in srgb, var(--meridian-space, #8a8fe0) 55%, #101018);
++  animation: fade 0.35s ease;
++}
++
++#root::after {
++  content: '';
++  position: absolute;
++  inset: 0;
++  background: radial-gradient(ellipse at 50% 40%, transparent 30%,
++                              rgba(0, 0, 0, 0.28));
++  pointer-events: none;
++}
++
++@keyframes fade {
++  from {
++    opacity: 0;
++  }
++}
++
++/* ------------------------------------------------------------ background */
++
++.bg {
++  position: absolute;
++  inset: -20%;
++  pointer-events: none;
++  filter: blur(70px) saturate(1.2);
++}
++
++.bg i {
++  position: absolute;
++  border-radius: 50%;
++  opacity: 0.85;
++}
++
++.bg .b1 {
++  width: 60vw;
++  height: 60vw;
++  left: 5%;
++  top: 0;
++  background: var(--meridian-space, #8a8fe0);
++  animation: drift1 16s ease-in-out infinite alternate;
++}
++
++.bg .b2 {
++  width: 55vw;
++  height: 55vw;
++  right: 0;
++  bottom: 0;
++  background: var(--meridian-space2, #b48ae0);
++  animation: drift2 19s ease-in-out infinite alternate;
++}
++
++.bg .b3 {
++  width: 40vw;
++  height: 40vw;
++  left: 35%;
++  top: 35%;
++  background: color-mix(in srgb, var(--meridian-space, #8a8fe0) 50%, #fff);
++  opacity: 0.35;
++  animation: drift3 23s ease-in-out infinite alternate;
++}
++
++@keyframes drift1 {
++  to {
++    transform: translate(18vw, 12vh) scale(1.15);
++  }
++}
++
++@keyframes drift2 {
++  to {
++    transform: translate(-16vw, -10vh) scale(0.9);
++  }
++}
++
++@keyframes drift3 {
++  to {
++    transform: translate(-12vw, 8vh) scale(1.25);
++  }
++}
++
++/* ------------------------------------------------------------ frame */
++
++.top,
++.stage,
++.foot {
++  position: relative;
++  z-index: 1;
++}
++
++/* Only the top strip moves the window. */
++.top {
++  display: flex;
++  height: 52px;
++  align-items: center;
++  padding: 0 22px 0 90px;
++  app-region: drag;
++  -webkit-app-region: drag;
++}
++
++.grow {
++  flex: 1;
++}
++
++.skip {
++  color: rgba(255, 255, 255, 0.72);
++  font-weight: 500;
++  padding: 5px 10px;
++  border-radius: 8px;
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
++}
++
++.skip:hover {
++  color: #fff;
++  background: rgba(255, 255, 255, 0.12);
++}
++
++.stage {
++  flex: 1;
++}
++
++.page {
++  position: absolute;
++  inset: 0;
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  justify-content: center;
++  padding: 0 40px 20px;
++  text-align: center;
++  animation: page-in 0.56s cubic-bezier(0.2, 0.8, 0.2, 1) both;
++}
++
++@keyframes page-in {
++  from {
++    opacity: 0;
++    transform: translateX(60px) scale(0.98);
++    filter: blur(8px);
++  }
++}
++
++h1 {
++  font-size: clamp(38px, 6vw, 64px);
++  font-weight: 750;
++  letter-spacing: -0.035em;
++  margin: 24px 0 14px;
++  line-height: 1.02;
++}
++
++h2 {
++  font-size: clamp(30px, 4.4vw, 46px);
++  font-weight: 750;
++  letter-spacing: -0.03em;
++  margin: 0 0 12px;
++  line-height: 1.05;
++}
++
++.whisper {
++  font-size: 15px;
++  line-height: 1.5;
++  color: rgba(255, 255, 255, 0.72);
++  max-width: 460px;
++  margin: 26px 0 0;
++}
++
++.whisper.top {
++  margin: 0 0 30px;
++}
++
++kbd {
++  color: #fff;
++  background: rgba(255, 255, 255, 0.16);
++  border: 1px solid rgba(255, 255, 255, 0.22);
++  border-bottom-width: 2px;
++  border-radius: 6px;
++  padding: 0 6px;
++  font: 600 13px system-ui;
++}
++
++.hero {
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++}
++
++.mark {
++  width: 132px;
++  height: 132px;
++  border-radius: 34px;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  background: rgba(255, 255, 255, 0.16);
++  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.25),
++      0 20px 60px rgba(0, 0, 0, 0.2);
++  animation: float 6s ease-in-out infinite;
++  margin-bottom: 20px;
++}
++
++.mark.done {
++  border-radius: 50%;
++}
++
++@keyframes float {
++  50% {
++    transform: translateY(-8px);
++  }
++}
++
++/* ------------------------------------------------------------ footer */
++
++.foot {
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  padding: 18px 28px 26px;
++}
++
++#back {
++  position: absolute;
++  left: 28px;
++  width: 40px;
++  padding: 0;
++}
++
++.dots {
++  position: absolute;
++  left: 50%;
++  bottom: 10px;
++  transform: translateX(-50%);
++  display: flex;
++  gap: 7px;
++}
++
++.dot {
++  width: 7px;
++  height: 7px;
++  border-radius: 4px;
++  background: rgba(255, 255, 255, 0.32);
++  transition: width 0.3s, background 0.3s;
++}
++
++.dot.past {
++  background: rgba(255, 255, 255, 0.6);
++}
++
++.dot.on {
++  width: 24px;
++  background: #fff;
++}
++
++.btn {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  gap: 8px;
++  height: 40px;
++  padding: 0 18px;
++  border-radius: 12px;
++  font-weight: 600;
++  font-size: 14px;
++  transition: transform 0.12s, background 0.15s, box-shadow 0.15s;
++}
++
++.btn:active:not(:disabled) {
++  transform: scale(0.97);
++}
++
++.btn.primary {
++  background: #fff;
++  color: #17171c;
++  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
++}
++
++.btn.ghost {
++  color: rgba(255, 255, 255, 0.85);
++}
++
++.btn.ghost:hover {
++  background: rgba(255, 255, 255, 0.12);
++}
++
++.btn.big {
++  height: 48px;
++  padding: 0 24px;
++  font-size: 15px;
++  border-radius: 14px;
++}
++
++#next {
++  min-width: 168px;
++  height: 46px;
++  border-radius: 23px;
++  font-size: 15px;
++  margin-bottom: 18px;
++}
++
++#next.round {
++  min-width: 0;
++  width: 58px;
++  height: 58px;
++  border-radius: 50%;
++  padding: 0;
++}
++
++#next:disabled {
++  opacity: 0.75;
++}
++
++#next:focus-visible,
++.btn:focus-visible {
++  outline: 2px solid rgba(255, 255, 255, 0.45);
++  outline-offset: 4px;
++}
++
++#root[data-step='default'] #next {
++  background: transparent;
++  color: rgba(255, 255, 255, 0.85);
++  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.35);
++}
++
++.default-btn {
++  margin-top: 26px;
++}
++
++.link {
++  font-size: 12px;
++  color: rgba(255, 255, 255, 0.75);
++  text-decoration: underline;
++  margin-top: 22px;
++}
++
++/* ------------------------------------------------------------ hello */
++
++.hello {
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  gap: 28px;
++}
++
++.hello-word {
++  position: relative;
++  height: 1.25em;
++  min-width: 6ch;
++  display: grid;
++  place-items: center;
++  font: 400 clamp(84px, 13vw, 168px) / 1.1 'Snell Roundhand', 'Apple Chancery',
++      cursive;
++  text-shadow: 0 6px 40px rgba(0, 0, 0, 0.18);
++}
++
++.hello-word span {
++  grid-area: 1 / 1;
++  white-space: nowrap;
++  padding: 0 0.15em;
++  animation: write 1.5s cubic-bezier(0.55, 0.1, 0.25, 1) both;
++}
++
++@keyframes write {
++  from {
++    clip-path: inset(-20% 100% -20% -15%);
++    opacity: 0.4;
++    filter: blur(2px);
++  }
++  to {
++    clip-path: inset(-20% -10% -20% -15%);
++    opacity: 1;
++    filter: blur(0);
++  }
++}
++
++.hello-mark {
++  display: inline-flex;
++  align-items: center;
++  gap: 8px;
++  font-weight: 650;
++  font-size: 15px;
++  color: rgba(255, 255, 255, 0.82);
++  animation: fade 1.2s 0.9s ease both;
++}
++
++/* ------------------------------------------------------------ arc */
++
++.arc-move {
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  gap: 18px;
++  width: min(560px, 100%);
++}
++
++.arc-stats {
++  display: flex;
++  gap: 10px;
++  flex-wrap: wrap;
++  justify-content: center;
++}
++
++.arc-stats b {
++  font-size: 15px;
++  font-weight: 650;
++  padding: 8px 16px;
++  border-radius: 14px;
++  background: rgba(255, 255, 255, 0.14);
++  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
++}
++
++.arc-spaces {
++  display: flex;
++  gap: 8px;
++  flex-wrap: wrap;
++  justify-content: center;
++}
++
++.space {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  height: 28px;
++  padding: 0 12px 0 8px;
++  border-radius: 14px;
++  background: rgba(255, 255, 255, 0.14);
++  font-weight: 500;
++  font-size: 13px;
++}
++
++.space i {
++  width: 10px;
++  height: 10px;
++  border-radius: 50%;
++  background: var(--c);
++  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.5);
++}
++
++.space em,
++.pv-space em {
++  font-style: normal;
++}
++
++.opt {
++  width: min(420px, 100%);
++  display: flex;
++  align-items: center;
++  gap: 12px;
++  padding: 12px 14px;
++  border-radius: 16px;
++  text-align: left;
++  background: rgba(255, 255, 255, 0.1);
++  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
++  transition: background 0.2s;
++}
++
++.opt > span:nth-child(2) {
++  flex: 1;
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++}
++
++.opt b {
++  font-size: 14px;
++}
++
++.opt em {
++  font-style: normal;
++  font-size: 12px;
++  color: rgba(255, 255, 255, 0.7);
++}
++
++.opt-ic {
++  width: 32px;
++  height: 32px;
++  border-radius: 10px;
++  display: grid;
++  place-items: center;
++  background: rgba(255, 255, 255, 0.16);
++  flex: none;
++}
++
++.tick {
++  width: 22px;
++  height: 22px;
++  border-radius: 50%;
++  display: grid;
++  place-items: center;
++  box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.5);
++  color: transparent;
++  flex: none;
++  transition: all 0.2s;
++}
++
++.opt.on {
++  background: rgba(255, 255, 255, 0.2);
++}
++
++.opt.on .tick {
++  background: #fff;
++  color: #17171c;
++  box-shadow: none;
++}
++
++/* ------------------------------------------------------------ tailor */
++
++.tailor {
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  gap: 18px;
++  width: min(560px, 100%);
++  min-height: 150px;
++  margin-top: 8px;
++}
++
++.consent {
++  display: flex;
++  gap: 10px;
++  flex-wrap: wrap;
++  justify-content: center;
++}
++
++.pill {
++  display: inline-flex;
++  align-items: center;
++  gap: 8px;
++  height: 42px;
++  padding: 0 18px;
++  border-radius: 21px;
++  font-weight: 600;
++  font-size: 14px;
++  color: rgba(255, 255, 255, 0.75);
++  background: rgba(255, 255, 255, 0.08);
++  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.2);
++  transition: all 0.2s;
++}
++
++.pill.on {
++  background: #fff;
++  color: #17171c;
++  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
++}
++
++.think {
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  gap: 22px;
++}
++
++.orb {
++  position: relative;
++  width: 92px;
++  height: 92px;
++}
++
++.orb i {
++  position: absolute;
++  inset: 0;
++  border-radius: 50%;
++  mix-blend-mode: screen;
++  filter: blur(6px);
++}
++
++.orb i:nth-child(1) {
++  background: radial-gradient(circle at 35% 35%, #fff,
++                              var(--meridian-space, #8a8fe0) 60%);
++  animation: orb1 2.4s ease-in-out infinite;
++}
++
++.orb i:nth-child(2) {
++  background: radial-gradient(circle at 65% 40%, #ffb3d9, transparent 60%);
++  animation: orb2 3.1s ease-in-out infinite;
++}
++
++.orb i:nth-child(3) {
++  background: radial-gradient(circle at 50% 70%, #9fd8ff, transparent 60%);
++  animation: orb3 2.7s ease-in-out infinite;
++}
++
++@keyframes orb1 {
++  50% {
++    transform: scale(1.12);
++  }
++}
++
++@keyframes orb2 {
++  50% {
++    transform: translate(8px, -6px) scale(0.9);
++  }
++}
++
++@keyframes orb3 {
++  50% {
++    transform: translate(-7px, 5px) scale(1.1);
++  }
++}
++
++.lines {
++  list-style: none;
++  margin: 0;
++  padding: 0;
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  gap: 8px;
++  min-height: 120px;
++}
++
++.lines li {
++  font-size: 15px;
++  color: rgba(255, 255, 255, 0.75);
++  animation: rise 0.36s ease-out both;
++}
++
++.lines li.final {
++  font-size: 24px;
++  font-weight: 700;
++  letter-spacing: -0.02em;
++  color: #fff;
++  margin-top: 6px;
++}
++
++@keyframes rise {
++  from {
++    opacity: 0;
++    transform: translateY(6px);
++  }
++}
++
++/* ------------------------------------------------------------ preview */
++
++.preview-title {
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  gap: 10px;
++}
++
++.preview-title h2 {
++  margin-bottom: 18px;
++}
++
++.persona {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  font-size: 13px;
++  font-weight: 650;
++  padding: 5px 12px;
++  border-radius: 14px;
++  background: rgba(255, 255, 255, 0.16);
++  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22);
++}
++
++.pv-window {
++  width: 440px;
++  height: 270px;
++  border-radius: 16px;
++  display: flex;
++  overflow: hidden;
++  text-align: left;
++  background: linear-gradient(140deg,
++      color-mix(in srgb, var(--meridian-space, #8a8fe0) 70%, #fff),
++      color-mix(in srgb, var(--meridian-space2, #b48ae0) 75%, #fff));
++  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.3),
++      0 0 0 1px rgba(255, 255, 255, 0.3);
++  animation: window-rise 0.7s 0.15s cubic-bezier(0.2, 0.8, 0.2, 1) both;
++}
++
++@keyframes window-rise {
++  from {
++    transform: translateY(18px) scale(0.97);
++    opacity: 0;
++  }
++}
++
++.pv-side {
++  width: 168px;
++  padding: 12px 10px;
++  display: flex;
++  flex-direction: column;
++  gap: 9px;
++  color: #17171c;
++}
++
++.pv-url {
++  height: 20px;
++  border-radius: 6px;
++  background: rgba(255, 255, 255, 0.55);
++}
++
++.pv-favs {
++  display: grid;
++  grid-template-columns: repeat(3, 1fr);
++  gap: 5px;
++}
++
++.pv-fav {
++  height: 34px;
++  border-radius: 8px;
++  background: rgba(255, 255, 255, 0.5);
++  display: grid;
++  place-items: center;
++  transition: opacity 0.2s, transform 0.2s;
++  animation: pop 0.4s cubic-bezier(0.3, 1.5, 0.5, 1) both;
++}
++
++@keyframes pop {
++  from {
++    transform: scale(0.4);
++    opacity: 0;
++  }
++}
++
++.pv-fav.off,
++.pv-space.off {
++  opacity: 0.28;
++  transform: scale(0.94);
++}
++
++.fav {
++  width: 20px;
++  height: 20px;
++  border-radius: 6px;
++  background: var(--c);
++  color: #fff;
++  font: 700 11px system-ui;
++  display: grid;
++  place-items: center;
++}
++
++.pv-spaces {
++  display: flex;
++  flex-direction: column;
++  gap: 3px;
++}
++
++.pv-space {
++  display: flex;
++  align-items: center;
++  gap: 7px;
++  height: 26px;
++  padding: 0 8px;
++  border-radius: 7px;
++  font-size: 12.5px;
++  font-weight: 600;
++  color: #17171c;
++  text-align: left;
++  transition: opacity 0.2s, transform 0.2s;
++}
++
++.pv-space:first-child {
++  background: rgba(255, 255, 255, 0.6);
++}
++
++.pv-rows {
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++  margin-top: 2px;
++}
++
++.pv-rows i {
++  height: 8px;
++  border-radius: 4px;
++  background: rgba(23, 23, 28, 0.12);
++}
++
++.pv-rows i.s {
++  width: 60%;
++}
++
++.pv-page {
++  flex: 1;
++  margin: 8px 8px 8px 0;
++  border-radius: 10px;
++  background: rgba(255, 255, 255, 0.92);
++  padding: 16px;
++  display: flex;
++  flex-direction: column;
++  gap: 9px;
++}
++
++.pv-page i {
++  height: 9px;
++  border-radius: 5px;
++  background: rgba(23, 23, 28, 0.08);
++}
++
++.pv-page i.w60 {
++  width: 60%;
++}
++
++.pv-page i.w80 {
++  width: 80%;
++}
++
++/* ------------------------------------------------------------ busy, confirm */
++
++#next.busy {
++  color: transparent;
++  position: relative;
++}
++
++#next.busy::after {
++  content: '';
++  position: absolute;
++  width: 18px;
++  height: 18px;
++  border-radius: 50%;
++  border: 2.5px solid rgba(23, 23, 28, 0.25);
++  border-top-color: #17171c;
++  animation: spin 0.7s linear infinite;
++}
++
++@keyframes spin {
++  to {
++    transform: rotate(360deg);
++  }
++}
++
++.confirm {
++  position: absolute;
++  inset: 0;
++  z-index: 2;
++  display: grid;
++  place-items: center;
++  background: rgba(10, 10, 16, 0.4);
++  animation: fade 0.2s ease;
++}
++
++.card {
++  width: min(440px, 90vw);
++  padding: 22px 24px 18px;
++  border-radius: 18px;
++  background: #fff;
++  color: #17171c;
++  text-align: left;
++  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.35);
++}
++
++.card h3 {
++  margin: 0 0 10px;
++  font-size: 17px;
++}
++
++.card p {
++  margin: 0 0 10px;
++  font-size: 13.5px;
++  line-height: 1.5;
++  color: #44444c;
++}
++
++.card-actions {
++  display: flex;
++  justify-content: flex-end;
++  gap: 8px;
++  margin-top: 14px;
++}
++
++.card .btn.ghost {
++  color: #44444c;
++}
++
++.card .btn.ghost:hover {
++  background: rgba(0, 0, 0, 0.06);
++}
++
++.card .btn.primary {
++  background: #17171c;
++  color: #fff;
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .hello-word span,
++  .pv-window,
++  .pv-fav,
++  .orb i,
++  .mark,
++  .page {
++    animation: none !important;
++  }
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+new file mode 100644
+index 0000000000..0dd60deee8
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+@@ -0,0 +1,186 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html, repeat} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {icon} from './icons.js';
++import type {MeridianOnboardingElement} from './onboarding.js';
++
++export function getHtml(this: MeridianOnboardingElement) {
++  return html`<!--_html_template_start_-->
++<div id="root" data-step="${this.step_}" @keydown="${this.onRootKeydown_}">
++  <div class="bg"><i class="b1"></i><i class="b2"></i><i class="b3"></i></div>
++  <div class="top">
++    <div class="grow"></div>
++    <button id="skip" class="skip" ?hidden="${this.step_ === 'done'}"
++        @click="${this.onSkipClick_}">Skip</button>
++  </div>
++  <div class="stage">
++    ${repeat([this.step_], s => s, () => html`
++      <div class="page step-${this.step_}">
++        ${this.step_ === 'hello' ? html`
++          <div class="hello">
++            <div class="hello-word" aria-live="polite">
++              ${repeat([this.hello_], w => w, w => html`<span>${w}</span>`)}
++            </div>
++            <div class="hello-mark">
++              <svg width="26" height="26" viewBox="0 7 64 64" class="logo">
++                <path d="M10 50 A26 26 0 0 1 54 50" fill="none"
++                    stroke="currentColor" stroke-width="6"
++                    stroke-linecap="round"/>
++                <circle cx="32" cy="50" r="4.5" fill="currentColor"/>
++              </svg>
++              <span>Meridian</span>
++            </div>
++          </div>` : ''}
++
++        ${this.step_ === 'arc' && this.arc_ ? html`
++          <h2>Bring everything from Arc</h2>
++          <p class="whisper top">Your spaces, pinned tabs and favorites move
++            over as they are. Arc stays untouched.</p>
++          <div class="arc-move">
++            <div class="arc-stats">
++              <b>${this.arc_.spaceCount} spaces</b>
++              <b>${this.arcTabs_} tabs</b>
++              <b>${this.arc_.favoriteCount} favorites</b>
++            </div>
++            <div class="arc-spaces">
++              ${this.arcSpaces_.map(s => html`
++                <span class="space" style="--c:${s.color}">
++                  ${s.icon ? html`<em>${s.icon}</em>` : html`<i></i>`}
++                  ${s.name}
++                </span>`)}
++            </div>
++            ${this.arc_.loginsAvailable ? html`
++              <button id="logins" class="opt ${this.withLogins_ ? 'on' : ''}"
++                  @click="${this.onLoginsClick_}">
++                <span class="opt-ic">${icon('lock', 16)}</span>
++                <span><b>Stay signed in to your sites</b>
++                  <em>So you don’t have to log in everywhere again</em></span>
++                <span class="tick">${icon('check', 13)}</span>
++              </button>` : ''}
++          </div>
++          ${this.canStartFresh_ ? html`
++            <button id="fresh" class="link" @click="${this.onFreshClick_}">
++              Start fresh instead</button>` : ''}
++          ${this.note_ ? html`<p class="whisper">${this.note_}</p>` : ''}
++        ` : ''}
++
++        ${this.step_ === 'arc' && !this.arc_ ? html`
++          <h2>Arc isn’t on this Mac</h2>
++          <p class="whisper">There is nothing to bring over.</p>` : ''}
++
++        ${this.step_ === 'tailor' ? html`
++          <h2>Let’s make it yours</h2>
++          <div class="tailor">
++            <div class="consent" ?hidden="${this.thinking_}">
++              <button id="useApps" class="pill ${this.useApps_ ? 'on' : ''}"
++                  @click="${this.onUseAppsClick_}">
++                ${icon('grid', 15)} Look at the apps I use
++              </button>
++            </div>
++            <div class="think" ?hidden="${!this.thinking_}">
++              <div class="orb"><i></i><i></i><i></i></div>
++              <ul class="lines">
++                ${this.lines_.map((line, i) => html`
++                  <li class="${i === this.lines_.length - 1 &&
++                               this.proposal_ ? 'final' : ''}">${line}</li>`)}
++              </ul>
++            </div>
++          </div>
++          <p class="whisper">Meridian suggests spaces and favorites that fit
++            you. This happens on your computer — nothing is sent anywhere, and
++            nothing changes until you say so.</p>` : ''}
++
++        ${this.step_ === 'preview' ? html`
++          <div class="preview-title">
++            <span class="persona">${this.persona_}</span>
++            <h2>Here’s your Meridian</h2>
++          </div>
++          <div class="pv-window">
++            <div class="pv-side">
++              <div class="pv-url"></div>
++              <div class="pv-favs">
++                ${this.tiles_.map(t => html`
++                  <button class="pv-fav ${t.off ? 'off' : ''}" title="${t.title}"
++                      data-index="${t.index}" @click="${this.onTileClick_}">
++                    <span class="fav" style="--c:${t.color}">${t.letter}</span>
++                  </button>`)}
++              </div>
++              <div class="pv-spaces">
++                ${this.chips_.map(s => html`
++                  <button class="pv-space ${s.off ? 'off' : ''}"
++                      style="--c:${s.color}" data-index="${s.index}"
++                      @click="${this.onChipClick_}">
++                    <em>${s.icon}</em>${s.name}
++                  </button>`)}
++              </div>
++              <div class="pv-rows"><i></i><i></i><i class="s"></i></div>
++            </div>
++            <div class="pv-page"><i class="w60"></i><i></i><i class="w80"></i>
++            </div>
++          </div>
++          <p class="whisper">Tap anything to leave it out.</p>` : ''}
++
++        ${this.step_ === 'default' ? html`
++          <div class="hero">
++            <div class="mark">${icon('link', 46)}</div>
++            <h2>Open your links in Meridian?</h2>
++            <p class="whisper">Links from Mail, Slack, Notion and other apps
++              will open here instead of your old browser. You can change this
++              any time.</p>
++            <button id="useMeridian" class="btn primary big default-btn"
++                @click="${this.onDefaultClick_}">
++              ${icon('check', 16)} Yes, use Meridian
++            </button>
++          </div>` : ''}
++
++        ${this.step_ === 'done' ? html`
++          <div class="hero">
++            <div class="mark done">${icon('check', 54)}</div>
++            <h1>You’re all set</h1>
++            <p class="whisper">Press <kbd>⌘</kbd><kbd>T</kbd> to open a new tab
++              or find anything you had open.</p>
++            ${this.note_ ? html`<p class="whisper">${this.note_}</p>` : ''}
++          </div>` : ''}
++      </div>`)}
++  </div>
++  <div class="foot">
++    <button id="back" class="btn ghost"
++        ?hidden="${this.stepIndex_ === 0 || this.step_ === 'done'}"
++        @click="${this.onBackClick_}">${icon('arrowLeft', 16)}</button>
++    <div class="dots">
++      ${this.dots_.map(d => html`
++        <button class="dot ${d.cls}" data-index="${d.index}"
++            aria-label="Step ${d.index + 1}" @click="${this.onDotClick_}">
++        </button>`)}
++    </div>
++    <button id="next"
++        class="btn primary ${this.step_ === 'hello' ? 'round' : ''}
++            ${this.busy_ ? 'busy' : ''}"
++        ?disabled="${!!this.busy_}" @click="${this.onNextClick_}">
++      ${this.step_ === 'hello' ? html`${icon('arrowRight', 18)}` :
++                                 html`${this.nextLabel_}`}
++    </button>
++  </div>
++  ${this.confirmLogins_ ? html`
++    <div class="confirm" role="dialog" aria-modal="true">
++      <div class="card">
++        <h3>Your Mac will ask for permission</h3>
++        <p>To keep you signed in to your sites, Meridian copies Arc’s sign-ins.
++          Your Mac will ask once whether Meridian may read them: click
++          <b>Always Allow</b> (and type your Mac password if asked).</p>
++        <p>Nothing leaves your computer, and Arc stays as it is. Saved
++          passwords aren’t copied.</p>
++        <div class="card-actions">
++          <button id="confirmCancel" class="btn ghost"
++              @click="${this.onConfirmCancelClick_}">Cancel</button>
++          <button id="confirmContinue" class="btn primary"
++              @click="${this.onConfirmContinueClick_}">Continue</button>
++        </div>
++      </div>
++    </div>` : ''}
++</div>
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+new file mode 100644
+index 0000000000..066a576e9b
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+@@ -0,0 +1,430 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The welcome tour, full window (in the spirit of a new Mac's first launch).
++// It is about moving in:
++//   Arc found:  hello → Bring everything from Arc → links → All set
++//   no Arc:     hello → Make it yours (from the apps on this computer, worked
++//               out locally) → Here's your Meridian → links → All set
++// Help > Welcome Tour runs it again; File > Import from Arc opens its Arc step.
++
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {browserProxyFactory} from '../sidebar.mojom-webui.js';
++import type {ArcPreview, Item, SetupProposal, SidebarHandlerInterface, Space} from '../sidebar.mojom-webui.js';
++
++import {getCss} from './onboarding.css.js';
++import {getHtml} from './onboarding.html.js';
++
++export type StepName = 'hello'|'arc'|'tailor'|'preview'|'default'|'done';
++
++const HELLOS = [
++  'hello', 'привет', 'hola', 'bonjour', 'hallo', 'ciao', 'olá', 'გამარჯობა',
++  'merhaba', 'hej', 'こんにちは', '你好',
++];
++
++const FAV_COLORS: Record<string, string> = {
++  'Gmail': '#ea4335',
++  'Google Calendar': '#4285f4',
++  'Google Docs': '#4285f4',
++  'Google Maps': '#34a853',
++  'Notion': '#111',
++  'Slack': '#4a154b',
++  'Linear': '#5e6ad2',
++  'Figma': '#a259ff',
++  'GitHub': '#24292f',
++  'Telegram': '#2aabee',
++  'WhatsApp': '#25d366',
++  'YouTube': '#ff0000',
++  'Claude': '#d97757',
++  'Dribbble': '#ea4c89',
++  'Pinterest': '#e60023',
++  'Outlook': '#0078d4',
++  'Microsoft Teams': '#6264a7',
++};
++
++export interface Dot {
++  index: number;
++  cls: string;
++}
++
++export interface FavTile {
++  index: number;
++  title: string;
++  letter: string;
++  color: string;
++  off: boolean;
++}
++
++export interface SpaceChip {
++  index: number;
++  name: string;
++  icon: string;
++  color: string;
++  off: boolean;
++}
++
++export class MeridianOnboardingElement extends CrLitElement {
++  static get is() {
++    return 'meridian-onboarding';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      open: {type: Boolean, reflect: true},
++      step_: {state: true, type: String},
++      steps_: {state: true, type: Array},
++      arc_: {state: true, type: Object},
++      withLogins_: {state: true, type: Boolean},
++      confirmLogins_: {state: true, type: Boolean},
++      proposal_: {state: true, type: Object},
++      pickedSpaces_: {state: true, type: Array},
++      pickedFavorites_: {state: true, type: Array},
++      busy_: {state: true, type: String},
++      hello_: {state: true, type: String},
++      lines_: {state: true, type: Array},
++      thinking_: {state: true, type: Boolean},
++      useApps_: {state: true, type: Boolean},
++      note_: {state: true, type: String},
++      dots_: {state: true, type: Array},
++      stepIndex_: {state: true, type: Number},
++      nextLabel_: {state: true, type: String},
++      arcSpaces_: {state: true, type: Array},
++      tiles_: {state: true, type: Array},
++      chips_: {state: true, type: Array},
++      persona_: {state: true, type: String},
++      arcTabs_: {state: true, type: Number},
++      canStartFresh_: {state: true, type: Boolean},
++    };
++  }
++
++  accessor open: boolean = false;
++  protected accessor step_: StepName = 'hello';
++  protected accessor steps_: StepName[] = [];
++  protected accessor arc_: ArcPreview|null = null;
++  protected accessor withLogins_: boolean = true;
++  protected accessor confirmLogins_: boolean = false;
++  protected accessor proposal_: SetupProposal|null = null;
++  protected accessor pickedSpaces_: boolean[] = [];
++  protected accessor pickedFavorites_: boolean[] = [];
++  // The Continue button's label while it works ('' when idle).
++  protected accessor busy_: string = '';
++  protected accessor hello_: string = HELLOS[0]!;
++  protected accessor lines_: string[] = [];
++  protected accessor thinking_: boolean = false;
++  protected accessor useApps_: boolean = true;
++  // A line under the Arc step after an import (e.g. sign-ins not brought).
++  protected accessor note_: string = '';
++
++  // Derived in willUpdate() for the template.
++  protected accessor dots_: Dot[] = [];
++  protected accessor stepIndex_: number = 0;
++  protected accessor nextLabel_: string = 'Continue';
++  protected accessor arcSpaces_: SpaceChip[] = [];
++  protected accessor tiles_: FavTile[] = [];
++  protected accessor chips_: SpaceChip[] = [];
++  protected accessor persona_: string = '';
++  protected accessor arcTabs_: number = 0;
++  protected accessor canStartFresh_: boolean = false;
++
++  private readonly handler_: SidebarHandlerInterface =
++      browserProxyFactory.getInstance().handler;
++  private isDefault_: boolean = false;
++  private fresh_: boolean = false;
++  private helloTimer_: number|null = null;
++
++  // `start`: 'arc' opens straight at the Arc step (File > Import from Arc).
++  async show(start: 'tour'|'arc' = 'tour') {
++    if (this.open) {
++      return;
++    }
++    const [{preview}, {isDefault}] = await Promise.all([
++      this.handler_.getArcPreview(),
++      this.handler_.isDefaultBrowser(),
++    ]);
++    this.arc_ = preview;
++    this.isDefault_ = isDefault;
++    this.fresh_ = false;
++    this.withLogins_ = !!preview?.loginsAvailable;
++    this.confirmLogins_ = false;
++    this.proposal_ = null;
++    this.lines_ = [];
++    this.thinking_ = false;
++    this.useApps_ = true;
++    this.note_ = '';
++    this.busy_ = '';
++    this.steps_ = start === 'arc' ? ['arc', 'done'] : this.tourSteps_();
++    this.step_ = this.steps_[0]!;
++    this.open = true;
++    this.startHello_();
++  }
++
++  private tourSteps_(): StepName[] {
++    const steps: StepName[] = ['hello'];
++    steps.push(...(this.arc_ && !this.fresh_ ? ['arc' as const] :
++                                             ['tailor' as const,
++                                              'preview' as const]));
++    if (!this.isDefault_) {
++      steps.push('default');
++    }
++    steps.push('done');
++    return steps;
++  }
++
++  override willUpdate(changed: PropertyValues<this>) {
++    super.willUpdate(changed);
++    this.stepIndex_ = this.steps_.indexOf(this.step_);
++    this.dots_ = this.steps_.map((_, index) => ({
++                                   index,
++                                   cls: index === this.stepIndex_ ? 'on' :
++                                       index < this.stepIndex_    ? 'past' :
++                                                                    '',
++                                 }));
++    this.nextLabel_ = this.busy_ || {
++      hello: '',
++      arc: this.arc_ ? 'Bring everything' : 'Continue',
++      tailor: 'Suggest a setup',
++      preview: 'Looks great',
++      default: 'Not now',
++      done: 'Start browsing',
++    }[this.step_];
++    this.arcTabs_ = (this.arc_?.pinnedCount || 0) + (this.arc_?.todayCount || 0);
++    this.canStartFresh_ = this.steps_.includes('hello');
++    this.arcSpaces_ = (this.arc_?.spaces || []).map(
++        (s, index) => ({index, name: s.name, icon: s.icon,
++                        color: s.color || '#8a8fe0', off: false}));
++    const p = this.proposal_;
++    this.persona_ = p?.title || '';
++    this.tiles_ = (p?.favorites || []).map((f, index) => ({
++                                             index,
++                                             title: f.title,
++                                             letter: f.title.charAt(0),
++                                             color: FAV_COLORS[f.title] ||
++                                                 '#8a8fe0',
++                                             off: !this.pickedFavorites_[index],
++                                           }));
++    this.chips_ = (p?.spaces || []).map((s, index) => ({
++                                          index,
++                                          name: s.name,
++                                          icon: s.icon,
++                                          color: s.color,
++                                          off: !this.pickedSpaces_[index],
++                                        }));
++  }
++
++  override updated(changed: PropertyValues<this>) {
++    super.updated(changed);
++    if (changed.has('step_' as keyof MeridianOnboardingElement) && this.open) {
++      this.shadowRoot.querySelector<HTMLElement>('#next')?.focus();
++    }
++  }
++
++  private startHello_() {
++    this.stopHello_();
++    let i = 0;
++    this.helloTimer_ = setInterval(() => {
++      i = (i + 1) % HELLOS.length;
++      this.hello_ = HELLOS[i]!;
++    }, 2600);
++  }
++
++  private stopHello_() {
++    if (this.helloTimer_ !== null) {
++      clearInterval(this.helloTimer_);
++      this.helloTimer_ = null;
++    }
++  }
++
++  private goTo_(step: StepName) {
++    this.busy_ = '';
++    this.step_ = step;
++  }
++
++  private advance_() {
++    const next = this.steps_[this.stepIndex_ + 1];
++    if (next) {
++      this.goTo_(next);
++    } else {
++      this.finish_();
++    }
++  }
++
++  private finish_() {
++    this.stopHello_();
++    this.open = false;
++    this.handler_.finishOnboarding();
++  }
++
++  // ------------------------------------------------------------ events
++
++  protected onSkipClick_() {
++    this.finish_();
++  }
++
++  protected onBackClick_() {
++    const previous = this.steps_[this.stepIndex_ - 1];
++    if (previous && !this.busy_) {
++      this.goTo_(previous);
++    }
++  }
++
++  protected onDotClick_(e: Event) {
++    const index = Number((e.currentTarget as HTMLElement).dataset['index']);
++    if (index < this.stepIndex_ && !this.busy_) {
++      this.goTo_(this.steps_[index]!);
++    }
++  }
++
++  protected onRootKeydown_(e: KeyboardEvent) {
++    if (e.key === 'Escape' && this.confirmLogins_) {
++      this.confirmLogins_ = false;
++    }
++  }
++
++  protected async onNextClick_() {
++    if (this.busy_) {
++      return;
++    }
++    switch (this.step_) {
++      case 'arc':
++        return this.arc_ ? this.bringArc_() : this.advance_();
++      case 'tailor':
++        return this.suggest_();
++      case 'preview':
++        return this.applyProposal_();
++      default:
++        return this.advance_();
++    }
++  }
++
++  protected onLoginsClick_() {
++    this.withLogins_ = !this.withLogins_;
++  }
++
++  protected onFreshClick_() {
++    this.fresh_ = true;
++    this.steps_ = this.tourSteps_();
++    this.goTo_('tailor');
++  }
++
++  protected onUseAppsClick_() {
++    this.useApps_ = !this.useApps_;
++  }
++
++  protected onTileClick_(e: Event) {
++    const i = Number((e.currentTarget as HTMLElement).dataset['index']);
++    const picks = [...this.pickedFavorites_];
++    picks[i] = !picks[i];
++    this.pickedFavorites_ = picks;
++  }
++
++  protected onChipClick_(e: Event) {
++    const i = Number((e.currentTarget as HTMLElement).dataset['index']);
++    const picks = [...this.pickedSpaces_];
++    picks[i] = !picks[i];
++    this.pickedSpaces_ = picks;
++  }
++
++  protected async onDefaultClick_() {
++    if (this.busy_) {
++      return;
++    }
++    this.busy_ = 'One moment…';
++    const {isDefault} = await this.handler_.setDefaultBrowser();
++    this.busy_ = '';
++    if (isDefault) {
++      this.advance_();
++    }
++  }
++
++  protected onConfirmCancelClick_() {
++    this.confirmLogins_ = false;
++  }
++
++  protected onConfirmContinueClick_() {
++    this.confirmLogins_ = false;
++    this.bringArc_(/*confirmed=*/ true);
++  }
++
++  // ------------------------------------------------------------ actions
++
++  private async bringArc_(confirmed = false) {
++    // Reading Arc's sign-ins makes macOS ask; say so first.
++    if (this.withLogins_ && this.arc_?.loginsAvailable && !confirmed) {
++      this.confirmLogins_ = true;
++      return;
++    }
++    this.busy_ = 'Moving in…';
++    const {ok} = await this.handler_.importArc();
++    if (ok && this.withLogins_ && this.arc_?.loginsAvailable) {
++      const {imported, error} = await this.handler_.importArcLogins();
++      this.note_ = error === 'denied' ?
++          'Sign-ins weren’t brought over. You can try again from File > Import from Arc.' :
++          error ? 'Arc’s sign-ins couldn’t be read.' :
++                  `You’re still signed in to your sites (${
++                      imported.toLocaleString()} sign-ins brought over).`;
++    }
++    this.advance_();
++  }
++
++  private async suggest_() {
++    this.busy_ = 'One moment…';
++    this.thinking_ = true;
++    this.lines_ = this.useApps_ ? ['Looking at your apps…'] : [];
++    const [{proposal}] = await Promise.all([
++      this.handler_.proposeSetup(this.useApps_),
++      new Promise(r => setTimeout(r, 1500)),
++    ]);
++    if (!this.open || this.step_ !== 'tailor') {
++      return;
++    }
++    if (proposal.seenApps.length) {
++      this.lines_ = [
++        ...this.lines_,
++        `Found ${proposal.seenApps.slice(0, 4).join(', ')}${
++            proposal.seenApps.length > 4 ? '…' : ''}`,
++      ];
++    }
++    await new Promise(r => setTimeout(r, 600));
++    this.lines_ = [...this.lines_, proposal.title];
++    this.proposal_ = proposal;
++    this.pickedSpaces_ = proposal.spaces.map(() => true);
++    this.pickedFavorites_ = proposal.favorites.map(() => true);
++    await new Promise(r => setTimeout(r, 1000));
++    if (this.open && this.step_ === 'tailor') {
++      this.thinking_ = false;
++      this.advance_();
++    }
++  }
++
++  private applyProposal_() {
++    const p = this.proposal_;
++    if (!p) {
++      return this.advance_();
++    }
++    this.busy_ = 'Setting up…';
++    const spaces: Space[] = p.spaces.filter((_, i) => this.pickedSpaces_[i]);
++    const favorites: Item[] =
++        p.favorites.filter((_, i) => this.pickedFavorites_[i]);
++    this.handler_.applySetup(spaces, favorites, p.mode);
++    this.advance_();
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-onboarding': MeridianOnboardingElement;
++  }
++}
++
++customElements.define(MeridianOnboardingElement.is, MeridianOnboardingElement);
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index adc35227f5..4f3ac80b6f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -107,6 +107,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+   private commandBarListenerId_: number|null = null;
+   private commandListenerId_: number|null = null;
+   private statusListenerId_: number|null = null;
++  private onboardingShown_: boolean = false;
+ 
+   constructor() {
+     super();
+@@ -247,6 +248,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.rev_++;
+     this.fire('meridian-splits-changed', state.splits);
+     this.fire('meridian-little-changed', state.little);
++    // First start of this profile: the welcome tour, once per window.
++    if (state.onboarding && !this.onboardingShown_) {
++      this.onboardingShown_ = true;
++      this.fire('meridian-onboarding', 'tour');
++    }
+     this.fire('meridian-peeks-changed',
+               state.tabs.filter(t => t.peek && t.openerId)
+                   .map(t => ({tab: t.tabId, opener: t.openerId!})));
+@@ -652,6 +658,12 @@ export class MeridianSidebarElement extends CrLitElement implements
+       case Command.kClearToday:
+         this.handler_.clearToday();
+         break;
++      case Command.kWelcomeTour:
++        this.fire('meridian-onboarding', 'tour');
++        break;
++      case Command.kImportArc:
++        this.fire('meridian-onboarding', 'arc');
++        break;
+       case Command.kNewFolder:
+         if (space) {
+           this.addFolder_(space.id, '');
+diff --git a/chrome/browser/ui/browser_command_controller.cc b/chrome/browser/ui/browser_command_controller.cc
+index 365465d3a8..223cb5d4df 100644
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -2069,7 +2069,8 @@ void BrowserCommandController::InitCommandState() {
+         IDC_MERIDIAN_NEXT_SPACE, IDC_MERIDIAN_PREVIOUS_SPACE,
+         IDC_MERIDIAN_NEW_FOLDER, IDC_MERIDIAN_NEXT_TAB,
+         IDC_MERIDIAN_PREVIOUS_TAB, IDC_MERIDIAN_SPLIT, IDC_MERIDIAN_UNSPLIT,
+-        IDC_MERIDIAN_ARCHIVE, IDC_MERIDIAN_CLEAR_TODAY}) {
++        IDC_MERIDIAN_ARCHIVE, IDC_MERIDIAN_CLEAR_TODAY,
++        IDC_MERIDIAN_WELCOME_TOUR, IDC_MERIDIAN_IMPORT_ARC}) {
+     command_updater_->UpdateCommandEnabled(meridian_command, supports_tabs);
+   }
+   for (int i = IDC_MERIDIAN_SPACE_1; i <= IDC_MERIDIAN_SPACE_9; ++i) {
+diff --git a/chrome/browser/ui/cocoa/main_menu_builder.mm b/chrome/browser/ui/cocoa/main_menu_builder.mm
+index 38feea706c..2c920d91c4 100644
+--- a/chrome/browser/ui/cocoa/main_menu_builder.mm
++++ b/chrome/browser/ui/cocoa/main_menu_builder.mm
+@@ -72,6 +72,9 @@ NSMenuItem* BuildAppMenu(NSApplication* nsapp,
+               Item(IDS_IMPORT_SETTINGS_MENU_MAC)
+                   .command_id(IDC_IMPORT_SETTINGS)
+                   .remove_if(is_pwa),
++              Item(IDS_MERIDIAN_IMPORT_ARC_MAC)
++                  .command_id(IDC_MERIDIAN_IMPORT_ARC)
++                  .remove_if(is_pwa),
+               Item().is_separator(),
+               Item(IDS_SERVICES_MAC)
+                   .tag(-1)
+@@ -619,6 +622,8 @@ NSMenuItem* BuildHelpMenu(NSApplication* nsapp,
+                         .command_id(IDC_REPORT_UNSAFE_SITE));
+   }
+ #endif
++  items.push_back(Item(IDS_MERIDIAN_WELCOME_TOUR_MAC)
++                      .command_id(IDC_MERIDIAN_WELCOME_TOUR));
+   items.push_back(Item(IDS_HELP_MAC)
+                       .string_format_1(product_name)
+                       .command_id(IDC_HELP_PAGE_VIA_MENU));
