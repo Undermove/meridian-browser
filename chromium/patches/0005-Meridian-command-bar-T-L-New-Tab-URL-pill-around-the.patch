@@ -1,0 +1,739 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 27 Oct 2026 12:33:46 +0400
+Subject: [PATCH 6/6] =?UTF-8?q?Meridian:=20command=20bar=20(=E2=8C=98T,=20?=
+ =?UTF-8?q?=E2=8C=98L,=20New=20Tab,=20URL=20pill)=20around=20the=20omnibox?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ chrome/browser/meridian/sidebar.mojom         |  4 +
+ chrome/browser/meridian/sidebar_handler.cc    | 23 +++++
+ chrome/browser/meridian/sidebar_handler.h     |  4 +
+ .../browser/resources/webui_browser/BUILD.gn  |  3 +
+ .../browser/resources/webui_browser/app.css   | 60 ++++++------
+ .../resources/webui_browser/app.html.ts       |  9 +-
+ chrome/browser/resources/webui_browser/app.ts | 55 ++++++++---
+ .../webui_browser/meridian/command_bar.css    | 75 +++++++++++++++
+ .../meridian/command_bar.html.ts              | 21 +++++
+ .../webui_browser/meridian/command_bar.ts     | 94 +++++++++++++++++++
+ .../webui_browser/meridian/sidebar.ts         | 17 +++-
+ .../webui_browser/webui_browser_searchbox.ts  | 42 +++++++++
+ chrome/browser/ui/BUILD.gn                    |  1 +
+ .../browser/ui/browser_command_controller.cc  |  6 ++
+ 14 files changed, 362 insertions(+), 52 deletions(-)
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/command_bar.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/command_bar.ts
+
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index d335af6d00..f5beb21a60 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -63,6 +63,10 @@ interface SidebarPage {
+   // The whole state, after any change (from this window, another window or
+   // an agent).
+   OnStateChanged(SidebarState state);
++
++  // ⌘T / File > New Tab: the command bar opens, and a tab opens only once
++  // something is picked (like Arc).
++  ShowCommandBar();
+ };
+ 
+ interface SidebarHandler {
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index bbb5a3a159..8e0f28e02a 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -7,6 +7,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/no_destructor.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "chrome/browser/meridian/sidebar_service_factory.h"
+@@ -27,6 +28,13 @@ namespace meridian {
+ 
+ namespace {
+ 
++// The sidebar of each window, for ShowCommandBar().
++std::map<BrowserWindowInterface*, SidebarHandler*>& Handlers() {
++  static base::NoDestructor<std::map<BrowserWindowInterface*, SidebarHandler*>>
++      handlers;
++  return *handlers;
++}
++
+ mojom::ItemPtr ToMojo(const Item& item) {
+   auto m = mojom::Item::New();
+   m->id = item.id;
+@@ -52,6 +60,7 @@ SidebarHandler::SidebarHandler(
+       receiver_(this, std::move(receiver)) {
+   service_observation_.Observe(service_.get());
+   model()->AddObserver(this);
++  Handlers()[browser_] = this;
+   if (service_->loaded()) {
+     OnSidebarChanged();
+   }
+@@ -59,6 +68,20 @@ SidebarHandler::SidebarHandler(
+ 
+ SidebarHandler::~SidebarHandler() {
+   model()->RemoveObserver(this);
++  auto it = Handlers().find(browser_);
++  if (it != Handlers().end() && it->second == this) {
++    Handlers().erase(it);
++  }
++}
++
++// static
++bool SidebarHandler::ShowCommandBar(BrowserWindowInterface* browser) {
++  auto it = Handlers().find(browser);
++  if (it == Handlers().end() || !it->second->page_.is_connected()) {
++    return false;
++  }
++  it->second->page_->ShowCommandBar();
++  return true;
+ }
+ 
+ TabStripModel* SidebarHandler::model() {
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index a40e8ee166..6e737c0d79 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -38,6 +38,10 @@ class SidebarHandler : public mojom::SidebarHandler,
+   SidebarHandler& operator=(const SidebarHandler&) = delete;
+   ~SidebarHandler() override;
+ 
++  // Asks `browser`'s sidebar to open the command bar for a new tab. False if
++  // the window has no Meridian sidebar (the caller opens a tab as usual).
++  static bool ShowCommandBar(BrowserWindowInterface* browser);
++
+   // mojom::SidebarHandler:
+   void GetState(GetStateCallback callback) override;
+   void CreateSpace(const std::string& name,
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index 19368bf732..8b5c4653ef 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -27,6 +27,8 @@ build_webui("build") {
+     "extension.ts",
+     "extensions_bar.ts",
+     "icons.html.ts",
++    "meridian/command_bar.html.ts",
++    "meridian/command_bar.ts",
+     "meridian/fav.html.ts",
+     "meridian/fav.ts",
+     "meridian/icons.ts",
+@@ -63,6 +65,7 @@ build_webui("build") {
+     "content_region.css",
+     "extension.css",
+     "extensions_bar.css",
++    "meridian/command_bar.css",
+     "meridian/rows.css",
+     "meridian/sidebar.css",
+     "side_panel.css",
+diff --git a/chrome/browser/resources/webui_browser/app.css b/chrome/browser/resources/webui_browser/app.css
+index 51a4e38ff0..d432877066 100644
+--- a/chrome/browser/resources/webui_browser/app.css
++++ b/chrome/browser/resources/webui_browser/app.css
+@@ -26,6 +26,7 @@
+   --meridian-row-shadow: 0 1px 2px rgba(0, 0, 0, 0.08), 0 1px 6px rgba(0, 0, 0, 0.05);
+   --meridian-field: color-mix(in srgb, var(--meridian-space) 18%, #fff);
+   --meridian-surface: #fff;
++  --meridian-overlay: rgba(20, 20, 30, 0.25);
+ 
+   display: flex;
+   height: 100%;
+@@ -53,6 +54,7 @@
+     --meridian-row-shadow: none;
+     --meridian-field: color-mix(in srgb, var(--meridian-space) 14%, #2a2a31);
+     --meridian-surface: #1f1f24;
++    --meridian-overlay: rgba(0, 0, 0, 0.45);
+     background:
+       linear-gradient(160deg,
+         color-mix(in srgb, var(--meridian-space) var(--meridian-tint), #16161a),
+@@ -145,53 +147,53 @@ cr-icon-button {
+   margin-left: -70px;
+ }
+ 
+-#addressBox {
+-  position: relative;
++#urlPill {
+   display: flex;
+   align-items: center;
++  gap: 4px;
++  height: 34px;
++  padding: 0 11px 0 4px;
+   margin-bottom: 10px;
++  border-radius: 9px;
++  background: color-mix(in srgb, var(--meridian-row-active) 70%, transparent);
++  overflow: hidden;
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
+ }
+ 
+-webui-browser-searchbox {
+-  --cr-searchbox-font-size: 13px;
+-  --cr-searchbox-height: 34px;
+-  --cr-searchbox-input-height: 34px;
+-  --cr-searchbox-shadow: none;
+-  --cr-searchbox-icon-left-position: 10px;
+-  --cr-searchbox-icon-size-in-searchbox: 16px;
+-  --cr-searchbox-icon-top-position: 0;
+-  --cr-searchbox-match-padding: 4px 0;
+-  --color-searchbox-background: var(--meridian-field);
+-  flex: 1;
+-  min-width: 0;
+-  display: block;
+-  border-radius: var(--meridian-radius);
++#urlPill:hover {
++  background: var(--meridian-row-active);
+ }
+ 
+-webui-browser-searchbox[dropdown-is-visible] {
+-  --cr-searchbox-shadow: 0 3px 12px 0 rgba(0, 0, 0, 0.18);
+-  --color-searchbox-background: var(--meridian-surface);
++#urlPill .host {
++  flex: 1;
++  min-width: 0;
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  font-weight: 500;
++  padding-left: 7px;
+ }
+ 
+ #locationIconButton {
+-  position: absolute;
+-  z-index: 101;
+-  top: 4px;
+-  left: 4px;
+   height: 26px;
+-  min-width: 28px;
++  min-width: 26px;
+   padding: 0;
+   border: none;
+-  border-radius: 8px;
++  border-radius: 7px;
+   --iron-icon-width: 14px;
+   --iron-icon-height: 14px;
+-  /* covers the searchbox's own icon, like the stock layout */
+-  background-color: var(--meridian-field);
++  background-color: transparent;
++  --cr-button-background-color: transparent;
++}
++
++#locationIconButton[hidden] + .host {
++  padding-left: 7px;
+ }
+ 
+ #locationIcon {
+-  fill: var(--meridian-text);
+-  stroke: var(--meridian-text);
++  fill: var(--meridian-text-muted);
++  stroke: var(--meridian-text-muted);
+   stroke-width: 0;
+   shape-rendering: geometricPrecision;
+ }
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index c13fca1caa..1a87f95e7c 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -44,18 +44,20 @@ export function getHtml(this: WebuiBrowserAppElement) {
+           @click="${this.onReloadOrStopClick_}">
+       </cr-icon-button>
+     </div>
+-    <div id="addressBox">
+-      <webui-browser-searchbox id="address"></webui-browser-searchbox>
++    <div id="urlPill" role="button" tabindex="0"
++        title="Edit URL (⌘L)" @click="${this.onUrlPillClick_}">
+       <cr-button id="locationIconButton" type="button"
+           ?hidden="${!this.showLocationIconButton_}"
+           @click="${this.onLocationIconClick_}">
+         <cr-icon id="locationIcon" icon="webui-browser:${this.locationIcon_}">
+         </cr-icon>
+       </cr-button>
++      <span class="host">${this.urlHost_}</span>
+     </div>
+     <meridian-sidebar id="tabstrip" @tab-added="${this.onTabAdded_}"
+         @tab-closed="${this.onTabClosed_}" @tab-updated="${this.onTabUpdated_}"
+-        @meridian-space-changed="${this.onMeridianSpaceChanged_}">
++        @meridian-space-changed="${this.onMeridianSpaceChanged_}"
++        @meridian-show-command-bar="${this.onMeridianShowCommandBar_}">
+       <cr-icon-button slot="bottom-start" id="appMenuButton"
+           iron-icon="cr:more-vert" title="$i18n{appMenuTooltip}"
+           @click="${this.onAppMenuClick_}">
+@@ -71,6 +73,7 @@ export function getHtml(this: WebuiBrowserAppElement) {
+     <webui-browser-bookmark-bar id="bookmarkBar" hidden>
+     </webui-browser-bookmark-bar>
+   </div>
++  <meridian-command-bar id="commandBar"></meridian-command-bar>
+   <div id="main">
+     <content-region id="contentRegion"
+         ?showing-side-panel="${this.showingSidePanel_}">
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 5174001655..c438337f62 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -10,7 +10,7 @@ import './side_panel.js';
+ import '/strings.m.js';
+ import './meridian/sidebar.js';
+ import './webview.js';
+-import './webui_browser_searchbox.js';
++import './meridian/command_bar.js';
+ import 'chrome://resources/cr_elements/cr_button/cr_button.js';
+ import 'chrome://resources/cr_elements/cr_icon_button/cr_icon_button.js';
+ import 'chrome://resources/cr_elements/cr_icon/cr_icon.js';
+@@ -28,12 +28,29 @@ import {browserProxyFactory, FullscreenContext, SecurityIcon} from './browser.mo
+ import type {ContentRegionElement} from './content_region.js';
+ import type {SidePanelElement} from './side_panel.js';
+ import type {TabAdded, TabClosed, TabUpdated} from './tab_strip/events.js';
++import type {MeridianCommandBarElement} from './meridian/command_bar.js';
+ import type {MeridianSidebarElement} from './meridian/sidebar.js';
+-import type {WebuiBrowserSearchboxElement} from './webui_browser_searchbox.js';
++
++// "github.com/foo" -> "github.com"; Arc shows just the site.
++function hostForPill(url: string): string {
++  if (!url) {
++    return '';
++  }
++  try {
++    const u = new URL(url);
++    if (u.protocol === 'http:' || u.protocol === 'https:') {
++      return u.hostname.replace(/^www\./, '');
++    }
++  } catch {
++    // Not a URL; show it as is.
++  }
++  return url;
++}
+ 
+ export interface WebuiBrowserAppElement {
+   $: {
+-    address: WebuiBrowserSearchboxElement,
++    commandBar: MeridianCommandBarElement,
++    urlPill: HTMLElement,
+     appMenuButton: HTMLElement,
+     avatarButton: HTMLElement,
+     backButton: HTMLElement,
+@@ -69,6 +86,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       showLocationIconButton_: {type: Boolean, reflect: true},
+       locationIcon_: {state: true, type: String},
+       tabStripInset_: {state: true, type: Number},
++      urlHost_: {state: true, type: String},
+       inactive_: {
+         type: Boolean,
+         reflect: true,
+@@ -91,6 +109,9 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       loadTimeData.getInteger('tabStripInset') :
+       0;
+   protected accessor inactive_: boolean = false;
++  // The active tab's URL, and what the sidebar's URL pill shows of it.
++  private url_: string = '';
++  protected accessor urlHost_: string = '';
+ 
+   constructor() {
+     super();
+@@ -113,7 +134,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     // super.connectedCallback().
+     super.connectedCallback();
+     this.trackedElementManager_.startTracking(
+-        this.$.address, 'kLocationBarElementId');
++        this.$.urlPill, 'kLocationBarElementId');
+     this.trackedElementManager_.startTracking(
+         this.$.appMenuButton, 'kToolbarAppMenuButtonElementId');
+     this.trackedElementManager_.startTracking(
+@@ -303,7 +324,8 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       }
+     }
+     this.showLocationIconButton_ = !isNTP;
+-    this.$.address.setInputText(displayUrl);
++    this.url_ = displayUrl;
++    this.urlHost_ = hostForPill(displayUrl);
+     this.$.contentRegion.classList.toggle('modalScrim', active.isBlocked);
+   }
+ 
+@@ -335,18 +357,21 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.style.setProperty('--meridian-space2', e.detail.color2);
+   }
+ 
+-  protected setFocusToLocationBar(isUserInitiated: boolean) {
+-    this.$.address.focusInput();
++  // ⌘L and the like: the command bar, editing the current URL.
++  protected setFocusToLocationBar(_isUserInitiated: boolean) {
++    this.$.commandBar.show(/*newTab=*/ false, this.url_);
++  }
+ 
+-    // If the user initiated the selection (e.g. by pressing Ctrl-L) we want to
+-    // select everything in order to make it easy to replace the URL. This is
+-    // also useful for some cases where we auto-focus (e.g. about:blank set as
+-    // the NTP) if they're not actively using the omnibox, which we check by
+-    // looking at the focus. See OmniBoxViewViews::SetFocus() for the
+-    // inspiration.
+-    if (isUserInitiated || this.shadowRoot.activeElement !== this.$.address) {
+-      this.$.address.selectAll();
++  protected onUrlPillClick_(e: Event) {
++    if (e.composedPath().includes(this.shadowRoot.getElementById(
++            'locationIconButton')!)) {
++      return;
+     }
++    this.$.commandBar.show(/*newTab=*/ false, this.url_);
++  }
++
++  protected onMeridianShowCommandBar_() {
++    this.$.commandBar.show(/*newTab=*/ true, '');
+   }
+ 
+   protected setReloadStopState(isLoading: boolean) {
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.css b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+new file mode 100644
+index 0000000000..4fe7cd28ce
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+@@ -0,0 +1,75 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #scheme=relative
++ * #css_wrapper_metadata_end */
++
++/* Mirrors the Electron command bar (#cmdbar in src/renderer/styles.css). */
++
++:host {
++  position: fixed;
++  inset: 0;
++  z-index: 50;
++  display: none;
++}
++
++:host([open]) {
++  display: block;
++}
++
++#overlay {
++  position: absolute;
++  inset: 0;
++  display: flex;
++  justify-content: center;
++  align-items: flex-start;
++  padding-top: 14vh;
++  background: var(--meridian-overlay, rgba(20, 20, 30, 0.25));
++  animation: fade 0.12s ease;
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
++}
++
++@keyframes fade {
++  from {
++    opacity: 0;
++  }
++}
++
++#bar {
++  width: min(680px, 90vw);
++  border-radius: 14px;
++  background: var(--meridian-surface);
++  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35),
++    0 0 0 0.5px var(--meridian-border);
++  overflow: hidden;
++  animation: pop 0.14s ease;
++}
++
++@keyframes pop {
++  from {
++    transform: scale(0.97);
++    opacity: 0;
++  }
++}
++
++webui-browser-searchbox {
++  --cr-searchbox-font-size: 18px;
++  --cr-searchbox-height: 56px;
++  --cr-searchbox-input-height: 56px;
++  --cr-searchbox-shadow: none;
++  --cr-searchbox-icon-left-position: 18px;
++  --cr-searchbox-icon-size-in-searchbox: 20px;
++  --cr-searchbox-icon-top-position: 0;
++  --cr-searchbox-match-padding: 6px 0;
++  --color-searchbox-background: var(--meridian-surface);
++  --color-searchbox-results-background: var(--meridian-surface);
++  display: block;
++  /* The card grows with the suggestions (the stock box has a fixed height
++   * and lets them overflow). */
++  height: auto;
++  max-height: 70vh;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+new file mode 100644
+index 0000000000..d4c2eb189a
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+@@ -0,0 +1,21 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {MeridianCommandBarElement} from './command_bar.js';
++
++export function getHtml(this: MeridianCommandBarElement) {
++  return html`<!--_html_template_start_-->
++<div id="overlay" @mousedown="${this.onOverlayMousedown_}"
++    @keydown="${this.onOverlayKeydown_}">
++  <div id="bar">
++    <webui-browser-searchbox id="address" ?new-tab="${this.newTab}"
++        .newTab="${this.newTab}" .inlineDropdown="${true}"
++        @searchbox-navigated="${this.onAddressSearchboxNavigated_}">
++    </webui-browser-searchbox>
++  </div>
++</div>
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+new file mode 100644
+index 0000000000..6d25745f9b
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -0,0 +1,94 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The command bar (⌘T, ⌘L, New Tab, a click on the URL in the sidebar): a
++// centred overlay around Chromium's omnibox, so it has history, search
++// suggestions, URL completion and "switch to tab" for every space's tabs.
++
++import '../webui_browser_searchbox.js';
++
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {WebuiBrowserSearchboxElement} from '../webui_browser_searchbox.js';
++
++import {getCss} from './command_bar.css.js';
++import {getHtml} from './command_bar.html.js';
++
++export interface MeridianCommandBarElement {
++  $: {
++    address: WebuiBrowserSearchboxElement,
++  };
++}
++
++export class MeridianCommandBarElement extends CrLitElement {
++  static get is() {
++    return 'meridian-command-bar';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      open: {type: Boolean, reflect: true},
++      newTab: {type: Boolean, reflect: true, attribute: 'new-tab'},
++    };
++  }
++
++  accessor open: boolean = false;
++  // Picks open in a new tab (⌘T) rather than in the current one (⌘L).
++  accessor newTab: boolean = false;
++
++  // `text`: what the field starts with (the current URL for ⌘L), selected.
++  async show(newTab: boolean, text: string) {
++    this.newTab = newTab;
++    this.open = true;
++    // A display:none field can't take the focus: wait for the render.
++    await this.updateComplete;
++    const box = this.$.address;
++    box.reset(text);
++    box.focusInput();
++    box.selectAll();
++  }
++
++  hide() {
++    if (!this.open) {
++      return;
++    }
++    this.open = false;
++    this.$.address.reset('');
++    this.fire('command-bar-closed');
++  }
++
++  protected onOverlayMousedown_(e: MouseEvent) {
++    if (e.target === e.currentTarget) {
++      this.hide();
++    }
++  }
++
++  protected onOverlayKeydown_(e: KeyboardEvent) {
++    if (e.key === 'Escape') {
++      e.preventDefault();
++      e.stopPropagation();
++      this.hide();
++    }
++  }
++
++  protected onAddressSearchboxNavigated_() {
++    this.hide();
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-command-bar': MeridianCommandBarElement;
++  }
++}
++
++customElements.define(MeridianCommandBarElement.is, MeridianCommandBarElement);
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 1837c754e2..eb45f62e17 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -104,6 +104,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+   private readonly handler_: SidebarHandlerInterface;
+   private observation_: TabStripObservation|undefined;
+   private listenerId_: number|null = null;
++  private commandBarListenerId_: number|null = null;
+ 
+   constructor() {
+     super();
+@@ -112,6 +113,9 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.handler_ = proxy.handler;
+     this.listenerId_ = proxy.callbackRouter.onStateChanged.addListener(
+         (state: SidebarState) => this.setState_(state));
++    this.commandBarListenerId_ =
++        proxy.callbackRouter.showCommandBar.addListener(
++            () => this.fire('meridian-show-command-bar'));
+   }
+ 
+   override connectedCallback() {
+@@ -126,11 +130,13 @@ export class MeridianSidebarElement extends CrLitElement implements
+   override disconnectedCallback() {
+     super.disconnectedCallback();
+     this.observation_ = undefined;
+-    if (this.listenerId_ !== null) {
+-      sidebarProxyFactory.getInstance().callbackRouter.removeListener(
+-          this.listenerId_);
+-      this.listenerId_ = null;
++    for (const id of [this.listenerId_, this.commandBarListenerId_]) {
++      if (id !== null) {
++        sidebarProxyFactory.getInstance().callbackRouter.removeListener(id);
++      }
+     }
++    this.listenerId_ = null;
++    this.commandBarListenerId_ = null;
+     document.removeEventListener('mousedown', this.onDocumentMouseDown_, true);
+     window.removeEventListener('blur', this.closeMenu_);
+   }
+@@ -338,8 +344,9 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.handler_.resetItemToHome(item.id);
+   }
+ 
++  // Like Arc: New Tab opens the command bar; the tab opens on a pick.
+   protected onNewTabClick_() {
+-    this.tabStripService_.createTabAt(null, null);
++    this.fire('meridian-show-command-bar');
+   }
+ 
+   startRenaming(id: string) {
+diff --git a/chrome/browser/resources/webui_browser/webui_browser_searchbox.ts b/chrome/browser/resources/webui_browser/webui_browser_searchbox.ts
+index 18f4f8cfa8..ffcbf2a15e 100644
+--- a/chrome/browser/resources/webui_browser/webui_browser_searchbox.ts
++++ b/chrome/browser/resources/webui_browser/webui_browser_searchbox.ts
+@@ -106,9 +106,51 @@ export class WebuiBrowserSearchboxElement extends
+         reflect: true,
+       },
+       unboundedSupported_: {type: Boolean},
++      newTab: {type: Boolean},
+     };
+   }
+ 
++  // Meridian: in the command bar opened by ⌘T / New Tab, the picked match
++  // opens in a new foreground tab instead of the current one.
++  accessor newTab: boolean = false;
++
++  override navigateToMatch(matchIndex: number, e: KeyboardEvent|MouseEvent) {
++    if (!this.newTab) {
++      super.navigateToMatch(matchIndex, e);
++      this.fire('searchbox-navigated');
++      return;
++    }
++    // A foreground new tab is what Shift+Cmd (Shift+Ctrl elsewhere) means
++    // to ui::DispositionFromClick.
++    const isMac = navigator.userAgent.includes('Mac');
++    const proxy = new Proxy(e, {
++      get: (target, prop) => {
++        if (prop === 'shiftKey') {
++          return true;
++        }
++        if (prop === (isMac ? 'metaKey' : 'ctrlKey')) {
++          return true;
++        }
++        const value = Reflect.get(target, prop, target);
++        return typeof value === 'function' ? value.bind(target) : value;
++      },
++    });
++    super.navigateToMatch(matchIndex, proxy);
++    this.fire('searchbox-navigated');
++  }
++
++  // Meridian: the command bar draws the suggestions inside its own card
++  // instead of in a separate OS window.
++  set inlineDropdown(value: boolean) {
++    this.unboundedSupported_ = !value && isUnboundedSupported();
++  }
++
++  // Empties the field and the suggestions, for a fresh command bar.
++  reset(text: string) {
++    this.setInputText(text);
++    this.clearAutocompleteMatches();
++  }
++
+   accessor placeholderText: string = '';
+   accessor searchboxChromeRefreshTheming: boolean =
+       loadTimeData.getBoolean('searchboxCr23Theming');
+diff --git a/chrome/browser/ui/BUILD.gn b/chrome/browser/ui/BUILD.gn
+index ca60f10e59..3277e827b8 100644
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -698,6 +698,7 @@ if (!is_android) {
+       ":singleton_tabs",
+       ":ui_features",
+       "//base",
++      "//chrome/browser/meridian",
+       "//chrome/app:command_ids",
+       "//chrome/browser:browser_process",
+       "//chrome/browser/actor/ui:actor_overlay",
+diff --git a/chrome/browser/ui/browser_command_controller.cc b/chrome/browser/ui/browser_command_controller.cc
+index afc3f64a97..492c6de7fd 100644
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -2,6 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include "chrome/browser/meridian/sidebar_handler.h"
+ #include "chrome/browser/ui/browser_command_controller.h"
+ 
+ #include <stddef.h>
+@@ -783,6 +784,11 @@ void BrowserCommandController::HandleCommandWithDisposition(
+       CloseWindow(browser_);
+       break;
+     case IDC_NEW_TAB: {
++      // Meridian: the command bar opens instead; the tab opens once a site
++      // or search is picked.
++      if (meridian::SidebarHandler::ShowCommandBar(browser_)) {
++        break;
++      }
+       NewTab(browser_, NewTabTypes::kNewTabCommand);
+       break;
+     }
