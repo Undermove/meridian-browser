@@ -112,8 +112,8 @@ test('spaces, pins and which space each tab is in survive a restart', async () =
     await b.waitFor(todayCount(0));
     await b.quit();
 
-    // Like a normal relaunch; "Continue where you left off" brings the tabs back.
-    b = await launch(['--restore-last-session'], { profile });
+    // A plain relaunch: Meridian restores the last session by default, like Arc.
+    b = await launch([], { profile });
     try {
       await b.waitFor(`app.$.tabstrip.state_?.spaces.length === 2`, 15000);
       const state = await b.state();
