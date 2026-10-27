@@ -1,0 +1,545 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 27 Oct 2026 13:12:28 +0400
+Subject: [PATCH 9/9] =?UTF-8?q?Meridian:=20split=20view=20on=20Chromium=20?=
+ =?UTF-8?q?split=20tabs=20(two=20cards,=20divider,=20=E2=8C=83=E2=87=A7=3D?=
+ =?UTF-8?q?/=E2=8C=83=E2=87=A7-,=20menu)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ chrome/app/chrome_command_ids.h               |  2 +
+ .../browser/global_keyboard_shortcuts_mac.mm  |  4 ++
+ chrome/browser/meridian/BUILD.gn              |  2 +
+ chrome/browser/meridian/sidebar.mojom         | 18 +++++
+ chrome/browser/meridian/sidebar_handler.cc    | 60 ++++++++++++++++
+ chrome/browser/meridian/sidebar_handler.h     |  4 ++
+ .../resources/webui_browser/app.html.ts       |  7 +-
+ chrome/browser/resources/webui_browser/app.ts | 28 ++++++++
+ .../webui_browser/content_region.css          | 71 +++++++++++++++++++
+ .../resources/webui_browser/content_region.ts | 61 ++++++++++++++++
+ .../webui_browser/meridian/sidebar.ts         | 30 ++++++++
+ .../browser/ui/browser_command_controller.cc  |  2 +-
+ 12 files changed, 286 insertions(+), 3 deletions(-)
+
+diff --git a/chrome/app/chrome_command_ids.h b/chrome/app/chrome_command_ids.h
+index 5af9ac4efd..222747f186 100644
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -121,6 +121,8 @@
+ #define IDC_MERIDIAN_NEW_FOLDER       39704
+ #define IDC_MERIDIAN_NEXT_TAB         39705
+ #define IDC_MERIDIAN_PREVIOUS_TAB     39706
++#define IDC_MERIDIAN_SPLIT            39707
++#define IDC_MERIDIAN_UNSPLIT          39708
+ // Spaces 1-9: IDC_MERIDIAN_SPACE_1 + n.
+ #define IDC_MERIDIAN_SPACE_1          39710
+ #define IDC_MERIDIAN_SPACE_9          39718
+diff --git a/chrome/browser/global_keyboard_shortcuts_mac.mm b/chrome/browser/global_keyboard_shortcuts_mac.mm
+index 93ee619719..d9e4704505 100644
+--- a/chrome/browser/global_keyboard_shortcuts_mac.mm
++++ b/chrome/browser/global_keyboard_shortcuts_mac.mm
+@@ -144,6 +144,10 @@ const std::vector<KeyboardShortcutData>& GetShortcutsNotPresentInMainMenu() {
+       {true,  false, false, false, kVK_ANSI_9,            IDC_SELECT_LAST_TAB},
+       {true,  false, false, false, kVK_ANSI_Keypad9,      IDC_SELECT_LAST_TAB},
+ 
++      // Meridian: Ctrl-Shift-= / - split and unsplit.
++      {false, true,  true,  false, kVK_ANSI_Equal,        IDC_MERIDIAN_SPLIT},
++      {false, true,  true,  false, kVK_ANSI_Minus,        IDC_MERIDIAN_UNSPLIT},
++
+       // Meridian: Ctrl-1..9 switch to space n.
+       {false, false, true,  false, kVK_ANSI_1,            IDC_MERIDIAN_SPACE_1},
+       {false, false, true,  false, kVK_ANSI_2,            IDC_MERIDIAN_SPACE_1 + 1},
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index d434e02859..d7368e5abc 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -56,10 +56,12 @@ source_set("meridian") {
+     "//chrome/browser/sessions",
+     "//chrome/browser/ui/navigator",
+     "//chrome/browser/ui/browser_window",
++    "//chrome/browser/ui/tabs",
+     "//chrome/browser/ui/tabs:tab_strip",
+     "//chrome/browser/ui/tabs:tab_strip_model_observer",
+     "//components/browser_apis/tab_strip/types",
+     "//components/sessions",
++    "//components/split_tabs",
+     "//components/tabs:public",
+     "//ui/base",
+     "//ui/gfx",
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 5ce28ec107..1d9be33c2f 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -38,12 +38,22 @@ struct TabInfo {
+   string item_id;
+ };
+ 
++// Two tabs side by side (Chromium split tabs), `start` on the left.
++struct Split {
++  string id;
++  tabs_api.mojom.NodeId start;
++  tabs_api.mojom.NodeId end;
++  // Share of the width for `start`.
++  double ratio;
++};
++
+ struct SidebarState {
+   array<Space> spaces;
+   string active_space_id;
+   // Shared by every space of the profile.
+   array<Item> favorites;
+   array<TabInfo> tabs;
++  array<Split> splits;
+ };
+ 
+ // Where an item goes. `container` is a space id, or "favorites".
+@@ -68,6 +78,8 @@ enum Command {
+   kTogglePin,
+   kToggleSidebar,
+   kNewFolder,
++  kSplit,
++  kUnsplit,
+ };
+ 
+ interface SidebarHandlerFactory {
+@@ -119,4 +131,10 @@ interface SidebarHandler {
+   // macOS: hides the window's traffic lights while the sidebar is hidden (they
+   // come back with it), like Arc.
+   SetWindowControlsVisible(bool visible);
++
++  // Split view: the active tab and `other` side by side (⌃⇧=), back to one
++  // (⌃⇧-), and the divider position.
++  SplitWith(tabs_api.mojom.NodeId other);
++  Unsplit();
++  SetSplitRatio(string split_id, double ratio);
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index fca4018c88..ed44b55409 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -18,9 +18,13 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "chrome/browser/ui/tabs/split_tab_metrics.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "components/browser_apis/tab_strip/types/node_id.h"
++#include "components/split_tabs/split_tab_id.h"
++#include "components/split_tabs/split_tab_visual_data.h"
++#include "components/tabs/public/split_tab_data.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/web_contents.h"
+ #include "ui/base/page_transition_types.h"
+@@ -170,6 +174,12 @@ bool SidebarHandler::HandleCommand(BrowserWindowInterface* browser,
+       case IDC_MERIDIAN_NEW_FOLDER:
+         command = mojom::Command::kNewFolder;
+         break;
++      case IDC_MERIDIAN_SPLIT:
++        command = mojom::Command::kSplit;
++        break;
++      case IDC_MERIDIAN_UNSPLIT:
++        command = mojom::Command::kUnsplit;
++        break;
+       default:
+         return false;
+     }
+@@ -252,6 +262,21 @@ mojom::SidebarStatePtr SidebarHandler::BuildState() {
+     info->space_id = data ? data->space_id() : service_->active_space_id();
+     info->item_id = data ? data->item_id() : std::string();
+     state->tabs.push_back(std::move(info));
++    // Each split once, from its first tab.
++    std::optional<split_tabs::SplitTabId> split_id = tab->GetSplit();
++    if (split_id && (i == 0 || model()->GetTabAtIndex(i - 1)->GetSplit() !=
++                                   split_id)) {
++      split_tabs::SplitTabData* split_data = model()->GetSplitData(*split_id);
++      std::vector<tabs::TabInterface*> pair = split_data->ListTabs();
++      if (pair.size() == 2) {
++        auto split = mojom::Split::New();
++        split->id = split_id->ToString();
++        split->start = tabs_api::NodeId::FromTabHandle(pair[0]->GetHandle());
++        split->end = tabs_api::NodeId::FromTabHandle(pair[1]->GetHandle());
++        split->ratio = split_data->visual_data()->split_ratio();
++        state->splits.push_back(std::move(split));
++      }
++    }
+   }
+   return state;
+ }
+@@ -475,6 +500,41 @@ void SidebarHandler::OpenItem(const std::string& item_id) {
+   }
+ }
+ 
++void SidebarHandler::OnSplitTabChanged(const SplitTabChange& change) {
++  ScheduleNotify();
++}
++
++void SidebarHandler::SplitWith(const tabs_api::NodeId& other) {
++  tabs::TabInterface* tab = TabFor(other);
++  tabs::TabInterface* active = model()->GetActiveTab();
++  if (!tab || !active || tab == active || tab->GetSplit() ||
++      active->GetSplit()) {
++    return;
++  }
++  model()->AddToNewSplit(
++      {model()->GetIndexOfTab(active), model()->GetIndexOfTab(tab)},
++      split_tabs::SplitTabVisualData(split_tabs::SplitTabLayout::kSideBySide),
++      split_tabs::SplitTabCreatedSource::kTabContextMenu);
++}
++
++void SidebarHandler::Unsplit() {
++  tabs::TabInterface* active = model()->GetActiveTab();
++  if (active && active->GetSplit()) {
++    model()->RemoveSplit(*active->GetSplit());
++  }
++}
++
++void SidebarHandler::SetSplitRatio(const std::string& split_id, double ratio) {
++  for (int i = 0; i < model()->count(); ++i) {
++    std::optional<split_tabs::SplitTabId> id =
++        model()->GetTabAtIndex(i)->GetSplit();
++    if (id && id->ToString() == split_id) {
++      model()->UpdateSplitRatio(*id, std::clamp(ratio, 0.15, 0.85));
++      return;
++    }
++  }
++}
++
+ void SidebarHandler::ResetItemToHome(const std::string& item_id) {
+   const Item* item = service_->FindItem(item_id);
+   tabs::TabInterface* tab = LiveTabOf(item_id);
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index f7e405e17a..773bda4cd2 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -78,6 +78,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void OpenItem(const std::string& item_id) override;
+   void ResetItemToHome(const std::string& item_id) override;
+   void SetWindowControlsVisible(bool visible) override;
++  void SplitWith(const tabs_api::NodeId& other) override;
++  void Unsplit() override;
++  void SetSplitRatio(const std::string& split_id, double ratio) override;
+ 
+   // SidebarService::Observer:
+   void OnSidebarChanged() override;
+@@ -87,6 +90,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+       TabStripModel* tab_strip_model,
+       const TabStripModelChange& change,
+       const TabStripSelectionChange& selection) override;
++  void OnSplitTabChanged(const SplitTabChange& change) override;
+ 
+  private:
+   TabStripModel* model();
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index a7f3504394..63e3ced049 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -59,7 +59,8 @@ export function getHtml(this: WebuiBrowserAppElement) {
+         @tab-closed="${this.onTabClosed_}" @tab-updated="${this.onTabUpdated_}"
+         @meridian-space-changed="${this.onMeridianSpaceChanged_}"
+         @meridian-show-command-bar="${this.onMeridianShowCommandBar_}"
+-        @meridian-toggle-sidebar="${this.onMeridianToggleSidebar_}">
++        @meridian-toggle-sidebar="${this.onMeridianToggleSidebar_}"
++        @meridian-splits-changed="${this.onMeridianSplitsChanged_}">
+       <cr-icon-button slot="bottom-start" id="appMenuButton"
+           iron-icon="cr:more-vert" title="$i18n{appMenuTooltip}"
+           @click="${this.onAppMenuClick_}">
+@@ -78,7 +79,9 @@ export function getHtml(this: WebuiBrowserAppElement) {
+   <meridian-command-bar id="commandBar"></meridian-command-bar>
+   <div id="main">
+     <content-region id="contentRegion"
+-        ?showing-side-panel="${this.showingSidePanel_}">
++        ?showing-side-panel="${this.showingSidePanel_}"
++        @split-ratio-changed="${this.onSplitRatioChanged_}"
++        @split-pane-focused="${this.onSplitPaneFocused_}">
+     </content-region>
+     <side-panel id="sidePanel" @side-panel-closed="${this.onSidePanelClosed_}">
+     </side-panel>
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 197b7e0e3a..a294ca5d7f 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -31,6 +31,7 @@ import type {SidePanelElement} from './side_panel.js';
+ import type {TabAdded, TabClosed, TabUpdated} from './tab_strip/events.js';
+ import type {MeridianCommandBarElement} from './meridian/command_bar.js';
+ import type {MeridianSidebarElement} from './meridian/sidebar.js';
++import type {Split} from './sidebar.mojom-webui.js';
+ 
+ const SIDEBAR_HIDDEN_KEY = 'meridian.sidebarHidden';
+ 
+@@ -306,6 +307,8 @@ export class WebuiBrowserAppElement extends CrLitElement {
+ 
+     // TODO(crbug.com/537801193): store and restore focus on tab switch.
+     this.$.contentRegion.activateTab(tabData.id);
++    this.activeTabId_ = tabData.id;
++    this.updateSplit_();
+     this.updateUrlForActiveTab_(tabData);
+     this.refreshLayout();
+   }
+@@ -415,6 +418,31 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.sidebarPeek_ = false;
+   }
+ 
++  // Meridian split view: the content region shows the active tab's split.
++  private splits_: Split[] = [];
++  private activeTabId_ = '';
++
++  protected onMeridianSplitsChanged_(e: CustomEvent<Split[]>) {
++    this.splits_ = e.detail;
++    this.updateSplit_();
++  }
++
++  private updateSplit_() {
++    const split = this.splits_.find(
++        s => s.start === this.activeTabId_ || s.end === this.activeTabId_);
++    this.$.contentRegion.setSplit(
++        split ? {id: split.id, start: split.start, end: split.end,
++                 ratio: split.ratio} : null);
++  }
++
++  protected onSplitRatioChanged_(e: CustomEvent<{id: string, ratio: number}>) {
++    this.$.tabstrip.setSplitRatio(e.detail.id, e.detail.ratio);
++  }
++
++  protected onSplitPaneFocused_(e: CustomEvent<string>) {
++    this.$.tabstrip.activateTab(e.detail);
++  }
++
+   protected onMeridianShowCommandBar_() {
+     this.$.commandBar.show(/*newTab=*/ true, '');
+   }
+diff --git a/chrome/browser/resources/webui_browser/content_region.css b/chrome/browser/resources/webui_browser/content_region.css
+index 485da70ac0..77ac3783ec 100644
+--- a/chrome/browser/resources/webui_browser/content_region.css
++++ b/chrome/browser/resources/webui_browser/content_region.css
+@@ -38,3 +38,74 @@ cr-tab-webview.active {
+   visibility: visible;
+   position: static;
+ }
++
++/* Meridian split view: two cards side by side with a gap and a divider
++ * (Electron: body.is-split). */
++:host([split]) {
++  background: transparent;
++  box-shadow: none !important;
++  overflow: visible !important;
++  border-radius: 0 !important;
++}
++
++:host([split]) cr-tab-webview.split-start,
++:host([split]) cr-tab-webview.split-end {
++  visibility: visible;
++  position: absolute;
++  top: 0;
++  bottom: 0;
++  height: auto;
++  border-radius: var(--meridian-radius, 10px);
++  overflow: hidden;
++  background: var(--meridian-surface, #fff);
++  box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.12), 0 2px 10px rgba(0, 0, 0, 0.08);
++}
++
++:host([split]) cr-tab-webview.split-start {
++  left: 0;
++  width: calc(var(--split-ratio, 0.5) * 100% - 4px);
++}
++
++:host([split]) cr-tab-webview.split-end {
++  left: calc(var(--split-ratio, 0.5) * 100% + 4px);
++  right: 0;
++  width: auto;
++}
++
++:host([split]) cr-tab-webview.active {
++  box-shadow: 0 0 0 2px color-mix(in srgb, var(--meridian-space, #8a8fe0) 70%, transparent),
++    0 2px 10px rgba(0, 0, 0, 0.08);
++}
++
++#splitHandle {
++  position: absolute;
++  top: 0;
++  bottom: 0;
++  left: calc(var(--split-ratio, 0.5) * 100% - 4px);
++  width: 8px;
++  cursor: col-resize;
++  z-index: 3;
++}
++
++#splitHandle::after {
++  content: '';
++  position: absolute;
++  top: 50%;
++  left: 3px;
++  width: 2px;
++  height: 36px;
++  margin-top: -18px;
++  border-radius: 2px;
++  background: var(--meridian-text-muted, #888);
++  opacity: 0;
++  transition: opacity 0.15s;
++}
++
++#splitHandle:hover::after {
++  opacity: 0.7;
++}
++
++/* While dragging the divider, the pages must not swallow the pointer. */
++:host([resizing]) cr-tab-webview {
++  pointer-events: none;
++}
+diff --git a/chrome/browser/resources/webui_browser/content_region.ts b/chrome/browser/resources/webui_browser/content_region.ts
+index 8ad3ede567..0e4958f098 100644
+--- a/chrome/browser/resources/webui_browser/content_region.ts
++++ b/chrome/browser/resources/webui_browser/content_region.ts
+@@ -58,6 +58,7 @@ export class ContentRegionElement extends CrLitElement {
+     }
+ 
+     const webview = new TabWebviewElement(tabId);
++    webview.addEventListener('focusin', this.onWebviewFocusIn_);
+     this.webviews.set(tabId, webview);
+     this.shadowRoot.appendChild(webview);
+     if (isActive) {
+@@ -66,6 +67,66 @@ export class ContentRegionElement extends CrLitElement {
+     this.requestUpdate();
+   }
+ 
++  // Meridian split view: `split` tabs side by side as two cards, `ratio` of
++  // the width for the first, with a draggable divider. null: one tab.
++  private split_: {id: string, start: string, end: string}|null = null;
++  private handle_: HTMLElement|null = null;
++
++  setSplit(split: {id: string, start: string, end: string, ratio: number}|null) {
++    for (const webview of this.webviews.values()) {
++      webview.classList.remove('split-start', 'split-end');
++    }
++    this.split_ = split;
++    this.toggleAttribute('split', !!split);
++    if (!split) {
++      this.handle_?.remove();
++      return;
++    }
++    this.webviews.get(split.start)?.classList.add('split-start');
++    this.webviews.get(split.end)?.classList.add('split-end');
++    this.style.setProperty('--split-ratio', String(split.ratio));
++    if (!this.handle_) {
++      this.handle_ = document.createElement('div');
++      this.handle_.id = 'splitHandle';
++      this.handle_.addEventListener('pointerdown', this.onHandleDown_);
++    }
++    this.shadowRoot.appendChild(this.handle_);
++  }
++
++  private onHandleDown_ = (e: PointerEvent) => {
++    const split = this.split_;
++    if (!split || !this.handle_) {
++      return;
++    }
++    e.preventDefault();
++    this.handle_.setPointerCapture(e.pointerId);
++    this.toggleAttribute('resizing', true);
++    const rect = this.getBoundingClientRect();
++    const ratioAt = (x: number) =>
++        Math.min(0.85, Math.max(0.15, (x - rect.left) / rect.width));
++    const move = (ev: PointerEvent) => {
++      this.style.setProperty('--split-ratio', String(ratioAt(ev.clientX)));
++    };
++    const up = (ev: PointerEvent) => {
++      this.handle_?.removeEventListener('pointermove', move);
++      this.handle_?.removeEventListener('pointerup', up);
++      this.toggleAttribute('resizing', false);
++      this.fire('split-ratio-changed', {id: split.id, ratio: ratioAt(ev.clientX)});
++    };
++    this.handle_.addEventListener('pointermove', move);
++    this.handle_.addEventListener('pointerup', up);
++  };
++
++  // A click into the other half of a split makes its tab the active one.
++  private onWebviewFocusIn_ = (e: Event) => {
++    const webview = e.currentTarget as TabWebviewElement;
++    if (this.split_ && webview !== this.activeWebview &&
++        (webview.tabId === this.split_.start ||
++         webview.tabId === this.split_.end)) {
++      this.fire('split-pane-focused', webview.tabId);
++    }
++  };
++
+   removeTab(tabId: string) {
+     const webview = this.webviews.get(tabId);
+     assert(webview);
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index a549ddc42d..328ac42def 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -242,6 +242,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+   private setState_(state: SidebarState) {
+     this.state_ = state;
+     this.rev_++;
++    this.fire('meridian-splits-changed', state.splits);
+     const space = this.activeSpace();
+     if (space) {
+       this.fire('meridian-space-changed',
+@@ -622,6 +623,22 @@ export class MeridianSidebarElement extends CrLitElement implements
+       case Command.kToggleSidebar:
+         this.fire('meridian-toggle-sidebar');
+         break;
++      case Command.kSplit: {
++        // With the next tab down the sidebar (Electron: ⌃⇧=).
++        const active = this.activeTab_();
++        const order = this.navOrder_()
++                          .map(e => e.tab || (e.item ? this.liveTab(e.item.id) : null))
++                          .filter((t): t is Tab => !!t);
++        const at = order.findIndex(t => t.id === active?.id);
++        const other = order[at + 1] || order[at - 1];
++        if (other) {
++          this.handler_.splitWith(other.id);
++        }
++        break;
++      }
++      case Command.kUnsplit:
++        this.handler_.unsplit();
++        break;
+       case Command.kNewFolder:
+         if (space) {
+           this.addFolder_(space.id, '');
+@@ -666,6 +683,14 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.fire('meridian-show-command-bar');
+   }
+ 
++  setSplitRatio(splitId: string, ratio: number) {
++    this.handler_.setSplitRatio(splitId, ratio);
++  }
++
++  activateTab(tabId: NodeId) {
++    this.tabStripService_.activateTab(tabId);
++  }
++
+   setWindowControlsVisible(visible: boolean) {
+     this.handler_.setWindowControlsVisible(visible);
+   }
+@@ -812,6 +837,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+         action: () => this.handler_.moveTabToSpace(tab.id, s.id),
+         separatorBefore: i === 0,
+       })),
++      ...(tab.isActive ? [] : [{
++        label: 'Open in Split View',
++        action: () => this.handler_.splitWith(tab.id),
++        separatorBefore: true,
++      }]),
+       {
+         label: 'Copy Link',
+         action: () => navigator.clipboard.writeText(tab.url),
+diff --git a/chrome/browser/ui/browser_command_controller.cc b/chrome/browser/ui/browser_command_controller.cc
+index 76adcefdd6..e5c9a04db0 100644
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -2068,7 +2068,7 @@ void BrowserCommandController::InitCommandState() {
+        {IDC_MERIDIAN_TOGGLE_SIDEBAR, IDC_MERIDIAN_TOGGLE_PIN,
+         IDC_MERIDIAN_NEXT_SPACE, IDC_MERIDIAN_PREVIOUS_SPACE,
+         IDC_MERIDIAN_NEW_FOLDER, IDC_MERIDIAN_NEXT_TAB,
+-        IDC_MERIDIAN_PREVIOUS_TAB}) {
++        IDC_MERIDIAN_PREVIOUS_TAB, IDC_MERIDIAN_SPLIT, IDC_MERIDIAN_UNSPLIT}) {
+     command_updater_->UpdateCommandEnabled(meridian_command, supports_tabs);
+   }
+   for (int i = IDC_MERIDIAN_SPACE_1; i <= IDC_MERIDIAN_SPACE_9; ++i) {
