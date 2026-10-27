@@ -1,0 +1,752 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 27 Oct 2026 18:26:20 +0400
+Subject: [PATCH 16/16] Meridian: import Arc's sidebar (spaces, pins, folders,
+ favorites, open tabs)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   8 +-
+ chrome/browser/meridian/arc_import.cc         | 276 ++++++++++++++++++
+ chrome/browser/meridian/arc_import.h          |  50 ++++
+ .../browser/meridian/arc_import_unittest.cc   | 101 +++++++
+ chrome/browser/meridian/sidebar.mojom         |  16 +
+ chrome/browser/meridian/sidebar_handler.cc    |  88 ++++++
+ chrome/browser/meridian/sidebar_handler.h     |   4 +
+ chrome/browser/meridian/sidebar_service.cc    |  37 +++
+ chrome/browser/meridian/sidebar_service.h     |   7 +-
+ 9 files changed, 584 insertions(+), 3 deletions(-)
+ create mode 100644 chrome/browser/meridian/arc_import.cc
+ create mode 100644 chrome/browser/meridian/arc_import.h
+ create mode 100644 chrome/browser/meridian/arc_import_unittest.cc
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 1ec7c7d3d0..8f0f48341e 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -18,10 +18,12 @@ mojom("mojo_bindings") {
+ # The sidebar model alone (no browser deps), so its tests stay small.
+ source_set("model") {
+   sources = [
+-    "atc.cc",
+-    "atc.h",
++    "arc_import.cc",
++    "arc_import.h",
+     "archive_service.cc",
+     "archive_service.h",
++    "atc.cc",
++    "atc.h",
+     "sidebar_service.cc",
+     "sidebar_service.h",
+   ]
+@@ -65,6 +67,7 @@ source_set("meridian") {
+     "//chrome/browser/profiles:profile",
+     "//chrome/browser/sessions",
+     "//chrome/browser/ui:status_bubble",
++    "//chrome/browser/ui:browser_tabrestore",
+     "//chrome/browser/ui/navigator",
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/tabs",
+@@ -88,6 +91,7 @@ import("//testing/test.gni")
+ # out/Release/meridian_unittests
+ test("meridian_unittests") {
+   sources = [
++    "arc_import_unittest.cc",
+     "archive_service_unittest.cc",
+     "atc_unittest.cc",
+     "sidebar_service_unittest.cc",
+diff --git a/chrome/browser/meridian/arc_import.cc b/chrome/browser/meridian/arc_import.cc
+new file mode 100644
+index 0000000000..f9d4eb1922
+--- /dev/null
++++ b/chrome/browser/meridian/arc_import.cc
+@@ -0,0 +1,276 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/arc_import.h"
++
++#include <algorithm>
++#include <cmath>
++#include <map>
++
++#include "base/base_paths.h"
++#include "base/command_line.h"
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
++#include "base/path_service.h"
++#include "base/strings/stringprintf.h"
++
++namespace meridian {
++
++namespace {
++
++constexpr char kArcDirSwitch[] = "meridian-arc-dir";
++
++// Arc keeps maps as flat lists: [key, value, key, value, ...].
++std::vector<std::pair<std::string, const base::Value*>> Pairs(
++    const base::ListValue* list) {
++  std::vector<std::pair<std::string, const base::Value*>> out;
++  if (!list) {
++    return out;
++  }
++  for (size_t i = 0; i + 1 < list->size(); i += 2) {
++    if ((*list)[i].is_string()) {
++      out.emplace_back((*list)[i].GetString(), &(*list)[i + 1]);
++    }
++  }
++  return out;
++}
++
++std::string ToHex(const base::DictValue* color) {
++  if (!color) {
++    return std::string();
++  }
++  auto channel = [&](const char* key) {
++    double v = std::clamp(color->FindDouble(key).value_or(0), 0.0, 1.0);
++    return static_cast<int>(std::lround(v * 255));
++  };
++  return base::StringPrintf("#%02x%02x%02x", channel("red"), channel("green"),
++                            channel("blue"));
++}
++
++std::string SpaceColor(const base::DictValue* custom_info) {
++  const base::DictValue* theme =
++      custom_info ? custom_info->FindDict("windowTheme") : nullptr;
++  if (!theme) {
++    return std::string();
++  }
++  if (const base::DictValue* mid =
++          theme->FindDictByDottedPath("primaryColorPalette.midTone")) {
++    return ToHex(mid);
++  }
++  // Newer themes: background.single._0.style.color._0.blendedGradient._0
++  const base::DictValue* grad = theme->FindDictByDottedPath(
++      "background.single._0.style.color._0.blendedGradient._0");
++  const base::ListValue* overlays =
++      grad ? grad->FindList("overlayColors") : nullptr;
++  if (overlays) {
++    for (const base::Value& c : *overlays) {
++      const base::DictValue* dict = c.GetIfDict();
++      if (dict && dict->FindDouble("alpha").value_or(0) > 0.2) {
++        return ToHex(dict);
++      }
++    }
++  }
++  return std::string();
++}
++
++class Converter {
++ public:
++  explicit Converter(const base::ListValue* items) {
++    for (const auto& [id, value] : Pairs(items)) {
++      if (const base::DictValue* dict = value->GetIfDict()) {
++        items_[id] = dict;
++      }
++    }
++  }
++
++  std::optional<Item> Convert(const std::string& id, int depth = 0) const {
++    auto it = items_.find(id);
++    if (it == items_.end() || depth > 32) {
++      return std::nullopt;
++    }
++    const base::DictValue& node = *it->second;
++    const std::string* title = node.FindString("title");
++    Item item;
++    if (const base::DictValue* tab = node.FindDictByDottedPath("data.tab")) {
++      const std::string* url = tab->FindString("savedURL");
++      GURL gurl = url ? GURL(*url) : GURL();
++      if (!gurl.is_valid()) {
++        return std::nullopt;
++      }
++      const std::string* saved_title = tab->FindString("savedTitle");
++      item.url = gurl;
++      item.title = title && !title->empty()               ? *title
++                   : saved_title && !saved_title->empty() ? *saved_title
++                                                          : gurl.spec();
++      return item;
++    }
++    // Folders, and Arc's split views and easels (their tabs, as a folder).
++    std::vector<Item> children = ChildrenOf(id, depth + 1);
++    if (!node.FindDictByDottedPath("data.list") && children.empty()) {
++      return std::nullopt;
++    }
++    item.is_folder = true;
++    item.open = false;
++    item.title = title && !title->empty()
++                     ? *title
++                     : (node.FindDictByDottedPath("data.list") ? "Folder"
++                                                               : "Group");
++    item.children = std::move(children);
++    return item;
++  }
++
++  std::vector<Item> ChildrenOf(const std::string& id, int depth = 0) const {
++    std::vector<Item> out;
++    auto it = items_.find(id);
++    const base::ListValue* ids =
++        it == items_.end() ? nullptr : it->second->FindList("childrenIds");
++    if (!ids) {
++      return out;
++    }
++    for (const base::Value& child : *ids) {
++      if (child.is_string()) {
++        if (std::optional<Item> item = Convert(child.GetString(), depth)) {
++          out.push_back(std::move(*item));
++        }
++      }
++    }
++    return out;
++  }
++
++ private:
++  std::map<std::string, const base::DictValue*> items_;
++};
++
++void Flatten(std::vector<Item> items, std::vector<Item>& out) {
++  for (Item& item : items) {
++    if (item.is_folder) {
++      Flatten(std::move(item.children), out);
++    } else {
++      out.push_back(std::move(item));
++    }
++  }
++}
++
++// The id after `key` in a space's containerIDs: ["pinned", id, ...].
++std::string ContainerId(const base::ListValue* ids, const char* key) {
++  if (!ids) {
++    return std::string();
++  }
++  for (size_t i = 0; i + 1 < ids->size(); ++i) {
++    if ((*ids)[i].is_string() && (*ids)[i].GetString() == key &&
++        (*ids)[i + 1].is_string()) {
++      return (*ids)[i + 1].GetString();
++    }
++  }
++  return std::string();
++}
++
++}  // namespace
++
++ArcSidebar::ArcSidebar() = default;
++ArcSidebar::ArcSidebar(ArcSidebar&&) = default;
++ArcSidebar& ArcSidebar::operator=(ArcSidebar&&) = default;
++ArcSidebar::~ArcSidebar() = default;
++
++base::FilePath ArcDataDir() {
++  const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++  if (cl->HasSwitch(kArcDirSwitch)) {
++    return cl->GetSwitchValuePath(kArcDirSwitch);
++  }
++  base::FilePath home;
++  if (!base::PathService::Get(base::DIR_HOME, &home)) {
++    return base::FilePath();
++  }
++  return home.Append("Library/Application Support/Arc");
++}
++
++std::optional<ArcSidebar> ParseArcSidebar(const base::DictValue& root) {
++  const base::ListValue* containers =
++      root.FindListByDottedPath("sidebar.containers");
++  const base::DictValue* container = nullptr;
++  if (containers) {
++    for (const base::Value& c : *containers) {
++      if (c.is_dict() && c.GetDict().FindList("items")) {
++        container = &c.GetDict();
++        break;
++      }
++    }
++  }
++  if (!container) {
++    return std::nullopt;
++  }
++  Converter converter(container->FindList("items"));
++  ArcSidebar out;
++
++  // Favorites ("top apps"), one list per Arc profile; Meridian has one.
++  // [profile, containerId, ...]: the key is an object, so not Pairs().
++  if (const base::ListValue* top = container->FindList("topAppsContainerIDs")) {
++    for (size_t i = 0; i + 1 < top->size(); i += 2) {
++      if (!(*top)[i + 1].is_string()) {
++        continue;
++      }
++      std::vector<Item> tabs;
++      Flatten(converter.ChildrenOf((*top)[i + 1].GetString()), tabs);
++      for (Item& tab : tabs) {
++        bool known = std::ranges::any_of(
++            out.favorites, [&](const Item& f) { return f.url == tab.url; });
++        if (!known) {
++          out.favorites.push_back(std::move(tab));
++        }
++      }
++    }
++  }
++
++  for (const auto& [arc_id, value] : Pairs(container->FindList("spaces"))) {
++    const base::DictValue* s = value->GetIfDict();
++    if (!s) {
++      continue;
++    }
++    const base::ListValue* ids = s->FindList("containerIDs");
++    Space space;
++    const std::string* title = s->FindString("title");
++    space.name = title && !title->empty() ? *title : "Space";
++    const base::DictValue* custom_info = s->FindDict("customInfo");
++    if (const std::string* emoji =
++            custom_info ? custom_info->FindStringByDottedPath(
++                              "iconType.emoji_v2")
++                        : nullptr) {
++      space.icon = *emoji;
++    }
++    space.color = SpaceColor(custom_info);
++    space.color2 = space.color;
++    std::string pinned = ContainerId(ids, "pinned");
++    if (!pinned.empty()) {
++      space.pinned = converter.ChildrenOf(pinned);
++    }
++    std::vector<ArcSidebar::Tab> today;
++    std::string unpinned = ContainerId(ids, "unpinned");
++    if (!unpinned.empty()) {
++      std::vector<Item> tabs;
++      Flatten(converter.ChildrenOf(unpinned), tabs);
++      for (Item& tab : tabs) {
++        today.push_back({tab.url, tab.title});
++      }
++    }
++    out.spaces.push_back(std::move(space));
++    out.today.push_back(std::move(today));
++  }
++  return out;
++}
++
++std::optional<ArcSidebar> ReadArcSidebar() {
++  base::FilePath dir = ArcDataDir();
++  std::string json;
++  if (dir.empty() ||
++      !base::ReadFileToString(dir.Append("StorableSidebar.json"), &json)) {
++    return std::nullopt;
++  }
++  std::optional<base::Value> root = base::JSONReader::Read(json, 0);
++  if (!root || !root->is_dict()) {
++    return std::nullopt;
++  }
++  return ParseArcSidebar(root->GetDict());
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/arc_import.h b/chrome/browser/meridian/arc_import.h
+new file mode 100644
+index 0000000000..1d24c4b3f5
+--- /dev/null
++++ b/chrome/browser/meridian/arc_import.h
+@@ -0,0 +1,50 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_ARC_IMPORT_H_
++#define CHROME_BROWSER_MERIDIAN_ARC_IMPORT_H_
++
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/values.h"
++#include "chrome/browser/meridian/sidebar_service.h"
++#include "url/gurl.h"
++
++namespace meridian {
++
++// Arc's sidebar, read from its local StorableSidebar.json: spaces with their
++// pinned tabs and folders, each space's open (Today) tabs, and the favorites.
++// Nothing leaves the machine, and Arc's files are only read.
++struct ArcSidebar {
++  ArcSidebar();
++  ArcSidebar(ArcSidebar&&);
++  ArcSidebar& operator=(ArcSidebar&&);
++  ~ArcSidebar();
++
++  struct Tab {
++    GURL url;
++    std::string title;
++  };
++  // `spaces[i]` has no id yet; `today[i]` are its open tabs.
++  std::vector<Space> spaces;
++  std::vector<std::vector<Tab>> today;
++  std::vector<Item> favorites;
++};
++
++// Arc's data folder (~/Library/Application Support/Arc), or the one given
++// with --meridian-arc-dir (tests).
++base::FilePath ArcDataDir();
++
++// Parses StorableSidebar.json; nullopt if it isn't Arc's format.
++std::optional<ArcSidebar> ParseArcSidebar(const base::DictValue& root);
++
++// Reads and parses Arc's sidebar; blocking (file IO).
++std::optional<ArcSidebar> ReadArcSidebar();
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_ARC_IMPORT_H_
+diff --git a/chrome/browser/meridian/arc_import_unittest.cc b/chrome/browser/meridian/arc_import_unittest.cc
+new file mode 100644
+index 0000000000..d12c6d9aa7
+--- /dev/null
++++ b/chrome/browser/meridian/arc_import_unittest.cc
+@@ -0,0 +1,101 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/arc_import.h"
++
++#include "base/json/json_reader.h"
++#include "base/test/task_environment.h"
++#include "chrome/browser/meridian/sidebar_service.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace meridian {
++namespace {
++
++// A trimmed StorableSidebar.json in Arc's shape (same as the E2E fixture).
++constexpr char kArc[] = R"({"sidebar": {"containers": [{"global": {}}, {
++  "topAppsContainerIDs": [{"default": true}, "top1", {"custom": {}}, "top2"],
++  "spaces": [
++    "s-work", {"title": "Work",
++      "customInfo": {"iconType": {"emoji_v2": "W"}, "windowTheme":
++        {"primaryColorPalette": {"midTone": {"red": 1, "green": 0.5, "blue": 0}}}},
++      "containerIDs": ["unpinned", "wu", "pinned", "wp"]},
++    "s-home", {"title": "Home", "containerIDs": ["pinned", "hp"]}
++  ],
++  "items": [
++    "top1", {"childrenIds": ["gmail"]},
++    "gmail", {"data": {"tab": {"savedURL": "https://mail.google.com/", "savedTitle": "Gmail"}}},
++    "top2", {"childrenIds": ["gmail2", "yt"]},
++    "gmail2", {"data": {"tab": {"savedURL": "https://mail.google.com/"}}},
++    "yt", {"data": {"tab": {"savedURL": "https://youtube.com/", "savedTitle": "YouTube"}}},
++    "wp", {"childrenIds": ["linear", "design", "broken"]},
++    "linear", {"title": "Linear", "data": {"tab": {"savedURL": "https://linear.app/", "savedTitle": "Inbox"}}},
++    "design", {"title": "Design", "data": {"list": {}}, "childrenIds": ["figma", "split"]},
++    "figma", {"data": {"tab": {"savedURL": "https://figma.com/", "savedTitle": "Figma"}}},
++    "split", {"data": {"splitView": {}}, "childrenIds": ["docs"]},
++    "docs", {"data": {"tab": {"savedURL": "https://docs.google.com/", "savedTitle": "Docs"}}},
++    "broken", {"data": {"tab": {"savedURL": "nope"}}},
++    "wu", {"childrenIds": ["t1"]},
++    "t1", {"data": {"tab": {"savedURL": "https://news.ycombinator.com/", "savedTitle": "HN"}}},
++    "hp", {"childrenIds": []}
++  ]}]}})";
++
++ArcSidebar Parse() {
++  std::optional<base::Value> root = base::JSONReader::Read(kArc, 0);
++  std::optional<ArcSidebar> arc = ParseArcSidebar(root->GetDict());
++  EXPECT_TRUE(arc);
++  return std::move(*arc);
++}
++
++TEST(ArcImportTest, ReadsSpacesPinsFoldersTodayAndFavorites) {
++  ArcSidebar arc = Parse();
++  ASSERT_EQ(arc.spaces.size(), 2u);
++  const Space& work = arc.spaces[0];
++  EXPECT_EQ(work.name, "Work");
++  EXPECT_EQ(work.icon, "W");
++  EXPECT_EQ(work.color, "#ff8000");
++  ASSERT_EQ(work.pinned.size(), 2u);  // the broken tab is left out
++  EXPECT_EQ(work.pinned[0].title, "Linear");
++  EXPECT_EQ(work.pinned[0].url, GURL("https://linear.app/"));
++  const Item& design = work.pinned[1];
++  EXPECT_TRUE(design.is_folder);
++  EXPECT_EQ(design.title, "Design");
++  ASSERT_EQ(design.children.size(), 2u);
++  EXPECT_EQ(design.children[0].title, "Figma");
++  // A split view comes in as a folder of its tabs.
++  EXPECT_TRUE(design.children[1].is_folder);
++  EXPECT_EQ(design.children[1].children[0].title, "Docs");
++  ASSERT_EQ(arc.today[0].size(), 1u);
++  EXPECT_EQ(arc.today[0][0].title, "HN");
++  EXPECT_TRUE(arc.today[1].empty());
++  // Favorites of every Arc profile, without duplicates.
++  ASSERT_EQ(arc.favorites.size(), 2u);
++  EXPECT_EQ(arc.favorites[0].title, "Gmail");
++  EXPECT_EQ(arc.favorites[1].title, "YouTube");
++}
++
++TEST(ArcImportTest, RejectsOtherFiles) {
++  std::optional<base::Value> root = base::JSONReader::Read(R"({"a": 1})", 0);
++  EXPECT_FALSE(ParseArcSidebar(root->GetDict()));
++}
++
++TEST(ArcImportTest, ImportReplacesTheUntouchedFirstSpace) {
++  base::test::TaskEnvironment env;
++  SidebarService service{base::FilePath()};
++  ArcSidebar arc = Parse();
++  service.Import(arc.spaces, std::move(arc.favorites));
++  ASSERT_EQ(service.spaces().size(), 2u);
++  EXPECT_EQ(service.spaces()[0].name, "Work");
++  EXPECT_EQ(service.active_space_id(), arc.spaces[0].id);
++  EXPECT_FALSE(service.spaces()[0].pinned[1].children[0].id.empty());
++  EXPECT_EQ(service.favorites().size(), 2u);
++
++  // A second import adds the spaces again but not the same favorites.
++  ArcSidebar again = Parse();
++  service.Import(again.spaces, std::move(again.favorites));
++  EXPECT_EQ(service.spaces().size(), 4u);
++  EXPECT_EQ(service.favorites().size(), 2u);
++}
++
++}  // namespace
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 1f3e11598e..533dbfaf2f 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -72,6 +72,16 @@ struct SidebarState {
+   bool little;
+ };
+ 
++// What an Arc import would bring, shown before anything is imported.
++struct ArcPreview {
++  int32 space_count;
++  int32 pinned_count;
++  int32 today_count;
++  int32 favorite_count;
++  // The first few spaces: name, icon and colour only.
++  array<Space> spaces;
++};
++
+ // Where an item goes. `container` is a space id, or "favorites".
+ struct ItemPosition {
+   string container;
+@@ -175,6 +185,12 @@ interface SidebarHandler {
+   // needed); the Little window closes.
+   OpenInMeridian();
+ 
++  // Arc's sidebar on this computer (null if there is none).
++  GetArcPreview() => (ArcPreview? preview);
++  // Brings Arc's spaces, pinned tabs, folders and favorites in; Arc's open
++  // tabs come in as Today tabs that load when first opened.
++  ImportArc() => (bool ok);
++
+   // Turns a Peek into an ordinary Today tab.
+   ExpandPeek(tabs_api.mojom.NodeId tab_id);
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index a39868079e..05dd984dd9 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/meridian/sidebar_handler.h"
+ 
++#include <functional>
+ #include <utility>
+ #include <vector>
+ 
+@@ -15,6 +16,10 @@
+ #include "base/task/sequenced_task_runner.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/meridian/little_window.h"
++#include "chrome/browser/ui/browser_tabrestore.h"
++#include "components/sessions/core/serialized_navigation_entry.h"
++#include "components/sessions/core/serialized_user_agent_override.h"
++#include "base/task/thread_pool.h"
+ #include "chrome/browser/meridian/sidebar_service_factory.h"
+ #include "chrome/browser/meridian/tab_data.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -380,6 +385,89 @@ void SidebarHandler::OpenInMeridian() {
+   target->GetWindow()->Show();
+ }
+ 
++void SidebarHandler::GetArcPreview(GetArcPreviewCallback callback) {
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&ReadArcSidebar),
++      base::BindOnce(
++          [](GetArcPreviewCallback callback, std::optional<ArcSidebar> arc) {
++            if (!arc || arc->spaces.empty()) {
++              std::move(callback).Run(nullptr);
++              return;
++            }
++            auto preview = mojom::ArcPreview::New();
++            preview->space_count = arc->spaces.size();
++            preview->favorite_count = arc->favorites.size();
++            std::function<int(const std::vector<Item>&)> count =
++                [&](const std::vector<Item>& items) {
++                  int n = 0;
++                  for (const Item& item : items) {
++                    n += item.is_folder ? count(item.children) : 1;
++                  }
++                  return n;
++                };
++            for (size_t i = 0; i < arc->spaces.size(); ++i) {
++              const Space& space = arc->spaces[i];
++              preview->pinned_count += count(space.pinned);
++              preview->today_count += arc->today[i].size();
++              if (i < 8) {
++                auto s = mojom::Space::New();
++                s->name = space.name;
++                s->icon = space.icon;
++                s->color = space.color;
++                s->color2 = space.color2;
++                preview->spaces.push_back(std::move(s));
++              }
++            }
++            std::move(callback).Run(std::move(preview));
++          },
++          std::move(callback)));
++}
++
++void SidebarHandler::ImportArc(ImportArcCallback callback) {
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&ReadArcSidebar),
++      base::BindOnce(&SidebarHandler::OnArcRead, weak_factory_.GetWeakPtr(),
++                     std::move(callback)));
++}
++
++void SidebarHandler::OnArcRead(ImportArcCallback callback,
++                               std::optional<ArcSidebar> arc) {
++  if (!arc || arc->spaces.empty()) {
++    std::move(callback).Run(false);
++    return;
++  }
++  service_->Import(arc->spaces, std::move(arc->favorites));
++  // Arc's open tabs: Today tabs of their space, loaded when first opened.
++  for (size_t i = 0; i < arc->spaces.size(); ++i) {
++    for (const ArcSidebar::Tab& tab : arc->today[i]) {
++      sessions::SerializedNavigationEntry entry;
++      entry.set_index(0);
++      entry.set_virtual_url(tab.url);
++      entry.set_original_request_url(tab.url);
++      entry.set_title(base::UTF8ToUTF16(tab.title));
++      entry.set_transition_type(ui::PAGE_TRANSITION_AUTO_BOOKMARK);
++      entry.set_timestamp(base::Time::Now());
++      content::WebContents* contents = chrome::AddRestoredTab(
++          browser_, base::span_from_ref(entry), model()->count(),
++          /*selected_navigation=*/0, /*extension_app_id=*/std::string(),
++          /*group=*/std::nullopt, /*select=*/false, /*pin=*/false,
++          base::TimeTicks::Now(), base::Time::Now(),
++          /*session_storage_namespace=*/nullptr,
++          sessions::SerializedUserAgentOverride(),
++          /*extra_data=*/{}, /*from_session_restore=*/false,
++          /*is_active_browser=*/std::nullopt);
++      if (contents) {
++        TabData::Set(contents, arc->spaces[i].id, std::string());
++      }
++    }
++  }
++  ActivateSpace(service_->active_space_id());
++  ScheduleNotify();
++  std::move(callback).Run(true);
++}
++
+ void SidebarHandler::ClearToday() {
+   std::vector<content::WebContents*> today;
+   for (int i = 0; i < model()->count(); ++i) {
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 6fd276f0a5..0eaba0deb6 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -13,6 +13,7 @@
+ #include "base/scoped_observation.h"
+ #include "base/timer/timer.h"
+ #include "chrome/browser/meridian/archive_service.h"
++#include "chrome/browser/meridian/arc_import.h"
+ #include "chrome/browser/meridian/sidebar.mojom.h"
+ #include "chrome/browser/meridian/sidebar_service.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+@@ -94,6 +95,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void DeleteArchived(const std::string& id) override;
+   void ClearToday() override;
+   void OpenInMeridian() override;
++  void GetArcPreview(GetArcPreviewCallback callback) override;
++  void ImportArc(ImportArcCallback callback) override;
+   void ExpandPeek(const tabs_api::NodeId& tab_id) override;
+ 
+   // ArchiveService::Observer:
+@@ -117,6 +120,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+  private:
+   TabStripModel* model();
+   mojom::SidebarStatePtr BuildState();
++  void OnArcRead(ImportArcCallback callback, std::optional<ArcSidebar> arc);
+   // Coalesces notifications into one OnStateChanged per task.
+   void ScheduleNotify();
+   void Notify();
+diff --git a/chrome/browser/meridian/sidebar_service.cc b/chrome/browser/meridian/sidebar_service.cc
+index 5ae6dd89e6..6f2f33fd5d 100644
+--- a/chrome/browser/meridian/sidebar_service.cc
++++ b/chrome/browser/meridian/sidebar_service.cc
+@@ -26,6 +26,13 @@ std::string NewId() {
+   return base::Uuid::GenerateRandomV4().AsLowercaseString();
+ }
+ 
++void AssignIds(std::vector<Item>& items) {
++  for (Item& item : items) {
++    item.id = NewId();
++    AssignIds(item.children);
++  }
++}
++
+ base::DictValue ItemToValue(const Item& item) {
+   base::DictValue d;
+   d.Set("id", item.id);
+@@ -467,6 +474,36 @@ bool SidebarService::SetFolderOpen(const std::string& item_id, bool open) {
+   return true;
+ }
+ 
++void SidebarService::Import(std::vector<Space>& spaces,
++                            std::vector<Item> favorites) {
++  for (Space& space : spaces) {
++    space.id = NewId();
++    if (space.color.empty()) {
++      space.color = kDefaultColor;
++    }
++    if (space.color2.empty()) {
++      space.color2 = space.color;
++    }
++    AssignIds(space.pinned);
++  }
++  bool pristine = spaces_.size() == 1 && spaces_[0].pinned.empty();
++  if (pristine && !spaces.empty()) {
++    spaces_.clear();
++    active_space_id_ = spaces[0].id;
++  }
++  spaces_.insert(spaces_.end(), spaces.begin(), spaces.end());
++  for (Item& favorite : favorites) {
++    bool known = std::ranges::any_of(
++        favorites_, [&](const Item& f) { return f.url == favorite.url; });
++    if (!known && !favorite.is_folder) {
++      favorite.id = NewId();
++      favorites_.push_back(std::move(favorite));
++    }
++  }
++  EnsureDefaultSpace();
++  Changed();
++}
++
+ void SidebarService::ReplaceAll(std::vector<Space> spaces,
+                                 std::vector<Item> favorites,
+                                 const std::string& active_space_id) {
+diff --git a/chrome/browser/meridian/sidebar_service.h b/chrome/browser/meridian/sidebar_service.h
+index 46fe35e23d..b563a30e97 100644
+--- a/chrome/browser/meridian/sidebar_service.h
++++ b/chrome/browser/meridian/sidebar_service.h
+@@ -118,7 +118,12 @@ class SidebarService : public KeyedService {
+   bool RenameItem(const std::string& item_id, const std::string& title);
+   bool SetFolderOpen(const std::string& item_id, bool open);
+ 
+-  // For tests and import: replaces everything.
++  // Import (from Arc): adds `spaces` after the existing ones, or in place of
++  // the untouched first space, and the `favorites` not there yet (by URL).
++  // Ids are assigned here and written back into `spaces`.
++  void Import(std::vector<Space>& spaces, std::vector<Item> favorites);
++
++  // For tests: replaces everything.
+   void ReplaceAll(std::vector<Space> spaces,
+                   std::vector<Item> favorites,
+                   const std::string& active_space_id);
