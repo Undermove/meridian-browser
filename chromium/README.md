@@ -29,7 +29,7 @@ Plan for about 60 GB free: about 32 GB of source, about 9 GB of build, and Xcode
 ```sh
 chromium/setup.sh          # once
 chromium/build.sh
-open ~/repos/chromium/src/out/Release/Chromium.app
+open ~/repos/chromium/src/out/Release/Meridian.app
 ```
 
 Edit files in `~/repos/chromium/src` (the Meridian UI is in `chrome/browser/resources/webui_browser/`),
@@ -53,7 +53,8 @@ commit on the `meridian` branch, run `build.sh`, then `export.sh` and commit `pa
 - [x] Settings (⌘,): theme, sidebar left/right, mode, archive time, default browser, Air Traffic Control editor, links to Chromium settings
 - [x] Edit Space Theme, private window theme
 - [x] Home page (new tab): search, feature cards, "Set up for me" presets, tips
-- [ ] Swipe, ad blocking, Electron migration
+- [x] Ad and tracker blocking: EasyList + EasyPrivacy through Chromium's subresource filter on every site (tools/adblock.sh), toggle in Settings, per-site exceptions in Site settings
+- [ ] Swipe, Electron migration
 - [ ] MCP server, AI (Ask/chat/keys/vault), local agents, Mission Control, Workbench, sandboxes, hubs
 - [ ] Updater, packaging, signing
 - [ ] Windows and Linux builds
