@@ -46,7 +46,8 @@ commit on the `meridian` branch, run `build.sh`, then `export.sh` and commit `pa
 - [x] Drag and drop in the sidebar (pin, reorder, folders, favorites, Today, other spaces)
 - [x] Split view (Chromium split tabs), Peek, archive (auto-archive + ⌥⌘A + Clear Today)
 - [x] Restore last session by default, loading indicators, link status bubble
-- [ ] Little window, Air Traffic Control, private window theme, swipe, settings, home, ad blocking, Arc import, Electron migration
+- [x] Little window for links from other apps (Open in Meridian)
+- [ ] Air Traffic Control, private window theme, swipe, settings, home, ad blocking, Arc import, Electron migration
 - [ ] MCP server, AI (Ask/chat/keys/vault), local agents, Mission Control, Workbench, sandboxes, hubs
 - [ ] Updater, packaging, signing
 - [ ] Windows and Linux builds

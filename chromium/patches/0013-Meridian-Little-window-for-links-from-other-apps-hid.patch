@@ -1,0 +1,528 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 27 Oct 2026 17:48:55 +0400
+Subject: [PATCH 14/14] Meridian: Little window for links from other apps; hide
+ the peeking sidebar when the pointer reaches the page
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/BUILD.gn                       |  1 +
+ chrome/browser/app_controller_mac.mm          | 16 ++++-
+ chrome/browser/meridian/BUILD.gn              |  3 +
+ chrome/browser/meridian/little_window.cc      | 70 +++++++++++++++++++
+ chrome/browser/meridian/little_window.h       | 23 ++++++
+ chrome/browser/meridian/sidebar.mojom         |  7 ++
+ chrome/browser/meridian/sidebar_handler.cc    | 43 ++++++++++++
+ chrome/browser/meridian/sidebar_handler.h     |  1 +
+ .../browser/resources/webui_browser/app.css   | 70 +++++++++++++++++++
+ .../resources/webui_browser/app.html.ts       |  9 ++-
+ chrome/browser/resources/webui_browser/app.ts | 22 +++++-
+ .../webui_browser/meridian/sidebar.ts         |  5 ++
+ 12 files changed, 266 insertions(+), 4 deletions(-)
+ create mode 100644 chrome/browser/meridian/little_window.cc
+ create mode 100644 chrome/browser/meridian/little_window.h
+
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index f0f529901a..6101218312 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1816,6 +1816,7 @@ source_set("core") {
+     ]
+ 
+     deps += [
++      "//chrome/browser/meridian",
+       ":app_controller_mac",
+       ":chrome_browser_application_mac",
+       ":chrome_browser_main_mac",
+diff --git a/chrome/browser/app_controller_mac.mm b/chrome/browser/app_controller_mac.mm
+index f251259f82..62fce18198 100644
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -83,6 +83,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/meridian/little_window.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+ #include "chrome/browser/ui/chrome_pages.h"
+ #include "chrome/browser/ui/cocoa/apps/quit_with_apps_controller_mac.h"
+@@ -2650,6 +2651,18 @@ void OpenStartupTabsInBrowserWithProfile(const StartupTabs& tabs,
+     profile = ProfileManager::MaybeForceOffTheRecordMode(
+         profile->GetOriginalProfile());
+   }
++  // Meridian: web links from other apps open in a Little window.
++  StartupTabs other_tabs;
++  for (const StartupTab& tab : tabs) {
++    if (tab.url.SchemeIsHTTPOrHTTPS() && !profile->IsOffTheRecord()) {
++      meridian::OpenLittleWindow(profile, tab.url);
++    } else {
++      other_tabs.push_back(tab);
++    }
++  }
++  if (other_tabs.empty()) {
++    return;
++  }
+   // Use FindTabbedBrowser() to ensure URLs open in a normal tabbed browser
+   // window, not in PWA/app windows which cannot accept new tabs.
+   BrowserWindowInterface* browser =
+@@ -2678,7 +2691,8 @@ void OpenStartupTabsInBrowserWithProfile(const StartupTabs& tabs,
+                                     : chrome::startup::IsFirstRun::kNo;
+   StartupBrowserCreatorImpl launch(base::FilePath(), dummy, first_run);
+   launch.OpenTabsInBrowser(browser, chrome::startup::IsProcessStartup::kNo,
+-                           tabs, StartupBrowserCreatorImpl::TabOverWrite::kNo);
++                           other_tabs,
++                           StartupBrowserCreatorImpl::TabOverWrite::kNo);
+ 
+   // This NTP check should be replaced once https://crbug.com/41261582 is fixed.
+   if (startupIndex != TabStripModel::kNoTab &&
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 0b4c933048..bf28ddcfc9 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -33,6 +33,8 @@ source_set("model") {
+ 
+ source_set("meridian") {
+   sources = [
++    "little_window.cc",
++    "little_window.h",
+     "sidebar_handler.cc",
+     "sidebar_handler.h",
+     "sidebar_service_factory.cc",
+@@ -72,6 +74,7 @@ source_set("meridian") {
+     "//components/url_formatter",
+     "//net",
+     "//ui/base",
++    "//ui/display",
+     "//ui/gfx",
+   ]
+ }
+diff --git a/chrome/browser/meridian/little_window.cc b/chrome/browser/meridian/little_window.cc
+new file mode 100644
+index 0000000000..95c66d29dc
+--- /dev/null
++++ b/chrome/browser/meridian/little_window.cc
+@@ -0,0 +1,70 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/little_window.h"
++
++#include <map>
++
++#include "base/callback_list.h"
++#include "base/no_destructor.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/create_browser_window.h"
++#include "ui/base/base_window.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/display/screen.h"
++#include "ui/gfx/geometry/rect.h"
++#include "url/gurl.h"
++
++namespace meridian {
++
++namespace {
++
++constexpr int kWidth = 980;
++constexpr int kHeight = 720;
++
++// Open Little windows, until they close.
++std::map<const BrowserWindowInterface*, base::CallbackListSubscription>&
++LittleWindows() {
++  static base::NoDestructor<
++      std::map<const BrowserWindowInterface*, base::CallbackListSubscription>>
++      windows;
++  return *windows;
++}
++
++}  // namespace
++
++BrowserWindowInterface* OpenLittleWindow(Profile* profile, const GURL& url) {
++  BrowserWindowCreateParams params(*profile, /*from_user_gesture=*/true);
++  gfx::Rect work_area =
++      display::Screen::Get()->GetDisplayForNewWindows().work_area();
++  params.initial_bounds = work_area;
++  params.initial_bounds.ClampToCenteredSize(gfx::Size(kWidth, kHeight));
++  params.initial_origin_specified =
++      BrowserWindowCreateParams::ValueSpecified::kSpecified;
++  params.omit_from_session_restore = true;
++  params.should_trigger_session_restore = false;
++  BrowserWindowInterface* browser = CreateBrowserWindow(std::move(params));
++  if (!browser) {
++    return nullptr;
++  }
++  LittleWindows()[browser] = browser->RegisterBrowserDidClose(
++      base::BindRepeating([](BrowserWindowInterface* closed) {
++        LittleWindows().erase(closed);
++      }));
++
++  NavigateParams nav(browser, url, ui::PAGE_TRANSITION_LINK);
++  nav.disposition = WindowOpenDisposition::kNewForegroundTab;
++  Navigate(&nav);
++  browser->GetWindow()->Show();
++  return browser;
++}
++
++bool IsLittleWindow(const BrowserWindowInterface* browser) {
++  return LittleWindows().contains(browser);
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/little_window.h b/chrome/browser/meridian/little_window.h
+new file mode 100644
+index 0000000000..fcaf8669f1
+--- /dev/null
++++ b/chrome/browser/meridian/little_window.h
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_LITTLE_WINDOW_H_
++#define CHROME_BROWSER_MERIDIAN_LITTLE_WINDOW_H_
++
++class BrowserWindowInterface;
++class GURL;
++class Profile;
++
++namespace meridian {
++
++// Arc's Little window: a link opened from another app shows in a small window
++// without the sidebar, with "Open in Meridian" to move it into the main
++// window. It is not saved with the session.
++BrowserWindowInterface* OpenLittleWindow(Profile* profile, const GURL& url);
++
++bool IsLittleWindow(const BrowserWindowInterface* browser);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_LITTLE_WINDOW_H_
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 55c1efc6b5..1f3e11598e 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -67,6 +67,9 @@ struct SidebarState {
+   array<Item> favorites;
+   array<TabInfo> tabs;
+   array<Split> splits;
++  // A Little window (a link from another app): no sidebar, a bar with
++  // "Open in Meridian".
++  bool little;
+ };
+ 
+ // Where an item goes. `container` is a space id, or "favorites".
+@@ -168,6 +171,10 @@ interface SidebarHandler {
+   // Archives every Today tab of the active space (⇧⌘K).
+   ClearToday();
+ 
++  // Little window: moves its tab into the main window (opening one if
++  // needed); the Little window closes.
++  OpenInMeridian();
++
+   // Turns a Peek into an ordinary Today tab.
+   ExpandPeek(tabs_api.mojom.NodeId tab_id);
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 37e721e2dc..52e74ef988 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -14,14 +14,19 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/meridian/little_window.h"
+ #include "chrome/browser/meridian/sidebar_service_factory.h"
+ #include "chrome/browser/meridian/tab_data.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/create_browser_window.h"
++#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
++#include "chrome/browser/ui/tabs/tab_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "components/browser_apis/tab_strip/types/node_id.h"
+ #include "components/split_tabs/split_tab_id.h"
+@@ -30,6 +35,7 @@
+ #include "content/public/browser/navigation_controller.h"
+ #include "net/base/registry_controlled_domains/registry_controlled_domain.h"
+ #include "content/public/browser/web_contents.h"
++#include "ui/base/base_window.h"
+ #include "ui/base/page_transition_types.h"
+ #include "ui/base/window_open_disposition.h"
+ 
+@@ -357,6 +363,42 @@ void SidebarHandler::DeleteArchived(const std::string& id) {
+   archive_->Remove(id);
+ }
+ 
++void SidebarHandler::OpenInMeridian() {
++  tabs::TabInterface* tab = model()->GetActiveTab();
++  if (!IsLittleWindow(browser_) || !tab) {
++    return;
++  }
++  Profile* profile = browser_->GetProfile();
++  BrowserWindowInterface* target = nullptr;
++  ProfileBrowserCollection::GetForProfile(profile)->ForEach(
++      [&](BrowserWindowInterface* browser) {
++        if (browser != browser_ &&
++            browser->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
++            !IsLittleWindow(browser)) {
++          target = browser;
++          return false;
++        }
++        return true;
++      },
++      BrowserCollection::Order::kActivation);
++  if (!target) {
++    BrowserWindowCreateParams params(*profile, /*from_user_gesture=*/true);
++    params.should_trigger_session_restore = false;
++    target = CreateBrowserWindow(std::move(params));
++    if (!target) {
++      return;
++    }
++  }
++  // The last tab leaving closes this window (and this handler), so nothing
++  // touches `this` after the detach.
++  std::unique_ptr<tabs::TabModel> detached =
++      model()->DetachTabAtForInsertion(model()->GetIndexOfTab(tab));
++  TabStripModel* to = target->GetTabStripModel();
++  to->InsertDetachedTabAt(to->count(), std::move(detached),
++                          AddTabTypes::ADD_ACTIVE);
++  target->GetWindow()->Show();
++}
++
+ void SidebarHandler::ClearToday() {
+   std::vector<content::WebContents*> today;
+   for (int i = 0; i < model()->count(); ++i) {
+@@ -474,6 +516,7 @@ mojom::SidebarStatePtr SidebarHandler::BuildState() {
+       }
+     }
+   }
++  state->little = IsLittleWindow(browser_);
+   return state;
+ }
+ 
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 742a04569b..6fd276f0a5 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -93,6 +93,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void RestoreArchived(const std::string& id) override;
+   void DeleteArchived(const std::string& id) override;
+   void ClearToday() override;
++  void OpenInMeridian() override;
+   void ExpandPeek(const tabs_api::NodeId& tab_id) override;
+ 
+   // ArchiveService::Observer:
+diff --git a/chrome/browser/resources/webui_browser/app.css b/chrome/browser/resources/webui_browser/app.css
+index 4079bf5c1a..b733509c76 100644
+--- a/chrome/browser/resources/webui_browser/app.css
++++ b/chrome/browser/resources/webui_browser/app.css
+@@ -304,6 +304,17 @@ cr-icon-button[hidden] {
+   padding: var(--meridian-gap);
+ }
+ 
++#peekShield {
++  display: none;
++  position: absolute;
++  inset: 0;
++  z-index: 29;
++}
++
++:host([sidebar-hidden][sidebar-peek]) #peekShield {
++  display: block;
++}
++
+ /* Sliding away (and hidden), the sidebar must not catch the pointer. */
+ :host([sidebar-hidden]:not([sidebar-peek])) #sidebar {
+   pointer-events: none;
+@@ -331,3 +342,62 @@ cr-icon-button[hidden] {
+ #statusBubble[hidden] {
+   display: none;
+ }
++
++/* Little window (a link from another app): no sidebar; a bar on top with the
++ * site and "Open in Meridian", next to the traffic lights. */
++#littleBar {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  height: 38px;
++  flex-shrink: 0;
++  padding: 0 var(--meridian-gap) 0 78px;
++  color: var(--meridian-text);
++  app-region: drag;
++  -webkit-app-region: drag;
++}
++
++#littleBar[hidden] {
++  display: none;
++}
++
++#littleBar .host {
++  flex: 1;
++  min-width: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++  text-align: center;
++  font-size: 12.5px;
++  color: var(--meridian-text-muted);
++}
++
++#openInMeridian {
++  font: inherit;
++  font-size: 12px;
++  font-weight: 500;
++  color: var(--meridian-text);
++  padding: 4px 10px;
++  border: 0;
++  border-radius: 7px;
++  background: color-mix(in srgb, var(--meridian-row-active) 80%, transparent);
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
++}
++
++#openInMeridian:hover {
++  background: color-mix(in srgb, var(--meridian-space) 28%, transparent);
++}
++
++:host([little]) #rootContainer {
++  flex-direction: column;
++}
++
++:host([little]) #sidebar,
++:host([little]) #edgeHotzone {
++  display: none;
++}
++
++:host([little]) #main {
++  padding: 0 var(--meridian-gap) var(--meridian-gap);
++}
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 0cefe96121..fb8c5582a4 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -10,6 +10,7 @@ export function getHtml(this: WebuiBrowserAppElement) {
+   return html`<!--_html_template_start_-->
+ <div id="rootContainer">
+   <div id="edgeHotzone" @mouseenter="${this.onEdgeHotzoneMouseenter_}"></div>
++  <div id="peekShield" @mouseenter="${this.onPeekShieldMouseenter_}"></div>
+   <div id="sidebar" @mouseleave="${this.onSidebarMouseleave_}">
+     <div id="sidebarTop">
+ <if expr="not is_macosx">
+@@ -64,7 +65,8 @@ export function getHtml(this: WebuiBrowserAppElement) {
+         @meridian-splits-changed="${this.onMeridianSplitsChanged_}"
+         @meridian-show-archive="${this.onMeridianShowArchive_}"
+         @meridian-peeks-changed="${this.onMeridianPeeksChanged_}"
+-        @meridian-status="${this.onMeridianStatus_}">
++        @meridian-status="${this.onMeridianStatus_}"
++        @meridian-little-changed="${this.onMeridianLittleChanged_}">
+       <cr-icon-button slot="bottom-start" id="appMenuButton"
+           iron-icon="cr:more-vert" title="$i18n{appMenuTooltip}"
+           @click="${this.onAppMenuClick_}">
+@@ -82,6 +84,11 @@ export function getHtml(this: WebuiBrowserAppElement) {
+   </div>
+   <meridian-command-bar id="commandBar"></meridian-command-bar>
+   <meridian-archive id="archive"></meridian-archive>
++  <div id="littleBar" ?hidden="${!this.little_}">
++    <span class="host">${this.urlHost_}</span>
++    <button id="openInMeridian" title="Open in Meridian"
++        @click="${this.onOpenInMeridianClick_}">Open in Meridian</button>
++  </div>
+   <div id="main">
+     <content-region id="contentRegion"
+         ?showing-side-panel="${this.showingSidePanel_}"
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 1eaeeabcd5..b118ea2d23 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -104,6 +104,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       urlHost_: {state: true, type: String},
+       statusText_: {state: true, type: String},
+       sidebarHidden_: {type: Boolean, reflect: true, attribute: 'sidebar-hidden'},
++      little_: {type: Boolean, reflect: true, attribute: 'little'},
+       sidebarPeek_: {type: Boolean, reflect: true, attribute: 'sidebar-peek'},
+       inactive_: {
+         type: Boolean,
+@@ -134,6 +135,8 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   // ⌘S hides the sidebar; it slides back over the page from the window edge.
+   protected accessor sidebarHidden_: boolean = readSidebarHidden();
+   protected accessor sidebarPeek_: boolean = false;
++  // A Little window: a link from another app, without the sidebar.
++  protected accessor little_: boolean = false;
+ 
+   constructor() {
+     super();
+@@ -397,9 +400,10 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   override updated(changed: PropertyValues<this>) {
+     super.updated(changed);
+     if (changed.has('sidebarHidden_' as keyof WebuiBrowserAppElement) ||
+-        changed.has('sidebarPeek_' as keyof WebuiBrowserAppElement)) {
++        changed.has('sidebarPeek_' as keyof WebuiBrowserAppElement) ||
++        changed.has('little_' as keyof WebuiBrowserAppElement)) {
+       this.$.tabstrip.setWindowControlsVisible(
+-          !this.sidebarHidden_ || this.sidebarPeek_);
++          this.little_ || !this.sidebarHidden_ || this.sidebarPeek_);
+     }
+   }
+ 
+@@ -423,6 +427,12 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.sidebarPeek_ = false;
+   }
+ 
++  // The pointer over the page goes to the page's own process, so the sidebar
++  // never hears it leave; while it is out, this layer over the page does.
++  protected onPeekShieldMouseenter_() {
++    this.sidebarPeek_ = false;
++  }
++
+   // Meridian split view: the content region shows the active tab's split.
+   private splits_: Split[] = [];
+   private activeTabId_ = '';
+@@ -477,6 +487,14 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.statusText_ = e.detail;
+   }
+ 
++  protected onMeridianLittleChanged_(e: CustomEvent<boolean>) {
++    this.little_ = e.detail;
++  }
++
++  protected onOpenInMeridianClick_() {
++    this.$.tabstrip.openInMeridian();
++  }
++
+   protected onMeridianShowArchive_() {
+     this.$.archive.show();
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 2ae5b70560..adc35227f5 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -246,6 +246,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.state_ = state;
+     this.rev_++;
+     this.fire('meridian-splits-changed', state.splits);
++    this.fire('meridian-little-changed', state.little);
+     this.fire('meridian-peeks-changed',
+               state.tabs.filter(t => t.peek && t.openerId)
+                   .map(t => ({tab: t.tabId, opener: t.openerId!})));
+@@ -723,6 +724,10 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.handler_.setWindowControlsVisible(visible);
+   }
+ 
++  openInMeridian() {
++    this.handler_.openInMeridian();
++  }
++
+   startRenaming(id: string) {
+     this.renaming_ = id;
+   }

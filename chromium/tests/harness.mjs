@@ -28,6 +28,15 @@ class Cdp {
   close() { this.ws?.close(); }
 }
 
+async function evalUi(cdp, expr) {
+  const r = await cdp.send('Runtime.evaluate', {
+    expression: `(async () => { const app = document.querySelector('webui-browser-app'); return (${expr}); })()`,
+    awaitPromise: true, returnByValue: true,
+  });
+  if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
+  return r.result.value;
+}
+
 // `profile`: reuse a profile dir (to test what survives a restart); it's then left for the caller to delete.
 export async function launch(urls = [], { profile: keep, args = [] } = {}) {
   const profile = keep || fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
@@ -52,13 +61,18 @@ export async function launch(urls = [], { profile: keep, args = [] } = {}) {
   const b = {
     proc, profile, base, cdp,
     // Evaluates an expression in the browser UI page; `app` is the <webui-browser-app> element.
-    async eval(expr) {
-      const r = await cdp.send('Runtime.evaluate', {
-        expression: `(async () => { const app = document.querySelector('webui-browser-app'); return (${expr}); })()`,
-        awaitPromise: true, returnByValue: true,
-      });
-      if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
-      return r.result.value;
+    eval(expr) { return evalUi(cdp, expr); },
+    // The UI pages of the other browser windows (a Little window, say), each with eval/close.
+    async otherWindows() {
+      const list = (await (await fetch(`${base}/json/list`)).json())
+          .filter((t) => t.url.startsWith('chrome://webui-browser') && t.id !== ui.id);
+      return Promise.all(list.map(async (t) => {
+        const c = await new Cdp(t.webSocketDebuggerUrl).open();
+        return {
+          eval: (expr) => evalUi(c, expr), close: () => c.close(),
+          async screenshot(file) { const { data } = await c.send('Page.captureScreenshot', { format: 'png' }); fs.writeFileSync(file, Buffer.from(data, 'base64')); },
+        };
+      }));
     },
     async waitFor(expr, timeout = 10000) {
       const end = Date.now() + timeout; let last;
