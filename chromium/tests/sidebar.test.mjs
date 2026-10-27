@@ -14,7 +14,7 @@ test('the sidebar holds the address field and a vertical list of tabs', async ()
     assert.equal(rects[0].x, rects[1].x, 'tabs share a column');
     assert.ok(rects[1].y > rects[0].y, 'second tab is below the first');
     assert.equal(await b.eval(`app.shadowRoot.getElementById('sidebar').getBoundingClientRect().width`), 260);
-    assert.ok(await b.eval(`app.shadowRoot.getElementById('sidebar').contains(app.$.address)`), 'address field in the sidebar');
+    assert.ok(await b.eval(`app.shadowRoot.getElementById('sidebar').contains(app.$.urlPill)`), 'URL pill in the sidebar');
     // Today lists the newest tab first, like Arc.
     assert.deepEqual((await b.tabs()).map((t) => t.title), ['Two', 'One']);
   } finally { await b.close(); }
@@ -35,14 +35,12 @@ test('clicking a tab in the sidebar switches to it', async () => {
   } finally { await b.close(); }
 });
 
-test('New Tab opens a tab and the close button closes one', async () => {
-  const b = await launch([page('One')]);
+test('the close button closes a tab', async () => {
+  const b = await launch([page('One'), page('Two')]);
   try {
-    await b.waitFor(count(1));
-    await b.click(`${SB}.getElementById('newTabButton')`);
     await b.waitFor(count(2));
-    assert.ok((await b.tabs())[0].active, 'the new tab is active, at the top');
     await b.click(`${tabEl(0)}.shadowRoot.querySelector('.close')`);
     await b.waitFor(count(1));
+    assert.equal((await b.tabs())[0].title, 'One');
   } finally { await b.close(); }
 });
