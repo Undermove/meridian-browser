@@ -1,0 +1,1872 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 27 Oct 2026 13:44:28 +0400
+Subject: [PATCH 10/10] =?UTF-8?q?Meridian:=20archive=20(closed=20+=20auto-?=
+ =?UTF-8?q?archived=20Today=20tabs,=20=E2=8C=A5=E2=8C=98A=20panel,=20Clear?=
+ =?UTF-8?q?=20Today)=20and=20Peek?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ chrome/app/chrome_command_ids.h               |   2 +
+ chrome/app/meridian_strings.grdp              |   6 +
+ chrome/browser/meridian/BUILD.gn              |   9 +-
+ chrome/browser/meridian/archive_service.cc    | 234 ++++++++++++++++++
+ chrome/browser/meridian/archive_service.h     |  91 +++++++
+ .../meridian/archive_service_unittest.cc      |  81 ++++++
+ chrome/browser/meridian/sidebar.mojom         |  30 +++
+ chrome/browser/meridian/sidebar_handler.cc    | 187 ++++++++++++++
+ chrome/browser/meridian/sidebar_handler.h     |  28 +++
+ .../meridian/sidebar_service_factory.cc       |  31 +++
+ .../meridian/sidebar_service_factory.h        |  18 ++
+ chrome/browser/meridian/tab_data.cc           |   6 +
+ chrome/browser/meridian/tab_data.h            |   7 +
+ ...hrome_browser_main_extra_parts_profiles.cc |   1 +
+ .../browser/resources/webui_browser/BUILD.gn  |   3 +
+ .../resources/webui_browser/app.html.ts       |   8 +-
+ chrome/browser/resources/webui_browser/app.ts |  32 +++
+ .../webui_browser/content_region.css          |  71 ++++++
+ .../resources/webui_browser/content_region.ts |  54 ++++
+ .../webui_browser/meridian/archive.css        | 141 +++++++++++
+ .../webui_browser/meridian/archive.html.ts    |  43 ++++
+ .../webui_browser/meridian/archive.ts         | 170 +++++++++++++
+ .../webui_browser/meridian/sidebar.css        |  21 ++
+ .../webui_browser/meridian/sidebar.html.ts    |   6 +-
+ .../webui_browser/meridian/sidebar.ts         |  27 +-
+ .../browser/ui/browser_command_controller.cc  |   3 +-
+ chrome/browser/ui/cocoa/accelerators_cocoa.mm |   3 +
+ chrome/browser/ui/cocoa/main_menu_builder.mm  |   5 +
+ 28 files changed, 1312 insertions(+), 6 deletions(-)
+ create mode 100644 chrome/browser/meridian/archive_service.cc
+ create mode 100644 chrome/browser/meridian/archive_service.h
+ create mode 100644 chrome/browser/meridian/archive_service_unittest.cc
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/archive.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/archive.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/archive.ts
+
+diff --git a/chrome/app/chrome_command_ids.h b/chrome/app/chrome_command_ids.h
+index 222747f186..cfc0e3edf0 100644
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -123,6 +123,8 @@
+ #define IDC_MERIDIAN_PREVIOUS_TAB     39706
+ #define IDC_MERIDIAN_SPLIT            39707
+ #define IDC_MERIDIAN_UNSPLIT          39708
++#define IDC_MERIDIAN_ARCHIVE          39709
++#define IDC_MERIDIAN_CLEAR_TODAY      39719
+ // Spaces 1-9: IDC_MERIDIAN_SPACE_1 + n.
+ #define IDC_MERIDIAN_SPACE_1          39710
+ #define IDC_MERIDIAN_SPACE_9          39718
+diff --git a/chrome/app/meridian_strings.grdp b/chrome/app/meridian_strings.grdp
+index 5feb7cf676..e9ca709c14 100644
+--- a/chrome/app/meridian_strings.grdp
++++ b/chrome/app/meridian_strings.grdp
+@@ -19,4 +19,10 @@
+   <message name="IDS_MERIDIAN_NEW_FOLDER_MAC" desc="Menu item: a new folder for pinned tabs in the current space.">
+     New Folder
+   </message>
++  <message name="IDS_MERIDIAN_ARCHIVE_MAC" desc="Menu item: open the archive of closed and auto-archived tabs.">
++    View Archive
++  </message>
++  <message name="IDS_MERIDIAN_CLEAR_TODAY_MAC" desc="Menu item: archive all Today tabs of the current space.">
++    Clear Today
++  </message>
+ </grit-part>
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index d7368e5abc..93f24c8f38 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -18,11 +18,14 @@ mojom("mojo_bindings") {
+ # The sidebar model alone (no browser deps), so its tests stay small.
+ source_set("model") {
+   sources = [
++    "archive_service.cc",
++    "archive_service.h",
+     "sidebar_service.cc",
+     "sidebar_service.h",
+   ]
+   public_deps = [
+     "//base",
++    "//base:i18n",
+     "//components/keyed_service/core",
+     "//url",
+   ]
+@@ -63,6 +66,7 @@ source_set("meridian") {
+     "//components/sessions",
+     "//components/split_tabs",
+     "//components/tabs:public",
++    "//net",
+     "//ui/base",
+     "//ui/gfx",
+   ]
+@@ -72,7 +76,10 @@ import("//testing/test.gni")
+ 
+ # out/Release/meridian_unittests
+ test("meridian_unittests") {
+-  sources = [ "sidebar_service_unittest.cc" ]
++  sources = [
++    "archive_service_unittest.cc",
++    "sidebar_service_unittest.cc",
++  ]
+   deps = [
+     ":model",
+     "//base/test:run_all_unittests",
+diff --git a/chrome/browser/meridian/archive_service.cc b/chrome/browser/meridian/archive_service.cc
+new file mode 100644
+index 0000000000..d345f3f99a
+--- /dev/null
++++ b/chrome/browser/meridian/archive_service.cc
+@@ -0,0 +1,234 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/archive_service.h"
++
++#include <algorithm>
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/i18n/case_conversion.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/json/values_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/thread_pool.h"
++#include "base/uuid.h"
++
++namespace meridian {
++
++namespace {
++
++constexpr base::FilePath::CharType kFileName[] =
++    FILE_PATH_LITERAL("Meridian Archive.json");
++
++bool WorthKeeping(const GURL& url) {
++  if (!url.is_valid() || url.is_empty()) {
++    return false;
++  }
++  if (url.SchemeIs("about") || url.SchemeIs("data") ||
++      url.SchemeIs("javascript")) {
++    return false;
++  }
++  return !(url.SchemeIs("chrome") &&
++           (url.host() == "newtab" || url.host() == "new-tab-page"));
++}
++
++std::optional<std::string> ReadFile(const base::FilePath& path) {
++  std::string json;
++  if (!base::ReadFileToString(path, &json)) {
++    return std::nullopt;
++  }
++  return json;
++}
++
++std::u16string Fold(const std::string& s) {
++  return base::i18n::ToLower(base::UTF8ToUTF16(s));
++}
++
++}  // namespace
++
++class ArchiveService::Serializer
++    : public base::ImportantFileWriter::DataSerializer {
++ public:
++  explicit Serializer(ArchiveService* service) : service_(service) {}
++  std::optional<std::string> SerializeData() override {
++    return base::WriteJson(service_->ToValue());
++  }
++
++ private:
++  raw_ptr<ArchiveService> service_;
++};
++
++ArchiveService::ArchiveService(const base::FilePath& profile_path,
++                               bool off_the_record)
++    : off_the_record_(off_the_record),
++      serializer_(std::make_unique<Serializer>(this)) {
++  if (profile_path.empty() || off_the_record) {
++    return;
++  }
++  scoped_refptr<base::SequencedTaskRunner> file_runner =
++      base::ThreadPool::CreateSequencedTaskRunner(
++          {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
++           base::TaskShutdownBehavior::BLOCK_SHUTDOWN});
++  base::FilePath path = profile_path.Append(kFileName);
++  writer_ = std::make_unique<base::ImportantFileWriter>(path, file_runner);
++  file_runner->PostTaskAndReplyWithResult(
++      FROM_HERE, base::BindOnce(&ReadFile, path),
++      base::BindOnce(&ArchiveService::OnLoaded, weak_factory_.GetWeakPtr()));
++}
++
++ArchiveService::~ArchiveService() {
++  if (writer_ && writer_->HasPendingWrite()) {
++    writer_->DoScheduledWrite();
++  }
++}
++
++void ArchiveService::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void ArchiveService::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++void ArchiveService::OnLoaded(std::optional<std::string> json) {
++  if (!json) {
++    return;
++  }
++  std::optional<base::Value> value =
++      base::JSONReader::Read(*json, base::JSON_PARSE_RFC);
++  if (!value || !value->is_list()) {
++    return;
++  }
++  // Entries archived while loading go first (they're newer).
++  std::vector<ArchivedTab> loaded = FromValue(value->GetList());
++  entries_.insert(entries_.end(), loaded.begin(), loaded.end());
++  if (entries_.size() > kMaxEntries) {
++    entries_.resize(kMaxEntries);
++  }
++  for (Observer& o : observers_) {
++    o.OnArchiveChanged();
++  }
++}
++
++void ArchiveService::Add(const GURL& url,
++                         const std::string& title,
++                         const std::string& space_id,
++                         base::Time when) {
++  if (off_the_record_ || !WorthKeeping(url)) {
++    return;
++  }
++  // The same page archived again moves to the top.
++  std::erase_if(entries_, [&](const ArchivedTab& e) { return e.url == url; });
++  ArchivedTab entry;
++  entry.id = base::Uuid::GenerateRandomV4().AsLowercaseString();
++  entry.url = url;
++  entry.title = title;
++  entry.space_id = space_id;
++  entry.archived_at = when;
++  entries_.insert(entries_.begin(), std::move(entry));
++  if (entries_.size() > kMaxEntries) {
++    entries_.resize(kMaxEntries);
++  }
++  Changed();
++}
++
++std::optional<ArchivedTab> ArchiveService::Take(const std::string& id) {
++  auto it = std::ranges::find(entries_, id, &ArchivedTab::id);
++  if (it == entries_.end()) {
++    return std::nullopt;
++  }
++  ArchivedTab entry = std::move(*it);
++  entries_.erase(it);
++  Changed();
++  return entry;
++}
++
++void ArchiveService::Remove(const std::string& id) {
++  Take(id);
++}
++
++void ArchiveService::Clear() {
++  entries_.clear();
++  Changed();
++}
++
++std::vector<ArchivedTab> ArchiveService::Search(const std::string& query,
++                                                size_t limit) const {
++  std::vector<ArchivedTab> out;
++  std::u16string q = Fold(query);
++  for (const ArchivedTab& e : entries_) {
++    if (out.size() >= limit) {
++      break;
++    }
++    if (q.empty() || Fold(e.title).find(q) != std::u16string::npos ||
++        Fold(e.url.spec()).find(q) != std::u16string::npos) {
++      out.push_back(e);
++    }
++  }
++  return out;
++}
++
++base::ListValue ArchiveService::ToValue() const {
++  base::ListValue list;
++  for (const ArchivedTab& e : entries_) {
++    base::DictValue d;
++    d.Set("id", e.id);
++    d.Set("url", e.url.spec());
++    d.Set("title", e.title);
++    d.Set("space", e.space_id);
++    d.Set("at", base::TimeToValue(e.archived_at));
++    list.Append(std::move(d));
++  }
++  return list;
++}
++
++// static
++std::vector<ArchivedTab> ArchiveService::FromValue(
++    const base::ListValue& list) {
++  std::vector<ArchivedTab> out;
++  for (const base::Value& v : list) {
++    if (!v.is_dict()) {
++      continue;
++    }
++    const base::DictValue& d = v.GetDict();
++    const std::string* id = d.FindString("id");
++    const std::string* url = d.FindString("url");
++    if (!id || !url || !GURL(*url).is_valid()) {
++      continue;
++    }
++    ArchivedTab e;
++    e.id = *id;
++    e.url = GURL(*url);
++    if (const std::string* title = d.FindString("title")) {
++      e.title = *title;
++    }
++    if (const std::string* space = d.FindString("space")) {
++      e.space_id = *space;
++    }
++    if (const base::Value* at = d.Find("at")) {
++      e.archived_at = base::ValueToTime(*at).value_or(base::Time());
++    }
++    out.push_back(std::move(e));
++  }
++  return out;
++}
++
++void ArchiveService::FlushForTesting() {
++  if (writer_ && writer_->HasPendingWrite()) {
++    writer_->DoScheduledWrite();
++  }
++}
++
++void ArchiveService::Changed() {
++  if (writer_) {
++    writer_->ScheduleWrite(serializer_.get());
++  }
++  for (Observer& o : observers_) {
++    o.OnArchiveChanged();
++  }
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/archive_service.h b/chrome/browser/meridian/archive_service.h
+new file mode 100644
+index 0000000000..c1899475e3
+--- /dev/null
++++ b/chrome/browser/meridian/archive_service.h
+@@ -0,0 +1,91 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_ARCHIVE_SERVICE_H_
++#define CHROME_BROWSER_MERIDIAN_ARCHIVE_SERVICE_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/files/important_file_writer.h"
++#include "base/memory/weak_ptr.h"
++#include "base/observer_list.h"
++#include "base/observer_list_types.h"
++#include "base/time/time.h"
++#include "base/values.h"
++#include "components/keyed_service/core/keyed_service.h"
++#include "url/gurl.h"
++
++namespace meridian {
++
++// A Today tab that was closed or auto-archived, kept so it can be found and
++// reopened (Arc's archive).
++struct ArchivedTab {
++  std::string id;
++  GURL url;
++  std::string title;
++  std::string space_id;
++  base::Time archived_at;
++};
++
++// The archive of one profile, newest first, capped at kMaxEntries. Saved as
++// "<profile>/Meridian Archive.json"; off-the-record profiles keep nothing.
++class ArchiveService : public KeyedService {
++ public:
++  static constexpr size_t kMaxEntries = 5000;
++
++  class Observer : public base::CheckedObserver {
++   public:
++    virtual void OnArchiveChanged() = 0;
++  };
++
++  // `profile_path` empty: in memory only. `off_the_record`: archives nothing.
++  ArchiveService(const base::FilePath& profile_path, bool off_the_record);
++  ArchiveService(const ArchiveService&) = delete;
++  ArchiveService& operator=(const ArchiveService&) = delete;
++  ~ArchiveService() override;
++
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
++
++  const std::vector<ArchivedTab>& entries() const { return entries_; }
++
++  // Ignores URLs not worth keeping (new tab page, about:blank, ...).
++  void Add(const GURL& url,
++           const std::string& title,
++           const std::string& space_id,
++           base::Time when);
++  // Removes and returns the entry, for reopening.
++  std::optional<ArchivedTab> Take(const std::string& id);
++  void Remove(const std::string& id);
++  void Clear();
++
++  // Case-insensitive match on title and URL; empty query: everything.
++  std::vector<ArchivedTab> Search(const std::string& query,
++                                  size_t limit) const;
++
++  base::ListValue ToValue() const;
++  static std::vector<ArchivedTab> FromValue(const base::ListValue& list);
++  void FlushForTesting();
++
++ private:
++  class Serializer;
++
++  void OnLoaded(std::optional<std::string> json);
++  void Changed();
++
++  const bool off_the_record_;
++  std::vector<ArchivedTab> entries_;
++  std::unique_ptr<Serializer> serializer_;
++  std::unique_ptr<base::ImportantFileWriter> writer_;
++  base::ObserverList<Observer> observers_;
++  base::WeakPtrFactory<ArchiveService> weak_factory_{this};
++};
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_ARCHIVE_SERVICE_H_
+diff --git a/chrome/browser/meridian/archive_service_unittest.cc b/chrome/browser/meridian/archive_service_unittest.cc
+new file mode 100644
+index 0000000000..82f1f5c45f
+--- /dev/null
++++ b/chrome/browser/meridian/archive_service_unittest.cc
+@@ -0,0 +1,81 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/archive_service.h"
++
++#include "base/files/scoped_temp_dir.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/test/task_environment.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace meridian {
++namespace {
++
++class ArchiveServiceTest : public testing::Test {
++ protected:
++  base::test::TaskEnvironment env_;
++};
++
++TEST_F(ArchiveServiceTest, KeepsNewestFirstWithoutDuplicatesOrJunk) {
++  ArchiveService archive{base::FilePath(), /*off_the_record=*/false};
++  base::Time now = base::Time::Now();
++  archive.Add(GURL("https://a.example/"), "A", "s", now);
++  archive.Add(GURL("https://b.example/"), "B", "s", now);
++  archive.Add(GURL("https://a.example/"), "A again", "s", now);
++  archive.Add(GURL("chrome://newtab/"), "New Tab", "s", now);
++  archive.Add(GURL("about:blank"), "", "s", now);
++  ASSERT_EQ(archive.entries().size(), 2u);
++  EXPECT_EQ(archive.entries()[0].title, "A again");
++  EXPECT_EQ(archive.entries()[1].title, "B");
++}
++
++TEST_F(ArchiveServiceTest, SearchTakeAndOffTheRecord) {
++  ArchiveService archive{base::FilePath(), false};
++  archive.Add(GURL("https://docs.example/design"), "Design Doc", "s",
++              base::Time::Now());
++  archive.Add(GURL("https://mail.example/"), "Inbox", "s", base::Time::Now());
++  EXPECT_EQ(archive.Search("DESIGN", 10).size(), 1u);
++  EXPECT_EQ(archive.Search("mail.example", 10).size(), 1u);
++  EXPECT_EQ(archive.Search("", 1).size(), 1u);
++  std::string id = archive.entries()[0].id;
++  auto taken = archive.Take(id);
++  ASSERT_TRUE(taken);
++  EXPECT_EQ(archive.entries().size(), 1u);
++  EXPECT_FALSE(archive.Take(id));
++
++  ArchiveService incognito{base::FilePath(), /*off_the_record=*/true};
++  incognito.Add(GURL("https://secret.example/"), "x", "s", base::Time::Now());
++  EXPECT_TRUE(incognito.entries().empty());
++}
++
++TEST_F(ArchiveServiceTest, SavesAndLoads) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  base::Time when = base::Time::Now() - base::Hours(13);
++  {
++    ArchiveService archive(dir.GetPath(), false);
++    env_.RunUntilIdle();
++    archive.Add(GURL("https://kept.example/"), "Kept", "space-1", when);
++    archive.FlushForTesting();
++    env_.RunUntilIdle();
++  }
++  ArchiveService again(dir.GetPath(), false);
++  env_.RunUntilIdle();
++  ASSERT_EQ(again.entries().size(), 1u);
++  EXPECT_EQ(again.entries()[0].title, "Kept");
++  EXPECT_EQ(again.entries()[0].space_id, "space-1");
++  EXPECT_EQ(again.entries()[0].archived_at, when);
++}
++
++TEST_F(ArchiveServiceTest, Capped) {
++  ArchiveService archive{base::FilePath(), false};
++  for (size_t i = 0; i < ArchiveService::kMaxEntries + 10; ++i) {
++    archive.Add(GURL("https://e.example/" + base::NumberToString(i)), "e", "s",
++                base::Time::Now());
++  }
++  EXPECT_EQ(archive.entries().size(), ArchiveService::kMaxEntries);
++}
++
++}  // namespace
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 1d9be33c2f..13fe893a00 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -36,6 +36,9 @@ struct TabInfo {
+   tabs_api.mojom.NodeId tab_id;
+   string space_id;
+   string item_id;
++  // A Peek card over `opener_id` (see TabData::peek()).
++  bool peek;
++  tabs_api.mojom.NodeId? opener_id;
+ };
+ 
+ // Two tabs side by side (Chromium split tabs), `start` on the left.
+@@ -47,6 +50,16 @@ struct Split {
+   double ratio;
+ };
+ 
++// A closed or auto-archived Today tab.
++struct ArchivedTab {
++  string id;
++  url.mojom.Url url;
++  string title;
++  string space_id;
++  // Milliseconds since the epoch.
++  double archived_at;
++};
++
+ struct SidebarState {
+   array<Space> spaces;
+   string active_space_id;
+@@ -80,6 +93,8 @@ enum Command {
+   kNewFolder,
+   kSplit,
+   kUnsplit,
++  kShowArchive,
++  kClearToday,
+ };
+ 
+ interface SidebarHandlerFactory {
+@@ -97,6 +112,9 @@ interface SidebarPage {
+   ShowCommandBar();
+ 
+   RunCommand(Command command, int32 arg);
++
++  // Something was archived or restored.
++  OnArchiveChanged();
+ };
+ 
+ interface SidebarHandler {
+@@ -137,4 +155,16 @@ interface SidebarHandler {
+   SplitWith(tabs_api.mojom.NodeId other);
+   Unsplit();
+   SetSplitRatio(string split_id, double ratio);
++
++  // The archive, newest first, filtered by `query` (title or URL).
++  SearchArchive(string query) => (array<ArchivedTab> tabs);
++  // Opens an archived tab again, in the active space, and drops it from the
++  // archive.
++  RestoreArchived(string id);
++  DeleteArchived(string id);
++  // Archives every Today tab of the active space (⇧⌘K).
++  ClearToday();
++
++  // Turns a Peek into an ordinary Today tab.
++  ExpandPeek(tabs_api.mojom.NodeId tab_id);
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index ed44b55409..9bd2686abc 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -7,7 +7,9 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/command_line.h"
+ #include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
+ #include "build/build_config.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+@@ -26,6 +28,7 @@
+ #include "components/split_tabs/split_tab_visual_data.h"
+ #include "components/tabs/public/split_tab_data.h"
+ #include "content/public/browser/navigation_controller.h"
++#include "net/base/registry_controlled_domains/registry_controlled_domain.h"
+ #include "content/public/browser/web_contents.h"
+ #include "ui/base/page_transition_types.h"
+ #include "ui/base/window_open_disposition.h"
+@@ -62,9 +65,15 @@ SidebarHandler::SidebarHandler(
+     mojo::PendingReceiver<mojom::SidebarHandler> receiver)
+     : browser_(browser),
+       service_(SidebarServiceFactory::GetForProfile(browser->GetProfile())),
++      archive_(ArchiveServiceFactory::GetForProfile(browser->GetProfile())),
+       page_(std::move(page)),
+       receiver_(this, std::move(receiver)) {
+   service_observation_.Observe(service_.get());
++  archive_observation_.Observe(archive_.get());
++  // Checked often enough that a tab goes within minutes of its time.
++  base::TimeDelta sweep = std::min(base::Minutes(5), ArchiveAfter() / 4);
++  archive_timer_.Start(FROM_HERE, sweep, this,
++                       &SidebarHandler::ArchiveStaleTabs);
+   model()->AddObserver(this);
+   Handlers()[browser_] = this;
+   if (service_->loaded()) {
+@@ -115,6 +124,54 @@ tabs::TabInterface* SidebarHandler::LiveTabOf(const std::string& item_id) {
+   return nullptr;
+ }
+ 
++// A tab opened from a pinned tab or favorite into another site becomes a
++// Peek over it (Arc). Its URL often isn't known when it is inserted (a
++// target=_blank link starts loading after), so this runs again on changes.
++void SidebarHandler::MaybePeek(tabs::TabInterface* tab) {
++  auto candidate = peek_candidates_.find(tab->GetHandle());
++  if (candidate == peek_candidates_.end()) {
++    int index = model()->GetIndexOfTab(tab);
++    tabs::TabInterface* opener = index == TabStripModel::kNoTab
++                                     ? nullptr
++                                     : model()->GetOpenerOfTabAt(index);
++    const TabData* opener_data =
++        opener ? TabData::Get(opener->GetContents()) : nullptr;
++    if (!opener_data || opener_data->item_id().empty()) {
++      return;
++    }
++    candidate = peek_candidates_
++                    .emplace(tab->GetHandle(),
++                             opener->GetContents()->GetLastCommittedURL())
++                    .first;
++  }
++  GURL to = tab->GetContents()->GetVisibleURL();
++  if (!to.SchemeIsHTTPOrHTTPS()) {
++    return;  // not known yet
++  }
++  bool peek = !net::registry_controlled_domains::SameDomainOrHost(
++      candidate->second, to,
++      net::registry_controlled_domains::INCLUDE_PRIVATE_REGISTRIES);
++  peek_candidates_.erase(candidate);
++  if (peek) {
++    TabData::SetPeek(tab->GetContents(), true);
++    ScheduleNotify();
++  }
++}
++
++void SidebarHandler::OnTabChangedAt(tabs::TabInterface* tab,
++                                    TabChangeType change_type) {
++  if (!peek_candidates_.empty()) {
++    MaybePeek(tab);
++  }
++}
++
++void SidebarHandler::ExpandPeek(const tabs_api::NodeId& tab_id) {
++  if (tabs::TabInterface* tab = TabFor(tab_id)) {
++    TabData::SetPeek(tab->GetContents(), false);
++    ScheduleNotify();
++  }
++}
++
+ void SidebarHandler::Adopt(tabs::TabInterface* tab) {
+   content::WebContents* contents = tab->GetContents();
+   const TabData* data = TabData::Get(contents);
+@@ -180,6 +237,12 @@ bool SidebarHandler::HandleCommand(BrowserWindowInterface* browser,
+       case IDC_MERIDIAN_UNSPLIT:
+         command = mojom::Command::kUnsplit;
+         break;
++      case IDC_MERIDIAN_ARCHIVE:
++        command = mojom::Command::kShowArchive;
++        break;
++      case IDC_MERIDIAN_CLEAR_TODAY:
++        command = mojom::Command::kClearToday;
++        break;
+       default:
+         return false;
+     }
+@@ -207,6 +270,109 @@ void SidebarHandler::OnActiveTabChanged(tabs::TabInterface* tab) {
+   }
+ }
+ 
++// static
++base::TimeDelta SidebarHandler::ArchiveAfter() {
++  // For tests: --meridian-archive-after-seconds=N.
++  const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++  int seconds = 0;
++  if (base::StringToInt(
++          cl->GetSwitchValueASCII("meridian-archive-after-seconds"),
++          &seconds) &&
++      seconds > 0) {
++    return base::Seconds(seconds);
++  }
++  return base::Hours(12);
++}
++
++bool SidebarHandler::IsTodayTab(tabs::TabInterface* tab) {
++  const TabData* data = TabData::Get(tab->GetContents());
++  return !data || (data->item_id().empty() && !data->peek());
++}
++
++void SidebarHandler::ArchiveStaleTabs() {
++  base::Time cutoff = base::Time::Now() - ArchiveAfter();
++  tabs::TabInterface* active = model()->GetActiveTab();
++  std::vector<content::WebContents*> stale;
++  for (int i = 0; i < model()->count(); ++i) {
++    tabs::TabInterface* tab = model()->GetTabAtIndex(i);
++    if (tab == active || tab->GetSplit() || !IsTodayTab(tab)) {
++      continue;
++    }
++    content::WebContents* contents = tab->GetContents();
++    if (contents->GetLastActiveTime() < cutoff &&
++        !contents->IsCurrentlyAudible()) {
++      stale.push_back(contents);
++    }
++  }
++  // Closing archives them (OnTabStripModelChanged).
++  for (content::WebContents* contents : stale) {
++    int index = model()->GetIndexOfWebContents(contents);
++    if (index != TabStripModel::kNoTab) {
++      model()->CloseWebContentsAt(index, TabCloseTypes::CLOSE_NONE);
++    }
++  }
++}
++
++void SidebarHandler::OnArchiveChanged() {
++  if (page_.is_connected()) {
++    page_->OnArchiveChanged();
++  }
++}
++
++void SidebarHandler::SearchArchive(const std::string& query,
++                                   SearchArchiveCallback callback) {
++  std::vector<mojom::ArchivedTabPtr> out;
++  for (const ArchivedTab& e : archive_->Search(query, 500)) {
++    auto m = mojom::ArchivedTab::New();
++    m->id = e.id;
++    m->url = e.url;
++    m->title = e.title;
++    m->space_id = e.space_id;
++    m->archived_at = e.archived_at.InMillisecondsFSinceUnixEpoch();
++    out.push_back(std::move(m));
++  }
++  std::move(callback).Run(std::move(out));
++}
++
++void SidebarHandler::RestoreArchived(const std::string& id) {
++  std::optional<ArchivedTab> entry = archive_->Take(id);
++  if (!entry) {
++    return;
++  }
++  NavigateParams params(browser_, entry->url, ui::PAGE_TRANSITION_AUTO_BOOKMARK);
++  params.disposition = WindowOpenDisposition::kNewForegroundTab;
++  Navigate(&params);
++}
++
++void SidebarHandler::DeleteArchived(const std::string& id) {
++  archive_->Remove(id);
++}
++
++void SidebarHandler::ClearToday() {
++  std::vector<content::WebContents*> today;
++  for (int i = 0; i < model()->count(); ++i) {
++    tabs::TabInterface* tab = model()->GetTabAtIndex(i);
++    const TabData* data = TabData::Get(tab->GetContents());
++    if (IsTodayTab(tab) &&
++        (!data || data->space_id() == service_->active_space_id())) {
++      today.push_back(tab->GetContents());
++    }
++  }
++  // Closing the window's last tabs would close the window: leave a new tab.
++  if (!today.empty() && static_cast<int>(today.size()) == model()->count()) {
++    NavigateParams params(browser_, GURL("chrome://newtab/"),
++                          ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
++    params.disposition = WindowOpenDisposition::kNewForegroundTab;
++    Navigate(&params);
++  }
++  for (content::WebContents* contents : today) {
++    int index = model()->GetIndexOfWebContents(contents);
++    if (index != TabStripModel::kNoTab) {
++      model()->CloseWebContentsAt(index, TabCloseTypes::CLOSE_USER_GESTURE);
++    }
++  }
++}
++
+ void SidebarHandler::OnSidebarChanged() {
+   if (!service_->loaded()) {
+     return;
+@@ -228,6 +394,23 @@ void SidebarHandler::OnTabStripModelChanged(
+   if (change.type() == TabStripModelChange::kInserted) {
+     for (const auto& inserted : change.GetInsert()->contents) {
+       Adopt(inserted.tab);
++      MaybePeek(inserted.tab);
++    }
++  }
++  // A closed Today tab goes to the archive (not when the window closes).
++  if (change.type() == TabStripModelChange::kRemoved &&
++      !tab_strip_model->closing_all()) {
++    for (const auto& removed : change.GetRemove()->contents) {
++      if (removed.remove_reason != TabRemovedReason::kDeleted ||
++          !IsTodayTab(removed.tab)) {
++        continue;
++      }
++      content::WebContents* contents = removed.contents;
++      const TabData* data = TabData::Get(contents);
++      archive_->Add(contents->GetLastCommittedURL(),
++                    base::UTF16ToUTF8(contents->GetTitle()),
++                    data ? data->space_id() : service_->active_space_id(),
++                    base::Time::Now());
+     }
+   }
+   if (selection.active_tab_changed()) {
+@@ -261,6 +444,10 @@ mojom::SidebarStatePtr SidebarHandler::BuildState() {
+     info->tab_id = tabs_api::NodeId::FromTabHandle(tab->GetHandle());
+     info->space_id = data ? data->space_id() : service_->active_space_id();
+     info->item_id = data ? data->item_id() : std::string();
++    info->peek = data && data->peek();
++    if (tabs::TabInterface* opener = model()->GetOpenerOfTabAt(i)) {
++      info->opener_id = tabs_api::NodeId::FromTabHandle(opener->GetHandle());
++    }
+     state->tabs.push_back(std::move(info));
+     // Each split once, from its first tab.
+     std::optional<split_tabs::SplitTabId> split_id = tab->GetSplit();
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 773bda4cd2..cfa9f3ae15 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -11,6 +11,8 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/scoped_observation.h"
++#include "base/timer/timer.h"
++#include "chrome/browser/meridian/archive_service.h"
+ #include "chrome/browser/meridian/sidebar.mojom.h"
+ #include "chrome/browser/meridian/sidebar_service.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+@@ -29,6 +31,7 @@ namespace meridian {
+ // remembers its last active tab.
+ class SidebarHandler : public mojom::SidebarHandler,
+                        public SidebarService::Observer,
++                       public ArchiveService::Observer,
+                        public TabStripModelObserver {
+  public:
+   SidebarHandler(BrowserWindowInterface* browser,
+@@ -81,6 +84,18 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void SplitWith(const tabs_api::NodeId& other) override;
+   void Unsplit() override;
+   void SetSplitRatio(const std::string& split_id, double ratio) override;
++  void SearchArchive(const std::string& query,
++                     SearchArchiveCallback callback) override;
++  void RestoreArchived(const std::string& id) override;
++  void DeleteArchived(const std::string& id) override;
++  void ClearToday() override;
++  void ExpandPeek(const tabs_api::NodeId& tab_id) override;
++
++  // ArchiveService::Observer:
++  void OnArchiveChanged() override;
++
++  // How long a Today tab may go unvisited before it is archived (Arc: 12 h).
++  static base::TimeDelta ArchiveAfter();
+ 
+   // SidebarService::Observer:
+   void OnSidebarChanged() override;
+@@ -91,6 +106,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+       const TabStripModelChange& change,
+       const TabStripSelectionChange& selection) override;
+   void OnSplitTabChanged(const SplitTabChange& change) override;
++  void OnTabChangedAt(tabs::TabInterface* tab,
++                      TabChangeType change_type) override;
+ 
+  private:
+   TabStripModel* model();
+@@ -102,10 +119,19 @@ class SidebarHandler : public mojom::SidebarHandler,
+   tabs::TabInterface* LiveTabOf(const std::string& item_id);
+   // Gives a tab without (valid) Meridian data the active space.
+   void Adopt(tabs::TabInterface* tab);
++  void MaybePeek(tabs::TabInterface* tab);
+   void OnActiveTabChanged(tabs::TabInterface* tab);
++  // Closes (and so archives) Today tabs not visited for ArchiveAfter().
++  void ArchiveStaleTabs();
++  bool IsTodayTab(tabs::TabInterface* tab);
+ 
+   raw_ptr<BrowserWindowInterface> browser_;
+   raw_ptr<SidebarService> service_;
++  raw_ptr<ArchiveService> archive_;
++  base::RepeatingTimer archive_timer_;
++  // New tabs opened from a pinned tab or favorite, until their URL is known:
++  // opener's URL, to decide whether they are a Peek (MaybePeek).
++  std::map<tabs::TabHandle, GURL> peek_candidates_;
+   // Last active tab per space id.
+   std::map<std::string, tabs::TabHandle> last_active_;
+   bool notify_pending_ = false;
+@@ -114,6 +140,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+   mojo::Receiver<mojom::SidebarHandler> receiver_;
+   base::ScopedObservation<SidebarService, SidebarService::Observer>
+       service_observation_{this};
++  base::ScopedObservation<ArchiveService, ArchiveService::Observer>
++      archive_observation_{this};
+   base::WeakPtrFactory<SidebarHandler> weak_factory_{this};
+ };
+ 
+diff --git a/chrome/browser/meridian/sidebar_service_factory.cc b/chrome/browser/meridian/sidebar_service_factory.cc
+index 3b0b36fb93..4da8b4ba8b 100644
+--- a/chrome/browser/meridian/sidebar_service_factory.cc
++++ b/chrome/browser/meridian/sidebar_service_factory.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/meridian/sidebar_service_factory.h"
+ 
++#include "chrome/browser/meridian/archive_service.h"
+ #include "chrome/browser/meridian/sidebar_service.h"
+ #include "chrome/browser/profiles/profile.h"
+ 
+@@ -39,4 +40,34 @@ SidebarServiceFactory::BuildServiceInstanceForBrowserContext(
+       profile->IsOffTheRecord() ? base::FilePath() : profile->GetPath());
+ }
+ 
++// static
++ArchiveService* ArchiveServiceFactory::GetForProfile(Profile* profile) {
++  return static_cast<ArchiveService*>(
++      GetInstance()->GetServiceForBrowserContext(profile, /*create=*/true));
++}
++
++// static
++ArchiveServiceFactory* ArchiveServiceFactory::GetInstance() {
++  static base::NoDestructor<ArchiveServiceFactory> instance;
++  return instance.get();
++}
++
++ArchiveServiceFactory::ArchiveServiceFactory()
++    : ProfileKeyedServiceFactory(
++          "MeridianArchiveService",
++          ProfileSelections::Builder()
++              .WithRegular(ProfileSelection::kOwnInstance)
++              .WithGuest(ProfileSelection::kOwnInstance)
++              .Build()) {}
++
++ArchiveServiceFactory::~ArchiveServiceFactory() = default;
++
++std::unique_ptr<KeyedService>
++ArchiveServiceFactory::BuildServiceInstanceForBrowserContext(
++    content::BrowserContext* context) const {
++  Profile* profile = Profile::FromBrowserContext(context);
++  return std::make_unique<ArchiveService>(profile->GetPath(),
++                                          profile->IsOffTheRecord());
++}
++
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/sidebar_service_factory.h b/chrome/browser/meridian/sidebar_service_factory.h
+index 07fecefe63..6db232eead 100644
+--- a/chrome/browser/meridian/sidebar_service_factory.h
++++ b/chrome/browser/meridian/sidebar_service_factory.h
+@@ -12,6 +12,7 @@ class Profile;
+ 
+ namespace meridian {
+ 
++class ArchiveService;
+ class SidebarService;
+ 
+ // One SidebarService per profile. Incognito gets its own, kept in memory.
+@@ -31,6 +32,23 @@ class SidebarServiceFactory : public ProfileKeyedServiceFactory {
+       content::BrowserContext* context) const override;
+ };
+ 
++// One ArchiveService per profile; incognito archives nothing.
++class ArchiveServiceFactory : public ProfileKeyedServiceFactory {
++ public:
++  static ArchiveService* GetForProfile(Profile* profile);
++  static ArchiveServiceFactory* GetInstance();
++
++ private:
++  friend base::NoDestructor<ArchiveServiceFactory>;
++
++  ArchiveServiceFactory();
++  ~ArchiveServiceFactory() override;
++
++  // BrowserContextKeyedServiceFactory:
++  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
++      content::BrowserContext* context) const override;
++};
++
+ }  // namespace meridian
+ 
+ #endif  // CHROME_BROWSER_MERIDIAN_SIDEBAR_SERVICE_FACTORY_H_
+diff --git a/chrome/browser/meridian/tab_data.cc b/chrome/browser/meridian/tab_data.cc
+index a6cb3c9ca3..1d985484b7 100644
+--- a/chrome/browser/meridian/tab_data.cc
++++ b/chrome/browser/meridian/tab_data.cc
+@@ -41,6 +41,12 @@ void TabData::Set(content::WebContents* contents,
+   data->Persist();
+ }
+ 
++// static
++void TabData::SetPeek(content::WebContents* contents, bool peek) {
++  CreateForWebContents(contents);
++  FromWebContents(contents)->peek_ = peek;
++}
++
+ // static
+ void TabData::RestoreFromExtraData(
+     content::WebContents* contents,
+diff --git a/chrome/browser/meridian/tab_data.h b/chrome/browser/meridian/tab_data.h
+index 298c0ca0c9..324537332f 100644
+--- a/chrome/browser/meridian/tab_data.h
++++ b/chrome/browser/meridian/tab_data.h
+@@ -32,6 +32,12 @@ class TabData : public content::WebContentsUserData<TabData> {
+   const std::string& space_id() const { return space_id_; }
+   const std::string& item_id() const { return item_id_; }
+ 
++  // Peek: a page opened from a pinned tab or favorite into another site,
++  // shown as a card over its opener rather than in Today. Not saved: after a
++  // restart it is an ordinary Today tab.
++  static void SetPeek(content::WebContents* contents, bool peek);
++  bool peek() const { return peek_; }
++
+  private:
+   friend class content::WebContentsUserData<TabData>;
+   explicit TabData(content::WebContents* contents);
+@@ -40,6 +46,7 @@ class TabData : public content::WebContentsUserData<TabData> {
+ 
+   std::string space_id_;
+   std::string item_id_;
++  bool peek_ = false;
+ 
+   WEB_CONTENTS_USER_DATA_KEY_DECL();
+ };
+diff --git a/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc b/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+index e04d67d3eb..79e029ecaf 100644
+--- a/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
++++ b/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+@@ -1294,6 +1294,7 @@ void ChromeBrowserMainExtraPartsProfiles::
+   PersonalContextServiceFactory::GetInstance();
+ #if !BUILDFLAG(IS_ANDROID)
+   PinnedTabServiceFactory::GetInstance();
++  meridian::ArchiveServiceFactory::GetInstance();
+   meridian::SidebarServiceFactory::GetInstance();
+   PinnedToolbarActionsModelFactory::GetInstance();
+ #endif
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index 8b5c4653ef..fd4ba9afe8 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -27,6 +27,8 @@ build_webui("build") {
+     "extension.ts",
+     "extensions_bar.ts",
+     "icons.html.ts",
++    "meridian/archive.html.ts",
++    "meridian/archive.ts",
+     "meridian/command_bar.html.ts",
+     "meridian/command_bar.ts",
+     "meridian/fav.html.ts",
+@@ -65,6 +67,7 @@ build_webui("build") {
+     "content_region.css",
+     "extension.css",
+     "extensions_bar.css",
++    "meridian/archive.css",
+     "meridian/command_bar.css",
+     "meridian/rows.css",
+     "meridian/sidebar.css",
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 63e3ced049..eed6fd2cf5 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -60,7 +60,9 @@ export function getHtml(this: WebuiBrowserAppElement) {
+         @meridian-space-changed="${this.onMeridianSpaceChanged_}"
+         @meridian-show-command-bar="${this.onMeridianShowCommandBar_}"
+         @meridian-toggle-sidebar="${this.onMeridianToggleSidebar_}"
+-        @meridian-splits-changed="${this.onMeridianSplitsChanged_}">
++        @meridian-splits-changed="${this.onMeridianSplitsChanged_}"
++        @meridian-show-archive="${this.onMeridianShowArchive_}"
++        @meridian-peeks-changed="${this.onMeridianPeeksChanged_}">
+       <cr-icon-button slot="bottom-start" id="appMenuButton"
+           iron-icon="cr:more-vert" title="$i18n{appMenuTooltip}"
+           @click="${this.onAppMenuClick_}">
+@@ -77,11 +79,13 @@ export function getHtml(this: WebuiBrowserAppElement) {
+     </webui-browser-bookmark-bar>
+   </div>
+   <meridian-command-bar id="commandBar"></meridian-command-bar>
++  <meridian-archive id="archive"></meridian-archive>
+   <div id="main">
+     <content-region id="contentRegion"
+         ?showing-side-panel="${this.showingSidePanel_}"
+         @split-ratio-changed="${this.onSplitRatioChanged_}"
+-        @split-pane-focused="${this.onSplitPaneFocused_}">
++        @split-pane-focused="${this.onSplitPaneFocused_}"
++        @peek-action="${this.onPeekAction_}">
+     </content-region>
+     <side-panel id="sidePanel" @side-panel-closed="${this.onSidePanelClosed_}">
+     </side-panel>
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index a294ca5d7f..847c5afe00 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -10,6 +10,7 @@ import './side_panel.js';
+ import '/strings.m.js';
+ import './meridian/sidebar.js';
+ import './webview.js';
++import './meridian/archive.js';
+ import './meridian/command_bar.js';
+ import 'chrome://resources/cr_elements/cr_button/cr_button.js';
+ import 'chrome://resources/cr_elements/cr_icon_button/cr_icon_button.js';
+@@ -29,6 +30,7 @@ import {browserProxyFactory, FullscreenContext, SecurityIcon} from './browser.mo
+ import type {ContentRegionElement} from './content_region.js';
+ import type {SidePanelElement} from './side_panel.js';
+ import type {TabAdded, TabClosed, TabUpdated} from './tab_strip/events.js';
++import type {MeridianArchiveElement} from './meridian/archive.js';
+ import type {MeridianCommandBarElement} from './meridian/command_bar.js';
+ import type {MeridianSidebarElement} from './meridian/sidebar.js';
+ import type {Split} from './sidebar.mojom-webui.js';
+@@ -61,6 +63,7 @@ function hostForPill(url: string): string {
+ 
+ export interface WebuiBrowserAppElement {
+   $: {
++    archive: MeridianArchiveElement,
+     commandBar: MeridianCommandBarElement,
+     urlPill: HTMLElement,
+     appMenuButton: HTMLElement,
+@@ -427,12 +430,37 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.updateSplit_();
+   }
+ 
++  private peeks_: Array<{tab: string, opener: string}> = [];
++
++  protected onMeridianPeeksChanged_(
++      e: CustomEvent<Array<{tab: string, opener: string}>>) {
++    this.peeks_ = e.detail;
++    this.updateSplit_();
++  }
++
++  protected onPeekAction_(
++      e: CustomEvent<{action: string, tab: string, under: string}>) {
++    const {action, tab, under} = e.detail;
++    if (action === 'close') {
++      this.$.tabstrip.closeTab(tab);
++      this.$.tabstrip.activateTab(under);
++    } else if (action === 'expand') {
++      this.$.tabstrip.expandPeek(tab);
++    } else if (action === 'split') {
++      this.$.tabstrip.expandPeek(tab);
++      this.$.tabstrip.splitActiveWith(under);
++    }
++  }
++
+   private updateSplit_() {
+     const split = this.splits_.find(
+         s => s.start === this.activeTabId_ || s.end === this.activeTabId_);
+     this.$.contentRegion.setSplit(
+         split ? {id: split.id, start: split.start, end: split.end,
+                  ratio: split.ratio} : null);
++    const peek = this.peeks_.find(p => p.tab === this.activeTabId_);
++    this.$.contentRegion.setPeek(
++        peek ? {tab: peek.tab, under: peek.opener, url: this.url_} : null);
+   }
+ 
+   protected onSplitRatioChanged_(e: CustomEvent<{id: string, ratio: number}>) {
+@@ -443,6 +471,10 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.$.tabstrip.activateTab(e.detail);
+   }
+ 
++  protected onMeridianShowArchive_() {
++    this.$.archive.show();
++  }
++
+   protected onMeridianShowCommandBar_() {
+     this.$.commandBar.show(/*newTab=*/ true, '');
+   }
+diff --git a/chrome/browser/resources/webui_browser/content_region.css b/chrome/browser/resources/webui_browser/content_region.css
+index 77ac3783ec..590f7130a4 100644
+--- a/chrome/browser/resources/webui_browser/content_region.css
++++ b/chrome/browser/resources/webui_browser/content_region.css
+@@ -109,3 +109,74 @@ cr-tab-webview.active {
+ :host([resizing]) cr-tab-webview {
+   pointer-events: none;
+ }
++
++/* Meridian Peek: the opener stays behind, the peeked page is a card on top
++ * (Electron: #peek .peek-card). */
++:host([peek]) cr-tab-webview.peek-under {
++  visibility: visible;
++  position: absolute;
++  inset: 0;
++  height: auto;
++}
++
++:host([peek]) cr-tab-webview.peek-card {
++  visibility: visible;
++  position: absolute;
++  top: 48px;
++  bottom: 24px;
++  left: 6%;
++  right: 6%;
++  height: auto;
++  width: auto;
++  z-index: 3;
++  border-radius: 12px;
++  overflow: hidden;
++  background: var(--meridian-surface, #fff);
++  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35), 0 0 0 0.5px rgba(0, 0, 0, 0.12);
++}
++
++#peekLayer {
++  position: absolute;
++  inset: 0;
++  z-index: 2;
++}
++
++#peekBackdrop {
++  position: absolute;
++  inset: 0;
++  background: rgba(20, 20, 30, 0.28);
++}
++
++#peekBar {
++  position: absolute;
++  top: 10px;
++  left: 6%;
++  right: 6%;
++  height: 30px;
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  z-index: 4;
++  color: #fff;
++  font: 13px -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
++}
++
++#peekBar .host {
++  flex: 1;
++  font-weight: 600;
++  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
++}
++
++#peekBar button {
++  height: 26px;
++  padding: 0 10px;
++  border: 0;
++  border-radius: 7px;
++  background: rgba(255, 255, 255, 0.85);
++  color: #1d1d22;
++  font: inherit;
++}
++
++#peekBar button:hover {
++  background: #fff;
++}
+diff --git a/chrome/browser/resources/webui_browser/content_region.ts b/chrome/browser/resources/webui_browser/content_region.ts
+index 0e4958f098..d12921a5cf 100644
+--- a/chrome/browser/resources/webui_browser/content_region.ts
++++ b/chrome/browser/resources/webui_browser/content_region.ts
+@@ -117,6 +117,60 @@ export class ContentRegionElement extends CrLitElement {
+     this.handle_.addEventListener('pointerup', up);
+   };
+ 
++  // Meridian Peek: `peek` as a card over `under` (its opener), with a bar to
++  // expand it into a tab, put it in split view or close it. null: no Peek.
++  private peekLayer_: HTMLElement|null = null;
++  private peekHost_: HTMLElement|null = null;
++  private peek_: {tab: string, under: string}|null = null;
++
++  setPeek(peek: {tab: string, under: string, url: string}|null) {
++    for (const webview of this.webviews.values()) {
++      webview.classList.remove('peek-card', 'peek-under');
++    }
++    this.peek_ = peek;
++    this.toggleAttribute('peek', !!peek);
++    if (!peek || !this.webviews.has(peek.tab) || !this.webviews.has(peek.under)) {
++      this.peekLayer_?.remove();
++      return;
++    }
++    this.webviews.get(peek.tab)!.classList.add('peek-card');
++    this.webviews.get(peek.under)!.classList.add('peek-under');
++    if (!this.peekLayer_) {
++      this.peekLayer_ = document.createElement('div');
++      this.peekLayer_.id = 'peekLayer';
++      const backdrop = document.createElement('div');
++      backdrop.id = 'peekBackdrop';
++      backdrop.addEventListener('mousedown', () => this.firePeek_('close'));
++      const bar = document.createElement('div');
++      bar.id = 'peekBar';
++      this.peekHost_ = document.createElement('span');
++      this.peekHost_.className = 'host';
++      bar.appendChild(this.peekHost_);
++      for (const [action, label] of [['split', 'Split'], ['expand', 'Open as Tab'],
++                                     ['close', 'Close']]) {
++        const button = document.createElement('button');
++        button.dataset['action'] = action;
++        button.textContent = label!;
++        button.addEventListener('click', () => this.firePeek_(action!));
++        bar.appendChild(button);
++      }
++      this.peekLayer_.append(backdrop, bar);
++    }
++    try {
++      this.peekHost_!.textContent = new URL(peek.url).hostname;
++    } catch {
++      this.peekHost_!.textContent = peek.url;
++    }
++    this.shadowRoot.appendChild(this.peekLayer_);
++  }
++
++  private firePeek_(action: string) {
++    if (this.peek_) {
++      this.fire('peek-action', {action, tab: this.peek_.tab,
++                                under: this.peek_.under});
++    }
++  }
++
+   // A click into the other half of a split makes its tab the active one.
+   private onWebviewFocusIn_ = (e: Event) => {
+     const webview = e.currentTarget as TabWebviewElement;
+diff --git a/chrome/browser/resources/webui_browser/meridian/archive.css b/chrome/browser/resources/webui_browser/meridian/archive.css
+new file mode 100644
+index 0000000000..5b888773c7
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/archive.css
+@@ -0,0 +1,141 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #scheme=relative
++ * #css_wrapper_metadata_end */
++
++:host {
++  position: fixed;
++  inset: 0;
++  z-index: 50;
++  display: none;
++  color: var(--meridian-text);
++}
++
++:host([open]) {
++  display: block;
++}
++
++#overlay {
++  position: absolute;
++  inset: 0;
++  display: flex;
++  justify-content: center;
++  align-items: flex-start;
++  padding-top: 10vh;
++  background: var(--meridian-overlay);
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
++}
++
++#panel {
++  width: min(720px, 90vw);
++  max-height: 72vh;
++  display: flex;
++  flex-direction: column;
++  border-radius: 14px;
++  background: var(--meridian-surface);
++  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35), 0 0 0 0.5px var(--meridian-border);
++  overflow: hidden;
++}
++
++#head {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  height: 52px;
++  padding: 0 16px;
++  border-bottom: 1px solid var(--meridian-border);
++}
++
++#head .ic {
++  display: inline-flex;
++  color: var(--meridian-text-muted);
++}
++
++#search {
++  flex: 1;
++  border: 0;
++  outline: 0;
++  background: transparent;
++  color: inherit;
++  font: 16px -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
++}
++
++#list {
++  overflow-y: auto;
++  padding: 6px 8px 10px;
++}
++
++.day {
++  margin: 10px 8px 4px;
++  font-size: 11px;
++  font-weight: 600;
++  text-transform: uppercase;
++  letter-spacing: 0.04em;
++  color: var(--meridian-text-muted);
++}
++
++.entry {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  height: 34px;
++  padding: 0 6px 0 10px;
++  border-radius: 8px;
++}
++
++.entry:hover {
++  background: color-mix(in srgb, var(--meridian-space) 16%, transparent);
++}
++
++.entry img {
++  flex: none;
++  border-radius: 3px;
++}
++
++.title {
++  flex: 1;
++  min-width: 0;
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++}
++
++.host,
++.time {
++  flex: none;
++  font-size: 12px;
++  color: var(--meridian-text-muted);
++}
++
++.forget {
++  width: 22px;
++  height: 22px;
++  border: 0;
++  border-radius: 6px;
++  background: none;
++  color: var(--meridian-text-muted);
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  opacity: 0;
++}
++
++.entry:hover .forget {
++  opacity: 1;
++}
++
++.forget:hover {
++  background: var(--meridian-row-hover);
++  color: var(--meridian-text);
++}
++
++.empty {
++  padding: 28px 16px;
++  text-align: center;
++  color: var(--meridian-text-muted);
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/archive.html.ts b/chrome/browser/resources/webui_browser/meridian/archive.html.ts
+new file mode 100644
+index 0000000000..67c98df694
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/archive.html.ts
+@@ -0,0 +1,43 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {MeridianArchiveElement} from './archive.js';
++import {icon} from './icons.js';
++
++export function getHtml(this: MeridianArchiveElement) {
++  return html`<!--_html_template_start_-->
++<div id="overlay" @mousedown="${this.onOverlayMousedown_}"
++    @keydown="${this.onOverlayKeydown_}">
++  <div id="panel">
++    <div id="head">
++      <span class="ic">${icon('archive', 18)}</span>
++      <input id="search" placeholder="Search the archive" spellcheck="false"
++          @input="${this.onSearchInput_}">
++    </div>
++    <div id="list">
++      ${this.empty_ ? html`
++        <div class="empty">Tabs you close, and Today tabs you leave alone for
++          12 hours, land here.</div>` : ''}
++      ${this.groups_.map(group => html`
++        <div class="day">${group.label}</div>
++        ${group.tabs.map(tab => html`
++          <div class="entry" data-id="${tab.id}" title="${tab.url}"
++              @click="${this.onRowClick_}">
++            <img src="${this.favicon_(tab.url)}" width="16" height="16" alt="">
++            <span class="title">${tab.title || tab.url}</span>
++            <span class="host">${this.host_(tab.url)}</span>
++            <span class="time">${this.time_(tab.archivedAt)}</span>
++            <button class="forget" title="Remove from the archive"
++                data-id="${tab.id}" @click="${this.onDeleteClick_}">
++              ${icon('x', 14)}
++            </button>
++          </div>`)}
++      `)}
++    </div>
++  </div>
++</div>
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/archive.ts b/chrome/browser/resources/webui_browser/meridian/archive.ts
+new file mode 100644
+index 0000000000..ec4645684f
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/archive.ts
+@@ -0,0 +1,170 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The archive (⌥⌘A): closed and auto-archived Today tabs, newest first,
++// grouped by day; search, reopen, forget.
++
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {browserProxyFactory} from '../sidebar.mojom-webui.js';
++import type {ArchivedTab, SidebarHandlerInterface} from '../sidebar.mojom-webui.js';
++
++import {getCss} from './archive.css.js';
++import {getHtml} from './archive.html.js';
++
++export interface ArchiveGroup {
++  label: string;
++  tabs: ArchivedTab[];
++}
++
++export interface MeridianArchiveElement {
++  $: {
++    search: HTMLInputElement,
++  };
++}
++
++export class MeridianArchiveElement extends CrLitElement {
++  static get is() {
++    return 'meridian-archive';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      open: {type: Boolean, reflect: true},
++      groups_: {state: true, type: Array},
++      empty_: {state: true, type: Boolean},
++    };
++  }
++
++  accessor open: boolean = false;
++  protected accessor groups_: ArchiveGroup[] = [];
++  protected accessor empty_: boolean = false;
++
++  private readonly handler_: SidebarHandlerInterface =
++      browserProxyFactory.getInstance().handler;
++  private listenerId_: number|null = null;
++
++  override connectedCallback() {
++    super.connectedCallback();
++    this.listenerId_ =
++        browserProxyFactory.getInstance().callbackRouter.onArchiveChanged
++            .addListener(() => this.open && this.refresh_());
++  }
++
++  override disconnectedCallback() {
++    super.disconnectedCallback();
++    if (this.listenerId_ !== null) {
++      browserProxyFactory.getInstance().callbackRouter.removeListener(
++          this.listenerId_);
++      this.listenerId_ = null;
++    }
++  }
++
++  async show() {
++    this.open = true;
++    await this.updateComplete;
++    this.$.search.value = '';
++    this.$.search.focus();
++    await this.refresh_();
++  }
++
++  hide() {
++    this.open = false;
++  }
++
++  private async refresh_() {
++    const {tabs} = await this.handler_.searchArchive(this.$.search.value);
++    this.empty_ = tabs.length === 0;
++    this.groups_ = groupByDay(tabs);
++  }
++
++  protected onSearchInput_() {
++    this.refresh_();
++  }
++
++  protected onOverlayMousedown_(e: MouseEvent) {
++    if (e.target === e.currentTarget) {
++      this.hide();
++    }
++  }
++
++  protected onOverlayKeydown_(e: KeyboardEvent) {
++    if (e.key === 'Escape') {
++      e.preventDefault();
++      this.hide();
++    }
++  }
++
++  protected onRowClick_(e: Event) {
++    const id = (e.currentTarget as HTMLElement).dataset['id']!;
++    this.handler_.restoreArchived(id);
++    this.hide();
++  }
++
++  protected onDeleteClick_(e: Event) {
++    e.stopPropagation();
++    const id = (e.currentTarget as HTMLElement).dataset['id']!;
++    this.handler_.deleteArchived(id);
++  }
++
++  protected favicon_(url: string): string {
++    return `chrome://favicon2/?size=16&scaleFactor=2x&allowGoogleServerFallback=0&pageUrl=${
++        encodeURIComponent(url)}`;
++  }
++
++  protected host_(url: string): string {
++    try {
++      return new URL(url).hostname.replace(/^www\./, '');
++    } catch {
++      return url;
++    }
++  }
++
++  protected time_(ms: number): string {
++    return new Date(ms).toLocaleTimeString(
++        undefined, {hour: '2-digit', minute: '2-digit'});
++  }
++}
++
++function groupByDay(tabs: ArchivedTab[]): ArchiveGroup[] {
++  const groups: ArchiveGroup[] = [];
++  const today = new Date();
++  today.setHours(0, 0, 0, 0);
++  const day = 24 * 60 * 60 * 1000;
++  for (const tab of tabs) {
++    const d = new Date(tab.archivedAt);
++    d.setHours(0, 0, 0, 0);
++    const diff = Math.round((today.getTime() - d.getTime()) / day);
++    const label = diff === 0 ? 'Today' :
++        diff === 1          ? 'Yesterday' :
++                              d.toLocaleDateString(undefined, {
++                                weekday: 'long',
++                                month: 'long',
++                                day: 'numeric',
++                              });
++    const last = groups[groups.length - 1];
++    if (last && last.label === label) {
++      last.tabs.push(tab);
++    } else {
++      groups.push({label, tabs: [tab]});
++    }
++  }
++  return groups;
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-archive': MeridianArchiveElement;
++  }
++}
++
++customElements.define(MeridianArchiveElement.is, MeridianArchiveElement);
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.css b/chrome/browser/resources/webui_browser/meridian/sidebar.css
+index 20c2612b23..11bd6c7147 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.css
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.css
+@@ -87,6 +87,27 @@ button {
+   flex: 1;
+   height: 1px;
+   background: var(--meridian-border);
++  order: 1;
++}
++
++.divider .clear-today {
++  order: 2;
++  font-size: 11px;
++  font-weight: 500;
++  text-transform: none;
++  letter-spacing: 0;
++  padding: 2px 6px;
++  border-radius: 5px;
++  opacity: 0;
++}
++
++.divider:hover .clear-today {
++  opacity: 1;
++}
++
++.divider .clear-today:hover {
++  background: var(--meridian-row-hover);
++  color: var(--meridian-text);
+ }
+ 
+ .row.new-tab {
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+index 059bf5d7a4..1590da5218 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+@@ -33,7 +33,11 @@ export function getHtml(this: MeridianSidebarElement) {
+             .host="${this}" .rev="${this.rev_}" .renaming="${this.renaming_}">
+         </meridian-item>`)}
+     </div>
+-    <div class="divider"><span>Today</span></div>
++    <div class="divider">
++      <span>Today</span>
++      <button class="clear-today" title="Archive Today's tabs (⇧⌘K)"
++          @click="${this.onClearTodayClick_}">Clear</button>
++    </div>
+     <button id="newTabButton" class="row new-tab"
+         @click="${this.onNewTabClick_}">
+       <span class="ic">${icon('plus', 16)}</span>
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 328ac42def..28a1de0f40 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -243,6 +243,9 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.state_ = state;
+     this.rev_++;
+     this.fire('meridian-splits-changed', state.splits);
++    this.fire('meridian-peeks-changed',
++              state.tabs.filter(t => t.peek && t.openerId)
++                  .map(t => ({tab: t.tabId, opener: t.openerId!})));
+     const space = this.activeSpace();
+     if (space) {
+       this.fire('meridian-space-changed',
+@@ -282,7 +285,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+     const known = new Set<NodeId>();
+     for (const info of this.state_.tabs) {
+       known.add(info.tabId);
+-      if (info.spaceId === space.id && !info.itemId) {
++      if (info.spaceId === space.id && !info.itemId && !info.peek) {
+         const tab = this.tabs_.get(info.tabId);
+         if (tab) {
+           result.push(tab);
+@@ -639,6 +642,12 @@ export class MeridianSidebarElement extends CrLitElement implements
+       case Command.kUnsplit:
+         this.handler_.unsplit();
+         break;
++      case Command.kShowArchive:
++        this.fire('meridian-show-archive');
++        break;
++      case Command.kClearToday:
++        this.handler_.clearToday();
++        break;
+       case Command.kNewFolder:
+         if (space) {
+           this.addFolder_(space.id, '');
+@@ -678,11 +687,27 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.handler_.resetItemToHome(item.id);
+   }
+ 
++  protected onClearTodayClick_() {
++    this.handler_.clearToday();
++  }
++
+   // Like Arc: New Tab opens the command bar; the tab opens on a pick.
+   protected onNewTabClick_() {
+     this.fire('meridian-show-command-bar');
+   }
+ 
++  expandPeek(tabId: NodeId) {
++    this.handler_.expandPeek(tabId);
++  }
++
++  splitActiveWith(tabId: NodeId) {
++    this.handler_.splitWith(tabId);
++  }
++
++  closeTab(tabId: NodeId) {
++    this.tabStripService_.closeNodes([tabId]);
++  }
++
+   setSplitRatio(splitId: string, ratio: number) {
+     this.handler_.setSplitRatio(splitId, ratio);
+   }
+diff --git a/chrome/browser/ui/browser_command_controller.cc b/chrome/browser/ui/browser_command_controller.cc
+index e5c9a04db0..365465d3a8 100644
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -2068,7 +2068,8 @@ void BrowserCommandController::InitCommandState() {
+        {IDC_MERIDIAN_TOGGLE_SIDEBAR, IDC_MERIDIAN_TOGGLE_PIN,
+         IDC_MERIDIAN_NEXT_SPACE, IDC_MERIDIAN_PREVIOUS_SPACE,
+         IDC_MERIDIAN_NEW_FOLDER, IDC_MERIDIAN_NEXT_TAB,
+-        IDC_MERIDIAN_PREVIOUS_TAB, IDC_MERIDIAN_SPLIT, IDC_MERIDIAN_UNSPLIT}) {
++        IDC_MERIDIAN_PREVIOUS_TAB, IDC_MERIDIAN_SPLIT, IDC_MERIDIAN_UNSPLIT,
++        IDC_MERIDIAN_ARCHIVE, IDC_MERIDIAN_CLEAR_TODAY}) {
+     command_updater_->UpdateCommandEnabled(meridian_command, supports_tabs);
+   }
+   for (int i = IDC_MERIDIAN_SPACE_1; i <= IDC_MERIDIAN_SPACE_9; ++i) {
+diff --git a/chrome/browser/ui/cocoa/accelerators_cocoa.mm b/chrome/browser/ui/cocoa/accelerators_cocoa.mm
+index 45c4c60e86..2e546a3514 100644
+--- a/chrome/browser/ui/cocoa/accelerators_cocoa.mm
++++ b/chrome/browser/ui/cocoa/accelerators_cocoa.mm
+@@ -57,6 +57,9 @@ const struct AcceleratorMapping {
+     {IDC_MERIDIAN_NEW_FOLDER,
+      ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN | ui::EF_SHIFT_DOWN, ui::VKEY_N},
+     {IDC_COPY_URL, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN, ui::VKEY_C},
++    {IDC_MERIDIAN_ARCHIVE, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN, ui::VKEY_A},
++    {IDC_MERIDIAN_CLEAR_TODAY, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN,
++     ui::VKEY_K},
+     {IDC_SHOW_BOOKMARK_BAR, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN,
+      ui::VKEY_B},
+     {IDC_SHOW_BOOKMARK_MANAGER, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN,
+diff --git a/chrome/browser/ui/cocoa/main_menu_builder.mm b/chrome/browser/ui/cocoa/main_menu_builder.mm
+index e8d5e9fcd9..38feea706c 100644
+--- a/chrome/browser/ui/cocoa/main_menu_builder.mm
++++ b/chrome/browser/ui/cocoa/main_menu_builder.mm
+@@ -522,6 +522,11 @@ NSMenuItem* BuildSpacesMenu(NSApplication* nsapp,
+               .command_id(IDC_MERIDIAN_NEXT_SPACE),
+           Item(IDS_MERIDIAN_PREVIOUS_SPACE_MAC)
+               .command_id(IDC_MERIDIAN_PREVIOUS_SPACE),
++          Item().is_separator(),
++          Item(IDS_MERIDIAN_ARCHIVE_MAC)
++              .command_id(IDC_MERIDIAN_ARCHIVE),
++          Item(IDS_MERIDIAN_CLEAR_TODAY_MAC)
++              .command_id(IDC_MERIDIAN_CLEAR_TODAY),
+       })
+       .Build();
+   // clang-format on

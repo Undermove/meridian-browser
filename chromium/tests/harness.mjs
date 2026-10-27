@@ -29,12 +29,13 @@ class Cdp {
 }
 
 // `profile`: reuse a profile dir (to test what survives a restart); it's then left for the caller to delete.
-export async function launch(urls = [], { profile: keep } = {}) {
+export async function launch(urls = [], { profile: keep, args = [] } = {}) {
   const profile = keep || fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
   const port = 9400 + Math.floor(Math.random() * 500);
   const proc = spawn(APP, [
     `--user-data-dir=${profile}`, `--remote-debugging-port=${port}`, '--use-mock-keychain',
-    '--no-first-run', '--no-default-browser-check', '--window-size=1280,860', ...urls,
+    '--no-first-run', '--no-default-browser-check', '--window-size=1280,860',
+    ...args, ...urls,
   ], { stdio: 'ignore' });
   const base = `http://127.0.0.1:${port}`;
   let ui;
