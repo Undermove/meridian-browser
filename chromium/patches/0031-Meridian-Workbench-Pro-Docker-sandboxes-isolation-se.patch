@@ -1,0 +1,1640 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 28 Oct 2026 03:19:42 +0400
+Subject: [PATCH 32/32] Meridian Workbench Pro: Docker sandboxes (isolation,
+ secrets file, review), Mission Control from inside containers
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   4 +
+ .../browser/meridian/mission/event_channel.cc | 107 +++-
+ .../browser/meridian/mission/event_channel.h  |   8 +
+ .../meridian/mission/mission_control.cc       |  78 ++-
+ .../meridian/mission/mission_control.h        |  20 +-
+ chrome/browser/meridian/workbench/sandbox.cc  | 553 ++++++++++++++++++
+ chrome/browser/meridian/workbench/sandbox.h   |  98 ++++
+ .../meridian/workbench/sandbox_unittest.cc    |  99 ++++
+ .../meridian/workbench/workbench_handler.cc   | 389 +++++++++++-
+ .../meridian/workbench/workbench_handler.h    |  16 +
+ 10 files changed, 1362 insertions(+), 10 deletions(-)
+ create mode 100644 chrome/browser/meridian/workbench/sandbox.cc
+ create mode 100644 chrome/browser/meridian/workbench/sandbox.h
+ create mode 100644 chrome/browser/meridian/workbench/sandbox_unittest.cc
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index b2a4959926..5d8175d854 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -74,6 +74,8 @@ source_set("workbench_core") {
+     "workbench/project_fs.cc",
+     "workbench/project_fs.h",
+     "workbench/project_fs_mac.mm",
++    "workbench/sandbox.cc",
++    "workbench/sandbox.h",
+     "workbench/secret_files.cc",
+     "workbench/secret_files.h",
+     "workbench/terminal.cc",
+@@ -83,6 +85,7 @@ source_set("workbench_core") {
+   deps = [
+     ":ai_providers",
+     "//base:i18n",
++    "//crypto",
+     "//third_party/icu",
+     "//third_party/re2",
+   ]
+@@ -284,6 +287,7 @@ test("meridian_unittests") {
+     "workbench/agents_unittest.cc",
+     "workbench/guard_hook_unittest.cc",
+     "workbench/project_fs_unittest.cc",
++    "workbench/sandbox_unittest.cc",
+     "workbench/secret_files_unittest.cc",
+     "workbench/terminal_unittest.cc",
+   ]
+diff --git a/chrome/browser/meridian/mission/event_channel.cc b/chrome/browser/meridian/mission/event_channel.cc
+index 693f65570b..f410940f2b 100644
+--- a/chrome/browser/meridian/mission/event_channel.cc
++++ b/chrome/browser/meridian/mission/event_channel.cc
+@@ -7,6 +7,7 @@
+ #include <fcntl.h>
+ #include <poll.h>
+ #include <sys/socket.h>
++#include <sys/stat.h>
+ #include <sys/un.h>
+ #include <unistd.h>
+ 
+@@ -150,6 +151,7 @@ class EventChannel::Server : public base::RefCountedThreadSafe<Server> {
+         }
+       }
+       std::erase_if(clients, [](const Client& c) { return !c.fd.is_valid(); });
++      ReadTails();
+     }
+     listener.reset();
+     base::DeletePathRecursively(dir_);
+@@ -163,6 +165,15 @@ class EventChannel::Server : public base::RefCountedThreadSafe<Server> {
+     }
+   }
+ 
++  void AddTail(const std::string& token, const base::FilePath& dir) {
++    base::AutoLock hold(lock_);
++    TailState t;
++    t.dir = dir;
++    struct stat st;
++    t.dev = lstat(dir.value().c_str(), &st) == 0 ? st.st_dev : 0;
++    tails_[token] = t;
++  }
++
+   std::string Register(const std::string& session) {
+     std::string token = base::HexEncodeLower(base::RandBytesAsVector(32));
+     base::AutoLock hold(lock_);
+@@ -171,8 +182,21 @@ class EventChannel::Server : public base::RefCountedThreadSafe<Server> {
+   }
+ 
+   void Unregister(const std::string& token) {
+-    base::AutoLock hold(lock_);
+-    sessions_.erase(token);
++    base::FilePath dir;
++    {
++      base::AutoLock hold(lock_);
++      sessions_.erase(token);
++      auto it = tails_.find(token);
++      if (it != tails_.end()) {
++        dir = it->second.dir;
++        tails_.erase(it);
++      }
++    }
++    if (!dir.empty()) {
++      base::ThreadPool::PostTask(
++          FROM_HERE, {base::MayBlock()},
++          base::BindOnce(base::IgnoreResult(&base::DeletePathRecursively), dir));
++    }
+   }
+ 
+  private:
+@@ -188,6 +212,67 @@ class EventChannel::Server : public base::RefCountedThreadSafe<Server> {
+     double bucket;
+     base::TimeTicks at;
+   };
++  struct TailState {
++    base::FilePath dir;
++    dev_t dev = 0;
++    ino_t ino = 0;
++    off_t offset = 0;
++    size_t total = 0;
++    std::string partial;
++  };
++
++  // New lines from each sandbox's events file (bounded per round and in
++  // total; a replaced or truncated file starts over).
++  void ReadTails() {
++    std::map<std::string, TailState> tails;
++    {
++      base::AutoLock hold(lock_);
++      tails = tails_;
++    }
++    for (auto& [token, t] : tails) {
++      base::FilePath file = t.dir.Append("events.jsonl");
++      base::ScopedFD fd(HANDLE_EINTR(
++          open(file.value().c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK)));
++      if (!fd.is_valid()) {
++        continue;
++      }
++      struct stat st;
++      if (fstat(fd.get(), &st) != 0 || !S_ISREG(st.st_mode) ||
++          st.st_nlink != 1 || st.st_dev != t.dev) {
++        continue;
++      }
++      if (st.st_ino != t.ino || st.st_size < t.offset) {
++        t.ino = st.st_ino;
++        t.offset = 0;
++        t.partial.clear();
++      }
++      if (st.st_size <= t.offset || t.total >= 4u * 1024 * 1024) {
++        continue;
++      }
++      std::array<char, 65536> chunk;
++      ssize_t n = HANDLE_EINTR(pread(fd.get(), chunk.data(), chunk.size(), t.offset));
++      if (n <= 0) {
++        continue;
++      }
++      t.offset += n;
++      t.total += static_cast<size_t>(n);
++      t.partial.append(base::as_string_view(
++          base::span(chunk).first(static_cast<size_t>(n))));
++      size_t nl;
++      while ((nl = t.partial.find('\n')) != std::string::npos) {
++        Accept(t.partial.substr(0, nl));
++        t.partial.erase(0, nl + 1);
++      }
++      if (t.partial.size() > kMaxLine) {
++        t.partial.clear();
++      }
++      base::AutoLock hold(lock_);
++      auto it = tails_.find(token);
++      if (it != tails_.end()) {
++        it->second = t;
++      }
++    }
++  }
+ 
+   void Accept(const std::string& line) {
+     if (line.empty() || line.size() > kMaxLine) {
+@@ -236,6 +321,7 @@ class EventChannel::Server : public base::RefCountedThreadSafe<Server> {
+   int wake_write_ = -1;
+   base::Lock lock_;
+   std::map<std::string, Session> sessions_;
++  std::map<std::string, TailState> tails_;
+ };
+ 
+ EventChannel::EventChannel(EventCallback on_event)
+@@ -275,6 +361,23 @@ void EventChannel::Start(base::OnceCallback<void(base::FilePath)> done) {
+       base::BindOnce(&Server::Run, server_, std::move(started)));
+ }
+ 
++// static
++base::FilePath EventChannel::MakeTailDir() {
++  base::FilePath dir;
++  if (!base::CreateNewTempDirectory("meridian-mission-", &dir)) {
++    return base::FilePath();
++  }
++  dir = base::MakeAbsoluteFilePath(dir);
++  base::SetPosixFilePermissions(dir, 0700);
++  base::ScopedFD fd(HANDLE_EINTR(open(dir.Append("events.jsonl").value().c_str(),
++                                      O_WRONLY | O_CREAT | O_EXCL, 0600)));
++  return fd.is_valid() ? dir : base::FilePath();
++}
++
++void EventChannel::Tail(const std::string& token, const base::FilePath& dir) {
++  server_->AddTail(token, dir);
++}
++
+ std::string EventChannel::Register(const std::string& session) {
+   return server_->Register(session);
+ }
+diff --git a/chrome/browser/meridian/mission/event_channel.h b/chrome/browser/meridian/mission/event_channel.h
+index e845e56c11..54e84cc58b 100644
+--- a/chrome/browser/meridian/mission/event_channel.h
++++ b/chrome/browser/meridian/mission/event_channel.h
+@@ -46,6 +46,14 @@ class EventChannel {
+ 
+   // A new session; returns its token.
+   std::string Register(const std::string& session);
++  // Docker sandboxes can't reach the socket: they append lines to
++  // <dir>/events.jsonl in a fresh private dir that is mounted into the
++  // container. Everything in that dir is hostile (the file may be swapped
++  // for a symlink, a FIFO, a hard link…): it is only read through a
++  // descriptor opened without following links, and only while it is a
++  // regular file with one link on the dir's device. Blocking.
++  static base::FilePath MakeTailDir();
++  void Tail(const std::string& token, const base::FilePath& dir);
+   void Unregister(const std::string& token);
+ 
+  private:
+diff --git a/chrome/browser/meridian/mission/mission_control.cc b/chrome/browser/meridian/mission/mission_control.cc
+index 247beb443c..4afc730696 100644
+--- a/chrome/browser/meridian/mission/mission_control.cc
++++ b/chrome/browser/meridian/mission/mission_control.cc
+@@ -21,7 +21,9 @@
+ #include "chrome/browser/meridian/mission/mission_platform.h"
+ #include "chrome/browser/meridian/mission/secrets.h"
+ #include "chrome/browser/meridian/prefs.h"
++#include "chrome/browser/meridian/workbench/sandbox.h"
+ #include "chrome/browser/meridian/workbench/vault.h"
++#include "chrome/browser/meridian/workbench/workbench_source.h"
+ #include "chrome/browser/meridian/workbench/workbench_service.h"
+ #include "chrome/browser/meridian/workbench/workbench_service_factory.h"
+ #include "chrome/browser/notifications/notification_display_service.h"
+@@ -194,17 +196,85 @@ std::optional<std::pair<int, std::string>> MissionControl::TerminalOf(
+                         node->term_id);
+ }
+ 
+-MissionControl::Registration MissionControl::RegisterTerminal(
++void MissionControl::FollowSandbox(const workbench::SandboxMount& mount) {
++  channel_->Tail(mount.token, mount.dir);
++}
++
++void MissionControl::Discard(const std::string& token,
++                             const std::string& node_id) {
++  if (!token.empty()) {
++    channel_->Unregister(token);
++    terminals_.erase(token);
++  }
++  std::erase_if(token_hashes_,
++                [&](const auto& kv) { return kv.second == node_id; });
++  if (nodes_.erase(node_id)) {
++    Changed();
++  }
++}
++
++// static
++std::optional<workbench::SandboxMount> MissionControl::MakeSandboxMount(
++    const std::string& token,
+     const std::string& kind,
++    base::DictValue settings) {
++  if (token.empty()) {
++    return std::nullopt;
++  }
++  std::string script;
++  if (!base::ReadFileToString(workbench::WorkbenchSource::Folder().Append(
++                                  "hooks/mission-hook.js"),
++                              &script)) {
++    return std::nullopt;
++  }
++  base::FilePath dir = EventChannel::MakeTailDir();
++  if (dir.empty()) {
++    return std::nullopt;
++  }
++  base::WriteFile(dir.Append("mission-hook.js"), script);
++  base::SetPosixFilePermissions(dir.Append("mission-hook.js"), 0600);
++  workbench::SandboxMount mount;
++  mount.dir = dir;
++  mount.target = "/meridian";
++  mount.env["MERIDIAN_MISSION_FILE"] = "/meridian/events.jsonl";
++  mount.token = token;
++  if (kind == "sandbox-claude") {
++    // Inside the container the hook is the script, run by node.
++    for (auto [event, list] : *settings.FindDict("hooks")) {
++      for (base::Value& entry : list.GetList()) {
++        for (base::Value& hook : *entry.GetDict().FindList("hooks")) {
++          hook.GetDict().Set("command", "node /meridian/mission-hook.js");
++        }
++      }
++    }
++    base::WriteFile(dir.Append("settings.json"),
++                    base::WriteJson(settings).value_or("{}"));
++    base::SetPosixFilePermissions(dir.Append("settings.json"), 0600);
++    mount.args = {"--settings", "/meridian/settings.json"};
++  } else if (kind == "sandbox-codex") {
++    mount.args = {"-c",
++                  "notify=[\"node\", \"/meridian/mission-hook.js\", "
++                  "\"--codex\"]"};
++  }
++  return mount;
++}
++
++MissionControl::Registration MissionControl::RegisterTerminal(
++    const std::string& kind_id,
+     const std::string& project,
+-    int owner_tab) {
++    int owner_tab,
++    bool sandbox) {
++  std::string kind = kind_id;
++  if (kind.starts_with("sandbox-")) {
++    kind = kind.substr(8);
++  }
+   Registration out;
+   Node node;
+   node.owner_tab = owner_tab;
+   node.id = "term-" + RandomId(6);
+   node.kind = "session";
+   node.source = kind;
+-  node.where = "local";
++  node.where = sandbox ? "sandbox" : "local";
+   node.label = kind == "claude"  ? "Claude Code"
+                : kind == "codex" ? "Codex"
+                : kind == "gemini" ? "Gemini"
+@@ -237,7 +307,7 @@ MissionControl::Registration MissionControl::RegisterTerminal(
+                       crypto::hash::Sha256(base::as_byte_span(out.token)))
+                       .substr(0, 32)] = out.node_id;
+     out.env["MERIDIAN_MISSION_TOKEN"] = out.token;
+-    if (!channel_->socket_path().empty()) {
++    if (!sandbox && !channel_->socket_path().empty()) {
+       out.env["MERIDIAN_MISSION_SOCKET"] = channel_->socket_path().value();
+     }
+   }
+diff --git a/chrome/browser/meridian/mission/mission_control.h b/chrome/browser/meridian/mission/mission_control.h
+index a3c6cb77d0..0e4f1703a7 100644
+--- a/chrome/browser/meridian/mission/mission_control.h
++++ b/chrome/browser/meridian/mission/mission_control.h
+@@ -23,6 +23,10 @@
+ 
+ class Profile;
+ 
++namespace meridian::workbench {
++struct SandboxMount;
++}
++
+ namespace meridian::mission {
+ 
+ class EventChannel;
+@@ -72,7 +76,21 @@ class MissionControl : public KeyedService,
+   // `owner_tab`: the Workbench tab's handle id (to open its terminal).
+   Registration RegisterTerminal(const std::string& kind,
+                                 const std::string& project,
+-                                int owner_tab);
++                                int owner_tab,
++                                bool sandbox = false);
++  // A Docker sandbox session: a private dir mounted at /meridian with the
++  // hook script (run by node in the container), Claude Code's settings and
++  // the events file the browser follows. Blocking (writes files);
++  // `claude_settings` is ClaudeHookSettings().
++  static std::optional<workbench::SandboxMount> MakeSandboxMount(
++      const std::string& token,
++      const std::string& kind,
++      base::DictValue claude_settings);
++  // Starts following a sandbox session's events file.
++  void FollowSandbox(const workbench::SandboxMount& mount);
++  // A terminal that turned out not to be an agent session (the sandbox
++  // image is built first).
++  void Discard(const std::string& token, const std::string& node_id);
+   // (owner tab handle id, terminal id) of a session node, if it has one.
+   std::optional<std::pair<int, std::string>> TerminalOf(
+       const std::string& node_id);
+diff --git a/chrome/browser/meridian/workbench/sandbox.cc b/chrome/browser/meridian/workbench/sandbox.cc
+new file mode 100644
+index 0000000000..a665dd8af4
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/sandbox.cc
+@@ -0,0 +1,553 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/workbench/sandbox.h"
++
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <set>
++
++#include "base/base64.h"
++#include "base/files/file_enumerator.h"
++#include "base/files/file_util.h"
++#include "base/no_destructor.h"
++#include "base/rand_util.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/synchronization/lock.h"
++#include "chrome/browser/meridian/ai/process_runner.h"
++#include "chrome/browser/meridian/workbench/agents.h"
++#include "crypto/hash.h"
++#include "third_party/re2/src/re2/re2.h"
++
++namespace meridian::workbench {
++
++namespace {
++
++const std::vector<std::string>& ProtectDirs() {
++  static const base::NoDestructor<std::vector<std::string>> v(
++      std::vector<std::string>{".git", ".claude", ".vscode", ".idea",
++                               ".husky"});
++  return *v;
++}
++const std::vector<std::string>& ProtectFiles() {
++  static const base::NoDestructor<std::vector<std::string>> v(
++      std::vector<std::string>{".mcp.json", ".envrc"});
++  return *v;
++}
++const std::vector<std::string>& ProtectIfPresent() {
++  static const base::NoDestructor<std::vector<std::string>> v(
++      std::vector<std::string>{".devcontainer", ".gemini", ".codex", ".cursor",
++                               ".githooks", ".pre-commit-config.yaml",
++                               "lefthook.yml", ".lefthook.yml"});
++  return *v;
++}
++
++bool Contains(const std::vector<std::string>& v, const std::string& s) {
++  return std::ranges::find(v, s) != v.end();
++}
++
++std::string Placeholder(const std::string& name) {
++  if (name == ".mcp.json") {
++    return "{\"mcpServers\":{}}\n";
++  }
++  if (name == ".envrc") {
++    return "# Placeholder made by Meridian while a sandboxed agent runs in "
++           "this folder; removed when it stops.\n";
++  }
++  return std::string();
++}
++
++// Placeholders shared by running sandboxes: path -> users.
++base::Lock& PlaceholderLock() {
++  static base::NoDestructor<base::Lock> lock;
++  return *lock;
++}
++std::map<base::FilePath, int>& PlaceholderRefs() {
++  static base::NoDestructor<std::map<base::FilePath, int>> refs;
++  return *refs;
++}
++
++std::string Hex(base::span<const uint8_t> bytes) {
++  return base::HexEncodeLower(bytes);
++}
++
++bool BadMountPath(const std::string& p) {
++  return p.find_first_of(",\n\r\"") != std::string::npos ||
++         p.find('\0') != std::string::npos;
++}
++
++}  // namespace
++
++const SandboxKind* FindSandboxKind(const std::string& id) {
++  static const base::NoDestructor<std::vector<SandboxKind>> kinds(
++      std::vector<SandboxKind>{
++          {"sandbox-claude", "Claude Code (sandbox)", {"claude"},
++           {"ANTHROPIC_API_KEY"}},
++          {"sandbox-codex", "Codex (sandbox)", {"codex"}, {"OPENAI_API_KEY"}},
++          {"sandbox-shell", "Shell (sandbox)", {"bash", "-l"}, {}},
++      });
++  for (const SandboxKind& k : *kinds) {
++    if (id == k.id) {
++      return &k;
++    }
++  }
++  return nullptr;
++}
++
++std::string FindDocker(const std::string& search_path) {
++  std::string home = base::GetHomeDir().value();
++  std::vector<std::string> candidates = {
++      FindExecutable("docker", search_path),
++      home + "/.orbstack/bin/docker",
++      "/usr/local/bin/docker",
++      "/opt/homebrew/bin/docker",
++      "/Applications/OrbStack.app/Contents/MacOS/xbin/docker",
++      "/Applications/Docker.app/Contents/Resources/bin/docker",
++  };
++  for (const std::string& c : candidates) {
++    if (!c.empty() && access(c.c_str(), X_OK) == 0 &&
++        !base::DirectoryExists(base::FilePath(c))) {
++      return c;
++    }
++  }
++  return std::string();
++}
++
++std::string SandboxImageTag(const std::string& dockerfile) {
++  return "meridian-sandbox:" +
++         Hex(crypto::hash::Sha256(dockerfile)).substr(0, 12);
++}
++
++base::DictValue SandboxStatus(const std::map<std::string, std::string>& env,
++                              const std::string& dockerfile) {
++  auto found = env.find("PATH");
++  std::string docker = FindDocker(found != env.end() ? found->second : "");
++  base::DictValue st;
++  st.Set("installed", !docker.empty());
++  st.Set("running", false);
++  st.Set("docker", docker.empty() ? base::Value() : base::Value(docker));
++  st.Set("version", base::Value());
++  st.Set("image", SandboxImageTag(dockerfile));
++  st.Set("imagePresent", false);
++  st.Set("error", base::Value());
++  st.Set("available", !dockerfile.empty());
++  if (docker.empty()) {
++    return st;
++  }
++  base::FilePath home = base::GetHomeDir();
++  int code = -1;
++  std::string out = ai::CaptureOutput(
++      {docker, "info", "--format", "{{.ServerVersion}}"}, env, home.value(),
++      base::Seconds(8), &code);
++  std::string version(base::TrimWhitespaceASCII(out, base::TRIM_ALL));
++  if (code == 0 && !version.empty() && version.find('\n') == std::string::npos) {
++    st.Set("running", true);
++    st.Set("version", version.substr(0, 40));
++    int inspect = -1;
++    ai::CaptureOutput({docker, "image", "inspect", "--format", "{{.Id}}",
++                       SandboxImageTag(dockerfile)},
++                      env, home.value(), base::Seconds(8), &inspect);
++    st.Set("imagePresent", inspect == 0);
++  } else {
++    std::vector<std::string> lines = base::SplitString(
++        out, "\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++    st.Set("error", lines.empty() ? std::string("The Docker daemon is not running.")
++                                  : lines.back().substr(0, 300));
++  }
++  return st;
++}
++
++base::expected<SandboxLaunch, std::string> MakeSandboxLaunch(
++    const std::string& kind_id,
++    const base::FilePath& root,
++    const std::map<std::string, std::string>& secrets,
++    bool network,
++    const std::vector<base::FilePath>& forbidden,
++    const base::DictValue& status,
++    const std::string& dockerfile,
++    const std::optional<SandboxMount>& mission) {
++  const SandboxKind* kind = FindSandboxKind(kind_id);
++  if (!kind) {
++    return base::unexpected("unknown sandbox");
++  }
++  // Never the whole disk or home, nor anything holding Meridian's own data.
++  base::FilePath home = base::MakeAbsoluteFilePath(base::GetHomeDir());
++  if (root.value() == "/" || root == home) {
++    return base::unexpected(
++        "Meridian won’t mount your whole disk or home folder into a sandbox. "
++        "Open a project folder instead.");
++  }
++  for (const base::FilePath& f : forbidden) {
++    base::FilePath real = base::MakeAbsoluteFilePath(f);
++    if (real.empty()) {
++      real = f;
++    }
++    if (real == root || root.IsParent(real) || real.IsParent(root)) {
++      return base::unexpected(
++          "This folder holds Meridian’s own data, so it can’t be opened in a "
++          "sandbox — a sandboxed agent could plant code that runs with "
++          "Workbench powers. Use a host terminal here.");
++    }
++  }
++  if (!status.FindBool("installed").value_or(false)) {
++    return base::unexpected(
++        "Docker isn’t installed. Install OrbStack or Docker Desktop to run "
++        "agents in a sandbox.");
++  }
++  if (!status.FindBool("running").value_or(false)) {
++    const std::string* error = status.FindString("error");
++    return base::unexpected("Docker isn’t running — start OrbStack or Docker "
++                            "Desktop. (" +
++                            (error ? *error : std::string()) + ")");
++  }
++  if (dockerfile.empty()) {
++    return base::unexpected("The sandbox Dockerfile is missing from this build.");
++  }
++  if (!root.IsAbsolute() || BadMountPath(root.value())) {
++    return base::unexpected(
++        "This project path can’t be mounted into a container (it contains a "
++        "comma, a quote or a line break).");
++  }
++  std::string docker = *status.FindString("docker");
++  std::string image = *status.FindString("image");
++  SandboxLaunch out;
++  if (!status.FindBool("imagePresent").value_or(false)) {
++    base::FilePath dir;
++    if (!base::CreateNewTempDirectory("meridian-sbx-build-", &dir)) {
++      return base::unexpected("Couldn’t prepare the image build.");
++    }
++    base::SetPosixFilePermissions(dir, 0700);
++    base::WriteFile(dir.Append("Dockerfile"), dockerfile);
++    out.title = "Building sandbox image";
++    out.argv = {docker, "build", "--progress=plain", "--label",
++                "dev.meridian.sandbox=1", "-t", image, dir.value()};
++    out.cleanup = {dir};
++    out.notes = {"First run: building " + image +
++                 " (Node LTS, git, ripgrep, Claude Code and Codex CLIs). This "
++                 "takes a few minutes once; the " +
++                 kind->label + " starts when it’s done."};
++    out.then = kind_id;
++    return out;
++  }
++  // Host-run config pinned read-only; placeholders for the missing ones.
++  std::vector<std::string> mounts;
++  std::vector<std::string> pinned;
++  std::vector<base::FilePath> created;
++  std::vector<std::string> names = ProtectDirs();
++  names.insert(names.end(), ProtectFiles().begin(), ProtectFiles().end());
++  names.insert(names.end(), ProtectIfPresent().begin(), ProtectIfPresent().end());
++  {
++    base::AutoLock hold(PlaceholderLock());
++    for (const std::string& name : names) {
++      base::FilePath abs = root.Append(name);
++      struct stat st;
++      bool exists = lstat(abs.value().c_str(), &st) == 0;
++      if (exists && S_ISLNK(st.st_mode)) {
++        for (const base::FilePath& c : created) {
++          --PlaceholderRefs()[c];
++        }
++        return base::unexpected(
++            "“" + name +
++            "” in this project is a symlink. Meridian won’t start a sandbox "
++            "here: docker would mount whatever it points at. Replace the "
++            "symlink with a real file or folder (or remove it) and try "
++            "again.");
++      }
++      if (exists && !S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) {
++        return base::unexpected("“" + name +
++                                "” in this project is not a regular file or "
++                                "folder.");
++      }
++      if (!exists) {
++        if (Contains(ProtectIfPresent(), name)) {
++          continue;
++        }
++        bool made = Contains(ProtectDirs(), name)
++                        ? base::CreateDirectory(abs)
++                        : base::WriteFile(abs, Placeholder(name));
++        if (!made) {
++          return base::unexpected("Couldn’t prepare " + name + ".");
++        }
++        PlaceholderRefs()[abs] = 1;
++        created.push_back(abs);
++      } else if (PlaceholderRefs().contains(abs)) {
++        ++PlaceholderRefs()[abs];  // another running sandbox made it
++        created.push_back(abs);
++      }
++      mounts.insert(mounts.end(),
++                    {"--mount", "type=bind,source=" + abs.value() +
++                                    ",target=/workspace/" + name + ",readonly"});
++      pinned.push_back(name);
++    }
++  }
++  out.placeholders = created;
++  // The session's secrets: NAME=<base64 value> lines in a private file.
++  std::map<std::string, std::string> file_vars;
++  for (const auto& [name, value] : secrets) {
++    if (RE2::FullMatch(name, "[A-Z_][A-Z0-9_]{0,63}")) {
++      file_vars[name] = value;
++      out.secret_names.push_back(name);
++    }
++  }
++  if (mission && !mission->token.empty()) {
++    file_vars["MERIDIAN_MISSION_TOKEN"] = mission->token;
++  }
++  base::FilePath env_dir;
++  if (!base::CreateNewTempDirectory("meridian-sbx-env-", &env_dir) ||
++      BadMountPath(env_dir.value())) {
++    ReleasePlaceholders(created);
++    return base::unexpected("The temp folder path can’t be mounted into a "
++                            "container.");
++  }
++  env_dir = base::MakeAbsoluteFilePath(env_dir);
++  base::SetPosixFilePermissions(env_dir, 0700);
++  std::string body;
++  for (const auto& [name, value] : file_vars) {
++    body += name + "=" + base::Base64Encode(value) + "\n";
++  }
++  base::FilePath env_file = env_dir.Append("env");
++  if (!base::WriteFile(env_file, body) ||
++      !base::SetPosixFilePermissions(env_file, 0600)) {
++    ReleasePlaceholders(created);
++    return base::unexpected("Couldn’t write the sandbox’s secrets file.");
++  }
++  out.cleanup = {env_dir};
++  out.container = "meridian-sbx-" + Hex(base::RandBytesAsVector(5));
++  std::string volume =
++      "meridian-sbx-home-" + Hex(crypto::hash::Sha256(root.value())).substr(0, 12);
++  out.title = kind->label;
++  out.argv = {docker, "run", "--rm", "-it", "--init", "--name", out.container,
++              "--hostname", "sandbox", "--label", "dev.meridian.sandbox=1",
++              "--user", "node", "--cap-drop", "ALL", "--security-opt",
++              "no-new-privileges", "--pids-limit", "512", "--memory", "4g",
++              "--memory-swap", "4g", "--cpus", "2", "--mount",
++              "type=bind,source=" + root.value() + ",target=/workspace"};
++  out.argv.insert(out.argv.end(), mounts.begin(), mounts.end());
++  out.argv.insert(
++      out.argv.end(),
++      {"--mount",
++       "type=bind,source=" + env_file.value() +
++           ",target=/run/meridian/env,readonly",
++       "--mount", "type=volume,source=" + volume + ",target=/home/node",
++       "--workdir", "/workspace", "-e", "TERM=xterm-256color", "-e",
++       "COLORTERM=truecolor"});
++  if (!network) {
++    out.argv.insert(out.argv.end(), {"--network", "none"});
++  }
++  if (mission && mission->dir.IsAbsolute() &&
++      !BadMountPath(mission->dir.value())) {
++    out.argv.insert(out.argv.end(),
++                    {"--mount", "type=bind,source=" + mission->dir.value() +
++                                    ",target=" + mission->target});
++    for (const auto& [n, v] : mission->env) {
++      out.argv.insert(out.argv.end(), {"-e", n + "=" + v});
++    }
++    out.argv.push_back(image);
++    out.argv.insert(out.argv.end(), kind->cmd.begin(), kind->cmd.end());
++    out.argv.insert(out.argv.end(), mission->args.begin(), mission->args.end());
++  } else {
++    out.argv.push_back(image);
++    out.argv.insert(out.argv.end(), kind->cmd.begin(), kind->cmd.end());
++  }
++  out.notes.push_back(
++      std::string("Sandbox: only this project is mounted (at /workspace); ") +
++      (network ? "network ON (the agent can reach the internet, which it "
++                 "needs for its API)"
++               : "no network") +
++      "; limits 2 CPUs, 4g RAM.");
++  out.notes.push_back("Read-only inside the sandbox: " +
++                      base::JoinString(pinned, ", ") +
++                      " (git works read-only: commit from a host terminal).");
++  out.notes.push_back(
++      out.secret_names.empty()
++          ? "No vault secrets are passed into this sandbox."
++          : "Secrets in this sandbox: " + base::JoinString(out.secret_names, ", ") +
++                " (values hidden).");
++  std::vector<std::string> missing;
++  for (const std::string& n : kind->needs) {
++    if (!Contains(out.secret_names, n)) {
++      missing.push_back(n);
++    }
++  }
++  if (!missing.empty()) {
++    std::string label = kind->label;
++    base::ReplaceSubstringsAfterOffset(&label, 0, " (sandbox)", "");
++    out.notes.push_back(base::JoinString(missing, ", ") +
++                        " is not passed in, so " + label +
++                        " can’t sign in inside the container. Add it in "
++                        "Secrets (lock icon) and restart.");
++  }
++  if (!network && kind_id != "sandbox-shell") {
++    out.notes.push_back(
++        "Network is off: the agent can’t reach its API. Turn network on in "
++        "the sandbox menu.");
++  }
++  return out;
++}
++
++void ReleasePlaceholders(const std::vector<base::FilePath>& placeholders) {
++  base::AutoLock hold(PlaceholderLock());
++  for (const base::FilePath& abs : placeholders) {
++    auto it = PlaceholderRefs().find(abs);
++    if (it != PlaceholderRefs().end() && --it->second > 0) {
++      continue;
++    }
++    PlaceholderRefs().erase(abs);
++    struct stat st;
++    if (lstat(abs.value().c_str(), &st) != 0) {
++      continue;
++    }
++    if (S_ISDIR(st.st_mode)) {
++      rmdir(abs.value().c_str());  // stays if anything was put inside
++    } else if (S_ISREG(st.st_mode)) {
++      std::string content;
++      if (base::ReadFileToString(abs, &content) &&
++          content == Placeholder(abs.BaseName().value())) {
++        base::DeleteFile(abs);
++      }
++    }
++  }
++}
++
++namespace {
++
++std::string Digest(const base::FilePath& abs, int* seen) {
++  struct stat st;
++  if (lstat(abs.value().c_str(), &st) != 0) {
++    return "other";
++  }
++  if (S_ISLNK(st.st_mode)) {
++    base::FilePath target;
++    return "link:" + (base::ReadSymbolicLink(abs, &target) ? target.value()
++                                                           : std::string("?"));
++  }
++  if (S_ISREG(st.st_mode)) {
++    if (st.st_size > 1024 * 1024) {
++      return "big:" + base::NumberToString(st.st_size) + ":" +
++             base::NumberToString(st.st_mtime);
++    }
++    std::string content;
++    base::ReadFileToString(abs, &content);
++    return "file:" + Hex(crypto::hash::Sha256(content));
++  }
++  if (!S_ISDIR(st.st_mode)) {
++    return "other";
++  }
++  // One digest over the folder's files (sorted, bounded).
++  std::string listing;
++  std::vector<std::pair<base::FilePath, int>> stack = {{abs, 0}};
++  while (!stack.empty() && *seen < 30000) {
++    auto [dir, depth] = stack.back();
++    stack.pop_back();
++    if (depth > 6) {
++      continue;
++    }
++    std::vector<base::FilePath> entries;
++    base::FileEnumerator e(dir, false,
++                           base::FileEnumerator::FILES |
++                               base::FileEnumerator::DIRECTORIES |
++                               base::FileEnumerator::SHOW_SYM_LINKS);
++    for (base::FilePath p = e.Next(); !p.empty(); p = e.Next()) {
++      entries.push_back(p);
++    }
++    std::ranges::sort(entries);
++    for (const base::FilePath& p : entries) {
++      ++*seen;
++      base::FilePath rel;
++      abs.AppendRelativePath(p, &rel);
++      struct stat s2;
++      if (lstat(p.value().c_str(), &s2) != 0) {
++        continue;
++      }
++      if (S_ISDIR(s2.st_mode)) {
++        listing += "d " + rel.value() + "\n";
++        stack.push_back({p, depth + 1});
++      } else {
++        listing += rel.value() + " " + Digest(p, seen) + "\n";
++      }
++    }
++  }
++  return "dir:" + Hex(crypto::hash::Sha256(listing));
++}
++
++}  // namespace
++
++base::DictValue AutoExecSnapshot(const base::FilePath& root) {
++  std::set<std::string> names(ProtectDirs().begin(), ProtectDirs().end());
++  names.insert(ProtectFiles().begin(), ProtectFiles().end());
++  names.insert(ProtectIfPresent().begin(), ProtectIfPresent().end());
++  base::DictValue out;
++  int seen = 0;
++  std::vector<std::pair<base::FilePath, int>> stack = {{root, 0}};
++  while (!stack.empty() && seen < 30000) {
++    auto [dir, depth] = stack.back();
++    stack.pop_back();
++    if (depth > 8) {
++      continue;
++    }
++    base::FileEnumerator e(dir, false,
++                           base::FileEnumerator::FILES |
++                               base::FileEnumerator::DIRECTORIES |
++                               base::FileEnumerator::SHOW_SYM_LINKS);
++    for (base::FilePath p = e.Next(); !p.empty(); p = e.Next()) {
++      if (++seen > 30000) {
++        break;
++      }
++      std::string name = p.BaseName().value();
++      base::FilePath rel;
++      root.AppendRelativePath(p, &rel);
++      if (names.contains(name)) {
++        if (rel.value() != ".git") {
++          out.Set(rel.value(), Digest(p, &seen));
++        }
++        continue;
++      }
++      if (e.GetInfo().IsDirectory() && name != "node_modules") {
++        stack.push_back({p, depth + 1});
++      }
++    }
++  }
++  return out;
++}
++
++base::ListValue SnapshotDiff(const base::DictValue& before,
++                             const base::DictValue& after) {
++  auto placeholder = [](const std::string& rel, const std::string& digest) {
++    if (Contains(ProtectDirs(), rel)) {
++      return digest == "dir:" + Hex(crypto::hash::Sha256(std::string()));
++    }
++    if (Contains(ProtectFiles(), rel)) {
++      return digest == "file:" + Hex(crypto::hash::Sha256(Placeholder(rel)));
++    }
++    return false;
++  };
++  std::vector<std::pair<std::string, std::string>> changes;
++  for (const auto [rel, d] : after) {
++    const std::string* was = before.FindString(rel);
++    if (!was) {
++      if (!placeholder(rel, d.GetString())) {
++        changes.emplace_back(rel, "added");
++      }
++    } else if (*was != d.GetString()) {
++      changes.emplace_back(rel, "changed");
++    }
++  }
++  for (const auto [rel, d] : before) {
++    if (!after.Find(rel)) {
++      changes.emplace_back(rel, "removed");
++    }
++  }
++  std::ranges::sort(changes);
++  base::ListValue out;
++  for (const auto& [rel, change] : changes) {
++    out.Append(base::DictValue().Set("path", rel).Set("change", change));
++  }
++  return out;
++}
++
++}  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/sandbox.h b/chrome/browser/meridian/workbench/sandbox.h
+new file mode 100644
+index 0000000000..c4dd57b0b5
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/sandbox.h
+@@ -0,0 +1,98 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_WORKBENCH_SANDBOX_H_
++#define CHROME_BROWSER_MERIDIAN_WORKBENCH_SANDBOX_H_
++
++#include <map>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/types/expected.h"
++#include "base/values.h"
++
++namespace meridian::workbench {
++
++// Coding agents in a Docker / OrbStack container. What the container gets:
++//  - the project folder, read-write, at /workspace, and nothing else from the
++//    host (no home, no SSH keys, no Docker socket), EXCEPT files the host
++//    runs by itself (.git, .claude, .mcp.json, .vscode, .envrc…), mounted
++//    read-only on top; missing ones get an empty placeholder for the session,
++//    so the agent can't create them either. A symlinked one refuses the
++//    launch. What can't be pinned this way is snapshotted before the session
++//    and reviewed before the next host terminal (AutoExecSnapshot);
++//  - a per-project volume as /home/node; the unprivileged `node` user, all
++//    capabilities dropped, no-new-privileges, pid/memory/CPU limits;
++//    optionally no network;
++//  - only the vault secrets picked for the session, in a 0600 file in a
++//    private 0700 temp dir, mounted read-only (never container environment,
++//    which `docker inspect` shows, never a command line).
++// Every docker call is an argv array. Blocking.
++
++struct SandboxKind {
++  const char* id;
++  const char* label;
++  std::vector<std::string> cmd;
++  // Secrets the agent needs to sign in.
++  std::vector<std::string> needs;
++};
++const SandboxKind* FindSandboxKind(const std::string& id);
++
++std::string FindDocker(const std::string& search_path);
++// The image tag follows the Dockerfile: a changed recipe builds a new image.
++std::string SandboxImageTag(const std::string& dockerfile);
++
++// {installed, running, docker, version, image, imagePresent, error,
++// available}
++base::DictValue SandboxStatus(const std::map<std::string, std::string>& env,
++                              const std::string& dockerfile);
++
++struct SandboxMount {
++  base::FilePath dir;
++  std::string target;
++  std::map<std::string, std::string> env;
++  std::vector<std::string> args;
++  std::string token;
++};
++
++struct SandboxLaunch {
++  std::string title;
++  std::vector<std::string> argv;
++  std::vector<base::FilePath> cleanup;
++  std::vector<std::string> notes;
++  // Set while the image is being built: the sandbox kind to start after.
++  std::string then;
++  std::vector<std::string> secret_names;
++  std::string container;
++  std::vector<base::FilePath> placeholders;
++};
++
++// `forbidden`: folders that can never be mounted (Meridian's own data).
++base::expected<SandboxLaunch, std::string> MakeSandboxLaunch(
++    const std::string& kind,
++    const base::FilePath& root,
++    const std::map<std::string, std::string>& secrets,
++    bool network,
++    const std::vector<base::FilePath>& forbidden,
++    const base::DictValue& status,
++    const std::string& dockerfile,
++    const std::optional<SandboxMount>& mission);
++
++// Placeholders nobody uses any more go — only if they are still exactly
++// what Meridian created.
++void ReleasePlaceholders(const std::vector<base::FilePath>& placeholders);
++
++// {"<rel path>": "<digest>"} for every host-run config entry in the project
++// (any depth; the root .git is read-only in sandboxes and skipped).
++base::DictValue AutoExecSnapshot(const base::FilePath& root);
++// [{path, change: added|removed|changed}]; Meridian's placeholders don't
++// count as added.
++base::ListValue SnapshotDiff(const base::DictValue& before,
++                             const base::DictValue& after);
++
++}  // namespace meridian::workbench
++
++#endif  // CHROME_BROWSER_MERIDIAN_WORKBENCH_SANDBOX_H_
+diff --git a/chrome/browser/meridian/workbench/sandbox_unittest.cc b/chrome/browser/meridian/workbench/sandbox_unittest.cc
+new file mode 100644
+index 0000000000..bb20ecdd9c
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/sandbox_unittest.cc
+@@ -0,0 +1,99 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/workbench/sandbox.h"
++
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace meridian::workbench {
++namespace {
++
++base::DictValue Running() {
++  return base::DictValue()
++      .Set("installed", true)
++      .Set("running", true)
++      .Set("docker", "/usr/local/bin/docker")
++      .Set("image", "meridian-sandbox:abc")
++      .Set("imagePresent", true);
++}
++
++class SandboxTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    ASSERT_TRUE(dir_.CreateUniqueTempDir());
++    root_ = base::MakeAbsoluteFilePath(dir_.GetPath()).Append("proj");
++    ASSERT_TRUE(base::CreateDirectory(root_.Append(".git")));
++  }
++  base::ScopedTempDir dir_;
++  base::FilePath root_;
++};
++
++TEST_F(SandboxTest, PinsHostRunConfigAndKeepsSecretsOutOfArgs) {
++  base::expected<SandboxLaunch, std::string> launch = MakeSandboxLaunch(
++      "sandbox-claude", root_, {{"ANTHROPIC_API_KEY", "sk-ant-secret-value"}},
++      /*network=*/false, {}, Running(), "FROM node", std::nullopt);
++  ASSERT_TRUE(launch.has_value()) << launch.error();
++  std::string args;
++  for (const std::string& a : launch->argv) {
++    args += a + " ";
++  }
++  EXPECT_NE(args.find("type=bind,source=" + root_.value() +
++                      ",target=/workspace "),
++            std::string::npos);
++  EXPECT_NE(args.find(root_.Append(".git").value() +
++                      ",target=/workspace/.git,readonly"),
++            std::string::npos);
++  EXPECT_NE(args.find("/workspace/.mcp.json,readonly"), std::string::npos);
++  EXPECT_NE(args.find("--cap-drop ALL"), std::string::npos);
++  EXPECT_NE(args.find("--network none"), std::string::npos);
++  EXPECT_EQ(args.find("sk-ant-secret-value"), std::string::npos);
++  // Placeholders exist while it runs and go afterwards; the real .git stays.
++  EXPECT_TRUE(base::PathExists(root_.Append(".mcp.json")));
++  EXPECT_TRUE(base::DirectoryExists(root_.Append(".claude")));
++  std::string env;
++  ASSERT_TRUE(base::ReadFileToString(launch->cleanup[0].Append("env"), &env));
++  EXPECT_EQ(env, "ANTHROPIC_API_KEY=c2stYW50LXNlY3JldC12YWx1ZQ==\n");
++  int mode = 0;
++  base::GetPosixFilePermissions(launch->cleanup[0].Append("env"), &mode);
++  EXPECT_EQ(mode, 0600);
++  ReleasePlaceholders(launch->placeholders);
++  EXPECT_FALSE(base::PathExists(root_.Append(".mcp.json")));
++  EXPECT_FALSE(base::PathExists(root_.Append(".claude")));
++  EXPECT_TRUE(base::DirectoryExists(root_.Append(".git")));
++  base::DeletePathRecursively(launch->cleanup[0]);
++}
++
++TEST_F(SandboxTest, RefusesSymlinksHomeAndMeridianData) {
++  ASSERT_TRUE(base::CreateSymbolicLink(base::FilePath("/etc"),
++                                       root_.Append(".vscode")));
++  EXPECT_FALSE(MakeSandboxLaunch("sandbox-shell", root_, {}, true, {},
++                                 Running(), "FROM node", std::nullopt)
++                   .has_value());
++  EXPECT_FALSE(base::PathExists(root_.Append(".mcp.json")));
++  EXPECT_FALSE(MakeSandboxLaunch("sandbox-shell",
++                                 base::MakeAbsoluteFilePath(base::GetHomeDir()),
++                                 {}, true, {}, Running(), "FROM node",
++                                 std::nullopt)
++                   .has_value());
++  EXPECT_FALSE(MakeSandboxLaunch("sandbox-shell", root_, {}, true,
++                                 {root_.Append("data")}, Running(),
++                                 "FROM node", std::nullopt)
++                   .has_value());
++}
++
++TEST_F(SandboxTest, SnapshotSeesPlantedConfig) {
++  base::DictValue before = AutoExecSnapshot(root_);
++  ASSERT_TRUE(base::CreateDirectory(root_.Append("sub/.git/hooks")));
++  ASSERT_TRUE(base::WriteFile(root_.Append("sub/.git/hooks/pre-commit"), "x"));
++  ASSERT_TRUE(base::WriteFile(root_.Append(".envrc"), "evil"));
++  base::ListValue diff = SnapshotDiff(before, AutoExecSnapshot(root_));
++  ASSERT_EQ(diff.size(), 2u);
++  EXPECT_EQ(*diff[0].GetDict().FindString("path"), ".envrc");
++  EXPECT_EQ(*diff[1].GetDict().FindString("path"), "sub/.git");
++}
++
++}  // namespace
++}  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 79817e3ea4..5b1ddc0063 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -23,6 +23,8 @@
+ #include "chrome/browser/meridian/sidebar_handler.h"
+ #include "chrome/browser/meridian/workbench/agents.h"
+ #include "chrome/browser/meridian/workbench/native_dialog.h"
++#include "chrome/browser/meridian/workbench/sandbox.h"
++#include "chrome/browser/meridian/workbench/workbench_source.h"
+ #include "chrome/browser/meridian/workbench/secret_files.h"
+ #include "chrome/browser/meridian/workbench/vault.h"
+ #include "chrome/browser/meridian/workbench/workbench_service.h"
+@@ -489,6 +491,24 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+       WorkbenchServiceFactory::GetForProfile(profile_)->UnregisterGuard(
+           it->second.guard_token);
+     }
++    if (!it->second.container.empty() && it->second.exited.is_none()) {
++      // The docker CLI going away doesn't stop the container.
++      files_->PostTask(
++          FROM_HERE,
++          base::BindOnce(
++              [](std::string docker, std::string name,
++                 std::vector<base::FilePath> placeholders) {
++                ai::CaptureOutput({docker, "rm", "-f", name},
++                                  ai::LoginEnvironment(),
++                                  base::GetHomeDir().value(), base::Seconds(15));
++                ReleasePlaceholders(placeholders);
++              },
++              it->second.docker, it->second.container,
++              it->second.placeholders));
++      if (int& n = sandboxes_running_[it->second.sandbox_root]; --n <= 0) {
++        sandboxes_running_.erase(it->second.sandbox_root);
++      }
++    }
+     if (!it->second.mission_node.empty()) {
+       if (mission::MissionControl* mission =
+               mission::MissionControlFactory::GetForProfile(profile_)) {
+@@ -506,6 +526,9 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+                                     std::move(cleanup)));
+     return std::move(reply).Run(base::Value(true));
+   }
++  if (method == "sandboxStatus" || method == "sandboxNetwork") {
++    return SandboxCall(method, params, std::move(reply));
++  }
+   if (method.starts_with("vault") || method == "secretScan" ||
+       method == "secretMigrate") {
+     return VaultCall(method, params, std::move(reply));
+@@ -1083,7 +1106,8 @@ void WorkbenchHandler::Info(Reply reply) {
+                     .Set("vaultUnavailable", vault_why.empty()
+                                                  ? base::Value()
+                                                  : base::Value(vault_why))
+-                    .Set("sandboxNetwork", true)
++                    .Set("sandboxNetwork",
++                         store.FindBool("sandboxNetwork").value_or(true))
+                     .Set("hubTemplates", base::ListValue()));
+           },
+           StorePath(), access, has_project, root, std::move(project),
+@@ -1245,6 +1269,28 @@ void WorkbenchHandler::CreateTerminal(base::DictValue opts, Reply reply) {
+   }
+   const std::string* kind_param = opts.FindString("kind");
+   std::string kind = kind_param ? *kind_param : "shell";
++  if (FindSandboxKind(kind)) {
++    return CreateSandbox(kind, std::move(opts), std::move(reply));
++  }
++  // A sandbox may have planted config the host runs: ask first.
++  if (!opts.FindBool("reviewed").value_or(false)) {
++    opts.Set("reviewed", true);
++    ReviewSandboxChanges(base::BindOnce(
++        [](base::WeakPtr<WorkbenchHandler> self, base::DictValue opts,
++           Reply reply, bool go) {
++          if (!self) {
++            return;
++          }
++          if (!go) {
++            return std::move(reply).Run(base::unexpected(
++                "Not started — review what the sandboxed agent changed "
++                "first."));
++          }
++          self->CreateTerminal(std::move(opts), std::move(reply));
++        },
++        weak_factory_.GetWeakPtr(), std::move(opts), std::move(reply)));
++    return;
++  }
+   // Agent sessions report to Mission Control: its channel must listen first.
+   mission::MissionControl* listening =
+       mission::MissionControlFactory::GetForProfile(profile_);
+@@ -1441,8 +1487,8 @@ base::DictValue WorkbenchHandler::TermInfo(const std::string& id,
+         return names;
+       }())
+       .Set("guard", !term.guard_token.empty())
+-      .Set("sandbox", false)
+-      .Set("then", base::Value())
++      .Set("sandbox", !term.container.empty())
++      .Set("then", term.then.empty() ? base::Value() : base::Value(term.then))
+       .Set("missionNode", term.mission_node.empty()
+                               ? base::Value()
+                               : base::Value(term.mission_node));
+@@ -1475,6 +1521,16 @@ void WorkbenchHandler::OnTerminalExit(std::string id, int code, int signal) {
+   exited.Set("code", code);
+   exited.Set("signal", signal ? base::Value(signal) : base::Value());
+   it->second.exited = base::Value(exited.Clone());
++  if (!it->second.placeholders.empty() || !it->second.sandbox_root.empty()) {
++    std::vector<base::FilePath> placeholders =
++        std::move(it->second.placeholders);
++    files_->PostTask(FROM_HERE,
++                     base::BindOnce(&ReleasePlaceholders, placeholders));
++    if (int& n = sandboxes_running_[it->second.sandbox_root]; --n <= 0) {
++      sandboxes_running_.erase(it->second.sandbox_root);
++    }
++    it->second.sandbox_root.clear();
++  }
+   if (!it->second.guard_token.empty()) {
+     WorkbenchServiceFactory::GetForProfile(profile_)->UnregisterGuard(
+         it->second.guard_token);
+@@ -1500,6 +1556,333 @@ void WorkbenchHandler::OnTerminalExit(std::string id, int code, int signal) {
+   Emit("wb:pty-exit", base::Value(std::move(exited)));
+ }
+ 
++namespace {
++
++std::string ReadDockerfile() {
++  std::string text;
++  base::ReadFileToString(
++      WorkbenchSource::Folder().Append("sandbox").Append("Dockerfile"), &text);
++  return text;
++}
++
++base::FilePath ReviewPath(Profile* profile) {
++  return profile->GetPath().Append("Meridian Workbench Review.json");
++}
++
++base::DictValue LoadJson(const base::FilePath& file) {
++  std::string json;
++  base::ReadFileToString(file, &json);
++  std::optional<base::Value> v = base::JSONReader::Read(json, 0);
++  return v && v->is_dict() ? std::move(v->GetDict()) : base::DictValue();
++}
++
++void SaveJson(const base::FilePath& file, const base::DictValue& value) {
++  if (base::WriteFile(file, base::WriteJson(value).value_or("{}"))) {
++    base::SetPosixFilePermissions(file, 0600);
++  }
++}
++
++}  // namespace
++
++void WorkbenchHandler::SandboxCall(const std::string& method,
++                                   const base::ListValue& params,
++                                   Reply reply) {
++  bool flag = !params.empty() && params[0].is_bool() && params[0].GetBool();
++  if (method == "sandboxNetwork") {
++    files_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(
++            [](base::FilePath file, bool on) -> Result {
++              base::DictValue store = LoadStore(file);
++              store.Set("sandboxNetwork", on);
++              SaveStore(file, store);
++              return base::Value(on);
++            },
++            StorePath(), flag),
++        std::move(reply));
++    return;
++  }
++  files_->PostTaskAndReplyWithResult(
++      FROM_HERE, base::BindOnce([]() -> Result {
++        return base::Value(SandboxStatus(TerminalEnv(), ReadDockerfile()));
++      }),
++      std::move(reply));
++}
++
++void WorkbenchHandler::ReviewSandboxChanges(
++    base::OnceCallback<void(bool)> go) {
++  if (!project_) {
++    return std::move(go).Run(true);
++  }
++  std::string root = project_->root().value();
++  bool running = sandboxes_running_.contains(root);
++  files_->PostTaskAndReplyWithResult(
++      FROM_HERE,
++      base::BindOnce(
++          [](base::FilePath review_file, std::string root, bool running)
++              -> std::optional<base::ListValue> {
++            base::DictValue review = LoadJson(review_file);
++            const base::DictValue* base_entry = review.FindDict(root);
++            if (!base_entry) {
++              return std::nullopt;
++            }
++            base::DictValue current = AutoExecSnapshot(base::FilePath(root));
++            const base::DictValue* snapshot = base_entry->FindDict("snapshot");
++            base::DictValue none;
++            base::ListValue changes =
++                SnapshotDiff(snapshot ? *snapshot : none, current);
++            if (changes.empty()) {
++              // Nothing to look at: settle now.
++              if (running) {
++                review.Set(root, base::DictValue().Set("snapshot",
++                                                       std::move(current)));
++              } else {
++                review.Remove(root);
++              }
++              SaveJson(review_file, review);
++              return std::nullopt;
++            }
++            return std::optional<base::ListValue>(std::move(changes));
++          },
++          ReviewPath(profile_), root, running),
++      base::BindOnce(
++          [](base::WeakPtr<WorkbenchHandler> self, std::string root,
++             bool running, base::OnceCallback<void(bool)> go,
++             std::optional<base::ListValue> changes) {
++            if (!self) {
++              return;
++            }
++            if (!changes) {
++              return std::move(go).Run(true);
++            }
++            std::string lines;
++            for (size_t i = 0; i < changes->size() && i < 15; ++i) {
++              const base::DictValue& c = (*changes)[i].GetDict();
++              lines += "• " + *c.FindString("change") + ": " +
++                       ai::OneLine(*c.FindString("path"), 160) + "\n";
++            }
++            if (changes->size() > 15) {
++              lines += "…and " + base::NumberToString(changes->size() - 15) +
++                       " more\n";
++            }
++            AskNative(
++                self->web_ui()->GetWebContents(),
++                "A sandboxed agent changed files that run code on this "
++                "computer",
++                "In " + ai::OneLine(root, 200) +
++                    (running ? " (a sandbox is still running there)" : "") +
++                    ":\n" + lines +
++                    "\nGit hooks and config, Claude Code / Codex / Gemini "
++                    "settings, MCP servers, editor tasks, direnv and similar "
++                    "files can run commands when you next use git, an agent "
++                    "or your editor in this folder. Look at them first (the "
++                    "file tree shows hidden files with the eye button).",
++                {"Cancel", "Start anyway"},
++                base::BindOnce(
++                    [](base::WeakPtr<WorkbenchHandler> self, std::string root,
++                       bool running, base::OnceCallback<void(bool)> go,
++                       int choice) {
++                      if (!self || choice != 1) {
++                        return std::move(go).Run(false);
++                      }
++                      self->files_->PostTaskAndReply(
++                          FROM_HERE,
++                          base::BindOnce(
++                              [](base::FilePath file, std::string root,
++                                 bool running) {
++                                base::DictValue review = LoadJson(file);
++                                if (running) {
++                                  review.Set(
++                                      root,
++                                      base::DictValue().Set(
++                                          "snapshot", AutoExecSnapshot(
++                                                          base::FilePath(root))));
++                                } else {
++                                  review.Remove(root);
++                                }
++                                SaveJson(file, review);
++                              },
++                              ReviewPath(self->profile_), root, running),
++                          base::BindOnce(std::move(go), true));
++                    },
++                    self, root, running, std::move(go)));
++          },
++          weak_factory_.GetWeakPtr(), root, running, std::move(go)));
++}
++
++void WorkbenchHandler::CreateSandbox(std::string kind,
++                                     base::DictValue opts,
++                                     Reply reply) {
++  WorkbenchService* workbench = WorkbenchServiceFactory::GetForProfile(profile_);
++  if (!opts.FindBool("vaultReady").value_or(false)) {
++    opts.Set("vaultReady", true);
++    workbench->vault().WhenReady(base::BindOnce(
++        &WorkbenchHandler::CreateSandbox, weak_factory_.GetWeakPtr(), kind,
++        std::move(opts), std::move(reply)));
++    return;
++  }
++  std::string root = project_->root().value();
++  const SandboxKind* sandbox_kind = FindSandboxKind(kind);
++  // Only the secrets picked for this session (default: what the agent needs
++  // to sign in plus project secrets marked "available in sandboxes").
++  std::map<std::string, std::string> available =
++      workbench->vault().EnvFor(root);
++  std::vector<std::string> wanted;
++  if (const base::ListValue* picked = opts.FindList("secrets")) {
++    for (const base::Value& n : *picked) {
++      if (n.is_string()) {
++        wanted.push_back(n.GetString());
++      }
++    }
++  } else {
++    wanted = workbench->vault().SandboxDefaults(root, sandbox_kind->needs);
++  }
++  std::map<std::string, std::string> secrets;
++  for (const std::string& n : wanted) {
++    if (available.contains(n)) {
++      secrets[n] = available[n];
++    }
++  }
++  // Mission Control: sandboxes report through a mounted events file.
++  mission::MissionControl* mission =
++      mission::MissionControlFactory::GetForProfile(profile_);
++  mission::MissionControl::Registration registration;
++  base::DictValue claude_settings;
++  if (mission && kind != "sandbox-shell") {
++    tabs::TabInterface* tab =
++        tabs::TabInterface::MaybeGetFromContents(web_ui()->GetWebContents());
++    registration = mission->RegisterTerminal(
++        kind, project_->name(), tab ? tab->GetHandle().raw_value() : 0,
++        /*sandbox=*/true);
++    claude_settings = mission->ClaudeHookSettings();
++  }
++  int cols = opts.FindInt("cols").value_or(80);
++  int rows = opts.FindInt("rows").value_or(24);
++  std::vector<base::FilePath> forbidden = {profile_->GetPath().DirName()};
++  struct Made {
++    base::expected<SandboxLaunch, std::string> launch;
++    std::optional<SandboxMount> mount;
++    std::map<std::string, std::string> env;
++    std::string docker;
++  };
++  files_->PostTaskAndReplyWithResult(
++      FROM_HERE,
++      base::BindOnce(
++          [](std::string kind, std::string root,
++             std::map<std::string, std::string> secrets,
++             std::vector<base::FilePath> forbidden, base::FilePath store_file,
++             base::FilePath review_file, std::string token,
++             base::DictValue claude_settings) -> Made {
++            std::map<std::string, std::string> env = TerminalEnv();
++            std::string dockerfile = ReadDockerfile();
++            base::DictValue status = SandboxStatus(env, dockerfile);
++            bool network =
++                LoadStore(store_file).FindBool("sandboxNetwork").value_or(true);
++            std::optional<SandboxMount> mount;
++            if (!token.empty() && status.FindBool("imagePresent").value_or(false)) {
++              mount = mission::MissionControl::MakeSandboxMount(
++                  token, kind, std::move(claude_settings));
++            }
++            base::expected<SandboxLaunch, std::string> launch =
++                MakeSandboxLaunch(kind, base::FilePath(root), secrets, network,
++                                  forbidden, status, dockerfile, mount);
++            // What the host would run, before the sandbox can change it.
++            if (launch.has_value() && launch->then.empty()) {
++              base::DictValue review = LoadJson(review_file);
++              if (!review.FindDict(root)) {
++                review.Set(root, base::DictValue().Set(
++                                     "snapshot",
++                                     AutoExecSnapshot(base::FilePath(root))));
++                SaveJson(review_file, review);
++              }
++            }
++            const std::string* docker = status.FindString("docker");
++            return Made{std::move(launch), std::move(mount), std::move(env),
++                        docker ? *docker : std::string()};
++          },
++          kind, root, std::move(secrets), forbidden, StorePath(),
++          ReviewPath(profile_), registration.token, std::move(claude_settings)),
++      base::BindOnce(
++          [](base::WeakPtr<WorkbenchHandler> self, std::string kind, int cols,
++             int rows, mission::MissionControl::Registration registration,
++             Reply reply, Made made) {
++            mission::MissionControl* mission =
++                self ? mission::MissionControlFactory::GetForProfile(
++                           self->profile_)
++                     : nullptr;
++            if (!self || !self->project_ || !made.launch.has_value()) {
++              if (mission && !registration.node_id.empty()) {
++                mission->Discard(registration.token, registration.node_id);
++              }
++              if (self && !made.launch.has_value()) {
++                std::move(reply).Run(base::unexpected(made.launch.error()));
++              }
++              return;
++            }
++            SandboxLaunch& launch = *made.launch;
++            // The image build gets no secrets and no Mission node.
++            if (!launch.then.empty() && mission &&
++                !registration.node_id.empty()) {
++              mission->Discard(registration.token, registration.node_id);
++              registration = {};
++            }
++            if (made.mount && mission) {
++              mission->FollowSandbox(*made.mount);
++            }
++            std::string id = "t" + base::NumberToString(++self->term_seq_);
++            Terminal::Spec run;
++            run.argv = launch.argv;
++            run.env = made.env;
++            run.cwd = self->project_->root().value();
++            run.cols = cols;
++            run.rows = rows;
++            std::unique_ptr<Terminal> terminal = Terminal::Start(
++                run,
++                base::BindPostTaskToCurrentDefault(base::BindRepeating(
++                    &WorkbenchHandler::OnTerminalData, self, id)),
++                base::BindPostTaskToCurrentDefault(base::BindOnce(
++                    &WorkbenchHandler::OnTerminalExit, self, id)));
++            if (!terminal) {
++              ReleasePlaceholders(launch.placeholders);
++              return std::move(reply).Run(
++                  base::unexpected("Couldn’t start the terminal."));
++            }
++            Term term;
++            term.terminal = std::move(terminal);
++            term.kind = kind;
++            term.title = launch.title;
++            term.cleanup = launch.cleanup;
++            if (made.mount) {
++              term.cleanup.push_back(made.mount->dir);
++            }
++            term.secrets = launch.secret_names;
++            term.then = launch.then;
++            term.container = launch.container;
++            term.docker = made.docker;
++            term.placeholders = launch.placeholders;
++            term.mission_node = registration.node_id;
++            term.mission_token = registration.token;
++            if (launch.then.empty()) {
++              term.sandbox_root = self->project_->root().value();
++              self->sandboxes_running_[term.sandbox_root]++;
++            }
++            if (mission && !registration.node_id.empty()) {
++              mission->AttachTerminal(registration.node_id, id);
++            }
++            base::DictValue info = self->TermInfo(id, term);
++            base::ListValue notes;
++            for (const std::string& n : launch.notes) {
++              notes.Append(n);
++            }
++            info.Set("notes", std::move(notes));
++            info.Set("browserTools", false);
++            self->terms_[id] = std::move(term);
++            std::move(reply).Run(base::Value(std::move(info)));
++          },
++          weak_factory_.GetWeakPtr(), kind, cols, rows,
++          std::move(registration), std::move(reply)));
++}
++
+ void WorkbenchHandler::OnMissionChanged(const base::DictValue& snapshot) {
+   // The counts for the topbar chip.
+   base::DictValue counts = snapshot.FindDict("counts")->Clone();
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.h b/chrome/browser/meridian/workbench/workbench_handler.h
+index bed56cc0d7..6c00e57e38 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.h
++++ b/chrome/browser/meridian/workbench/workbench_handler.h
+@@ -81,6 +81,12 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+     std::string mission_node;
+     std::string mission_token;
+     std::string guard_token;
++    // Docker sandboxes: the container, its placeholders, its project.
++    std::string container;
++    std::string docker;
++    std::vector<base::FilePath> placeholders;
++    std::string sandbox_root;
++    std::string then;
+     // The vault secrets in its environment (names only).
+     std::vector<std::string> secrets;
+   };
+@@ -103,6 +109,14 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+   // Runs `op` on the project, on the file sequence.
+   void OnProject(base::OnceCallback<Result(const ProjectFs&)> op, Reply reply);
+   void CreateTerminal(base::DictValue opts, Reply reply);
++  // Docker sandboxes.
++  void CreateSandbox(std::string kind, base::DictValue opts, Reply reply);
++  void SandboxCall(const std::string& method,
++                   const base::ListValue& params,
++                   Reply reply);
++  // Before a host terminal: what a sandboxed agent changed that the host
++  // would run is shown first. `go` gets false if the person cancelled.
++  void ReviewSandboxChanges(base::OnceCallback<void(bool)> go);
+   void OnTerminalData(std::string id, std::string data);
+   void OnTerminalExit(std::string id, int code, int signal);
+   base::DictValue TermInfo(const std::string& id, const Term& term) const;
+@@ -131,6 +145,8 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+   base::OneShotTimer flush_;
+   std::map<std::string, Term> terms_;
+   int term_seq_ = 0;
++  // Sandboxes running per project root.
++  std::map<std::string, int> sandboxes_running_;
+   scoped_refptr<ui::SelectFileDialog> dialog_;
+   Reply pick_reply_;
+   base::ScopedObservation<mission::MissionControl,

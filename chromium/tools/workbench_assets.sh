@@ -23,6 +23,10 @@ for f in workbench.html workbench.js workbench-pro.js workbench.css secret-detec
 done
 cp "$repo/src/renderer/icons.js" "$dest.tmp/icons.js"
 cp "$here/workbench/bridge.js" "$dest.tmp/bridge.js"
+# Docker sandboxes: the image recipe, and the Mission Control hook node runs inside it.
+mkdir -p "$dest.tmp/sandbox" "$dest.tmp/hooks"
+cp "$repo/build/sandbox/Dockerfile" "$dest.tmp/sandbox/Dockerfile"
+cp "$repo/src/agents/hooks/mission-hook.js" "$dest.tmp/hooks/mission-hook.js"
 # The bridge goes first: it is what gives the page `window.workbench`.
 perl -0pi -e 's|(<script src="/vendor/xterm/lib/xterm.js"></script>)|<script src="bridge.js"></script>\n  $1|' "$dest.tmp/workbench.html"
 grep -q 'src="bridge.js"' "$dest.tmp/workbench.html"
