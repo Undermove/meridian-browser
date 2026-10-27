@@ -15,6 +15,9 @@ test('the sidebar holds the address field and a vertical list of tabs', async ()
     assert.ok(rects[1].y > rects[0].y, 'second tab is below the first');
     assert.equal(await b.eval(`app.shadowRoot.getElementById('sidebar').getBoundingClientRect().width`), 260);
     assert.ok(await b.eval(`app.shadowRoot.getElementById('sidebar').contains(app.$.urlPill)`), 'URL pill in the sidebar');
+    // The page card has the same margin on the right as at the top and bottom.
+    const m = await b.eval(`(() => { const r = app.$.contentRegion.getBoundingClientRect(); return { right: innerWidth - r.right, bottom: innerHeight - r.bottom, top: r.top }; })()`);
+    assert.deepEqual(m, { right: 8, bottom: 8, top: 8 });
     // Today lists the newest tab first, like Arc.
     assert.deepEqual((await b.tabs()).map((t) => t.title), ['Two', 'One']);
   } finally { await b.close(); }

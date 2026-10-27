@@ -1,0 +1,847 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 27 Oct 2026 12:57:20 +0400
+Subject: [PATCH 7/7] Meridian: keyboard (tabs/spaces/pin/sidebar commands,
+ Spaces menu), hide sidebar with edge reveal, even page margins
+
+---
+ chrome/app/chrome_command_ids.h               |  12 ++
+ chrome/app/generated_resources.grd            |   3 +
+ chrome/app/generated_resources.grd.gritdeps   |   1 +
+ chrome/app/meridian_strings.grdp              |  22 ++++
+ .../browser/global_keyboard_shortcuts_mac.mm  |  19 ++-
+ chrome/browser/meridian/BUILD.gn              |   7 +
+ chrome/browser/meridian/sidebar.mojom         |  22 ++++
+ chrome/browser/meridian/sidebar_handler.cc    |  64 ++++++++++
+ chrome/browser/meridian/sidebar_handler.h     |   6 +
+ .../browser/meridian/sidebar_handler_mac.mm   |  23 ++++
+ .../browser/resources/webui_browser/app.css   |  51 ++++++++
+ .../resources/webui_browser/app.html.ts       |   6 +-
+ chrome/browser/resources/webui_browser/app.ts |  45 +++++++
+ .../webui_browser/meridian/sidebar.ts         | 120 +++++++++++++++++-
+ .../browser/ui/browser_command_controller.cc  |  16 +++
+ chrome/browser/ui/cocoa/accelerators_cocoa.mm |  13 +-
+ chrome/browser/ui/cocoa/main_menu_builder.mm  |  43 +++++--
+ 17 files changed, 450 insertions(+), 23 deletions(-)
+ create mode 100644 chrome/app/meridian_strings.grdp
+ create mode 100644 chrome/browser/meridian/sidebar_handler_mac.mm
+
+diff --git a/chrome/app/chrome_command_ids.h b/chrome/app/chrome_command_ids.h
+index f526d4df2d..5af9ac4efd 100644
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -113,6 +113,18 @@
+ #endif
+ 
+ // Tab group Commands
++// Meridian (sidebar, spaces). Handled by meridian::SidebarHandler.
++#define IDC_MERIDIAN_TOGGLE_SIDEBAR   39700
++#define IDC_MERIDIAN_TOGGLE_PIN       39701
++#define IDC_MERIDIAN_NEXT_SPACE       39702
++#define IDC_MERIDIAN_PREVIOUS_SPACE   39703
++#define IDC_MERIDIAN_NEW_FOLDER       39704
++#define IDC_MERIDIAN_NEXT_TAB         39705
++#define IDC_MERIDIAN_PREVIOUS_TAB     39706
++// Spaces 1-9: IDC_MERIDIAN_SPACE_1 + n.
++#define IDC_MERIDIAN_SPACE_1          39710
++#define IDC_MERIDIAN_SPACE_9          39718
++
+ #define IDC_ADD_NEW_TAB_TO_GROUP      34100
+ #define IDC_CREATE_NEW_TAB_GROUP      34101
+ #define IDC_FOCUS_NEXT_TAB_GROUP      34102
+diff --git a/chrome/app/generated_resources.grd b/chrome/app/generated_resources.grd
+index a30c25ceba..59a88aea19 100644
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -292,6 +292,9 @@ are declared in tools/grit/grit_args.gni.
+       <!-- Glic specific strings -->
+       <part file="glic_strings.grdp" />
+ 
++      <!-- Meridian strings -->
++      <part file="meridian_strings.grdp" />
++
+       <!-- Global Media Controls specific strings -->
+       <part file="gmc_strings.grdp" />
+ 
+diff --git a/chrome/app/generated_resources.grd.gritdeps b/chrome/app/generated_resources.grd.gritdeps
+index c56cb13d3c..9fe50321ac 100644
+--- a/chrome/app/generated_resources.grd.gritdeps
++++ b/chrome/app/generated_resources.grd.gritdeps
+@@ -12,6 +12,7 @@ chrome/app/glic_strings.grdp
+ chrome/app/gmc_strings.grdp
+ chrome/app/media_live_preview_strings.grdp
+ chrome/app/media_router_strings.grdp
++chrome/app/meridian_strings.grdp
+ chrome/app/nearby_share_strings.grdp
+ chrome/app/notebooks_strings.grdp
+ chrome/app/os_settings_search_tag_strings.grdp
+diff --git a/chrome/app/meridian_strings.grdp b/chrome/app/meridian_strings.grdp
+new file mode 100644
+index 0000000000..5feb7cf676
+--- /dev/null
++++ b/chrome/app/meridian_strings.grdp
+@@ -0,0 +1,22 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Meridian strings (included from generated_resources.grd). -->
++<grit-part>
++  <message name="IDS_MERIDIAN_SPACES_MENU_MAC" desc="The Mac menu bar menu for Meridian spaces.">
++    Spaces
++  </message>
++  <message name="IDS_MERIDIAN_NEXT_SPACE_MAC" desc="Menu item: switch to the next Meridian space.">
++    Next Space
++  </message>
++  <message name="IDS_MERIDIAN_PREVIOUS_SPACE_MAC" desc="Menu item: switch to the previous Meridian space.">
++    Previous Space
++  </message>
++  <message name="IDS_MERIDIAN_TOGGLE_SIDEBAR_MAC" desc="Menu item: show or hide the Meridian sidebar.">
++    Toggle Sidebar
++  </message>
++  <message name="IDS_MERIDIAN_TOGGLE_PIN_MAC" desc="Menu item: pin the current tab to the space, or unpin it.">
++    Pin / Unpin Tab
++  </message>
++  <message name="IDS_MERIDIAN_NEW_FOLDER_MAC" desc="Menu item: a new folder for pinned tabs in the current space.">
++    New Folder
++  </message>
++</grit-part>
+diff --git a/chrome/browser/global_keyboard_shortcuts_mac.mm b/chrome/browser/global_keyboard_shortcuts_mac.mm
+index 4e41528d09..93ee619719 100644
+--- a/chrome/browser/global_keyboard_shortcuts_mac.mm
++++ b/chrome/browser/global_keyboard_shortcuts_mac.mm
+@@ -118,8 +118,9 @@ const std::vector<KeyboardShortcutData>& GetShortcutsNotPresentInMainMenu() {
+       {true,  true,  false, false, kVK_ANSI_LeftBracket,  IDC_SELECT_PREVIOUS_TAB},
+       {false, false, true,  false, kVK_PageDown,          IDC_SELECT_NEXT_TAB},
+       {false, false, true,  false, kVK_PageUp,            IDC_SELECT_PREVIOUS_TAB},
+-      {true,  false, false, true,  kVK_RightArrow,        IDC_SELECT_NEXT_TAB},
+-      {true,  false, false, true,  kVK_LeftArrow,         IDC_SELECT_PREVIOUS_TAB},
++      // Meridian: ⌘⌥←/→ switch spaces (menu items); ⌘⌥↑/↓ step tabs.
++      {true,  false, false, true,  kVK_DownArrow,         IDC_MERIDIAN_NEXT_TAB},
++      {true,  false, false, true,  kVK_UpArrow,           IDC_MERIDIAN_PREVIOUS_TAB},
+       {false, true,  true,  false, kVK_PageDown,          IDC_MOVE_TAB_NEXT},
+       {false, true,  true,  false, kVK_PageUp,            IDC_MOVE_TAB_PREVIOUS},
+ 
+@@ -143,12 +144,20 @@ const std::vector<KeyboardShortcutData>& GetShortcutsNotPresentInMainMenu() {
+       {true,  false, false, false, kVK_ANSI_9,            IDC_SELECT_LAST_TAB},
+       {true,  false, false, false, kVK_ANSI_Keypad9,      IDC_SELECT_LAST_TAB},
+ 
++      // Meridian: Ctrl-1..9 switch to space n.
++      {false, false, true,  false, kVK_ANSI_1,            IDC_MERIDIAN_SPACE_1},
++      {false, false, true,  false, kVK_ANSI_2,            IDC_MERIDIAN_SPACE_1 + 1},
++      {false, false, true,  false, kVK_ANSI_3,            IDC_MERIDIAN_SPACE_1 + 2},
++      {false, false, true,  false, kVK_ANSI_4,            IDC_MERIDIAN_SPACE_1 + 3},
++      {false, false, true,  false, kVK_ANSI_5,            IDC_MERIDIAN_SPACE_1 + 4},
++      {false, false, true,  false, kVK_ANSI_6,            IDC_MERIDIAN_SPACE_1 + 5},
++      {false, false, true,  false, kVK_ANSI_7,            IDC_MERIDIAN_SPACE_1 + 6},
++      {false, false, true,  false, kVK_ANSI_8,            IDC_MERIDIAN_SPACE_1 + 7},
++      {false, false, true,  false, kVK_ANSI_9,            IDC_MERIDIAN_SPACE_9},
++
+       {true,  true,  false, false, kVK_ANSI_M,            IDC_SHOW_AVATAR_MENU},
+       {true,  false, false, true,  kVK_ANSI_L,            IDC_SHOW_DOWNLOADS},
+-      {true,  true,  false, false, kVK_ANSI_C,            IDC_DEV_TOOLS_INSPECT},
+       {true,  false, false, true,  kVK_ANSI_C,            IDC_DEV_TOOLS_INSPECT},
+-      {true,  false, false, true,  kVK_DownArrow,         IDC_FOCUS_NEXT_PANE},
+-      {true,  false, false, true,  kVK_UpArrow,           IDC_FOCUS_PREVIOUS_PANE},
+       {true,  true,  false, true,  kVK_ANSI_A,            IDC_FOCUS_INACTIVE_POPUP_FOR_ACCESSIBILITY},
+       {true,  false, false, true,  kVK_ANSI_R,            IDC_SHOW_READING_MODE_KEYBOARD},
+     });
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 190147f607..d434e02859 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -37,6 +37,10 @@ source_set("meridian") {
+     "tab_data.cc",
+     "tab_data.h",
+   ]
++  if (is_mac) {
++    sources += [ "sidebar_handler_mac.mm" ]
++    frameworks = [ "AppKit.framework" ]
++  }
+   public_deps = [
+     ":mojo_bindings",
+     ":model",
+@@ -47,6 +51,7 @@ source_set("meridian") {
+     "//url",
+   ]
+   deps = [
++    "//chrome/app:command_ids",
+     "//chrome/browser/profiles:profile",
+     "//chrome/browser/sessions",
+     "//chrome/browser/ui/navigator",
+@@ -56,6 +61,8 @@ source_set("meridian") {
+     "//components/browser_apis/tab_strip/types",
+     "//components/sessions",
+     "//components/tabs:public",
++    "//ui/base",
++    "//ui/gfx",
+   ]
+ }
+ 
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index f5beb21a60..5ce28ec107 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -54,6 +54,22 @@ struct ItemPosition {
+   int32 index;
+ };
+ 
++// Keyboard commands the browser hands to the sidebar, which knows the order
++// of the active space's favorites, pinned tabs and Today.
++enum Command {
++  // arg: index (8 = last)
++  kSelectTab,
++  // arg: +1 / -1
++  kStepTab,
++  // arg: index
++  kSelectSpace,
++  // arg: +1 / -1
++  kStepSpace,
++  kTogglePin,
++  kToggleSidebar,
++  kNewFolder,
++};
++
+ interface SidebarHandlerFactory {
+   CreateSidebarHandler(pending_remote<SidebarPage> page,
+                        pending_receiver<SidebarHandler> handler);
+@@ -67,6 +83,8 @@ interface SidebarPage {
+   // ⌘T / File > New Tab: the command bar opens, and a tab opens only once
+   // something is picked (like Arc).
+   ShowCommandBar();
++
++  RunCommand(Command command, int32 arg);
+ };
+ 
+ interface SidebarHandler {
+@@ -97,4 +115,8 @@ interface SidebarHandler {
+   OpenItem(string item_id);
+   // Sends the item's live tab back to the home URL.
+   ResetItemToHome(string item_id);
++
++  // macOS: hides the window's traffic lights while the sidebar is hidden (they
++  // come back with it), like Arc.
++  SetWindowControlsVisible(bool visible);
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 8e0f28e02a..fca4018c88 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -8,8 +8,10 @@
+ #include <vector>
+ 
+ #include "base/no_destructor.h"
++#include "build/build_config.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/meridian/sidebar_service_factory.h"
+ #include "chrome/browser/meridian/tab_data.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -122,6 +124,64 @@ void SidebarHandler::Adopt(tabs::TabInterface* tab) {
+   TabData::Set(contents, service_->active_space_id(), std::string());
+ }
+ 
++// static
++bool SidebarHandler::HandleCommand(BrowserWindowInterface* browser,
++                                   int id) {
++  mojom::Command command;
++  int arg = 0;
++  if (id >= IDC_SELECT_TAB_0 && id <= IDC_SELECT_TAB_7) {
++    command = mojom::Command::kSelectTab;
++    arg = id - IDC_SELECT_TAB_0;
++  } else if (id >= IDC_MERIDIAN_SPACE_1 && id <= IDC_MERIDIAN_SPACE_9) {
++    command = mojom::Command::kSelectSpace;
++    arg = id - IDC_MERIDIAN_SPACE_1;
++  } else {
++    switch (id) {
++      case IDC_SELECT_LAST_TAB:
++        command = mojom::Command::kSelectTab;
++        arg = 8;
++        break;
++      case IDC_SELECT_NEXT_TAB:
++      case IDC_CYCLE_TO_NEXT_TAB:
++      case IDC_MERIDIAN_NEXT_TAB:
++        command = mojom::Command::kStepTab;
++        arg = 1;
++        break;
++      case IDC_SELECT_PREVIOUS_TAB:
++      case IDC_CYCLE_TO_PREV_TAB:
++      case IDC_MERIDIAN_PREVIOUS_TAB:
++        command = mojom::Command::kStepTab;
++        arg = -1;
++        break;
++      case IDC_MERIDIAN_NEXT_SPACE:
++        command = mojom::Command::kStepSpace;
++        arg = 1;
++        break;
++      case IDC_MERIDIAN_PREVIOUS_SPACE:
++        command = mojom::Command::kStepSpace;
++        arg = -1;
++        break;
++      case IDC_MERIDIAN_TOGGLE_PIN:
++        command = mojom::Command::kTogglePin;
++        break;
++      case IDC_MERIDIAN_TOGGLE_SIDEBAR:
++        command = mojom::Command::kToggleSidebar;
++        break;
++      case IDC_MERIDIAN_NEW_FOLDER:
++        command = mojom::Command::kNewFolder;
++        break;
++      default:
++        return false;
++    }
++  }
++  auto it = Handlers().find(browser);
++  if (it == Handlers().end() || !it->second->page_.is_connected()) {
++    return false;
++  }
++  it->second->page_->RunCommand(command, arg);
++  return true;
++}
++
+ void SidebarHandler::OnActiveTabChanged(tabs::TabInterface* tab) {
+   if (!tab) {
+     return;
+@@ -426,4 +486,8 @@ void SidebarHandler::ResetItemToHome(const std::string& item_id) {
+       std::string());
+ }
+ 
++#if !BUILDFLAG(IS_MAC)
++void SidebarHandler::SetWindowControlsVisible(bool visible) {}
++#endif
++
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 6e737c0d79..f7e405e17a 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -42,6 +42,11 @@ class SidebarHandler : public mojom::SidebarHandler,
+   // the window has no Meridian sidebar (the caller opens a tab as usual).
+   static bool ShowCommandBar(BrowserWindowInterface* browser);
+ 
++  // Handles the tab / space / pin commands (IDC_*) for `browser` through its
++  // sidebar. False if the command isn't one of them or the window has no
++  // Meridian sidebar.
++  static bool HandleCommand(BrowserWindowInterface* browser, int command_id);
++
+   // mojom::SidebarHandler:
+   void GetState(GetStateCallback callback) override;
+   void CreateSpace(const std::string& name,
+@@ -72,6 +77,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void SetFolderOpen(const std::string& item_id, bool open) override;
+   void OpenItem(const std::string& item_id) override;
+   void ResetItemToHome(const std::string& item_id) override;
++  void SetWindowControlsVisible(bool visible) override;
+ 
+   // SidebarService::Observer:
+   void OnSidebarChanged() override;
+diff --git a/chrome/browser/meridian/sidebar_handler_mac.mm b/chrome/browser/meridian/sidebar_handler_mac.mm
+new file mode 100644
+index 0000000000..24cf1032a1
+--- /dev/null
++++ b/chrome/browser/meridian/sidebar_handler_mac.mm
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include <AppKit/AppKit.h>
++
++#include "chrome/browser/meridian/sidebar_handler.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "ui/base/base_window.h"
++#include "ui/gfx/native_ui_types.h"
++
++namespace meridian {
++
++void SidebarHandler::SetWindowControlsVisible(bool visible) {
++  NSWindow* window =
++      browser_->GetWindow()->GetNativeWindow().GetNativeNSWindow();
++  for (NSWindowButton button :
++       {NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton}) {
++    [window standardWindowButton:button].hidden = !visible;
++  }
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/resources/webui_browser/app.css b/chrome/browser/resources/webui_browser/app.css
+index d432877066..9bd3ac152d 100644
+--- a/chrome/browser/resources/webui_browser/app.css
++++ b/chrome/browser/resources/webui_browser/app.css
+@@ -224,6 +224,11 @@ content-region {
+   box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.12), 0 2px 10px rgba(0, 0, 0, 0.08);
+ }
+ 
++/* Without a panel, no gap after the page: the right edge matches the bottom. */
++content-region:not([showing-side-panel]) + side-panel {
++  display: none;
++}
++
+ side-panel {
+   border-radius: var(--meridian-radius);
+   overflow: hidden;
+@@ -233,3 +238,49 @@ side-panel {
+ cr-icon-button[hidden] {
+   display: none;
+ }
++
++/* ⌘S: the sidebar hides; hovering the window edge slides it back over the
++ * page as a floating card (Electron: body.sidebar-hidden). */
++#edgeHotzone {
++  display: none;
++  position: absolute;
++  top: 0;
++  bottom: 0;
++  left: 0;
++  width: 8px;
++  z-index: 20;
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
++}
++
++:host([sidebar-hidden]) #edgeHotzone {
++  display: block;
++}
++
++:host([sidebar-hidden]) #sidebar {
++  position: absolute;
++  top: var(--meridian-gap);
++  bottom: var(--meridian-gap);
++  left: var(--meridian-gap);
++  z-index: 30;
++  border-radius: 12px;
++  background: color-mix(in srgb, var(--meridian-surface) 82%, var(--meridian-space));
++  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.25);
++  transform: translateX(calc(-100% - 20px));
++  opacity: 0;
++  transition: transform 0.22s ease, opacity 0.22s ease;
++}
++
++:host([sidebar-hidden][sidebar-peek]) #sidebar {
++  transform: none;
++  opacity: 1;
++}
++
++:host([sidebar-hidden]) #main {
++  padding: var(--meridian-gap);
++}
++
++/* Sliding away (and hidden), the sidebar must not catch the pointer. */
++:host([sidebar-hidden]:not([sidebar-peek])) #sidebar {
++  pointer-events: none;
++}
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 1a87f95e7c..a7f3504394 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -9,7 +9,8 @@ import type {WebuiBrowserAppElement} from './app.js';
+ export function getHtml(this: WebuiBrowserAppElement) {
+   return html`<!--_html_template_start_-->
+ <div id="rootContainer">
+-  <div id="sidebar">
++  <div id="edgeHotzone" @mouseenter="${this.onEdgeHotzoneMouseenter_}"></div>
++  <div id="sidebar" @mouseleave="${this.onSidebarMouseleave_}">
+     <div id="sidebarTop">
+ <if expr="not is_macosx">
+       <div class="captionButtonsDiv">
+@@ -57,7 +58,8 @@ export function getHtml(this: WebuiBrowserAppElement) {
+     <meridian-sidebar id="tabstrip" @tab-added="${this.onTabAdded_}"
+         @tab-closed="${this.onTabClosed_}" @tab-updated="${this.onTabUpdated_}"
+         @meridian-space-changed="${this.onMeridianSpaceChanged_}"
+-        @meridian-show-command-bar="${this.onMeridianShowCommandBar_}">
++        @meridian-show-command-bar="${this.onMeridianShowCommandBar_}"
++        @meridian-toggle-sidebar="${this.onMeridianToggleSidebar_}">
+       <cr-icon-button slot="bottom-start" id="appMenuButton"
+           iron-icon="cr:more-vert" title="$i18n{appMenuTooltip}"
+           @click="${this.onAppMenuClick_}">
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index c438337f62..197b7e0e3a 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -21,6 +21,7 @@ import {loadTimeData} from '//resources/js/load_time_data.js';
+ import type {Tab as TabData} from '/tab_strip_api/tab_strip_api_data_model.mojom-webui.js';
+ import {TrackedElementManager} from 'chrome://resources/js/tracked_element/tracked_element_manager.js';
+ import {CrLitElement} from 'chrome://resources/lit/v3_0/lit.rollup.js';
++import type {PropertyValues} from 'chrome://resources/lit/v3_0/lit.rollup.js';
+ 
+ import {getCss} from './app.css.js';
+ import {getHtml} from './app.html.js';
+@@ -31,6 +32,16 @@ import type {TabAdded, TabClosed, TabUpdated} from './tab_strip/events.js';
+ import type {MeridianCommandBarElement} from './meridian/command_bar.js';
+ import type {MeridianSidebarElement} from './meridian/sidebar.js';
+ 
++const SIDEBAR_HIDDEN_KEY = 'meridian.sidebarHidden';
++
++function readSidebarHidden(): boolean {
++  try {
++    return localStorage.getItem(SIDEBAR_HIDDEN_KEY) === '1';
++  } catch {
++    return false;
++  }
++}
++
+ // "github.com/foo" -> "github.com"; Arc shows just the site.
+ function hostForPill(url: string): string {
+   if (!url) {
+@@ -87,6 +98,8 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       locationIcon_: {state: true, type: String},
+       tabStripInset_: {state: true, type: Number},
+       urlHost_: {state: true, type: String},
++      sidebarHidden_: {type: Boolean, reflect: true, attribute: 'sidebar-hidden'},
++      sidebarPeek_: {type: Boolean, reflect: true, attribute: 'sidebar-peek'},
+       inactive_: {
+         type: Boolean,
+         reflect: true,
+@@ -112,6 +125,9 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   // The active tab's URL, and what the sidebar's URL pill shows of it.
+   private url_: string = '';
+   protected accessor urlHost_: string = '';
++  // ⌘S hides the sidebar; it slides back over the page from the window edge.
++  protected accessor sidebarHidden_: boolean = readSidebarHidden();
++  protected accessor sidebarPeek_: boolean = false;
+ 
+   constructor() {
+     super();
+@@ -370,6 +386,35 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.$.commandBar.show(/*newTab=*/ false, this.url_);
+   }
+ 
++  override updated(changed: PropertyValues<this>) {
++    super.updated(changed);
++    if (changed.has('sidebarHidden_' as keyof WebuiBrowserAppElement) ||
++        changed.has('sidebarPeek_' as keyof WebuiBrowserAppElement)) {
++      this.$.tabstrip.setWindowControlsVisible(
++          !this.sidebarHidden_ || this.sidebarPeek_);
++    }
++  }
++
++  protected onMeridianToggleSidebar_() {
++    this.sidebarHidden_ = !this.sidebarHidden_;
++    this.sidebarPeek_ = false;
++    try {
++      localStorage.setItem(SIDEBAR_HIDDEN_KEY, this.sidebarHidden_ ? '1' : '');
++    } catch {
++      // Storage unavailable: the choice lasts until the window closes.
++    }
++  }
++
++  protected onEdgeHotzoneMouseenter_() {
++    if (this.sidebarHidden_) {
++      this.sidebarPeek_ = true;
++    }
++  }
++
++  protected onSidebarMouseleave_() {
++    this.sidebarPeek_ = false;
++  }
++
+   protected onMeridianShowCommandBar_() {
+     this.$.commandBar.show(/*newTab=*/ true, '');
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index eb45f62e17..e0a10d1b5c 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -22,7 +22,7 @@ import type {NodeId} from '/tab_strip_api/tab_strip_api_types.mojom-webui.js';
+ import {TabStripObservation} from '/tab_strip_api/tab_strip_observation.js';
+ import type {TabStripObserver} from '/tab_strip_api/tab_strip_observer.js';
+ 
+-import {browserProxyFactory as sidebarProxyFactory} from '../sidebar.mojom-webui.js';
++import {browserProxyFactory as sidebarProxyFactory, Command} from '../sidebar.mojom-webui.js';
+ import type {Item, SidebarHandlerInterface, SidebarState, Space} from '../sidebar.mojom-webui.js';
+ import type {TabAdded, TabClosed, TabUpdated} from '../tab_strip/events.js';
+ 
+@@ -105,6 +105,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+   private observation_: TabStripObservation|undefined;
+   private listenerId_: number|null = null;
+   private commandBarListenerId_: number|null = null;
++  private commandListenerId_: number|null = null;
+ 
+   constructor() {
+     super();
+@@ -116,6 +117,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.commandBarListenerId_ =
+         proxy.callbackRouter.showCommandBar.addListener(
+             () => this.fire('meridian-show-command-bar'));
++    this.commandListenerId_ = proxy.callbackRouter.runCommand.addListener(
++        (command: Command, arg: number) => this.runCommand(command, arg));
+   }
+ 
+   override connectedCallback() {
+@@ -130,13 +133,15 @@ export class MeridianSidebarElement extends CrLitElement implements
+   override disconnectedCallback() {
+     super.disconnectedCallback();
+     this.observation_ = undefined;
+-    for (const id of [this.listenerId_, this.commandBarListenerId_]) {
++    for (const id of [this.listenerId_, this.commandBarListenerId_,
++                      this.commandListenerId_]) {
+       if (id !== null) {
+         sidebarProxyFactory.getInstance().callbackRouter.removeListener(id);
+       }
+     }
+     this.listenerId_ = null;
+     this.commandBarListenerId_ = null;
++    this.commandListenerId_ = null;
+     document.removeEventListener('mousedown', this.onDocumentMouseDown_, true);
+     window.removeEventListener('blur', this.closeMenu_);
+   }
+@@ -312,6 +317,113 @@ export class MeridianSidebarElement extends CrLitElement implements
+         encodeURIComponent(url)}`;
+   }
+ 
++  // ----------------------------------------------------------- commands
++
++  // What ⌘1-9 and ⌃Tab walk through, top to bottom: favorites, the space's
++  // pinned items (not inside collapsed folders), then Today.
++  private navOrder_(): Array<{item?: Item, tab?: Tab}> {
++    const space = this.activeSpace();
++    if (!space || !this.state_) {
++      return [];
++    }
++    const order: Array<{item?: Item, tab?: Tab}> =
++        this.state_.favorites.filter(i => !i.isFolder).map(item => ({item}));
++    const walk = (items: Item[]) => {
++      for (const item of items) {
++        if (item.isFolder) {
++          if (item.open) {
++            walk(item.children);
++          }
++        } else {
++          order.push({item});
++        }
++      }
++    };
++    walk(space.pinned);
++    return order.concat(this.todayTabs().map(tab => ({tab})));
++  }
++
++  private activeTab_(): Tab|null {
++    for (const tab of this.tabs_.values()) {
++      if (tab.isActive) {
++        return tab;
++      }
++    }
++    return null;
++  }
++
++  private openEntry_(entry: {item?: Item, tab?: Tab}) {
++    if (entry.tab) {
++      this.tabStripService_.activateTab(entry.tab.id);
++    } else if (entry.item) {
++      this.handler_.openItem(entry.item.id);
++    }
++  }
++
++  runCommand(command: Command, arg: number) {
++    const spaces = this.state_?.spaces || [];
++    const space = this.activeSpace();
++    switch (command) {
++      case Command.kSelectTab: {
++        const order = this.navOrder_();
++        const entry = arg >= 8 ? order[order.length - 1] :
++                                 order[arg] || order[order.length - 1];
++        if (entry) {
++          this.openEntry_(entry);
++        }
++        break;
++      }
++      case Command.kStepTab: {
++        const order = this.navOrder_();
++        if (!order.length) {
++          break;
++        }
++        const active = this.activeTab_();
++        const live = (e: {item?: Item, tab?: Tab}) =>
++            e.tab || (e.item ? this.liveTab(e.item.id) : null);
++        const at = order.findIndex(e => !!active && live(e)?.id === active.id);
++        const next = (at + arg + order.length) % order.length;
++        this.openEntry_(order[at < 0 ? 0 : next]!);
++        break;
++      }
++      case Command.kSelectSpace:
++        if (spaces[arg]) {
++          this.handler_.activateSpace(spaces[arg].id);
++        }
++        break;
++      case Command.kStepSpace: {
++        const at = spaces.findIndex(s => s.id === space?.id);
++        const next = spaces[(at + arg + spaces.length) % spaces.length];
++        if (next && spaces.length > 1) {
++          this.handler_.activateSpace(next.id);
++        }
++        break;
++      }
++      case Command.kTogglePin: {
++        const active = this.activeTab_();
++        if (!active || !space) {
++          break;
++        }
++        const info = this.state_?.tabs.find(t => t.tabId === active.id);
++        if (info?.itemId) {
++          this.handler_.removeItem(info.itemId);
++        } else {
++          this.handler_.pinTab(
++              active.id, {container: space.id, parentId: '', index: -1});
++        }
++        break;
++      }
++      case Command.kToggleSidebar:
++        this.fire('meridian-toggle-sidebar');
++        break;
++      case Command.kNewFolder:
++        if (space) {
++          this.addFolder_(space.id, '');
++        }
++        break;
++    }
++  }
++
+   // ------------------------------------------------------------ actions
+ 
+   onTabMouseDown(e: MouseEvent, tab: Tab) {
+@@ -349,6 +461,10 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.fire('meridian-show-command-bar');
+   }
+ 
++  setWindowControlsVisible(visible: boolean) {
++    this.handler_.setWindowControlsVisible(visible);
++  }
++
+   startRenaming(id: string) {
+     this.renaming_ = id;
+   }
+diff --git a/chrome/browser/ui/browser_command_controller.cc b/chrome/browser/ui/browser_command_controller.cc
+index 492c6de7fd..76adcefdd6 100644
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -698,6 +698,12 @@ void BrowserCommandController::HandleCommandWithDisposition(
+   //    E(kActionFoo, IDC_FOO)
+   // 2. Wire callback in BrowserActions::Initialize...() (browser_actions.cc).
+   // ===========================================================================
++  // Meridian: tab and space shortcuts follow the sidebar (the active space's
++  // favorites, pinned tabs and Today), not the raw tab strip.
++  if (meridian::SidebarHandler::HandleCommand(browser_, id)) {
++    return;
++  }
++
+   // The order of commands in this switch statement must match the function
+   // declaration order in browser.h!
+   switch (id) {
+@@ -2058,6 +2064,16 @@ void BrowserCommandController::InitCommandState() {
+                                          supports_tabs);
+   command_updater_->UpdateCommandEnabled(IDC_CYCLE_TO_NEXT_TAB, supports_tabs);
+   command_updater_->UpdateCommandEnabled(IDC_CYCLE_TO_PREV_TAB, supports_tabs);
++  for (int meridian_command :
++       {IDC_MERIDIAN_TOGGLE_SIDEBAR, IDC_MERIDIAN_TOGGLE_PIN,
++        IDC_MERIDIAN_NEXT_SPACE, IDC_MERIDIAN_PREVIOUS_SPACE,
++        IDC_MERIDIAN_NEW_FOLDER, IDC_MERIDIAN_NEXT_TAB,
++        IDC_MERIDIAN_PREVIOUS_TAB}) {
++    command_updater_->UpdateCommandEnabled(meridian_command, supports_tabs);
++  }
++  for (int i = IDC_MERIDIAN_SPACE_1; i <= IDC_MERIDIAN_SPACE_9; ++i) {
++    command_updater_->UpdateCommandEnabled(i, supports_tabs);
++  }
+   command_updater_->UpdateCommandEnabled(IDC_MOVE_TAB_NEXT, supports_tabs);
+   command_updater_->UpdateCommandEnabled(IDC_MOVE_TAB_PREVIOUS, supports_tabs);
+   command_updater_->UpdateCommandEnabled(IDC_SELECT_TAB_0, supports_tabs);
+diff --git a/chrome/browser/ui/cocoa/accelerators_cocoa.mm b/chrome/browser/ui/cocoa/accelerators_cocoa.mm
+index 7182077016..45c4c60e86 100644
+--- a/chrome/browser/ui/cocoa/accelerators_cocoa.mm
++++ b/chrome/browser/ui/cocoa/accelerators_cocoa.mm
+@@ -46,12 +46,21 @@ const struct AcceleratorMapping {
+     {IDC_PASTE, ui::EF_COMMAND_DOWN, ui::VKEY_V},
+     {IDC_PRINT, ui::EF_COMMAND_DOWN, ui::VKEY_P},
+     {IDC_RESTORE_TAB, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN, ui::VKEY_T},
+-    {IDC_SAVE_PAGE, ui::EF_COMMAND_DOWN, ui::VKEY_S},
++    // Meridian: ⌘S hides the sidebar and ⌘D pins, like Arc; Save Page and
++    // Bookmark This Tab stay in the menus without a shortcut.
++    {IDC_MERIDIAN_TOGGLE_SIDEBAR, ui::EF_COMMAND_DOWN, ui::VKEY_S},
++    {IDC_MERIDIAN_TOGGLE_PIN, ui::EF_COMMAND_DOWN, ui::VKEY_D},
++    {IDC_MERIDIAN_NEXT_SPACE, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN,
++     ui::VKEY_RIGHT},
++    {IDC_MERIDIAN_PREVIOUS_SPACE, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN,
++     ui::VKEY_LEFT},
++    {IDC_MERIDIAN_NEW_FOLDER,
++     ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN | ui::EF_SHIFT_DOWN, ui::VKEY_N},
++    {IDC_COPY_URL, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN, ui::VKEY_C},
+     {IDC_SHOW_BOOKMARK_BAR, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN,
+      ui::VKEY_B},
+     {IDC_SHOW_BOOKMARK_MANAGER, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN,
+      ui::VKEY_B},
+-    {IDC_BOOKMARK_THIS_TAB, ui::EF_COMMAND_DOWN, ui::VKEY_D},
+     {IDC_SHOW_DOWNLOADS, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN, ui::VKEY_J},
+     {IDC_SHOW_HISTORY, ui::EF_COMMAND_DOWN, ui::VKEY_Y},
+     {IDC_VIEW_SOURCE, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN, ui::VKEY_U},
+diff --git a/chrome/browser/ui/cocoa/main_menu_builder.mm b/chrome/browser/ui/cocoa/main_menu_builder.mm
+index 0476742487..e8d5e9fcd9 100644
+--- a/chrome/browser/ui/cocoa/main_menu_builder.mm
++++ b/chrome/browser/ui/cocoa/main_menu_builder.mm
+@@ -293,6 +293,9 @@ NSMenuItem* BuildViewMenu(NSApplication* nsapp,
+       Item(IDS_VIEW_MENU_MAC)
+           .tag(IDC_VIEW_MENU)
+           .submenu({
++              Item(IDS_MERIDIAN_TOGGLE_SIDEBAR_MAC)
++                  .command_id(IDC_MERIDIAN_TOGGLE_SIDEBAR)
++                  .remove_if(is_pwa),
+               Item(IDS_BOOKMARK_BAR_ALWAYS_SHOW_MAC)
+                   .command_id(IDC_SHOW_BOOKMARK_BAR)
+                   .remove_if(is_pwa),
+@@ -504,6 +507,26 @@ NSMenuItem* BuildWindowMenu(NSApplication* nsapp,
+   return item;
+ }
+ 
++NSMenuItem* BuildSpacesMenu(NSApplication* nsapp,
++                            id app_delegate,
++                            const std::u16string& product_name,
++                            bool is_pwa,
++                            bool is_rtl) {
++  if (is_pwa) {
++    return nil;
++  }
++  // clang-format off
++  return Item(IDS_MERIDIAN_SPACES_MENU_MAC)
++      .submenu({
++          Item(IDS_MERIDIAN_NEXT_SPACE_MAC)
++              .command_id(IDC_MERIDIAN_NEXT_SPACE),
++          Item(IDS_MERIDIAN_PREVIOUS_SPACE_MAC)
++              .command_id(IDC_MERIDIAN_PREVIOUS_SPACE),
++      })
++      .Build();
++  // clang-format on
++}
++
+ NSMenuItem* BuildTabMenu(NSApplication* nsapp,
+                          id app_delegate,
+                          const std::u16string& product_name,
+@@ -540,18 +563,13 @@ NSMenuItem* BuildTabMenu(NSApplication* nsapp,
+                   .command_id(IDC_MUTE_TARGET_SITE)
+                   .is_alternate()
+                   .key_equivalent(@"", NSEventModifierFlagOption),
+-              Item(IDS_PIN_TAB_MAC)
+-                  .command_id(IDC_WINDOW_PIN_TAB),
+-              Item(IDS_PIN_TARGET_TAB_MAC)
+-                  .command_id(IDC_PIN_TARGET_TAB)
+-                  .is_alternate()
+-                  .key_equivalent(@"", NSEventModifierFlagOption),
+-              Item(IDS_GROUP_TAB_MAC)
+-                  .command_id(IDC_WINDOW_GROUP_TAB),
+-              Item(IDS_GROUP_TARGET_TAB_MAC)
+-                  .command_id(IDC_GROUP_TARGET_TAB)
+-                  .is_alternate()
+-                  .key_equivalent(@"", NSEventModifierFlagOption),
++              // Meridian: pins go to the space (no tab groups).
++              Item(IDS_MERIDIAN_TOGGLE_PIN_MAC)
++                  .command_id(IDC_MERIDIAN_TOGGLE_PIN),
++              Item(IDS_MERIDIAN_NEW_FOLDER_MAC)
++                  .command_id(IDC_MERIDIAN_NEW_FOLDER),
++              Item(IDS_COPY_URL)
++                  .command_id(IDC_COPY_URL),
+               Item(IDS_TAB_CXMENU_CLOSEOTHERTABS)
+                   .command_id(IDC_WINDOW_CLOSE_OTHER_TABS),
+               Item(is_rtl ? IDS_TAB_CXMENU_CLOSETABSTOLEFT
+@@ -627,6 +645,7 @@ NSMenu* BuildMainMenu(NSApplication* nsapp,
+            &BuildHistoryMenu,
+            &BuildBookmarksMenu,
+            &BuildProfilesMenu,
++           &BuildSpacesMenu,
+            &BuildTabMenu,
+            &BuildWindowMenu,
+            &BuildHelpMenu,
