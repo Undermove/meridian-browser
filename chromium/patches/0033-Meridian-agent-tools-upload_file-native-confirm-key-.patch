@@ -1,0 +1,440 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 28 Oct 2026 10:26:03 +0400
+Subject: [PATCH 34/34] Meridian agent tools: upload_file (native confirm, key
+ files refused, DOM.setFileInputFiles)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/agent/agent_page.js   |  33 ++
+ .../browser/meridian/agent/agent_service.cc   | 283 ++++++++++++++++++
+ chrome/browser/meridian/agent/agent_service.h |   7 +
+ .../browser/meridian/agent/agent_tools.json   |  27 ++
+ 4 files changed, 350 insertions(+)
+
+diff --git a/chrome/browser/meridian/agent/agent_page.js b/chrome/browser/meridian/agent/agent_page.js
+index 0c62174105..70b36cb636 100644
+--- a/chrome/browser/meridian/agent/agent_page.js
++++ b/chrome/browser/meridian/agent/agent_page.js
+@@ -248,6 +248,39 @@
+       return {scrollY: Math.round(scrollY), height: document.documentElement.scrollHeight, viewport: innerHeight};
+     },
+ 
++    // upload_file: marks the <input type=file> to fill (by index, selector,
++    // or the only one on the page) for the browser to find through DevTools.
++    markFileInput(spec) {
++      let el = null;
++      if (Number.isInteger(spec.element_index)) el = (window.__meridianEls || [])[spec.element_index];
++      else if (spec.selector) {
++        try { el = deepOne(spec.selector); } catch (e) { return {error: 'invalid selector'}; }
++      }
++      const files = deepAll('input[type=file]');
++      const isFile = (e) => e && e.tagName === 'INPUT' && e.type === 'file';
++      if (el && !isFile(el)) {
++        el = (el.shadowRoot && el.shadowRoot.querySelector('input[type=file]')) || (el.querySelector && el.querySelector('input[type=file]')) ||
++            (el.closest && el.closest('label') && el.closest('label').querySelector('input[type=file]')) || null;
++      }
++      if (!el && !spec.selector && !Number.isInteger(spec.element_index)) el = files.length === 1 ? files[0] : null;
++      if (!isFile(el)) {
++        return {error: files.length ? 'pick the file field: element_index or selector of an <input type=file> (' + files.length + ' on the page)' : 'no file field on this page — open the attach/upload dialog first'};
++      }
++      if (el.disabled) return {error: 'that file field is disabled'};
++      const mark = Math.random().toString(36).slice(2);
++      el.setAttribute('data-meridian-upload', mark);
++      window.__meridianUpload = el;
++      const lab = el.getAttribute('aria-label') || (el.closest('label') && el.closest('label').innerText) || el.getAttribute('name') || el.getAttribute('accept') || '';
++      return {mark, label: clip(lab, 80), multiple: el.multiple, accept: el.accept || ''};
++    },
++
++    unmarkFileInput() {
++      const el = window.__meridianUpload;
++      if (el) el.removeAttribute('data-meridian-upload');
++      window.__meridianUpload = null;
++      return true;
++    },
++
+     has(text, selector) {
+       if (selector) {
+         try { if (deepOne(selector)) return true; } catch { return 'bad-selector'; }
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index febf3a8ae6..a7424c499d 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -11,6 +11,13 @@
+ #include <utility>
+ 
+ #include "base/base64.h"
++#include "base/files/file_util.h"
++#include "base/path_service.h"
++#include "base/task/thread_pool.h"
++#include "chrome/browser/meridian/workbench/native_dialog.h"
++#include "content/public/browser/devtools_agent_host.h"
++#include "content/public/browser/devtools_agent_host_client.h"
++#include "third_party/re2/src/re2/re2.h"
+ #include "base/functional/bind.h"
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
+@@ -177,6 +184,165 @@ void SendKey(content::RenderWidgetHost* widget,
+   }
+ }
+ 
++// upload_file: the file the person is asked about, or why it can't go.
++// Blocking.
++base::expected<std::pair<base::FilePath, int64_t>, std::string> CheckUpload(
++    const std::string& raw,
++    const base::FilePath& user_data) {
++  base::FilePath path(raw);
++  if (!path.IsAbsolute()) {
++    return base::unexpected("path must be an absolute path to a file");
++  }
++  base::File::Info info;
++  if (!base::GetFileInfo(path, &info)) {
++    return base::unexpected("no such file");
++  }
++  if (info.is_directory) {
++    return base::unexpected("not a file");
++  }
++  if (info.size > 1024LL * 1024 * 1024) {
++    return base::unexpected("file is over 1 GB");
++  }
++  base::FilePath real = base::MakeAbsoluteFilePath(path);
++  base::FilePath home = base::GetHomeDir();
++  std::vector<base::FilePath> forbidden = {
++      home.Append(".ssh"),         home.Append(".aws"),
++      home.Append(".gnupg"),       home.Append(".config/gh"),
++      home.Append("Library/Keychains"), home.Append(".docker"),
++      home.Append(".kube"),        base::MakeAbsoluteFilePath(user_data)};
++  bool secret = real.empty() ||
++                std::ranges::any_of(forbidden, [&](const base::FilePath& d) {
++                  return !d.empty() && (real == d || d.IsParent(real));
++                }) ||
++                RE2::PartialMatch(real.value(),
++                                  "(?i)(^|/)\\.env(\\.|$)|\\.(pem|key|p12|pfx|"
++                                  "keychain-db)$");
++  if (secret) {
++    return base::unexpected(
++        "that file holds keys or credentials; agents can’t upload it");
++  }
++  return std::make_pair(real, info.size);
++}
++
++// Puts a file into the marked <input type=file> through DevTools
++// (DOM.setFileInputFiles), then detaches. Deletes itself.
++class FileInputSetter : public content::DevToolsAgentHostClient {
++ public:
++  static void Start(content::WebContents* contents,
++                    const std::string& mark,
++                    const base::FilePath& file,
++                    base::OnceCallback<void(std::string error)> done) {
++    auto* self = new FileInputSetter(mark, file, std::move(done));
++    self->host_ = content::DevToolsAgentHost::GetOrCreateFor(contents);
++    if (!self->host_->AttachClient(self)) {
++      self->host_ = nullptr;
++      return self->Finish("couldn't reach the page");
++    }
++    self->Send("DOM.getDocument",
++               base::DictValue().Set("depth", -1).Set("pierce", true));
++  }
++
++  // content::DevToolsAgentHostClient:
++  void DispatchProtocolMessage(content::DevToolsAgentHost*,
++                               base::span<const uint8_t> message) override {
++    std::optional<base::Value> v = base::JSONReader::Read(
++        std::string_view(reinterpret_cast<const char*>(message.data()),
++                         message.size()),
++        0);
++    if (!v || !v->is_dict() || v->GetDict().FindInt("id") != id_) {
++      return;  // events
++    }
++    if (const base::DictValue* error = v->GetDict().FindDict("error")) {
++      const std::string* m = error->FindString("message");
++      return Finish(m ? *m : "DevTools error");
++    }
++    const base::DictValue* result = v->GetDict().FindDict("result");
++    if (!result) {
++      return Finish("DevTools error");
++    }
++    switch (step_) {
++      case 1:
++        Send("DOM.performSearch",
++             base::DictValue()
++                 .Set("query", "[data-meridian-upload=\"" + mark_ + "\"]")
++                 .Set("includeUserAgentShadowDOM", false));
++        break;
++      case 2: {
++        const std::string* search = result->FindString("searchId");
++        if (!search || result->FindInt("resultCount").value_or(0) < 1) {
++          return Finish(
++              "the file field disappeared — call get_interactive_elements "
++              "again");
++        }
++        search_ = *search;
++        Send("DOM.getSearchResults", base::DictValue()
++                                         .Set("searchId", search_)
++                                         .Set("fromIndex", 0)
++                                         .Set("toIndex", 1));
++        break;
++      }
++      case 3: {
++        const base::ListValue* ids = result->FindList("nodeIds");
++        if (!ids || ids->empty() || !(*ids)[0].is_int()) {
++          return Finish("the file field disappeared");
++        }
++        Send("DOM.setFileInputFiles",
++             base::DictValue()
++                 .Set("files", base::ListValue().Append(file_.value()))
++                 .Set("nodeId", (*ids)[0].GetInt()));
++        break;
++      }
++      default:
++        Finish(std::string());
++    }
++  }
++  void AgentHostClosed(content::DevToolsAgentHost*) override {
++    host_ = nullptr;
++    Finish("the tab is gone");
++  }
++  bool MayReadLocalFiles() override { return true; }
++
++ private:
++  friend class base::DeleteHelper<FileInputSetter>;
++
++  FileInputSetter(std::string mark,
++                  base::FilePath file,
++                  base::OnceCallback<void(std::string)> done)
++      : mark_(std::move(mark)), file_(std::move(file)), done_(std::move(done)) {}
++  ~FileInputSetter() override = default;
++
++  void Send(const std::string& method, base::DictValue params) {
++    ++step_;
++    std::string json =
++        base::WriteJson(base::DictValue()
++                            .Set("id", ++id_)
++                            .Set("method", method)
++                            .Set("params", std::move(params)))
++            .value_or("{}");
++    host_->DispatchProtocolMessage(this, base::as_byte_span(json));
++  }
++
++  void Finish(std::string error) {
++    if (host_) {
++      host_->DetachClient(this);
++      host_ = nullptr;
++    }
++    // Not from inside the host's dispatch.
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(done_), std::move(error)));
++    base::SequencedTaskRunner::GetCurrentDefault()->DeleteSoon(FROM_HERE,
++                                                               this);
++  }
++
++  std::string mark_;
++  base::FilePath file_;
++  base::OnceCallback<void(std::string)> done_;
++  scoped_refptr<content::DevToolsAgentHost> host_;
++  int id_ = 0;
++  int step_ = 0;
++  std::string search_;
++};
++
+ }  // namespace
+ 
+ // One tool call in flight.
+@@ -341,6 +507,7 @@ void AgentService::Run(std::unique_ptr<Call> call) {
+       {"scroll", &AgentService::Scroll},
+       {"wait_for", &AgentService::WaitFor},
+       {"organize_tab", &AgentService::OrganizeTab},
++      {"upload_file", &AgentService::UploadFile},
+       {"split_view", &AgentService::SplitView},
+       {"create_space", &AgentService::CreateSpace},
+       {"run_javascript", &AgentService::RunJavaScript},
+@@ -1449,6 +1616,122 @@ void AgentService::OrganizeTab(std::unique_ptr<Call> call) {
+           weak_factory_.GetWeakPtr(), handle, action));
+ }
+ 
++void AgentService::UploadFile(std::unique_ptr<Call> call) {
++  tabs::TabInterface* tab = TabFor(*call);
++  if (!tab) {
++    return call->Fail("no such tab");
++  }
++  Activity(*call, tab);
++  std::string raw = call->StrOr("path", "");
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock()},
++      base::BindOnce(&CheckUpload, raw, profile_->GetPath().DirName()),
++      base::BindOnce(&AgentService::UploadChecked, weak_factory_.GetWeakPtr(),
++                     tab->GetHandle(), std::move(call)));
++}
++
++void AgentService::UploadChecked(
++    tabs::TabHandle handle,
++    std::unique_ptr<Call> call,
++    base::expected<std::pair<base::FilePath, int64_t>, std::string> file) {
++  tabs::TabInterface* tab = handle.Get();
++  if (!tab) {
++    return call->Fail("the tab is gone");
++  }
++  if (!file.has_value()) {
++    return call->Fail(file.error());
++  }
++  base::DictValue spec;
++  for (const char* key : {"element_index", "selector"}) {
++    if (const base::Value* v = call->input.Find(key)) {
++      spec.Set(key, v->Clone());
++    }
++  }
++  RunInPage(
++      tab->GetContents(),
++      "__meridianAgent.markFileInput(" + base::WriteJson(spec).value_or("{}") +
++          ")",
++      base::BindOnce(
++          [](base::WeakPtr<AgentService> self, tabs::TabHandle handle,
++             std::unique_ptr<Call> call, base::FilePath real, int64_t size,
++             base::Value target) {
++            tabs::TabInterface* tab = handle.Get();
++            if (!self || !tab || !target.is_dict()) {
++              return call->Fail("couldn't look at the page");
++            }
++            const base::DictValue& t = target.GetDict();
++            if (const std::string* error = t.FindString("error")) {
++              return call->Fail(*error);
++            }
++            std::string mark = *t.FindString("mark");
++            std::string label = t.FindString("label") && !t.FindString("label")->empty()
++                                    ? *t.FindString("label")
++                                    : "file field";
++            std::string mb =
++                size >= 1024 * 1024
++                    ? base::StringPrintf("%.1f MB", size / 1024.0 / 1024.0)
++                    : base::NumberToString(
++                          std::max<int64_t>(1, (size + 512) / 1024)) +
++                          " KB";
++            content::WebContents* contents = tab->GetContents();
++            std::string host(contents->GetLastCommittedURL().host());
++            // Always asked, whatever the access level: a local file leaves
++            // the computer.
++            workbench::AskNative(
++                contents,
++                "Upload a file from your computer to " + host + "?",
++                (call->client.empty() ? std::string("An agent") : call->client) +
++                    " wants to upload:\n" + real.value() + "\nSize: " + mb +
++                    "\nInto: “" + label + "”",
++                {"Don’t upload", "Upload this file"},
++                base::BindOnce(
++                    [](base::WeakPtr<AgentService> self,
++                       tabs::TabHandle handle, std::unique_ptr<Call> call,
++                       std::string mark, base::FilePath real, std::string mb,
++                       std::string label, int choice) {
++                      tabs::TabInterface* tab = handle.Get();
++                      if (!self || !tab) {
++                        return call->Fail("the tab is gone");
++                      }
++                      content::WebContents* contents = tab->GetContents();
++                      if (choice != 1) {
++                        self->RunInPage(contents,
++                                        "__meridianAgent.unmarkFileInput()",
++                                        base::DoNothing());
++                        return call->Fail("The person declined this upload.");
++                      }
++                      FileInputSetter::Start(
++                          contents, mark, real,
++                          base::BindOnce(
++                              [](base::WeakPtr<AgentService> self,
++                                 tabs::TabHandle handle,
++                                 std::unique_ptr<Call> call,
++                                 base::FilePath real, std::string mb,
++                                 std::string label, std::string error) {
++                                if (self && handle.Get()) {
++                                  self->RunInPage(
++                                      handle.Get()->GetContents(),
++                                      "__meridianAgent.unmarkFileInput()",
++                                      base::DoNothing());
++                                }
++                                if (!error.empty()) {
++                                  return call->Fail(error);
++                                }
++                                call->Ok(base::Value(
++                                    base::DictValue()
++                                        .Set("uploaded",
++                                             real.BaseName().value())
++                                        .Set("size", mb)
++                                        .Set("into", label)));
++                              },
++                              self, handle, std::move(call), real, mb, label));
++                    },
++                    self, handle, std::move(call), mark, real, mb, label));
++          },
++          weak_factory_.GetWeakPtr(), handle, std::move(call),
++          file->first, file->second));
++}
++
+ void AgentService::SplitView(std::unique_ptr<Call> call) {
+   Call& c = *call;
+   auto tab_by_id = [&](const char* key) -> tabs::TabInterface* {
+diff --git a/chrome/browser/meridian/agent/agent_service.h b/chrome/browser/meridian/agent/agent_service.h
+index a608f30ec9..06e2f7824d 100644
+--- a/chrome/browser/meridian/agent/agent_service.h
++++ b/chrome/browser/meridian/agent/agent_service.h
+@@ -9,9 +9,11 @@
+ #include <memory>
+ #include <string>
+ 
++#include "base/files/file_path.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/task/cancelable_task_tracker.h"
++#include "base/types/expected.h"
+ #include "base/values.h"
+ #include "components/keyed_service/core/keyed_service.h"
+ #include "components/prefs/pref_change_registrar.h"
+@@ -99,6 +101,11 @@ class AgentService : public KeyedService {
+   void Scroll(std::unique_ptr<Call> call);
+   void WaitFor(std::unique_ptr<Call> call);
+   void OrganizeTab(std::unique_ptr<Call> call);
++  void UploadFile(std::unique_ptr<Call> call);
++  void UploadChecked(
++      tabs::TabHandle handle,
++      std::unique_ptr<Call> call,
++      base::expected<std::pair<base::FilePath, int64_t>, std::string> file);
+   void SplitView(std::unique_ptr<Call> call);
+   void CreateSpace(std::unique_ptr<Call> call);
+   void RunJavaScript(std::unique_ptr<Call> call);
+diff --git a/chrome/browser/meridian/agent/agent_tools.json b/chrome/browser/meridian/agent/agent_tools.json
+index 9ec93352e5..a99801f357 100644
+--- a/chrome/browser/meridian/agent/agent_tools.json
++++ b/chrome/browser/meridian/agent/agent_tools.json
+@@ -397,6 +397,33 @@
+    ]
+   }
+  },
++ {
++  "name": "upload_file",
++  "access": "write",
++  "description": "Attach a local file (e.g. an image or video for a post) to a file field on the page: an <input type=file> by element_index or selector; with neither, the only file field on the page. Open the site's attach/upload dialog first if needed. The user always confirms the exact file in a native dialog; files with keys or credentials are refused.",
++  "input_schema": {
++   "type": "object",
++   "properties": {
++    "tab_id": {
++     "type": "string",
++     "description": "Tab id from list_tabs. Omit to use the agent's current tab (the last one it opened or used, else the active tab)."
++    },
++    "path": {
++     "type": "string",
++     "description": "Absolute path of the local file."
++    },
++    "element_index": {
++     "type": "integer"
++    },
++    "selector": {
++     "type": "string"
++    }
++   },
++   "required": [
++    "path"
++   ]
++  }
++ },
+  {
+   "name": "split_view",
+   "access": "write",
