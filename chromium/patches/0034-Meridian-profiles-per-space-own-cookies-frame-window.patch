@@ -1,0 +1,2991 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 28 Oct 2026 21:47:36 +0400
+Subject: [PATCH 35/35] Meridian: profiles per space (own cookies, frame
+ windows, Arc profiles) and the Downloads popover
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Spaces can live in their own Chromium profile: switching to one shows that
+profile's window in place of the current one; all share one sidebar model.
+Arc profiles import into "Meridian Profile Arc N" with their favorites and
+sign-ins. The sidebar gets a Downloads popover (⇧⌘J) with progress, cancel,
+open, reveal, keep/discard; closing what would cancel downloads asks first.
+Fixes a crash when a tab closes before its guest is attached (downloads).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   4 +
+ chrome/browser/meridian/arc_import.cc         |  41 +-
+ chrome/browser/meridian/arc_import.h          |  14 +-
+ chrome/browser/meridian/arc_logins.cc         |  71 +++-
+ chrome/browser/meridian/arc_logins.h          |   5 +-
+ chrome/browser/meridian/downloads_tracker.cc  | 142 +++++++
+ chrome/browser/meridian/downloads_tracker.h   |  59 +++
+ chrome/browser/meridian/little_window.cc      |  30 +-
+ chrome/browser/meridian/profile_windows.cc    | 283 ++++++++++++++
+ chrome/browser/meridian/profile_windows.h     |  62 +++
+ chrome/browser/meridian/sidebar.mojom         |  43 +++
+ chrome/browser/meridian/sidebar_handler.cc    | 354 +++++++++++++++++-
+ chrome/browser/meridian/sidebar_handler.h     |  31 ++
+ chrome/browser/meridian/sidebar_service.cc    | 173 ++++++++-
+ chrome/browser/meridian/sidebar_service.h     |  40 +-
+ .../meridian/sidebar_service_factory.cc       |  10 +-
+ .../meridian/sidebar_service_unittest.cc      |  38 ++
+ .../resources/webui_browser/meridian/icons.ts |  11 +-
+ .../webui_browser/meridian/settings.css       |  13 +
+ .../webui_browser/meridian/settings.html.ts   |  69 ++++
+ .../webui_browser/meridian/settings.ts        | 143 ++++++-
+ .../webui_browser/meridian/sidebar.css        | 142 +++++++
+ .../webui_browser/meridian/sidebar.html.ts    |  58 +++
+ .../webui_browser/meridian/sidebar.ts         |  94 ++++-
+ .../resources/webui_browser/webview.ts        |   4 +
+ chrome/browser/ui/webui_browser/browser.mojom |   5 +-
+ .../webui_browser_page_handler.cc             |  10 +-
+ .../ui/webui_browser/webui_browser_window.cc  |  30 +-
+ 28 files changed, 1909 insertions(+), 70 deletions(-)
+ create mode 100644 chrome/browser/meridian/downloads_tracker.cc
+ create mode 100644 chrome/browser/meridian/downloads_tracker.h
+ create mode 100644 chrome/browser/meridian/profile_windows.cc
+ create mode 100644 chrome/browser/meridian/profile_windows.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index ae43107b71..7c3b2d630c 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -194,7 +194,11 @@ source_set("meridian") {
+     "agent/agent_service_factory.h",
+     "arc_logins.cc",
+     "arc_logins.h",
++    "downloads_tracker.cc",
++    "downloads_tracker.h",
+     "little_window.cc",
++    "profile_windows.cc",
++    "profile_windows.h",
+     "little_window.h",
+     "sidebar_handler.cc",
+     "sidebar_handler.h",
+diff --git a/chrome/browser/meridian/arc_import.cc b/chrome/browser/meridian/arc_import.cc
+index f9d4eb1922..15913ba532 100644
+--- a/chrome/browser/meridian/arc_import.cc
++++ b/chrome/browser/meridian/arc_import.cc
+@@ -13,6 +13,7 @@
+ #include "base/files/file_util.h"
+ #include "base/json/json_reader.h"
+ #include "base/path_service.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/stringprintf.h"
+ 
+ namespace meridian {
+@@ -166,8 +167,29 @@ std::string ContainerId(const base::ListValue* ids, const char* key) {
+   return std::string();
+ }
+ 
++// The folder of an Arc profile reference: {"default": true} or
++// {"custom": {"_0": {"directoryBasename": "Profile 3"}}}.
++std::string ArcDirOf(const base::Value* profile) {
++  const base::DictValue* d = profile ? profile->GetIfDict() : nullptr;
++  if (!d || d->FindDict("default") || d->FindBool("default")) {
++    return "Default";
++  }
++  const std::string* dir =
++      d->FindStringByDottedPath("custom._0.directoryBasename");
++  return dir ? *dir : "Default";
++}
++
+ }  // namespace
+ 
++std::string ProfileIdForArcDir(const std::string& dir) {
++  int n = 0;
++  if (dir.starts_with("Profile ") && base::StringToInt(dir.substr(8), &n) &&
++      n > 0) {
++    return "Meridian Profile Arc " + base::NumberToString(n);
++  }
++  return std::string();
++}
++
+ ArcSidebar::ArcSidebar() = default;
+ ArcSidebar::ArcSidebar(ArcSidebar&&) = default;
+ ArcSidebar& ArcSidebar::operator=(ArcSidebar&&) = default;
+@@ -203,20 +225,23 @@ std::optional<ArcSidebar> ParseArcSidebar(const base::DictValue& root) {
+   Converter converter(container->FindList("items"));
+   ArcSidebar out;
+ 
+-  // Favorites ("top apps"), one list per Arc profile; Meridian has one.
++  // Favorites ("top apps"), one list per Arc profile.
+   // [profile, containerId, ...]: the key is an object, so not Pairs().
+   if (const base::ListValue* top = container->FindList("topAppsContainerIDs")) {
+     for (size_t i = 0; i + 1 < top->size(); i += 2) {
+       if (!(*top)[i + 1].is_string()) {
+         continue;
+       }
++      std::string profile = ProfileIdForArcDir(ArcDirOf(&(*top)[i]));
++      std::vector<Item>& list =
++          profile.empty() ? out.favorites : out.profile_favorites[profile];
+       std::vector<Item> tabs;
+       Flatten(converter.ChildrenOf((*top)[i + 1].GetString()), tabs);
+       for (Item& tab : tabs) {
+         bool known = std::ranges::any_of(
+-            out.favorites, [&](const Item& f) { return f.url == tab.url; });
++            list, [&](const Item& f) { return f.url == tab.url; });
+         if (!known) {
+-          out.favorites.push_back(std::move(tab));
++          list.push_back(std::move(tab));
+         }
+       }
+     }
+@@ -240,6 +265,11 @@ std::optional<ArcSidebar> ParseArcSidebar(const base::DictValue& root) {
+     }
+     space.color = SpaceColor(custom_info);
+     space.color2 = space.color;
++    std::string arc_dir = ArcDirOf(s->Find("profile"));
++    space.profile = ProfileIdForArcDir(arc_dir);
++    if (!space.profile.empty() && !out.profile_names.contains(space.profile)) {
++      out.profile_names[space.profile] = space.name;
++    }
+     std::string pinned = ContainerId(ids, "pinned");
+     if (!pinned.empty()) {
+       space.pinned = converter.ChildrenOf(pinned);
+@@ -256,6 +286,11 @@ std::optional<ArcSidebar> ParseArcSidebar(const base::DictValue& root) {
+     out.spaces.push_back(std::move(space));
+     out.today.push_back(std::move(today));
+   }
++  for (const auto& [profile, list] : out.profile_favorites) {
++    if (!out.profile_names.contains(profile)) {
++      out.profile_names[profile] = "Arc " + profile.substr(profile.rfind(' ') + 1);
++    }
++  }
+   return out;
+ }
+ 
+diff --git a/chrome/browser/meridian/arc_import.h b/chrome/browser/meridian/arc_import.h
+index 1d24c4b3f5..fd46d35935 100644
+--- a/chrome/browser/meridian/arc_import.h
++++ b/chrome/browser/meridian/arc_import.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_MERIDIAN_ARC_IMPORT_H_
+ #define CHROME_BROWSER_MERIDIAN_ARC_IMPORT_H_
+ 
++#include <map>
+ #include <optional>
+ #include <string>
+ #include <vector>
+@@ -29,12 +30,23 @@ struct ArcSidebar {
+     GURL url;
+     std::string title;
+   };
+-  // `spaces[i]` has no id yet; `today[i]` are its open tabs.
++  // `spaces[i]` has no id yet; `today[i]` are its open tabs. A space of an
++  // Arc profile other than the first has `profile` set (ProfileIdForArcDir).
+   std::vector<Space> spaces;
+   std::vector<std::vector<Tab>> today;
++  // The first Arc profile's favorites, and the others' by profile id.
+   std::vector<Item> favorites;
++  std::map<std::string, std::vector<Item>> profile_favorites;
++  // The other Arc profiles: id -> name (the first space using it).
++  std::map<std::string, std::string> profile_names;
+ };
+ 
++// The Meridian profile for an Arc profile folder: "" (the main one) for
++// "Default", "Meridian Profile Arc 3" for "Profile 3". The same every time,
++// so the sidebar and the sign-ins (arc_logins.h) land in the same profile
++// whichever is imported first.
++std::string ProfileIdForArcDir(const std::string& dir);
++
+ // Arc's data folder (~/Library/Application Support/Arc), or the one given
+ // with --meridian-arc-dir (tests).
+ base::FilePath ArcDataDir();
+diff --git a/chrome/browser/meridian/arc_logins.cc b/chrome/browser/meridian/arc_logins.cc
+index a4f1419dde..bb50c5ebf4 100644
+--- a/chrome/browser/meridian/arc_logins.cc
++++ b/chrome/browser/meridian/arc_logins.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/meridian/arc_logins.h"
+ 
+ #include <algorithm>
++#include <map>
+ #include <memory>
+ #include <set>
+ #include <tuple>
+@@ -22,7 +23,10 @@
+ #include "base/strings/string_util.h"
+ #include "base/task/thread_pool.h"
+ #include "build/build_config.h"
++#include "chrome/browser/browser_process.h"
+ #include "chrome/browser/meridian/arc_import.h"
++#include "chrome/browser/meridian/profile_windows.h"
++#include "chrome/browser/profiles/profile_manager.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "content/public/browser/storage_partition.h"
+ #include "crypto/aes_cbc.h"
+@@ -285,7 +289,8 @@ bool ReadProfile(const base::FilePath& db_file,
+ }
+ 
+ struct ReadResult {
+-  std::vector<net::CanonicalCookie> cookies;
++  // By Meridian profile id ("" for the main one).
++  std::map<std::string, std::vector<net::CanonicalCookie>> cookies;
+   ArcLoginsResult result;
+ };
+ 
+@@ -314,11 +319,18 @@ ReadResult ReadArcCookies() {
+     out.result.error = "read";
+     return out;
+   }
+-  std::set<std::tuple<std::string, std::string, std::string>> seen;
++  std::map<std::string,
++           std::set<std::tuple<std::string, std::string, std::string>>>
++      seen;
+   bool any = false;
+   for (const ArcProfile& p : profiles) {
+-    any |= ReadProfile(p.db, key, seen, out.cookies, out.result.failed);
++    std::string target = ProfileIdForArcDir(p.dir);
++    any |= ReadProfile(p.db, key, seen[target], out.cookies[target],
++                       out.result.failed);
+   }
++  std::erase_if(out.cookies, [](const auto& entry) {
++    return entry.second.empty();
++  });
+   OPENSSL_cleanse(key.data(), key.size());
+   if (!any) {
+     out.result.error = "read";
+@@ -341,6 +353,8 @@ class Writer : public base::RefCounted<Writer> {
+     }
+   }
+ 
++  void Failed() { ++result_.failed; }
++
+   void Finish() { std::move(done_).Run(result_); }
+ 
+  private:
+@@ -351,24 +365,21 @@ class Writer : public base::RefCounted<Writer> {
+   base::OnceCallback<void(ArcLoginsResult)> done_;
+ };
+ 
+-void WriteCookies(base::WeakPtr<Profile> profile,
+-                  base::OnceCallback<void(ArcLoginsResult)> done,
+-                  ReadResult read) {
+-  if (!profile || !read.result.error.empty() || read.cookies.empty()) {
+-    if (read.result.error.empty() && read.cookies.empty()) {
+-      read.result.error = "no-data";
++void WriteTo(scoped_refptr<Writer> writer,
++             base::RepeatingClosure barrier,
++             std::vector<net::CanonicalCookie> cookies,
++             Profile* profile) {
++  if (!profile) {
++    for (size_t i = 0; i < cookies.size(); ++i) {
++      writer->Failed();
++      barrier.Run();
+     }
+-    std::move(done).Run(read.result);
+     return;
+   }
+   network::mojom::CookieManager* manager =
+       profile->GetDefaultStoragePartition()
+           ->GetCookieManagerForBrowserProcess();
+-  auto writer =
+-      base::MakeRefCounted<Writer>(std::move(read.result), std::move(done));
+-  base::RepeatingClosure barrier = base::BarrierClosure(
+-      read.cookies.size(), base::BindOnce(&Writer::Finish, writer));
+-  for (net::CanonicalCookie& cookie : read.cookies) {
++  for (net::CanonicalCookie& cookie : cookies) {
+     std::string host = cookie.DomainWithoutDot();
+     GURL source(std::string(cookie.SecureAttribute() ? url::kHttpsScheme
+                                                      : url::kHttpScheme) +
+@@ -385,6 +396,36 @@ void WriteCookies(base::WeakPtr<Profile> profile,
+   }
+ }
+ 
++void WriteCookies(base::WeakPtr<Profile> profile,
++                  base::OnceCallback<void(ArcLoginsResult)> done,
++                  ReadResult read) {
++  if (!profile || !read.result.error.empty() || read.cookies.empty()) {
++    if (read.result.error.empty() && read.cookies.empty()) {
++      read.result.error = "no-data";
++    }
++    std::move(done).Run(read.result);
++    return;
++  }
++  size_t total = 0;
++  for (const auto& [id, cookies] : read.cookies) {
++    total += cookies.size();
++  }
++  auto writer =
++      base::MakeRefCounted<Writer>(std::move(read.result), std::move(done));
++  base::RepeatingClosure barrier =
++      base::BarrierClosure(total, base::BindOnce(&Writer::Finish, writer));
++  for (auto& [id, cookies] : read.cookies) {
++    if (id.empty()) {
++      WriteTo(writer, barrier, std::move(cookies), profile.get());
++      continue;
++    }
++    // Another Arc profile: its Meridian profile, created if needed.
++    g_browser_process->profile_manager()->CreateProfileAsync(
++        ProfilePathFor(id),
++        base::BindOnce(&WriteTo, writer, barrier, std::move(cookies)));
++  }
++}
++
+ }  // namespace
+ 
+ bool ArcLoginsAvailable() {
+diff --git a/chrome/browser/meridian/arc_logins.h b/chrome/browser/meridian/arc_logins.h
+index 3200f926e8..b6d85a813f 100644
+--- a/chrome/browser/meridian/arc_logins.h
++++ b/chrome/browser/meridian/arc_logins.h
+@@ -26,8 +26,9 @@ namespace meridian {
+ //
+ // Nothing leaves the machine and Arc is never written to: each database is
+ // copied to a private temp folder, read, and the copy deleted. Cookie values
+-// and the key are never logged. Arc's other profiles are folded into this one;
+-// the first profile wins when two have the same cookie.
++// and the key are never logged. Each Arc profile's cookies go to its Meridian
++// profile (ProfileIdForArcDir): "Default" to `profile`, "Profile 3" to
++// "Meridian Profile Arc 3", created if needed.
+ struct ArcLoginsResult {
+   int imported = 0;
+   int failed = 0;
+diff --git a/chrome/browser/meridian/downloads_tracker.cc b/chrome/browser/meridian/downloads_tracker.cc
+new file mode 100644
+index 0000000000..77465cb76d
+--- /dev/null
++++ b/chrome/browser/meridian/downloads_tracker.cc
+@@ -0,0 +1,142 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/downloads_tracker.h"
++
++#include <algorithm>
++
++#include "chrome/browser/platform_util.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/download/public/common/download_item.h"
++#include "content/public/browser/download_manager.h"
++
++namespace meridian {
++
++namespace {
++
++constexpr size_t kMax = 20;
++
++std::string StateOf(download::DownloadItem* item) {
++  switch (item->GetState()) {
++    case download::DownloadItem::IN_PROGRESS:
++      if (item->IsDangerous()) {
++        return "dangerous";
++      }
++      return item->IsPaused() ? "paused" : "progressing";
++    case download::DownloadItem::COMPLETE:
++      return "completed";
++    case download::DownloadItem::CANCELLED:
++      return "cancelled";
++    case download::DownloadItem::INTERRUPTED:
++    case download::DownloadItem::MAX_DOWNLOAD_STATE:
++      return "interrupted";
++  }
++  return "interrupted";
++}
++
++}  // namespace
++
++DownloadsTracker::DownloadsTracker(Profile* profile,
++                                   base::RepeatingClosure changed)
++    : profile_(profile),
++      changed_(std::move(changed)),
++      notifier_(profile->GetDownloadManager(), this) {}
++
++DownloadsTracker::~DownloadsTracker() = default;
++
++download::DownloadItem* DownloadsTracker::Find(const std::string& id) {
++  content::DownloadManager* manager = notifier_.GetManager();
++  return manager ? manager->GetDownloadByGuid(id) : nullptr;
++}
++
++std::vector<mojom::DownloadPtr> DownloadsTracker::List() {
++  std::vector<mojom::DownloadPtr> out;
++  for (const std::string& id : ids_) {
++    download::DownloadItem* item = Find(id);
++    if (!item) {
++      continue;
++    }
++    auto d = mojom::Download::New();
++    d->id = id;
++    d->name = item->GetFileNameToReportUser().AsUTF8Unsafe();
++    if (d->name.empty()) {
++      d->name = item->GetURL().ExtractFileName();
++    }
++    d->received = item->GetReceivedBytes();
++    d->total = std::max<int64_t>(0, item->GetTotalBytes());
++    d->state = StateOf(item);
++    out.push_back(std::move(d));
++  }
++  return out;
++}
++
++bool DownloadsTracker::AnyInProgress() {
++  return std::ranges::any_of(ids_, [&](const std::string& id) {
++    download::DownloadItem* item = Find(id);
++    return item && item->GetState() == download::DownloadItem::IN_PROGRESS;
++  });
++}
++
++void DownloadsTracker::Act(const std::string& id, const std::string& action) {
++  download::DownloadItem* item = Find(id);
++  if (!item) {
++    return;
++  }
++  if (action == "reveal") {
++    base::FilePath path = item->GetTargetFilePath();
++    if (!path.empty()) {
++      platform_util::ShowItemInFolder(profile_, path);
++    }
++  } else if (action == "open") {
++    if (item->GetState() == download::DownloadItem::COMPLETE) {
++      item->OpenDownload();
++    }
++  } else if (action == "cancel") {
++    item->Cancel(/*user_cancel=*/true);
++  } else if (action == "keep") {
++    if (item->IsDangerous()) {
++      item->ValidateDangerousDownload();
++    }
++  } else if (action == "discard") {
++    item->Remove();
++  }
++}
++
++void DownloadsTracker::Clear() {
++  std::erase_if(ids_, [&](const std::string& id) {
++    download::DownloadItem* item = Find(id);
++    return !item || item->GetState() != download::DownloadItem::IN_PROGRESS;
++  });
++  changed_.Run();
++}
++
++void DownloadsTracker::OnDownloadCreated(content::DownloadManager* manager,
++                                         download::DownloadItem* item) {
++  // This session's only (not the history Chromium loads at startup).
++  if (item->IsTransient() ||
++      item->GetState() != download::DownloadItem::IN_PROGRESS) {
++    return;
++  }
++  ids_.insert(ids_.begin(), item->GetGuid());
++  if (ids_.size() > kMax) {
++    ids_.resize(kMax);
++  }
++  changed_.Run();
++}
++
++void DownloadsTracker::OnDownloadUpdated(content::DownloadManager* manager,
++                                         download::DownloadItem* item) {
++  if (std::ranges::find(ids_, item->GetGuid()) != ids_.end()) {
++    changed_.Run();
++  }
++}
++
++void DownloadsTracker::OnDownloadRemoved(content::DownloadManager* manager,
++                                         download::DownloadItem* item) {
++  if (std::erase(ids_, item->GetGuid())) {
++    changed_.Run();
++  }
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/downloads_tracker.h b/chrome/browser/meridian/downloads_tracker.h
+new file mode 100644
+index 0000000000..cf08854f03
+--- /dev/null
++++ b/chrome/browser/meridian/downloads_tracker.h
+@@ -0,0 +1,59 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_DOWNLOADS_TRACKER_H_
++#define CHROME_BROWSER_MERIDIAN_DOWNLOADS_TRACKER_H_
++
++#include <set>
++#include <string>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/memory/raw_ptr.h"
++#include "chrome/browser/meridian/sidebar.mojom.h"
++#include "components/download/content/public/all_download_item_notifier.h"
++
++class Profile;
++
++namespace meridian {
++
++// The sidebar's Downloads popover (⇧⌘J): this session's downloads of a
++// profile, newest first, with what can be done to each (show in Finder,
++// open, cancel, keep or discard a dangerous one). `changed` runs on every
++// change, progress included.
++class DownloadsTracker : public download::AllDownloadItemNotifier::Observer {
++ public:
++  DownloadsTracker(Profile* profile, base::RepeatingClosure changed);
++  DownloadsTracker(const DownloadsTracker&) = delete;
++  DownloadsTracker& operator=(const DownloadsTracker&) = delete;
++  ~DownloadsTracker() override;
++
++  std::vector<mojom::DownloadPtr> List();
++  // "reveal", "open", "cancel", "keep" (a dangerous file) or "discard".
++  void Act(const std::string& id, const std::string& action);
++  // Forgets the finished ones (the files stay).
++  void Clear();
++  bool AnyInProgress();
++
++  // download::AllDownloadItemNotifier::Observer:
++  void OnDownloadCreated(content::DownloadManager* manager,
++                         download::DownloadItem* item) override;
++  void OnDownloadUpdated(content::DownloadManager* manager,
++                         download::DownloadItem* item) override;
++  void OnDownloadRemoved(content::DownloadManager* manager,
++                         download::DownloadItem* item) override;
++
++ private:
++  download::DownloadItem* Find(const std::string& id);
++
++  raw_ptr<Profile> profile_;
++  base::RepeatingClosure changed_;
++  // Newest first.
++  std::vector<std::string> ids_;
++  download::AllDownloadItemNotifier notifier_;
++};
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_DOWNLOADS_TRACKER_H_
+diff --git a/chrome/browser/meridian/little_window.cc b/chrome/browser/meridian/little_window.cc
+index 17d5cc1069..15248e43ff 100644
+--- a/chrome/browser/meridian/little_window.cc
++++ b/chrome/browser/meridian/little_window.cc
+@@ -10,6 +10,7 @@
+ #include "base/no_destructor.h"
+ #include "chrome/browser/meridian/atc.h"
+ #include "chrome/browser/meridian/prefs.h"
++#include "chrome/browser/meridian/profile_windows.h"
+ #include "chrome/browser/meridian/sidebar_service.h"
+ #include "chrome/browser/meridian/sidebar_service_factory.h"
+ #include "chrome/browser/meridian/tab_data.h"
+@@ -18,6 +19,7 @@
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+ #include "chrome/browser/ui/browser_window/public/browser_collection.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+ #include "components/prefs/pref_service.h"
+@@ -83,7 +85,7 @@ BrowserWindowInterface* FindOrCreateMainWindow(
+       [&](BrowserWindowInterface* browser) {
+         if (browser != except &&
+             browser->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
+-            !IsLittleWindow(browser)) {
++            !IsLittleWindow(browser) && !IsHiddenInFrame(browser)) {
+           found = browser;
+           return false;
+         }
+@@ -110,13 +112,37 @@ void OpenExternalLink(Profile* profile, const GURL& url) {
+     OpenLittleWindow(profile, url);
+     return;
+   }
+-  BrowserWindowInterface* browser = FindOrCreateMainWindow(profile);
++  // The frame in front, whichever profile shows there.
++  BrowserWindowInterface* browser = nullptr;
++  ForEachCurrentBrowserWindowInterfaceOrderedByActivation(
++      [&](BrowserWindowInterface* b) {
++        if (b->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
++            !IsLittleWindow(b) && !b->GetProfile()->IsOffTheRecord() &&
++            !IsHiddenInFrame(b) &&
++            SidebarServiceFactory::GetForProfile(b->GetProfile()) == service) {
++          browser = b;
++          return false;
++        }
++        return true;
++      });
++  if (!browser) {
++    browser = FindOrCreateMainWindow(profile);
++  }
+   if (!browser) {
+     return;
+   }
+   std::string space_id = route.target == AtcRoute::Target::kSpace
+                              ? route.space_id
+                              : service->active_space_id();
++  const Space* space = service->FindSpace(space_id);
++  if (space && (space->profile != ProfileIdOf(browser->GetProfile()) ||
++                IsHiddenInFrame(browser))) {
++    // A space of another profile (or a window hidden in a frame): the
++    // space's window comes to the front of the frame.
++    ShowSpaceInProfile(browser, space->profile, space_id, {url},
++                       /*show=*/true);
++    return;
++  }
+   service->SetActiveSpace(space_id);
+   NavigateParams nav(browser, url, ui::PAGE_TRANSITION_LINK);
+   nav.disposition = WindowOpenDisposition::kNewForegroundTab;
+diff --git a/chrome/browser/meridian/profile_windows.cc b/chrome/browser/meridian/profile_windows.cc
+new file mode 100644
+index 0000000000..9d3e496512
+--- /dev/null
++++ b/chrome/browser/meridian/profile_windows.cc
+@@ -0,0 +1,283 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/profile_windows.h"
++
++#include <map>
++#include <set>
++
++#include "base/files/file_util.h"
++#include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/meridian/little_window.h"
++#include "chrome/browser/meridian/sidebar_handler.h"
++#include "chrome/browser/meridian/sidebar_service.h"
++#include "chrome/browser/meridian/sidebar_service_factory.h"
++#include "chrome/browser/meridian/tab_data.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_attributes_storage.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
++#include "chrome/browser/ui/browser_window/public/create_browser_window.h"
++#include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "ui/base/base_window.h"
++
++namespace meridian {
++
++namespace {
++
++constexpr char kPrefix[] = "Meridian Profile ";
++
++struct Frames {
++  int next = 1;
++  std::map<BrowserWindowInterface*, int> frame_of;
++  std::map<int, BrowserWindowInterface*> visible_of;
++  std::map<BrowserWindowInterface*, base::CallbackListSubscription> closing;
++};
++
++Frames& F() {
++  static base::NoDestructor<Frames> frames;
++  return *frames;
++}
++
++void OnClosed(BrowserWindowInterface* browser) {
++  Frames& f = F();
++  f.closing.erase(browser);
++  auto it = f.frame_of.find(browser);
++  if (it == f.frame_of.end()) {
++    return;
++  }
++  int id = it->second;
++  f.frame_of.erase(it);
++  if (f.visible_of[id] != browser) {
++    return;
++  }
++  f.visible_of.erase(id);
++  // The frame closes with its visible window.
++  std::vector<BrowserWindowInterface*> hidden;
++  for (auto& [b, frame] : f.frame_of) {
++    if (frame == id) {
++      hidden.push_back(b);
++    }
++  }
++  for (BrowserWindowInterface* b : hidden) {
++    f.frame_of.erase(b);
++    b->GetWindow()->Close();
++  }
++}
++
++void Track(BrowserWindowInterface* browser, int frame) {
++  Frames& f = F();
++  f.frame_of[browser] = frame;
++  if (!f.closing.contains(browser)) {
++    f.closing[browser] =
++        browser->RegisterBrowserDidClose(base::BindRepeating(&OnClosed));
++  }
++}
++
++// The frame of `browser`, a new one (with it visible) if it has none.
++int FrameOf(BrowserWindowInterface* browser) {
++  Frames& f = F();
++  auto it = f.frame_of.find(browser);
++  if (it != f.frame_of.end()) {
++    return it->second;
++  }
++  int id = f.next++;
++  Track(browser, id);
++  f.visible_of[id] = browser;
++  return id;
++}
++
++bool IsMainWindow(BrowserWindowInterface* b) {
++  return b->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
++         !IsLittleWindow(b) && !b->GetProfile()->IsOffTheRecord();
++}
++
++void Open(BrowserWindowInterface* target,
++          const std::string& space_id,
++          const std::vector<GURL>& urls) {
++  TabStripModel* model = target->GetTabStripModel();
++  bool has_tab = false;
++  for (int i = 0; i < model->count(); ++i) {
++    const TabData* data = TabData::Get(model->GetWebContentsAt(i));
++    has_tab |= data && data->space_id() == space_id;
++  }
++  std::vector<GURL> open = urls;
++  if (open.empty() && !has_tab) {
++    open.push_back(GURL("chrome://newtab/"));  // an empty space, like Arc
++  }
++  for (const GURL& url : open) {
++    NavigateParams nav(target, url, ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
++    nav.disposition = WindowOpenDisposition::kNewForegroundTab;
++    Navigate(&nav);
++    if (nav.navigated_or_inserted_contents) {
++      TabData::Set(nav.navigated_or_inserted_contents, space_id,
++                   std::string());
++    }
++  }
++}
++
++}  // namespace
++
++std::string ProfileIdOf(Profile* profile) {
++  std::string base = profile->GetOriginalProfile()->GetPath().BaseName().value();
++  return base.starts_with(kPrefix) ? base : std::string();
++}
++
++bool IsSpaceProfile(Profile* profile) {
++  return !ProfileIdOf(profile).empty();
++}
++
++base::FilePath ProfilePathFor(const std::string& profile_id) {
++  const base::FilePath& dir = g_browser_process->profile_manager()->user_data_dir();
++  return profile_id.empty()
++             ? dir.Append(ProfileManager::GetInitialProfileDir())
++             : dir.Append(profile_id);
++}
++
++Profile* MainProfileFor(Profile* profile) {
++  if (!IsSpaceProfile(profile)) {
++    return profile;
++  }
++  ProfileManager* manager = g_browser_process->profile_manager();
++  base::FilePath main = ProfilePathFor(std::string());
++  if (Profile* loaded = manager->GetProfileByPath(main)) {
++    return loaded;
++  }
++  // Only after a restart with just another profile's windows open (loads
++  // synchronously; ProfileImpl allows its own blocking).
++  return manager->GetProfile(main);
++}
++
++std::string NewProfileId(const std::vector<std::string>& taken) {
++  ProfileManager* manager = g_browser_process->profile_manager();
++  ProfileAttributesStorage& known = manager->GetProfileAttributesStorage();
++  for (int n = 1;; ++n) {
++    std::string id = kPrefix + base::NumberToString(n);
++    if (std::ranges::find(taken, id) == taken.end() &&
++        !known.GetProfileAttributesWithPath(
++            manager->user_data_dir().Append(id))) {
++      return id;
++    }
++  }
++}
++
++void ShowSpaceInProfile(
++    BrowserWindowInterface* from,
++    const std::string& profile_id,
++    const std::string& space_id,
++    std::vector<GURL> urls,
++    bool show,
++    base::OnceCallback<void(BrowserWindowInterface*)> done) {
++  int frame = FrameOf(from);
++  g_browser_process->profile_manager()->CreateProfileAsync(
++      ProfilePathFor(profile_id),
++      base::BindOnce(
++          [](int frame, std::string space_id, std::vector<GURL> urls,
++             bool show, base::OnceCallback<void(BrowserWindowInterface*)> done,
++             Profile* profile) {
++            Frames& f = F();
++            auto visible = f.visible_of.find(frame);
++            if (!profile || visible == f.visible_of.end()) {
++              if (done) {
++                std::move(done).Run(nullptr);
++              }
++              return;
++            }
++            BrowserWindowInterface* current = visible->second;
++            BrowserWindowInterface* target = nullptr;
++            for (auto& [b, id] : f.frame_of) {
++              if (id == frame && b->GetProfile() == profile) {
++                target = b;
++              }
++            }
++            if (!target) {
++              BrowserWindowCreateParams params(*profile,
++                                               /*from_user_gesture=*/true);
++              params.initial_bounds = current->GetWindow()->GetBounds();
++              params.initial_origin_specified =
++                  BrowserWindowCreateParams::ValueSpecified::kSpecified;
++              params.should_trigger_session_restore = false;
++              target = CreateBrowserWindow(std::move(params));
++              if (!target) {
++                if (done) {
++                  std::move(done).Run(nullptr);
++                }
++                return;
++              }
++              Track(target, frame);
++            }
++            SidebarService* service =
++                SidebarServiceFactory::GetForProfile(profile);
++            if (show) {
++              service->SetActiveSpace(space_id);
++            }
++            Open(target, space_id, urls);
++            if (show && target != current) {
++              target->GetWindow()->SetBounds(current->GetWindow()->GetBounds());
++              f.visible_of[frame] = target;
++              target->GetWindow()->Show();
++              target->GetWindow()->Activate();
++              current->GetWindow()->Hide();
++            }
++            if (show) {
++              SidebarHandler::ActivateSpaceInWindow(target, space_id);
++            }
++            if (done) {
++              std::move(done).Run(target);
++            }
++          },
++          frame, space_id, std::move(urls), show, std::move(done)));
++}
++
++bool IsHiddenInFrame(BrowserWindowInterface* browser) {
++  Frames& f = F();
++  auto it = f.frame_of.find(browser);
++  return it != f.frame_of.end() && f.visible_of[it->second] != browser;
++}
++
++void JoinFrameIfBehind(BrowserWindowInterface* browser,
++                       const std::string& active_profile_id) {
++  Frames& f = F();
++  if (!IsMainWindow(browser) || f.frame_of.contains(browser)) {
++    return;
++  }
++  bool active = ProfileIdOf(browser->GetProfile()) == active_profile_id;
++  std::vector<BrowserWindowInterface*> others;
++  ForEachCurrentBrowserWindowInterfaceOrderedByActivation(
++      [&](BrowserWindowInterface* b) {
++        if (b != browser && IsMainWindow(b) &&
++            b->GetProfile() != browser->GetProfile()) {
++          others.push_back(b);
++        }
++        return true;
++      });
++  if (!active) {
++    // Behind a visible window of the active space's profile.
++    for (BrowserWindowInterface* b : others) {
++      if (ProfileIdOf(b->GetProfile()) == active_profile_id &&
++          !IsHiddenInFrame(b)) {
++        Track(browser, FrameOf(b));
++        browser->GetWindow()->Hide();
++        return;
++      }
++    }
++    return;
++  }
++  // The other profiles' separate windows go behind this one.
++  int frame = FrameOf(browser);
++  for (BrowserWindowInterface* b : others) {
++    if (!f.frame_of.contains(b)) {
++      Track(b, frame);
++      b->GetWindow()->Hide();
++    }
++  }
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/profile_windows.h b/chrome/browser/meridian/profile_windows.h
+new file mode 100644
+index 0000000000..c98e298052
+--- /dev/null
++++ b/chrome/browser/meridian/profile_windows.h
+@@ -0,0 +1,62 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_PROFILE_WINDOWS_H_
++#define CHROME_BROWSER_MERIDIAN_PROFILE_WINDOWS_H_
++
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "url/gurl.h"
++
++class BrowserWindowInterface;
++class Profile;
++
++namespace meridian {
++
++// Spaces with their own profile, Arc's model on Chromium: every Meridian
++// profile is a Chromium profile ("Meridian Profile N" next to the main one),
++// and a Meridian window is a frame of one browser window per profile, stacked
++// in the same place. Switching to a space of another profile shows that
++// profile's window where the current one was and hides the current one;
++// closing the visible window closes the hidden ones of its frame. The sidebar
++// model is the main profile's (SidebarServiceFactory).
++
++// "" for the main profile (or any profile Meridian didn't create), else the
++// profile's folder name.
++std::string ProfileIdOf(Profile* profile);
++bool IsSpaceProfile(Profile* profile);
++// The folder of a Meridian profile id.
++base::FilePath ProfilePathFor(const std::string& profile_id);
++// The main profile, loaded if it isn't yet (blocking then).
++Profile* MainProfileFor(Profile* profile);
++// A folder name for a new profile, unused on disk and in `taken`.
++std::string NewProfileId(const std::vector<std::string>& taken);
++
++// Shows `space_id` (of `profile_id`) in the frame of `from`: activates the
++// space in that profile's window, creating the window at `from`'s place if
++// needed, and opens `urls` there as tabs of the space. With `show` false the
++// frame stays as it is (the tabs open in the hidden window). `done` gets the
++// window, or nullptr if the profile couldn't be loaded.
++void ShowSpaceInProfile(
++    BrowserWindowInterface* from,
++    const std::string& profile_id,
++    const std::string& space_id,
++    std::vector<GURL> urls,
++    bool show,
++    base::OnceCallback<void(BrowserWindowInterface*)> done = {});
++
++// Whether `browser` is a hidden window of a frame.
++bool IsHiddenInFrame(BrowserWindowInterface* browser);
++// After a restart the windows of a frame come back as separate windows:
++// `browser`, of a profile other than the active space's, joins (hidden) the
++// frame of a visible window of that profile, if there is one.
++void JoinFrameIfBehind(BrowserWindowInterface* browser,
++                       const std::string& active_profile_id);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_PROFILE_WINDOWS_H_
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 152df9c21c..641d7d8cf7 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -27,9 +27,30 @@ struct Space {
+   // Two CSS colours for the window tint gradient.
+   string color;
+   string color2;
++  // The Meridian profile its tabs live in (SpaceProfile.id).
++  string profile_id;
+   array<Item> pinned;
+ };
+ 
++// A download of this session (the Downloads popover).
++struct Download {
++  string id;
++  string name;
++  double received;
++  // 0 when unknown.
++  double total;
++  // "progressing", "paused", "dangerous" (waits for Keep or Discard),
++  // "completed", "cancelled" or "interrupted".
++  string state;
++};
++
++// A Meridian profile: its own cookies, logins and site data. The main one
++// has the empty id.
++struct SpaceProfile {
++  string id;
++  string name;
++};
++
+ // Which space a live tab belongs to, and which pinned item / favorite it is
+ // the live tab of (empty for a Today tab).
+ struct TabInfo {
+@@ -65,6 +86,9 @@ struct SidebarState {
+   string active_space_id;
+   // Shared by every space of the profile.
+   array<Item> favorites;
++  array<SpaceProfile> profiles;
++  // The profile of this window.
++  string profile_id;
+   array<TabInfo> tabs;
+   array<Split> splits;
+   // The welcome tour should open (first start of this profile).
+@@ -129,6 +153,8 @@ enum Command {
+   kWorkbench,
+   // ⇧⌘M: Mission Control.
+   kMission,
++  // ⇧⌘J: the Downloads popover.
++  kDownloads,
+ };
+ 
+ // Air Traffic Control (atc.h): where links from other apps go.
+@@ -284,6 +310,9 @@ interface SidebarPage {
+   // an agent).
+   OnStateChanged(SidebarState state);
+ 
++  // The Downloads popover's list, after any change (progress included).
++  OnDownloads(array<Download> downloads);
++
+   // ⌘T / File > New Tab: the command bar opens, and a tab opens only once
+   // something is picked (like Arc).
+   ShowCommandBar();
+@@ -317,6 +346,12 @@ interface SidebarPage {
+ interface SidebarHandler {
+   GetState() => (SidebarState state);
+ 
++  // The Downloads popover.
++  GetDownloads() => (array<Download> downloads);
++  // "reveal", "open", "cancel", "keep" or "discard".
++  DownloadAction(string id, string action);
++  ClearDownloads();
++
+   CreateSpace(string name, string icon, string color, string color2)
+       => (string space_id);
+   UpdateSpace(string space_id, string name, string icon, string color,
+@@ -326,6 +361,14 @@ interface SidebarHandler {
+   MoveSpace(string space_id, int32 index);
+   // Shows the space: its last active tab, or a new tab if it has none.
+   ActivateSpace(string space_id);
++  // Profiles (Settings > Profiles, a space's Profile menu). Deleting needs
++  // no space to use it; its site data is removed.
++  AddProfile(string name) => (string profile_id);
++  RenameProfile(string profile_id, string name);
++  DeleteProfile(string profile_id) => (bool deleted);
++  ClearProfileData(string profile_id) => (bool cleared);
++  // The space's open tabs reopen in the new profile.
++  SetSpaceProfile(string space_id, string profile_id);
+   // Moves a live tab (and any item it is linked to stays where it is).
+   MoveTabToSpace(tabs_api.mojom.NodeId tab_id, string space_id);
+ 
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 8edae27381..4b7728998e 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -45,9 +45,20 @@
+ #include "chrome/browser/meridian/little_window.h"
+ #include "chrome/browser/meridian/prefs.h"
+ #include "chrome/browser/meridian/setup_profile.h"
++#include "chrome/browser/meridian/profile_windows.h"
+ #include "chrome/browser/meridian/sidebar_service_factory.h"
++#include "chrome/browser/profiles/keep_alive/profile_keep_alive_types.h"
++#include "chrome/browser/profiles/keep_alive/scoped_profile_keep_alive.h"
+ #include "chrome/browser/meridian/tab_data.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/browsing_data/chrome_browsing_data_remover_constants.h"
++#include "chrome/browser/profiles/delete_profile_helper.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_attributes_storage.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/profiles/profile_metrics.h"
++#include "chrome/common/pref_names.h"
++#include "content/public/browser/browsing_data_remover.h"
+ #include "chrome/browser/ui/browser_tabrestore.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+@@ -140,6 +151,7 @@ SidebarHandler::SidebarHandler(
+     mojo::PendingRemote<mojom::SidebarPage> page,
+     mojo::PendingReceiver<mojom::SidebarHandler> receiver)
+     : browser_(browser),
++      profile_id_(ProfileIdOf(browser->GetProfile())),
+       service_(SidebarServiceFactory::GetForProfile(browser->GetProfile())),
+       archive_(ArchiveServiceFactory::GetForProfile(browser->GetProfile())),
+       page_(std::move(page)),
+@@ -162,6 +174,29 @@ SidebarHandler::SidebarHandler(
+                                  base::Unretained(this)));
+   model()->AddObserver(this);
+   Handlers()[browser_] = this;
++  downloads_ = std::make_unique<DownloadsTracker>(
++      browser->GetProfile(),
++      base::BindRepeating(
++          [](SidebarHandler* self) {
++            // Progress comes often: a few updates a second are enough.
++            if (!self->downloads_timer_.IsRunning()) {
++              self->downloads_timer_.Start(
++                  FROM_HERE, base::Milliseconds(150),
++                  base::BindOnce(
++                      [](SidebarHandler* self) {
++                        if (self->page_.is_connected()) {
++                          self->page_->OnDownloads(self->downloads_->List());
++                        }
++                      },
++                      base::Unretained(self)));
++            }
++          },
++          base::Unretained(this)));
++  if (!profile_id_.empty() && !browser->GetProfile()->IsOffTheRecord()) {
++    main_keep_alive_ = std::make_unique<ScopedProfileKeepAlive>(
++        MainProfileFor(browser->GetProfile()),
++        ProfileKeepAliveOrigin::kBrowserWindow);
++  }
+   if (service_->loaded()) {
+     OnSidebarChanged();
+   }
+@@ -268,7 +303,40 @@ void SidebarHandler::Adopt(tabs::TabInterface* tab) {
+     }
+     return;
+   }
+-  TabData::Set(contents, service_->active_space_id(), std::string());
++  // Into the active space, or the first one of this window's profile.
++  std::string space_id = service_->active_space_id();
++  const Space* active = service_->FindSpace(space_id);
++  if (active && active->profile != profile_id_) {
++    for (const Space& space : service_->spaces()) {
++      if (space.profile == profile_id_) {
++        space_id = space.id;
++        break;
++      }
++    }
++  }
++  TabData::Set(contents, space_id, std::string());
++}
++
++std::string SidebarHandler::Favorites() const {
++  return SidebarService::FavoritesOf(profile_id_);
++}
++
++namespace {
++
++bool IsFavorites(const std::string& container) {
++  return container == kFavorites ||
++         container.starts_with(std::string(kFavorites) + ":");
++}
++
++}  // namespace
++
++// static
++void SidebarHandler::ActivateSpaceInWindow(BrowserWindowInterface* browser,
++                                           const std::string& space_id) {
++  auto it = Handlers().find(browser);
++  if (it != Handlers().end()) {
++    it->second->ActivateSpaceHere(space_id);
++  }
+ }
+ 
+ // static
+@@ -306,10 +374,11 @@ bool SidebarHandler::PinTabContents(content::WebContents* contents,
+   const TabData* data = TabData::Get(contents);
+   if (data && !data->item_id().empty()) {
+     bool in_favorites = std::ranges::any_of(
+-        self->service_->favorites(),
++        self->service_->favorites(self->profile_id_),
+         [&](const Item& f) { return f.id == data->item_id(); });
+     if (favorite && !in_favorites) {
+-      self->service_->MoveItem(data->item_id(), kFavorites, std::string(), -1);
++      self->service_->MoveItem(data->item_id(), self->Favorites(),
++                               std::string(), -1);
+       self->ScheduleNotify();
+     }
+     return true;
+@@ -321,7 +390,7 @@ bool SidebarHandler::PinTabContents(content::WebContents* contents,
+   item.title = title.empty() ? base::UTF16ToUTF8(contents->GetTitle()) : title;
+   item.url = url;
+   std::string item_id = self->service_->AddItem(
+-      favorite ? std::string(kFavorites) : space_id, std::string(), -1, item);
++      favorite ? self->Favorites() : space_id, std::string(), -1, item);
+   if (item_id.empty()) {
+     return false;
+   }
+@@ -480,6 +549,9 @@ bool SidebarHandler::HandleCommand(BrowserWindowInterface* browser,
+       case IDC_MERIDIAN_MISSION:
+         command = mojom::Command::kMission;
+         break;
++      case IDC_SHOW_DOWNLOADS:
++        command = mojom::Command::kDownloads;
++        break;
+       default:
+         return false;
+     }
+@@ -501,7 +573,7 @@ void SidebarHandler::OnActiveTabChanged(tabs::TabInterface* tab) {
+   last_active_[data->space_id()] = tab->GetHandle();
+   // A favorite belongs to every space: opening one doesn't switch spaces.
+   bool favorite = !data->item_id().empty() &&
+-                  service_->ContainerOf(data->item_id()) == kFavorites;
++                  IsFavorites(service_->ContainerOf(data->item_id()));
+   if (!favorite && data->space_id() != service_->active_space_id()) {
+     service_->SetActiveSpace(data->space_id());
+   }
+@@ -1162,6 +1234,9 @@ void SidebarHandler::GetArcPreview(GetArcPreviewCallback callback) {
+             auto preview = mojom::ArcPreview::New();
+             preview->space_count = arc->spaces.size();
+             preview->favorite_count = arc->favorites.size();
++            for (const auto& [id, list] : arc->profile_favorites) {
++              preview->favorite_count += list.size();
++            }
+             preview->logins_available = read.second;
+             std::function<int(const std::vector<Item>&)> count =
+                 [&](const std::vector<Item>& items) {
+@@ -1451,9 +1526,46 @@ void SidebarHandler::OnArcRead(ImportArcCallback callback,
+     std::move(callback).Run(false);
+     return;
+   }
++  // Arc's other profiles become Meridian profiles (the same ones the
++  // sign-in import fills).
++  for (const auto& [id, name] : arc->profile_names) {
++    if (!service_->FindProfile(id)) {
++      service_->AddProfile(id, name.substr(0, 60));
++    }
++  }
++  if (!arc->profile_names.empty()) {
++    g_browser_process->local_state()->SetBoolean(
++        ::prefs::kBrowserShowProfilePickerOnStartup, false);
++  }
+   service_->Import(arc->spaces, std::move(arc->favorites));
++  for (auto& [id, list] : arc->profile_favorites) {
++    for (Item& item : list) {
++      const std::vector<Item>& known = service_->favorites(id);
++      if (!item.is_folder &&
++          std::ranges::none_of(known, [&](const Item& f) {
++            return f.url == item.url;
++          })) {
++        item.id.clear();
++        service_->AddItem(SidebarService::FavoritesOf(id), std::string(), -1,
++                          std::move(item));
++      }
++    }
++  }
+   // Arc's open tabs: Today tabs of their space, loaded when first opened.
+   for (size_t i = 0; i < arc->spaces.size(); ++i) {
++    if (arc->spaces[i].profile != profile_id_) {
++      // In their profile's window, behind this one.
++      std::vector<GURL> urls;
++      for (const ArcSidebar::Tab& tab : arc->today[i]) {
++        urls.push_back(tab.url);
++      }
++      if (!urls.empty()) {
++        ShowSpaceInProfile(browser_, arc->spaces[i].profile,
++                           arc->spaces[i].id, std::move(urls),
++                           /*show=*/false);
++      }
++      continue;
++    }
+     for (const ArcSidebar::Tab& tab : arc->today[i]) {
+       sessions::SerializedNavigationEntry entry;
+       entry.set_index(0);
+@@ -1514,6 +1626,13 @@ void SidebarHandler::OnSidebarChanged() {
+   for (int i = 0; i < model()->count(); ++i) {
+     Adopt(model()->GetTabAtIndex(i));
+   }
++  if (!joined_frame_) {
++    // After a restart: this window goes behind (or in front of) the windows
++    // of the other profiles, as one frame.
++    joined_frame_ = true;
++    const Space* active = service_->FindSpace(service_->active_space_id());
++    JoinFrameIfBehind(browser_, active ? active->profile : std::string());
++  }
+   ScheduleNotify();
+ }
+ 
+@@ -1561,15 +1680,23 @@ mojom::SidebarStatePtr SidebarHandler::BuildState() {
+     s->icon = space.icon;
+     s->color = space.color;
+     s->color2 = space.color2;
++    s->profile_id = space.profile;
+     for (const Item& item : space.pinned) {
+       s->pinned.push_back(ToMojo(item));
+     }
+     state->spaces.push_back(std::move(s));
+   }
+   state->active_space_id = service_->active_space_id();
+-  for (const Item& item : service_->favorites()) {
++  for (const Item& item : service_->favorites(profile_id_)) {
+     state->favorites.push_back(ToMojo(item));
+   }
++  for (const ProfileInfo& p : service_->profiles()) {
++    auto profile = mojom::SpaceProfile::New();
++    profile->id = p.id;
++    profile->name = p.name;
++    state->profiles.push_back(std::move(profile));
++  }
++  state->profile_id = profile_id_;
+   for (int i = 0; i < model()->count(); ++i) {
+     tabs::TabInterface* tab = model()->GetTabAtIndex(i);
+     const TabData* data = TabData::Get(tab->GetContents());
+@@ -1662,20 +1789,37 @@ void SidebarHandler::DeleteSpace(const std::string& space_id) {
+       }
+     }
+   }
+-  std::vector<content::WebContents*> to_close;
+-  for (int i = 0; i < model()->count(); ++i) {
+-    content::WebContents* contents = model()->GetTabAtIndex(i)->GetContents();
+-    const TabData* data = TabData::Get(contents);
+-    if (data && data->space_id() == space_id) {
+-      to_close.push_back(contents);
++  // Its tabs, in every window (a space of another profile lives in that
++  // profile's window).
++  std::vector<base::WeakPtr<content::WebContents>> to_close;
++  for (auto& [window, handler] : Handlers()) {
++    if (handler->service_ != service_) {
++      continue;
+     }
++    TabStripModel* tabs = window->GetTabStripModel();
++    for (int i = 0; i < tabs->count(); ++i) {
++      content::WebContents* contents = tabs->GetWebContentsAt(i);
++      const TabData* data = TabData::Get(contents);
++      if (data && data->space_id() == space_id) {
++        to_close.push_back(contents->GetWeakPtr());
++      }
++    }
++    handler->last_active_.erase(space_id);
+   }
+   service_->DeleteSpace(space_id);
+-  last_active_.erase(space_id);
+-  for (content::WebContents* contents : to_close) {
+-    int index = model()->GetIndexOfWebContents(contents);
++  for (const auto& contents : to_close) {
++    if (!contents) {
++      continue;
++    }
++    tabs::TabInterface* tab =
++        tabs::TabInterface::MaybeGetFromContents(contents.get());
++    TabStripModel* tabs =
++        tab ? tab->GetBrowserWindowInterface()->GetTabStripModel() : nullptr;
++    int index = tabs ? tabs->GetIndexOfWebContents(contents.get())
++                     : TabStripModel::kNoTab;
+     if (index != TabStripModel::kNoTab) {
+-      model()->CloseWebContentsAt(index, TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
++      tabs->CloseWebContentsAt(index,
++                               TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
+     }
+   }
+ }
+@@ -1685,6 +1829,20 @@ void SidebarHandler::MoveSpace(const std::string& space_id, int32_t index) {
+ }
+ 
+ void SidebarHandler::ActivateSpace(const std::string& space_id) {
++  const Space* space = service_->FindSpace(space_id);
++  if (!space) {
++    return;
++  }
++  if (space->profile != profile_id_ && !browser_->GetProfile()->IsOffTheRecord() &&
++      !IsLittleWindow(browser_)) {
++    // Another profile: its window takes this one's place.
++    ShowSpaceInProfile(browser_, space->profile, space_id, {}, /*show=*/true);
++    return;
++  }
++  ActivateSpaceHere(space_id);
++}
++
++void SidebarHandler::ActivateSpaceHere(const std::string& space_id) {
+   if (!service_->FindSpace(space_id)) {
+     return;
+   }
+@@ -1728,16 +1886,166 @@ void SidebarHandler::MoveTabToSpace(const tabs_api::NodeId& tab_id,
+   std::string item_id = data ? data->item_id() : std::string();
+   // A tab leaving the space of its pinned item is no longer that item's tab.
+   if (!item_id.empty() && service_->ContainerOf(item_id) != space_id &&
+-      service_->ContainerOf(item_id) != kFavorites) {
++      !IsFavorites(service_->ContainerOf(item_id))) {
+     item_id.clear();
+   }
++  const Space* target = service_->FindSpace(space_id);
++  if (target->profile != profile_id_ && !IsLittleWindow(browser_) &&
++      !browser_->GetProfile()->IsOffTheRecord()) {
++    // A page can't change profiles: it reopens there (signed out, maybe).
++    GURL url = tab->GetContents()->GetLastCommittedURL();
++    base::WeakPtr<content::WebContents> old =
++        tab->GetContents()->GetWeakPtr();
++    ShowSpaceInProfile(
++        browser_, target->profile, space_id, {url}, /*show=*/false,
++        base::BindOnce(
++            [](base::WeakPtr<content::WebContents> old,
++               BrowserWindowInterface* opened) {
++              if (opened && old) {
++                old->ClosePage();
++              }
++            },
++            old));
++    return;
++  }
+   TabData::Set(tab->GetContents(), space_id, item_id);
+   ScheduleNotify();
+ }
+ 
++void SidebarHandler::GetDownloads(GetDownloadsCallback callback) {
++  std::move(callback).Run(downloads_->List());
++}
++
++void SidebarHandler::DownloadAction(const std::string& id,
++                                    const std::string& action) {
++  downloads_->Act(id, action);
++}
++
++void SidebarHandler::ClearDownloads() {
++  downloads_->Clear();
++}
++
++void SidebarHandler::AddProfile(const std::string& name,
++                                AddProfileCallback callback) {
++  std::vector<std::string> taken;
++  for (const ProfileInfo& p : service_->profiles()) {
++    taken.push_back(p.id);
++  }
++  std::string id = NewProfileId(taken);
++  std::string clean(base::TrimWhitespaceASCII(name, base::TRIM_ALL));
++  if (!service_->AddProfile(id, clean.substr(0, 60))) {
++    return std::move(callback).Run(std::string());
++  }
++  // Meridian has no profile picker: never Chromium's at startup either.
++  g_browser_process->local_state()->SetBoolean(
++      ::prefs::kBrowserShowProfilePickerOnStartup, false);
++  std::move(callback).Run(id);
++}
++
++void SidebarHandler::RenameProfile(const std::string& profile_id,
++                                   const std::string& name) {
++  std::string clean(base::TrimWhitespaceASCII(name, base::TRIM_ALL));
++  service_->RenameProfile(profile_id, clean.substr(0, 60));
++}
++
++void SidebarHandler::DeleteProfile(const std::string& profile_id,
++                                   DeleteProfileCallback callback) {
++  if (!service_->RemoveProfile(profile_id)) {
++    return std::move(callback).Run(false);
++  }
++  base::FilePath path = ProfilePathFor(profile_id);
++  ProfileManager* manager = g_browser_process->profile_manager();
++  if (manager->GetProfileAttributesStorage().GetProfileAttributesWithPath(
++          path)) {
++    manager->GetDeleteProfileHelper().MaybeScheduleProfileForDeletion(
++        path, base::DoNothing(), ProfileMetrics::DELETE_PROFILE_SETTINGS);
++  }
++  std::move(callback).Run(true);
++}
++
++void SidebarHandler::ClearProfileData(const std::string& profile_id,
++                                      ClearProfileDataCallback callback) {
++  if (!service_->FindProfile(profile_id)) {
++    return std::move(callback).Run(false);
++  }
++  Profile* profile = g_browser_process->profile_manager()->GetProfileByPath(
++      ProfilePathFor(profile_id));
++  if (!profile) {
++    // Not loaded since Meridian started: load it to clear it.
++    g_browser_process->profile_manager()->CreateProfileAsync(
++        ProfilePathFor(profile_id),
++        base::BindOnce(
++            [](ClearProfileDataCallback callback, Profile* profile) {
++              if (profile) {
++                profile->GetBrowsingDataRemover()->Remove(
++                    base::Time(), base::Time::Max(),
++                    chrome_browsing_data_remover::ALL_DATA_TYPES,
++                    chrome_browsing_data_remover::ALL_ORIGIN_TYPES);
++              }
++              std::move(callback).Run(!!profile);
++            },
++            std::move(callback)));
++    return;
++  }
++  profile->GetBrowsingDataRemover()->Remove(
++      base::Time(), base::Time::Max(),
++      chrome_browsing_data_remover::ALL_DATA_TYPES,
++      chrome_browsing_data_remover::ALL_ORIGIN_TYPES);
++  std::move(callback).Run(true);
++}
++
++void SidebarHandler::SetSpaceProfile(const std::string& space_id,
++                                     const std::string& profile_id) {
++  const Space* space = service_->FindSpace(space_id);
++  if (!space || space->profile == profile_id ||
++      !service_->FindProfile(profile_id) || IsLittleWindow(browser_) ||
++      browser_->GetProfile()->IsOffTheRecord()) {
++    return;
++  }
++  // Its open tabs, in every window: they reopen in the new profile.
++  std::vector<GURL> urls;
++  std::vector<base::WeakPtr<content::WebContents>> old;
++  for (auto& [window, handler] : Handlers()) {
++    if (handler->service_ != service_) {
++      continue;
++    }
++    TabStripModel* tabs = window->GetTabStripModel();
++    for (int i = 0; i < tabs->count(); ++i) {
++      content::WebContents* contents = tabs->GetWebContentsAt(i);
++      const TabData* data = TabData::Get(contents);
++      if (data && data->space_id() == space_id) {
++        if (data->item_id().empty() &&
++            contents->GetLastCommittedURL().SchemeIsHTTPOrHTTPS()) {
++          urls.push_back(contents->GetLastCommittedURL());
++        }
++        old.push_back(contents->GetWeakPtr());
++      }
++    }
++  }
++  bool active = service_->active_space_id() == space_id;
++  service_->SetSpaceProfile(space_id, profile_id);
++  // The tabs close once the new window has its own (a window losing its last
++  // tab would close).
++  ShowSpaceInProfile(
++      browser_, profile_id, space_id, std::move(urls), /*show=*/active,
++      base::BindOnce(
++          [](std::vector<base::WeakPtr<content::WebContents>> old,
++             BrowserWindowInterface*) {
++            for (const auto& contents : old) {
++              if (contents) {
++                contents->ClosePage();
++              }
++            }
++          },
++          std::move(old)));
++}
++
+ void SidebarHandler::PinTab(const tabs_api::NodeId& tab_id,
+                             mojom::ItemPositionPtr position,
+                             const std::string& title) {
++  if (position->container == kFavorites) {
++    position->container = Favorites();
++  }
+   tabs::TabInterface* tab = TabFor(tab_id);
+   if (!tab) {
+     return;
+@@ -1756,7 +2064,7 @@ void SidebarHandler::PinTab(const tabs_api::NodeId& tab_id,
+     return;
+   }
+   const TabData* data = TabData::Get(contents);
+-  std::string space_id = position->container == kFavorites
++  std::string space_id = IsFavorites(position->container)
+                              ? (data ? data->space_id()
+                                      : service_->active_space_id())
+                              : position->container;
+@@ -1767,6 +2075,9 @@ void SidebarHandler::PinTab(const tabs_api::NodeId& tab_id,
+ void SidebarHandler::AddFolder(mojom::ItemPositionPtr position,
+                                const std::string& title,
+                                AddFolderCallback callback) {
++  if (position->container == kFavorites) {
++    position->container = Favorites();
++  }
+   Item folder;
+   folder.is_folder = true;
+   folder.title = title.empty() ? "New Folder" : title;
+@@ -1776,12 +2087,15 @@ void SidebarHandler::AddFolder(mojom::ItemPositionPtr position,
+ 
+ void SidebarHandler::MoveItem(const std::string& item_id,
+                               mojom::ItemPositionPtr position) {
++  if (position->container == kFavorites) {
++    position->container = Favorites();
++  }
+   if (!service_->MoveItem(item_id, position->container, position->parent_id,
+                           position->index)) {
+     return;
+   }
+   // The live tabs follow their items into another space.
+-  if (position->container == kFavorites) {
++  if (IsFavorites(position->container)) {
+     return;
+   }
+   for (const std::string& id : service_->SubtreeIds(item_id)) {
+@@ -1823,7 +2137,7 @@ void SidebarHandler::OpenItem(const std::string& item_id) {
+   }
+   std::string container = service_->ContainerOf(item_id);
+   std::string space_id =
+-      container == kFavorites ? service_->active_space_id() : container;
++      IsFavorites(container) ? service_->active_space_id() : container;
+   NavigateParams params(browser_, item->url, ui::PAGE_TRANSITION_AUTO_BOOKMARK);
+   params.disposition = WindowOpenDisposition::kNewForegroundTab;
+   Navigate(&params);
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index f9e8399172..87db904cc8 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -6,6 +6,7 @@
+ #define CHROME_BROWSER_MERIDIAN_SIDEBAR_HANDLER_H_
+ 
+ #include <map>
++#include <memory>
+ #include <string>
+ 
+ #include "base/memory/raw_ptr.h"
+@@ -15,6 +16,7 @@
+ #include "components/prefs/pref_change_registrar.h"
+ #include "chrome/browser/meridian/archive_service.h"
+ #include "chrome/browser/meridian/arc_import.h"
++#include "chrome/browser/meridian/downloads_tracker.h"
+ #include "chrome/browser/meridian/sidebar.mojom.h"
+ #include "chrome/browser/meridian/sidebar_service.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+@@ -24,6 +26,7 @@
+ #include "mojo/public/cpp/bindings/remote.h"
+ 
+ class BrowserWindowInterface;
++class ScopedProfileKeepAlive;
+ class TabStripModel;
+ 
+ namespace meridian {
+@@ -54,6 +57,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+   // Meridian sidebar.
+   static bool HandleCommand(BrowserWindowInterface* browser, int command_id);
+ 
++  // Shows `space_id` in `browser` (a window of the space's profile).
++  static void ActivateSpaceInWindow(BrowserWindowInterface* browser,
++                                    const std::string& space_id);
+   // Opens Mission Control in a window of `profile`, on `node_id`.
+   static void ShowMissionControl(Profile* profile, const std::string& node_id);
+   // Keeps the tab of `contents` one click away: a pinned item of its space
+@@ -90,6 +96,20 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void DeleteSpace(const std::string& space_id) override;
+   void MoveSpace(const std::string& space_id, int32_t index) override;
+   void ActivateSpace(const std::string& space_id) override;
++  void GetDownloads(GetDownloadsCallback callback) override;
++  void DownloadAction(const std::string& id,
++                      const std::string& action) override;
++  void ClearDownloads() override;
++  void AddProfile(const std::string& name,
++                  AddProfileCallback callback) override;
++  void RenameProfile(const std::string& profile_id,
++                     const std::string& name) override;
++  void DeleteProfile(const std::string& profile_id,
++                     DeleteProfileCallback callback) override;
++  void ClearProfileData(const std::string& profile_id,
++                        ClearProfileDataCallback callback) override;
++  void SetSpaceProfile(const std::string& space_id,
++                       const std::string& profile_id) override;
+   void MoveTabToSpace(const tabs_api::NodeId& tab_id,
+                       const std::string& space_id) override;
+   void PinTab(const tabs_api::NodeId& tab_id,
+@@ -228,6 +248,10 @@ class SidebarHandler : public mojom::SidebarHandler,
+   tabs::TabInterface* LiveTabOf(const std::string& item_id);
+   // Gives a tab without (valid) Meridian data the active space.
+   void Adopt(tabs::TabInterface* tab);
++  // The favorites container of this window's profile.
++  std::string Favorites() const;
++  // The space in this window, without switching windows.
++  void ActivateSpaceHere(const std::string& space_id);
+   void MaybePeek(tabs::TabInterface* tab);
+   void OnActiveTabChanged(tabs::TabInterface* tab);
+   // Closes (and so archives) Today tabs not visited for ArchiveAfter().
+@@ -237,6 +261,13 @@ class SidebarHandler : public mojom::SidebarHandler,
+   std::vector<std::string> SpaceIds();
+ 
+   raw_ptr<BrowserWindowInterface> browser_;
++  // The Meridian profile of this window ("" for the main one), and the main
++  // profile kept loaded while it shows its sidebar.
++  std::string profile_id_;
++  std::unique_ptr<ScopedProfileKeepAlive> main_keep_alive_;
++  bool joined_frame_ = false;
++  std::unique_ptr<DownloadsTracker> downloads_;
++  base::OneShotTimer downloads_timer_;
+   raw_ptr<SidebarService> service_;
+   raw_ptr<ArchiveService> archive_;
+   base::RepeatingTimer archive_timer_;
+diff --git a/chrome/browser/meridian/sidebar_service.cc b/chrome/browser/meridian/sidebar_service.cc
+index 6f2f33fd5d..8e560b618c 100644
+--- a/chrome/browser/meridian/sidebar_service.cc
++++ b/chrome/browser/meridian/sidebar_service.cc
+@@ -10,6 +10,7 @@
+ #include "base/files/file_util.h"
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
++#include "base/no_destructor.h"
+ #include "base/task/thread_pool.h"
+ #include "base/uuid.h"
+ 
+@@ -227,6 +228,28 @@ void SidebarService::OnLoaded(std::optional<std::string> json) {
+     std::optional<base::DictValue> dict = base::JSONReader::ReadDict(*json, base::JSON_PARSE_RFC);
+     if (dict) {
+       FromValue(*dict, &spaces_, &favorites_, &active_space_id_);
++      if (const std::string* name = dict->FindString("mainProfileName")) {
++        main_profile_name_ = *name;
++      }
++      if (const base::ListValue* profiles = dict->FindList("profiles")) {
++        for (const base::Value& v : *profiles) {
++          const std::string* id = v.is_dict() ? v.GetDict().FindString("id")
++                                              : nullptr;
++          if (!id || id->empty() || FindProfile(*id)) {
++            continue;
++          }
++          const std::string* name = v.GetDict().FindString("name");
++          profiles_.push_back({*id, name ? *name : "Profile"});
++          profile_favorites_[*id] =
++              ItemsFromValue(v.GetDict().FindList("favorites"));
++        }
++      }
++      // A space of a profile that is gone falls back to the main one.
++      for (Space& space : spaces_) {
++        if (!FindProfile(space.profile)) {
++          space.profile.clear();
++        }
++      }
+     }
+   }
+   EnsureDefaultSpace();
+@@ -255,9 +278,60 @@ const Space* SidebarService::FindSpace(const std::string& space_id) const {
+   return it == spaces_.end() ? nullptr : &*it;
+ }
+ 
++const std::vector<Item>& SidebarService::favorites(
++    const std::string& profile_id) const {
++  if (profile_id.empty()) {
++    return favorites_;
++  }
++  static const base::NoDestructor<std::vector<Item>> kNone;
++  auto it = profile_favorites_.find(profile_id);
++  return it == profile_favorites_.end() ? *kNone : it->second;
++}
++
++// static
++std::string SidebarService::FavoritesOf(const std::string& profile_id) {
++  return profile_id.empty() ? std::string(kFavorites)
++                            : std::string(kFavorites) + ":" + profile_id;
++}
++
++std::vector<ProfileInfo> SidebarService::profiles() const {
++  std::vector<ProfileInfo> out = {{std::string(), main_profile_name_}};
++  out.insert(out.end(), profiles_.begin(), profiles_.end());
++  return out;
++}
++
++const ProfileInfo* SidebarService::FindProfile(
++    const std::string& profile_id) const {
++  static base::NoDestructor<ProfileInfo> main;
++  if (profile_id.empty()) {
++    *main = {std::string(), main_profile_name_};
++    return main.get();
++  }
++  auto it = std::ranges::find(profiles_, profile_id, &ProfileInfo::id);
++  return it == profiles_.end() ? nullptr : &*it;
++}
++
++std::vector<std::vector<Item>*> SidebarService::FavoriteLists() {
++  std::vector<std::vector<Item>*> out = {&favorites_};
++  for (auto& [id, list] : profile_favorites_) {
++    out.push_back(&list);
++  }
++  return out;
++}
++
++std::vector<const std::vector<Item>*> SidebarService::FavoriteLists() const {
++  std::vector<const std::vector<Item>*> out = {&favorites_};
++  for (const auto& [id, list] : profile_favorites_) {
++    out.push_back(&list);
++  }
++  return out;
++}
++
+ const Item* SidebarService::FindItem(const std::string& item_id) const {
+-  if (const Item* item = FindIn(favorites_, item_id)) {
+-    return item;
++  for (const std::vector<Item>* list : FavoriteLists()) {
++    if (const Item* item = FindIn(*list, item_id)) {
++      return item;
++    }
+   }
+   for (const Space& space : spaces_) {
+     if (const Item* item = FindIn(space.pinned, item_id)) {
+@@ -271,6 +345,11 @@ std::string SidebarService::ContainerOf(const std::string& item_id) const {
+   if (FindIn(favorites_, item_id)) {
+     return kFavorites;
+   }
++  for (const auto& [id, list] : profile_favorites_) {
++    if (FindIn(list, item_id)) {
++      return FavoritesOf(id);
++    }
++  }
+   for (const Space& space : spaces_) {
+     if (FindIn(space.pinned, item_id)) {
+       return space.id;
+@@ -366,11 +445,74 @@ bool SidebarService::SetActiveSpace(const std::string& space_id) {
+   return true;
+ }
+ 
++bool SidebarService::SetSpaceProfile(const std::string& space_id,
++                                     const std::string& profile_id) {
++  auto it = std::ranges::find(spaces_, space_id, &Space::id);
++  if (it == spaces_.end() || !FindProfile(profile_id)) {
++    return false;
++  }
++  if (it->profile != profile_id) {
++    it->profile = profile_id;
++    Changed();
++  }
++  return true;
++}
++
++bool SidebarService::AddProfile(const std::string& id,
++                                const std::string& name) {
++  if (id.empty() || FindProfile(id)) {
++    return false;
++  }
++  profiles_.push_back({id, name.empty() ? "Profile" : name});
++  profile_favorites_[id];
++  Changed();
++  return true;
++}
++
++bool SidebarService::RenameProfile(const std::string& profile_id,
++                                   const std::string& name) {
++  if (name.empty()) {
++    return false;
++  }
++  if (profile_id.empty()) {
++    main_profile_name_ = name;
++  } else {
++    auto it = std::ranges::find(profiles_, profile_id, &ProfileInfo::id);
++    if (it == profiles_.end()) {
++      return false;
++    }
++    it->name = name;
++  }
++  Changed();
++  return true;
++}
++
++bool SidebarService::RemoveProfile(const std::string& profile_id) {
++  auto it = std::ranges::find(profiles_, profile_id, &ProfileInfo::id);
++  if (profile_id.empty() || it == profiles_.end() ||
++      std::ranges::any_of(spaces_, [&](const Space& s) {
++        return s.profile == profile_id;
++      })) {
++    return false;
++  }
++  profiles_.erase(it);
++  profile_favorites_.erase(profile_id);
++  Changed();
++  return true;
++}
++
+ std::vector<Item>* SidebarService::ListFor(const std::string& container,
+                                            const std::string& parent_id) {
+   std::vector<Item>* top = nullptr;
+   if (container == kFavorites) {
+     top = &favorites_;
++  } else if (container.starts_with(std::string(kFavorites) + ":")) {
++    auto it = profile_favorites_.find(
++        container.substr(std::string_view(kFavorites).size() + 1));
++    if (it == profile_favorites_.end()) {
++      return nullptr;
++    }
++    top = &it->second;
+   } else {
+     auto it = std::ranges::find(spaces_, container, &Space::id);
+     if (it == spaces_.end()) {
+@@ -422,7 +564,10 @@ bool SidebarService::MoveItem(const std::string& item_id,
+   // Take it out, then insert at the target.
+   std::vector<Item>* from = nullptr;
+   size_t from_index = 0;
+-  bool found = Locate(favorites_, item_id, &from, &from_index);
++  bool found = false;
++  for (std::vector<Item>* list : FavoriteLists()) {
++    found = found || Locate(*list, item_id, &from, &from_index);
++  }
+   for (size_t i = 0; !found && i < spaces_.size(); ++i) {
+     found = Locate(spaces_[i].pinned, item_id, &from, &from_index);
+   }
+@@ -441,7 +586,10 @@ bool SidebarService::MoveItem(const std::string& item_id,
+ bool SidebarService::RemoveItem(const std::string& item_id) {
+   std::vector<Item>* list = nullptr;
+   size_t index = 0;
+-  bool found = Locate(favorites_, item_id, &list, &index);
++  bool found = false;
++  for (std::vector<Item>* favorites : FavoriteLists()) {
++    found = found || Locate(*favorites, item_id, &list, &index);
++  }
+   for (size_t i = 0; !found && i < spaces_.size(); ++i) {
+     found = Locate(spaces_[i].pinned, item_id, &list, &index);
+   }
+@@ -526,11 +674,27 @@ base::DictValue SidebarService::ToValue() const {
+     s.Set("icon", space.icon);
+     s.Set("color", space.color);
+     s.Set("color2", space.color2);
++    if (!space.profile.empty()) {
++      s.Set("profile", space.profile);
++    }
+     s.Set("pinned", ItemsToValue(space.pinned));
+     spaces.Append(std::move(s));
+   }
+   root.Set("spaces", std::move(spaces));
+   root.Set("favorites", ItemsToValue(favorites_));
++  root.Set("mainProfileName", main_profile_name_);
++  base::ListValue profiles;
++  for (const ProfileInfo& p : profiles_) {
++    auto it = profile_favorites_.find(p.id);
++    profiles.Append(base::DictValue()
++                        .Set("id", p.id)
++                        .Set("name", p.name)
++                        .Set("favorites", ItemsToValue(
++                                              it == profile_favorites_.end()
++                                                  ? std::vector<Item>()
++                                                  : it->second)));
++  }
++  root.Set("profiles", std::move(profiles));
+   return root;
+ }
+ 
+@@ -563,6 +727,7 @@ bool SidebarService::FromValue(const base::DictValue& value,
+     space.icon = str("icon");
+     space.color = str("color");
+     space.color2 = str("color2");
++    space.profile = str("profile");
+     if (space.color.empty()) {
+       space.color = kDefaultColor;
+     }
+diff --git a/chrome/browser/meridian/sidebar_service.h b/chrome/browser/meridian/sidebar_service.h
+index b563a30e97..5225fb569b 100644
+--- a/chrome/browser/meridian/sidebar_service.h
++++ b/chrome/browser/meridian/sidebar_service.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_MERIDIAN_SIDEBAR_SERVICE_H_
+ #define CHROME_BROWSER_MERIDIAN_SIDEBAR_SERVICE_H_
+ 
++#include <map>
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -22,8 +23,18 @@
+ namespace meridian {
+ 
+ // The container id of the favorites, which every space of a profile shares.
++// Another profile's favorites are "favorites:<profile id>" (FavoritesOf).
+ inline constexpr char kFavorites[] = "favorites";
+ 
++// A Meridian profile: its own cookies, logins and site data, like a separate
++// browser (a Chromium profile in the user data folder). The main profile, the
++// one holding the sidebar, has the empty id; the others are profile folder
++// names.
++struct ProfileInfo {
++  std::string id;
++  std::string name;
++};
++
+ struct Item {
+   Item();
+   Item(const Item&);
+@@ -53,12 +64,15 @@ struct Space {
+   std::string icon;
+   std::string color;
+   std::string color2;
++  // The profile its tabs live in (ProfileInfo::id).
++  std::string profile;
+   std::vector<Item> pinned;
+ };
+ 
+-// The Meridian sidebar of one profile: its spaces, each space's pinned items
+-// and folders, and the favorites. Live tabs are not stored here; a tab points
+-// at its space and item through TabData.
++// The Meridian sidebar: its spaces, each space's pinned items and folders,
++// the profiles and each profile's favorites. Live tabs are not stored here; a
++// tab points at its space and item through TabData. Windows of the other
++// Meridian profiles use the main profile's instance (SidebarServiceFactory).
+ //
+ // Saved as JSON in "<profile>/Meridian Sidebar.json". Off-the-record profiles
+ // keep it in memory only.
+@@ -81,6 +95,12 @@ class SidebarService : public KeyedService {
+   bool loaded() const { return loaded_; }
+   const std::vector<Space>& spaces() const { return spaces_; }
+   const std::vector<Item>& favorites() const { return favorites_; }
++  // The favorites of `profile_id` (empty: none yet).
++  const std::vector<Item>& favorites(const std::string& profile_id) const;
++  static std::string FavoritesOf(const std::string& profile_id);
++  // Every profile, the main one ("") first.
++  std::vector<ProfileInfo> profiles() const;
++  const ProfileInfo* FindProfile(const std::string& profile_id) const;
+   const std::string& active_space_id() const { return active_space_id_; }
+   const Space* FindSpace(const std::string& space_id) const;
+   // Searches favorites and every space; nullptr if unknown.
+@@ -103,6 +123,14 @@ class SidebarService : public KeyedService {
+   bool DeleteSpace(const std::string& space_id);
+   bool MoveSpace(const std::string& space_id, int index);
+   bool SetActiveSpace(const std::string& space_id);
++  bool SetSpaceProfile(const std::string& space_id,
++                       const std::string& profile_id);
++
++  // A new profile `id` (a folder name not used yet) called `name`.
++  bool AddProfile(const std::string& id, const std::string& name);
++  bool RenameProfile(const std::string& profile_id, const std::string& name);
++  // Not the main one, nor one a space uses. Its favorites go too.
++  bool RemoveProfile(const std::string& profile_id);
+ 
+   // `container` is a space id or kFavorites; `parent_id` a folder in it or
+   // empty. Returns the new item's id, or empty if the position is invalid.
+@@ -145,10 +173,16 @@ class SidebarService : public KeyedService {
+   void EnsureDefaultSpace();
+   std::vector<Item>* ListFor(const std::string& container,
+                              const std::string& parent_id);
++  // Favorites of every profile.
++  std::vector<std::vector<Item>*> FavoriteLists();
++  std::vector<const std::vector<Item>*> FavoriteLists() const;
+   void Changed();
+ 
+   std::vector<Space> spaces_;
+   std::vector<Item> favorites_;
++  std::string main_profile_name_ = "Default";
++  std::vector<ProfileInfo> profiles_;  // without the main one
++  std::map<std::string, std::vector<Item>> profile_favorites_;
+   std::string active_space_id_;
+   bool loaded_ = false;
+ 
+diff --git a/chrome/browser/meridian/sidebar_service_factory.cc b/chrome/browser/meridian/sidebar_service_factory.cc
+index 4da8b4ba8b..60294cc662 100644
+--- a/chrome/browser/meridian/sidebar_service_factory.cc
++++ b/chrome/browser/meridian/sidebar_service_factory.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/meridian/sidebar_service_factory.h"
+ 
+ #include "chrome/browser/meridian/archive_service.h"
++#include "chrome/browser/meridian/profile_windows.h"
+ #include "chrome/browser/meridian/sidebar_service.h"
+ #include "chrome/browser/profiles/profile.h"
+ 
+@@ -12,8 +13,9 @@ namespace meridian {
+ 
+ // static
+ SidebarService* SidebarServiceFactory::GetForProfile(Profile* profile) {
+-  return static_cast<SidebarService*>(
+-      GetInstance()->GetServiceForBrowserContext(profile, /*create=*/true));
++  // Every Meridian profile's windows share the main profile's sidebar.
++  return static_cast<SidebarService*>(GetInstance()->GetServiceForBrowserContext(
++      MainProfileFor(profile), /*create=*/true));
+ }
+ 
+ // static
+@@ -42,8 +44,8 @@ SidebarServiceFactory::BuildServiceInstanceForBrowserContext(
+ 
+ // static
+ ArchiveService* ArchiveServiceFactory::GetForProfile(Profile* profile) {
+-  return static_cast<ArchiveService*>(
+-      GetInstance()->GetServiceForBrowserContext(profile, /*create=*/true));
++  return static_cast<ArchiveService*>(GetInstance()->GetServiceForBrowserContext(
++      MainProfileFor(profile), /*create=*/true));
+ }
+ 
+ // static
+diff --git a/chrome/browser/meridian/sidebar_service_unittest.cc b/chrome/browser/meridian/sidebar_service_unittest.cc
+index 9530a8f3df..a3b7b20ed5 100644
+--- a/chrome/browser/meridian/sidebar_service_unittest.cc
++++ b/chrome/browser/meridian/sidebar_service_unittest.cc
+@@ -131,6 +131,44 @@ TEST_F(SidebarServiceTest, SavesAndLoadsJson) {
+   ASSERT_NE(again.FindItem(fav), nullptr);
+ }
+ 
++TEST_F(SidebarServiceTest, ProfilesKeepTheirOwnFavorites) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  std::string space, work_fav;
++  {
++    SidebarService service(dir.GetPath());
++    env_.RunUntilIdle();
++    ASSERT_TRUE(service.AddProfile("Meridian Profile 1", "Work"));
++    EXPECT_FALSE(service.AddProfile("Meridian Profile 1", "Again"));
++    space = service.CreateSpace("Client", "", "", "");
++    ASSERT_TRUE(service.SetSpaceProfile(space, "Meridian Profile 1"));
++    EXPECT_FALSE(service.SetSpaceProfile(space, "nope"));
++    service.AddItem(kFavorites, "", -1, Link("Mail", "https://mail.example/"));
++    work_fav = service.AddItem(SidebarService::FavoritesOf("Meridian Profile 1"),
++                               "", -1, Link("Jira", "https://jira.example/"));
++    ASSERT_FALSE(work_fav.empty());
++    EXPECT_EQ(service.ContainerOf(work_fav), "favorites:Meridian Profile 1");
++    EXPECT_FALSE(service.RemoveProfile("Meridian Profile 1")) << "a space uses it";
++    EXPECT_FALSE(service.RemoveProfile("")) << "never the main one";
++    service.FlushForTesting();
++    env_.RunUntilIdle();
++  }
++  SidebarService again(dir.GetPath());
++  env_.RunUntilIdle();
++  ASSERT_EQ(again.profiles().size(), 2u);
++  EXPECT_EQ(again.profiles()[1].name, "Work");
++  EXPECT_EQ(again.FindSpace(space)->profile, "Meridian Profile 1");
++  ASSERT_EQ(again.favorites("Meridian Profile 1").size(), 1u);
++  EXPECT_EQ(again.favorites("Meridian Profile 1")[0].title, "Jira");
++  ASSERT_EQ(again.favorites().size(), 1u);
++  // Moving between profiles' favorites, then removing the profile.
++  EXPECT_TRUE(again.MoveItem(work_fav, kFavorites, "", -1));
++  EXPECT_EQ(again.favorites().size(), 2u);
++  again.SetSpaceProfile(space, "");
++  EXPECT_TRUE(again.RemoveProfile("Meridian Profile 1"));
++  EXPECT_EQ(again.profiles().size(), 1u);
++}
++
+ TEST_F(SidebarServiceTest, IgnoresBrokenEntries) {
+   std::vector<Space> spaces;
+   std::vector<Item> favorites;
+diff --git a/chrome/browser/resources/webui_browser/meridian/icons.ts b/chrome/browser/resources/webui_browser/meridian/icons.ts
+index d6d5b1a090..3c84acc1d6 100644
+--- a/chrome/browser/resources/webui_browser/meridian/icons.ts
++++ b/chrome/browser/resources/webui_browser/meridian/icons.ts
+@@ -46,7 +46,10 @@ export type IconName =
+     'code'|
+     'globe'|
+     'bolt'|
+-    'agents';
++    'agents'|
++    'users'|
++    'download'|
++    'file';
+ 
+ export function icon(name: IconName, size = 16): TemplateResult {
+   switch (name) {
+@@ -122,5 +125,11 @@ export function icon(name: IconName, size = 16): TemplateResult {
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 3.5L5.5 13.5h6l-1 7 7.5-10h-6z"/></svg>`;
+     case 'agents':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="2.2"/><path d="M12 4.5a7.5 7.5 0 0 1 7.5 7.5"/><path d="M4.5 12A7.5 7.5 0 0 1 12 4.5" opacity=".55"/><path d="M19.5 12A7.5 7.5 0 0 1 12 19.5"/><path d="M12 19.5A7.5 7.5 0 0 1 4.5 12" opacity=".55"/><circle cx="19.5" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="4.5" cy="12" r="1.3" fill="currentColor" stroke="none"/></svg>`;
++    case 'users':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9.5" cy="9" r="3.5"/><path d="M3.5 19c1-3 3.3-4.5 6-4.5s5 1.5 6 4.5"/><path d="M15.5 5.7a3.5 3.5 0 0 1 0 6.6M17.5 14.8c1.4.6 2.4 1.9 3 4.2"/></svg>`;
++    case 'download':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4.5v10M7.5 10.5L12 15l4.5-4.5"/><path d="M5 19.5h14"/></svg>`;
++    case 'file':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 3.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13.5 3.5V9H19"/></svg>`;
+   }
+ }
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.css b/chrome/browser/resources/webui_browser/meridian/settings.css
+index 3a22a9b8c3..f98fc78042 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.css
++++ b/chrome/browser/resources/webui_browser/meridian/settings.css
+@@ -405,6 +405,19 @@ select:focus {
+   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+ }
+ 
++.confirm-card input.text {
++  width: 100%;
++  box-sizing: border-box;
++  margin: 4px 0 12px;
++}
++
++.group-note {
++  color: var(--meridian-text-muted);
++  font-size: 11.5px;
++  line-height: 1.4;
++  margin: 8px 4px 0;
++}
++
+ .confirm-card h3 {
+   margin: 0 0 8px;
+   font-size: 15px;
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index 288085fab3..4f386b3c1b 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -26,6 +26,10 @@ export function getHtml(this: MeridianSettingsElement) {
+           data-id="ai" role="tab" @click="${this.onTabClick_}">
+         ${icon('sparkles', 18)}<span>AI</span>
+       </button>
++      <button class="tab ${this.section_ === 'profiles' ? 'on' : ''}"
++          data-id="profiles" role="tab" @click="${this.onTabClick_}">
++        ${icon('users', 18)}<span>Profiles</span>
++      </button>
+       <button class="tab ${this.section_ === 'advanced' ? 'on' : ''}"
+           data-id="advanced" role="tab" @click="${this.onTabClick_}">
+         ${icon('more', 18)}<span>Advanced</span>
+@@ -519,6 +523,40 @@ export function getHtml(this: MeridianSettingsElement) {
+           </div>
+         </section>` : ''}
+ 
++      ${this.settings_ && this.section_ === 'profiles' ? html`
++        <section id="profiles">
++          <div class="group">
++            <h2>Profiles</h2>
++            <div class="card">
++              ${this.profileRows_.map(p => html`
++                <div class="row profile" data-id="${p.id}">
++                  <div class="row-text">
++                    <div class="row-label">${p.name}</div>
++                    <div class="row-desc">${p.usage}</div>
++                  </div>
++                  <button class="icon-btn" title="Rename" data-id="${p.id}"
++                      @click="${this.onProfileRenameClick_}">
++                    ${icon('pencil', 15)}</button>
++                  <button class="btn" data-id="${p.id}"
++                      @click="${this.onProfileClearClick_}">Clear Data…</button>
++                  <button class="icon-btn danger" data-id="${p.id}"
++                      title="${p.canDelete ? 'Delete profile' : 'Used by a space'}"
++                      ?disabled="${!p.canDelete}"
++                      @click="${this.onProfileDeleteClick_}">
++                    ${icon('trash', 15)}</button>
++                </div>`)}
++              <div class="row">
++                <button id="newProfile" class="btn"
++                    @click="${this.onNewProfileClick_}">
++                  ${icon('plus', 14)} New Profile</button>
++              </div>
++            </div>
++            <p class="group-note">Each profile keeps its own cookies, logins
++              and site data, like separate browsers. Spaces choose their
++              profile: right-click a space and pick Profile.</p>
++          </div>
++        </section>` : ''}
++
+       ${this.settings_ && this.section_ === 'advanced' ? html`
+         <section id="advanced">
+           <div class="group">
+@@ -597,6 +635,37 @@ export function getHtml(this: MeridianSettingsElement) {
+           </div>
+         </div>
+       </div>` : ''}
++    ${this.profileEdit_ ? html`
++      <div class="confirm">
++        <div class="confirm-card">
++          <h3>${this.profileEdit_.title}</h3>
++          <input id="profileName" class="text" spellcheck="false"
++              placeholder="Work, Personal, Client…"
++              .value="${this.profileEdit_.value}"
++              @input="${this.onProfileNameInput_}"
++              @keydown="${this.onProfileNameKeydown_}">
++          <div class="confirm-actions">
++            <button class="btn" @click="${this.onProfileCancelClick_}">
++              Cancel</button>
++            <button id="profileSave" class="btn primary"
++                @click="${this.onProfileSaveClick_}">Save</button>
++          </div>
++        </div>
++      </div>` : ''}
++    ${this.profileConfirm_ ? html`
++      <div class="confirm">
++        <div class="confirm-card">
++          <h3>${this.profileConfirm_.title}</h3>
++          <p>${this.profileConfirm_.text}</p>
++          <div class="confirm-actions">
++            <button class="btn" @click="${this.onProfileCancelClick_}">
++              Cancel</button>
++            <button id="profileConfirm" class="btn danger"
++                @click="${this.onProfileConfirmClick_}">
++              ${this.profileConfirm_.button}</button>
++          </div>
++        </div>
++      </div>` : ''}
+     ${this.confirmClear_ ? html`
+       <div class="confirm">
+         <div class="confirm-card">
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index e656f7cb12..ce00a15456 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -15,7 +15,30 @@ import type {AgentCli, AiProvider, Atc, Settings, SidebarHandlerInterface, Space
+ import {getCss} from './settings.css.js';
+ import {getHtml} from './settings.html.js';
+ 
+-export type SectionId = 'general'|'links'|'ai'|'advanced';
++export type SectionId = 'general'|'links'|'ai'|'profiles'|'advanced';
++
++// Settings > Profiles: a row per profile.
++interface ProfileRow {
++  id: string;
++  name: string;
++  // "Used by Work, Client" / "Not used by a space".
++  usage: string;
++  canDelete: boolean;
++}
++
++// The rename / new profile prompt, and the clear / delete confirmation.
++interface ProfileEdit {
++  id: string;  // empty: a new profile
++  title: string;
++  value: string;
++}
++interface ProfileConfirm {
++  id: string;
++  kind: 'clear'|'delete';
++  title: string;
++  text: string;
++  button: string;
++}
+ 
+ export interface Choice {
+   value: string;
+@@ -118,6 +141,9 @@ export class MeridianSettingsElement extends CrLitElement {
+       section_: {state: true, type: String},
+       settings_: {state: true, type: Object},
+       spaces_: {state: true, type: Array},
++      profileRows_: {state: true, type: Array},
++      profileEdit_: {state: true, type: Object},
++      profileConfirm_: {state: true, type: Object},
+       tryResult_: {state: true, type: String},
+       confirmClear_: {state: true, type: Boolean},
+       rules_: {state: true, type: Array},
+@@ -147,6 +173,9 @@ export class MeridianSettingsElement extends CrLitElement {
+   protected accessor section_: SectionId = 'general';
+   protected accessor settings_: Settings|null = null;
+   protected accessor spaces_: Space[] = [];
++  protected accessor profileRows_: ProfileRow[] = [];
++  protected accessor profileEdit_: ProfileEdit|null = null;
++  protected accessor profileConfirm_: ProfileConfirm|null = null;
+   protected accessor tryResult_: string = '';
+   protected accessor confirmClear_: boolean = false;
+   // Derived in willUpdate().
+@@ -197,6 +226,118 @@ export class MeridianSettingsElement extends CrLitElement {
+     this.aiMessage_ = '';
+     this.setup_ = null;
+     this.loadProviders_(false);
++    this.profileEdit_ = null;
++    this.profileConfirm_ = null;
++    this.loadProfiles_();
++  }
++
++  // ---------------------------------------------------------- profiles
++
++  private async loadProfiles_() {
++    const {state} = await this.handler_.getState();
++    this.spaces_ = state.spaces;
++    this.profileRows_ = state.profiles.map(p => {
++      const used = state.spaces.filter(s => s.profileId === p.id);
++      return {
++        id: p.id,
++        name: p.name,
++        usage: used.length ? 'Used by ' + used.map(s => s.name).join(', ') :
++                             'Not used by a space',
++        canDelete: p.id !== '' && used.length === 0,
++      };
++    });
++  }
++
++  protected onNewProfileClick_() {
++    this.profileEdit_ = {id: '', title: 'New profile', value: ''};
++  }
++
++  protected onProfileRenameClick_(e: Event) {
++    const row = this.profileRow_(e);
++    if (row) {
++      this.profileEdit_ = {id: row.id, title: 'Rename profile', value: row.name};
++    }
++  }
++
++  protected onProfileClearClick_(e: Event) {
++    const row = this.profileRow_(e);
++    if (row) {
++      this.profileConfirm_ = {
++        id: row.id,
++        kind: 'clear',
++        title: `Clear all data for “${row.name}”?`,
++        text: 'Cookies, logins, cache and site storage for this profile are ' +
++            'deleted. Tabs stay.',
++        button: 'Clear Data',
++      };
++    }
++  }
++
++  protected onProfileDeleteClick_(e: Event) {
++    const row = this.profileRow_(e);
++    if (row) {
++      this.profileConfirm_ = {
++        id: row.id,
++        kind: 'delete',
++        title: `Delete “${row.name}”?`,
++        text: 'Its favorites and site data are removed.',
++        button: 'Delete',
++      };
++    }
++  }
++
++  private profileRow_(e: Event): ProfileRow|undefined {
++    const id = (e.currentTarget as HTMLElement).dataset['id'];
++    return this.profileRows_.find(r => r.id === id);
++  }
++
++  protected onProfileNameInput_(e: Event) {
++    if (this.profileEdit_) {
++      this.profileEdit_ = {
++        ...this.profileEdit_,
++        value: (e.target as HTMLInputElement).value,
++      };
++    }
++  }
++
++  protected onProfileNameKeydown_(e: KeyboardEvent) {
++    if (e.key === 'Enter') {
++      this.onProfileSaveClick_();
++    }
++  }
++
++  protected async onProfileSaveClick_() {
++    const edit = this.profileEdit_;
++    const name = edit?.value.trim();
++    if (!edit || !name) {
++      return;
++    }
++    this.profileEdit_ = null;
++    if (edit.id) {
++      this.handler_.renameProfile(edit.id, name);
++    } else {
++      await this.handler_.addProfile(name);
++    }
++    this.loadProfiles_();
++  }
++
++  protected onProfileCancelClick_() {
++    this.profileEdit_ = null;
++    this.profileConfirm_ = null;
++  }
++
++  protected async onProfileConfirmClick_() {
++    const c = this.profileConfirm_;
++    this.profileConfirm_ = null;
++    if (!c) {
++      return;
++    }
++    if (c.kind === 'clear') {
++      await this.handler_.clearProfileData(c.id);
++    } else {
++      await this.handler_.deleteProfile(c.id);
++    }
++    this.loadProfiles_();
+   }
+ 
+   hide() {
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.css b/chrome/browser/resources/webui_browser/meridian/sidebar.css
+index 3c54089a11..476bb3e668 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.css
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.css
+@@ -17,6 +17,7 @@
+   flex-direction: column;
+   flex: 1;
+   min-height: 0;
++  position: relative;
+   color: var(--meridian-text);
+ }
+ 
+@@ -192,6 +193,147 @@ button {
+   color: var(--meridian-text);
+ }
+ 
++/* ------------------------------------------------------- downloads */
++
++.icon-btn.downloads {
++  position: relative;
++}
++
++.icon-btn.downloads.open {
++  background: var(--meridian-row-hover);
++  color: var(--meridian-text);
++}
++
++.icon-btn.downloads .ring {
++  position: absolute;
++  inset: 0;
++  transform: rotate(-90deg);
++  pointer-events: none;
++}
++
++.icon-btn.downloads .ring circle {
++  fill: none;
++  stroke: var(--meridian-space);
++  stroke-width: 2;
++  stroke-linecap: round;
++}
++
++#downloads {
++  position: absolute;
++  z-index: 90;
++  left: 8px;
++  right: 8px;
++  bottom: 44px;
++  max-height: 60vh;
++  overflow-y: auto;
++  padding: 6px;
++  border-radius: 10px;
++  background: var(--meridian-surface);
++  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.22), 0 0 0 0.5px var(--meridian-border);
++}
++
++#downloads[hidden] {
++  display: none;
++}
++
++.dl-head {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  padding: 4px 6px 6px;
++  font-weight: 600;
++}
++
++.dl-clear,
++.dl-act {
++  padding: 2px 8px;
++  border-radius: 6px;
++  color: var(--meridian-text-muted);
++  font-size: 12px;
++}
++
++.dl-clear:hover,
++.dl-act:hover {
++  background: var(--meridian-row-hover);
++  color: var(--meridian-text);
++}
++
++.dl-empty {
++  padding: 10px 6px;
++  color: var(--meridian-text-muted);
++}
++
++.dl {
++  display: flex;
++  align-items: center;
++  gap: 2px;
++  border-radius: 7px;
++}
++
++.dl:hover {
++  background: var(--meridian-row-hover);
++}
++
++.dl-main {
++  flex: 1;
++  min-width: 0;
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  padding: 6px;
++  text-align: left;
++}
++
++.dl-main:disabled {
++  cursor: default;
++}
++
++.dl-text {
++  min-width: 0;
++  flex: 1;
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++}
++
++.dl-name {
++  overflow: hidden;
++  white-space: nowrap;
++  text-overflow: ellipsis;
++}
++
++.dl-status {
++  font-size: 11px;
++  color: var(--meridian-text-muted);
++}
++
++.dl.dangerous .dl-status,
++.dl.interrupted .dl-status {
++  color: #d13c3c;
++}
++
++.dl.cancelled .dl-name {
++  opacity: 0.6;
++}
++
++.dl-bar {
++  height: 3px;
++  border-radius: 2px;
++  background: var(--meridian-border);
++  overflow: hidden;
++}
++
++.dl-bar > span {
++  display: block;
++  height: 100%;
++  background: var(--meridian-space);
++}
++
++.dl-icon {
++  width: 24px;
++  height: 24px;
++}
++
+ /* ------------------------------------------------------------ menu */
+ 
+ #menu {
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+index 0089f682fb..00dbec894a 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+@@ -5,6 +5,7 @@
+ import {html, repeat} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+ import {icon} from './icons.js';
++import {downloadStatus} from './sidebar.js';
+ import type {MeridianSidebarElement} from './sidebar.js';
+ 
+ export function getHtml(this: MeridianSidebarElement) {
+@@ -66,6 +67,18 @@ export function getHtml(this: MeridianSidebarElement) {
+     ${this.missionCounts_.waiting ? html`
+       <span class="mission-badge">${this.missionCounts_.waiting}</span>` : ''}
+   </button>
++  ${this.downloads_.length || this.downloadsOpen_ ? html`
++    <button id="downloadsButton"
++        class="icon-btn downloads ${this.downloadsOpen_ ? 'open' : ''}"
++        title="Downloads (⇧⌘J)" @click="${this.onDownloadsClick_}">
++      ${icon('download', 16)}
++      ${this.downloadsProgress_() !== null ? html`
++        <svg class="ring" viewBox="0 0 28 28">
++          <circle cx="14" cy="14" r="12.5" pathLength="100"
++              stroke-dasharray="${Math.max(4, this.downloadsProgress_()! * 100)} 100">
++          </circle>
++        </svg>` : ''}
++    </button>` : ''}
+   <div id="spaceDots">
+     ${repeat(this.state_?.spaces || [], s => s.id, s => html`
+       <button class="space-dot ${s.id === this.space_?.id ? 'active' : ''}"
+@@ -82,6 +95,51 @@ export function getHtml(this: MeridianSidebarElement) {
+   </button>
+   <slot name="bottom-end"></slot>
+ </div>
++<div id="downloads" role="dialog" aria-label="Downloads"
++    ?hidden="${!this.downloadsOpen_}">
++  <div class="dl-head">
++    <span>Downloads</span>
++    ${this.downloads_.some(d => d.state !== 'progressing' &&
++                                d.state !== 'paused' &&
++                                d.state !== 'dangerous') ? html`
++      <button id="clearDownloads" class="dl-clear"
++          @click="${this.onClearDownloadsClick_}">Clear</button>` : ''}
++  </div>
++  ${!this.downloads_.length ? html`
++    <div class="dl-empty">Nothing downloaded yet</div>` : ''}
++  ${repeat(this.downloads_, d => d.id, d => html`
++    <div class="dl ${d.state}" data-id="${d.id}" title="${d.name}">
++      <button class="dl-main" data-id="${d.id}" data-action="open"
++          ?disabled="${d.state !== 'completed'}"
++          @click="${this.onDownloadActionClick_}">
++        <span class="ic">${icon('file', 16)}</span>
++        <span class="dl-text">
++          <span class="dl-name">${d.name}</span>
++          <span class="dl-status">${downloadStatus(d)}</span>
++          ${d.state === 'progressing' || d.state === 'paused' ? html`
++            <span class="dl-bar"><span style="width:${
++                d.total ? Math.round(d.received / d.total * 100) : 0}%"></span>
++            </span>` : ''}
++        </span>
++      </button>
++      ${d.state === 'dangerous' ? html`
++        <button class="dl-act" data-id="${d.id}" data-action="discard"
++            @click="${this.onDownloadActionClick_}">Discard</button>
++        <button class="dl-act" data-id="${d.id}" data-action="keep"
++            @click="${this.onDownloadActionClick_}">Keep</button>` : ''}
++      ${d.state === 'progressing' || d.state === 'paused' ? html`
++        <button class="icon-btn dl-icon" title="Cancel" data-id="${d.id}"
++            data-action="cancel" @click="${this.onDownloadActionClick_}">
++          ${icon('x', 14)}
++        </button>` : ''}
++      ${d.state === 'completed' ? html`
++        <button class="icon-btn dl-icon" title="Show in Finder"
++            data-id="${d.id}" data-action="reveal"
++            @click="${this.onDownloadActionClick_}">
++          ${icon('search', 14)}
++        </button>` : ''}
++    </div>`)}
++</div>
+ <div id="menu" role="menu" ?hidden="${!this.menu_}"
+     style="left:${this.menu_?.x ?? 0}px; top:${this.menu_?.y ?? 0}px">
+   ${(this.menu_?.entries || []).map((entry, index) => html`
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index d1cfd53486..b292987fa3 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -23,7 +23,7 @@ import {TabStripObservation} from '/tab_strip_api/tab_strip_observation.js';
+ import type {TabStripObserver} from '/tab_strip_api/tab_strip_observer.js';
+ 
+ import {browserProxyFactory as sidebarProxyFactory, Command} from '../sidebar.mojom-webui.js';
+-import type {Item, SidebarHandlerInterface, SidebarState, Space, TidyFolder, TidyRename} from '../sidebar.mojom-webui.js';
++import type {Download, Item, SidebarHandlerInterface, SidebarState, Space, TidyFolder, TidyRename} from '../sidebar.mojom-webui.js';
+ import type {TabAdded, TabClosed, TabUpdated} from '../tab_strip/events.js';
+ 
+ import './fav.js';
+@@ -52,9 +52,40 @@ export interface MenuEntry {
+ export interface MeridianSidebarElement {
+   $: {
+     menu: HTMLElement,
++    downloads: HTMLElement,
+   };
+ }
+ 
++// "4.2 MB of 10 MB", "820 KB".
++function formatBytes(bytes: number): string {
++  const units = ['B', 'KB', 'MB', 'GB'];
++  let i = 0;
++  while (bytes >= 1024 && i < units.length - 1) {
++    bytes /= 1024;
++    i++;
++  }
++  return `${i ? bytes.toFixed(bytes < 10 ? 1 : 0) : bytes} ${units[i]}`;
++}
++
++export function downloadStatus(d: Download): string {
++  switch (d.state) {
++    case 'progressing':
++    case 'paused': {
++      const done = formatBytes(d.received);
++      const of = d.total ? `${done} of ${formatBytes(d.total)}` : done;
++      return d.state === 'paused' ? `Paused · ${of}` : of;
++    }
++    case 'dangerous':
++      return 'This file may be harmful';
++    case 'completed':
++      return formatBytes(d.total || d.received);
++    case 'cancelled':
++      return 'Cancelled';
++    default:
++      return 'Failed';
++  }
++}
++
+ export class MeridianSidebarElement extends CrLitElement implements
+     TabStripObserver {
+   static get is() {
+@@ -82,6 +113,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+       favorites_: {state: true, type: Array},
+       missionCounts_: {state: true, type: Object},
+       today_: {state: true, type: Array},
++      downloads_: {state: true, type: Array},
++      downloadsOpen_: {state: true, type: Boolean},
+     };
+   }
+ 
+@@ -105,6 +138,9 @@ export class MeridianSidebarElement extends CrLitElement implements
+       {working: number, waiting: number, live: number} =
+           {working: 0, waiting: 0, live: 0};
+   protected accessor today_: Tab[] = [];
++  // This session's downloads (the Downloads popover, ⇧⌘J).
++  protected accessor downloads_: Download[] = [];
++  protected accessor downloadsOpen_: boolean = false;
+ 
+   private order_ = new Map<NodeId, number>();
+   // Shorter titles for Today tabs (Tidy Today), until the tab closes.
+@@ -120,6 +156,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+   private commandListenerId_: number|null = null;
+   private statusListenerId_: number|null = null;
+   private previewListenerId_: number|null = null;
++  private downloadsListenerId_: number|null = null;
+   private missionListenerIds_: number[] = [];
+   private onboardingShown_: boolean = false;
+ 
+@@ -153,6 +190,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+             'meridian-link-preview', {phase, url, title, summary, host, error}));
+     this.commandListenerId_ = proxy.callbackRouter.runCommand.addListener(
+         (command: Command, arg: number) => this.runCommand(command, arg));
++    this.downloadsListenerId_ = proxy.callbackRouter.onDownloads.addListener(
++        (downloads: Download[]) => this.downloads_ = downloads);
+   }
+ 
+   override connectedCallback() {
+@@ -160,6 +199,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.observation_ = new TabStripObservation(this);
+     this.load_(this.observation_);
+     this.handler_.getState().then(({state}) => this.setState_(state));
++    this.handler_.getDownloads().then(({downloads}) => this.downloads_ = downloads);
+     document.addEventListener('mousedown', this.onDocumentMouseDown_, true);
+     window.addEventListener('blur', this.closeMenu_);
+     this.shadowRoot.addEventListener('dragstart', this.onDragStart_ as EventListener);
+@@ -173,7 +213,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.observation_ = undefined;
+     for (const id of [this.listenerId_, this.commandBarListenerId_,
+                       this.commandListenerId_, this.statusListenerId_,
+-                      this.previewListenerId_, ...this.missionListenerIds_]) {
++                      this.previewListenerId_, this.downloadsListenerId_,
++                      ...this.missionListenerIds_]) {
+       if (id !== null) {
+         sidebarProxyFactory.getInstance().callbackRouter.removeListener(id);
+       }
+@@ -714,6 +755,9 @@ export class MeridianSidebarElement extends CrLitElement implements
+       case Command.kMission:
+         this.fire('meridian-mission', '');
+         break;
++      case Command.kDownloads:
++        this.downloadsOpen_ = !this.downloadsOpen_;
++        break;
+       case Command.kNewFolder:
+         if (space) {
+           this.addFolder_(space.id, '');
+@@ -864,6 +908,35 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.fire('meridian-mission', '');
+   }
+ 
++  protected onDownloadsClick_() {
++    this.downloadsOpen_ = !this.downloadsOpen_;
++  }
++
++  // The fraction done of what is still downloading (the button's ring).
++  protected downloadsProgress_(): number|null {
++    const live = this.downloads_.filter(d => d.state === 'progressing');
++    const total = live.reduce((sum, d) => sum + d.total, 0);
++    if (!live.length || live.some(d => !d.total)) {
++      return live.length ? 0 : null;
++    }
++    return live.reduce((sum, d) => sum + d.received, 0) / total;
++  }
++
++  protected onDownloadActionClick_(e: Event) {
++    e.stopPropagation();
++    const el = e.currentTarget as HTMLElement;
++    const id = el.dataset['id']!;
++    const action = el.dataset['action']!;
++    this.handler_.downloadAction(id, action);
++    if (action === 'open') {
++      this.downloadsOpen_ = false;
++    }
++  }
++
++  protected onClearDownloadsClick_() {
++    this.handler_.clearDownloads();
++  }
++
+   // A new tab (links in AI answers).
+   openUrl(url: string) {
+     this.tabStripService_.createTabAt(null, url);
+@@ -1117,6 +1190,15 @@ export class MeridianSidebarElement extends CrLitElement implements
+       },
+       {label: 'New Folder', action: () => this.addFolder_(space.id, '')},
+     ];
++    // Its profile (cookies, logins, site data), once there is a choice.
++    const profiles = this.state_?.profiles || [];
++    if (profiles.length > 1) {
++      profiles.forEach((p, i) => entries.push({
++        label: (p.id === space.profileId ? '✓ ' : '') + 'Profile: ' + p.name,
++        action: () => this.handler_.setSpaceProfile(space.id, p.id),
++        separatorBefore: i === 0,
++      }));
++    }
+     if ((this.state_?.spaces.length || 0) > 1) {
+       entries.push({
+         label: 'Delete Space',
+@@ -1154,9 +1236,15 @@ export class MeridianSidebarElement extends CrLitElement implements
+   };
+ 
+   private onDocumentMouseDown_ = (e: MouseEvent) => {
+-    if (this.menu_ && !e.composedPath().includes(this.$.menu)) {
++    const path = e.composedPath();
++    if (this.menu_ && !path.includes(this.$.menu)) {
+       this.menu_ = null;
+     }
++    const button = this.shadowRoot.getElementById('downloadsButton');
++    if (this.downloadsOpen_ && !path.includes(this.$.downloads) &&
++        !(button && path.includes(button))) {
++      this.downloadsOpen_ = false;
++    }
+   };
+ }
+ 
+diff --git a/chrome/browser/resources/webui_browser/webview.ts b/chrome/browser/resources/webui_browser/webview.ts
+index 676886fa3d..7ca12aacd8 100644
+--- a/chrome/browser/resources/webui_browser/webview.ts
++++ b/chrome/browser/resources/webui_browser/webview.ts
+@@ -150,6 +150,10 @@ export class TabWebviewElement extends WebviewElement {
+         .getGuestIdForTabId(
+             this.tabId, this.guestHandler.$.bindNewPipeAndPassReceiver())
+         .then(({guestId}) => {
++          // The tab is already gone.
++          if (!guestId) {
++            return;
++          }
+           this.guestId = guestId;
+           this.tryToAttach();
+         });
+diff --git a/chrome/browser/ui/webui_browser/browser.mojom b/chrome/browser/ui/webui_browser/browser.mojom
+index 7e0800ab6d..1019073a72 100644
+--- a/chrome/browser/ui/webui_browser/browser.mojom
++++ b/chrome/browser/ui/webui_browser/browser.mojom
+@@ -54,11 +54,12 @@ interface Page {
+ 
+ // Browser-side handler for requests from WebUI page.
+ interface PageHandler {
+-  // Get the guest id for a tab id and connect up the GuestHandler.
++  // Get the guest id for a tab id and connect up the GuestHandler. Null when
++  // the tab is already gone (closed right after opening, e.g. a download).
+   GetGuestIdForTabId(
+       tabs_api.mojom.NodeId tab_id,
+       pending_receiver<GuestHandler> handler)
+-      => (mojo_base.mojom.UnguessableToken guest_id);
++      => (mojo_base.mojom.UnguessableToken? guest_id);
+ 
+   // Load TabSearch in a guest contents and returns the guest id.
+   LoadTabSearch() => (mojo_base.mojom.UnguessableToken guest_id);
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_page_handler.cc b/chrome/browser/ui/webui_browser/webui_browser_page_handler.cc
+index 19139d918a..0bffe901d4 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_page_handler.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_page_handler.cc
+@@ -198,15 +198,13 @@ void WebUIBrowserPageHandler::GetGuestIdForTabId(
+     tab = maybe_tab_handle->Get();
+   }
+ 
+-  if (!tab) {
+-    mojo::ReportBadMessage("Invalid tab id");
++  // Meridian: a tab can close before the page asks (a link that turns out to
++  // be a download), so that's no bad message.
++  if (!tab || !tab->GetContents()) {
++    std::move(callback).Run(std::nullopt);
+     return;
+   }
+   content::WebContents* tab_contents = tab->GetContents();
+-  if (tab_contents == nullptr) {
+-    mojo::ReportBadMessage("Tab has no contents");
+-    return;
+-  }
+ 
+   // The RenderFrameHost takes ownership of this object via the DocumentService.
+   base::MakeSelfDeleting<WebUIBrowserGuestHandler>(
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index cdb580c47e..6c7aa4ec53 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -3,12 +3,15 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/meridian/status_bubble.h"
++#include "chrome/browser/meridian/workbench/native_dialog.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser_window.h"
+ 
+ #include "base/check.h"
+ #include "base/feature_list.h"
+ #include "base/notimplemented.h"
++#include "base/strings/stringprintf.h"
+ #include "chrome/browser/app_mode/app_mode_utils.h"
++#include "chrome/browser/lifetime/browser_shutdown.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "ui/base/window_open_disposition.h"
+@@ -365,11 +368,13 @@ void WebUIBrowserWindow::EnsureActiveTabHasNonZeroSize() {
+ }
+ 
+ void WebUIBrowserWindow::ShowInactive() {
+-  NOTIMPLEMENTED_LOG_ONCE();
++  widget_->ShowInactive();
+ }
+ 
++// Meridian: a window of a space in another profile hides behind the shown
++// one (profile_windows.h).
+ void WebUIBrowserWindow::Hide() {
+-  NOTIMPLEMENTED_LOG_ONCE();
++  widget_->Hide();
+ }
+ 
+ bool WebUIBrowserWindow::IsVisible() const {
+@@ -996,7 +1001,26 @@ void WebUIBrowserWindow::ConfirmBrowserCloseWithPendingDownloads(
+     int download_count,
+     UnloadController::DownloadCloseType dialog_type,
+     base::OnceCallback<void(bool)> callback) {
+-  NOTIMPLEMENTED_LOG_ONCE();
++  // Meridian: a native alert on this window (`callback` gets true when the
++  // downloads are to be cancelled and the window closed).
++  // On a Mac closing the last window only stops downloads of a private one,
++  // so "quit" is said only when the app is quitting.
++  const bool quitting = browser_shutdown::IsTryingToQuit();
++  std::string message =
++      download_count == 1
++          ? "A download is in progress"
++          : base::StringPrintf("%d downloads are in progress", download_count);
++  std::string detail =
++      quitting ? (download_count == 1 ? "Quitting Meridian cancels it."
++                                      : "Quitting Meridian cancels them.")
++               : (download_count == 1 ? "Closing this window cancels it."
++                                      : "Closing this window cancels them.");
++  meridian::workbench::AskNative(
++      web_view_->GetWebContents(), message, detail,
++      {"Keep Downloading", quitting ? "Quit Anyway" : "Close Anyway"},
++      base::BindOnce([](base::OnceCallback<void(bool)> callback,
++                        int index) { std::move(callback).Run(index == 1); },
++                     std::move(callback)));
+ }
+ 
+ void WebUIBrowserWindow::UserChangedTheme(

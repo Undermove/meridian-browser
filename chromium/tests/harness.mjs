@@ -203,6 +203,7 @@ export async function launch(urls = [], { profile: keep, args = [] } = {}) {
       cdp.close();
       if (proc.exitCode === null && proc.signalCode === null) { proc.kill(); await exited(); }
       if (!keep) fs.rmSync(profile, { recursive: true, force: true });
+      fs.rmSync(empty, { recursive: true, force: true });
     },
   };
   return b;

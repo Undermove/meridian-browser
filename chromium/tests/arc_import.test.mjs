@@ -28,7 +28,7 @@ test('Arc import: preview, then spaces, pins, folders, favorites and Today', asy
     const { preview } = await b.eval(`${H}.getArcPreview()`);
     assert.deepEqual(
       { s: preview.spaceCount, p: preview.pinnedCount, t: preview.todayCount, f: preview.favoriteCount },
-      { s: 2, p: 3, t: 2, f: 2 });
+      { s: 2, p: 3, t: 2, f: 3 });
     assert.deepEqual(preview.spaces.map((s) => [s.name, s.icon, s.color]), [['Work', '💼', '#ff8000'], ['Home', '', '']]);
 
     assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
@@ -37,7 +37,12 @@ test('Arc import: preview, then spaces, pins, folders, favorites and Today', asy
     await b.waitFor(`${SB}.querySelector('.space-name')?.textContent === 'Work'`);
     const pinned = await b.pinned();
     assert.deepEqual(pinned.map((p) => [p.title, p.folder]), [['Linear', false], ['Design', true]]);
-    assert.deepEqual((await b.favorites()).map((f) => f.title), ['Gmail', 'YouTube']);
+    // Home was in Arc's second profile: it gets its own Meridian profile, with that profile's favorite.
+    const st = await b.eval(`${H}.getState().then(({state}) => state)`);
+    assert.deepEqual(st.profiles.map((p) => [p.id, p.name]), [['', 'Default'], ['Meridian Profile Arc 2', 'Home']]);
+    assert.equal(st.spaces.find((s) => s.name === 'Home').profileId, 'Meridian Profile Arc 2');
+    assert.equal(st.spaces.find((s) => s.name === 'Work').profileId, '');
+    assert.deepEqual((await b.favorites()).map((f) => f.title), ['Gmail']);
     // Arc's open tabs, in Today, not loaded until opened.
     await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].map((r) => r.tab.title).includes('Arc today')`);
     await new Promise((r) => setTimeout(r, 1000));
@@ -79,7 +84,7 @@ test('Arc logins: cookies come over, so sites stay signed in; Deny imports nothi
     { host: '127.0.0.1', name: 'sid', value: 'signed-in', port },
     { host: '127.0.0.1', name: 'old', value: 'expired', port, expires: Date.now() - 1000 },
   ]);
-  // Another Arc profile with the same cookie: the first profile's wins.
+  // Another Arc profile: its cookie goes to that profile's Meridian profile.
   writeArcCookies(path.join(arcDir, 'User Data', 'Profile 2'), 'test-pass', [{ host: '127.0.0.1', name: 'sid', value: 'other', port }]);
   try {
     let b = await launch(['about:blank'], { args: [`--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=__deny__'] });
@@ -92,9 +97,29 @@ test('Arc logins: cookies come over, so sites stay signed in; Deny imports nothi
     b = await launch(['about:blank'], { args: [`--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=test-pass'] });
     try {
       await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 1, error: '' });
+      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 2, error: '' });
       await b.eval(`app.$.tabstrip.tabStripService_.createTabAt(null, 'http://127.0.0.1:${port}/')`);
       await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'cookie:sid=signed-in')`);
+      // The sidebar after the sign-ins: Home (Arc's Profile 2) has that profile's cookie.
+      assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
+      const home = (await b.eval(`${H}.getState().then(({state}) => state)`)).spaces.find((s) => s.name === 'Home');
+      await b.eval(`${H}.activateSpace(${JSON.stringify(home.id)})`);
+      let w;
+      for (let i = 0; i < 60 && !w; i++) {
+        for (const o of await b.otherWindows()) {
+          try { if ((await o.eval(`${H}.getState().then(({state}) => state.profileId)`)) === 'Meridian Profile Arc 2') w = o; else o.close(); } catch {}
+        }
+        if (!w) await new Promise((r) => setTimeout(r, 250));
+      }
+      assert.ok(w, 'Home opens in its profile');
+      await w.eval(`app.$.tabstrip.openUrl('http://127.0.0.1:${port}/')`);
+      let titles = [];
+      for (let i = 0; i < 50 && !titles.includes('cookie:sid=other'); i++) {
+        titles = await w.eval(`[...${SB}.querySelectorAll('meridian-tab-row')].map((r) => r.tab.title)`);
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      assert.ok(titles.includes('cookie:sid=other'), JSON.stringify(titles));
+      w.close();
     } finally { await b.close(); }
   } finally { server.close(); fs.rmSync(arcDir, { recursive: true, force: true }); }
 });

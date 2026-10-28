@@ -72,7 +72,7 @@ test('with Arc: Bring everything, after saying macOS will ask; File > Import fro
     await b.waitFor(`${step} === 'hello'`);
     await b.click(`${OB}.getElementById('next')`);
     await b.waitFor(`${step} === 'arc'`);
-    assert.deepEqual(await b.eval(`[...${OB}.querySelectorAll('.arc-stats b')].map((e) => e.textContent.trim())`), ['2 spaces', '5 tabs', '2 favorites']);
+    assert.deepEqual(await b.eval(`[...${OB}.querySelectorAll('.arc-stats b')].map((e) => e.textContent.trim())`), ['2 spaces', '5 tabs', '3 favorites']);
     assert.ok(await b.eval(`${OB}.getElementById('logins').classList.contains('on')`));
     await b.click(`${OB}.getElementById('next')`); // Bring everything
     // First: macOS will ask for permission.
