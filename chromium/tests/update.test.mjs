@@ -80,7 +80,7 @@ test('Updates: a newer release is checked and unpacked; Restart to update swaps 
   try {
     const s = await waitStatus(S.ready);
     assert.equal(s.version, '9.9.9');
-    assert.equal(s.current, '1.0.0');
+    assert.equal(s.current, '0.5.0');
     // Settings says so too.
     await b.eval(`app.$.settings.show(app.$.tabstrip.state_.spaces, 'general')`);
     await b.waitFor(`app.$.settings.shadowRoot.getElementById('updateText')?.textContent.includes('Meridian 9.9.9 is ready')`);
@@ -133,7 +133,7 @@ test('Updates: a wrong checksum is refused; a folder it can’t write to gets th
   }
 
   // The release is this version: Check for Updates says it's up to date.
-  rel = await release({ tag: 'v1.0.0' });
+  rel = await release({ tag: 'v0.5.0' });
   ({ b, waitStatus } = await start(rel, installed));
   try {
     await waitStatus(S.upToDate);

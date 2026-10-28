@@ -32,7 +32,7 @@ case "$OS" in
       aarch64|arm64) PATTERN="-linux-arm64.AppImage" ;;
       *) fail "No Meridian build for $ARCH yet." ;;
     esac
-    # Meridian 1.0 (built on Chromium) is macOS-only for now.
+    # Meridian 0.5+ (built on Chromium) is macOS-only for now.
     printf '%s' "$(curl -fsSL -H 'Accept: application/vnd.github+json' "$API" 2>/dev/null)" | grep -q -- "$PATTERN" ||
       fail "Meridian for Linux isn't out yet: the current release is macOS-only. Linux comes later." ;;
   *) fail "This installer is for macOS and Linux. On Windows, download the .exe from https://github.com/$REPO/releases/latest" ;;
