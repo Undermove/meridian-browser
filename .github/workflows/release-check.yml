@@ -1,0 +1,50 @@
+name: Release check
+
+# Every published release, on a clean Mac: install it the way people do (install.sh), check the
+# checksum and the signature, and run the whole E2E suite against the installed app. If anything
+# fails, the release goes back to pre-release (so 0.4.x users aren't offered it) and an issue opens.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, e.g. v0.5.1'
+        required: true
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install with install.sh
+        run: |
+          MERIDIAN_RELEASE_API="https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG" \
+            MERIDIAN_INSTALL_DIR="$RUNNER_TEMP/apps" MERIDIAN_NO_OPEN=1 bash docs/install.sh
+          codesign --verify --deep --strict "$RUNNER_TEMP/apps/Meridian.app"
+          codesign -d -r- "$RUNNER_TEMP/apps/Meridian.app" 2>&1 | grep -q 'certificate root = H"3c14fc1c2294761dfa79fdb55d0dd53cb819186b"' \
+            || { echo "Not signed with Meridian Signing"; exit 1; }
+      - name: E2E tests against the installed app
+        run: |
+          MERIDIAN_APP="$RUNNER_TEMP/apps/Meridian.app/Contents/MacOS/Meridian" \
+            node --test --test-force-exit --test-concurrency=1 --test-timeout=120000 chromium/tests/*.test.mjs
+      - name: Take the release back to pre-release
+        if: failure()
+        run: |
+          gh release edit "$TAG" --prerelease
+          gh issue create --title "Release check failed for $TAG" \
+            --body "The release was set back to pre-release. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

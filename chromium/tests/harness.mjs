@@ -6,7 +6,9 @@ import os from 'node:os';
 import path from 'node:path';
 
 const DIR = process.env.CHROMIUM_DIR || path.join(os.homedir(), 'repos/chromium');
-export const APP = path.join(DIR, 'src/out/Release/Meridian.app/Contents/MacOS/Meridian');
+// MERIDIAN_APP: another Meridian binary, such as an installed release (CI checks every release).
+export const APP = process.env.MERIDIAN_APP ||
+    path.join(DIR, 'src/out/Release/Meridian.app/Contents/MacOS/Meridian');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 class Cdp {

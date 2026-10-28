@@ -1,0 +1,59 @@
+name: Chromium watch
+
+# Daily: is Meridian behind Chrome? A newer build of our Chromium branch (Chrome ships security fixes
+# this way) or a newer stable branch opens an issue labelled chromium-update, with what to run.
+# With the repository variable AUTO_UPDATE=true and the self-hosted Mac runner registered, it also
+# starts "Chromium update" there, which drafts the release by itself.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  actions: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Compare with Chrome's releases
+        id: watch
+        run: |
+          node chromium/tools/chromium_watch.mjs > watch.json
+          cat watch.json
+          echo "action=$(jq -r .action watch.json)" >> "$GITHUB_OUTPUT"
+      - name: Open (or keep) the issue
+        if: steps.watch.outputs.action != 'none'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create chromium-update --color d93f0b --description "Meridian is behind Chrome" 2>/dev/null || true
+          gh label create urgent --color b60205 2>/dev/null || true
+          title="$(jq -r .title watch.json)"
+          if gh issue list --label chromium-update --state open --json title -q '.[].title' | grep -qxF "$title"; then
+            echo "Already open: $title"
+          else
+            # An older one is superseded by this one.
+            for n in $(gh issue list --label chromium-update --state open --json number -q '.[].number'); do
+              gh issue close "$n" --comment "Superseded by a newer Chromium." || true
+            done
+            labels=chromium-update
+            [ "$(jq -r .urgent watch.json)" = true ] && labels="$labels,urgent"
+            gh issue create --title "$title" --body "$(jq -r .body watch.json)" --label "$labels"
+          fi
+      - name: Start the update on the Mac runner
+        if: steps.watch.outputs.action != 'none' && vars.AUTO_UPDATE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args=""
+          [ "$(jq -r .action watch.json)" = milestone ] && args="--branch $(jq -r .branch watch.json)"
+          gh workflow run chromium-update.yml --ref "${{ vars.PORT_BRANCH || 'main' }}" -f args="$args"

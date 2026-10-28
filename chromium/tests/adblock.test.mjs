@@ -12,7 +12,8 @@ import { launch, APP, SB } from './harness.mjs';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const CONVERTER = path.resolve(APP, '../../../../ruleset_converter');
 
-test('ads are blocked on every site; turning it off in Settings lets them through', async () => {
+// The converter comes with a build, not with a release.
+test('ads are blocked on every site; turning it off in Settings lets them through', { skip: !fs.existsSync(CONVERTER) && 'no ruleset_converter next to this Meridian' }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-adblock-'));
   fs.writeFileSync(path.join(dir, 'list.txt'), '/ads/banner.\n||tracker.invalid^\n');
   execFileSync(CONVERTER, ['--input_format=filter-list', '--output_format=unindexed-ruleset',
