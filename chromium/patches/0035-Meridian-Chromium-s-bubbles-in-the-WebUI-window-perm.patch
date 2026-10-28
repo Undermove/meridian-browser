@@ -1,0 +1,219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 28 Oct 2026 23:07:26 +0400
+Subject: [PATCH 36/36] Meridian: Chromium's bubbles in the WebUI window
+ (permissions, multiple downloads, save password)
+
+There's no toolbar or location bar: the stub location bar reports itself
+not drawn, so permission requests are bubbles (not chips or quiet icons
+nobody sees, which silently denied location asked on load); the password
+bubble anchors like page info; anchoring no longer dereferences a missing
+BrowserView (crashed on a permission prompt with the location icon hidden).
+Tests list and answer the bubbles through --meridian-test-bubbles.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar.mojom         |  6 +++
+ chrome/browser/meridian/sidebar_handler.cc    | 38 +++++++++++++++++++
+ chrome/browser/meridian/sidebar_handler.h     |  2 +
+ .../ui/views/bubble_anchor_util_views.cc      | 17 +++++++++
+ .../passwords/password_bubble_view_base.cc    | 29 ++++++++++++--
+ .../webui_browser/webui_stub_location_bar.cc  |  5 ++-
+ 6 files changed, 91 insertions(+), 6 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 641d7d8cf7..083601ca45 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -352,6 +352,12 @@ interface SidebarHandler {
+   DownloadAction(string id, string action);
+   ClearDownloads();
+ 
++  // Tests only (--meridian-test-bubbles; otherwise nothing): the native
++  // bubbles and dialogs open on this window, by view class, after `action`
++  // on the newest one: "" (none), "accept" or "cancel". Shown or not: macOS
++  // hides them while Meridian isn't the active app, as it is in tests.
++  TestBubbles(string action) => (array<string> bubbles);
++
+   CreateSpace(string name, string icon, string color, string color2)
+       => (string space_id);
+   UpdateSpace(string space_id, string name, string icon, string color,
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 4b7728998e..1e25dbdea0 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -78,6 +78,9 @@
+ #include "content/public/browser/web_contents.h"
+ #include "net/base/registry_controlled_domains/registry_controlled_domain.h"
+ #include "ui/base/base_window.h"
++#include "ui/views/widget/widget.h"
++#include "ui/views/widget/widget_delegate.h"
++#include "ui/views/window/dialog_delegate.h"
+ #include "ui/base/page_transition_types.h"
+ #include "ui/base/window_open_disposition.h"
+ 
+@@ -1925,6 +1928,41 @@ void SidebarHandler::ClearDownloads() {
+   downloads_->Clear();
+ }
+ 
++void SidebarHandler::TestBubbles(const std::string& action,
++                                 TestBubblesCallback callback) {
++  std::vector<std::string> names;
++  views::Widget* window = views::Widget::GetWidgetForNativeWindow(
++      browser_->GetWindow()->GetNativeWindow());
++  if (!base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "meridian-test-bubbles") ||
++      !window) {
++    std::move(callback).Run(std::move(names));
++    return;
++  }
++  views::DialogDelegate* newest = nullptr;
++  for (views::Widget* widget :
++       views::Widget::GetAllOwnedWidgets(window->GetNativeView())) {
++    if (widget->IsClosed() || !widget->widget_delegate()) {
++      continue;
++    }
++    newest = widget->widget_delegate()->AsDialogDelegate();
++  }
++  if (newest && action == "accept") {
++    newest->AcceptDialog();
++  } else if (newest && action == "cancel") {
++    newest->CancelDialog();
++  }
++  for (views::Widget* widget :
++       views::Widget::GetAllOwnedWidgets(window->GetNativeView())) {
++    if (!widget->IsClosed() && widget->widget_delegate() &&
++        widget->widget_delegate()->GetContentsView()) {
++      names.emplace_back(
++          widget->widget_delegate()->GetContentsView()->GetClassName());
++    }
++  }
++  std::move(callback).Run(std::move(names));
++}
++
+ void SidebarHandler::AddProfile(const std::string& name,
+                                 AddProfileCallback callback) {
+   std::vector<std::string> taken;
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 87db904cc8..c53e7dd114 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -100,6 +100,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void DownloadAction(const std::string& id,
+                       const std::string& action) override;
+   void ClearDownloads() override;
++  void TestBubbles(const std::string& action,
++                   TestBubblesCallback callback) override;
+   void AddProfile(const std::string& name,
+                   AddProfileCallback callback) override;
+   void RenameProfile(const std::string& profile_id,
+diff --git a/chrome/browser/ui/views/bubble_anchor_util_views.cc b/chrome/browser/ui/views/bubble_anchor_util_views.cc
+index 2d36e44a69..2071beb0ea 100644
+--- a/chrome/browser/ui/views/bubble_anchor_util_views.cc
++++ b/chrome/browser/ui/views/bubble_anchor_util_views.cc
+@@ -75,6 +75,11 @@ AnchorConfiguration GetPageInfoAnchorConfiguration(
+     }
+   }
+ 
++  // Meridian (WebUI browser): nothing else to anchor to.
++  if (!browser_view) {
++    return {};
++  }
++
+   if (anchor == Anchor::kLocationBar && browser_view->GetIsFloatingType()) {
+     auto* frame_view = static_cast<PictureInPictureBrowserFrameView*>(
+         browser_view->browser_widget()->GetFrameView());
+@@ -191,6 +196,18 @@ gfx::Rect GetPageInfoAnchorRect(BrowserWindowInterface* browser) {
+         base::NotFatalUntil::M162);
+ 
+   BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser);
++  if (!browser_view) {
++    // Meridian (WebUI browser, no BrowserView) with its sidebar's location
++    // icon not drawn: near the window's top left, below the traffic lights.
++    views::Widget* widget = views::Widget::GetWidgetForNativeWindow(
++        BrowserWindow::FromBrowser(browser)->GetNativeWindow());
++    if (!widget) {
++      return gfx::Rect();
++    }
++    gfx::Point origin = widget->GetClientAreaBoundsInScreen().origin();
++    origin += gfx::Vector2d(bubble_anchor_util::kNoToolbarLeftOffset, 40);
++    return gfx::Rect(origin, gfx::Size());
++  }
+   // Get position in view (taking RTL UI into account).
+   int x_within_browser_view = browser_view->GetMirroredXInView(
+       bubble_anchor_util::kNoToolbarLeftOffset);
+diff --git a/chrome/browser/ui/views/passwords/password_bubble_view_base.cc b/chrome/browser/ui/views/passwords/password_bubble_view_base.cc
+index 12b7c0d5ab..26d7f467d9 100644
+--- a/chrome/browser/ui/views/passwords/password_bubble_view_base.cc
++++ b/chrome/browser/ui/views/passwords/password_bubble_view_base.cc
+@@ -6,7 +6,10 @@
+ 
+ #include "base/functional/bind.h"
+ #include "base/notreached.h"
++#include "chrome/browser/platform_util.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/bubble_anchor_util.h"
++#include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/actions/chrome_action_id.h"
+ #include "chrome/browser/ui/browser_actions.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+@@ -63,12 +66,16 @@ void PasswordBubbleViewBase::ShowBubble(content::WebContents* web_contents,
+         base::NotFatalUntil::M162);
+ 
+   auto* button_provider = ToolbarButtonProvider::From(browser);
++  // Meridian (WebUI browser): no toolbar, so the bubble sits where page info
++  // would, like the permission prompts.
++  bubble_anchor_util::AnchorConfiguration page_info;
+   if (!button_provider) {
+-    // TODO(crbug.com/520672542): Support password bubble in WebUI Browser.
+-    return;
++    page_info = bubble_anchor_util::GetPageInfoAnchorConfiguration(browser);
+   }
+   views::BubbleAnchor anchor =
+-      button_provider->GetBubbleAnchor(kActionShowPasswordsBubbleOrPage);
++      button_provider
++          ? button_provider->GetBubbleAnchor(kActionShowPasswordsBubbleOrPage)
++          : page_info.anchor;
+ 
+   PasswordBubbleViewBase* bubble = CreateBubble(web_contents, anchor, reason);
+   CHECK(bubble, base::NotFatalUntil::M162);
+@@ -84,7 +91,21 @@ void PasswordBubbleViewBase::ShowBubble(content::WebContents* web_contents,
+   // (e.g. a button), it will automatically be used as the
+   // highlighted button by BubbleDialogDelegate. If not, we set the page action
+   // icon as the highlighted button here.
+-  if (!bubble_anchor_util::IsHighlightable(anchor)) {
++  if (!button_provider) {
++    if (views::View* view = anchor.GetIfView()) {
++      g_manage_passwords_bubble_->set_parent_window(
++          view->GetWidget()->GetNativeView());
++    } else if (ui::TrackedElement* element = anchor.GetIfElement()) {
++      g_manage_passwords_bubble_->set_parent_window(element->GetNativeView());
++    } else {
++      g_manage_passwords_bubble_->set_parent_window(
++          platform_util::GetViewForWindow(
++              browser->GetWindow()->GetNativeWindow()));
++      g_manage_passwords_bubble_->SetAnchorRect(
++          bubble_anchor_util::GetPageInfoAnchorRect(browser));
++    }
++    g_manage_passwords_bubble_->SetArrow(page_info.bubble_arrow);
++  } else if (!bubble_anchor_util::IsHighlightable(anchor)) {
+     g_manage_passwords_bubble_->SetHighlightedElement(
+         kPasswordsOmniboxKeyIconElementId);
+   }
+diff --git a/chrome/browser/ui/webui_browser/webui_stub_location_bar.cc b/chrome/browser/ui/webui_browser/webui_stub_location_bar.cc
+index 4d17c35698..df0b11f3f3 100644
+--- a/chrome/browser/ui/webui_browser/webui_stub_location_bar.cc
++++ b/chrome/browser/ui/webui_browser/webui_stub_location_bar.cc
+@@ -142,8 +142,9 @@ bool WebUIStubLocationBar::IsVisible() const {
+ }
+ 
+ bool WebUIStubLocationBar::IsDrawn() const {
+-  NOTIMPLEMENTED();
+-  return true;
++  // Meridian: there is no native location bar, so permission prompts are
++  // bubbles rather than chips or quiet icons inside it.
++  return false;
+ }
+ 
+ bool WebUIStubLocationBar::IsFullscreen() const {

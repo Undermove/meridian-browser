@@ -46,11 +46,14 @@ export async function launch(urls = [], { profile: keep, args = [] } = {}) {
   for (const sw of ['--meridian-arc-dir']) {
     if (!args.some((a) => a.startsWith(sw + '='))) args = [...args, `${sw}=${empty}`];
   }
+  const started = Date.now();
   const proc = spawn(APP, [
     `--user-data-dir=${profile}`, `--remote-debugging-port=${port}`, '--use-mock-keychain',
     '--no-first-run', '--no-default-browser-check', '--window-size=1280,860',
     // Keep drawing when the window is covered or the display sleeps (input waits for frames).
     '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
+    // No on-device model downloads (≈190 MB each into the temp folder).
+    '--disable-features=OptimizationGuideModelDownloading,OptimizationGuideOnDeviceModel',
     ...args, ...urls,
     // MERIDIAN_LOG=<file>: the browser's log there (debugging).
   ].concat(process.env.MERIDIAN_LOG ? ['--enable-logging=stderr'] : []),
@@ -204,6 +207,12 @@ export async function launch(urls = [], { profile: keep, args = [] } = {}) {
       if (proc.exitCode === null && proc.signalCode === null) { proc.kill(); await exited(); }
       if (!keep) fs.rmSync(profile, { recursive: true, force: true });
       fs.rmSync(empty, { recursive: true, force: true });
+      // What the browser left in the temp folder (downloads in progress, sockets) when killed.
+      for (const name of fs.readdirSync(os.tmpdir())) {
+        if (!name.startsWith('dev.meridian.browser.')) continue;
+        const p = path.join(os.tmpdir(), name);
+        try { if (fs.statSync(p).mtimeMs >= started - 1000) fs.rmSync(p, { recursive: true, force: true }); } catch {}
+      }
     },
   };
   return b;
