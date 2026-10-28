@@ -1,0 +1,1370 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 28 Oct 2026 23:23:20 +0400
+Subject: [PATCH 37/37] Meridian: updater (GitHub release, SHA256SUMS,
+ same-certificate check, swap and relaunch)
+
+A little after start and daily, Meridian asks GitHub for its latest
+release; a newer one's zip is downloaded in the background, checked
+against the release's SHA256SUMS and against this build's code-signing
+requirement, and unpacked. The sidebar then offers "Restart to update":
+Meridian quits (the session is saved) and a small script swaps the app
+and opens the new one. Run from a disk image or an unwritable folder it
+points to the release page. Settings > General shows the version and
+Check for Updates. Development (ad-hoc) builds don't update themselves.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   5 +
+ chrome/browser/meridian/sidebar.mojom         |  35 ++
+ chrome/browser/meridian/sidebar_handler.cc    |  21 +
+ chrome/browser/meridian/sidebar_handler.h     |  10 +-
+ chrome/browser/meridian/update_check.cc       | 167 +++++++
+ chrome/browser/meridian/update_check.h        |  62 +++
+ .../browser/meridian/update_check_unittest.cc | 103 +++++
+ chrome/browser/meridian/updater.cc            | 435 ++++++++++++++++++
+ chrome/browser/meridian/updater.h             |  95 ++++
+ .../webui_browser/meridian/settings.html.ts   |  23 +
+ .../webui_browser/meridian/settings.ts        |  66 ++-
+ .../webui_browser/meridian/sidebar.css        |  19 +
+ .../webui_browser/meridian/sidebar.html.ts    |   7 +
+ .../webui_browser/meridian/sidebar.ts         |  22 +-
+ 14 files changed, 1065 insertions(+), 5 deletions(-)
+ create mode 100644 chrome/browser/meridian/update_check.cc
+ create mode 100644 chrome/browser/meridian/update_check.h
+ create mode 100644 chrome/browser/meridian/update_check_unittest.cc
+ create mode 100644 chrome/browser/meridian/updater.cc
+ create mode 100644 chrome/browser/meridian/updater.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 7c3b2d630c..53eee7472d 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -30,6 +30,8 @@ source_set("model") {
+     "setup_profile.h",
+     "sidebar_service.cc",
+     "sidebar_service.h",
++    "update_check.cc",
++    "update_check.h",
+   ]
+   public_deps = [
+     "//base",
+@@ -208,6 +210,8 @@ source_set("meridian") {
+     "status_bubble.h",
+     "tab_data.cc",
+     "tab_data.h",
++    "updater.cc",
++    "updater.h",
+   ]
+   if (is_mac) {
+     sources += [
+@@ -287,6 +291,7 @@ test("meridian_unittests") {
+     "atc_unittest.cc",
+     "setup_profile_unittest.cc",
+     "sidebar_service_unittest.cc",
++    "update_check_unittest.cc",
+     "ai/chats_unittest.cc",
+     "ai/page_text_unittest.cc",
+     "ai/process_runner_unittest.cc",
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 083601ca45..45ec79f376 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -44,6 +44,32 @@ struct Download {
+   string state;
+ };
+ 
++// Meridian's updater (updater.h).
++enum UpdateStatus {
++  kIdle,
++  kChecking,
++  kUpToDate,
++  // Newer, but this copy can't be replaced in place (run from a disk image):
++  // the release page has it.
++  kAvailable,
++  kDownloading,
++  // Downloaded and checked: "Restart to update".
++  kReady,
++  kFailed,
++};
++
++struct UpdateState {
++  UpdateStatus status;
++  // This build's version.
++  string current;
++  // The newer one, when there is one.
++  string version;
++  // 0..1 while downloading.
++  double progress;
++  string error;
++  string page_url;
++};
++
+ // A Meridian profile: its own cookies, logins and site data. The main one
+ // has the empty id.
+ struct SpaceProfile {
+@@ -313,6 +339,9 @@ interface SidebarPage {
+   // The Downloads popover's list, after any change (progress included).
+   OnDownloads(array<Download> downloads);
+ 
++  // The updater's state, after any change.
++  OnUpdateState(UpdateState state);
++
+   // ⌘T / File > New Tab: the command bar opens, and a tab opens only once
+   // something is picked (like Arc).
+   ShowCommandBar();
+@@ -352,6 +381,12 @@ interface SidebarHandler {
+   DownloadAction(string id, string action);
+   ClearDownloads();
+ 
++  // Updates.
++  GetUpdateState() => (UpdateState state);
++  CheckForUpdates();
++  // Quits and swaps in the downloaded version; false if none is ready.
++  InstallUpdate() => (bool started);
++
+   // Tests only (--meridian-test-bubbles; otherwise nothing): the native
+   // bubbles and dialogs open on this window, by view class, after `action`
+   // on the newest one: "" (none), "accept" or "cancel". Shown or not: macOS
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 1e25dbdea0..236bbe0429 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -177,6 +177,8 @@ SidebarHandler::SidebarHandler(
+                                  base::Unretained(this)));
+   model()->AddObserver(this);
+   Handlers()[browser_] = this;
++  Updater::Get().AddObserver(this);
++  Updater::Get().Start();
+   downloads_ = std::make_unique<DownloadsTracker>(
+       browser->GetProfile(),
+       base::BindRepeating(
+@@ -206,6 +208,7 @@ SidebarHandler::SidebarHandler(
+ }
+ 
+ SidebarHandler::~SidebarHandler() {
++  Updater::Get().RemoveObserver(this);
+   model()->RemoveObserver(this);
+   auto it = Handlers().find(browser_);
+   if (it != Handlers().end() && it->second == this) {
+@@ -1928,6 +1931,24 @@ void SidebarHandler::ClearDownloads() {
+   downloads_->Clear();
+ }
+ 
++void SidebarHandler::GetUpdateState(GetUpdateStateCallback callback) {
++  std::move(callback).Run(Updater::Get().State());
++}
++
++void SidebarHandler::CheckForUpdates() {
++  Updater::Get().CheckNow();
++}
++
++void SidebarHandler::InstallUpdate(InstallUpdateCallback callback) {
++  std::move(callback).Run(Updater::Get().Install());
++}
++
++void SidebarHandler::OnUpdateStateChanged() {
++  if (page_.is_connected()) {
++    page_->OnUpdateState(Updater::Get().State());
++  }
++}
++
+ void SidebarHandler::TestBubbles(const std::string& action,
+                                  TestBubblesCallback callback) {
+   std::vector<std::string> names;
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index c53e7dd114..c9b581dd8a 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -17,6 +17,7 @@
+ #include "chrome/browser/meridian/archive_service.h"
+ #include "chrome/browser/meridian/arc_import.h"
+ #include "chrome/browser/meridian/downloads_tracker.h"
++#include "chrome/browser/meridian/updater.h"
+ #include "chrome/browser/meridian/sidebar.mojom.h"
+ #include "chrome/browser/meridian/sidebar_service.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+@@ -39,7 +40,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+                        public SidebarService::Observer,
+                        public ArchiveService::Observer,
+                        public mission::MissionControl::Observer,
+-                       public TabStripModelObserver {
++                       public TabStripModelObserver,
++                       public Updater::Observer {
+  public:
+   SidebarHandler(BrowserWindowInterface* browser,
+                  mojo::PendingRemote<mojom::SidebarPage> page,
+@@ -100,6 +102,12 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void DownloadAction(const std::string& id,
+                       const std::string& action) override;
+   void ClearDownloads() override;
++  void GetUpdateState(GetUpdateStateCallback callback) override;
++  void CheckForUpdates() override;
++  void InstallUpdate(InstallUpdateCallback callback) override;
++
++  // Updater::Observer:
++  void OnUpdateStateChanged() override;
+   void TestBubbles(const std::string& action,
+                    TestBubblesCallback callback) override;
+   void AddProfile(const std::string& name,
+diff --git a/chrome/browser/meridian/update_check.cc b/chrome/browser/meridian/update_check.cc
+new file mode 100644
+index 0000000000..00624b6c0c
+--- /dev/null
++++ b/chrome/browser/meridian/update_check.cc
+@@ -0,0 +1,167 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/update_check.h"
++
++#include <vector>
++
++#include "base/json/json_reader.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
++#include "base/values.h"
++
++namespace meridian::update {
++
++namespace {
++
++// Digits and dots only ("1.0.3").
++std::optional<std::vector<int>> Parts(std::string_view version) {
++  std::vector<int> out;
++  for (std::string_view part : base::SplitStringPiece(
++           version, ".", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL)) {
++    int n = 0;
++    if (part.empty() || !base::StringToInt(part, &n) || n < 0 ||
++        part.find_first_not_of("0123456789") != std::string_view::npos) {
++      return std::nullopt;
++    }
++    out.push_back(n);
++  }
++  return out;
++}
++
++// Single-quoted for bash.
++std::string Quote(const base::FilePath& path) {
++  std::string s;
++  base::ReplaceChars(path.value(), "'", "'\\''", &s);
++  return "'" + s + "'";
++}
++
++}  // namespace
++
++bool IsNewer(std::string_view latest, std::string_view current) {
++  std::optional<std::vector<int>> a = Parts(latest);
++  // The current one may carry a suffix ("1.0.0-dev"): compare its numbers.
++  std::optional<std::vector<int>> b =
++      Parts(current.substr(0, current.find('-')));
++  if (!a || !b) {
++    return false;
++  }
++  for (size_t i = 0; i < std::max(a->size(), b->size()); ++i) {
++    int x = i < a->size() ? (*a)[i] : 0;
++    int y = i < b->size() ? (*b)[i] : 0;
++    if (x != y) {
++      return x > y;
++    }
++  }
++  return false;
++}
++
++std::optional<Release> ParseRelease(std::string_view json,
++                                    std::string_view arch) {
++  std::optional<base::Value> value =
++      base::JSONReader::Read(json, base::JSON_PARSE_RFC);
++  if (!value || !value->is_dict()) {
++    return std::nullopt;
++  }
++  const base::DictValue& dict = value->GetDict();
++  const std::string* tag = dict.FindString("tag_name");
++  if (!tag || dict.FindBool("prerelease").value_or(false) ||
++      dict.FindBool("draft").value_or(false)) {
++    return std::nullopt;
++  }
++  Release release;
++  release.version = std::string(base::TrimString(*tag, "v", base::TRIM_LEADING));
++  if (!Parts(release.version)) {
++    return std::nullopt;
++  }
++  if (const std::string* page = dict.FindString("html_url")) {
++    release.page_url = *page;
++  }
++  release.zip_name = base::StringPrintf("Meridian-%s-mac-%s.zip",
++                                        release.version.c_str(),
++                                        std::string(arch).c_str());
++  if (const base::ListValue* assets = dict.FindList("assets")) {
++    for (const base::Value& asset : *assets) {
++      if (!asset.is_dict()) {
++        continue;
++      }
++      const std::string* name = asset.GetDict().FindString("name");
++      const std::string* url =
++          asset.GetDict().FindString("browser_download_url");
++      if (!name || !url) {
++        continue;
++      }
++      if (*name == release.zip_name) {
++        release.zip_url = *url;
++      } else if (*name == "SHA256SUMS") {
++        release.sums_url = *url;
++      }
++    }
++  }
++  if (release.zip_url.empty() || release.sums_url.empty()) {
++    return std::nullopt;
++  }
++  return release;
++}
++
++std::optional<std::string> FindSum(std::string_view sums,
++                                   std::string_view name) {
++  for (std::string_view line : base::SplitStringPiece(
++           sums, "\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++    std::vector<std::string_view> parts = base::SplitStringPiece(
++        line, " \t", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++    if (parts.size() != 2) {
++      continue;
++    }
++    // `shasum -b` marks binary mode with a leading '*'.
++    std::string_view file = parts[1];
++    if (base::StartsWith(file, "*")) {
++      file.remove_prefix(1);
++    }
++    if (file != name || parts[0].size() != 64 ||
++        parts[0].find_first_not_of("0123456789abcdefABCDEF") !=
++            std::string_view::npos) {
++      continue;
++    }
++    return base::ToLowerASCII(parts[0]);
++  }
++  return std::nullopt;
++}
++
++bool CanUpdateInPlace(const base::FilePath& bundle) {
++  if (bundle.Extension() != ".app") {
++    return false;
++  }
++  const std::string& path = bundle.value();
++  return !base::StartsWith(path, "/Volumes/") &&
++         path.find("/AppTranslocation/") == std::string::npos;
++}
++
++std::string SwapScript(int pid,
++                       const base::FilePath& staged,
++                       const base::FilePath& target,
++                       bool relaunch) {
++  const std::string old = Quote(target.AddExtension("previous"));
++  return base::StringPrintf(
++      "set -u\n"
++      "# Meridian's updater: swap the app once Meridian has quit.\n"
++      "for i in $(seq 1 600); do kill -0 %d 2>/dev/null || break; "
++      "sleep 0.1; done\n"
++      "kill -0 %d 2>/dev/null && { echo 'Meridian is still running'; "
++      "exit 1; }\n"
++      "rm -rf %s\n"
++      "mv %s %s || exit 1\n"
++      "if ! mv %s %s; then mv %s %s; echo 'swap failed'; exit 1; fi\n"
++      "rm -rf %s\n"
++      "echo 'updated'\n"
++      "%s\n",
++      pid, pid, old.c_str(), Quote(target).c_str(), old.c_str(),
++      Quote(staged).c_str(), Quote(target).c_str(), old.c_str(),
++      Quote(target).c_str(), old.c_str(),
++      relaunch ? ("/usr/bin/open " + Quote(target)).c_str() : "true");
++}
++
++}  // namespace meridian::update
+diff --git a/chrome/browser/meridian/update_check.h b/chrome/browser/meridian/update_check.h
+new file mode 100644
+index 0000000000..4c7f98b5cd
+--- /dev/null
++++ b/chrome/browser/meridian/update_check.h
+@@ -0,0 +1,62 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_UPDATE_CHECK_H_
++#define CHROME_BROWSER_MERIDIAN_UPDATE_CHECK_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++
++#include "base/files/file_path.h"
++
++namespace meridian::update {
++
++// This build's version (the release tag without "v").
++inline constexpr char kVersion[] = "1.0.0";
++
++// GitHub's latest release of Meridian.
++inline constexpr char kFeed[] =
++    "https://api.github.com/repos/Undermove/meridian-browser/releases/latest";
++
++// "1.0.10" > "1.0.9"; a pre-release tag ("1.1.0-beta") is never newer.
++bool IsNewer(std::string_view latest, std::string_view current);
++
++// What a release offers this Mac: the zip the updater swaps in, the
++// checksums it is verified against, and the page for doing it by hand.
++struct Release {
++  std::string version;
++  std::string zip_name;
++  std::string zip_url;
++  std::string sums_url;
++  std::string page_url;
++};
++
++// From the GitHub release JSON; nullopt if it isn't one or has no zip for
++// `arch` ("arm64" or "x64") named Meridian-<version>-mac-<arch>.zip.
++std::optional<Release> ParseRelease(std::string_view json,
++                                    std::string_view arch);
++
++// The SHA-256 (lowercase hex) of `name` in a SHA256SUMS file
++// ("<hex>  <name>" lines), or nullopt.
++std::optional<std::string> FindSum(std::string_view sums,
++                                   std::string_view name);
++
++// Whether Meridian.app at `bundle` can be replaced in place: not run from a
++// disk image or a quarantine-translocated copy. (Writability is checked by
++// the caller.)
++bool CanUpdateInPlace(const base::FilePath& bundle);
++
++// The script that swaps the app once Meridian has quit: waits for `pid` to
++// exit, moves `target` aside, moves `staged` into its place (putting the old
++// one back if that fails), then opens it unless `relaunch` is false. Run
++// detached with /bin/bash.
++std::string SwapScript(int pid,
++                       const base::FilePath& staged,
++                       const base::FilePath& target,
++                       bool relaunch);
++
++}  // namespace meridian::update
++
++#endif  // CHROME_BROWSER_MERIDIAN_UPDATE_CHECK_H_
+diff --git a/chrome/browser/meridian/update_check_unittest.cc b/chrome/browser/meridian/update_check_unittest.cc
+new file mode 100644
+index 0000000000..98f0100ebb
+--- /dev/null
++++ b/chrome/browser/meridian/update_check_unittest.cc
+@@ -0,0 +1,103 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/update_check.h"
++
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/process/launch.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace meridian::update {
++namespace {
++
++TEST(UpdateCheckTest, ComparesVersions) {
++  EXPECT_TRUE(IsNewer("1.0.1", "1.0.0"));
++  EXPECT_TRUE(IsNewer("1.0.10", "1.0.9"));
++  EXPECT_TRUE(IsNewer("1.1", "1.0.9"));
++  EXPECT_TRUE(IsNewer("1.0.0", "1.0.0-dev") == false);
++  EXPECT_FALSE(IsNewer("1.0.0", "1.0.0"));
++  EXPECT_FALSE(IsNewer("0.9.9", "1.0.0"));
++  EXPECT_FALSE(IsNewer("1.1.0-beta", "1.0.0"));
++  EXPECT_FALSE(IsNewer("", "1.0.0"));
++  EXPECT_FALSE(IsNewer("1..2", "1.0.0"));
++}
++
++TEST(UpdateCheckTest, ParsesTheReleaseForThisMac) {
++  const char kJson[] = R"({
++    "tag_name": "v1.0.3", "html_url": "https://github.com/x/releases/tag/v1.0.3",
++    "assets": [
++      {"name": "Meridian-1.0.3-mac-arm64.dmg", "browser_download_url": "https://d/dmg"},
++      {"name": "Meridian-1.0.3-mac-arm64.zip", "browser_download_url": "https://d/zip"},
++      {"name": "SHA256SUMS", "browser_download_url": "https://d/sums"}
++    ]})";
++  std::optional<Release> r = ParseRelease(kJson, "arm64");
++  ASSERT_TRUE(r);
++  EXPECT_EQ(r->version, "1.0.3");
++  EXPECT_EQ(r->zip_name, "Meridian-1.0.3-mac-arm64.zip");
++  EXPECT_EQ(r->zip_url, "https://d/zip");
++  EXPECT_EQ(r->sums_url, "https://d/sums");
++  EXPECT_EQ(r->page_url, "https://github.com/x/releases/tag/v1.0.3");
++  // No zip for this architecture, a pre-release, or not JSON at all.
++  EXPECT_FALSE(ParseRelease(kJson, "x64"));
++  EXPECT_FALSE(ParseRelease(R"({"tag_name": "v1.1.0", "prerelease": true,
++      "assets": []})", "arm64"));
++  EXPECT_FALSE(ParseRelease("<html>", "arm64"));
++  EXPECT_FALSE(ParseRelease(R"({"tag_name": "nightly", "assets": []})",
++                            "arm64"));
++}
++
++TEST(UpdateCheckTest, FindsTheChecksum) {
++  const std::string hex(64, 'a');
++  const std::string sums = "0123  other.zip\n" + hex +
++                           "  Meridian-1.0.3-mac-arm64.dmg\n" +
++                           std::string(64, 'B') +
++                           " *Meridian-1.0.3-mac-arm64.zip\n";
++  EXPECT_EQ(FindSum(sums, "Meridian-1.0.3-mac-arm64.dmg"), hex);
++  EXPECT_EQ(FindSum(sums, "Meridian-1.0.3-mac-arm64.zip"),
++            std::string(64, 'b'));
++  EXPECT_FALSE(FindSum(sums, "other.zip"));
++  EXPECT_FALSE(FindSum(sums, "missing.zip"));
++}
++
++TEST(UpdateCheckTest, UpdatesInPlaceOnlyFromAnInstalledApp) {
++  EXPECT_TRUE(CanUpdateInPlace(base::FilePath("/Applications/Meridian.app")));
++  EXPECT_TRUE(
++      CanUpdateInPlace(base::FilePath("/Users/me/Applications/Meridian.app")));
++  EXPECT_FALSE(CanUpdateInPlace(base::FilePath("/Volumes/Meridian/Meridian.app")));
++  EXPECT_FALSE(CanUpdateInPlace(base::FilePath(
++      "/private/var/folders/x/AppTranslocation/1234/d/Meridian.app")));
++  EXPECT_FALSE(CanUpdateInPlace(base::FilePath("/usr/local/bin/meridian")));
++}
++
++TEST(UpdateCheckTest, TheSwapScriptReplacesTheAppAndKeepsItOnFailure) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  base::FilePath target = dir.GetPath().Append("Mer'idian.app");
++  base::FilePath staged = dir.GetPath().Append("staged").Append("Meridian.app");
++  ASSERT_TRUE(base::CreateDirectory(target));
++  ASSERT_TRUE(base::WriteFile(target.Append("version"), "old"));
++  ASSERT_TRUE(base::CreateDirectory(staged));
++  ASSERT_TRUE(base::WriteFile(staged.Append("version"), "new"));
++
++  // A process that has already exited.
++  std::string out;
++  ASSERT_TRUE(base::GetAppOutput(
++      {"/bin/bash", "-c", SwapScript(999999, staged, target, false)}, &out));
++  EXPECT_EQ(out, "updated\n");
++  std::string version;
++  ASSERT_TRUE(base::ReadFileToString(target.Append("version"), &version));
++  EXPECT_EQ(version, "new");
++  EXPECT_FALSE(base::PathExists(staged));
++  EXPECT_FALSE(base::PathExists(target.AddExtension("previous")));
++
++  // Nothing staged: the installed app stays.
++  base::GetAppOutput(
++      {"/bin/bash", "-c", SwapScript(999999, staged, target, false)}, &out);
++  ASSERT_TRUE(base::ReadFileToString(target.Append("version"), &version));
++  EXPECT_EQ(version, "new");
++}
++
++}  // namespace
++}  // namespace meridian::update
+diff --git a/chrome/browser/meridian/updater.cc b/chrome/browser/meridian/updater.cc
+new file mode 100644
+index 0000000000..bfc826fa53
+--- /dev/null
++++ b/chrome/browser/meridian/updater.cc
+@@ -0,0 +1,435 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/updater.h"
++
++#include <utility>
++#include <vector>
++
++#include "base/apple/bundle_locations.h"
++#include "base/command_line.h"
++#include "base/files/file.h"
++#include "base/files/file_util.h"
++#include "base/logging.h"
++#include "base/no_destructor.h"
++#include "base/path_service.h"
++#include "base/process/launch.h"
++#include "base/process/process.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/task/thread_pool.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/lifetime/application_lifetime.h"
++#include "chrome/common/chrome_paths.h"
++#include "crypto/hash.h"
++#include "net/base/load_flags.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++
++namespace meridian {
++
++namespace {
++
++constexpr base::TimeDelta kFirstCheck = base::Seconds(15);
++constexpr base::TimeDelta kEvery = base::Hours(24);
++constexpr int64_t kMaxZip = int64_t{2} << 30;
++
++constexpr net::NetworkTrafficAnnotationTag kAnnotation =
++    net::DefineNetworkTrafficAnnotation("meridian_updater", R"(
++      semantics {
++        sender: "Meridian updater"
++        description:
++          "Asks GitHub for Meridian's latest release and downloads it, with "
++          "its checksums, when it is newer than this build."
++        trigger: "A little after start, then daily; Settings > Check for "
++                 "Updates."
++        data: "None: no cookies or other credentials are sent."
++        destination: OTHER
++        destination_other: "GitHub releases of Meridian."
++      }
++      policy {
++        cookies_allowed: NO
++        setting: "None; the update is installed only when the person "
++                 "restarts to update."
++        policy_exception_justification: "Keeps Meridian up to date."
++      })");
++
++const char* Arch() {
++#if defined(ARCH_CPU_ARM64)
++  return "arm64";
++#else
++  return "x64";
++#endif
++}
++
++const base::CommandLine& Switches() {
++  return *base::CommandLine::ForCurrentProcess();
++}
++
++std::unique_ptr<network::SimpleURLLoader> Request(const std::string& url) {
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = GURL(url);
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  request->load_flags = net::LOAD_DISABLE_CACHE;
++  // Not IDLE: SimpleURLLoader would write the file at BEST_EFFORT, which
++  // waits for startup to finish (and never does behind a locked screen).
++  request->priority = net::LOW;
++  request->headers.SetHeader("Accept", "application/vnd.github+json");
++  auto loader =
++      network::SimpleURLLoader::Create(std::move(request), kAnnotation);
++  loader->SetRetryOptions(
++      2, network::SimpleURLLoader::RETRY_ON_NETWORK_CHANGE |
++             network::SimpleURLLoader::RETRY_ON_5XX);
++  return loader;
++}
++
++// The designated requirement macOS keeps for `bundle` ("identifier ... and
++// certificate leaf = H\"...\""), or empty for an unsigned or ad-hoc one.
++std::string Requirement(const base::FilePath& bundle) {
++  std::string out;
++  if (!base::GetAppOutputAndError(
++          {"/usr/bin/codesign", "-d", "-r-", bundle.value()}, &out)) {
++    return std::string();
++  }
++  for (std::string_view line : base::SplitStringPiece(
++           out, "\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++    if (base::StartsWith(line, "designated => ")) {
++      line.remove_prefix(strlen("designated => "));
++      // Ad-hoc signatures are only their own hash.
++      if (base::StartsWith(line, "cdhash ")) {
++        return std::string();
++      }
++      return std::string(line);
++    }
++  }
++  return std::string();
++}
++
++std::string Plist(const base::FilePath& bundle, const std::string& key) {
++  std::string out;
++  base::GetAppOutput({"/usr/libexec/PlistBuddy", "-c", "Print :" + key,
++                      bundle.Append("Contents/Info.plist").value()},
++                     &out);
++  return std::string(base::TrimWhitespaceASCII(out, base::TRIM_ALL));
++}
++
++// On a worker: checks the zip, unpacks it and checks the app inside.
++// Returns an error for the person, or empty when `staged` is ready.
++std::string Stage(base::FilePath zip,
++                  std::string sum,
++                  base::FilePath staged,
++                  base::FilePath running,
++                  bool check_signature) {
++  base::File file(zip, base::File::FLAG_OPEN | base::File::FLAG_READ);
++  if (!file.IsValid()) {
++    return "The download is missing.";
++  }
++  crypto::hash::Hasher hasher(crypto::hash::kSha256);
++  std::vector<uint8_t> buffer(1 << 20);
++  while (true) {
++    std::optional<size_t> n = file.ReadAtCurrentPos(buffer);
++    if (!n) {
++      return "The download couldn’t be read.";
++    }
++    if (*n == 0) {
++      break;
++    }
++    hasher.Update(base::span(buffer).first(*n));
++  }
++  std::array<uint8_t, crypto::hash::kSha256Size> digest;
++  hasher.Finish(digest);
++  if (base::ToLowerASCII(base::HexEncode(digest)) != sum) {
++    return "The download doesn’t match the release’s checksum.";
++  }
++
++  base::FilePath unpacked = staged.DirName();
++  base::DeletePathRecursively(unpacked);
++  base::CreateDirectory(unpacked);
++  std::string out;
++  int code = -1;
++  if (!base::GetAppOutputWithExitCode(
++          {"/usr/bin/ditto", "-x", "-k", zip.value(), unpacked.value()}, &out,
++          &code) ||
++      code != 0 || !base::DirectoryExists(staged)) {
++    return "The download couldn’t be unpacked.";
++  }
++  base::DeleteFile(zip);
++  if (Plist(staged, "CFBundleIdentifier") !=
++      Plist(running, "CFBundleIdentifier")) {
++    return "The download isn’t Meridian.";
++  }
++  if (check_signature) {
++    // Signed with the same certificate as this build ("Meridian Signing").
++    std::string requirement = Requirement(running);
++    if (requirement.empty()) {
++      return "This build isn’t signed, so it can’t check an update.";
++    }
++    if (!base::GetAppOutputWithExitCode(
++            {"/usr/bin/codesign", "--verify", "--deep", "--strict",
++             "-R=" + requirement, staged.value()},
++            &out, &code) ||
++        code != 0) {
++      return "The download isn’t signed like Meridian.";
++    }
++  }
++  return std::string();
++}
++
++}  // namespace
++
++// static
++Updater& Updater::Get() {
++  static base::NoDestructor<Updater> updater;
++  return *updater;
++}
++
++Updater::Updater() = default;
++Updater::~Updater() = default;
++
++void Updater::Start() {
++  if (started_) {
++    return;
++  }
++  started_ = true;
++  base::PathService::Get(chrome::DIR_USER_DATA, &dir_);
++  dir_ = dir_.Append("Meridian Update");
++  bundle_ = base::apple::OuterBundlePath();
++  if (Switches().HasSwitch("meridian-test-update-target")) {
++    bundle_ = Switches().GetSwitchValuePath("meridian-test-update-target");
++  }
++  // Off the UI thread: whether this build is signed (development builds,
++  // ad-hoc signed in out/, don't update themselves; tests point them at a
++  // feed) and whether its folder can take the new version.
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(
++          [](base::FilePath bundle, base::FilePath dir) {
++            base::CreateDirectory(dir);
++            return std::make_pair(
++                !Requirement(base::apple::OuterBundlePath()).empty(),
++                update::CanUpdateInPlace(bundle) &&
++                    base::PathIsWritable(bundle.DirName()));
++          },
++          bundle_, dir_),
++      base::BindOnce(&Updater::OnLocated, weak_factory_.GetWeakPtr()));
++}
++
++void Updater::OnLocated(std::pair<bool, bool> signed_and_in_place) {
++  in_place_ = signed_and_in_place.second;
++  located_ = true;
++  if (user_check_) {
++    Check();
++  }
++  if (!signed_and_in_place.first &&
++      !Switches().HasSwitch("meridian-update-feed")) {
++    return;
++  }
++  first_.Start(FROM_HERE,
++               Switches().HasSwitch("meridian-update-feed") ? base::TimeDelta()
++                                                            : kFirstCheck,
++               base::BindOnce(&Updater::Check, weak_factory_.GetWeakPtr()));
++  timer_.Start(FROM_HERE, kEvery,
++               base::BindRepeating(&Updater::Check,
++                                   weak_factory_.GetWeakPtr()));
++}
++
++void Updater::CheckNow() {
++  user_check_ = true;
++  Start();
++  if (located_) {
++    Check();
++  }
++}
++
++void Updater::Check() {
++  // Busy, or already waiting for a restart.
++  if (status_ == mojom::UpdateStatus::kChecking ||
++      status_ == mojom::UpdateStatus::kDownloading ||
++      status_ == mojom::UpdateStatus::kReady) {
++    return;
++  }
++  std::string feed = Switches().HasSwitch("meridian-update-feed")
++                         ? Switches().GetSwitchValueASCII("meridian-update-feed")
++                         : update::kFeed;
++  Set(mojom::UpdateStatus::kChecking);
++  loader_ = Request(feed);
++  loader_->DownloadToString(
++      g_browser_process->shared_url_loader_factory().get(),
++      base::BindOnce(&Updater::OnFeed, weak_factory_.GetWeakPtr()),
++      1 << 20);
++}
++
++void Updater::OnFeed(std::optional<std::string> body) {
++  loader_.reset();
++  bool user = std::exchange(user_check_, false);
++  if (!body) {
++    Set(user ? mojom::UpdateStatus::kFailed : mojom::UpdateStatus::kIdle,
++        "Couldn’t reach GitHub to check for updates.");
++    return;
++  }
++  std::optional<update::Release> release = update::ParseRelease(*body, Arch());
++  std::string current = Switches().HasSwitch("meridian-test-version")
++                            ? Switches().GetSwitchValueASCII(
++                                  "meridian-test-version")
++                            : update::kVersion;
++  if (!release || !update::IsNewer(release->version, current)) {
++    Set(mojom::UpdateStatus::kUpToDate);
++    return;
++  }
++  release_ = *release;
++  if (!in_place_) {
++    Set(mojom::UpdateStatus::kAvailable);
++    return;
++  }
++  progress_ = 0;
++  zip_size_ = 0;
++  Set(mojom::UpdateStatus::kDownloading);
++  loader_ = Request(release_.zip_url);
++  loader_->SetOnResponseStartedCallback(base::BindOnce(
++      [](Updater* self, const GURL&,
++         const network::mojom::URLResponseHead& head) {
++        self->zip_size_ = head.content_length;
++      },
++      base::Unretained(this)));
++  loader_->SetOnDownloadProgressCallback(base::BindRepeating(
++      [](Updater* self, uint64_t current) {
++        if (self->zip_size_ > 0) {
++          double progress = static_cast<double>(current) / self->zip_size_;
++          // A few updates are enough.
++          if (progress - self->progress_ >= 0.02 || progress >= 1) {
++            self->progress_ = progress;
++            self->observers_.Notify(&Observer::OnUpdateStateChanged);
++          }
++        }
++      },
++      base::Unretained(this)));
++  loader_->DownloadToFile(
++      g_browser_process->shared_url_loader_factory().get(),
++      base::BindOnce(&Updater::OnZip, weak_factory_.GetWeakPtr()),
++      dir_.Append(release_.zip_name), kMaxZip);
++}
++
++void Updater::OnZip(base::FilePath path) {
++  bool ok = loader_ && loader_->NetError() == net::OK && !path.empty();
++  loader_.reset();
++  if (!ok) {
++    Set(mojom::UpdateStatus::kFailed, "The update didn’t download.");
++    return;
++  }
++  zip_ = path;
++  loader_ = Request(release_.sums_url);
++  loader_->DownloadToString(
++      g_browser_process->shared_url_loader_factory().get(),
++      base::BindOnce(&Updater::OnSums, weak_factory_.GetWeakPtr()), 64 << 10);
++}
++
++void Updater::OnSums(std::optional<std::string> body) {
++  loader_.reset();
++  std::optional<std::string> sum =
++      body ? update::FindSum(*body, release_.zip_name) : std::nullopt;
++  if (!sum) {
++    Set(mojom::UpdateStatus::kFailed,
++        "The release has no checksum for this Mac.");
++    return;
++  }
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE,
++      {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
++       base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
++      base::BindOnce(&Stage, zip_, *sum,
++                     dir_.Append("staged").Append("Meridian.app"),
++                     base::apple::OuterBundlePath(),
++                     !Switches().HasSwitch("meridian-test-update-target")),
++      base::BindOnce(&Updater::OnStaged, weak_factory_.GetWeakPtr()));
++}
++
++void Updater::OnStaged(std::string error) {
++  if (!error.empty()) {
++    LOG(WARNING) << "Meridian update " << release_.version << ": " << error;
++    Set(mojom::UpdateStatus::kFailed, error);
++    return;
++  }
++  Set(mojom::UpdateStatus::kReady);
++}
++
++bool Updater::Install() {
++  if (status_ != mojom::UpdateStatus::kReady) {
++    return false;
++  }
++  const bool test = Switches().HasSwitch("meridian-test-update-target");
++  std::string script = update::SwapScript(
++      base::Process::Current().Pid(),
++      dir_.Append("staged").Append("Meridian.app"), bundle_,
++      /*relaunch=*/!test);
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_BLOCKING},
++      base::BindOnce(
++          [](base::FilePath dir, std::string script) {
++            base::FilePath path = dir.Append("swap.sh");
++            if (!base::WriteFile(path, script)) {
++              return false;
++            }
++            base::LaunchOptions options;
++            options.new_process_group = true;
++            base::File log(dir.Append("swap.log"), base::File::FLAG_CREATE_ALWAYS |
++                                                       base::File::FLAG_WRITE);
++            if (log.IsValid()) {
++              options.fds_to_remap.emplace_back(log.GetPlatformFile(),
++                                                STDOUT_FILENO);
++              options.fds_to_remap.emplace_back(log.GetPlatformFile(),
++                                                STDERR_FILENO);
++            }
++            return base::LaunchProcess({"/bin/bash", path.value()}, options)
++                .IsValid();
++          },
++          dir_, std::move(script)),
++      base::BindOnce(
++          [](base::WeakPtr<Updater> self, bool started) {
++            if (!started) {
++              if (self) {
++                self->Set(mojom::UpdateStatus::kFailed,
++                          "Couldn’t start the update.");
++              }
++              return;
++            }
++            // Quit like ⌘Q: the session is saved and comes back in the new
++            // version.
++            chrome::AttemptExit();
++          },
++          weak_factory_.GetWeakPtr()));
++  return true;
++}
++
++mojom::UpdateStatePtr Updater::State() const {
++  auto state = mojom::UpdateState::New();
++  state->status = status_;
++  state->current = Switches().HasSwitch("meridian-test-version")
++                       ? Switches().GetSwitchValueASCII("meridian-test-version")
++                       : update::kVersion;
++  state->version = release_.version;
++  state->progress = progress_;
++  state->error = error_;
++  state->page_url = release_.page_url;
++  return state;
++}
++
++void Updater::Set(mojom::UpdateStatus status, std::string error) {
++  status_ = status;
++  error_ = std::move(error);
++  observers_.Notify(&Observer::OnUpdateStateChanged);
++}
++
++void Updater::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void Updater::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/updater.h b/chrome/browser/meridian/updater.h
+new file mode 100644
+index 0000000000..b8b94da0f1
+--- /dev/null
++++ b/chrome/browser/meridian/updater.h
+@@ -0,0 +1,95 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_UPDATER_H_
++#define CHROME_BROWSER_MERIDIAN_UPDATER_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "base/files/file_path.h"
++#include "base/memory/weak_ptr.h"
++#include "base/observer_list.h"
++#include "base/timer/timer.h"
++#include "chrome/browser/meridian/sidebar.mojom.h"
++#include "chrome/browser/meridian/update_check.h"
++
++namespace network {
++class SimpleURLLoader;
++}
++
++namespace meridian {
++
++// Meridian's own updater (no paid Apple signing, so no Sparkle or system
++// updater): asks GitHub for the latest release a little after start and then
++// daily, downloads its zip in the background, checks it against the
++// release's SHA256SUMS and that it is signed like this build, unpacks it,
++// and offers "Restart to update", which quits and lets a small script swap
++// the app and open the new one. Run from a disk image (or anywhere it can't
++// write) it only points to the release page.
++//
++// Tests: --meridian-update-feed=<url> (checks at once), and
++// --meridian-test-update-target=<Meridian.app> swaps that one instead of the
++// running app, without the signature check and without opening it.
++class Updater {
++ public:
++  class Observer : public base::CheckedObserver {
++   public:
++    virtual void OnUpdateStateChanged() = 0;
++  };
++
++  static Updater& Get();
++
++  Updater(const Updater&) = delete;
++  Updater& operator=(const Updater&) = delete;
++
++  // Starts the checks (once; later calls do nothing).
++  void Start();
++  // "Check for Updates" in Settings: now, and says when it's up to date.
++  void CheckNow();
++  // Quits Meridian and swaps in the downloaded version.
++  bool Install();
++
++  mojom::UpdateStatePtr State() const;
++
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
++
++ private:
++  friend class base::NoDestructor<Updater>;
++  Updater();
++  ~Updater();
++
++  void OnLocated(std::pair<bool, bool> signed_and_in_place);
++  void Check();
++  void OnFeed(std::optional<std::string> body);
++  void OnZip(base::FilePath path);
++  void OnSums(std::optional<std::string> body);
++  void OnStaged(std::string error);
++  void Set(mojom::UpdateStatus status, std::string error = std::string());
++
++  bool started_ = false;
++  bool user_check_ = false;
++  bool located_ = false;
++  bool in_place_ = false;
++  base::FilePath dir_;
++  base::FilePath bundle_;
++  base::FilePath zip_;
++  update::Release release_;
++  mojom::UpdateStatus status_ = mojom::UpdateStatus::kIdle;
++  std::string error_;
++  double progress_ = 0;
++  int64_t zip_size_ = 0;
++  std::unique_ptr<network::SimpleURLLoader> loader_;
++  base::RepeatingTimer timer_;
++  base::OneShotTimer first_;
++  base::ObserverList<Observer> observers_;
++  base::WeakPtrFactory<Updater> weak_factory_{this};
++};
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_UPDATER_H_
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index 4f386b3c1b..91b610c08b 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -166,6 +166,29 @@ export function getHtml(this: MeridianSettingsElement) {
+               </div>
+             </div>
+           </div>
++          <div class="group">
++            <h2>Updates</h2>
++            <div class="card">
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Meridian ${this.update_?.current}</div>
++                  <div class="row-desc" id="updateText">${this.updateText_()}</div>
++                </div>
++                ${this.updateReady_() ? html`
++                  <button id="restartUpdate" class="btn primary"
++                      @click="${this.onRestartUpdateClick_}">
++                    Restart to Update</button>` : ''}
++                ${this.updateAvailable_() ? html`
++                  <button id="releasePage" class="btn"
++                      @click="${this.onReleasePageClick_}">
++                    Release Page</button>` : ''}
++                ${!this.updateReady_() && !this.updateAvailable_() ? html`
++                  <button id="checkUpdates" class="btn"
++                      @click="${this.onCheckUpdatesClick_}">
++                    Check for Updates</button>` : ''}
++              </div>
++            </div>
++          </div>
+           <div class="group">
+             <h2>Chromium</h2>
+             <div class="card">
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index ce00a15456..00f3a83fef 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -9,8 +9,8 @@
+ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+-import {browserProxyFactory} from '../sidebar.mojom-webui.js';
+-import type {AgentCli, AiProvider, Atc, Settings, SidebarHandlerInterface, Space} from '../sidebar.mojom-webui.js';
++import {browserProxyFactory, UpdateStatus} from '../sidebar.mojom-webui.js';
++import type {AgentCli, AiProvider, Atc, Settings, SidebarHandlerInterface, Space, UpdateState} from '../sidebar.mojom-webui.js';
+ 
+ import {getCss} from './settings.css.js';
+ import {getHtml} from './settings.html.js';
+@@ -166,6 +166,7 @@ export class MeridianSettingsElement extends CrLitElement {
+       otherAgents_: {state: true, type: Boolean},
+       setup_: {state: true, type: Object},
+       aiMessage_: {state: true, type: String},
++      update_: {state: true, type: Object},
+     };
+   }
+ 
+@@ -204,12 +205,20 @@ export class MeridianSettingsElement extends CrLitElement {
+   protected accessor otherAgents_: boolean = false;
+   protected accessor setup_: SetupRequest|null = null;
+   protected accessor aiMessage_: string = '';
++  protected accessor update_: UpdateState|null = null;
+   private setupPoll_: number|null = null;
+ 
+   private readonly handler_: SidebarHandlerInterface =
+       browserProxyFactory.getInstance().handler;
+   private tryUrl_: string = '';
+ 
++  constructor() {
++    super();
++    // Lives as long as the page (Settings is never removed).
++    browserProxyFactory.getInstance().callbackRouter.onUpdateState.addListener(
++        (state: UpdateState) => this.update_ = state);
++  }
++
+   async show(spaces: Space[], section: SectionId = 'general') {
+     this.spaces_ = spaces;
+     this.section_ = section;
+@@ -229,6 +238,59 @@ export class MeridianSettingsElement extends CrLitElement {
+     this.profileEdit_ = null;
+     this.profileConfirm_ = null;
+     this.loadProfiles_();
++    this.handler_.getUpdateState().then(({state}) => this.update_ = state);
++  }
++
++  // ----------------------------------------------------------- updates
++
++  protected updateText_(): string {
++    const u = this.update_;
++    if (!u) {
++      return '';
++    }
++    switch (u.status) {
++      case UpdateStatus.kChecking:
++        return 'Checking for updates…';
++      case UpdateStatus.kUpToDate:
++        return 'Meridian is up to date.';
++      case UpdateStatus.kAvailable:
++        return `Meridian ${u.version} is available. Install it from the ` +
++            'release page (this copy runs from a disk image or a folder it ' +
++            'can’t write to).';
++      case UpdateStatus.kDownloading:
++        return `Downloading Meridian ${u.version}… ${
++            Math.round(u.progress * 100)}%`;
++      case UpdateStatus.kReady:
++        return `Meridian ${u.version} is ready. Restart to update; your ` +
++            'tabs come back.';
++      case UpdateStatus.kFailed:
++        return u.error;
++      default:
++        return '';
++    }
++  }
++
++  protected updateReady_(): boolean {
++    return this.update_?.status === UpdateStatus.kReady;
++  }
++
++  protected updateAvailable_(): boolean {
++    return this.update_?.status === UpdateStatus.kAvailable;
++  }
++
++  protected onCheckUpdatesClick_() {
++    this.handler_.checkForUpdates();
++  }
++
++  protected onRestartUpdateClick_() {
++    this.handler_.installUpdate();
++  }
++
++  protected onReleasePageClick_() {
++    if (this.update_?.pageUrl) {
++      this.fire('meridian-open-url', this.update_.pageUrl);
++      this.open = false;
++    }
+   }
+ 
+   // ---------------------------------------------------------- profiles
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.css b/chrome/browser/resources/webui_browser/meridian/sidebar.css
+index 476bb3e668..c67d3adb8c 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.css
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.css
+@@ -193,6 +193,25 @@ button {
+   color: var(--meridian-text);
+ }
+ 
++/* ---------------------------------------------------------- update */
++
++.update-banner {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  margin-top: 8px;
++  padding: 7px 10px;
++  border-radius: 9px;
++  background: color-mix(in srgb, var(--meridian-space) 28%, var(--meridian-surface));
++  color: var(--meridian-text);
++  font-weight: 500;
++  text-align: left;
++}
++
++.update-banner:hover {
++  background: color-mix(in srgb, var(--meridian-space) 40%, var(--meridian-surface));
++}
++
+ /* ------------------------------------------------------- downloads */
+ 
+ .icon-btn.downloads {
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+index 00dbec894a..8e08ec71c1 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+@@ -54,6 +54,13 @@ export function getHtml(this: MeridianSidebarElement) {
+     </div>
+   ` : ''}
+ </div>
++${this.updateReady_() ? html`
++  <button id="updateBanner" class="update-banner"
++      title="Meridian quits and opens again with your tabs"
++      @click="${this.onUpdateClick_}">
++    <span class="ic">${icon('reload', 14)}</span>
++    <span>Restart to update to ${this.update_!.version}</span>
++  </button>` : ''}
+ <div id="bottom">
+   <slot name="bottom-start"></slot>
+   <button id="workbenchButton" class="icon-btn" title="Workbench (⇧⌘E)"
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index b292987fa3..0f32475c19 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -22,8 +22,8 @@ import type {NodeId} from '/tab_strip_api/tab_strip_api_types.mojom-webui.js';
+ import {TabStripObservation} from '/tab_strip_api/tab_strip_observation.js';
+ import type {TabStripObserver} from '/tab_strip_api/tab_strip_observer.js';
+ 
+-import {browserProxyFactory as sidebarProxyFactory, Command} from '../sidebar.mojom-webui.js';
+-import type {Download, Item, SidebarHandlerInterface, SidebarState, Space, TidyFolder, TidyRename} from '../sidebar.mojom-webui.js';
++import {browserProxyFactory as sidebarProxyFactory, Command, UpdateStatus} from '../sidebar.mojom-webui.js';
++import type {Download, Item, SidebarHandlerInterface, UpdateState, SidebarState, Space, TidyFolder, TidyRename} from '../sidebar.mojom-webui.js';
+ import type {TabAdded, TabClosed, TabUpdated} from '../tab_strip/events.js';
+ 
+ import './fav.js';
+@@ -115,6 +115,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+       today_: {state: true, type: Array},
+       downloads_: {state: true, type: Array},
+       downloadsOpen_: {state: true, type: Boolean},
++      update_: {state: true, type: Object},
+     };
+   }
+ 
+@@ -141,6 +142,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+   // This session's downloads (the Downloads popover, ⇧⌘J).
+   protected accessor downloads_: Download[] = [];
+   protected accessor downloadsOpen_: boolean = false;
++  // Meridian's updater: a "Restart to update" pill when one is ready.
++  protected accessor update_: UpdateState|null = null;
+ 
+   private order_ = new Map<NodeId, number>();
+   // Shorter titles for Today tabs (Tidy Today), until the tab closes.
+@@ -157,6 +160,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+   private statusListenerId_: number|null = null;
+   private previewListenerId_: number|null = null;
+   private downloadsListenerId_: number|null = null;
++  private updateListenerId_: number|null = null;
+   private missionListenerIds_: number[] = [];
+   private onboardingShown_: boolean = false;
+ 
+@@ -192,6 +196,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+         (command: Command, arg: number) => this.runCommand(command, arg));
+     this.downloadsListenerId_ = proxy.callbackRouter.onDownloads.addListener(
+         (downloads: Download[]) => this.downloads_ = downloads);
++    this.updateListenerId_ = proxy.callbackRouter.onUpdateState.addListener(
++        (state: UpdateState) => this.update_ = state);
+   }
+ 
+   override connectedCallback() {
+@@ -200,6 +206,9 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.load_(this.observation_);
+     this.handler_.getState().then(({state}) => this.setState_(state));
+     this.handler_.getDownloads().then(({downloads}) => this.downloads_ = downloads);
++    // The reply and the page's own updates come on different pipes: an
++    // update that came first wins.
++    this.handler_.getUpdateState().then(({state}) => this.update_ ??= state);
+     document.addEventListener('mousedown', this.onDocumentMouseDown_, true);
+     window.addEventListener('blur', this.closeMenu_);
+     this.shadowRoot.addEventListener('dragstart', this.onDragStart_ as EventListener);
+@@ -214,6 +223,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+     for (const id of [this.listenerId_, this.commandBarListenerId_,
+                       this.commandListenerId_, this.statusListenerId_,
+                       this.previewListenerId_, this.downloadsListenerId_,
++                      this.updateListenerId_,
+                       ...this.missionListenerIds_]) {
+       if (id !== null) {
+         sidebarProxyFactory.getInstance().callbackRouter.removeListener(id);
+@@ -933,6 +943,14 @@ export class MeridianSidebarElement extends CrLitElement implements
+     }
+   }
+ 
++  protected updateReady_(): boolean {
++    return this.update_?.status === UpdateStatus.kReady;
++  }
++
++  protected onUpdateClick_() {
++    this.handler_.installUpdate();
++  }
++
+   protected onClearDownloadsClick_() {
+     this.handler_.clearDownloads();
+   }
