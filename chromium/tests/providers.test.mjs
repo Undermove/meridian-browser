@@ -167,7 +167,10 @@ test('other AIs: Ollama, a cloud key with a model picker, and Codex (sessions, S
     await b.eval(`${ST}.querySelector('button[data-id="openai"]').scrollIntoView({ block: 'center' })`);
     await b.click(`${ST}.querySelector('button[data-id="openai"]')`);
     await b.waitFor(`!${ST}.getElementById('ai-openai')`);
-    const prefs = fs.readFileSync(path.join(b.profile, 'Default', 'Preferences'), 'utf8');
+    // Chromium writes Preferences up to 10 s after a change.
+    const prefsFile = path.join(b.profile, 'Default', 'Preferences');
+    for (let i = 0; i < 150 && !fs.existsSync(prefsFile); i++) await sleep(100);
+    const prefs = fs.readFileSync(prefsFile, 'utf8');
     assert.ok(!prefs.includes(GOOD));
   } finally {
     await b.close(); local.server.close(); api.server.close();

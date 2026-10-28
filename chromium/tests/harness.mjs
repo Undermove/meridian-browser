@@ -38,6 +38,11 @@ async function evalUi(cdp, expr) {
 }
 
 // `profile`: reuse a profile dir (to test what survives a restart); it's then left for the caller to delete.
+// Browsers still running when this test process ends (a test timed out, --test-force-exit) are
+// killed with it, so a later test's `open -a` never reaches a leftover one.
+const running = new Set();
+process.on('exit', () => { for (const p of running) { try { p.kill('SIGKILL'); } catch {} } });
+
 export async function launch(urls = [], { profile: keep, args = [] } = {}) {
   const profile = keep || fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
   const port = 9400 + Math.floor(Math.random() * 500);
@@ -58,6 +63,8 @@ export async function launch(urls = [], { profile: keep, args = [] } = {}) {
     // MERIDIAN_LOG=<file>: the browser's log there (debugging).
   ].concat(process.env.MERIDIAN_LOG ? ['--enable-logging=stderr'] : []),
   { stdio: process.env.MERIDIAN_LOG ? ['ignore', 'ignore', fs.openSync(process.env.MERIDIAN_LOG, 'a')] : 'ignore' });
+  running.add(proc);
+  proc.once('exit', () => running.delete(proc));
   const base = `http://127.0.0.1:${port}`;
   let ui;
   for (let i = 0; i < 100 && !ui; i++) {
