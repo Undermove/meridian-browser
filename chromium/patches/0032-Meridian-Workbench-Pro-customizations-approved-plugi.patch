@@ -1,0 +1,2275 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 28 Oct 2026 10:24:11 +0400
+Subject: [PATCH 33/33] Meridian Workbench Pro: customizations (approved
+ plugins, user.css, Safe Mode, snapshots) and hubs (templates, pin to sidebar)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   8 +
+ chrome/browser/meridian/sidebar_handler.cc    |  39 ++
+ chrome/browser/meridian/sidebar_handler.h     |   7 +
+ .../meridian/workbench/customizations.cc      | 303 ++++++++++++
+ .../meridian/workbench/customizations.h       |  51 ++
+ .../meridian/workbench/customizations_texts.h | 184 +++++++
+ .../workbench/customizations_unittest.cc      |  54 +++
+ chrome/browser/meridian/workbench/hubs.cc     | 272 +++++++++++
+ chrome/browser/meridian/workbench/hubs.h      |  44 ++
+ .../browser/meridian/workbench/hubs_texts.h   | 225 +++++++++
+ .../meridian/workbench/hubs_unittest.cc       |  42 ++
+ .../meridian/workbench/workbench_handler.cc   | 459 ++++++++++++++++--
+ .../meridian/workbench/workbench_handler.h    |  14 +
+ .../meridian/workbench/workbench_service.cc   | 133 ++++-
+ .../meridian/workbench/workbench_service.h    |  29 ++
+ .../meridian/workbench/workbench_source.cc    |  25 +-
+ .../meridian/workbench/workbench_source.h     |   6 +-
+ .../meridian/workbench/workbench_ui.cc        |   3 +-
+ 18 files changed, 1858 insertions(+), 40 deletions(-)
+ create mode 100644 chrome/browser/meridian/workbench/customizations.cc
+ create mode 100644 chrome/browser/meridian/workbench/customizations.h
+ create mode 100644 chrome/browser/meridian/workbench/customizations_texts.h
+ create mode 100644 chrome/browser/meridian/workbench/customizations_unittest.cc
+ create mode 100644 chrome/browser/meridian/workbench/hubs.cc
+ create mode 100644 chrome/browser/meridian/workbench/hubs.h
+ create mode 100644 chrome/browser/meridian/workbench/hubs_texts.h
+ create mode 100644 chrome/browser/meridian/workbench/hubs_unittest.cc
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 5d8175d854..ae43107b71 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -71,6 +71,12 @@ source_set("workbench_core") {
+   sources = [
+     "workbench/agents.cc",
+     "workbench/agents.h",
++    "workbench/customizations.cc",
++    "workbench/customizations.h",
++    "workbench/customizations_texts.h",
++    "workbench/hubs.cc",
++    "workbench/hubs.h",
++    "workbench/hubs_texts.h",
+     "workbench/project_fs.cc",
+     "workbench/project_fs.h",
+     "workbench/project_fs_mac.mm",
+@@ -285,6 +291,8 @@ test("meridian_unittests") {
+     "mission/mission_hook_unittest.cc",
+     "mission/secrets_unittest.cc",
+     "workbench/agents_unittest.cc",
++    "workbench/customizations_unittest.cc",
++    "workbench/hubs_unittest.cc",
+     "workbench/guard_hook_unittest.cc",
+     "workbench/project_fs_unittest.cc",
+     "workbench/sandbox_unittest.cc",
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 232d2e08b4..8edae27381 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -291,6 +291,45 @@ void SidebarHandler::ShowMissionControl(Profile* profile,
+   }
+ }
+ 
++bool SidebarHandler::PinTabContents(content::WebContents* contents,
++                                    bool favorite,
++                                    const GURL& url,
++                                    const std::string& title) {
++  tabs::TabInterface* tab = tabs::TabInterface::MaybeGetFromContents(contents);
++  BrowserWindowInterface* window =
++      tab ? tab->GetBrowserWindowInterface() : nullptr;
++  auto it = window ? Handlers().find(window) : Handlers().end();
++  if (it == Handlers().end()) {
++    return false;
++  }
++  SidebarHandler* self = it->second;
++  const TabData* data = TabData::Get(contents);
++  if (data && !data->item_id().empty()) {
++    bool in_favorites = std::ranges::any_of(
++        self->service_->favorites(),
++        [&](const Item& f) { return f.id == data->item_id(); });
++    if (favorite && !in_favorites) {
++      self->service_->MoveItem(data->item_id(), kFavorites, std::string(), -1);
++      self->ScheduleNotify();
++    }
++    return true;
++  }
++  std::string space_id = data && !data->space_id().empty()
++                             ? data->space_id()
++                             : self->service_->active_space_id();
++  Item item;
++  item.title = title.empty() ? base::UTF16ToUTF8(contents->GetTitle()) : title;
++  item.url = url;
++  std::string item_id = self->service_->AddItem(
++      favorite ? std::string(kFavorites) : space_id, std::string(), -1, item);
++  if (item_id.empty()) {
++    return false;
++  }
++  TabData::Set(contents, space_id, item_id);
++  self->ScheduleNotify();
++  return true;
++}
++
+ void SidebarHandler::OnMissionChanged(const base::DictValue& snapshot) {
+   if (page_.is_connected()) {
+     page_->OnMissionState(base::WriteJson(snapshot).value_or("{}"));
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 3723d377af..f9e8399172 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -56,6 +56,13 @@ class SidebarHandler : public mojom::SidebarHandler,
+ 
+   // Opens Mission Control in a window of `profile`, on `node_id`.
+   static void ShowMissionControl(Profile* profile, const std::string& node_id);
++  // Keeps the tab of `contents` one click away: a pinned item of its space
++  // (or a favorite) that opens `url`. A tab that already is a pinned item
++  // only moves to Favorites when asked. False without a sidebar for it.
++  static bool PinTabContents(content::WebContents* contents,
++                             bool favorite,
++                             const GURL& url,
++                             const std::string& title);
+   // A link preview card in `browser`'s page (StatusBubble).
+   static void ShowLinkPreview(BrowserWindowInterface* browser,
+                               const std::string& phase,
+diff --git a/chrome/browser/meridian/workbench/customizations.cc b/chrome/browser/meridian/workbench/customizations.cc
+new file mode 100644
+index 0000000000..4539b58733
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/customizations.cc
+@@ -0,0 +1,303 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/workbench/customizations.h"
++
++#include <fcntl.h>
++#include <unistd.h>
++
++#include <algorithm>
++
++#include "base/files/file_enumerator.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_file.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/posix/eintr_wrapper.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/time/time.h"
++#include "chrome/browser/meridian/workbench/customizations_texts.h"
++#include "crypto/hash.h"
++#include "third_party/re2/src/re2/re2.h"
++
++namespace meridian::workbench {
++
++namespace {
++
++constexpr int64_t kMaxFile = 2 * 1024 * 1024;
++constexpr size_t kMaxPlugins = 50;
++constexpr size_t kKeepSnapshots = 40;
++
++// Never overwrites.
++void Once(const base::FilePath& file, std::string_view text) {
++  base::ScopedFD fd(HANDLE_EINTR(
++      open(file.value().c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)));
++  if (fd.is_valid()) {
++    base::WriteFileDescriptor(fd.get(), text);
++  }
++}
++
++bool Inside(const base::FilePath& root, const base::FilePath& p) {
++  return p == root || root.IsParent(p);
++}
++
++base::FilePath Real(const base::FilePath& root) {
++  base::FilePath real = base::MakeAbsoluteFilePath(root);
++  return real.empty() ? root : real;
++}
++
++double Now() {
++  return base::Time::Now().InMillisecondsFSinceUnixEpoch();
++}
++
++// rel -> text of the files a snapshot covers.
++base::DictValue Collect(const base::FilePath& root) {
++  base::DictValue files;
++  for (const char* rel : {"user.css", "settings.json", "AGENTS.md"}) {
++    std::string text;
++    std::optional<int64_t> size = base::GetFileSize(root.Append(rel));
++    if (size && *size <= kMaxFile && base::ReadFileToString(root.Append(rel), &text)) {
++      files.Set(rel, text);
++    }
++  }
++  for (const base::Value& p : CustomPlugins(root)) {
++    const base::DictValue& d = p.GetDict();
++    if (d.FindDouble("size").value_or(0) > kMaxFile) {
++      continue;
++    }
++    std::string text;
++    if (base::ReadFileToString(
++            root.Append("plugins").Append(*d.FindString("file")), &text)) {
++      files.Set("plugins/" + *d.FindString("file"), text);
++    }
++  }
++  return files;
++}
++
++std::optional<base::DictValue> ReadSnapshot(const base::FilePath& root,
++                                            const std::string& id) {
++  if (!RE2::FullMatch(id, "\\d{13}-[a-z]+")) {
++    return std::nullopt;
++  }
++  base::FilePath dir = root.Append(".history").Append(id);
++  std::string json;
++  if (!base::ReadFileToString(dir.Append("manifest.json"), &json)) {
++    return std::nullopt;
++  }
++  std::optional<base::Value> manifest = base::JSONReader::Read(json, 0);
++  const base::ListValue* list =
++      manifest && manifest->is_dict() ? manifest->GetDict().FindList("files")
++                                      : nullptr;
++  base::DictValue files;
++  if (list) {
++    for (const base::Value& rel : *list) {
++      if (!rel.is_string() ||
++          !RE2::FullMatch(rel.GetString(),
++                          "user\\.css|settings\\.json|AGENTS\\.md|plugins/"
++                          "[A-Za-z0-9][A-Za-z0-9._-]{0,80}\\.js")) {
++        continue;
++      }
++      std::string text;
++      if (base::ReadFileToString(dir.Append(rel.GetString()), &text)) {
++        files.Set(rel.GetString(), text);
++      }
++    }
++  }
++  return files;
++}
++
++}  // namespace
++
++bool EnsureCustomFolder(const base::FilePath& root) {
++  if (!base::CreateDirectory(root.Append("plugins")) ||
++      !base::CreateDirectory(root.Append("examples")) ||
++      !base::CreateDirectory(root.Append(".history"))) {
++    return false;
++  }
++  Once(root.Append("user.css"), texts::kUserCss);
++  Once(root.Append("settings.json"), texts::kDefaultSettings);
++  Once(root.Append("AGENTS.md"), texts::kAgentsMd);
++  Once(root.Append("CLAUDE.md"), texts::kClaudeMd);
++  Once(root.Append("examples/hello-button.js"), texts::kExamplePlugin);
++  Once(root.Append(".gitignore"), ".history/\n");
++  base::WriteFile(root.Append("API.md"), texts::kApiMd);
++  return true;
++}
++
++base::ListValue CustomPlugins(const base::FilePath& folder) {
++  base::FilePath root = Real(folder);
++  std::vector<std::string> names;
++  base::FileEnumerator e(root.Append("plugins"), false,
++                         base::FileEnumerator::FILES |
++                             base::FileEnumerator::SHOW_SYM_LINKS);
++  for (base::FilePath p = e.Next(); !p.empty(); p = e.Next()) {
++    std::string name = p.BaseName().value();
++    if (RE2::FullMatch(name, "[A-Za-z0-9][A-Za-z0-9._-]{0,80}\\.js")) {
++      names.push_back(name);
++    }
++  }
++  std::ranges::sort(names);
++  base::ListValue out;
++  for (const std::string& name : names) {
++    if (out.size() >= kMaxPlugins) {
++      break;
++    }
++    base::FilePath real =
++        base::MakeAbsoluteFilePath(root.Append("plugins").Append(name));
++    base::File::Info info;
++    if (real.empty() || !Inside(root, real) || !base::GetFileInfo(real, &info) ||
++        info.is_directory) {
++      continue;
++    }
++    base::DictValue item;
++    item.Set("file", name);
++    item.Set("path", real.value());
++    item.Set("mtimeMs", info.last_modified.InMillisecondsFSinceUnixEpoch());
++    item.Set("size", static_cast<double>(info.size));
++    std::string content;
++    if (info.size <= kMaxFile && base::ReadFileToString(real, &content)) {
++      item.Set("sha256", base::HexEncodeLower(crypto::hash::Sha256(content)));
++    } else {
++      item.Set("sha256", base::Value());
++    }
++    out.Append(std::move(item));
++  }
++  return out;
++}
++
++base::DictValue CustomState(const base::FilePath& folder) {
++  base::FilePath root = Real(folder);
++  std::string settings_text;
++  base::ReadFileToString(root.Append("settings.json"), &settings_text);
++  base::Value settings;
++  base::Value error;
++  if (!base::TrimWhitespaceASCII(settings_text, base::TRIM_ALL).empty()) {
++    auto parsed = base::JSONReader::ReadAndReturnValueWithError(settings_text, 0);
++    if (parsed.has_value()) {
++      settings = std::move(*parsed);
++    } else {
++      error = base::Value(parsed.error().message);
++    }
++  }
++  base::File::Info css;
++  double css_mtime = base::GetFileInfo(root.Append("user.css"), &css)
++                         ? css.last_modified.InMillisecondsFSinceUnixEpoch()
++                         : 0;
++  return base::DictValue()
++      .Set("root", root.value())
++      .Set("settings", std::move(settings))
++      .Set("settingsError", std::move(error))
++      .Set("cssMtime", css_mtime)
++      .Set("plugins", CustomPlugins(root));
++}
++
++std::optional<std::string> ServeCustomFile(const base::FilePath& folder,
++                                           const std::string& rel) {
++  if (!RE2::FullMatch(rel,
++                      "user\\.css|plugins/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*\\."
++                      "(js|css|json|svg|png)")) {
++    return std::nullopt;
++  }
++  for (const std::string& part : base::SplitString(
++           rel, "/", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL)) {
++    if (part == ".." || part.starts_with(".")) {
++      return std::nullopt;
++    }
++  }
++  base::FilePath root = Real(folder);
++  base::FilePath real = base::MakeAbsoluteFilePath(root.Append(rel));
++  base::File::Info info;
++  std::string content;
++  if (real.empty() || !Inside(root, real) || !base::GetFileInfo(real, &info) ||
++      info.is_directory || info.size > kMaxFile ||
++      !base::ReadFileToString(real, &content)) {
++    return std::nullopt;
++  }
++  return content;
++}
++
++base::ListValue CustomSnapshots(const base::FilePath& folder) {
++  base::FilePath root = Real(folder);
++  std::vector<std::string> ids;
++  base::FileEnumerator e(root.Append(".history"), false,
++                         base::FileEnumerator::DIRECTORIES);
++  for (base::FilePath p = e.Next(); !p.empty(); p = e.Next()) {
++    std::string id = p.BaseName().value();
++    if (RE2::FullMatch(id, "\\d{13}-[a-z]+")) {
++      ids.push_back(id);
++    }
++  }
++  std::ranges::sort(ids, std::greater<>());
++  base::ListValue out;
++  for (const std::string& id : ids) {
++    base::ListValue files;
++    if (std::optional<base::DictValue> snap = ReadSnapshot(root, id)) {
++      for (const auto [rel, text] : *snap) {
++        files.Append(rel);
++      }
++    }
++    double at = 0;
++    base::StringToDouble(id.substr(0, 13), &at);
++    out.Append(base::DictValue()
++                   .Set("id", id)
++                   .Set("at", at)
++                   .Set("reason", id.substr(14))
++                   .Set("files", std::move(files)));
++  }
++  return out;
++}
++
++std::string SnapshotCustom(const base::FilePath& folder,
++                           const std::string& reason) {
++  base::FilePath root = Real(folder);
++  base::DictValue files = Collect(root);
++  base::ListValue list = CustomSnapshots(root);
++  if (!list.empty()) {
++    const std::string& newest = *list[0].GetDict().FindString("id");
++    std::optional<base::DictValue> prev = ReadSnapshot(root, newest);
++    if (prev && *prev == files) {
++      return newest;
++    }
++  }
++  std::string id = base::NumberToString(static_cast<int64_t>(Now())) + "-" + reason;
++  base::FilePath dir = root.Append(".history").Append(id);
++  base::CreateDirectory(dir.Append("plugins"));
++  base::ListValue names;
++  for (const auto [rel, text] : files) {
++    base::WriteFile(dir.Append(rel), text.GetString());
++    names.Append(rel);
++  }
++  base::WriteFile(dir.Append("manifest.json"),
++                  base::WriteJson(base::DictValue().Set("files", std::move(names)))
++                      .value_or("{}"));
++  for (size_t i = kKeepSnapshots - 1; i < list.size(); ++i) {
++    base::DeletePathRecursively(
++        root.Append(".history").Append(*list[i].GetDict().FindString("id")));
++  }
++  return id;
++}
++
++base::expected<bool, std::string> RestoreCustom(const base::FilePath& folder,
++                                                const std::string& id) {
++  base::FilePath root = Real(folder);
++  std::optional<base::DictValue> files = ReadSnapshot(root, id);
++  if (!files) {
++    return base::unexpected("bad snapshot id");
++  }
++  SnapshotCustom(root, "before-revert");
++  for (const base::Value& p : CustomPlugins(root)) {
++    const std::string& file = *p.GetDict().FindString("file");
++    if (!files->Find("plugins/" + file)) {
++      base::DeleteFile(root.Append("plugins").Append(file));
++    }
++  }
++  for (const auto [rel, text] : *files) {
++    base::WriteFile(root.Append(rel), text.GetString());
++  }
++  return true;
++}
++
++}  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/customizations.h b/chrome/browser/meridian/workbench/customizations.h
+new file mode 100644
+index 0000000000..b89075cfb8
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/customizations.h
+@@ -0,0 +1,51 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_WORKBENCH_CUSTOMIZATIONS_H_
++#define CHROME_BROWSER_MERIDIAN_WORKBENCH_CUSTOMIZATIONS_H_
++
++#include <optional>
++#include <string>
++
++#include "base/files/file_path.h"
++#include "base/types/expected.h"
++#include "base/values.h"
++
++namespace meridian::workbench {
++
++// The Workbench customization folder:
++//   user.css        extra styles (hot-swapped)
++//   settings.json   editor / terminal / layout settings
++//   plugins/*.js    plugins (classic scripts in the Workbench page)
++//   AGENTS.md       how coding agents should change all of the above
++//   API.md          the plugin API reference (rewritten on every start)
++//   .history/       automatic snapshots, for one-click revert
++// A plugin only runs after the person approved its exact content (SHA-256,
++// kept outside this folder) in a native dialog. Blocking functions.
++
++// Creates the folder and its starter files (never overwriting the person's).
++bool EnsureCustomFolder(const base::FilePath& root);
++
++// [{file, path, mtimeMs, size, sha256}] for plugins/*.js (sorted, capped).
++base::ListValue CustomPlugins(const base::FilePath& root);
++// {root, settings, settingsError, cssMtime, plugins}
++base::DictValue CustomState(const base::FilePath& root);
++// A file to serve at chrome://workbench/custom/<rel> (user.css and
++// plugins/…), by real path inside the folder; nullopt otherwise.
++std::optional<std::string> ServeCustomFile(const base::FilePath& root,
++                                           const std::string& rel);
++
++// Snapshots of user.css, settings.json, AGENTS.md and plugins/*.js:
++// [{id, at, reason, files}] newest first; Snapshot() skips when nothing
++// changed and keeps the newest 40; Restore() snapshots first, so a revert
++// can be reverted.
++base::ListValue CustomSnapshots(const base::FilePath& root);
++std::string SnapshotCustom(const base::FilePath& root,
++                           const std::string& reason);
++base::expected<bool, std::string> RestoreCustom(const base::FilePath& root,
++                                                const std::string& id);
++
++}  // namespace meridian::workbench
++
++#endif  // CHROME_BROWSER_MERIDIAN_WORKBENCH_CUSTOMIZATIONS_H_
+diff --git a/chrome/browser/meridian/workbench/customizations_texts.h b/chrome/browser/meridian/workbench/customizations_texts.h
+new file mode 100644
+index 0000000000..5f90478c58
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/customizations_texts.h
+@@ -0,0 +1,184 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Generated by chromium/tools/gen_custom_texts.py from src/dev/custom.js.
++
++#ifndef CHROME_BROWSER_MERIDIAN_WORKBENCH_CUSTOMIZATIONS_TEXTS_H_
++#define CHROME_BROWSER_MERIDIAN_WORKBENCH_CUSTOMIZATIONS_TEXTS_H_
++
++namespace meridian::workbench::texts {
++
++inline constexpr char kUserCss[] = R"meridian(/* Workbench user styles — loaded after the built-in styles, hot-reloaded on save.
++ * Useful variables: --space (accent), --surface, --surface-2, --text, --text-muted, --border,
++ * --mono, --font, --tree-w, --term-h. Example:
++ *
++ *   #topbar { background: color-mix(in srgb, var(--space) 6%, var(--surface)); }
++ */
++)meridian";
++
++inline constexpr char kExamplePlugin[] = R"meridian(// Example plugin — copy this file into plugins/ to try it. Full reference: ../API.md
++workbenchPlugin({ id: 'hello', name: 'Hello button' }, (api) => {
++  api.toolbar.add({
++    id: 'hello', label: 'Hello', icon: 'bolt', title: 'Say hello',
++    onClick: () => api.toast('Hello from a plugin, ' + (api.project()?.name || 'no project')),
++  });
++  api.commands.add({ id: 'hello.git-status', title: 'Git: status in a terminal', keybinding: 'Mod+Shift+G', run: () => api.terminal.run('git status') });
++});
++)meridian";
++
++inline constexpr char kApiMd[] = R"meridian(# Meridian Workbench — plugin API
++
++> Generated by Meridian on every start. Don't edit; edit AGENTS.md, settings.json, user.css and plugins/ instead.
++
++Plugins are plain JavaScript files in `plugins/` (one file = one plugin, loaded in alphabetical
++order). They run inside the Workbench page, as classic scripts (no `import`, no `require`, no
++network: the page may only load files from Meridian itself). Every change to this folder is applied
++live: CSS and settings instantly, plugins are torn down and loaded again.
++
++## Registering
++
++```js
++workbenchPlugin({ id: 'deploy', name: 'Deploy button' }, (api) => {
++  // add things through api.* — they are removed automatically when the plugin reloads
++  return () => { /* optional extra cleanup */ };
++});
++```
++
++## api
++
++| Member | What it does |
++| --- | --- |
++| `api.toolbar.add({ id, label, icon?, title?, onClick })` | Button in the top bar (right of the agent launchers). `icon`: one of bolt, play, code, terminal, globe, file, folder, star, pin, layers, shield, lock, reload, search, settings. |
++| `api.commands.add({ id, title, run, keybinding? })` | Command in the palette (⌘⇧P / Ctrl+Shift+P). `keybinding` like `'Mod+Shift+D'` (Mod = ⌘ on macOS, Ctrl elsewhere; also Alt, Shift). |
++| `api.keybindings.add('Mod+Alt+T', fn)` | Bare keybinding. Keys Meridian uses app-wide (⌘T, ⌘L, ⌘W, ⌘D, ⌘S, ⌘J, ⌘1–9, …) never reach the page — prefer Mod+Alt+… or Mod+Shift+… combos. |
++| `api.panels.add({ id, title, icon?, render(el) })` | Panel in the right side pane. `render` gets an empty element; may return a cleanup function. |
++| `api.launchers.add({ id, label, command, mark?, color? })` | Launcher next to Claude Code / Codex / Shell: opens a shell in the project and runs `command`. |
++| `api.terminal.run(command, { title? })` | Opens a shell in the project and types `command` + Enter. Returns a promise. |
++| `api.files.read(rel)` / `api.files.write(rel, text)` / `api.files.open(rel)` | Project files (paths relative to the project root). |
++| `api.project()` | `{ root, name }` or `null`. |
++| `api.settings()` | Current effective settings (read-only copy). |
++| `api.on(event, fn)` | Events: `'project'` (project opened), `'file-open'` (rel path), `'file-save'` (rel path). |
++| `api.toast(text)` | Small notification. |
++| `api.css(text)` | Adds a style block (removed when the plugin reloads). |
++| `api.el(tag, props?, ...children)` | Tiny DOM helper: `api.el('button', { className: 'btn small', onclick }, 'Go')`. |
++
++Use `textContent` (or `api.el`) for any text that comes from files or terminals — never `innerHTML`
++with data you didn't write.
++
++## settings.json
++
++```json
++{
++  "editor": {
++    "fontSize": 13,
++    "fontFamily": "",
++    "lineHeight": 20,
++    "minimap": false,
++    "wordWrap": "off",
++    "tabSize": 2,
++    "theme": "auto"
++  },
++  "terminal": {
++    "fontSize": 12.5,
++    "fontFamily": "",
++    "lineHeight": 1.15
++  },
++  "layout": {
++    "treeWidth": 240,
++    "terminalHeight": "38%",
++    "sidePanelWidth": 320,
++    "showTree": true
++  },
++  "ui": {
++    "accent": ""
++  }
++}
++```
++
++- `editor.theme`: `"auto"` (follows the system), `"light"`, `"dark"`, `"hc-black"`, `"hc-light"`.
++- `layout.terminalHeight`: CSS length (`"40%"`, `"320px"`). `layout.showTree`: hide the file tree.
++- `ui.accent`: hex colour to override the space colour (`"#d97757"`), empty = follow the space.
++
++## user.css
++
++Loaded after the built-in styles. Main regions: `#topbar`, `#tree-pane`, `#editor-area`,
++`#term-area`, `#side-pane`, `#statusbar`. Variables: `--space`, `--surface`, `--surface-2`,
++`--text`, `--text-muted`, `--border`, `--mono`, `--font`.
++
++## Safety
++
++- Everything here runs with the Workbench's powers (terminals, project files). Only add code you'd
++  run yourself.
++- The user can switch any plugin off, start in Safe Mode (nothing from this folder loads) and revert
++  to any automatic snapshot from the Customize panel.
++- Never write API keys or tokens into these files. Secrets live in Meridian's vault and reach
++  processes as environment variables.
++)meridian";
++
++inline constexpr char kAgentsMd[] = R"meridian(# Workbench customizations — instructions for agents
++
++This folder customizes the Meridian Workbench (the mini IDE you are running in). The user asks for
++changes like "make the editor font bigger", "add a deploy button", "show a TODO panel"; you make
++them by editing files here. Meridian applies every saved change live — no restart, no build.
++
++Read **API.md** first: it is the exact, current plugin API and settings reference.
++
++## Where to change what
++
++- Font, sizes, theme, layout → `settings.json` (keep it valid JSON; unknown keys are ignored).
++- Colours, spacing, hiding things → `user.css`.
++- New buttons, commands, keybindings, panels, launchers → a plugin in `plugins/<name>.js`.
++  One feature per file, named after the feature (`plugins/deploy-button.js`).
++
++## Rules
++
++- Small, focused edits. Don't rewrite files you weren't asked to touch.
++- Plugins: classic scripts only (no import/require/fetch to the internet). Use `textContent` /
++  `api.el` for text; never build HTML from file or terminal contents.
++- Don't touch `.history/` (automatic snapshots) or `API.md` (regenerated by Meridian).
++- Never put secrets in these files. If a command needs a key, it is already in the environment of
++  terminals Meridian starts (ask the user to add it to the vault if it isn't).
++- After a change, tell the user what to look at. If something broke, they can revert from the
++  Customize panel; you can also restore files from `.history/<snapshot>/`.
++- `examples/` has a working plugin to copy from.
++)meridian";
++
++inline constexpr char kClaudeMd[] = R"meridian(# CLAUDE.md
++
++Read [AGENTS.md](AGENTS.md) and [API.md](API.md) before changing anything here.
++
++@AGENTS.md
++)meridian";
++
++inline constexpr char kDefaultSettings[] = R"meridian({
++  "editor": {
++    "fontSize": 13,
++    "fontFamily": "",
++    "lineHeight": 20,
++    "minimap": false,
++    "wordWrap": "off",
++    "tabSize": 2,
++    "theme": "auto"
++  },
++  "terminal": {
++    "fontSize": 12.5,
++    "fontFamily": "",
++    "lineHeight": 1.15
++  },
++  "layout": {
++    "treeWidth": 240,
++    "terminalHeight": "38%",
++    "sidePanelWidth": 320,
++    "showTree": true
++  },
++  "ui": {
++    "accent": ""
++  }
++}
++)meridian";
++
++
++}  // namespace meridian::workbench::texts
++
++#endif  // CHROME_BROWSER_MERIDIAN_WORKBENCH_CUSTOMIZATIONS_TEXTS_H_
+diff --git a/chrome/browser/meridian/workbench/customizations_unittest.cc b/chrome/browser/meridian/workbench/customizations_unittest.cc
+new file mode 100644
+index 0000000000..9b2c844301
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/customizations_unittest.cc
+@@ -0,0 +1,54 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/workbench/customizations.h"
++
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/threading/platform_thread.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace meridian::workbench {
++namespace {
++
++TEST(CustomizationsTest, StarterFilesPluginsServingAndRevert) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  base::FilePath root = base::MakeAbsoluteFilePath(dir.GetPath()).Append("c");
++  ASSERT_TRUE(EnsureCustomFolder(root));
++  std::string agents;
++  ASSERT_TRUE(base::ReadFileToString(root.Append("AGENTS.md"), &agents));
++  EXPECT_NE(agents.find("Read **API.md** first"), std::string::npos);
++  // The person's files are never overwritten.
++  ASSERT_TRUE(base::WriteFile(root.Append("user.css"), "body{}"));
++  ASSERT_TRUE(EnsureCustomFolder(root));
++  std::string css;
++  base::ReadFileToString(root.Append("user.css"), &css);
++  EXPECT_EQ(css, "body{}");
++
++  std::string first = SnapshotCustom(root, "initial");
++  ASSERT_TRUE(base::WriteFile(root.Append("plugins/deploy.js"), "1"));
++  base::ListValue plugins = CustomPlugins(root);
++  ASSERT_EQ(plugins.size(), 1u);
++  EXPECT_EQ(plugins[0].GetDict().FindString("sha256")->size(), 64u);
++  EXPECT_EQ(ServeCustomFile(root, "plugins/deploy.js"), "1");
++  EXPECT_FALSE(ServeCustomFile(root, "../c/plugins/deploy.js"));
++  EXPECT_FALSE(ServeCustomFile(root, "settings.json"));
++  EXPECT_FALSE(ServeCustomFile(root, ".history/x.js"));
++  ASSERT_TRUE(base::CreateSymbolicLink(base::FilePath("/etc/hosts"),
++                                       root.Append("plugins/evil.css")));
++  EXPECT_FALSE(ServeCustomFile(root, "plugins/evil.css"));
++
++  base::PlatformThread::Sleep(base::Milliseconds(5));
++  std::string second = SnapshotCustom(root, "auto");
++  EXPECT_NE(second, first);
++  EXPECT_EQ(SnapshotCustom(root, "auto"), second) << "unchanged: no new one";
++  ASSERT_TRUE(RestoreCustom(root, first).value_or(false));
++  EXPECT_FALSE(base::PathExists(root.Append("plugins/deploy.js")));
++  // "before-revert" equals the newest snapshot, so none is added.
++  EXPECT_EQ(CustomSnapshots(root).size(), 2u);
++}
++
++}  // namespace
++}  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/hubs.cc b/chrome/browser/meridian/workbench/hubs.cc
+new file mode 100644
+index 0000000000..80f5c7a29a
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/hubs.cc
+@@ -0,0 +1,272 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/workbench/hubs.h"
++
++#include <fcntl.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <set>
++
++#include "base/files/file_enumerator.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_file.h"
++#include "base/no_destructor.h"
++#include "base/i18n/time_formatting.h"
++#include "base/posix/eintr_wrapper.h"
++#include "base/strings/string_split.h"
++#include "base/strings/stringprintf.h"
++#include "base/strings/string_util.h"
++#include "base/time/time.h"
++#include "chrome/browser/meridian/ai/process_runner.h"
++#include "chrome/browser/meridian/workbench/agents.h"
++#include "chrome/browser/meridian/workbench/hubs_texts.h"
++#include "third_party/re2/src/re2/re2.h"
++
++namespace meridian::workbench {
++
++namespace {
++
++std::string Today() {
++  base::Time::Exploded e;
++  base::Time::Now().LocalExplode(&e);
++  return base::StringPrintf("%04d-%02d-%02d", e.year, e.month, e.day_of_month);
++}
++
++std::string Fill(std::string text, const std::string& name,
++                 const std::string& today) {
++  base::ReplaceSubstringsAfterOffset(&text, 0, "{{NAME}}", name);
++  base::ReplaceSubstringsAfterOffset(&text, 0, "{{TODAY}}", today);
++  return text;
++}
++
++// Creates `rel` under `root` exclusively (never overwriting).
++bool WriteNew(const base::FilePath& root,
++              const std::string& rel,
++              const std::string& content) {
++  base::FilePath abs = root.Append(rel);
++  if (!root.IsParent(abs) || rel.find("..") != std::string::npos) {
++    return false;
++  }
++  if (!base::CreateDirectory(abs.DirName())) {
++    return false;
++  }
++  base::ScopedFD fd(HANDLE_EINTR(
++      open(abs.value().c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644)));
++  return fd.is_valid() && base::WriteFileDescriptor(fd.get(), content);
++}
++
++}  // namespace
++
++base::ListValue HubTemplates() {
++  base::ListValue out;
++  for (const texts::HubTemplate& t : texts::kHubTemplates) {
++    out.Append(base::DictValue()
++                   .Set("id", t.id)
++                   .Set("label", t.label)
++                   .Set("description", t.description));
++  }
++  return out;
++}
++
++std::string GitPath(const std::string& search_path) {
++  std::string git = FindExecutable("git", search_path);
++  if (git == "/usr/bin/git" &&
++      !base::PathExists(
++          base::FilePath("/Library/Developer/CommandLineTools/usr/bin/git")) &&
++      !base::PathExists(base::FilePath(
++          "/Applications/Xcode.app/Contents/Developer/usr/bin/git"))) {
++    return std::string();
++  }
++  return git;
++}
++
++base::expected<base::DictValue, std::string> CreateHub(
++    const base::FilePath& parent,
++    const std::string& raw_name,
++    const std::string& template_id,
++    bool git,
++    bool skills,
++    const std::string& git_path) {
++  const texts::HubTemplate* t = nullptr;
++  for (const texts::HubTemplate& candidate : texts::kHubTemplates) {
++    if (template_id == candidate.id) {
++      t = &candidate;
++    }
++  }
++  if (!t) {
++    return base::unexpected("Unknown template");
++  }
++  std::string name(base::TrimWhitespaceASCII(raw_name, base::TRIM_ALL));
++  if (name.empty() || name.size() > 80 || name == "." || name == ".." ||
++      name.starts_with(".") ||
++      name.find_first_of("\\/:*?\"<>|") != std::string::npos ||
++      name.find('\0') != std::string::npos) {
++    return base::unexpected(
++        "Use a plain folder name (no slashes, not starting with a dot).");
++  }
++  base::FilePath parent_real = base::MakeAbsoluteFilePath(parent);
++  if (parent_real.empty()) {
++    return base::unexpected("The parent folder doesn’t exist.");
++  }
++  base::FilePath root = parent_real.Append(name);
++  if (root.DirName() != parent_real) {
++    return base::unexpected("Invalid name");
++  }
++  if (base::PathExists(root)) {
++    base::FileEnumerator e(root, false,
++                           base::FileEnumerator::FILES |
++                               base::FileEnumerator::DIRECTORIES);
++    for (base::FilePath p = e.Next(); !p.empty(); p = e.Next()) {
++      if (p.BaseName().value() != ".DS_Store") {
++        return base::unexpected("“" + name +
++                                "” already exists and isn’t empty. Pick "
++                                "another name, or open it with “Open folder "
++                                "as hub”.");
++      }
++    }
++  } else if (!base::CreateDirectory(root)) {
++    return base::unexpected("Couldn’t create the folder.");
++  }
++  std::string today = Today();
++  for (const char* d : t->dirs) {
++    base::CreateDirectory(root.Append(d));
++  }
++  for (const texts::HubFile& f : t->files) {
++    if (!WriteNew(root, Fill(f.path, name, today), Fill(f.content, name, today))) {
++      return base::unexpected(std::string("Couldn’t create ") + f.path);
++    }
++  }
++  WriteNew(root, "CLAUDE.md", texts::kHubClaudeMd);
++  WriteNew(root, ".gitignore", texts::kHubGitignore);
++  if (skills) {
++    WriteNew(root, ".claude/skills/hub-conventions/SKILL.md", t->skill);
++  }
++  base::DictValue out;
++  out.Set("root", root.value());
++  out.Set("git", false);
++  if (git) {
++    if (git_path.empty()) {
++      out.Set("reason", "git was not found on your PATH");
++    } else {
++      std::map<std::string, std::string> env = ai::LoginEnvironment();
++      int code = -1;
++      ai::CaptureOutput({git_path, "init", "-q"}, env, root.value(),
++                        base::Seconds(10), &code);
++      out.Set("git", code == 0);
++      if (code == 0) {
++        // The first commit is best-effort (fails without user.name/email).
++        int add = -1, commit = -1;
++        ai::CaptureOutput({git_path, "add", "-A"}, env, root.value(),
++                          base::Seconds(10), &add);
++        if (add == 0) {
++          ai::CaptureOutput({git_path, "-c", "commit.gpgsign=false", "commit",
++                             "-q", "--no-verify", "-m",
++                             "Create hub with Meridian"},
++                            env, root.value(), base::Seconds(10), &commit);
++        }
++        out.Set("committed", commit == 0);
++      }
++    }
++  }
++  return out;
++}
++
++base::DictValue HubInfo(const base::FilePath& folder) {
++  base::FilePath root = base::MakeAbsoluteFilePath(folder);
++  base::ListValue conventions;
++  bool is_hub = false;
++  for (const char* rel : {"AGENTS.md", "CLAUDE.md", "GEMINI.md",
++                          ".github/copilot-instructions.md", "README.md"}) {
++    base::FilePath real = base::MakeAbsoluteFilePath(root.Append(rel));
++    base::File::Info info;
++    if (real.empty() || !root.IsParent(real) || !base::GetFileInfo(real, &info) ||
++        info.is_directory) {
++      continue;
++    }
++    base::ListValue headings;
++    std::string text;
++    if (info.size < 512 * 1024 && std::string_view(rel) != "README.md" &&
++        base::ReadFileToString(real, &text)) {
++      std::vector<std::string> lines = base::SplitString(
++          text, "\n", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL);
++      for (size_t i = 0; i < lines.size() && headings.size() < 30; ++i) {
++        std::string hashes, title;
++        if (RE2::FullMatch(lines[i], "(#{1,3})\\s+(.+)", &hashes, &title)) {
++          headings.Append(base::DictValue()
++                              .Set("level", static_cast<int>(hashes.size()))
++                              .Set("text", std::string(base::TrimWhitespaceASCII(
++                                               title, base::TRIM_ALL))
++                                               .substr(0, 120))
++                              .Set("line", static_cast<int>(i + 1)));
++        }
++      }
++    }
++    is_hub |= std::string_view(rel) != "README.md";
++    conventions.Append(base::DictValue()
++                           .Set("path", rel)
++                           .Set("size", static_cast<double>(info.size))
++                           .Set("headings", std::move(headings)));
++  }
++  base::ListValue skills;
++  base::FileEnumerator s(root.Append(".claude/skills"), false,
++                         base::FileEnumerator::DIRECTORIES);
++  for (base::FilePath p = s.Next(); !p.empty() && skills.size() < 30;
++       p = s.Next()) {
++    skills.Append(p.BaseName().value());
++  }
++  static const base::NoDestructor<std::set<std::string>> skip(
++      std::set<std::string>{"node_modules", ".git", ".hg", ".svn", "dist",
++                            "build", ".next", "target", ".venv", "venv",
++                            "__pycache__", ".cache"});
++  std::vector<std::pair<double, std::string>> files;
++  int seen = 0;
++  std::vector<std::pair<base::FilePath, int>> stack = {{root, 0}};
++  while (!stack.empty() && seen < 8000) {
++    auto [dir, depth] = stack.back();
++    stack.pop_back();
++    if (depth > 5) {
++      continue;
++    }
++    base::FileEnumerator e(dir, false,
++                           base::FileEnumerator::FILES |
++                               base::FileEnumerator::DIRECTORIES);
++    for (base::FilePath p = e.Next(); !p.empty(); p = e.Next()) {
++      if (++seen > 8000) {
++        break;
++      }
++      std::string name = p.BaseName().value();
++      if (name == ".DS_Store") {
++        continue;
++      }
++      if (e.GetInfo().IsDirectory()) {
++        if (!skip->contains(name) &&
++            !(name.starts_with(".") && name != ".claude")) {
++          stack.push_back({p, depth + 1});
++        }
++        continue;
++      }
++      base::FilePath rel;
++      root.AppendRelativePath(p, &rel);
++      files.emplace_back(
++          e.GetInfo().GetLastModifiedTime().InMillisecondsFSinceUnixEpoch(),
++          rel.value());
++    }
++  }
++  std::ranges::sort(files, std::greater<>());
++  base::ListValue recent;
++  for (size_t i = 0; i < files.size() && i < 15; ++i) {
++    recent.Append(base::DictValue()
++                      .Set("path", files[i].second)
++                      .Set("mtimeMs", files[i].first));
++  }
++  return base::DictValue()
++      .Set("isHub", is_hub)
++      .Set("conventions", std::move(conventions))
++      .Set("skills", std::move(skills))
++      .Set("recent", std::move(recent));
++}
++
++}  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/hubs.h b/chrome/browser/meridian/workbench/hubs.h
+new file mode 100644
+index 0000000000..302cc1f209
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/hubs.h
+@@ -0,0 +1,44 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_WORKBENCH_HUBS_H_
++#define CHROME_BROWSER_MERIDIAN_WORKBENCH_HUBS_H_
++
++#include <string>
++
++#include "base/files/file_path.h"
++#include "base/types/expected.h"
++#include "base/values.h"
++
++namespace meridian::workbench {
++
++// Personal hubs: a folder of posts, notes or code worked on with coding
++// agents through AGENTS.md / CLAUDE.md conventions. Creating one only writes
++// inside a NEW folder (or an empty one) under a parent the person picked in a
++// native dialog; files are created exclusively (never overwritten); `git init`
++// runs as an argv array. Blocking.
++
++// [{id, label, description}]
++base::ListValue HubTemplates();
++
++// {root, git, committed?, reason?}
++base::expected<base::DictValue, std::string> CreateHub(
++    const base::FilePath& parent,
++    const std::string& name,
++    const std::string& template_id,
++    bool git,
++    bool skills,
++    const std::string& git_path);
++
++// {isHub, conventions: [{path, size, headings}], skills, recent}
++base::DictValue HubInfo(const base::FilePath& root);
++
++// git for `git init`, or empty. On macOS /usr/bin/git is a stub that offers
++// to install the Command Line Tools when they're missing: only used when
++// they're there.
++std::string GitPath(const std::string& search_path);
++
++}  // namespace meridian::workbench
++
++#endif  // CHROME_BROWSER_MERIDIAN_WORKBENCH_HUBS_H_
+diff --git a/chrome/browser/meridian/workbench/hubs_texts.h b/chrome/browser/meridian/workbench/hubs_texts.h
+new file mode 100644
+index 0000000000..cbc18d56f5
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/hubs_texts.h
+@@ -0,0 +1,225 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Generated by chromium/tools/gen_hub_texts.py from src/dev/hubs.js.
++
++#ifndef CHROME_BROWSER_MERIDIAN_WORKBENCH_HUBS_TEXTS_H_
++#define CHROME_BROWSER_MERIDIAN_WORKBENCH_HUBS_TEXTS_H_
++
++#include "base/containers/span.h"
++#include "base/memory/raw_ptr_exclusion.h"
++
++namespace meridian::workbench::texts {
++
++struct HubFile {
++  const char* path;
++  const char* content;
++};
++
++struct HubTemplate {
++  const char* id;
++  const char* label;
++  const char* description;
++  // Static data, never freed.
++  RAW_PTR_EXCLUSION base::span<const char* const> dirs;
++  RAW_PTR_EXCLUSION base::span<const HubFile> files;
++  const char* skill;
++};
++
++inline constexpr char kHubClaudeMd[] = R"meridian(# CLAUDE.md
++
++All instructions for agents live in [AGENTS.md](AGENTS.md). Read it first and follow it.
++
++@AGENTS.md
++)meridian";
++
++inline constexpr char kHubGitignore[] = R"meridian(# OS / editors
++.DS_Store
++Thumbs.db
++.idea/
++.vscode/
++*.swp
++
++# Secrets never go into git — keep them in the Meridian vault (they reach agents as env vars)
++.env
++.env.*
++!.env.example
++*.pem
++id_rsa*
++)meridian";
++
++inline constexpr const char* kContentDirs[] = {"posts", "posts/drafts", "articles", "images", "ideas"};
++inline constexpr HubFile kContentFiles[] = {
++    {"AGENTS.md", R"meridian(# {{NAME}} — instructions for agents
++
++This folder is a personal content hub: posts, long-form articles and the images that go with them.
++You (the coding agent) help write, edit and organise them. Read this file before doing anything.
++
++## Where things live
++
++- Short posts → `posts/`, one file per post, named `YYYY-MM-DD-topic.md`.
++- Drafts that are not published yet → `posts/drafts/` (same naming). Move a post out of drafts only
++  when the user says it was published.
++- Long-form articles → `articles/YYYY-MM-DD-topic.md`.
++- Images for a post → `images/<topic>/`. Reference them with relative links.
++- Loose ideas and links → `ideas/` (one file per idea or a running `ideas/inbox.md`).
++
++## Conventions
++
++- Write in the user's voice and language. Keep their wording when they dictate; don't pad.
++- Never invent facts, quotes or numbers. If something needs a source, put the link inline.
++- Don't reference a draft from another post as if it were published.
++- Don't delete files; move obsolete ones to `posts/drafts/archive/` and say so.
++- Secrets (API keys, tokens) are never written into files here. If a task needs one, use the
++  environment variable Meridian provides (e.g. `$OPENAI_API_KEY`) and never print its value.
++
++## Typical tasks
++
++- "Write a post about X" → draft in `posts/drafts/`, show it to the user, wait for approval.
++- "Turn these notes into an article" → `articles/`, keep a short outline at the top while drafting.
++- "Find the post about X" → search `posts/` and `articles/` by content, not just file names.
++)meridian"},
++    {"posts/drafts/.gitkeep", R"meridian()meridian"},
++    {"images/.gitkeep", R"meridian()meridian"},
++    {"articles/.gitkeep", R"meridian()meridian"},
++    {"ideas/inbox.md", R"meridian(# Ideas inbox
++
++- {{TODAY}} — first idea goes here
++)meridian"},
++    {"README.md", R"meridian(# {{NAME}}
++
++Personal content hub. Conventions for agents (and humans) are in [AGENTS.md](AGENTS.md).
++)meridian"},
++};
++
++inline constexpr const char* kKnowledgeDirs[] = {"notes", "inbox", "daily", "attachments"};
++inline constexpr HubFile kKnowledgeFiles[] = {
++    {"AGENTS.md", R"meridian(# {{NAME}} — instructions for agents
++
++This folder is a personal knowledge base in plain Markdown. You (the coding agent) help capture,
++file, link and summarise notes. Read this file before doing anything.
++
++## Structure
++
++- `inbox/` — quick captures, unsorted. One file per capture: `YYYY-MM-DD-short-title.md`.
++- `notes/` — permanent notes, one topic per file, named by topic in kebab-case (`http-caching.md`).
++- `daily/` — daily notes: `daily/YYYY-MM-DD.md`.
++- `attachments/` — images and PDFs referenced from notes.
++
++## Conventions
++
++- Link notes with relative Markdown links (`[HTTP caching](../notes/http-caching.md)`).
++- When filing an inbox item, move its content into an existing note if one fits; otherwise create a
++  new note. Keep a "Sources" line with links when the content came from somewhere.
++- Preserve the user's wording in quotes and personal notes; summarise only when asked.
++- Never delete notes. Merge, then leave a one-line pointer in the old file.
++- Frontmatter is optional; if a file has it, keep it valid YAML.
++- Secrets never go into notes. Use the environment variables Meridian provides instead.
++
++## Typical tasks
++
++- "Process the inbox" → file each item into `notes/` or today's daily note, list what you did.
++- "What do I know about X?" → search `notes/` and `daily/`, answer with links to the notes.
++- "Start today's note" → create `daily/{{TODAY}}.md` from the previous day's open items.
++)meridian"},
++    {"inbox/.gitkeep", R"meridian()meridian"},
++    {"attachments/.gitkeep", R"meridian()meridian"},
++    {"notes/index.md", R"meridian(# Index
++
++Start here. Link the most important notes from this page.
++)meridian"},
++    {"daily/{{TODAY}}.md", R"meridian(# {{TODAY}}
++
++## Today
++
++- 
++)meridian"},
++    {"README.md", R"meridian(# {{NAME}}
++
++Personal knowledge base. Conventions for agents (and humans) are in [AGENTS.md](AGENTS.md).
++)meridian"},
++};
++
++inline constexpr const char* kCodeDirs[] = {"src", "docs"};
++inline constexpr HubFile kCodeFiles[] = {
++    {"AGENTS.md", R"meridian(# {{NAME}} — instructions for agents
++
++## Project
++
++Describe what this project does in two or three sentences, and who uses it.
++
++## Layout
++
++- `src/` — source code.
++- `docs/` — design notes and decisions (`docs/YYYY-MM-DD-decision.md`).
++
++## How to work here
++
++- Before changing code, read the relevant files and explain the plan in one or two lines.
++- Keep changes small and focused; match the existing style.
++- Run the tests / build after every change and report the result honestly.
++- Don't add dependencies without asking.
++- Commit only when the user asks. Never push.
++- Secrets come from environment variables that Meridian injects from its vault. Never write keys into
++  files, never print them, and never commit `.env` files.
++
++## Commands
++
++- Build: _fill in_
++- Test: _fill in_
++- Run: _fill in_
++)meridian"},
++    {"src/.gitkeep", R"meridian()meridian"},
++    {"docs/.gitkeep", R"meridian()meridian"},
++    {"README.md", R"meridian(# {{NAME}}
++
++See [AGENTS.md](AGENTS.md) for how agents (and humans) work in this repository.
++)meridian"},
++};
++
++inline constexpr HubTemplate kHubTemplates[] = {
++    {"content", "Content hub", "Posts, articles and their images, with a drafts convention.", kContentDirs, kContentFiles,
++     R"meridian(---
++name: hub-conventions
++description: Use when creating, moving or naming files in this content hub — applies the folder conventions from AGENTS.md.
++---
++
++# Hub conventions
++
++1. Re-read AGENTS.md at the root of this folder.
++2. Pick the folder and file name exactly as AGENTS.md describes (dates as YYYY-MM-DD).
++3. Never overwrite or delete an existing file without asking; propose a new name instead.
++4. After creating or moving files, list the paths you touched.
++)meridian"},
++    {"knowledge", "Knowledge base", "Notes, an inbox for quick capture and daily notes.", kKnowledgeDirs, kKnowledgeFiles,
++     R"meridian(---
++name: hub-conventions
++description: Use when creating, moving or naming files in this knowledge base — applies the folder conventions from AGENTS.md.
++---
++
++# Hub conventions
++
++1. Re-read AGENTS.md at the root of this folder.
++2. Pick the folder and file name exactly as AGENTS.md describes (dates as YYYY-MM-DD).
++3. Never overwrite or delete an existing file without asking; propose a new name instead.
++4. After creating or moving files, list the paths you touched.
++)meridian"},
++    {"code", "Code project", "A fresh repository with agent instructions and a src/ folder.", kCodeDirs, kCodeFiles,
++     R"meridian(---
++name: hub-conventions
++description: Use when creating, moving or naming files in this code project — applies the folder conventions from AGENTS.md.
++---
++
++# Hub conventions
++
++1. Re-read AGENTS.md at the root of this folder.
++2. Pick the folder and file name exactly as AGENTS.md describes (dates as YYYY-MM-DD).
++3. Never overwrite or delete an existing file without asking; propose a new name instead.
++4. After creating or moving files, list the paths you touched.
++)meridian"},
++};
++
++}  // namespace meridian::workbench::texts
++
++#endif  // CHROME_BROWSER_MERIDIAN_WORKBENCH_HUBS_TEXTS_H_
+diff --git a/chrome/browser/meridian/workbench/hubs_unittest.cc b/chrome/browser/meridian/workbench/hubs_unittest.cc
+new file mode 100644
+index 0000000000..d3919c54ea
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/hubs_unittest.cc
+@@ -0,0 +1,42 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/workbench/hubs.h"
++
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace meridian::workbench {
++namespace {
++
++TEST(HubsTest, CreatesAContentHubAndReadsItBack) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  EXPECT_EQ(HubTemplates().size(), 3u);
++  base::expected<base::DictValue, std::string> hub =
++      CreateHub(dir.GetPath(), "My Posts", "content", /*git=*/false,
++                /*skills=*/true, "");
++  ASSERT_TRUE(hub.has_value()) << hub.error();
++  base::FilePath root(*hub->FindString("root"));
++  std::string agents;
++  ASSERT_TRUE(base::ReadFileToString(root.Append("AGENTS.md"), &agents));
++  EXPECT_TRUE(agents.starts_with("# My Posts — instructions for agents"));
++  EXPECT_TRUE(base::DirectoryExists(root.Append("posts/drafts")));
++  EXPECT_TRUE(base::PathExists(
++      root.Append(".claude/skills/hub-conventions/SKILL.md")));
++  base::DictValue info = HubInfo(root);
++  EXPECT_TRUE(info.FindBool("isHub").value_or(false));
++  EXPECT_EQ(*(*info.FindList("skills"))[0].GetIfString(), "hub-conventions");
++  // Not into a folder that has things in it, and only plain names.
++  EXPECT_FALSE(CreateHub(dir.GetPath(), "My Posts", "content", false, false, "")
++                   .has_value());
++  EXPECT_FALSE(CreateHub(dir.GetPath(), "../escape", "content", false, false, "")
++                   .has_value());
++  EXPECT_FALSE(CreateHub(dir.GetPath(), ".hidden", "code", false, false, "")
++                   .has_value());
++}
++
++}  // namespace
++}  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 5b1ddc0063..ff46964f26 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -14,6 +14,7 @@
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
+ #include "base/task/bind_post_task.h"
+ #include "base/task/thread_pool.h"
+ #include "chrome/browser/meridian/ai/process_runner.h"
+@@ -22,6 +23,9 @@
+ #include "chrome/browser/meridian/prefs.h"
+ #include "chrome/browser/meridian/sidebar_handler.h"
+ #include "chrome/browser/meridian/workbench/agents.h"
++#include "chrome/browser/meridian/workbench/customizations.h"
++#include "net/base/url_util.h"
++#include "chrome/browser/meridian/workbench/hubs.h"
+ #include "chrome/browser/meridian/workbench/native_dialog.h"
+ #include "chrome/browser/meridian/workbench/sandbox.h"
+ #include "chrome/browser/meridian/workbench/workbench_source.h"
+@@ -156,6 +160,32 @@ base::DictValue MergeClaudeSettings(base::DictValue base,
+   return base;
+ }
+ 
++
++std::string ReadDockerfile() {
++  std::string text;
++  base::ReadFileToString(
++      WorkbenchSource::Folder().Append("sandbox").Append("Dockerfile"), &text);
++  return text;
++}
++
++base::FilePath ReviewPath(Profile* profile) {
++  return profile->GetPath().Append("Meridian Workbench Review.json");
++}
++
++base::DictValue LoadJson(const base::FilePath& file) {
++  std::string json;
++  base::ReadFileToString(file, &json);
++  std::optional<base::Value> v = base::JSONReader::Read(json, 0);
++  return v && v->is_dict() ? std::move(v->GetDict()) : base::DictValue();
++}
++
++void SaveJson(const base::FilePath& file, const base::DictValue& value) {
++  if (base::WriteFile(file, base::WriteJson(value).value_or("{}"))) {
++    base::SetPosixFilePermissions(file, 0600);
++  }
++}
++
++
+ // The terminal environment: the login environment, a colour terminal.
+ std::map<std::string, std::string> TerminalEnv() {
+   std::map<std::string, std::string> env = ai::LoginEnvironment();
+@@ -185,6 +215,13 @@ WorkbenchHandler::WorkbenchHandler(Profile* profile)
+           mission::MissionControlFactory::GetForProfile(profile)) {
+     mission_observation_.Observe(mission);
+   }
++  custom_subscription_ =
++      WorkbenchServiceFactory::GetForProfile(profile)->OnCustomChange(
++          base::BindRepeating(
++              [](WorkbenchHandler* self) {
++                self->Emit("wb:custom-change", base::Value(base::DictValue()));
++              },
++              base::Unretained(this)));
+ }
+ 
+ // static
+@@ -312,6 +349,7 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+       return std::move(reply).Run(base::Value());
+     }
+     pick_reply_ = std::move(reply);
++    picking_hub_parent_ = false;
+     dialog_ = ui::SelectFileDialog::Create(
+         this, std::make_unique<ChromeSelectFilePolicy>(
+                   web_ui()->GetWebContents()));
+@@ -526,6 +564,12 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+                                     std::move(cleanup)));
+     return std::move(reply).Run(base::Value(true));
+   }
++  if (method.starts_with("custom")) {
++    return CustomCall(method, params, std::move(reply));
++  }
++  if (method.starts_with("hub")) {
++    return HubCall(method, params, std::move(reply));
++  }
+   if (method == "sandboxStatus" || method == "sandboxNetwork") {
+     return SandboxCall(method, params, std::move(reply));
+   }
+@@ -537,6 +581,344 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+       "This Workbench feature isn’t available in this version yet."));
+ }
+ 
++void WorkbenchHandler::CustomCall(const std::string& method,
++                                  const base::ListValue& params,
++                                  Reply reply) {
++  WorkbenchService* service = WorkbenchServiceFactory::GetForProfile(profile_);
++  base::FilePath root = service->custom_root();
++  base::FilePath approvals = service->approvals_file();
++  std::string a = StringParam(params, 0);
++  bool flag = params.size() > 1 && params[1].is_bool() && params[1].GetBool();
++  if (method == "customState") {
++    bool safe = service->safe_mode();
++    files_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(
++            [](base::FilePath root, base::FilePath approvals_file,
++               base::FilePath store_file, bool safe) -> Result {
++              base::DictValue st = CustomState(root);
++              base::DictValue approvals = LoadJson(approvals_file);
++              base::DictValue* approved = approvals.FindDict("plugins");
++              for (base::Value& p : *st.FindList("plugins")) {
++                base::DictValue& d = p.GetDict();
++                const std::string* sha = d.FindString("sha256");
++                const base::DictValue* entry =
++                    approved ? approved->FindDict(*d.FindString("file"))
++                             : nullptr;
++                const std::string* ok =
++                    entry ? entry->FindString("sha256") : nullptr;
++                d.Set("approved", sha && ok && *sha == *ok);
++                d.Set("everApproved", !!entry);
++              }
++              base::DictValue store = LoadStore(store_file);
++              const base::ListValue* disabled = store.FindList("disabledPlugins");
++              base::ListValue snapshots = CustomSnapshots(root);
++              while (snapshots.size() > 30) {
++                snapshots.erase(snapshots.end() - 1);
++              }
++              st.Set("safeMode", safe);
++              st.Set("disabled", disabled ? disabled->Clone() : base::ListValue());
++              st.Set("snapshots", std::move(snapshots));
++              return base::Value(std::move(st));
++            },
++            root, approvals, StorePath(), safe),
++        std::move(reply));
++    return;
++  }
++  if (method == "customSafeMode") {
++    bool on = !params.empty() && params[0].is_bool() && params[0].GetBool();
++    service->set_safe_mode(on);
++    for (auto& [contents, handler] : Handlers()) {
++      if (handler->profile_ == profile_) {
++        handler->Emit("wb:custom-change",
++                      base::Value(base::DictValue().Set("safeMode", on)));
++      }
++    }
++    return std::move(reply).Run(base::Value(on));
++  }
++  if (method == "customTogglePlugin") {
++    if (!RE2::FullMatch(a, "[A-Za-z0-9][A-Za-z0-9._-]{0,80}\\.js")) {
++      return std::move(reply).Run(base::unexpected("invalid plugin name"));
++    }
++    files_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(
++            [](base::FilePath file, std::string plugin, bool enabled) -> Result {
++              base::DictValue store = LoadStore(file);
++              base::ListValue* disabled = store.EnsureList("disabledPlugins");
++              disabled->EraseValue(base::Value(plugin));
++              if (!enabled) {
++                disabled->Append(plugin);
++              }
++              base::ListValue out = disabled->Clone();
++              SaveStore(file, store);
++              return base::Value(std::move(out));
++            },
++            StorePath(), a, flag),
++        base::BindOnce(
++            [](base::WeakPtr<WorkbenchHandler> self, Reply reply, Result r) {
++              if (self) {
++                self->Broadcast("wb:custom-change");
++              }
++              std::move(reply).Run(std::move(r));
++            },
++            weak_factory_.GetWeakPtr(), std::move(reply)));
++    return;
++  }
++  if (method == "customRestore") {
++    files_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(
++            [](base::FilePath root, std::string id) {
++              return Wrap(RestoreCustom(root, id));
++            },
++            root, a),
++        std::move(reply));
++    return;
++  }
++  if (method == "customOpen") {
++    return OpenProject(root, std::move(reply));
++  }
++  if (method == "customReveal") {
++    platform_util::OpenItem(profile_, root, platform_util::OPEN_FOLDER,
++                            base::DoNothing());
++    return std::move(reply).Run(base::Value(true));
++  }
++  if (method == "customApprovePlugins") {
++    // One native confirm for every new or changed (enabled) plugin. Only the
++    // browser writes approvals.
++    files_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(
++            [](base::FilePath root, base::FilePath approvals_file,
++               base::FilePath store_file) {
++              base::ListValue pending;
++              base::DictValue approvals = LoadJson(approvals_file);
++              base::DictValue store = LoadStore(store_file);
++              const base::ListValue* disabled = store.FindList("disabledPlugins");
++              for (base::Value& p : CustomPlugins(root)) {
++                base::DictValue& d = p.GetDict();
++                const std::string* sha = d.FindString("sha256");
++                const std::string& file = *d.FindString("file");
++                if (!sha || (disabled && disabled->contains(file))) {
++                  continue;
++                }
++                const base::DictValue* plugins = approvals.FindDict("plugins");
++                const base::DictValue* entry =
++                    plugins ? plugins->FindDict(file) : nullptr;
++                const std::string* ok =
++                    entry ? entry->FindString("sha256") : nullptr;
++                if (ok && *ok == *sha) {
++                  continue;
++                }
++                d.Set("changed", ok != nullptr);
++                pending.Append(std::move(d));
++              }
++              return pending;
++            },
++            root, approvals, StorePath()),
++        base::BindOnce(
++            [](base::WeakPtr<WorkbenchHandler> self, base::FilePath approvals,
++               Reply reply, base::ListValue pending) {
++              if (!self) {
++                return;
++              }
++              if (pending.empty()) {
++                return std::move(reply).Run(base::Value(
++                    base::DictValue().Set("approved", base::ListValue())));
++              }
++              std::string lines;
++              for (size_t i = 0; i < pending.size() && i < 12; ++i) {
++                const base::DictValue& p = pending[i].GetDict();
++                double size = p.FindDouble("size").value_or(0);
++                lines += "• " + *p.FindString("file") + " — " +
++                         (size < 1024 ? base::NumberToString(
++                                            static_cast<int>(size)) + " bytes"
++                                      : base::StringPrintf("%.1f KB",
++                                                           size / 1024)) +
++                         ", " +
++                         (p.FindBool("changed").value_or(false)
++                              ? "CHANGED since you approved it"
++                              : "new") +
++                         "\n   " + ai::OneLine(*p.FindString("path"), 200) +
++                         "\n";
++              }
++              size_t n = pending.size();
++              AskNative(
++                  self->web_ui()->GetWebContents(),
++                  n == 1 ? "Run this Workbench plugin?"
++                         : "Run these " + base::NumberToString(n) +
++                               " Workbench plugins?",
++                  lines +
++                      "\nPlugins run inside the Workbench with its powers: "
++                      "they can open terminals and run commands, read and "
++                      "change project files, and use your vault secrets. Only "
++                      "run code you trust. Any later change to a plugin file "
++                      "needs your approval again.",
++                  {"Don’t run", n == 1 ? "Run this plugin"
++                                       : "Run " + base::NumberToString(n) +
++                                             " plugins"},
++                  base::BindOnce(
++                      [](base::WeakPtr<WorkbenchHandler> self,
++                         base::FilePath approvals, Reply reply,
++                         base::ListValue pending, int choice) {
++                        if (!self || choice != 1) {
++                          return std::move(reply).Run(base::Value(
++                              base::DictValue().Set("approved",
++                                                    base::ListValue())));
++                        }
++                        self->files_->PostTaskAndReplyWithResult(
++                            FROM_HERE,
++                            base::BindOnce(
++                                [](base::FilePath file,
++                                   base::ListValue pending) -> Result {
++                                  base::DictValue all = LoadJson(file);
++                                  base::DictValue* plugins =
++                                      all.EnsureDict("plugins");
++                                  base::ListValue names;
++                                  for (const base::Value& p : pending) {
++                                    const base::DictValue& d = p.GetDict();
++                                    plugins->Set(
++                                        *d.FindString("file"),
++                                        base::DictValue()
++                                            .Set("sha256",
++                                                 *d.FindString("sha256"))
++                                            .Set("size",
++                                                 d.FindDouble("size").value_or(0))
++                                            .Set("at",
++                                                 base::Time::Now()
++                                                     .InMillisecondsFSinceUnixEpoch()));
++                                    names.Append(*d.FindString("file"));
++                                  }
++                                  all.Set("version", 1);
++                                  SaveJson(file, all);
++                                  return base::Value(base::DictValue().Set(
++                                      "approved", std::move(names)));
++                                },
++                                approvals, std::move(pending)),
++                            base::BindOnce(
++                                [](base::WeakPtr<WorkbenchHandler> self,
++                                   Reply reply, Result r) {
++                                  if (self) {
++                                    self->Broadcast("wb:custom-change");
++                                  }
++                                  std::move(reply).Run(std::move(r));
++                                },
++                                self, std::move(reply)));
++                      },
++                      self, approvals, std::move(reply), std::move(pending)));
++            },
++            weak_factory_.GetWeakPtr(), approvals, std::move(reply)));
++    return;
++  }
++  std::move(reply).Run(base::unexpected("unknown customization call"));
++}
++
++void WorkbenchHandler::SetHubParent(const base::FilePath& picked,
++                                    Reply reply) {
++  files_->PostTaskAndReplyWithResult(
++      FROM_HERE, base::BindOnce(&base::MakeAbsoluteFilePath, picked),
++      base::BindOnce(
++          [](base::WeakPtr<WorkbenchHandler> self, Reply reply,
++             base::FilePath real) {
++            if (!self) {
++              return;
++            }
++            self->hub_parent_ = real;
++            std::move(reply).Run(real.empty() ? base::Value()
++                                              : base::Value(real.value()));
++          },
++          weak_factory_.GetWeakPtr(), std::move(reply)));
++}
++
++void WorkbenchHandler::HubCall(const std::string& method,
++                               const base::ListValue& params,
++                               Reply reply) {
++  if (method == "hubPickParent") {
++    const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++    if (cl->HasSwitch("meridian-test-hub-parent")) {
++      return SetHubParent(cl->GetSwitchValuePath("meridian-test-hub-parent"),
++                          std::move(reply));
++    }
++    if (dialog_) {
++      return std::move(reply).Run(base::Value());
++    }
++    pick_reply_ = std::move(reply);
++    picking_hub_parent_ = true;
++    dialog_ = ui::SelectFileDialog::Create(
++        this, std::make_unique<ChromeSelectFilePolicy>(
++                  web_ui()->GetWebContents()));
++    dialog_->SelectFile(ui::SelectFileDialog::SELECT_FOLDER,
++                        u"Where should the hub folder be created?",
++                        base::FilePath(), nullptr, 0,
++                        base::FilePath::StringType(),
++                        web_ui()->GetWebContents()->GetTopLevelNativeWindow());
++    return;
++  }
++  if (method == "hubInfo") {
++    return OnProject(base::BindOnce([](const ProjectFs& p) -> Result {
++                       return base::Value(HubInfo(p.root()));
++                     }),
++                     std::move(reply));
++  }
++  if (method == "hubCreate") {
++    if (hub_parent_.empty()) {
++      return std::move(reply).Run(
++          base::unexpected("Choose where to create the hub first."));
++    }
++    base::DictValue o = params.size() && params[0].is_dict()
++                            ? params[0].GetDict().Clone()
++                            : base::DictValue();
++    const std::string* name = o.FindString("name");
++    const std::string* tmpl = o.FindString("template");
++    files_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(
++            [](base::FilePath parent, std::string name, std::string tmpl,
++               bool git, bool skills) {
++              std::map<std::string, std::string> env = TerminalEnv();
++              return CreateHub(parent, name, tmpl, git, skills,
++                               GitPath(env["PATH"]));
++            },
++            hub_parent_, name ? *name : std::string(),
++            tmpl ? *tmpl : std::string(), o.FindBool("git").value_or(true),
++            o.FindBool("skills").value_or(true)),
++        base::BindOnce(
++            [](base::WeakPtr<WorkbenchHandler> self, Reply reply,
++               base::expected<base::DictValue, std::string> made) {
++              if (!self) {
++                return;
++              }
++              if (!made.has_value()) {
++                return std::move(reply).Run(base::unexpected(made.error()));
++              }
++              base::FilePath root(*made->FindString("root"));
++              base::DictValue result = std::move(*made);
++              self->OpenProject(
++                  root,
++                  base::BindOnce(
++                      [](Reply reply, base::DictValue made, Result project) {
++                        if (!project.has_value()) {
++                          return std::move(reply).Run(std::move(project));
++                        }
++                        const std::string* reason = made.FindString("reason");
++                        std::move(reply).Run(base::Value(
++                            base::DictValue()
++                                .Set("project", std::move(*project))
++                                .Set("git", made.FindBool("git").value_or(false))
++                                .Set("committed",
++                                     made.FindBool("committed").value_or(false))
++                                .Set("gitReason", reason ? base::Value(*reason)
++                                                         : base::Value())));
++                      },
++                      std::move(reply), std::move(result)));
++            },
++            weak_factory_.GetWeakPtr(), std::move(reply)));
++    return;
++  }
++  std::move(reply).Run(base::unexpected("unknown hub call"));
++}
++
+ void WorkbenchHandler::Broadcast(const std::string& channel) {
+   for (auto& [contents, handler] : Handlers()) {
+     if (handler->profile_ == profile_) {
+@@ -1077,8 +1459,8 @@ void WorkbenchHandler::Info(Reply reply) {
+       FROM_HERE,
+       base::BindOnce(
+           [](base::FilePath store_file, std::string access, bool has_project,
+-             std::string root, base::DictValue project,
+-             std::string vault_why) -> Result {
++             std::string root, base::DictValue project, std::string vault_why,
++             bool safe_mode, std::string custom_root) -> Result {
+             base::DictValue store = LoadStore(store_file);
+             std::map<std::string, std::string> env = TerminalEnv();
+             base::DictValue agents = DetectAgents(env["PATH"]);
+@@ -1101,19 +1483,23 @@ void WorkbenchHandler::Info(Reply reply) {
+                     .Set("agentAccess", access)
+                     .Set("terminals", true)
+                     .Set("terminalError", base::Value())
+-                    .Set("safeMode", true)
+-                    .Set("customRoot", base::Value())
++                    .Set("safeMode", safe_mode)
++                    .Set("customRoot", custom_root)
+                     .Set("vaultUnavailable", vault_why.empty()
+                                                  ? base::Value()
+                                                  : base::Value(vault_why))
+                     .Set("sandboxNetwork",
+                          store.FindBool("sandboxNetwork").value_or(true))
+-                    .Set("hubTemplates", base::ListValue()));
++                    .Set("hubTemplates", HubTemplates()));
+           },
+           StorePath(), access, has_project, root, std::move(project),
+           WorkbenchServiceFactory::GetForProfile(profile_)
+               ->vault()
+-              .UnavailableReason()),
++              .UnavailableReason(),
++          WorkbenchServiceFactory::GetForProfile(profile_)->safe_mode(),
++          WorkbenchServiceFactory::GetForProfile(profile_)
++              ->custom_root()
++              .value()),
+       std::move(reply));
+ }
+ 
+@@ -1127,9 +1513,15 @@ base::DictValue WorkbenchHandler::ProjectInfo() const {
+ void WorkbenchHandler::FileSelected(const ui::SelectedFileInfo& file,
+                                     int index) {
+   dialog_.reset();
+-  if (pick_reply_) {
+-    OpenProject(file.path(), std::move(pick_reply_));
++  if (!pick_reply_) {
++    return;
++  }
++  if (picking_hub_parent_) {
++    // Only a folder picked in the native dialog can be a hub's parent.
++    SetHubParent(file.path(), std::move(pick_reply_));
++    return;
+   }
++  OpenProject(file.path(), std::move(pick_reply_));
+ }
+ 
+ void WorkbenchHandler::FileSelectionCanceled() {
+@@ -1556,33 +1948,6 @@ void WorkbenchHandler::OnTerminalExit(std::string id, int code, int signal) {
+   Emit("wb:pty-exit", base::Value(std::move(exited)));
+ }
+ 
+-namespace {
+-
+-std::string ReadDockerfile() {
+-  std::string text;
+-  base::ReadFileToString(
+-      WorkbenchSource::Folder().Append("sandbox").Append("Dockerfile"), &text);
+-  return text;
+-}
+-
+-base::FilePath ReviewPath(Profile* profile) {
+-  return profile->GetPath().Append("Meridian Workbench Review.json");
+-}
+-
+-base::DictValue LoadJson(const base::FilePath& file) {
+-  std::string json;
+-  base::ReadFileToString(file, &json);
+-  std::optional<base::Value> v = base::JSONReader::Read(json, 0);
+-  return v && v->is_dict() ? std::move(v->GetDict()) : base::DictValue();
+-}
+-
+-void SaveJson(const base::FilePath& file, const base::DictValue& value) {
+-  if (base::WriteFile(file, base::WriteJson(value).value_or("{}"))) {
+-    base::SetPosixFilePermissions(file, 0600);
+-  }
+-}
+-
+-}  // namespace
+ 
+ void WorkbenchHandler::SandboxCall(const std::string& method,
+                                    const base::ListValue& params,
+@@ -1896,6 +2261,30 @@ void WorkbenchHandler::ToHost(const base::DictValue& message) {
+     SidebarHandler::ShowMissionControl(profile_, std::string());
+     return;
+   }
++  if (type && *type == "ready") {
++    // A pinned hub reopens its project (chrome://workbench/?project=…); the
++    // page only opens folders already picked in the native dialog.
++    std::string project;
++    net::GetValueForKeyInQuery(web_ui()->GetWebContents()->GetLastCommittedURL(),
++                               "project", &project);
++    base::DictValue init;
++    init.Set("type", "init");
++    init.Set("project", project.empty() ? base::Value() : base::Value(project));
++    Emit("wb:command", base::Value(std::move(init)));
++    return;
++  }
++  if (type && *type == "pin-hub") {
++    if (!project_) {
++      return;
++    }
++    const std::string* where = message.FindString("where");
++    bool favorite = where && *where == "fav";
++    GURL url = net::AppendQueryParameter(GURL("chrome://workbench/"), "project",
++                                         project_->root().value());
++    SidebarHandler::PinTabContents(web_ui()->GetWebContents(), favorite, url,
++                                   project_->root().BaseName().value());
++    return;
++  }
+   const std::string* url = message.FindString("url");
+   if (!type || !url) {
+     return;
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.h b/chrome/browser/meridian/workbench/workbench_handler.h
+index 6c00e57e38..df3a49b826 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.h
++++ b/chrome/browser/meridian/workbench/workbench_handler.h
+@@ -11,6 +11,7 @@
+ #include <set>
+ #include <string>
+ 
++#include "base/callback_list.h"
+ #include "base/files/file_path.h"
+ #include "base/files/file_path_watcher.h"
+ #include "base/memory/raw_ptr.h"
+@@ -132,6 +133,14 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+                      GuardServer::Answer answer);
+   // To every Workbench page of this profile.
+   void Broadcast(const std::string& channel);
++  // Customizations and hubs.
++  void CustomCall(const std::string& method,
++                  const base::ListValue& params,
++                  Reply reply);
++  void HubCall(const std::string& method,
++               const base::ListValue& params,
++               Reply reply);
++  void SetHubParent(const base::FilePath& picked, Reply reply);
+ 
+   base::FilePath StorePath() const;
+ 
+@@ -149,6 +158,11 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+   std::map<std::string, int> sandboxes_running_;
+   scoped_refptr<ui::SelectFileDialog> dialog_;
+   Reply pick_reply_;
++  // What the folder dialog is for: a project or a hub's parent folder.
++  bool picking_hub_parent_ = false;
++  // The hub parent picked in the native dialog.
++  base::FilePath hub_parent_;
++  base::CallbackListSubscription custom_subscription_;
+   base::ScopedObservation<mission::MissionControl,
+                           mission::MissionControl::Observer>
+       mission_observation_{this};
+diff --git a/chrome/browser/meridian/workbench/workbench_service.cc b/chrome/browser/meridian/workbench/workbench_service.cc
+index f4bf8b104b..70b5f22d3c 100644
+--- a/chrome/browser/meridian/workbench/workbench_service.cc
++++ b/chrome/browser/meridian/workbench/workbench_service.cc
+@@ -5,15 +5,46 @@
+ #include "chrome/browser/meridian/workbench/workbench_service.h"
+ 
+ #include "base/functional/callback_helpers.h"
++#include "base/command_line.h"
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/task/bind_post_task.h"
++#include "base/task/thread_pool.h"
++#include "chrome/browser/meridian/workbench/customizations.h"
++#include "crypto/hash.h"
++#include "third_party/re2/src/re2/re2.h"
+ #include "chrome/browser/meridian/workbench/vault.h"
+ #include "chrome/browser/profiles/profile.h"
+ 
+ namespace meridian::workbench {
+ 
+ WorkbenchService::WorkbenchService(Profile* profile)
+-    : vault_(std::make_unique<Vault>(
++    : custom_root_(profile->GetPath().DirName().Append(
++          "Meridian Workbench Custom")),
++      approvals_file_(profile->GetPath().DirName().Append(
++          "Meridian Workbench Plugins.json")),
++      safe_mode_(base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "workbench-safe-mode")),
++      // The folder watcher lives here too: nothing that must finish before
++      // shutdown (a snapshot can be skipped).
++      files_(base::ThreadPool::CreateSequencedTaskRunner(
++          {base::MayBlock(), base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN})),
++      vault_(std::make_unique<Vault>(
+           profile->GetPath().Append("Meridian Vault.json"))) {
++  files_->PostTask(FROM_HERE, base::BindOnce(
++                                  [](base::FilePath root) {
++                                    if (EnsureCustomFolder(root)) {
++                                      SnapshotCustom(root, "initial");
++                                    }
++                                  },
++                                  custom_root_));
++  custom_watcher_ = base::SequenceBound<base::FilePathWatcher>(files_);
++  custom_watcher_.AsyncCall(base::IgnoreResult(&base::FilePathWatcher::Watch))
++      .WithArgs(custom_root_, base::FilePathWatcher::Type::kRecursive,
++                base::BindPostTaskToCurrentDefault(base::BindRepeating(
++                    &WorkbenchService::OnCustomFileChanged,
++                    weak_factory_.GetWeakPtr())));
+   guard_ = std::make_unique<GuardServer>(base::BindRepeating(
+       &WorkbenchService::Decide, weak_factory_.GetWeakPtr()));
+   guard_->Start(base::DoNothing());
+@@ -21,6 +52,106 @@ WorkbenchService::WorkbenchService(Profile* profile)
+ 
+ WorkbenchService::~WorkbenchService() = default;
+ 
++void WorkbenchService::OnCustomFileChanged(const base::FilePath& path,
++                                           bool error) {
++  base::FilePath rel;
++  custom_root_.AppendRelativePath(path, &rel);
++  std::string r = rel.value();
++  if (r.starts_with(".history") || r == "API.md" || r.ends_with(".tmp") ||
++      r.ends_with("~")) {
++    return;
++  }
++  custom_timer_.Start(
++      FROM_HERE, base::Milliseconds(200),
++      base::BindOnce(
++          [](base::WeakPtr<WorkbenchService> self) {
++            if (!self) {
++              return;
++            }
++            self->files_->PostTaskAndReply(
++                FROM_HERE,
++                base::BindOnce(base::IgnoreResult(&SnapshotCustom),
++                               self->custom_root_, "auto"),
++                base::BindOnce(
++                    [](base::WeakPtr<WorkbenchService> self) {
++                      if (self) {
++                        self->custom_listeners_.Notify();
++                      }
++                    },
++                    self));
++          },
++          weak_factory_.GetWeakPtr()));
++}
++
++base::CallbackListSubscription WorkbenchService::OnCustomChange(
++    base::RepeatingClosure changed) {
++  return custom_listeners_.Add(std::move(changed));
++}
++
++void WorkbenchService::ServeCustom(
++    const std::string& rel,
++    base::FilePath store_file,
++    base::OnceCallback<void(std::optional<std::string>)> done) {
++  if (safe_mode_) {
++    std::move(done).Run(std::nullopt);
++    return;
++  }
++  files_->PostTaskAndReplyWithResult(
++      FROM_HERE,
++      base::BindOnce(
++          [](base::FilePath root, base::FilePath approvals_file,
++             base::FilePath store_file,
++             std::string rel) -> std::optional<std::string> {
++            std::string file;
++            if (RE2::FullMatch(rel, "(?i)plugins/.*\\.js")) {
++              if (!RE2::FullMatch(rel,
++                                  "plugins/([A-Za-z0-9][A-Za-z0-9._-]{0,80}\\.js)",
++                                  &file)) {
++                return std::nullopt;  // never deeper scripts
++              }
++              std::string store_json;
++              base::ReadFileToString(store_file, &store_json);
++              std::optional<base::Value> store =
++                  base::JSONReader::Read(store_json, 0);
++              const base::ListValue* disabled =
++                  store && store->is_dict()
++                      ? store->GetDict().FindList("disabledPlugins")
++                      : nullptr;
++              if (disabled) {
++                for (const base::Value& d : *disabled) {
++                  if (d.is_string() && d.GetString() == file) {
++                    return std::nullopt;
++                  }
++                }
++              }
++            }
++            std::optional<std::string> body = ServeCustomFile(root, rel);
++            if (!body || file.empty()) {
++              return body;
++            }
++            std::string approvals_json;
++            base::ReadFileToString(approvals_file, &approvals_json);
++            std::optional<base::Value> approvals =
++                base::JSONReader::Read(approvals_json, 0);
++            // Not a dotted path: plugin names have dots.
++            const base::DictValue* plugins =
++                approvals && approvals->is_dict()
++                    ? approvals->GetDict().FindDict("plugins")
++                    : nullptr;
++            const base::DictValue* entry =
++                plugins ? plugins->FindDict(file) : nullptr;
++            const std::string* sha =
++                entry ? entry->FindString("sha256") : nullptr;
++            if (!sha ||
++                *sha != base::HexEncodeLower(crypto::hash::Sha256(*body))) {
++              return std::nullopt;
++            }
++            return body;
++          },
++          custom_root_, approvals_file_, std::move(store_file), rel),
++      std::move(done));
++}
++
+ std::string WorkbenchService::RegisterGuard(GuardDecider decider) {
+   std::string session = "g" + base::NumberToString(++next_session_);
+   deciders_[session] = std::move(decider);
+diff --git a/chrome/browser/meridian/workbench/workbench_service.h b/chrome/browser/meridian/workbench/workbench_service.h
+index 42112f2f8d..70d656fe39 100644
+--- a/chrome/browser/meridian/workbench/workbench_service.h
++++ b/chrome/browser/meridian/workbench/workbench_service.h
+@@ -10,7 +10,11 @@
+ #include <set>
+ #include <string>
+ 
++#include "base/callback_list.h"
+ #include "base/files/file_path.h"
++#include "base/files/file_path_watcher.h"
++#include "base/threading/sequence_bound.h"
++#include "base/timer/timer.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "chrome/browser/meridian/workbench/guard_server.h"
+@@ -39,6 +43,22 @@ class WorkbenchService : public KeyedService {
+   Vault& vault() { return *vault_; }
+   GuardServer& guard() { return *guard_; }
+ 
++  // Customizations (customizations.h): the folder, Safe Mode (nothing from
++  // it loads), and plugin approvals (kept outside the folder, so nothing
++  // that can write plugins can approve them).
++  const base::FilePath& custom_root() const { return custom_root_; }
++  const base::FilePath& approvals_file() const { return approvals_file_; }
++  bool safe_mode() const { return safe_mode_; }
++  void set_safe_mode(bool on) { safe_mode_ = on; }
++  // A file for chrome://workbench/custom/<rel>: nothing in Safe Mode,
++  // nothing for switched-off plugins, and a plugin only while its bytes
++  // match the approved SHA-256 (hashed from the very bytes served).
++  void ServeCustom(const std::string& rel,
++                   base::FilePath store_file,
++                   base::OnceCallback<void(std::optional<std::string>)> done);
++  // Runs `changed` after every change in the folder (snapshotted first).
++  base::CallbackListSubscription OnCustomChange(base::RepeatingClosure changed);
++
+   // A guarded Claude Code session; returns its token.
+   std::string RegisterGuard(GuardDecider decider);
+   void UnregisterGuard(const std::string& token);
+@@ -48,6 +68,15 @@ class WorkbenchService : public KeyedService {
+               GuardServer::Request request,
+               GuardServer::Answer answer);
+ 
++  void OnCustomFileChanged(const base::FilePath& path, bool error);
++
++  base::FilePath custom_root_;
++  base::FilePath approvals_file_;
++  bool safe_mode_ = false;
++  scoped_refptr<base::SequencedTaskRunner> files_;
++  base::SequenceBound<base::FilePathWatcher> custom_watcher_;
++  base::OneShotTimer custom_timer_;
++  base::RepeatingClosureList custom_listeners_;
+   std::unique_ptr<Vault> vault_;
+   std::unique_ptr<GuardServer> guard_;
+   // session id -> who decides.
+diff --git a/chrome/browser/meridian/workbench/workbench_source.cc b/chrome/browser/meridian/workbench/workbench_source.cc
+index d284ddab97..ceb7db0717 100644
+--- a/chrome/browser/meridian/workbench/workbench_source.cc
++++ b/chrome/browser/meridian/workbench/workbench_source.cc
+@@ -9,6 +9,9 @@
+ #include "base/memory/ref_counted_memory.h"
+ #include "base/strings/string_util.h"
+ #include "base/task/thread_pool.h"
++#include "chrome/browser/meridian/workbench/workbench_service.h"
++#include "chrome/browser/meridian/workbench/workbench_service_factory.h"
++#include "chrome/browser/profiles/profile.h"
+ #include "build/build_config.h"
+ #include "services/network/public/mojom/content_security_policy.mojom.h"
+ #include "url/gurl.h"
+@@ -68,7 +71,8 @@ base::FilePath WorkbenchSource::Folder() {
+ #endif
+ }
+ 
+-WorkbenchSource::WorkbenchSource() : folder_(Folder()) {}
++WorkbenchSource::WorkbenchSource(Profile* profile)
++    : profile_(profile), folder_(Folder()) {}
+ 
+ WorkbenchSource::~WorkbenchSource() = default;
+ 
+@@ -80,6 +84,21 @@ void WorkbenchSource::StartDataRequest(
+     const GURL& url,
+     const content::WebContents::Getter& wc_getter,
+     GotDataCallback callback) {
++  // The person's customizations (approved plugins, user.css).
++  std::string path = Path(url);
++  if (path.starts_with("custom/")) {
++    WorkbenchServiceFactory::GetForProfile(profile_)->ServeCustom(
++        path.substr(7), profile_->GetPath().Append("Meridian Workbench.json"),
++        base::BindOnce(
++            [](GotDataCallback callback, std::optional<std::string> body) {
++              std::move(callback).Run(
++                  body ? base::MakeRefCounted<base::RefCountedString>(
++                             std::move(*body))
++                       : nullptr);
++            },
++            std::move(callback)));
++    return;
++  }
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_BLOCKING},
+       base::BindOnce(&ReadInside, folder_, Path(url)), std::move(callback));
+@@ -110,7 +129,7 @@ bool WorkbenchSource::ShouldServeMimeTypeAsContentTypeHeader() {
+ }
+ 
+ // Local scripts only; Monaco needs inline styles and blob: workers (which
+-// load its local worker files).
++// load its local worker files); plugins may fetch their own files.
+ std::string WorkbenchSource::GetContentSecurityPolicy(
+     network::mojom::CSPDirectiveName directive) {
+   using Directive = network::mojom::CSPDirectiveName;
+@@ -125,6 +144,8 @@ std::string WorkbenchSource::GetContentSecurityPolicy(
+       return "font-src 'self' data:;";
+     case Directive::ImgSrc:
+       return "img-src 'self' data:;";
++    case Directive::ConnectSrc:
++      return "connect-src 'self';";
+     case Directive::RequireTrustedTypesFor:
+     case Directive::TrustedTypes:
+       return std::string();
+diff --git a/chrome/browser/meridian/workbench/workbench_source.h b/chrome/browser/meridian/workbench/workbench_source.h
+index 859a8dcb0a..b2d9699bbd 100644
+--- a/chrome/browser/meridian/workbench/workbench_source.h
++++ b/chrome/browser/meridian/workbench/workbench_source.h
+@@ -8,8 +8,11 @@
+ #include <string>
+ 
+ #include "base/files/file_path.h"
++#include "base/memory/raw_ptr.h"
+ #include "content/public/browser/url_data_source.h"
+ 
++class Profile;
++
+ namespace meridian::workbench {
+ 
+ // The Workbench page and its libraries (Monaco, xterm), from the app bundle's
+@@ -19,7 +22,7 @@ class WorkbenchSource : public content::URLDataSource {
+  public:
+   static base::FilePath Folder();
+ 
+-  WorkbenchSource();
++  explicit WorkbenchSource(Profile* profile);
+   WorkbenchSource(const WorkbenchSource&) = delete;
+   WorkbenchSource& operator=(const WorkbenchSource&) = delete;
+   ~WorkbenchSource() override;
+@@ -35,6 +38,7 @@ class WorkbenchSource : public content::URLDataSource {
+       network::mojom::CSPDirectiveName directive) override;
+ 
+  private:
++  raw_ptr<Profile> profile_;
+   base::FilePath folder_;
+ };
+ 
+diff --git a/chrome/browser/meridian/workbench/workbench_ui.cc b/chrome/browser/meridian/workbench/workbench_ui.cc
+index 2aa5ca7f20..7f75d82deb 100644
+--- a/chrome/browser/meridian/workbench/workbench_ui.cc
++++ b/chrome/browser/meridian/workbench/workbench_ui.cc
+@@ -25,7 +25,8 @@ bool WorkbenchUIConfig::IsWebUIEnabled(
+ WorkbenchUI::WorkbenchUI(content::WebUI* web_ui)
+     : content::WebUIController(web_ui) {
+   Profile* profile = Profile::FromWebUI(web_ui);
+-  content::URLDataSource::Add(profile, std::make_unique<WorkbenchSource>());
++  content::URLDataSource::Add(profile,
++                              std::make_unique<WorkbenchSource>(profile));
+   web_ui->AddMessageHandler(std::make_unique<WorkbenchHandler>(profile));
+ }
+ 
