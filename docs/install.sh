@@ -11,7 +11,8 @@
 set -euo pipefail
 
 REPO="Undermove/meridian-browser"
-API="https://api.github.com/repos/$REPO/releases/latest"
+# MERIDIAN_RELEASE_API: another release feed (tests).
+API="${MERIDIAN_RELEASE_API:-https://api.github.com/repos/$REPO/releases/latest}"
 
 say()  { printf '\033[1;35m==>\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -30,14 +31,17 @@ case "$OS" in
       x86_64|amd64) PATTERN="-linux-x86_64.AppImage" ;;
       aarch64|arm64) PATTERN="-linux-arm64.AppImage" ;;
       *) fail "No Meridian build for $ARCH yet." ;;
-    esac ;;
+    esac
+    # Meridian 1.0 (built on Chromium) is macOS-only for now.
+    printf '%s' "$(curl -fsSL -H 'Accept: application/vnd.github+json' "$API" 2>/dev/null)" | grep -q -- "$PATTERN" ||
+      fail "Meridian for Linux isn't out yet: the current release is macOS-only. Linux comes later." ;;
   *) fail "This installer is for macOS and Linux. On Windows, download the .exe from https://github.com/$REPO/releases/latest" ;;
 esac
 
 say "Looking up the latest Meridian release…"
 RELEASE="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$API")" || fail "Couldn't reach GitHub. Check your internet connection and try again."
-URL="$(printf '%s' "$RELEASE" | grep -o '"browser_download_url": *"[^"]*/Meridian-[0-9][^"/]*'"$PATTERN"'"' | head -1 | sed 's/.*"\(https[^"]*\)"/\1/')"
-SUMS_URL="$(printf '%s' "$RELEASE" | grep -o '"browser_download_url": *"[^"]*SHA256SUMS.txt"' | head -1 | sed 's/.*"\(https[^"]*\)"/\1/')"
+URL="$(printf '%s' "$RELEASE" | grep -o '"browser_download_url": *"[^"]*/Meridian-[0-9][^"/]*'"$PATTERN"'"' | head -1 | sed 's/.*"\(http[^"]*\)"/\1/')"
+SUMS_URL="$(printf '%s' "$RELEASE" | grep -o '"browser_download_url": *"[^"]*SHA256SUMS.txt"' | head -1 | sed 's/.*"\(http[^"]*\)"/\1/')"
 [ -n "$URL" ] || fail "Couldn't find a download for your computer ($PATTERN) in the latest release."
 FILE="${URL##*/}"
 VERSION="$(printf '%s' "$FILE" | sed -E 's/^Meridian-([0-9][^-]*)-.*/\1/')"
@@ -67,6 +71,7 @@ if [ "$OS" = "Darwin" ]; then
   fi
   ditto -x -k "$TMP/$FILE" "$TMP/app"
   [ -d "$TMP/app/Meridian.app" ] || fail "The download doesn't contain Meridian.app."
+  codesign --verify --deep --strict "$TMP/app/Meridian.app" 2>/dev/null || fail "The download's signature is broken. Nothing was installed."
   rm -rf "$DEST/Meridian.app"
   mv "$TMP/app/Meridian.app" "$DEST/"
   # Files fetched with curl aren't quarantined, but clear the flag in case something added it.

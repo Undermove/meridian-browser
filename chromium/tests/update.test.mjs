@@ -40,7 +40,7 @@ async function release({ tag = 'v9.9.9', badSum = false } = {}) {
       res.end(JSON.stringify({ tag_name: tag, html_url: `${base}/page`, assets: [
         { name: ZIP.replace('.zip', '.dmg'), browser_download_url: `${base}/dmg` },
         { name: ZIP, browser_download_url: `${base}/zip` },
-        { name: 'SHA256SUMS', browser_download_url: `${base}/sums` },
+        { name: 'SHA256SUMS.txt', browser_download_url: `${base}/sums` },
       ] }));
     } else if (req.url === '/zip') {
       res.writeHead(200, { 'content-type': 'application/zip', 'content-length': fs.statSync(zip).size });
