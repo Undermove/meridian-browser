@@ -72,3 +72,33 @@ test('New Tab opens the command bar; Escape and a click outside close it without
     assert.equal((await b.tabs()).length, 1);
   } finally { await b.close(); }
 });
+
+test('⌘T lists the open tabs (Switch to Tab), filters them as you type, and switches with a click or the arrows', async () => {
+  const site = await startServer();
+  const b = await launch([site.url('/p/Alpha'), site.url('/p/Beta'), site.url('/p/Gamma')]);
+  const CB = `${BAR}.shadowRoot`;
+  try {
+    await b.waitFor(today(3));
+    await b.click(`${SB}.getElementById('newTabButton')`);
+    await b.waitFor(`${open} && ${CB}.querySelectorAll('.tab-row').length === 2`);
+    // The field keeps its hint while focused.
+    assert.equal(await b.eval(`${BAR}.$.address.placeholderText`), 'Search or Enter URL…');
+    // Typing filters the list.
+    // The active tab isn't offered; typing narrows the rest.
+    await b.type('bet');
+    await b.key('t', 'KeyT', 84);
+    await b.waitFor(`[...${CB}.querySelectorAll('.tab-row .tab-title')].map((e) => e.textContent).join() === 'Beta'`);
+    await b.click(`${CB}.querySelector('.tab-row')`);
+    await b.waitFor(`!${open}`);
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive)?.tab.title === 'Beta'`);
+    // With nothing typed, ↓ and Return pick a tab.
+    await b.click(`${SB}.getElementById('newTabButton')`);
+    await b.waitFor(`${open} && ${CB}.querySelectorAll('.tab-row').length === 2`);
+    const first = await b.eval(`${CB}.querySelector('.tab-row .tab-title').textContent`);
+    await b.key('ArrowDown', 'ArrowDown', 40);
+    await b.waitFor(`${CB}.querySelector('.tab-row.sel')`);
+    await b.key('Enter', 'Enter', 13);
+    await b.waitFor(`!${open}`);
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive)?.tab.title === ${JSON.stringify(first)}`);
+  } finally { await b.close(); await site.close(); }
+});

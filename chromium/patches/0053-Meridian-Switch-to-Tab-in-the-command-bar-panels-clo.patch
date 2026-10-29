@@ -1,0 +1,490 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 30 Oct 2026 03:39:33 +0400
+Subject: [PATCH 54/54] Meridian: Switch to Tab in the command bar; panels
+ close each other; the chat steps aside
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- ⌘T and New Tab list the open tabs (favorites, pinned, Today) under the
+  field while nothing is typed, and the matching ones as you type; a click,
+  or the arrows and Return, switch to it. The field keeps its hint, Search or
+  Enter URL, while focused.
+- The Site Control Center closes when another panel opens.
+- Picking another tab leaves the Chat view.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../resources/webui_browser/app.html.ts       |  4 +-
+ chrome/browser/resources/webui_browser/app.ts | 37 +++++++--
+ .../webui_browser/meridian/command_bar.css    | 60 ++++++++++++++
+ .../meridian/command_bar.html.ts              | 13 +++
+ .../webui_browser/meridian/command_bar.ts     | 81 +++++++++++++++++++
+ .../webui_browser/meridian/sidebar.ts         | 18 +++++
+ .../webui_browser_searchbox.html.ts           |  2 +-
+ .../searchbox/searchbox_input.css             |  3 +-
+ 8 files changed, 209 insertions(+), 9 deletions(-)
+
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 125787075e..f40167fa0b 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -111,7 +111,9 @@ export function getHtml(this: WebuiBrowserAppElement) {
+     <webui-browser-bookmark-bar id="bookmarkBar" hidden>
+     </webui-browser-bookmark-bar>
+   </div>
+-  <meridian-command-bar id="commandBar"></meridian-command-bar>
++  <meridian-command-bar id="commandBar" .tabs="${this.commandBarTabs_}"
++      @command-bar-switch-tab="${this.onCommandBarSwitchTab_}">
++  </meridian-command-bar>
+   <meridian-archive id="archive"></meridian-archive>
+   <meridian-onboarding id="onboarding"></meridian-onboarding>
+   <meridian-settings id="settings"
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 45dc8838cb..15347c0767 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -44,7 +44,7 @@ import type {MeridianArchiveElement} from './meridian/archive.js';
+ import type {MeridianTidyElement, TidyApply} from './meridian/tidy.js';
+ import type {MeridianChatElement} from './meridian/chat.js';
+ import type {MeridianMissionElement, MissionSnapshot} from './meridian/mission.js';
+-import type {MeridianCommandBarElement} from './meridian/command_bar.js';
++import type {CommandBarTab, MeridianCommandBarElement} from './meridian/command_bar.js';
+ import type {MeridianOnboardingElement} from './meridian/onboarding.js';
+ import type {MeridianAskElement} from './meridian/ask.js';
+ import type {MeridianSettingsElement} from './meridian/settings.js';
+@@ -141,6 +141,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       showLocationIconButton_: {type: Boolean, reflect: true},
+       locationIcon_: {state: true, type: String},
+       url_: {state: true, type: String},
++      commandBarTabs_: {state: true, type: Array},
+       siteControlOpen_: {state: true, type: Boolean},
+       siteControlX_: {state: true, type: Number},
+       siteControlY_: {state: true, type: Number},
+@@ -180,6 +181,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   protected accessor siteControlX_: number = 0;
+   protected accessor siteControlY_: number = 0;
+   protected accessor linkCopied_: boolean = false;
++  protected accessor commandBarTabs_: CommandBarTab[] = [];
+   protected accessor tabStripInset_: number =
+       loadTimeData.valueExists('tabStripInset') ?
+       loadTimeData.getInteger('tabStripInset') :
+@@ -387,8 +389,13 @@ export class WebuiBrowserAppElement extends CrLitElement {
+ 
+     // TODO(crbug.com/537801193): store and restore focus on tab switch.
+     this.$.contentRegion.activateTab(tabData.id);
+-    if (this.activeTabId_ !== tabData.id && this.siteControlOpen_) {
++    if (this.activeTabId_ && this.activeTabId_ !== tabData.id) {
++      // Another tab: the Site Control Center was for the last one, and the
++      // Chat view steps aside for the page that was picked.
+       this.closeSiteControl_();
++      if (this.$.chat.shown) {
++        this.$.chat.hide();
++      }
+     }
+     this.activeTabId_ = tabData.id;
+     this.updateSplit_();
+@@ -462,7 +469,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+ 
+   // ⌘L and the like: the command bar, editing the current URL.
+   protected setFocusToLocationBar(_isUserInitiated: boolean) {
+-    this.$.commandBar.show(/*newTab=*/ false, this.url_);
++    this.showCommandBar_(/*newTab=*/ false, this.url_);
+   }
+ 
+   protected onUrlPillClick_(e: Event) {
+@@ -470,7 +477,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+             'locationIconButton')!)) {
+       return;
+     }
+-    this.$.commandBar.show(/*newTab=*/ false, this.url_);
++    this.showCommandBar_(/*newTab=*/ false, this.url_);
+   }
+ 
+   override updated(changed: PropertyValues<this>) {
+@@ -589,6 +596,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   }
+ 
+   protected onMeridianOnboarding_(e: CustomEvent<'tour'|'arc'>) {
++    this.closeSiteControl_();
+     this.$.onboarding.show(e.detail);
+   }
+ 
+@@ -644,6 +652,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   }
+ 
+   protected onMeridianMission_(e: CustomEvent<string>) {
++    this.closeSiteControl_();
+     if (e.detail) {
+       this.$.mission.show(e.detail);
+     } else {
+@@ -694,10 +703,12 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   }
+ 
+   protected onMeridianChat_() {
++    this.closeSiteControl_();
+     this.$.chat.toggle();
+   }
+ 
+   protected onMeridianTidy_(e: CustomEvent<TidyTab[]>) {
++    this.closeSiteControl_();
+     this.$.tidy.show(e.detail);
+   }
+ 
+@@ -706,6 +717,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   }
+ 
+   protected onMeridianEditTheme_(e: CustomEvent<Space|null>) {
++    this.closeSiteControl_();
+     const space = e.detail || this.$.tabstrip.activeSpace();
+     if (space) {
+       this.$.themeEditor.show(space);
+@@ -713,10 +725,12 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   }
+ 
+   protected onMeridianShowSettings_(e: CustomEvent<SectionId|undefined>) {
++    this.closeSiteControl_();
+     this.$.settings.show(this.$.tabstrip.spaces(), e.detail || 'general');
+   }
+ 
+   protected onMeridianAsk_() {
++    this.closeSiteControl_();
+     this.$.ask.toggle();
+   }
+ 
+@@ -727,7 +741,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   protected onMeridianHomeAction_(e: CustomEvent<string>) {
+     switch (e.detail) {
+       case 'command-bar':
+-        this.$.commandBar.show(/*newTab=*/ false, '');
++        this.showCommandBar_(/*newTab=*/ false, '');
+         break;
+       case 'edit-theme': {
+         const space = this.$.tabstrip.activeSpace();
+@@ -778,11 +792,12 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   }
+ 
+   protected onMeridianShowArchive_() {
++    this.closeSiteControl_();
+     this.$.archive.show();
+   }
+ 
+   protected onMeridianShowCommandBar_() {
+-    this.$.commandBar.show(/*newTab=*/ true, '');
++    this.showCommandBar_(/*newTab=*/ true, '');
+   }
+ 
+   protected setReloadStopState(isLoading: boolean) {
+@@ -908,6 +923,16 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     return this.linkCopied_ ? 'check' : 'link';
+   }
+ 
++  private showCommandBar_(newTab: boolean, text: string) {
++    this.closeSiteControl_();
++    this.commandBarTabs_ = this.$.tabstrip.openTabsForCommandBar();
++    this.$.commandBar.show(newTab, text);
++  }
++
++  protected onCommandBarSwitchTab_(e: CustomEvent<string>) {
++    this.$.tabstrip.activateTab(e.detail);
++  }
++
+   protected onCopyLinkClick_(e: Event) {
+     e.stopPropagation();
+     navigator.clipboard.writeText(this.url_);
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.css b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+index 5b906743aa..f3b5f4851a 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.css
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+@@ -140,3 +140,63 @@ webui-browser-searchbox {
+ .answer .error {
+   color: #b3261e;
+ }
++
++/* Switch to Tab: the open tabs while nothing is typed. */
++.tabs {
++  border-top: 1px solid var(--meridian-border);
++  padding: 6px;
++}
++
++.tabs-head {
++  padding: 4px 8px 6px;
++  font-size: 11px;
++  font-weight: 600;
++  letter-spacing: 0.04em;
++  text-transform: uppercase;
++  color: var(--meridian-text-muted);
++}
++
++.tab-row {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  width: 100%;
++  height: 34px;
++  padding: 0 10px;
++  border: 0;
++  border-radius: 8px;
++  background: none;
++  font: inherit;
++  font-size: 13px;
++  color: var(--meridian-text);
++  text-align: left;
++  cursor: pointer;
++}
++
++.tab-row:hover,
++.tab-row.sel {
++  background: color-mix(in srgb, var(--meridian-space) 16%, transparent);
++}
++
++.tab-row img {
++  flex: none;
++  border-radius: 3px;
++}
++
++.tab-title {
++  flex: 1;
++  min-width: 0;
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++}
++
++.tab-host {
++  flex: none;
++  max-width: 40%;
++  font-size: 12px;
++  color: var(--meridian-text-muted);
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+index 78da6a7725..3b0ebd5c87 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+@@ -13,8 +13,21 @@ export function getHtml(this: MeridianCommandBarElement) {
+   <div id="bar">
+     <webui-browser-searchbox id="address" ?new-tab="${this.newTab}"
+         .newTab="${this.newTab}" .inlineDropdown="${true}"
++        .placeholderText="${'Search or Enter URL…'}"
++        @keyup="${this.onAddressKeyup_}"
+         @searchbox-navigated="${this.onAddressSearchboxNavigated_}">
+     </webui-browser-searchbox>
++    ${this.tabRows_.length ? html`
++      <div id="tabs" class="tabs">
++        <div class="tabs-head">Switch to Tab</div>
++        ${this.tabRows_.map((t, i) => html`
++          <button class="tab-row ${i === this.tabSel_ ? 'sel' : ''}"
++              data-id="${t.id}" @click="${this.onTabRowClick_}">
++            <img src="${t.favicon}" width="16" height="16" alt="">
++            <span class="tab-title">${t.title || t.url}</span>
++            <span class="tab-host">${this.tabHost_(t.url)}</span>
++          </button>`)}
++      </div>` : ''}
+     ${this.hasAiKey_ ? html`
+       <button id="ask" class="ask" @click="${this.onAskClick_}">
+         <span class="spark">✦</span> Ask Meridian
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index 0edd3c47c3..7998c3da42 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -9,6 +9,7 @@
+ import '../webui_browser_searchbox.js';
+ 
+ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {TemplateResult} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+ import type {WebuiBrowserSearchboxElement} from '../webui_browser_searchbox.js';
+@@ -25,6 +26,14 @@ export interface MeridianCommandBarElement {
+   };
+ }
+ 
++// An open tab, for "Switch to Tab".
++export interface CommandBarTab {
++  id: string;
++  title: string;
++  url: string;
++  favicon: string;
++}
++
+ export class MeridianCommandBarElement extends CrLitElement {
+   static get is() {
+     return 'meridian-command-bar';
+@@ -46,9 +55,49 @@ export class MeridianCommandBarElement extends CrLitElement {
+       answer_: {state: true, type: Array},
+       asking_: {state: true, type: Boolean},
+       askError_: {state: true, type: String},
++      tabs: {type: Array},
++      query_: {state: true, type: String},
++      tabRows_: {state: true, type: Array},
++      tabSel_: {state: true, type: Number},
+     };
+   }
+ 
++  // The open tabs (favorites, pinned, Today): "Switch to Tab" while the field
++  // is empty, and the ones that match what is typed.
++  accessor tabs: CommandBarTab[] = [];
++  protected accessor query_: string = '';
++  protected accessor tabRows_: CommandBarTab[] = [];
++  protected accessor tabSel_: number = -1;
++
++  protected tabHost_(url: string): string {
++    try {
++      const u = new URL(url);
++      return u.protocol.startsWith('http') ? u.hostname.replace(/^www\./, '') : url;
++    } catch {
++      return url;
++    }
++  }
++
++  // What is typed (the field's own input events stay inside it).
++  protected onAddressKeyup_() {
++    const input = this.$.address.shadowRoot.querySelector('cr-searchbox-input')
++                      ?.shadowRoot?.querySelector<HTMLInputElement>('input');
++    const query = input?.value || '';
++    if (query !== this.query_) {
++      this.query_ = query;
++      this.tabSel_ = -1;
++    }
++  }
++
++  protected onTabRowClick_(e: Event) {
++    this.switchTo_((e.currentTarget as HTMLElement).dataset['id']!);
++  }
++
++  private switchTo_(id: string) {
++    this.hide();
++    this.fire('command-bar-switch-tab', id);
++  }
++
+   accessor open: boolean = false;
+   // Picks open in a new tab (⌘T) rather than in the current one (⌘L).
+   accessor newTab: boolean = false;
+@@ -89,6 +138,20 @@ export class MeridianCommandBarElement extends CrLitElement {
+     }
+   }
+ 
++  override willUpdate(changed: PropertyValues<this>) {
++    super.willUpdate(changed);
++    const q = this.query_.trim().toLowerCase();
++    const rows = q ?
++        this.tabs.filter(t => t.title.toLowerCase().includes(q) ||
++                              t.url.toLowerCase().includes(q))
++            .slice(0, 4) :
++        this.tabs.slice(0, 8);
++    this.tabRows_ = rows;
++    if (this.tabSel_ >= rows.length) {
++      this.tabSel_ = -1;
++    }
++  }
++
+   // `text`: what the field starts with (the current URL for ⌘L), selected.
+   async show(newTab: boolean, text: string) {
+     this.newTab = newTab;
+@@ -99,6 +162,8 @@ export class MeridianCommandBarElement extends CrLitElement {
+     // A display:none field can't take the focus: wait for the render.
+     await this.updateComplete;
+     const box = this.$.address;
++    this.query_ = text;
++    this.tabSel_ = -1;
+     box.reset(text);
+     box.focusInput();
+     box.selectAll();
+@@ -109,6 +174,7 @@ export class MeridianCommandBarElement extends CrLitElement {
+       return;
+     }
+     this.open = false;
++    this.query_ = '';
+     this.$.address.reset('');
+     this.clearAnswer_();
+     this.fire('command-bar-closed');
+@@ -157,6 +223,21 @@ export class MeridianCommandBarElement extends CrLitElement {
+       e.preventDefault();
+       e.stopPropagation();
+       this.hide();
++      return;
++    }
++    // With nothing typed, the arrows go through the open tabs.
++    if (!this.query_.trim() && this.tabRows_.length &&
++        (e.key === 'ArrowDown' || e.key === 'ArrowUp' ||
++         (e.key === 'Enter' && this.tabSel_ >= 0))) {
++      e.preventDefault();
++      e.stopPropagation();
++      if (e.key === 'Enter') {
++        this.switchTo_(this.tabRows_[this.tabSel_]!.id);
++        return;
++      }
++      const n = this.tabRows_.length;
++      this.tabSel_ = e.key === 'ArrowDown' ? (this.tabSel_ + 1) % n :
++                                             (this.tabSel_ - 1 + n) % n;
+     }
+   }
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index a048674ad4..7d6ca92b16 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -33,6 +33,7 @@ import './tab_row.js';
+ import type {IconName} from './icons.js';
+ import './menu.js';
+ import type {MeridianMenuElement, MenuEntry, MenuRowEvent} from './menu.js';
++import type {CommandBarTab} from './command_bar.js';
+ import {getCss} from './sidebar.css.js';
+ import {getHtml} from './sidebar.html.js';
+ 
+@@ -650,6 +651,23 @@ export class MeridianSidebarElement extends CrLitElement implements
+ 
+   // ----------------------------------------------------------- commands
+ 
++  // The open tabs in sidebar order, for the command bar's Switch to Tab.
++  openTabsForCommandBar(): CommandBarTab[] {
++    const out: CommandBarTab[] = [];
++    for (const entry of this.navOrder_()) {
++      const tab = entry.tab || (entry.item ? this.liveTab(entry.item.id) : null);
++      if (tab && !tab.isActive && !tab.url.startsWith('chrome://newtab')) {
++        out.push({
++          id: tab.id,
++          title: (entry.item?.title) || this.customTitle_(tab.id) || tab.title,
++          url: tab.url,
++          favicon: this.faviconFor(entry.item || null, tab),
++        });
++      }
++    }
++    return out;
++  }
++
+   // What ⌘1-9 and ⌃Tab walk through, top to bottom: favorites, the space's
+   // pinned items (not inside collapsed folders), then Today.
+   private navOrder_(): Array<{item?: Item, tab?: Tab}> {
+diff --git a/chrome/browser/resources/webui_browser/webui_browser_searchbox.html.ts b/chrome/browser/resources/webui_browser/webui_browser_searchbox.html.ts
+index a989d02fb0..1e8e89875e 100644
+--- a/chrome/browser/resources/webui_browser/webui_browser_searchbox.html.ts
++++ b/chrome/browser/resources/webui_browser/webui_browser_searchbox.html.ts
+@@ -14,7 +14,7 @@ export function getHtml(this: WebuiBrowserSearchboxElement) {
+     @keyup="${this.onInputWrapperKeyup_}"
+     @beforetoggle="${this.onInputWrapperBeforetoggle_}"
+     @toggle="${this.onInputWrapperToggle_}">
+-  <cr-searchbox-input id="input" exportparts="searchbox-input"
++  <cr-searchbox-input id="input" exportparts="searchbox-input" placeholder-on-focus
+       ?dropdown-is-visible="${this.dropdownIsVisible}"
+       ?multi-line-enabled="${this.multiLineEnabled}"
+       placeholder-text="${this.computePlaceholderText_()}"
+diff --git a/ui/webui/resources/cr_components/searchbox/searchbox_input.css b/ui/webui/resources/cr_components/searchbox/searchbox_input.css
+index b237d1788b..dd5bf01d04 100644
+--- a/ui/webui/resources/cr_components/searchbox/searchbox_input.css
++++ b/ui/webui/resources/cr_components/searchbox/searchbox_input.css
+@@ -238,7 +238,8 @@ input::-webkit-search-cancel-button {
+   visibility: hidden;
+ }
+ 
+-:host([in-keyword-mode]) :is(input, textarea):focus::placeholder {
++:host([in-keyword-mode]) :is(input, textarea):focus::placeholder,
++:host([placeholder-on-focus]) :is(input, textarea):focus::placeholder {
+   visibility: visible;
+ }
+ 
