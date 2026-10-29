@@ -86,6 +86,6 @@ if [ "$RELEASE" = 1 ]; then
   gh release create "v$VERSION" -R Undermove/meridian-browser --draft \
     --target "$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)" --title "Meridian $VERSION" \
     --notes "Chromium $NEW_VER (from $OLD_VER): the latest fixes from Chrome, including security fixes." \
-    "$D/Meridian-$VERSION-mac-"*.dmg "$D/Meridian-$VERSION-mac-"*.zip "$D/SHA256SUMS.txt"
+    "$D/Meridian-$VERSION-mac-"*.dmg "$D/Meridian-$VERSION-mac-"*.zip "$D/SHA256SUMS.txt" "$D/SHA256SUMS.txt.sig"
 fi
 say "Done: Meridian $VERSION on Chromium $NEW_VER."

@@ -28,6 +28,34 @@
     chrome.send('invoke', [id, method, args]);
   });
   const send = (method, ...args) => chrome.send('send', [method, args]);
+
+  // Terminal hyperlinks (OSC 8): output from any program can carry them.
+  // xterm's default handler opens them with window.open() from this
+  // chrome:// page; here every xterm gets a handler that takes only http(s)
+  // and opens it in a normal tab through the host (toHost, which checks the
+  // scheme again). xterm.js loads after this file and sets the global
+  // `Terminal`; the setter wraps it so every `new Terminal(opts)` gets it.
+  const openTerminalLink = (event, uri) => {
+    let url;
+    try { url = new URL(String(uri)); } catch { return; }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
+    send('toHost', { type: 'link', url: url.href });
+  };
+  const terminalLinkHandler = Object.freeze({ activate: openTerminalLink, allowNonHttpProtocols: false });
+  let SafeTerminal;
+  Object.defineProperty(window, 'Terminal', {
+    configurable: false,
+    enumerable: true,
+    get: () => SafeTerminal,
+    set: (Base) => {
+      if (SafeTerminal || typeof Base !== 'function') return;
+      SafeTerminal = class extends Base {
+        constructor(options = {}) {
+          super({ ...options, linkHandler: terminalLinkHandler });
+        }
+      };
+    },
+  });
   const listen = (channel) => (fn) => {
     if (!listeners.has(channel)) listeners.set(channel, new Set());
     listeners.get(channel).add(fn);

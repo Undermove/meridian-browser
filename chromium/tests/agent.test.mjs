@@ -124,6 +124,8 @@ test('ask: every action is put to the person; read-only refuses changes; off has
     assert.match((await pending).error, /declined/);
     const allowed = mcp.call('open_tab', { url: s.url('/form') });
     await b.waitFor(`!!${AG}.getElementById('ask')`);
+    // Allow takes no click in the first 600 ms (no click meant for the page lands on it).
+    await sleep(700);
     await b.click(`${AG}.getElementById('allow')`);
     assert.equal((await allowed).value.title, 'Form');
     assert.match((await mcp.call('run_javascript', { code: '1' })).error, /JavaScript is off/);
