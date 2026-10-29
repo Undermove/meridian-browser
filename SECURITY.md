@@ -70,9 +70,11 @@ Chromium's sandbox, site isolation, permission and certificate checks are unchan
 
 ## Known limitations
 
-- **Safe Browsing** (warnings about phishing sites and dangerous downloads) needs a Google API key built
-  in. A release built without `~/.config/meridian/google_api_keys` (`google_api_key = "…"`, a key limited
-  to the Safe Browsing API) has no such warnings; the download warnings Chromium gives without it stay.
+- **Safe Browsing** (warnings about phishing, malware and unwanted-software sites) is in releases from
+  0.5.2. It checks against Google's lists kept on your Mac and refreshed every half hour or so; Chrome's
+  extra real-time checks of new sites answer only Chrome's own key. It needs a Google API key built in:
+  a build made without `~/.config/meridian/google_api_keys` (`google_api_key = "…"`, a key limited to the
+  Safe Browsing API) has no such warnings, only the download warnings Chromium gives without it.
 - **Not notarized** while releases are signed with the self-signed "Meridian Signing" certificate: macOS
   asks to allow the first launch (System Settings → Privacy & Security → Open Anyway).
 - **Any program running as you can use the MCP server:** the token file is readable by your user, so a
