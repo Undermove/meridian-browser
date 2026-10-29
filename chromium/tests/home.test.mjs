@@ -19,6 +19,7 @@ test('a new tab shows the home page; search opens ⌘T; Make a space; it goes on
     await b.waitFor(`app.$.commandBar.open`);
     await b.key('Escape', 'Escape', 27);
     await b.waitFor(`!app.$.commandBar.open`);
+    await b.eval(`${HM}.querySelector('.card[data-card="manager"] .btn.accent').scrollIntoView({ block: 'center' })`);
     await b.click(`${HM}.querySelector('.card[data-card="manager"] .btn.accent')`);
     await b.waitFor(`app.$.tabstrip.state_.spaces.length === 2`);
     await b.waitFor(`!!${SB}.querySelector('.space-header input.rename')`);
@@ -33,6 +34,7 @@ test('Set up for me: the preset as a preview, then its spaces and favorites', as
   const b = await launch(['chrome://newtab/']);
   try {
     await b.waitFor(`app.$.home.shown`);
+    await b.eval(`${HM}.querySelector('.card[data-card="designer"] .btn.ghost').scrollIntoView({ block: 'center' })`);
     await b.click(`${HM}.querySelector('.card[data-card="designer"] .btn.ghost')`);
     await b.waitFor(`${step} === 'preview'`);
     assert.equal(await b.eval(`${OB}.querySelector('.persona').textContent`), 'Set up for design work');

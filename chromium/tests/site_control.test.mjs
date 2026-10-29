@@ -48,7 +48,9 @@ test('Site Control Center: ads, a permission, zoom and the address; a click outs
     await b.click(`${SC}.querySelector('.q[data-action="copy"]')`);
     await b.waitFor(`${SC}.querySelector('.q[data-action="copy"]').textContent.includes('Copied')`);
 
-    // A click on the page side closes it.
+    // A click on the page side closes it: the page's own process would get the click, so a layer
+    // of the controls lies over it.
+    assert.ok(await b.eval(`(() => { const r = app.$.contentRegion.getBoundingClientRect(); return app.shadowRoot.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2) === app.$.siteControl; })()`), 'the page is covered while the controls are open');
     await b.click(`app.$.contentRegion`);
     await b.waitFor(`!app.$.siteControl.open`);
     // A new tab has no site controls.
