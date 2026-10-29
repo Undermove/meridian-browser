@@ -14,7 +14,7 @@ test('pinning a tab moves it from Today to the space; closing it keeps the pin, 
   try {
     await b.waitFor(todayCount(2));
     const space = (await b.state()).spaces[0].name;
-    await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Docs')`, `Pin to ${space}`);
+    await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Docs')`, 'Pin Tab');
     await b.waitFor(todayCount(1));
     let pinned = await b.pinned();
     assert.deepEqual(pinned.map((p) => p.title), ['Docs']);
@@ -73,7 +73,7 @@ test('folders hold pins; favorites are shared by every space', async () => {
     await b.key('Enter', 'Enter', 13);
     await b.waitFor(`!!${itemEl('Design')}`);
     // Pin Figma, then move it into the folder through the model (drag & drop comes later).
-    await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Figma')`, `Pin to ${space}`);
+    await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Figma')`, 'Pin Tab');
     await b.waitFor(`!!${itemEl('Figma')}`);
     await b.eval(`(async () => { const s = app.$.tabstrip; const folder = ${itemEl('Design')}.item.id; const fig = ${itemEl('Figma')}.item.id; s.handler_.moveItem(fig, { container: s.state_.activeSpaceId, parentId: folder, index: 0 }); })()`);
     await b.waitFor(`(${itemEl('Figma')})?.depth === 1`);
@@ -104,11 +104,11 @@ test('spaces, pins and which space each tab is in survive a restart', async () =
     let b = await launch([page('Keep me'), page('Work tab')], { profile });
     await b.waitFor(todayCount(2));
     const space = (await b.state()).spaces[0].name;
-    await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Keep me')`, `Pin to ${space}`);
+    await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Keep me')`, 'Pin Tab');
     await b.waitFor(`!!${itemEl('Keep me')}`);
     await b.eval(`app.$.tabstrip.handler_.createSpace('Work', '', '#e08a8a', '#f0b5a8')`);
     await b.waitFor(`app.$.tabstrip.state_.spaces.length === 2`);
-    await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Work tab')`, 'Move to Work');
+    await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Work tab')`, 'Move to Space > Work');
     await b.waitFor(todayCount(0));
     await b.quit();
 

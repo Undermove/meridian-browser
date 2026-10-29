@@ -14,7 +14,7 @@ test('a new tab shows the home page; search opens ⌘T; Make a space; it goes on
   try {
     await b.waitFor(`app.$.home.shown`);
     assert.match(await b.eval(`${HM}.querySelector('.greet').textContent`), /^Good (morning|afternoon|evening|night)$/);
-    assert.deepEqual(await b.eval(`[...${HM}.querySelectorAll('.card')].map((c) => c.dataset.card)`), ['everyday', 'designer', 'manager']);
+    assert.deepEqual(await b.eval(`[...${HM}.querySelectorAll('.card')].map((c) => c.dataset.card)`), ['everyday', 'designer', 'manager', 'developer']);
     await b.click(`${HM}.getElementById('search')`);
     await b.waitFor(`app.$.commandBar.open`);
     await b.key('Escape', 'Escape', 27);

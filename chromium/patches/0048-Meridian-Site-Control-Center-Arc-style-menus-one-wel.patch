@@ -1,0 +1,3070 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 30 Oct 2026 02:34:34 +0400
+Subject: [PATCH 49/49] Meridian: Site Control Center, Arc-style menus, one
+ welcome on first launch
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- The URL pill is Arc's: the address on the left, Copy Link and the sliders
+  at the end. The sliders open the Site Control Center: Copy Link, Pin,
+  Split, Ask AI; the extensions; and for the site, ad and tracker blocking,
+  its permissions, zoom and clearing its cookies, over Chromium's own site
+  settings. "Secure" opens the page info, "…" all the site's settings.
+- The sidebar's right-click menus are the Electron build's again: a header,
+  icons, shortcuts, submenus (Move to Space, Colour, Profile) with swatches
+  and checks, keyboard navigation, and they stay inside the window. The
+  empty sidebar has its own menu.
+- First launch: Chromium's first-run window is gone; it came before the
+  welcome tour and left two windows, each with the tour.
+- The floating sidebar (⌘S) waits a moment before it slides away, so it can
+  be reached; it stays while one of its menus is open.
+- Mission Control is centred in the window.
+- The home page has Archive, Ask AI and Workbench under the search field and
+  the "For developers" card.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   2 +
+ chrome/browser/meridian/sidebar.mojom         |  36 ++
+ chrome/browser/meridian/sidebar_handler.cc    |  22 +
+ chrome/browser/meridian/sidebar_handler.h     |   5 +
+ chrome/browser/meridian/site_control.cc       | 238 ++++++++
+ chrome/browser/meridian/site_control.h        |  44 ++
+ .../browser/resources/webui_browser/BUILD.gn  |   6 +
+ .../browser/resources/webui_browser/app.css   |  49 +-
+ .../resources/webui_browser/app.html.ts       |  26 +-
+ chrome/browser/resources/webui_browser/app.ts | 138 ++++-
+ .../resources/webui_browser/meridian/home.css | 110 +++-
+ .../webui_browser/meridian/home.html.ts       |  20 +
+ .../resources/webui_browser/meridian/home.ts  |  25 +-
+ .../resources/webui_browser/meridian/icons.ts | 230 ++++++--
+ .../resources/webui_browser/meridian/menu.css | 125 +++++
+ .../webui_browser/meridian/menu.html.ts       |  33 ++
+ .../resources/webui_browser/meridian/menu.ts  | 132 +++++
+ .../webui_browser/meridian/mission.css        |   3 +-
+ .../webui_browser/meridian/sidebar.css        |  45 +-
+ .../webui_browser/meridian/sidebar.html.ts    |  23 +-
+ .../webui_browser/meridian/sidebar.ts         | 525 ++++++++++++++----
+ .../webui_browser/meridian/site_control.css   | 273 +++++++++
+ .../meridian/site_control.html.ts             |  90 +++
+ .../webui_browser/meridian/site_control.ts    | 208 +++++++
+ .../browser/ui/startup/first_run_service.cc   |   7 +
+ 25 files changed, 2187 insertions(+), 228 deletions(-)
+ create mode 100644 chrome/browser/meridian/site_control.cc
+ create mode 100644 chrome/browser/meridian/site_control.h
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/menu.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/menu.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/menu.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/site_control.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/site_control.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/site_control.ts
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 0a044733dd..c502624c55 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -221,6 +221,8 @@ source_set("meridian") {
+     "sidebar_handler.h",
+     "sidebar_service_factory.cc",
+     "sidebar_service_factory.h",
++    "site_control.cc",
++    "site_control.h",
+     "status_bubble.cc",
+     "status_bubble.h",
+     "tab_data.cc",
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 14ebda03b7..bb021a1336 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -188,6 +188,33 @@ enum Command {
+   kDownloads,
+ };
+ 
++// The Site Control Center (the sliders in the URL pill).
++struct SitePermission {
++  // "camera", "microphone", "location", "notifications", "popups", "sound",
++  // "clipboard", "downloads", "pip".
++  string type;
++  string label;
++  // "allow", "block" or "ask".
++  string setting;
++  // Not set for this site: the default applies.
++  bool is_default;
++};
++
++struct SiteInfo {
++  // Empty when the page has no site settings (a new tab, chrome:// pages).
++  string origin;
++  string host;
++  // "secure", "insecure", "dangerous" or "internal".
++  string security;
++  // Ads and trackers are blocked here; and Meridian blocks them everywhere.
++  bool adblock;
++  bool adblock_everywhere;
++  // The page zoom, in percent.
++  int32 zoom;
++  // The site settings set for this site, and the ones always shown.
++  array<SitePermission> permissions;
++};
++
+ // Air Traffic Control (atc.h): where links from other apps go.
+ struct AtcRule {
+   string id;
+@@ -433,6 +460,15 @@ interface SidebarHandler {
+   // Sends the item's live tab back to the home URL.
+   ResetItemToHome(string item_id);
+ 
++  // The Site Control Center, for the active tab's site. `type` "ads" is the
++  // ad and tracker blocking; settings are "allow", "block" or "ask".
++  GetSiteInfo() => (SiteInfo info);
++  SetSitePermission(string type, string setting);
++  // +1 zooms in, -1 out, 0 back to 100%.
++  ZoomSite(int32 step);
++  // The site's cookies, storage and cache go; the page reloads.
++  ClearSiteData() => ();
++
+   // macOS: hides the window's traffic lights while the sidebar is hidden (they
+   // come back with it), like Arc.
+   SetWindowControlsVisible(bool visible);
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 238e2ad0f5..72016bf6d9 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -50,6 +50,7 @@
+ #include "chrome/browser/profiles/keep_alive/profile_keep_alive_types.h"
+ #include "chrome/browser/profiles/keep_alive/scoped_profile_keep_alive.h"
+ #include "chrome/browser/meridian/tab_data.h"
++#include "chrome/browser/meridian/site_control.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/browsing_data/chrome_browsing_data_remover_constants.h"
+ #include "chrome/browser/profiles/delete_profile_helper.h"
+@@ -2214,6 +2215,27 @@ void SidebarHandler::OnSplitTabChanged(const SplitTabChange& change) {
+   ScheduleNotify();
+ }
+ 
++void SidebarHandler::GetSiteInfo(GetSiteInfoCallback callback) {
++  std::move(callback).Run(meridian::GetSiteInfo(
++      browser_->GetProfile(), model()->GetActiveWebContents()));
++}
++
++void SidebarHandler::SetSitePermission(const std::string& type,
++                                       const std::string& setting) {
++  meridian::SetSitePermission(browser_->GetProfile(),
++                              model()->GetActiveWebContents(), type, setting);
++}
++
++void SidebarHandler::ZoomSite(int32_t step) {
++  meridian::ZoomSite(model()->GetActiveWebContents(), step);
++}
++
++void SidebarHandler::ClearSiteData(ClearSiteDataCallback callback) {
++  meridian::ClearSiteData(browser_->GetProfile(),
++                          model()->GetActiveWebContents(),
++                          std::move(callback));
++}
++
+ void SidebarHandler::SplitWith(const tabs_api::NodeId& other) {
+   tabs::TabInterface* tab = TabFor(other);
+   tabs::TabInterface* active = model()->GetActiveTab();
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index bc8e378de9..b6c76fe3a2 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -136,6 +136,11 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void SetFolderOpen(const std::string& item_id, bool open) override;
+   void OpenItem(const std::string& item_id) override;
+   void ResetItemToHome(const std::string& item_id) override;
++  void GetSiteInfo(GetSiteInfoCallback callback) override;
++  void SetSitePermission(const std::string& type,
++                         const std::string& setting) override;
++  void ZoomSite(int32_t step) override;
++  void ClearSiteData(ClearSiteDataCallback callback) override;
+   void SetWindowControlsVisible(bool visible) override;
+   void TestKeyPress(uint16_t key_code,
+                     const std::string& characters,
+diff --git a/chrome/browser/meridian/site_control.cc b/chrome/browser/meridian/site_control.cc
+new file mode 100644
+index 0000000000..3b41709014
+--- /dev/null
++++ b/chrome/browser/meridian/site_control.cc
+@@ -0,0 +1,238 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/site_control.h"
++
++#include <memory>
++#include <utility>
++
++#include "base/memory/weak_ptr.h"
++#include "chrome/browser/content_settings/host_content_settings_map_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/content_settings/core/browser/host_content_settings_map.h"
++#include "components/content_settings/core/common/content_settings.h"
++#include "components/content_settings/core/common/content_settings_types.h"
++#include "components/content_settings/core/common/content_settings_utils.h"
++#include "components/zoom/page_zoom.h"
++#include "components/zoom/zoom_controller.h"
++#include "content/public/browser/browsing_data_filter_builder.h"
++#include "content/public/browser/browsing_data_remover.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
++#include "content/public/browser/ssl_status.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_contents_observer.h"
++#include "content/public/common/page_zoom.h"
++#include "net/base/registry_controlled_domains/registry_controlled_domain.h"
++#include "net/cert/cert_status_flags.h"
++#include "url/gurl.h"
++#include "url/origin.h"
++
++namespace meridian {
++
++namespace {
++
++struct Kind {
++  const char* type;
++  const char* label;
++  ContentSettingsType setting;
++  // Shown even when it's at the default.
++  bool always;
++};
++
++// The site settings the Control Center offers, in its order.
++constexpr Kind kKinds[] = {
++    {"camera", "Camera", ContentSettingsType::MEDIASTREAM_CAMERA, false},
++    {"microphone", "Microphone", ContentSettingsType::MEDIASTREAM_MIC, false},
++    {"location", "Location", ContentSettingsType::GEOLOCATION, false},
++    {"notifications", "Notifications", ContentSettingsType::NOTIFICATIONS,
++     false},
++    {"popups", "Pop-ups and redirects", ContentSettingsType::POPUPS, true},
++    {"sound", "Sound", ContentSettingsType::SOUND, false},
++    {"clipboard", "Clipboard", ContentSettingsType::CLIPBOARD_READ_WRITE,
++     false},
++    {"downloads", "Automatic downloads",
++     ContentSettingsType::AUTOMATIC_DOWNLOADS, false},
++    {"pip", "Automatic picture-in-picture",
++     ContentSettingsType::AUTO_PICTURE_IN_PICTURE, false},
++};
++
++const Kind* KindOf(const std::string& type) {
++  for (const Kind& kind : kKinds) {
++    if (type == kind.type) {
++      return &kind;
++    }
++  }
++  return nullptr;
++}
++
++std::string SettingName(ContentSetting setting) {
++  switch (setting) {
++    case CONTENT_SETTING_ALLOW:
++      return "allow";
++    case CONTENT_SETTING_BLOCK:
++      return "block";
++    default:
++      return "ask";
++  }
++}
++
++// Only real web pages have site settings.
++bool IsWebSite(const GURL& url) {
++  return url.SchemeIsHTTPOrHTTPS();
++}
++
++std::string Security(content::WebContents* contents, const GURL& url) {
++  if (!IsWebSite(url)) {
++    return "internal";
++  }
++  if (!url.SchemeIs(url::kHttpsScheme)) {
++    return "insecure";
++  }
++  content::NavigationEntry* entry =
++      contents->GetController().GetLastCommittedEntry();
++  if (!entry || !entry->GetSSL().certificate ||
++      net::IsCertStatusError(entry->GetSSL().cert_status)) {
++    return "dangerous";
++  }
++  return "secure";
++}
++
++// Reloads the page once its site's data is gone (it deletes itself).
++class ClearObserver : public content::BrowsingDataRemover::Observer,
++                      public content::WebContentsObserver {
++ public:
++  ClearObserver(content::WebContents* contents, base::OnceClosure done)
++      : content::WebContentsObserver(contents), done_(std::move(done)) {}
++
++  void OnBrowsingDataRemoverDone(uint64_t failed_data_types) override {
++    if (web_contents()) {
++      web_contents()->GetController().Reload(content::ReloadType::NORMAL,
++                                             /*check_for_repost=*/true);
++    }
++    std::move(done_).Run();
++    delete this;
++  }
++
++ private:
++  base::OnceClosure done_;
++};
++
++}  // namespace
++
++mojom::SiteInfoPtr GetSiteInfo(Profile* profile,
++                               content::WebContents* contents) {
++  auto info = mojom::SiteInfo::New();
++  if (!contents) {
++    return info;
++  }
++  const GURL url = contents->GetLastCommittedURL();
++  info->security = Security(contents, url);
++  if (zoom::ZoomController* zoom =
++          zoom::ZoomController::FromWebContents(contents)) {
++    info->zoom = zoom->GetZoomPercent();
++  } else {
++    info->zoom = 100;
++  }
++  if (!IsWebSite(url)) {
++    return info;
++  }
++  info->origin = url::Origin::Create(url).Serialize();
++  info->host = url.host();
++  HostContentSettingsMap* map =
++      HostContentSettingsMapFactory::GetForProfile(profile);
++  // Ads: blocked unless the person allowed them here (or everywhere).
++  info->adblock = map->GetContentSetting(url, url, ContentSettingsType::ADS) ==
++                  CONTENT_SETTING_BLOCK;
++  info->adblock_everywhere =
++      map->GetDefaultContentSetting(ContentSettingsType::ADS) ==
++      CONTENT_SETTING_BLOCK;
++  for (const Kind& kind : kKinds) {
++    content_settings::SettingInfo setting_info;
++    const ContentSetting setting = content_settings::ValueToContentSetting(
++        map->GetWebsiteSetting(url, url, kind.setting, &setting_info));
++    const bool is_default =
++        setting_info.primary_pattern == ContentSettingsPattern::Wildcard() &&
++        setting_info.secondary_pattern == ContentSettingsPattern::Wildcard();
++    if (is_default && !kind.always) {
++      continue;
++    }
++    auto permission = mojom::SitePermission::New();
++    permission->type = kind.type;
++    permission->label = kind.label;
++    permission->setting = SettingName(setting);
++    permission->is_default = is_default;
++    info->permissions.push_back(std::move(permission));
++  }
++  return info;
++}
++
++void SetSitePermission(Profile* profile,
++                       content::WebContents* contents,
++                       const std::string& type,
++                       const std::string& setting) {
++  if (!contents) {
++    return;
++  }
++  const GURL url = contents->GetLastCommittedURL();
++  if (!IsWebSite(url)) {
++    return;
++  }
++  ContentSetting value = CONTENT_SETTING_DEFAULT;
++  if (setting == "allow") {
++    value = CONTENT_SETTING_ALLOW;
++  } else if (setting == "block") {
++    value = CONTENT_SETTING_BLOCK;
++  }
++  HostContentSettingsMap* map =
++      HostContentSettingsMapFactory::GetForProfile(profile);
++  if (type == "ads") {
++    map->SetContentSettingDefaultScope(url, url, ContentSettingsType::ADS,
++                                       value);
++    return;
++  }
++  const Kind* kind = KindOf(type);
++  if (!kind) {
++    return;
++  }
++  map->SetContentSettingDefaultScope(url, url, kind->setting, value);
++}
++
++void ZoomSite(content::WebContents* contents, int step) {
++  if (!contents) {
++    return;
++  }
++  zoom::PageZoom::Zoom(contents, step > 0   ? content::PAGE_ZOOM_IN
++                                 : step < 0 ? content::PAGE_ZOOM_OUT
++                                            : content::PAGE_ZOOM_RESET);
++}
++
++void ClearSiteData(Profile* profile,
++                   content::WebContents* contents,
++                   base::OnceClosure done) {
++  const GURL url = contents ? contents->GetLastCommittedURL() : GURL();
++  if (!IsWebSite(url)) {
++    std::move(done).Run();
++    return;
++  }
++  // The whole site (example.com and its subdomains), as Chromium's
++  // "Delete data" for a site does.
++  std::string domain = net::registry_controlled_domains::GetDomainAndRegistry(
++      url, net::registry_controlled_domains::INCLUDE_PRIVATE_REGISTRIES);
++  if (domain.empty()) {
++    domain = url.host();
++  }
++  auto filter = content::BrowsingDataFilterBuilder::Create(
++      content::BrowsingDataFilterBuilder::Mode::kDelete);
++  filter->AddRegisterableDomain(domain);
++  profile->GetBrowsingDataRemover()->RemoveWithFilterAndReply(
++      base::Time(), base::Time::Max(),
++      content::BrowsingDataRemover::DATA_TYPE_COOKIES |
++          content::BrowsingDataRemover::DATA_TYPE_DOM_STORAGE |
++          content::BrowsingDataRemover::DATA_TYPE_CACHE,
++      content::BrowsingDataRemover::ORIGIN_TYPE_UNPROTECTED_WEB,
++      std::move(filter), new ClearObserver(contents, std::move(done)));
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/site_control.h b/chrome/browser/meridian/site_control.h
+new file mode 100644
+index 0000000000..a13c57c2d0
+--- /dev/null
++++ b/chrome/browser/meridian/site_control.h
+@@ -0,0 +1,44 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_SITE_CONTROL_H_
++#define CHROME_BROWSER_MERIDIAN_SITE_CONTROL_H_
++
++#include <string>
++
++#include "base/functional/callback_forward.h"
++#include "chrome/browser/meridian/sidebar.mojom.h"
++
++class Profile;
++
++namespace content {
++class WebContents;
++}
++
++namespace meridian {
++
++// The Site Control Center (the sliders in the URL pill): what the site in
++// `contents` may do, and the controls for it. Settings are Chromium's own
++// site settings, so chrome://settings shows the same.
++mojom::SiteInfoPtr GetSiteInfo(Profile* profile,
++                               content::WebContents* contents);
++
++// `type` is a SitePermission type; `setting` is "allow", "block" or "ask"
++// (back to the default).
++void SetSitePermission(Profile* profile,
++                       content::WebContents* contents,
++                       const std::string& type,
++                       const std::string& setting);
++
++// `step`: +1 zooms in, -1 out, 0 back to 100%.
++void ZoomSite(content::WebContents* contents, int step);
++
++// Removes the site's cookies, storage and cache, then reloads the page.
++void ClearSiteData(Profile* profile,
++                   content::WebContents* contents,
++                   base::OnceClosure done);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_SITE_CONTROL_H_
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index 1e85836166..608950f6ed 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -34,6 +34,10 @@ build_webui("build") {
+     "meridian/ask.ts",
+     "meridian/tidy.html.ts",
+     "meridian/tidy.ts",
++    "meridian/menu.html.ts",
++    "meridian/menu.ts",
++    "meridian/site_control.html.ts",
++    "meridian/site_control.ts",
+     "meridian/chat.html.ts",
+     "meridian/chat.ts",
+     "meridian/mission.html.ts",
+@@ -90,6 +94,8 @@ build_webui("build") {
+     "meridian/archive.css",
+     "meridian/ask.css",
+     "meridian/tidy.css",
++    "meridian/menu.css",
++    "meridian/site_control.css",
+     "meridian/chat.css",
+     "meridian/mission.css",
+     "meridian/command_bar.css",
+diff --git a/chrome/browser/resources/webui_browser/app.css b/chrome/browser/resources/webui_browser/app.css
+index 4537df9aed..fd5e0bf7a3 100644
+--- a/chrome/browser/resources/webui_browser/app.css
++++ b/chrome/browser/resources/webui_browser/app.css
+@@ -26,6 +26,7 @@
+   --meridian-row-shadow: 0 1px 2px rgba(0, 0, 0, 0.08), 0 1px 6px rgba(0, 0, 0, 0.05);
+   --meridian-field: color-mix(in srgb, var(--meridian-space) 18%, #fff);
+   --meridian-surface: #fff;
++  --meridian-surface-2: #f4f4f6;
+   --meridian-overlay: rgba(20, 20, 30, 0.25);
+ 
+   display: flex;
+@@ -54,6 +55,7 @@
+     --meridian-row-shadow: none;
+     --meridian-field: color-mix(in srgb, var(--meridian-space) 14%, #2a2a31);
+     --meridian-surface: #1f1f24;
++    --meridian-surface-2: #2a2a31;
+     --meridian-overlay: rgba(0, 0, 0, 0.45);
+     background:
+       linear-gradient(160deg,
+@@ -93,6 +95,10 @@
+ 
+ #sidebar {
+   box-sizing: border-box;
++  /* Above the page and the home page, so its menus and popovers open over
++   * them; below the panels (Mission Control, Settings). */
++  position: relative;
++  z-index: 15;
+   width: var(--meridian-sidebar-w);
+   flex: none;
+   display: flex;
+@@ -153,7 +159,7 @@ cr-icon-button {
+   align-items: center;
+   gap: 4px;
+   height: 34px;
+-  padding: 0 11px 0 4px;
++  padding: 0 4px 0 4px;
+   margin-bottom: 10px;
+   border-radius: 9px;
+   background: color-mix(in srgb, var(--meridian-row-active) 70%, transparent);
+@@ -192,36 +198,52 @@ cr-icon-button {
+   /* A long host is cut on the left, so the registrable domain (the part that
+      says whose site it is) always shows: "…verify.evil.example". */
+   direction: rtl;
++  text-align: left;
+   flex: 1;
+   min-width: 0;
+   white-space: nowrap;
+   overflow: hidden;
+   text-overflow: ellipsis;
+   font-weight: 500;
+-  padding-left: 7px;
++  padding-left: 8px;
+ }
+ 
+-#locationIconButton {
++#urlPill .host.placeholder {
++  font-weight: 400;
++  color: var(--meridian-text-muted);
++}
++
++/* Copy Link and the Site Control Center's sliders, at the end of the pill. */
++.pill-btn {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  flex: none;
++  width: 26px;
+   height: 26px;
+   min-width: 26px;
+   padding: 0;
+   border: none;
+   border-radius: 7px;
+-  --iron-icon-width: 14px;
+-  --iron-icon-height: 14px;
+-  background-color: transparent;
++  color: var(--meridian-text-muted);
++  background: transparent;
+   --cr-button-background-color: transparent;
++  --cr-button-text-color: var(--meridian-text-muted);
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
+ }
+ 
+-#locationIconButton[hidden] + .host {
+-  padding-left: 7px;
++.pill-btn[hidden] {
++  display: none;
+ }
+ 
+-#locationIcon {
+-  fill: var(--meridian-text-muted);
+-  stroke: var(--meridian-text-muted);
+-  stroke-width: 0;
+-  shape-rendering: geometricPrecision;
++.pill-btn:hover {
++  color: var(--meridian-text);
++  background: color-mix(in srgb, var(--meridian-text) 8%, transparent);
++}
++
++#urlPill:not(:hover) #copyLinkButton {
++  opacity: 0;
+ }
+ 
+ meridian-sidebar {
+@@ -561,6 +583,7 @@ cr-icon-button[hidden] {
+   --meridian-row-shadow: none;
+   --meridian-field: rgba(255, 255, 255, 0.08);
+   --meridian-surface: #1f1f24;
++  --meridian-surface-2: #2a2a31;
+   --meridian-overlay: rgba(0, 0, 0, 0.5);
+   color-scheme: dark;
+   background: linear-gradient(160deg, #26262c, #141417);
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 30259376f8..7b5a6b17fe 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -5,13 +5,15 @@
+ import {html} from 'chrome://resources/lit/v3_0/lit.rollup.js';
+ 
+ import type {WebuiBrowserAppElement} from './app.js';
++import {icon} from './meridian/icons.js';
+ 
+ export function getHtml(this: WebuiBrowserAppElement) {
+   return html`<!--_html_template_start_-->
+ <div id="rootContainer">
+   <div id="edgeHotzone" @mouseenter="${this.onEdgeHotzoneMouseenter_}"></div>
+   <div id="peekShield" @mouseenter="${this.onPeekShieldMouseenter_}"></div>
+-  <div id="sidebar" @mouseleave="${this.onSidebarMouseleave_}">
++  <div id="sidebar" @mouseenter="${this.onSidebarMouseenter_}"
++      @mouseleave="${this.onSidebarMouseleave_}">
+     <div id="sidebarTop">
+ <if expr="not is_macosx">
+       <div class="captionButtonsDiv">
+@@ -32,8 +34,6 @@ export function getHtml(this: WebuiBrowserAppElement) {
+       <span id="privateBadge" class="private-badge"
+           ?hidden="${!this.private_}">Private</span>
+       <div class="grow"></div>
+-      <webui-browser-extensions-bar id="extensionsBar">
+-      </webui-browser-extensions-bar>
+       <cr-icon-button id="backButton" iron-icon="cr:arrow-back"
+           ?disabled="${this.backButtonDisabled_}" @click="${this.onBackClick_}"
+           @contextmenu="${this.onBackContextmenu_}">
+@@ -51,14 +51,26 @@ export function getHtml(this: WebuiBrowserAppElement) {
+     <div id="urlPill" role="button" tabindex="0"
+         class="${this.reloadOrStopIcon_ === 'icon-clear' ? 'loading' : ''}"
+         title="Edit URL (⌘L)" @click="${this.onUrlPillClick_}">
+-      <cr-button id="locationIconButton" type="button"
++      <span class="host ${this.urlHost_ ? '' : 'placeholder'}"><bdi dir="ltr">${
++          this.urlHost_ || 'Search or enter URL'}</bdi></span>
++      <button id="copyLinkButton" class="pill-btn" title="Copy Link (⇧⌘C)"
+           ?hidden="${!this.showLocationIconButton_}"
++          @click="${this.onCopyLinkClick_}">
++        ${icon(this.copyLinkIcon_(), 15)}
++      </button>
++      <cr-button id="locationIconButton" type="button" class="pill-btn"
++          title="Site controls" ?hidden="${!this.showLocationIconButton_}"
+           @click="${this.onLocationIconClick_}">
+-        <cr-icon id="locationIcon" icon="webui-browser:${this.locationIcon_}">
+-        </cr-icon>
++        ${icon('sliders', 15)}
+       </cr-button>
+-      <span class="host"><bdi dir="ltr">${this.urlHost_}</bdi></span>
+     </div>
++    <meridian-site-control id="siteControl" ?open="${this.siteControlOpen_}"
++        .url="${this.url_}"
++        style="--x:${this.siteControlX_}px; --y:${this.siteControlY_}px"
++        @site-control-action="${this.onSiteControlAction_}">
++      <webui-browser-extensions-bar id="extensionsBar" slot="extensions">
++      </webui-browser-extensions-bar>
++    </meridian-site-control>
+     <meridian-sidebar id="tabstrip" ?private="${this.private_}"
+         @tab-added="${this.onTabAdded_}"
+         @tab-closed="${this.onTabClosed_}" @tab-updated="${this.onTabUpdated_}"
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 6268f4e02d..e6b2a179bb 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -21,6 +21,7 @@ import './meridian/ask.js';
+ import './meridian/tidy.js';
+ import './meridian/chat.js';
+ import './meridian/mission.js';
++import './meridian/site_control.js';
+ import 'chrome://resources/cr_elements/cr_button/cr_button.js';
+ import 'chrome://resources/cr_elements/cr_icon_button/cr_icon_button.js';
+ import 'chrome://resources/cr_elements/cr_icon/cr_icon.js';
+@@ -50,6 +51,9 @@ import type {MeridianSettingsElement} from './meridian/settings.js';
+ import type {SectionId} from './meridian/settings.js';
+ import type {MeridianThemeEditorElement} from './meridian/theme_editor.js';
+ import type {MeridianSidebarElement} from './meridian/sidebar.js';
++import type {MeridianSiteControlElement} from './meridian/site_control.js';
++import type {IconName} from './meridian/icons.js';
++import {Command} from './sidebar.mojom-webui.js';
+ import type {Space, Split, TidyTab} from './sidebar.mojom-webui.js';
+ 
+ const SIDEBAR_HIDDEN_KEY = 'meridian.sidebarHidden';
+@@ -106,6 +110,7 @@ export interface WebuiBrowserAppElement {
+     backButton: HTMLElement,
+     forwardButton: HTMLElement,
+     locationIconButton: HTMLElement,
++    siteControl: MeridianSiteControlElement,
+     contentRegion: ContentRegionElement,
+     sidePanel: SidePanelElement,
+     tabstrip: MeridianSidebarElement,
+@@ -135,6 +140,11 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       reloadOrStopIcon_: {state: true, type: String},
+       showLocationIconButton_: {type: Boolean, reflect: true},
+       locationIcon_: {state: true, type: String},
++      url_: {state: true, type: String},
++      siteControlOpen_: {state: true, type: Boolean},
++      siteControlX_: {state: true, type: Number},
++      siteControlY_: {state: true, type: Number},
++      linkCopied_: {state: true, type: Boolean},
+       tabStripInset_: {state: true, type: Number},
+       urlHost_: {state: true, type: String},
+       statusText_: {state: true, type: String},
+@@ -165,13 +175,18 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   protected accessor showingSidePanel_: boolean = false;
+   protected accessor showLocationIconButton_: boolean = false;
+   protected accessor locationIcon_: string = 'no-encryption';
++  // The Site Control Center, under the sliders in the URL pill.
++  protected accessor siteControlOpen_: boolean = false;
++  protected accessor siteControlX_: number = 0;
++  protected accessor siteControlY_: number = 0;
++  protected accessor linkCopied_: boolean = false;
+   protected accessor tabStripInset_: number =
+       loadTimeData.valueExists('tabStripInset') ?
+       loadTimeData.getInteger('tabStripInset') :
+       0;
+   protected accessor inactive_: boolean = false;
+   // The active tab's URL, and what the sidebar's URL pill shows of it.
+-  private url_: string = '';
++  protected accessor url_: string = '';
+   protected accessor urlHost_: string = '';
+   protected accessor statusText_: string = '';
+   // The link preview card (Shift over a link).
+@@ -372,6 +387,9 @@ export class WebuiBrowserAppElement extends CrLitElement {
+ 
+     // TODO(crbug.com/537801193): store and restore focus on tab switch.
+     this.$.contentRegion.activateTab(tabData.id);
++    if (this.activeTabId_ !== tabData.id && this.siteControlOpen_) {
++      this.closeSiteControl_();
++    }
+     this.activeTabId_ = tabData.id;
+     this.updateSplit_();
+     this.updateUrlForActiveTab_(tabData);
+@@ -477,18 +495,39 @@ export class WebuiBrowserAppElement extends CrLitElement {
+ 
+   protected onEdgeHotzoneMouseenter_() {
+     if (this.sidebarHidden_) {
++      clearTimeout(this.peekCloseTimer_);
+       this.sidebarPeek_ = true;
+     }
+   }
+ 
++  protected onSidebarMouseenter_() {
++    clearTimeout(this.peekCloseTimer_);
++  }
++
+   protected onSidebarMouseleave_() {
+-    this.sidebarPeek_ = false;
++    this.closePeekSoon_();
+   }
+ 
+   // The pointer over the page goes to the page's own process, so the sidebar
+   // never hears it leave; while it is out, this layer over the page does.
+   protected onPeekShieldMouseenter_() {
+-    this.sidebarPeek_ = false;
++    this.closePeekSoon_();
++  }
++
++  // The floating sidebar stays a moment after the pointer leaves it, so
++  // reaching for it while it slides in, or overshooting its edge, doesn't
++  // send it away; it stays while one of its menus is open.
++  private peekCloseTimer_ = 0;
++
++  private closePeekSoon_() {
++    clearTimeout(this.peekCloseTimer_);
++    this.peekCloseTimer_ = setTimeout(() => {
++      if (this.$.tabstrip.menuOpen()) {
++        this.closePeekSoon_();
++        return;
++      }
++      this.sidebarPeek_ = false;
++    }, 450);
+   }
+ 
+   // Meridian split view: the content region shows the active tab's split.
+@@ -696,6 +735,15 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       case 'new-space':
+         this.$.tabstrip.addSpace();
+         break;
++      case 'archive':
++        this.$.tabstrip.runCommand(Command.kShowArchive, 0);
++        break;
++      case 'ask':
++        this.$.tabstrip.runCommand(Command.kAsk, 0);
++        break;
++      case 'workbench':
++        this.$.tabstrip.runCommand(Command.kWorkbench, 0);
++        break;
+     }
+   }
+ 
+@@ -778,10 +826,88 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     }
+   }
+ 
+-  protected onLocationIconClick_(_: Event) {
+-    if (this.$.contentRegion.activeWebview) {
+-      this.$.contentRegion.activeWebview.openPageInfoMenu();
++  protected onLocationIconClick_(e: Event) {
++    e.stopPropagation();
++    if (this.siteControlOpen_) {
++      this.closeSiteControl_();
++      return;
++    }
++    const r = this.$.locationIconButton.getBoundingClientRect();
++    const width = 300;
++    this.siteControlX_ = Math.max(
++        8, Math.min(r.left + r.width / 2 - width / 2,
++                    window.innerWidth - width - 8));
++    this.siteControlY_ = r.bottom + 8;
++    this.siteControlOpen_ = true;
++    document.addEventListener('mousedown', this.onSiteControlOutside_, true);
++    document.addEventListener('keydown', this.onSiteControlKeydown_, true);
++  }
++
++  private closeSiteControl_() {
++    this.siteControlOpen_ = false;
++    document.removeEventListener('mousedown', this.onSiteControlOutside_, true);
++    document.removeEventListener('keydown', this.onSiteControlKeydown_, true);
++  }
++
++  // A click anywhere else closes it. (Not losing focus: an extension's popup
++  // takes the focus and stays anchored to its button in here.)
++  private onSiteControlOutside_ = (e: MouseEvent) => {
++    const path = e.composedPath();
++    if (!path.includes(this.$.siteControl) &&
++        !path.includes(this.$.locationIconButton)) {
++      this.closeSiteControl_();
++    }
++  };
++
++  private onSiteControlKeydown_ = (e: KeyboardEvent) => {
++    if (e.key === 'Escape') {
++      this.closeSiteControl_();
+     }
++  };
++
++  protected onSiteControlAction_(e: CustomEvent<string>) {
++    let origin = '';
++    try {
++      origin = new URL(this.url_).origin;
++    } catch {
++      // Not a URL: no site settings to open.
++    }
++    this.closeSiteControl_();
++    switch (e.detail) {
++      case 'pin':
++        this.$.tabstrip.runCommand(Command.kTogglePin, 0);
++        break;
++      case 'split':
++        this.$.tabstrip.runCommand(Command.kSplit, 0);
++        break;
++      case 'ask':
++        this.$.tabstrip.runCommand(Command.kAsk, 0);
++        break;
++      case 'page-info':
++        this.$.contentRegion.activeWebview?.openPageInfoMenu();
++        break;
++      case 'site-settings':
++        this.$.tabstrip.openUrl('chrome://settings/content/siteDetails?site=' +
++                                encodeURIComponent(origin));
++        break;
++      case 'web-store':
++        this.$.tabstrip.openUrl('https://chromewebstore.google.com/');
++        break;
++      case 'settings':
++        this.$.settings.show(this.$.tabstrip.spaces(), 'general');
++        break;
++    }
++  }
++
++  protected copyLinkIcon_(): IconName {
++    return this.linkCopied_ ? 'check' : 'link';
++  }
++
++  protected onCopyLinkClick_(e: Event) {
++    e.stopPropagation();
++    navigator.clipboard.writeText(this.url_);
++    this.linkCopied_ = true;
++    setTimeout(() => this.linkCopied_ = false, 1400);
+   }
+ }
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/home.css b/chrome/browser/resources/webui_browser/meridian/home.css
+index 589d2f3ffe..dfb901dc17 100644
+--- a/chrome/browser/resources/webui_browser/meridian/home.css
++++ b/chrome/browser/resources/webui_browser/meridian/home.css
+@@ -166,7 +166,7 @@ kbd {
+ 
+ .cards {
+   display: grid;
+-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
++  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+   gap: 14px;
+ }
+ 
+@@ -558,3 +558,111 @@ kbd {
+     animation: none;
+   }
+ }
++
++/* Archive, Ask AI and Workbench, under the search field. */
++.quick {
++  display: flex;
++  justify-content: center;
++  gap: 8px;
++  margin-top: 16px;
++}
++
++.quick-act {
++  display: inline-flex;
++  align-items: center;
++  gap: 7px;
++  height: 32px;
++  padding: 0 8px 0 10px;
++  border-radius: 9px;
++  color: var(--meridian-text);
++  background: var(--meridian-surface-2);
++  border: 1px solid var(--meridian-border);
++  font: inherit;
++  font-size: 12.5px;
++  font-weight: 500;
++  transition: border-color 0.12s, transform 0.12s;
++}
++
++.quick-act:hover {
++  border-color: color-mix(in srgb, var(--meridian-space) 60%, transparent);
++}
++
++.quick-act:active {
++  transform: translateY(0.5px);
++}
++
++.quick-ic {
++  display: inline-flex;
++  color: var(--meridian-space);
++}
++
++.quick-keys {
++  margin-left: 2px;
++  font: inherit;
++  font-size: 11px;
++  letter-spacing: 0.04em;
++  padding: 1px 5px;
++  color: var(--meridian-text-muted);
++  background: transparent;
++  border: 1px solid var(--meridian-border);
++  border-radius: 5px;
++}
++
++.hd-workbench .hd-code {
++  left: 40px;
++  top: 6px;
++  bottom: 6px;
++  width: 54px;
++  border-radius: 5px;
++  background: #1e1e26;
++  padding: 7px 5px;
++  box-sizing: border-box;
++}
++
++.hd-workbench .hd-code b {
++  display: block;
++  position: relative;
++  height: 4px;
++  border-radius: 2px;
++  margin-bottom: 6px;
++  background: #8be9b5;
++  width: 0;
++  animation: hd-code 3s infinite steps(8);
++}
++
++.hd-workbench .hd-code b:nth-child(2) {
++  background: #b48cff;
++  animation-delay: 0.3s;
++}
++
++.hd-workbench .hd-code b:nth-child(3) {
++  background: #7cc7ff;
++  animation-delay: 0.6s;
++}
++
++.hd-workbench .hd-code b:nth-child(4) {
++  background: #ffd27a;
++  animation-delay: 0.9s;
++}
++
++.hd-workbench .hd-page.b {
++  left: 98px;
++}
++
++@keyframes hd-code {
++  0% {
++    width: 0;
++  }
++
++  40%,
++  100% {
++    width: 85%;
++  }
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .hd-workbench .hd-code b {
++    animation: none;
++    width: 85%;
++  }
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/home.html.ts b/chrome/browser/resources/webui_browser/meridian/home.html.ts
+index decd795f85..77233d9b6e 100644
+--- a/chrome/browser/resources/webui_browser/meridian/home.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/home.html.ts
+@@ -17,6 +17,20 @@ export function getHtml(this: MeridianHomeElement) {
+       <span class="search-text">Search or open a site</span>
+       <span class="search-keys"><kbd>⌘</kbd><kbd>T</kbd></span>
+     </button>
++    <div class="quick">
++      <button class="quick-act" data-action="archive" @click="${this.onQuickClick_}">
++        <span class="quick-ic">${icon('archive', 15)}</span>Archive
++        <kbd class="quick-keys">⌥⌘A</kbd>
++      </button>
++      <button class="quick-act" data-action="ask" @click="${this.onQuickClick_}">
++        <span class="quick-ic">${icon('sparkles', 15)}</span>Ask AI
++        <kbd class="quick-keys">⌘J</kbd>
++      </button>
++      <button class="quick-act" data-action="workbench" @click="${this.onQuickClick_}">
++        <span class="quick-ic">${icon('code', 15)}</span>Workbench
++        <kbd class="quick-keys">⇧⌘E</kbd>
++      </button>
++    </div>
+     ${this.compact_ ? html`
+       <button id="expand" class="link" @click="${this.onExpandClick_}">
+         What can Meridian do?</button>` : ''}
+@@ -45,6 +59,12 @@ export function getHtml(this: MeridianHomeElement) {
+                   <i class="hd-side"><b></b><b></b><b class="on"></b><b></b></i>
+                   <i class="hd-page a"></i><i class="hd-page b"></i>
+                 </div>` : ''}
++              ${c.demo === 'workbench' ? html`
++                <div class="hd hd-workbench">
++                  <i class="hd-side"><b></b><b class="on"></b><b></b><b></b></i>
++                  <i class="hd-code"><b></b><b></b><b></b><b></b></i>
++                  <i class="hd-page b"></i>
++                </div>` : ''}
+               ${c.demo === 'spaces' ? html`
+                 <div class="hd hd-spaces">
+                   <i class="hd-side s1"><b></b><b class="on"></b><b></b></i>
+diff --git a/chrome/browser/resources/webui_browser/meridian/home.ts b/chrome/browser/resources/webui_browser/meridian/home.ts
+index 49aa5a61b7..b00d2a4c51 100644
+--- a/chrome/browser/resources/webui_browser/meridian/home.ts
++++ b/chrome/browser/resources/webui_browser/meridian/home.ts
+@@ -25,10 +25,10 @@ export interface HomeCard {
+   title: string;
+   tagline: string;
+   color: string;
+-  demo: 'find'|'split'|'spaces';
++  demo: 'find'|'split'|'spaces'|'workbench';
+   points: HomePoint[];
+   tryLabel: string;
+-  tryAction: 'command-bar'|'edit-theme'|'new-space';
++  tryAction: 'command-bar'|'edit-theme'|'new-space'|'workbench';
+ }
+ 
+ const keys = (k: string) => k.split(' ');
+@@ -79,6 +79,21 @@ const CARDS: HomeCard[] = [
+     tryLabel: 'Make a space',
+     tryAction: 'new-space',
+   },
++  {
++    id: 'developer',
++    index: 3,
++    title: 'For developers',
++    tagline: 'Agents beside your site.',
++    color: '#43cea2',
++    demo: 'workbench',
++    points: [
++      {keys: keys('⇧ ⌘ E'), label: '', text: 'Workbench: files, editor and terminals'},
++      {keys: [], label: 'MCP', text: 'Coding agents can read and drive the browser'},
++      {keys: keys('⇧ ⌘ M'), label: '', text: 'Mission Control shows every running agent'},
++    ],
++    tryLabel: 'Open Workbench',
++    tryAction: 'workbench',
++  },
+ ];
+ 
+ const TIPS: Array<[string[], string]> = [
+@@ -184,6 +199,12 @@ export class MeridianHomeElement extends CrLitElement {
+     this.fire('meridian-home-action', 'command-bar');
+   }
+ 
++  // The shortcuts under the search field.
++  protected onQuickClick_(e: Event) {
++    this.fire('meridian-home-action',
++              (e.currentTarget as HTMLElement).dataset['action']);
++  }
++
+   protected onTryClick_(e: Event) {
+     this.fire('meridian-home-action',
+               (e.currentTarget as HTMLElement).dataset['action']);
+diff --git a/chrome/browser/resources/webui_browser/meridian/icons.ts b/chrome/browser/resources/webui_browser/meridian/icons.ts
+index 3c84acc1d6..3a124ee6fd 100644
+--- a/chrome/browser/resources/webui_browser/meridian/icons.ts
++++ b/chrome/browser/resources/webui_browser/meridian/icons.ts
+@@ -16,40 +16,76 @@ export type IconName =
+     'forward'|
+     'reload'|
+     'plus'|
++    'minus'|
+     'x'|
++    'check'|
+     'folder'|
+     'folderOpen'|
++    'settings'|
++    'sliders'|
++    'download'|
++    'split'|
++    'speaker'|
++    'mute'|
++    'search'|
++    'globe'|
++    'archive'|
++    'slash'|
++    'copy'|
++    'link'|
++    'lock'|
++    'chevronUp'|
+     'chevronDown'|
+     'chevronRight'|
+-    'chevronUp'|
+-    'slash'|
++    'expand'|
++    'history'|
++    'clock'|
++    'bolt'|
++    'sparkles'|
++    'layers'|
++    'shield'|
++    'star'|
+     'pin'|
+     'unpin'|
+-    'star'|
+-    'moveTo'|
++    'code'|
++    'terminal'|
++    'file'|
++    'play'|
++    'eye'|
++    'eyeOff'|
+     'trash'|
+     'pencil'|
+-    'copy'|
++    'palette'|
++    'user'|
++    'users'|
++    'keyboard'|
++    'route'|
++    'puzzle'|
++    'info'|
++    'external'|
+     'more'|
+-    'archive'|
+-    'search'|
++    'sun'|
++    'moon'|
++    'monitor'|
++    'window'|
++    'littleWindow'|
++    'incognito'|
+     'smile'|
+-    'palette'|
+-    'check'|
++    'duplicate'|
++    'moveTo'|
++    'unload'|
++    'restore'|
++    'home'|
++    'grid'|
++    'command'|
+     'arrowRight'|
+     'arrowLeft'|
+-    'sparkles'|
+-    'grid'|
+-    'lock'|
+-    'link'|
+-    'terminal'|
+-    'code'|
+-    'globe'|
+-    'bolt'|
+-    'agents'|
+-    'users'|
+-    'download'|
+-    'file';
++    'reveal'|
++    'chat'|
++    'arrowUp'|
++    'stop'|
++    'wand'|
++    'agents';
+ 
+ export function icon(name: IconName, size = 16): TemplateResult {
+   switch (name) {
+@@ -63,73 +99,145 @@ export function icon(name: IconName, size = 16): TemplateResult {
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36L21 8"/><path d="M21 3v5h-5"/></svg>`;
+     case 'plus':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5.5v13M5.5 12h13"/></svg>`;
++    case 'minus':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5.5 12h13"/></svg>`;
+     case 'x':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 7L7 17M7 7l10 10"/></svg>`;
++    case 'check':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>`;
+     case 'folder':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 7.5a2 2 0 0 1 2-2h3.6a2 2 0 0 1 1.4.6l1.3 1.3h6.7a2 2 0 0 1 2 2v7.1a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></svg>`;
+     case 'folderOpen':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 16.5v-9a2 2 0 0 1 2-2h3.6a2 2 0 0 1 1.4.6l1.3 1.3h5.7a2 2 0 0 1 2 2v1"/><path d="M3.5 16.5l2.1-5a2 2 0 0 1 1.8-1.2h12.1a1 1 0 0 1 .9 1.4l-2 4.8a2 2 0 0 1-1.8 1.2H5.5a2 2 0 0 1-2-1.2z"/></svg>`;
++    case 'settings':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.6h3.4l.5 2.4 1.7 1 2.3-.8 1.7 2.9-1.8 1.6v2l1.8 1.6-1.7 2.9-2.3-.8-1.7 1-.5 2.4h-3.4l-.5-2.4-1.7-1-2.3.8-1.7-2.9 1.8-1.6v-2L3.9 9.1l1.7-2.9 2.3.8 1.7-1z"/><circle cx="12" cy="12" r="2.75"/></svg>`;
++    case 'sliders':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6.5h9M17 6.5h3M4 12h3M11 12h9M4 17.5h11M19 17.5h1"/><circle cx="15" cy="6.5" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="17.5" r="2"/></svg>`;
++    case 'download':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4.5v10M7.5 10.5L12 15l4.5-4.5"/><path d="M5 19.5h14"/></svg>`;
++    case 'split':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M12 4v16"/></svg>`;
++    case 'speaker':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5.5L7 9H4v6h3l4 3.5z"/><path d="M15 9a4.2 4.2 0 0 1 0 6M17.8 6.5a8 8 0 0 1 0 11"/></svg>`;
++    case 'mute':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5.5L7 9H4v6h3l4 3.5z"/><path d="M20 9.5l-5 5M15 9.5l5 5"/></svg>`;
++    case 'search':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.4-4.4"/></svg>`;
++    case 'globe':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.3 2.4 3.4 5.2 3.4 8.5s-1.1 6.1-3.4 8.5c-2.3-2.4-3.4-5.2-3.4-8.5s1.1-6.1 3.4-8.5z"/></svg>`;
++    case 'archive':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="4" rx="1.2"/><path d="M5 8.5v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-9"/><path d="M10 12.5h4"/></svg>`;
++    case 'slash':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.5 5l-5 14"/></svg>`;
++    case 'copy':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8.5" y="8.5" width="11" height="11" rx="2.2"/><path d="M15.5 8.5V6.7a2.2 2.2 0 0 0-2.2-2.2H6.7a2.2 2.2 0 0 0-2.2 2.2v6.6a2.2 2.2 0 0 0 2.2 2.2h1.8"/></svg>`;
++    case 'link':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.5 13.5a3.6 3.6 0 0 0 5.1 0l2.9-2.9a3.6 3.6 0 0 0-5.1-5.1l-.9.9"/><path d="M13.5 10.5a3.6 3.6 0 0 0-5.1 0l-2.9 2.9a3.6 3.6 0 0 0 5.1 5.1l.9-.9"/></svg>`;
++    case 'lock':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="10.5" width="14" height="9.5" rx="2.2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/></svg>`;
++    case 'chevronUp':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 14.5l5-5 5 5"/></svg>`;
+     case 'chevronDown':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 9.5l5 5 5-5"/></svg>`;
+     case 'chevronRight':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.5 7l5 5-5 5"/></svg>`;
+-    case 'chevronUp':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 14.5l5-5 5 5"/></svg>`;
+-    case 'slash':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.5 5l-5 14"/></svg>`;
++    case 'expand':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4.5h5.5V10M10 19.5H4.5V14M19.5 4.5l-6 6M4.5 19.5l6-6"/></svg>`;
++    case 'history':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3L4.5 9"/><path d="M4.5 4.5V9H9"/><path d="M12 8v4.2l2.8 1.8"/></svg>`;
++    case 'clock':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>`;
++    case 'bolt':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 3.5L5.5 13.5h6l-1 7 7.5-10h-6z"/></svg>`;
++    case 'sparkles':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 4.5l1.5 4 4 1.5-4 1.5-1.5 4-1.5-4-4-1.5 4-1.5z"/><path d="M17.5 14l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z"/></svg>`;
++    case 'layers':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l8.5 4.5L12 13 3.5 8.5z"/><path d="M3.5 12.5L12 17l8.5-4.5"/><path d="M3.5 16.2L12 20.7l8.5-4.5"/></svg>`;
++    case 'shield':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5l7 2.8v5.4c0 4.4-3 7.6-7 8.8-4-1.2-7-4.4-7-8.8V6.3z"/></svg>`;
++    case 'star':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l2.4 4.9 5.4.8-3.9 3.8.9 5.4L12 16.4l-4.8 2.5.9-5.4-3.9-3.8 5.4-.8z"/></svg>`;
+     case 'pin':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 4.5h6M10 4.5v5.2l-3 3.3v1.5h10V13l-3-3.3V4.5M12 14.5v5"/></svg>`;
+     case 'unpin':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 4.5h6M10 4.5v5.2l-3 3.3v1.5h10V13l-3-3.3V4.5M12 14.5v5"/><path d="M4.5 4.5l15 15"/></svg>`;
+-    case 'star':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l2.4 4.9 5.4.8-3.9 3.8.9 5.4L12 16.4l-4.8 2.5.9-5.4-3.9-3.8 5.4-.8z"/></svg>`;
+-    case 'moveTo':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 12h11M11.5 7.5L16 12l-4.5 4.5"/><path d="M19.5 5v14"/></svg>`;
++    case 'code':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15.5 17.5L21 12l-5.5-5.5M8.5 6.5L3 12l5.5 5.5"/></svg>`;
++    case 'terminal':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 16.5l5-4.5-5-4.5M12.5 18h7"/></svg>`;
++    case 'file':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 3.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13.5 3.5V9H19"/></svg>`;
++    case 'play':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7.5 5l11 7-11 7z"/></svg>`;
++    case 'eye':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.75"/></svg>`;
++    case 'eyeOff':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 5.7a9.6 9.6 0 0 1 2-.2c6 0 9.5 6.5 9.5 6.5a16 16 0 0 1-2.4 3.2M6.6 6.6C4 8.3 2.5 12 2.5 12S6 18.5 12 18.5a9 9 0 0 0 4.5-1.2"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2M4 4l16 16"/></svg>`;
+     case 'trash':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 7h15M9.5 7V5.5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1V7M6.5 7l.8 11.2a2 2 0 0 0 2 1.8h5.4a2 2 0 0 0 2-1.8L17.5 7"/></svg>`;
+     case 'pencil':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.5 5.5l4 4L8.5 19.5h-4v-4z"/><path d="M12.5 7.5l4 4"/></svg>`;
+-    case 'copy':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8.5" y="8.5" width="11" height="11" rx="2.2"/><path d="M15.5 8.5V6.7a2.2 2.2 0 0 0-2.2-2.2H6.7a2.2 2.2 0 0 0-2.2 2.2v6.6a2.2 2.2 0 0 0 2.2 2.2h1.8"/></svg>`;
++    case 'palette':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5a8.5 8.5 0 0 0 0 17c1.1 0 1.8-.8 1.8-1.8 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.2 0-1 .8-1.8 1.8-1.8h2.1a4.3 4.3 0 0 0 4.3-4.3C21 6.9 17 3.5 12 3.5z"/><circle cx="7.8" cy="11.5" r="1.1"/><circle cx="10.5" cy="7.6" r="1.1"/><circle cx="15" cy="7.8" r="1.1"/></svg>`;
++    case 'user':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8.5" r="3.75"/><path d="M4.5 19.5c1.2-3.3 4-5 7.5-5s6.3 1.7 7.5 5"/></svg>`;
++    case 'users':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9.5" cy="9" r="3.5"/><path d="M3.5 19c1-3 3.3-4.5 6-4.5s5 1.5 6 4.5"/><path d="M15.5 5.7a3.5 3.5 0 0 1 0 6.6M17.5 14.8c1.4.6 2.4 1.9 3 4.2"/></svg>`;
++    case 'keyboard':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="5" width="20" height="14" rx="2.5"/><path d="M6 9.5h.01M10 9.5h.01M14 9.5h.01M18 9.5h.01M6 13h.01M18 13h.01M9 15h6"/></svg>`;
++    case 'route':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="18" r="2.25"/><circle cx="18" cy="6" r="2.25"/><path d="M8.25 18H15a3 3 0 0 0 0-6H9a3 3 0 0 1 0-6h6.75"/></svg>`;
++    case 'puzzle':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19.44 7.85c-.05.32.06.65.29.88l1.57 1.57c.47.47.7 1.09.7 1.7s-.23 1.24-.7 1.71l-1.61 1.61a.98.98 0 0 1-.84.27c-.47-.07-.8-.48-.97-.92a2.5 2.5 0 1 0-3.21 3.21c.44.17.85.5.92.97a.98.98 0 0 1-.27.84l-1.61 1.61a2.4 2.4 0 0 1-3.41 0l-1.57-1.57a1.03 1.03 0 0 0-.88-.29c-.49.07-.84.5-1.02.97a2.5 2.5 0 1 1-3.24-3.24c.47-.18.9-.53.97-1.02a1.03 1.03 0 0 0-.29-.88l-1.57-1.57a2.4 2.4 0 0 1 0-3.41L4.23 8.77c.24-.24.58-.35.92-.3.51.08.88.53 1.07 1.01a2.5 2.5 0 1 0 3.26-3.26c-.48-.2-.93-.56-1.01-1.07-.05-.34.06-.68.3-.92l1.53-1.53a2.4 2.4 0 0 1 3.41 0l1.57 1.57c.23.23.56.34.88.29.49-.07.84-.5 1.02-.97a2.5 2.5 0 1 1 3.24 3.24c-.47.18-.9.53-.97 1.02z"/></svg>`;
++    case 'info':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5M12 7.8h.01"/></svg>`;
++    case 'external':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 4.5h6v6M19.5 4.5L11 13"/><path d="M17.5 13.5v4a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2h4"/></svg>`;
+     case 'more':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="12" r=".9"/><circle cx="12" cy="12" r=".9"/><circle cx="18" cy="12" r=".9"/></svg>`;
+-    case 'archive':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="4" rx="1.2"/><path d="M5 8.5v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-9"/><path d="M10 12.5h4"/></svg>`;
+-    case 'search':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.4-4.4"/></svg>`;
++    case 'sun':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3.75"/><path d="M12 3.5v1.5M12 19v1.5M3.5 12H5M19 12h1.5M6 6l1 1M17 17l1 1M6 18l1-1M17 7l1-1"/></svg>`;
++    case 'moon':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19.5 14.5A7.5 7.5 0 0 1 9.5 4.5a7.5 7.5 0 1 0 10 10z"/></svg>`;
++    case 'monitor':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4.5" width="18" height="12" rx="2.2"/><path d="M8.5 20h7M12 16.5V20"/></svg>`;
++    case 'window':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4.5" width="18" height="15" rx="3"/><path d="M3 9h18"/><path d="M6 6.8h.01M8.3 6.8h.01"/></svg>`;
++    case 'littleWindow':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11V7a3 3 0 0 0-3-3H6a3 3 0 0 0-3 3v10a3 3 0 0 0 3 3h4"/><rect x="13" y="14" width="9" height="7" rx="1.5"/></svg>`;
++    case 'incognito':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 11h18"/><path d="M5 11l1.6-5.3a1 1 0 0 1 1.2-.7L12 6l4.2-1a1 1 0 0 1 1.2.7L19 11"/><circle cx="7" cy="16.5" r="2.8"/><circle cx="17" cy="16.5" r="2.8"/><path d="M9.8 16.5h4.4"/></svg>`;
+     case 'smile':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M8.8 14.2a4 4 0 0 0 6.4 0"/><path d="M9.2 9.8h.01M14.8 9.8h.01"/></svg>`;
+-    case 'palette':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5a8.5 8.5 0 0 0 0 17c1.1 0 1.8-.8 1.8-1.8 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.2 0-1 .8-1.8 1.8-1.8h2.1a4.3 4.3 0 0 0 4.3-4.3C21 6.9 17 3.5 12 3.5z"/><circle cx="7.8" cy="11.5" r="1.1"/><circle cx="10.5" cy="7.6" r="1.1"/><circle cx="15" cy="7.8" r="1.1"/></svg>`;
+-    case 'check':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>`;
++    case 'duplicate':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8.5" y="8.5" width="11" height="11" rx="2.2"/><path d="M14 11.5v5M11.5 14h5"/><path d="M15.5 8.5V6.7a2.2 2.2 0 0 0-2.2-2.2H6.7a2.2 2.2 0 0 0-2.2 2.2v6.6a2.2 2.2 0 0 0 2.2 2.2h1.8"/></svg>`;
++    case 'moveTo':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 12h11M11.5 7.5L16 12l-4.5 4.5"/><path d="M19.5 5v14"/></svg>`;
++    case 'unload':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4.5v7"/><path d="M7.3 7.2a7 7 0 1 0 9.4 0"/></svg>`;
++    case 'restore':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3L4.5 9"/><path d="M4.5 4.5V9H9"/></svg>`;
++    case 'home':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 10.5L12 4.5l7.5 6v8a1 1 0 0 1-1 1h-4v-5h-5v5h-4a1 1 0 0 1-1-1z"/></svg>`;
++    case 'grid':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4.5" y="4.5" width="6" height="6" rx="1.5"/><rect x="13.5" y="4.5" width="6" height="6" rx="1.5"/><rect x="4.5" y="13.5" width="6" height="6" rx="1.5"/><rect x="13.5" y="13.5" width="6" height="6" rx="1.5"/></svg>`;
++    case 'command':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 9V6.8A2.3 2.3 0 1 0 6.8 9H9zm0 0h6m-6 0v6m6-6V6.8A2.3 2.3 0 1 1 17.2 9H15zm0 0v6m0 0h-6m6 0v2.2a2.3 2.3 0 1 0 2.3-2.2H15zm-6 0v2.2A2.3 2.3 0 1 1 6.8 15H9z"/></svg>`;
+     case 'arrowRight':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13.5 6.5L19 12l-5.5 5.5"/></svg>`;
+     case 'arrowLeft':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M10.5 6.5L5 12l5.5 5.5"/></svg>`;
+-    case 'sparkles':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 4.5l1.5 4 4 1.5-4 1.5-1.5 4-1.5-4-4-1.5 4-1.5z"/><path d="M17.5 14l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z"/></svg>`;
+-    case 'grid':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4.5" y="4.5" width="6" height="6" rx="1.5"/><rect x="13.5" y="4.5" width="6" height="6" rx="1.5"/><rect x="4.5" y="13.5" width="6" height="6" rx="1.5"/><rect x="13.5" y="13.5" width="6" height="6" rx="1.5"/></svg>`;
+-    case 'lock':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="10.5" width="14" height="9.5" rx="2.2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/></svg>`;
+-    case 'link':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.5 13.5a3.6 3.6 0 0 0 5.1 0l2.9-2.9a3.6 3.6 0 0 0-5.1-5.1l-.9.9"/><path d="M13.5 10.5a3.6 3.6 0 0 0-5.1 0l-2.9 2.9a3.6 3.6 0 0 0 5.1 5.1l.9-.9"/></svg>`;
+-    case 'terminal':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 16.5l5-4.5-5-4.5M12.5 18h7"/></svg>`;
+-    case 'code':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15.5 17.5L21 12l-5.5-5.5M8.5 6.5L3 12l5.5 5.5"/></svg>`;
+-    case 'globe':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.3 2.4 3.4 5.2 3.4 8.5s-1.1 6.1-3.4 8.5c-2.3-2.4-3.4-5.2-3.4-8.5s1.1-6.1 3.4-8.5z"/></svg>`;
+-    case 'bolt':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 3.5L5.5 13.5h6l-1 7 7.5-10h-6z"/></svg>`;
++    case 'reveal':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 7.5a2 2 0 0 1 2-2h3.6a2 2 0 0 1 1.4.6l1.3 1.3h6.7a2 2 0 0 1 2 2v7.1a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/><path d="M12 15.5v-5M9.8 12.5l2.2-2.2 2.2 2.2"/></svg>`;
++    case 'chat':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11.5a7.5 7.5 0 0 1-11.1 6.6L4.5 19.5l1.4-4.2A7.5 7.5 0 1 1 20 11.5z"/></svg>`;
++    case 'arrowUp':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M6.5 10.5L12 5l5.5 5.5"/></svg>`;
++    case 'stop':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>`;
++    case 'wand':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 19l10-10M13 7l2-2 2 2-2 2"/><path d="M18.5 3.5v2M17.5 4.5h2M19.5 10.5v2M18.5 11.5h2M9.5 3.5v2M8.5 4.5h2"/></svg>`;
+     case 'agents':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="2.2"/><path d="M12 4.5a7.5 7.5 0 0 1 7.5 7.5"/><path d="M4.5 12A7.5 7.5 0 0 1 12 4.5" opacity=".55"/><path d="M19.5 12A7.5 7.5 0 0 1 12 19.5"/><path d="M12 19.5A7.5 7.5 0 0 1 4.5 12" opacity=".55"/><circle cx="19.5" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="4.5" cy="12" r="1.3" fill="currentColor" stroke="none"/></svg>`;
+-    case 'users':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9.5" cy="9" r="3.5"/><path d="M3.5 19c1-3 3.3-4.5 6-4.5s5 1.5 6 4.5"/><path d="M15.5 5.7a3.5 3.5 0 0 1 0 6.6M17.5 14.8c1.4.6 2.4 1.9 3 4.2"/></svg>`;
+-    case 'download':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4.5v10M7.5 10.5L12 15l4.5-4.5"/><path d="M5 19.5h14"/></svg>`;
+-    case 'file':
+-      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 3.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13.5 3.5V9H19"/></svg>`;
+   }
+ }
+diff --git a/chrome/browser/resources/webui_browser/meridian/menu.css b/chrome/browser/resources/webui_browser/meridian/menu.css
+new file mode 100644
+index 0000000000..5e0d6da15f
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/menu.css
+@@ -0,0 +1,125 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #scheme=relative
++ * #css_wrapper_metadata_end */
++
++:host {
++  display: block;
++}
++
++svg {
++  display: block;
++}
++
++.menu-item {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  height: 26px;
++  padding: 0 8px 0 6px;
++  border-radius: 6px;
++  white-space: nowrap;
++  cursor: default;
++}
++
++.menu-item.sel,
++.menu-item.open {
++  background: var(--meridian-space);
++  color: white;
++}
++
++.menu-item.sel .menu-keys,
++.menu-item.sel .menu-lead,
++.menu-item.sel .menu-chev,
++.menu-item.open .menu-keys,
++.menu-item.open .menu-lead,
++.menu-item.open .menu-chev,
++.menu-item.sel .menu-check {
++  color: rgba(255, 255, 255, 0.85);
++}
++
++.menu-item.disabled {
++  opacity: 0.38;
++}
++
++.menu-item.disabled.sel {
++  background: none;
++  color: var(--meridian-text);
++}
++
++.menu-item.danger {
++  color: #e5484d;
++}
++
++.menu-item.danger.sel {
++  background: #e5484d;
++  color: white;
++}
++
++.menu-item.danger .menu-lead {
++  color: inherit;
++}
++
++.menu-lead {
++  width: 18px;
++  display: inline-flex;
++  justify-content: center;
++  color: var(--meridian-text-muted);
++  flex: none;
++}
++
++.menu-label {
++  flex: 1;
++  overflow: hidden;
++  text-overflow: ellipsis;
++}
++
++.menu-keys {
++  color: var(--meridian-text-muted);
++  font-size: 12px;
++  letter-spacing: 0.04em;
++  padding-left: 14px;
++}
++
++.menu-check {
++  display: inline-flex;
++  color: var(--meridian-space);
++}
++
++.menu-chev {
++  display: inline-flex;
++  color: var(--meridian-text-muted);
++  margin-right: -2px;
++}
++
++.menu-sep {
++  height: 1px;
++  margin: 4px 8px;
++  background: var(--meridian-border);
++}
++
++.menu-header {
++  padding: 4px 8px 3px;
++  font-size: 11px;
++  font-weight: 600;
++  color: var(--meridian-text-muted);
++  letter-spacing: 0.02em;
++}
++
++.menu-swatch {
++  width: 12px;
++  height: 12px;
++  border-radius: 50%;
++  background: var(--c);
++  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);
++}
++
++.menu-emoji {
++  font-size: 13px;
++  line-height: 1;
++}
++
+diff --git a/chrome/browser/resources/webui_browser/meridian/menu.html.ts b/chrome/browser/resources/webui_browser/meridian/menu.html.ts
+new file mode 100644
+index 0000000000..35c80a177c
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/menu.html.ts
+@@ -0,0 +1,33 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {icon} from './icons.js';
++import type {MeridianMenuElement} from './menu.js';
++
++export function getHtml(this: MeridianMenuElement) {
++  return html`<!--_html_template_start_-->
++${this.rows_.map(r => html`
++  ${r.separator ? html`<div class="menu-sep"></div>` : ''}
++  ${r.entry.header ? html`<div class="menu-header">${r.entry.label}</div>` : html`
++    <div role="menuitem" class="${r.classes}"
++        aria-disabled="${r.entry.enabled === false}" data-index="${r.index}"
++        @mousemove="${this.onRowMousemove_}" @click="${this.onRowClick_}">
++      <span class="menu-lead">
++        ${r.entry.swatch ? html`
++          <span class="menu-swatch" style="--c:${r.entry.swatch}"></span>` : ''}
++        ${r.entry.emoji ? html`
++          <span class="menu-emoji">${r.entry.emoji}</span>` : ''}
++        ${r.entry.icon ? html`${icon(r.entry.icon, 15)}` : ''}
++      </span>
++      <span class="menu-label">${r.entry.label}</span>
++      ${r.entry.checked ? html`
++        <span class="menu-check">${icon('check', 13)}</span>` : ''}
++      ${r.entry.keys ? html`<span class="menu-keys">${r.entry.keys}</span>` : ''}
++      ${r.entry.submenu ? html`
++        <span class="menu-chev">${icon('chevronRight', 12)}</span>` : ''}
++    </div>`}`)}
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/menu.ts b/chrome/browser/resources/webui_browser/meridian/menu.ts
+new file mode 100644
+index 0000000000..84a5720803
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/menu.ts
+@@ -0,0 +1,132 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The rows of one of the sidebar's right-click menus, drawn like Arc's: an
++// icon, the label, its shortcut, a check, a submenu arrow or a colour swatch.
++// The sidebar keeps which row is highlighted and places the menus.
++
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {IconName} from './icons.js';
++import {getCss} from './menu.css.js';
++import {getHtml} from './menu.html.js';
++
++// A row of a menu.
++export interface MenuEntry {
++  label: string;
++  action?: () => void;
++  icon?: IconName;
++  emoji?: string;
++  swatch?: string;
++  keys?: string;
++  checked?: boolean;
++  // False shows it greyed out.
++  enabled?: boolean;
++  danger?: boolean;
++  separatorBefore?: boolean;
++  // A heading (the space's name), not a choice.
++  header?: boolean;
++  submenu?: MenuEntry[];
++}
++
++// A row as the template draws it.
++export interface MenuRow {
++  index: number;
++  entry: MenuEntry;
++  separator: boolean;
++  classes: string;
++}
++
++// Sent on pointer moves and clicks over a row.
++export interface MenuRowEvent {
++  level: number;
++  index: number;
++}
++
++export class MeridianMenuElement extends CrLitElement {
++  static get is() {
++    return 'meridian-menu';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      entries: {type: Array},
++      level: {type: Number},
++      sel: {type: Number},
++      openIndex: {type: Number},
++      rows_: {state: true, type: Array},
++    };
++  }
++
++  accessor entries: MenuEntry[] = [];
++  // 0: a menu, 1: the submenu beside it.
++  accessor level: number = 0;
++  // The highlighted row, and the row whose submenu is open.
++  accessor sel: number = -1;
++  accessor openIndex: number = -1;
++  protected accessor rows_: MenuRow[] = [];
++
++  override willUpdate(changed: PropertyValues<this>) {
++    super.willUpdate(changed);
++    this.rows_ = this.entries.map((entry, index) => {
++      const classes = ['menu-item'];
++      if (index === this.sel) {
++        classes.push('sel');
++      }
++      if (entry.enabled === false) {
++        classes.push('disabled');
++      }
++      if (entry.danger) {
++        classes.push('danger');
++      }
++      if (index === this.openIndex) {
++        classes.push('open');
++      }
++      return {
++        index,
++        entry,
++        separator: !!entry.separatorBefore && index > 0,
++        classes: classes.join(' '),
++      };
++    });
++  }
++
++  // Where a row is, to place its submenu beside it.
++  rowRect(index: number): DOMRect|null {
++    return this.shadowRoot
++               .querySelector<HTMLElement>(`.menu-item[data-index="${index}"]`)
++               ?.getBoundingClientRect() ||
++        null;
++  }
++
++  private rowEvent_(e: Event): MenuRowEvent {
++    const row = e.currentTarget as HTMLElement;
++    return {level: this.level, index: Number(row.dataset['index'])};
++  }
++
++  protected onRowMousemove_(e: Event) {
++    this.fire('menu-row-move', this.rowEvent_(e));
++  }
++
++  protected onRowClick_(e: Event) {
++    this.fire('menu-row-click', this.rowEvent_(e));
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-menu': MeridianMenuElement;
++  }
++}
++
++customElements.define(MeridianMenuElement.is, MeridianMenuElement);
+diff --git a/chrome/browser/resources/webui_browser/meridian/mission.css b/chrome/browser/resources/webui_browser/meridian/mission.css
+index 8be4dd2d4b..15a4f16f18 100644
+--- a/chrome/browser/resources/webui_browser/meridian/mission.css
++++ b/chrome/browser/resources/webui_browser/meridian/mission.css
+@@ -37,8 +37,7 @@ button {
+   inset: 0;
+   display: flex;
+   justify-content: center;
+-  align-items: flex-start;
+-  padding-top: 7vh;
++  align-items: center;
+   background: var(--meridian-overlay);
+   app-region: no-drag;
+   -webkit-app-region: no-drag;
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.css b/chrome/browser/resources/webui_browser/meridian/sidebar.css
+index 1cc1de6c65..0eabeb5c20 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.css
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.css
+@@ -356,37 +356,36 @@ button {
+ 
+ /* ------------------------------------------------------------ menu */
+ 
+-#menu {
++#menu,
++#submenu {
+   position: fixed;
++  left: 0;
++  top: 0;
+   z-index: 100;
+-  min-width: 200px;
++  min-width: 214px;
++  max-width: 320px;
+   padding: 5px;
+   border-radius: 10px;
+-  background: var(--meridian-surface);
+-  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.22), 0 0 0 0.5px var(--meridian-border);
+-}
+-
+-.menu-item {
+-  display: block;
+-  width: 100%;
+-  text-align: left;
+-  padding: 6px 10px;
+-  border-radius: 6px;
+-  white-space: nowrap;
+-}
+-
+-.menu-item:hover {
+-  background: color-mix(in srgb, var(--meridian-space) 22%, transparent);
++  background: color-mix(in srgb, var(--meridian-surface) 95%, transparent);
++  backdrop-filter: blur(24px) saturate(1.6);
++  box-shadow: 0 0 0 0.5px var(--meridian-border),
++      0 12px 36px rgba(0, 0, 0, 0.2), 0 2px 6px rgba(0, 0, 0, 0.08);
++  font-size: 13px;
++  color: var(--meridian-text);
++  animation: menu-in 0.11s cubic-bezier(0.2, 0.8, 0.2, 1);
++  transform-origin: top left;
++  user-select: none;
+ }
+ 
+-.menu-item.danger {
+-  color: #d13c3c;
++#menu[hidden] {
++  display: none;
+ }
+ 
+-.menu-sep {
+-  height: 1px;
+-  margin: 4px 6px;
+-  background: var(--meridian-border);
++@keyframes menu-in {
++  from {
++    opacity: 0;
++    transform: scale(0.96);
++  }
+ }
+ 
+ #favorites.drop-target,
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+index 37d97b84c9..730e7ac799 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+@@ -15,7 +15,7 @@ export function getHtml(this: MeridianSidebarElement) {
+     <meridian-fav .item="${f}" .host="${this}" .rev="${this.rev_}">
+     </meridian-fav>`)}
+ </div>
+-<div id="spacePage">
++<div id="spacePage" @contextmenu="${this.onBackgroundContextmenu_}">
+   ${this.space_ ? html`
+     <div class="space-header" data-space="${this.space_.id}"
+         @contextmenu="${this.onSpaceHeaderContextmenu_}"
+@@ -150,13 +150,20 @@ ${this.updateReady_() ? html`
+     </div>`)}
+ </div>
+ <div id="menu" role="menu" ?hidden="${!this.menu_}"
+-    style="left:${this.menu_?.x ?? 0}px; top:${this.menu_?.y ?? 0}px">
+-  ${(this.menu_?.entries || []).map((entry, index) => html`
+-    ${entry.separatorBefore ? html`<div class="menu-sep"></div>` : ''}
+-    <button role="menuitem" class="menu-item ${entry.danger ? 'danger' : ''}"
+-        data-index="${index}" @click="${this.onMenuEntryClick_}">
+-      ${entry.label}
+-    </button>`)}
++    @contextmenu="${this.onMenuContextmenu_}">
++  <meridian-menu .entries="${this.menuEntries(0)}" .level="${0}"
++      .sel="${this.menu_?.sel ?? -1}" .openIndex="${this.menu_?.sub?.index ?? -1}"
++      @menu-row-move="${this.onMenuRowMove_}"
++      @menu-row-click="${this.onMenuRowClick_}">
++  </meridian-menu>
+ </div>
++${this.menu_?.sub ? html`
++  <div id="submenu" role="menu" @contextmenu="${this.onMenuContextmenu_}">
++    <meridian-menu .entries="${this.menuEntries(1)}" .level="${1}"
++        .sel="${this.menu_.sub.sel}" .openIndex="${-1}"
++        @menu-row-move="${this.onMenuRowMove_}"
++        @menu-row-click="${this.onMenuRowClick_}">
++    </meridian-menu>
++  </div>` : ''}
+ <!--_html_template_end_-->`;
+ }
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index f452407eef..a048674ad4 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -30,6 +30,9 @@ import './fav.js';
+ import './item.js';
+ import './tab_row.js';
+ 
++import type {IconName} from './icons.js';
++import './menu.js';
++import type {MeridianMenuElement, MenuEntry, MenuRowEvent} from './menu.js';
+ import {getCss} from './sidebar.css.js';
+ import {getHtml} from './sidebar.html.js';
+ 
+@@ -42,13 +45,17 @@ const SPACE_COLORS = [
+   ['#8a9aa8', '#b5c0c8'],
+ ];
+ 
+-export interface MenuEntry {
+-  label: string;
+-  action: () => void;
+-  danger?: boolean;
+-  separatorBefore?: boolean;
++export interface OpenMenu {
++  x: number;
++  y: number;
++  entries: MenuEntry[];
++  // The highlighted row, and the submenu open beside one.
++  sel: number;
++  sub: {index: number, sel: number}|null;
+ }
+ 
++const COLOR_NAMES = ['Lavender', 'Rose', 'Sage', 'Sand', 'Sky', 'Violet', 'Slate'];
++
+ export interface MeridianSidebarElement {
+   $: {
+     menu: HTMLElement,
+@@ -135,8 +142,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+   // Live tabs by id, and the order they appeared in (newest Today tab first).
+   protected accessor tabs_: Map<NodeId, Tab> = new Map();
+   protected accessor state_: SidebarState|null = null;
+-  protected accessor menu_: {x: number, y: number, entries: MenuEntry[]}|null =
+-      null;
++  protected accessor menu_: OpenMenu|null = null;
+   // The item / space id being renamed in place.
+   protected accessor renaming_: string = '';
+   // Bumped on every change, so the row elements re-render with it.
+@@ -224,6 +230,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.handler_.getUpdateState().then(({state}) => this.update_ ??= state);
+     document.addEventListener('mousedown', this.onDocumentMouseDown_, true);
+     window.addEventListener('blur', this.closeMenu_);
++    document.addEventListener('keydown', this.onMenuKeydown_, true);
+     this.shadowRoot.addEventListener('dragstart', this.onDragStart_ as EventListener);
+     this.shadowRoot.addEventListener('dragend', this.onDragEnd_);
+     this.shadowRoot.addEventListener('dragover', this.onDragOver_ as EventListener);
+@@ -247,6 +254,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.commandListenerId_ = null;
+     document.removeEventListener('mousedown', this.onDocumentMouseDown_, true);
+     window.removeEventListener('blur', this.closeMenu_);
++    document.removeEventListener('keydown', this.onMenuKeydown_, true);
+   }
+ 
+   // ---------------------------------------------------------------- tabs
+@@ -1103,6 +1111,9 @@ export class MeridianSidebarElement extends CrLitElement implements
+ 
+   override updated(changed: PropertyValues<this>) {
+     super.updated(changed);
++    if (changed.has('menu_' as keyof MeridianSidebarElement)) {
++      this.placeMenus_();
++    }
+     // The space being renamed may only render after the next state push.
+     const input =
+         this.shadowRoot.querySelector<HTMLInputElement>('input.rename');
+@@ -1116,42 +1127,58 @@ export class MeridianSidebarElement extends CrLitElement implements
+ 
+   // --------------------------------------------------------------- menus
+ 
++  // The other spaces, as a "Move to Space" submenu.
++  private moveToSpaceMenu_(move: (spaceId: string) => void): MenuEntry[] {
++    const active = this.activeSpace();
++    return (this.state_?.spaces || []).filter(s => s.id !== active?.id)
++        .map(s => ({
++               label: s.name,
++               ...(s.icon ? {emoji: s.icon} : {swatch: s.color}),
++               action: () => move(s.id),
++             }));
++  }
++
+   onTabContextMenu(e: MouseEvent, tab: Tab) {
+     const space = this.activeSpace();
+     assert(space);
+-    const others = (this.state_?.spaces || []).filter(s => s.id !== space.id);
++    const move = this.moveToSpaceMenu_(id => this.handler_.moveTabToSpace(tab.id, id));
+     this.openMenu_(e, [
+       {
+-        label: 'Pin to ' + space.name,
+-        action: () => this.handler_.pinTab(
+-            tab.id, {container: space.id, parentId: '', index: -1},
+-            this.customTitle_(tab.id)),
++        label: 'Copy Link',
++        icon: 'link',
++        keys: tab.isActive ? '⇧⌘C' : undefined,
++        action: () => navigator.clipboard.writeText(tab.url),
++      },
++      {label: 'Duplicate', icon: 'duplicate', action: () => this.openUrl(tab.url)},
++      {
++        label: 'Open in Split View',
++        icon: 'split',
++        enabled: !tab.isActive,
++        action: () => this.handler_.splitWith(tab.id),
+       },
+       {
+         label: 'Add to Favorites',
++        icon: 'star',
++        separatorBefore: true,
+         action: () => this.handler_.pinTab(
+             tab.id, {container: FAVORITES, parentId: '', index: -1},
+             this.customTitle_(tab.id)),
+       },
+-      ...others.map((s, i) => ({
+-        label: 'Move to ' + s.name,
+-        action: () => this.handler_.moveTabToSpace(tab.id, s.id),
+-        separatorBefore: i === 0,
+-      })),
+-      ...(tab.isActive ? [] : [{
+-        label: 'Open in Split View',
+-        action: () => this.handler_.splitWith(tab.id),
+-        separatorBefore: true,
+-      }]),
+       {
+-        label: 'Copy Link',
+-        action: () => navigator.clipboard.writeText(tab.url),
+-        separatorBefore: true,
++        label: 'Pin Tab',
++        icon: 'pin',
++        keys: tab.isActive ? '⌘D' : undefined,
++        action: () => this.handler_.pinTab(
++            tab.id, {container: space.id, parentId: '', index: -1},
++            this.customTitle_(tab.id)),
+       },
++      {label: 'Move to Space', icon: 'moveTo', enabled: move.length > 0, submenu: move},
+       {
+         label: 'Close Tab',
++        icon: 'x',
++        keys: tab.isActive ? '⌘W' : undefined,
++        separatorBefore: true,
+         action: () => this.tabStripService_.closeNodes([tab.id]),
+-        danger: true,
+       },
+     ]);
+   }
+@@ -1160,90 +1187,226 @@ export class MeridianSidebarElement extends CrLitElement implements
+     const space = this.activeSpace();
+     assert(space);
+     const tab = this.liveTab(item.id);
+-    const entries: MenuEntry[] = [];
++    const moveItem = (spaceId: string) => this.handler_.moveItem(
++        item.id, {container: spaceId, parentId: '', index: -1});
++    const move = this.moveToSpaceMenu_(moveItem);
+     if (item.isFolder) {
+-      entries.push(
+-          {label: 'Rename Folder', action: () => this.renaming_ = item.id},
+-          {
+-            label: 'New Folder Inside',
+-            action: () => this.addFolder_(space.id, item.id),
+-          },
+-          {
+-            label: 'Delete Folder',
+-            action: () => this.handler_.removeItem(item.id),
+-            danger: true,
+-            separatorBefore: true,
+-          });
+-    } else {
+-      entries.push({label: 'Rename', action: () => this.renaming_ = item.id});
+-      if (container === FAVORITES) {
+-        entries.push({
+-          label: 'Move to ' + space.name,
+-          action: () => this.handler_.moveItem(
+-              item.id, {container: space.id, parentId: '', index: -1}),
+-        });
+-      } else {
+-        entries.push({
+-          label: 'Move to Favorites',
+-          action: () => this.handler_.moveItem(
+-              item.id, {container: FAVORITES, parentId: '', index: -1}),
+-        });
+-      }
+-      if (tab) {
+-        entries.push({
+-          label: 'Go to Home Page',
+-          action: () => this.handler_.resetItemToHome(item.id),
+-        });
+-      }
+-      entries.push(
+-          {
+-            label: 'Copy Link',
+-            action: () =>
+-                navigator.clipboard.writeText(tab ? tab.url : item.url),
+-            separatorBefore: true,
+-          },
+-          {
+-            label: container === FAVORITES ? 'Remove from Favorites' : 'Unpin',
+-            action: () => this.handler_.removeItem(item.id),
+-          });
+-      if (tab) {
+-        entries.push({
+-          label: 'Close Tab',
+-          action: () => this.tabStripService_.closeNodes([tab.id]),
++      this.openMenu_(e, [
++        {label: 'Rename Folder…', icon: 'pencil', action: () => this.renaming_ = item.id},
++        {
++          label: item.open ? 'Collapse' : 'Expand',
++          icon: item.open ? 'folder' : 'folderOpen',
++          action: () => this.handler_.setFolderOpen(item.id, !item.open),
++        },
++        {
++          label: 'New Folder Inside',
++          icon: 'plus',
++          action: () => this.addFolder_(space.id, item.id),
++        },
++        {
++          label: 'Move to Space',
++          icon: 'moveTo',
++          enabled: move.length > 0,
++          separatorBefore: true,
++          submenu: move,
++        },
++        {
++          label: 'Delete Folder…',
++          icon: 'trash',
+           danger: true,
+-        });
+-      }
++          separatorBefore: true,
++          action: () => this.handler_.removeItem(item.id),
++        },
++      ]);
++      return;
+     }
+-    this.openMenu_(e, entries);
++    const url = tab ? tab.url : item.url;
++    const fav = container === FAVORITES;
++    this.openMenu_(e, [
++      {
++        label: 'Copy Link',
++        icon: 'link',
++        keys: tab?.isActive ? '⇧⌘C' : undefined,
++        action: () => navigator.clipboard.writeText(url),
++      },
++      {label: 'Duplicate', icon: 'duplicate', action: () => this.openUrl(url)},
++      ...(tab ? [{
++        label: 'Open in Split View',
++        icon: 'split' as IconName,
++        enabled: !tab.isActive,
++        action: () => this.handler_.splitWith(tab.id),
++      }] : []),
++      fav ? {
++        label: 'Remove from Favorites',
++        icon: 'star',
++        separatorBefore: true,
++        action: () => moveItem(space.id),
++      } : {
++        label: 'Add to Favorites',
++        icon: 'star',
++        separatorBefore: true,
++        action: () => moveItem(FAVORITES),
++      },
++      ...(fav ? [] : [{
++        label: 'Unpin Tab',
++        icon: 'unpin' as IconName,
++        keys: tab?.isActive ? '⌘D' : undefined,
++        action: () => this.handler_.removeItem(item.id),
++      }]),
++      {label: 'Rename…', icon: 'pencil', action: () => this.renaming_ = item.id},
++      ...(tab && tab.url !== item.url ? [{
++        label: 'Go Back to Pinned URL',
++        icon: 'home' as IconName,
++        action: () => this.handler_.resetItemToHome(item.id),
++      }] : []),
++      ...(fav ? [] : [{
++        label: 'Move to Space',
++        icon: 'moveTo' as IconName,
++        enabled: move.length > 0,
++        submenu: move,
++      }]),
++      ...(tab ? [{
++        label: 'Close Tab',
++        icon: 'x' as IconName,
++        separatorBefore: true,
++        action: () => this.tabStripService_.closeNodes([tab.id]),
++      }] : []),
++      {
++        label: fav ? 'Delete Favorite' : 'Delete from Sidebar',
++        icon: 'trash',
++        danger: true,
++        separatorBefore: !tab,
++        action: () => {
++          if (tab) {
++            this.tabStripService_.closeNodes([tab.id]);
++          }
++          this.handler_.removeItem(item.id);
++        },
++      },
++    ]);
+   }
+ 
+   private openSpaceMenu_(e: MouseEvent, space: Space) {
+-    const entries: MenuEntry[] = [
+-      {label: 'Rename Space', action: () => this.renaming_ = space.id},
++    const spaces = this.state_?.spaces || [];
++    const index = spaces.findIndex(s => s.id === space.id);
++    const profiles = this.state_?.profiles || [];
++    this.openMenu_(e, [
++      {label: space.name, header: true},
+       {
+-        label: 'Edit Space Theme…',
++        label: 'Edit Theme…',
++        icon: 'palette',
+         action: () => this.fire('meridian-edit-theme', space),
+       },
+-      {label: 'New Folder', action: () => this.addFolder_(space.id, '')},
+-    ];
+-    // Its profile (cookies, logins, site data), once there is a choice.
+-    const profiles = this.state_?.profiles || [];
+-    if (profiles.length > 1) {
+-      profiles.forEach((p, i) => entries.push({
+-        label: (p.id === space.profileId ? '✓ ' : '') + 'Profile: ' + p.name,
+-        action: () => this.handler_.setSpaceProfile(space.id, p.id),
+-        separatorBefore: i === 0,
+-      }));
+-    }
+-    if ((this.state_?.spaces.length || 0) > 1) {
+-      entries.push({
+-        label: 'Delete Space',
+-        action: () => this.handler_.deleteSpace(space.id),
+-        danger: true,
++      {label: 'Rename…', icon: 'pencil', action: () => this.renaming_ = space.id},
++      {
++        label: 'Colour',
++        icon: 'grid',
++        submenu: SPACE_COLORS.map(([color, color2], i) => ({
++          label: COLOR_NAMES[i] || color!,
++          swatch: color,
++          checked: space.color === color,
++          action: () => this.handler_.updateSpace(
++              space.id, space.name, space.icon, color!, color2!),
++        })),
++      },
++      {
++        label: 'Profile',
++        icon: 'user',
++        submenu: [
++          ...profiles.map(p => ({
++            label: p.name,
++            checked: p.id === space.profileId,
++            action: () => this.handler_.setSpaceProfile(space.id, p.id),
++          })),
++          {
++            label: 'Manage Profiles…',
++            icon: 'users' as IconName,
++            separatorBefore: true,
++            action: () => this.fire('meridian-show-settings', 'profiles'),
++          },
++        ],
++      },
++      {
++        label: 'New Folder',
++        icon: 'folder',
++        keys: '⌥⇧⌘N',
++        action: () => this.addFolder_(space.id, ''),
++      },
++      {
++        label: 'Move Left',
++        icon: 'arrowLeft',
+         separatorBefore: true,
+-      });
++        enabled: index > 0,
++        action: () => this.handler_.moveSpace(space.id, index - 1),
++      },
++      {
++        label: 'Move Right',
++        icon: 'arrowRight',
++        enabled: index < spaces.length - 1,
++        action: () => this.handler_.moveSpace(space.id, index + 1),
++      },
++      {
++        label: 'New Space…',
++        icon: 'plus',
++        separatorBefore: true,
++        action: () => this.onAddSpaceClick_(),
++      },
++      {
++        label: 'Delete Space…',
++        icon: 'trash',
++        danger: true,
++        enabled: spaces.length > 1,
++        action: () => this.handler_.deleteSpace(space.id),
++      },
++    ]);
++  }
++
++  // Right-click on the sidebar's empty space.
++  protected onBackgroundContextmenu_(e: MouseEvent) {
++    const space = this.activeSpace();
++    if (!space || this.state_?.offTheRecord ||
++        e.composedPath().some(
++            n => n instanceof HTMLElement &&
++                (n.matches('meridian-item, meridian-fav, meridian-tab-row, ' +
++                           '.space-header, .space-dot, button, input')))) {
++      return;
+     }
+-    this.openMenu_(e, entries);
++    this.openMenu_(e, [
++      {label: 'New Tab', icon: 'plus', keys: '⌘T', action: () => this.onNewTabClick_()},
++      {
++        label: 'New Folder',
++        icon: 'folder',
++        keys: '⌥⇧⌘N',
++        action: () => this.addFolder_(space.id, ''),
++      },
++      {label: 'New Space…', icon: 'layers', action: () => this.onAddSpaceClick_()},
++      {
++        label: 'Edit Space Theme…',
++        icon: 'palette',
++        separatorBefore: true,
++        action: () => this.fire('meridian-edit-theme', space),
++      },
++      {
++        label: 'View Archive',
++        icon: 'archive',
++        keys: '⌥⌘A',
++        action: () => this.fire('meridian-show-archive'),
++      },
++      {
++        label: 'Clear Today',
++        icon: 'wand',
++        keys: '⇧⌘K',
++        enabled: this.today_.length > 0,
++        action: () => this.onClearTodayClick_(),
++      },
++      {
++        label: 'Open Workbench',
++        icon: 'code',
++        keys: '⇧⌘E',
++        separatorBefore: true,
++        action: () => this.onWorkbenchClick_(),
++      },
++    ]);
+   }
+ 
+   private async addFolder_(spaceId: string, parentId: string) {
+@@ -1257,14 +1420,164 @@ export class MeridianSidebarElement extends CrLitElement implements
+   private openMenu_(e: MouseEvent, entries: MenuEntry[]) {
+     e.preventDefault();
+     e.stopPropagation();
+-    this.menu_ = {x: e.clientX, y: e.clientY, entries};
++    this.menu_ = {x: e.clientX, y: e.clientY, entries, sel: -1, sub: null};
++  }
++
++  protected onMenuContextmenu_(e: Event) {
++    e.preventDefault();
++  }
++
++  menuOpen(): boolean {
++    return !!this.menu_;
++  }
++
++  // The entries of the menu at `level` (0: the menu, 1: its open submenu).
++  menuEntries(level: number): MenuEntry[] {
++    const menu = this.menu_;
++    if (!menu) {
++      return [];
++    }
++    return level === 0 ? menu.entries :
++                         (menu.sub && menu.entries[menu.sub.index]?.submenu) || [];
++  }
++
++  private subTimer_ = 0;
++
++  protected onMenuRowMove_(e: CustomEvent<MenuRowEvent>) {
++    const {level, index} = e.detail;
++    const menu = this.menu_;
++    if (!menu) {
++      return;
++    }
++    if (level === 1 && menu.sub) {
++      if (menu.sub.sel !== index) {
++        this.menu_ = {...menu, sub: {...menu.sub, sel: index}};
++      }
++      return;
++    }
++    if (menu.sel === index) {
++      return;
++    }
++    this.menu_ = {...menu, sel: index};
++    // A submenu opens after a moment, so a pass over its row doesn't flash it.
++    clearTimeout(this.subTimer_);
++    this.subTimer_ = setTimeout(() => {
++      const now = this.menu_;
++      if (!now || now.sel !== index) {
++        return;
++      }
++      const entry = now.entries[index];
++      if (entry?.submenu && entry.enabled !== false) {
++        if (now.sub?.index !== index) {
++          this.menu_ = {...now, sub: {index, sel: -1}};
++        }
++      } else if (now.sub) {
++        this.menu_ = {...now, sub: null};
++      }
++    }, 120);
++  }
++
++  protected onMenuRowClick_(e: CustomEvent<MenuRowEvent>) {
++    this.chooseMenuRow_(e.detail.level, e.detail.index);
+   }
+ 
+-  protected onMenuEntryClick_(e: Event) {
+-    const index = Number((e.currentTarget as HTMLElement).dataset['index']);
+-    const entry = this.menu_?.entries[index];
++  private chooseMenuRow_(level: number, index: number) {
++    const menu = this.menu_;
++    const entry = this.menuEntries(level)[index];
++    if (!menu || !entry || entry.header || entry.enabled === false) {
++      return;
++    }
++    if (entry.submenu) {
++      this.menu_ = {...menu, sel: index, sub: {index, sel: 0}};
++      return;
++    }
+     this.menu_ = null;
+-    entry?.action();
++    entry.action?.();
++  }
++
++  // Arrow keys, Return and Escape while a menu is open.
++  private onMenuKeydown_ = (e: KeyboardEvent) => {
++    const menu = this.menu_;
++    if (!menu) {
++      return;
++    }
++    const inSub = !!menu.sub && menu.sub.sel >= 0;
++    const level = inSub ? 1 : 0;
++    const entries = this.menuEntries(level);
++    const choosable = entries.map((m, i) => (!m.header && m.enabled !== false) ? i : -1)
++                          .filter(i => i >= 0);
++    const sel = inSub ? menu.sub!.sel : menu.sel;
++    const step = (d: number) => {
++      const at = choosable.indexOf(sel);
++      const next = choosable[(at + d + choosable.length) % choosable.length] ?? -1;
++      this.menu_ = inSub ? {...menu, sub: {...menu.sub!, sel: next}} :
++                           {...menu, sel: next, sub: null};
++    };
++    switch (e.key) {
++      case 'Escape':
++        this.menu_ = menu.sub ? {...menu, sub: null} : null;
++        break;
++      case 'ArrowDown':
++        step(1);
++        break;
++      case 'ArrowUp':
++        step(-1);
++        break;
++      case 'ArrowRight':
++        if (!inSub && entries[sel]?.submenu) {
++          this.chooseMenuRow_(0, sel);
++        }
++        break;
++      case 'ArrowLeft':
++        if (menu.sub) {
++          this.menu_ = {...menu, sub: null};
++        }
++        break;
++      case 'Enter':
++        if (sel >= 0) {
++          this.chooseMenuRow_(level, sel);
++        }
++        break;
++      default:
++        return;
++    }
++    e.preventDefault();
++    e.stopPropagation();
++  };
++
++  // Keeps the menus inside the window: a menu that would run past the bottom
++  // opens upward, a submenu that would run past the edge opens on the left.
++  private async placeMenus_() {
++    // The rows draw in the menus' own update, after this one.
++    await Promise.all(
++        [...this.shadowRoot.querySelectorAll<MeridianMenuElement>('meridian-menu')]
++            .map(m => m.updateComplete));
++    const menu = this.menu_;
++    if (!menu) {
++      return;
++    }
++    const place = (el: HTMLElement, x: number, y: number, flipX?: number) => {
++      const w = el.offsetWidth;
++      const h = el.offsetHeight;
++      let left = x;
++      let top = y;
++      if (left + w > window.innerWidth - 6) {
++        left = flipX !== undefined ? flipX - w : window.innerWidth - w - 6;
++      }
++      if (top + h > window.innerHeight - 6) {
++        top = window.innerHeight - h - 6;
++      }
++      el.style.left = Math.max(6, left) + 'px';
++      el.style.top = Math.max(6, top) + 'px';
++    };
++    place(this.$.menu, menu.x, menu.y);
++    const sub = this.shadowRoot.getElementById('submenu');
++    const rows =
++        this.$.menu.querySelector<MeridianMenuElement>('meridian-menu');
++    const r = menu.sub && rows?.rowRect(menu.sub.index);
++    if (sub && r) {
++      place(sub, r.right + 2, r.top - 5, r.left - 2);
++    }
+   }
+ 
+   private closeMenu_ = () => {
+@@ -1273,7 +1586,9 @@ export class MeridianSidebarElement extends CrLitElement implements
+ 
+   private onDocumentMouseDown_ = (e: MouseEvent) => {
+     const path = e.composedPath();
+-    if (this.menu_ && !path.includes(this.$.menu)) {
++    const submenu = this.shadowRoot.getElementById('submenu');
++    if (this.menu_ && !path.includes(this.$.menu) &&
++        !(submenu && path.includes(submenu))) {
+       this.menu_ = null;
+     }
+     const button = this.shadowRoot.getElementById('downloadsButton');
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_control.css b/chrome/browser/resources/webui_browser/meridian/site_control.css
+new file mode 100644
+index 0000000000..a0cde71722
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/site_control.css
+@@ -0,0 +1,273 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #scheme=relative
++ * #css_wrapper_metadata_end */
++
++:host {
++  position: fixed;
++  left: var(--x, 0);
++  top: var(--y, 0);
++  z-index: 95;
++  display: none;
++  color: var(--meridian-text);
++  font-size: 13px;
++}
++
++:host([open]) {
++  display: block;
++}
++
++button {
++  border: 0;
++  background: none;
++  font: inherit;
++  color: inherit;
++  padding: 0;
++  cursor: default;
++  text-align: left;
++}
++
++svg {
++  display: block;
++}
++
++#card {
++  width: 300px;
++  max-height: calc(100vh - var(--y, 0px) - 16px);
++  overflow-y: auto;
++  padding: 10px;
++  box-sizing: border-box;
++  border-radius: 16px;
++  background: color-mix(in srgb, var(--meridian-surface) 97%, var(--meridian-space));
++  backdrop-filter: blur(24px) saturate(1.6);
++  box-shadow: 0 0 0 0.5px var(--meridian-border),
++      0 16px 48px rgba(0, 0, 0, 0.22), 0 2px 8px rgba(0, 0, 0, 0.08);
++  animation: pop 0.14s cubic-bezier(0.2, 0.8, 0.2, 1);
++  transform-origin: top center;
++  user-select: none;
++}
++
++@keyframes pop {
++  from {
++    opacity: 0;
++    transform: translateY(-4px) scale(0.98);
++  }
++}
++
++.quick {
++  display: grid;
++  grid-template-columns: repeat(4, 1fr);
++  gap: 6px;
++}
++
++.q {
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  justify-content: center;
++  gap: 4px;
++  height: 52px;
++  border-radius: 11px;
++  background: var(--meridian-surface);
++  box-shadow: 0 0 0 0.5px var(--meridian-border), 0 1px 2px rgba(0, 0, 0, 0.06);
++  font-size: 10.5px;
++  font-weight: 500;
++  color: var(--meridian-text-muted);
++  transition: transform 0.1s, color 0.1s;
++}
++
++.q svg {
++  color: var(--meridian-text);
++}
++
++.q:hover {
++  color: var(--meridian-text);
++}
++
++.q:active {
++  transform: scale(0.97);
++}
++
++.sec {
++  margin: 14px 4px 6px;
++  font-size: 12px;
++  font-weight: 650;
++  color: var(--meridian-text);
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++}
++
++.ext {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: 6px;
++}
++
++.ext-add {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  width: 40px;
++  height: 32px;
++  border-radius: 9px;
++  background: color-mix(in srgb, var(--meridian-text) 6%, transparent);
++  color: var(--meridian-text-muted);
++}
++
++.ext-add:hover {
++  color: var(--meridian-text);
++}
++
++.row {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  width: 100%;
++  min-height: 44px;
++  padding: 4px 6px;
++  box-sizing: border-box;
++  border-radius: 10px;
++}
++
++button.row:hover {
++  background: color-mix(in srgb, var(--meridian-text) 5%, transparent);
++}
++
++.row-ic {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  width: 32px;
++  height: 32px;
++  flex: none;
++  border-radius: 50%;
++  background: color-mix(in srgb, var(--meridian-text) 8%, transparent);
++  color: var(--meridian-text-muted);
++}
++
++.row.on .row-ic {
++  background: color-mix(in srgb, var(--meridian-space) 22%, transparent);
++  color: var(--meridian-space);
++}
++
++.row-text {
++  display: flex;
++  flex-direction: column;
++  flex: 1;
++  min-width: 0;
++}
++
++.row-label {
++  font-weight: 600;
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++}
++
++.row-sub {
++  font-size: 12px;
++  color: var(--meridian-text-muted);
++}
++
++.row.confirm .row-label {
++  color: #e5484d;
++}
++
++.switch {
++  position: relative;
++  width: 30px;
++  height: 18px;
++  flex: none;
++  border-radius: 9px;
++  background: color-mix(in srgb, var(--meridian-text) 18%, transparent);
++  transition: background 0.15s;
++}
++
++.switch i {
++  position: absolute;
++  top: 2px;
++  left: 2px;
++  width: 14px;
++  height: 14px;
++  border-radius: 50%;
++  background: white;
++  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
++  transition: transform 0.15s;
++}
++
++.row.on .switch {
++  background: var(--meridian-space);
++}
++
++.row.on .switch i {
++  transform: translateX(12px);
++}
++
++.zoom-btn,
++.zoom-value {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  height: 26px;
++  border-radius: 7px;
++  background: color-mix(in srgb, var(--meridian-text) 6%, transparent);
++}
++
++.zoom-btn {
++  width: 26px;
++}
++
++.zoom-value {
++  min-width: 48px;
++  font-variant-numeric: tabular-nums;
++  font-weight: 500;
++}
++
++.zoom-btn:hover,
++.zoom-value:hover {
++  background: color-mix(in srgb, var(--meridian-text) 11%, transparent);
++}
++
++.foot {
++  display: flex;
++  align-items: center;
++  margin-top: 10px;
++  padding-top: 10px;
++  border-top: 1px solid var(--meridian-border);
++}
++
++.grow {
++  flex: 1;
++}
++
++.security {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  height: 30px;
++  padding: 0 10px;
++  border-radius: 9px;
++  background: color-mix(in srgb, var(--meridian-text) 6%, transparent);
++  font-weight: 600;
++}
++
++.security.insecure,
++.security.dangerous {
++  color: #e5484d;
++}
++
++.more {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  width: 30px;
++  height: 30px;
++  border-radius: 50%;
++  background: color-mix(in srgb, var(--meridian-text) 6%, transparent);
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_control.html.ts b/chrome/browser/resources/webui_browser/meridian/site_control.html.ts
+new file mode 100644
+index 0000000000..5db8bb3a43
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/site_control.html.ts
+@@ -0,0 +1,90 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {icon} from './icons.js';
++import type {MeridianSiteControlElement} from './site_control.js';
++
++export function getHtml(this: MeridianSiteControlElement) {
++  return html`<!--_html_template_start_-->
++<div id="card" role="dialog" aria-label="Site controls">
++  <div class="quick">
++    <button class="q" data-action="copy" @click="${this.onQuickClick_}">
++      ${icon(this.copyIcon_(), 18)}<span>${this.copyLabel_()}</span>
++    </button>
++    <button class="q" data-action="pin" @click="${this.onQuickClick_}">
++      ${icon('pin', 18)}<span>Pin</span>
++    </button>
++    <button class="q" data-action="split" @click="${this.onQuickClick_}">
++      ${icon('split', 18)}<span>Split</span>
++    </button>
++    <button class="q" data-action="ask" @click="${this.onQuickClick_}">
++      ${icon('sparkles', 18)}<span>Ask AI</span>
++    </button>
++  </div>
++
++  <div class="sec">Extensions</div>
++  <div class="ext">
++    <slot name="extensions"></slot>
++    <button id="addExtension" class="ext-add" title="Get extensions"
++        @click="${this.onAddExtensionClick_}">${icon('plus', 16)}</button>
++  </div>
++
++  ${this.info_?.origin ? html`
++    <div class="sec">${this.info_.host}</div>
++    <button id="adsRow" class="row ${this.info_.adblock ? 'on' : ''}"
++        @click="${this.onAdsClick_}">
++      <span class="row-ic">${icon('shield', 16)}</span>
++      <span class="row-text">
++        <span class="row-label">Block ads and trackers</span>
++        <span class="row-sub">${this.adsState_()}</span>
++      </span>
++      <span class="switch"><i></i></span>
++    </button>
++    ${this.rows_.map(r => html`
++      <button class="row permission ${r.allowed ? 'on' : ''}"
++          data-type="${r.type}" @click="${this.onPermissionClick_}">
++        <span class="row-ic">${icon(r.icon, 16)}</span>
++        <span class="row-text">
++          <span class="row-label">${r.label}</span>
++          <span class="row-sub">${r.state}</span>
++        </span>
++        <span class="switch"><i></i></span>
++      </button>`)}
++    <div class="row zoom">
++      <span class="row-ic">${icon('search', 16)}</span>
++      <span class="row-text">
++        <span class="row-label">Zoom</span>
++      </span>
++      <button class="zoom-btn" data-step="-1" title="Zoom out"
++          @click="${this.onZoomClick_}">${icon('minus', 14)}</button>
++      <button class="zoom-value" data-step="0" title="Reset to 100%"
++          @click="${this.onZoomClick_}">${this.info_.zoom}%</button>
++      <button class="zoom-btn" data-step="1" title="Zoom in"
++          @click="${this.onZoomClick_}">${icon('plus', 14)}</button>
++    </div>
++    <button id="clearRow" class="row ${this.confirmClear_ ? 'confirm' : ''}"
++        @click="${this.onClearClick_}">
++      <span class="row-ic">${icon('trash', 16)}</span>
++      <span class="row-text">
++        <span class="row-label">${this.clearLabel_()}</span>
++        <span class="row-sub">You’ll be signed out of this site</span>
++      </span>
++    </button>
++  ` : ''}
++
++  <div class="foot">
++    <button id="security" class="security ${this.info_?.security || ''}"
++        @click="${this.onSecurityClick_}">
++      ${icon(this.securityIcon_(), 14)}<span>${this.securityLabel_()}</span>
++    </button>
++    <div class="grow"></div>
++    ${this.info_?.origin ? html`
++      <button id="more" class="more" title="All site settings"
++          @click="${this.onMoreClick_}">${icon('more', 16)}</button>` : ''}
++  </div>
++</div>
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_control.ts b/chrome/browser/resources/webui_browser/meridian/site_control.ts
+new file mode 100644
+index 0000000000..637ee8f2b8
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/site_control.ts
+@@ -0,0 +1,208 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The Site Control Center: the sliders at the end of the URL pill open it.
++// Quick actions for the page, the extensions, and what the site may do (ads
++// and trackers, permissions, zoom, its cookies), like Arc's, over Chromium's
++// own site settings.
++
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {browserProxyFactory} from '../sidebar.mojom-webui.js';
++import type {SidebarHandlerInterface, SiteInfo} from '../sidebar.mojom-webui.js';
++
++import type {IconName} from './icons.js';
++import {getCss} from './site_control.css.js';
++import {getHtml} from './site_control.html.js';
++
++// A permission row as the template draws it.
++export interface SiteRow {
++  type: string;
++  label: string;
++  icon: IconName;
++  state: string;
++  allowed: boolean;
++}
++
++const ICONS: Record<string, IconName> = {
++  camera: 'eye',
++  microphone: 'speaker',
++  location: 'globe',
++  notifications: 'bolt',
++  popups: 'window',
++  sound: 'speaker',
++  clipboard: 'copy',
++  downloads: 'download',
++  pip: 'littleWindow',
++};
++
++const STATES: Record<string, string> = {
++  allow: 'Allowed',
++  block: 'Blocked',
++  ask: 'Ask',
++};
++
++export class MeridianSiteControlElement extends CrLitElement {
++  static get is() {
++    return 'meridian-site-control';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      open: {type: Boolean, reflect: true},
++      url: {type: String},
++      hasExtensions: {type: Boolean},
++      info_: {state: true, type: Object},
++      rows_: {state: true, type: Array},
++      copied_: {state: true, type: Boolean},
++      confirmClear_: {state: true, type: Boolean},
++    };
++  }
++
++  accessor open: boolean = false;
++  // The page's address (Copy Link).
++  accessor url: string = '';
++  accessor hasExtensions: boolean = false;
++  protected accessor info_: SiteInfo|null = null;
++  protected accessor rows_: SiteRow[] = [];
++  protected accessor copied_: boolean = false;
++  // "Clear cookies and site data" asks once more.
++  protected accessor confirmClear_: boolean = false;
++
++  private handler_: SidebarHandlerInterface =
++      browserProxyFactory.getInstance().handler;
++
++  override willUpdate(changed: PropertyValues<this>) {
++    super.willUpdate(changed);
++    if (changed.has('open') && this.open) {
++      this.copied_ = false;
++      this.confirmClear_ = false;
++      this.refresh_();
++    }
++    this.rows_ = (this.info_?.permissions || []).map(p => ({
++      type: p.type,
++      label: p.label,
++      icon: ICONS[p.type] || 'settings',
++      state: (STATES[p.setting] || p.setting) + (p.isDefault ? ' (default)' : ''),
++      allowed: p.setting === 'allow',
++    }));
++  }
++
++  private async refresh_() {
++    const {info} = await this.handler_.getSiteInfo();
++    this.info_ = info;
++  }
++
++  protected copyIcon_(): IconName {
++    return this.copied_ ? 'check' : 'link';
++  }
++
++  protected copyLabel_(): string {
++    return this.copied_ ? 'Copied' : 'Copy Link';
++  }
++
++  protected clearLabel_(): string {
++    return this.confirmClear_ ? 'Click again to clear and reload' :
++                                'Clear cookies and site data';
++  }
++
++  protected securityLabel_(): string {
++    switch (this.info_?.security) {
++      case 'secure':
++        return 'Secure';
++      case 'insecure':
++        return 'Not secure';
++      case 'dangerous':
++        return 'Dangerous';
++      default:
++        return 'Meridian page';
++    }
++  }
++
++  protected securityIcon_(): IconName {
++    return this.info_?.security === 'secure' ? 'lock' : 'info';
++  }
++
++  protected adsState_(): string {
++    if (!this.info_?.adblockEverywhere) {
++      return 'Off in Settings';
++    }
++    return this.info_.adblock ? 'On' : 'Off for this site';
++  }
++
++  protected onQuickClick_(e: Event) {
++    const action = (e.currentTarget as HTMLElement).dataset['action'];
++    if (action === 'copy') {
++      navigator.clipboard.writeText(this.url);
++      this.copied_ = true;
++      setTimeout(() => this.copied_ = false, 1400);
++      return;
++    }
++    this.fire('site-control-action', action);
++  }
++
++  protected async onAdsClick_() {
++    if (!this.info_?.adblockEverywhere) {
++      this.fire('site-control-action', 'settings');
++      return;
++    }
++    // Allowed here, or back to the default (blocked).
++    await this.handler_.setSitePermission(
++        'ads', this.info_.adblock ? 'allow' : 'ask');
++    this.refresh_();
++  }
++
++  protected async onPermissionClick_(e: Event) {
++    const type = (e.currentTarget as HTMLElement).dataset['type']!;
++    const row = this.rows_.find(r => r.type === type);
++    await this.handler_.setSitePermission(type, row?.allowed ? 'block' : 'allow');
++    this.refresh_();
++  }
++
++  protected async onZoomClick_(e: Event) {
++    const step = Number((e.currentTarget as HTMLElement).dataset['step']);
++    await this.handler_.zoomSite(step);
++    this.refresh_();
++  }
++
++  protected async onClearClick_() {
++    if (!this.confirmClear_) {
++      this.confirmClear_ = true;
++      return;
++    }
++    this.confirmClear_ = false;
++    await this.handler_.clearSiteData();
++    this.refresh_();
++  }
++
++  protected onSecurityClick_() {
++    this.fire('site-control-action', 'page-info');
++  }
++
++  protected onMoreClick_() {
++    this.fire('site-control-action', 'site-settings');
++  }
++
++  protected onAddExtensionClick_() {
++    this.fire('site-control-action', 'web-store');
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-site-control': MeridianSiteControlElement;
++  }
++}
++
++customElements.define(
++    MeridianSiteControlElement.is, MeridianSiteControlElement);
+diff --git a/chrome/browser/ui/startup/first_run_service.cc b/chrome/browser/ui/startup/first_run_service.cc
+index f48c1d59cb..1a280b43a5 100644
+--- a/chrome/browser/ui/startup/first_run_service.cc
++++ b/chrome/browser/ui/startup/first_run_service.cc
+@@ -296,6 +296,13 @@ FirstRunServiceFactory::BuildServiceInstanceForBrowserContext(
+ // Helpers ---------------------------------------------------------------------
+ 
+ bool ShouldOpenFirstRun(Profile* profile) {
++  // Meridian greets people with its own welcome tour in the browser window
++  // (default browser included). Chromium's first-run window came before it
++  // and left two browser windows, each with the tour.
++  if (!base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "meridian-chromium-first-run")) {
++    return false;
++  }
+   return IsFirstRunEligibleProcess() && IsFirstRunEligibleProfile(profile) &&
+          !IsFirstRunMarkedFinishedInPrefs();
+ }

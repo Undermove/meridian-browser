@@ -108,3 +108,14 @@ test('with Arc: Bring everything, after saying macOS will ask; File > Import fro
     w.close();
   } finally { await b.close(); fs.rmSync(arcDir, { recursive: true, force: true }); }
 });
+
+test('the very first launch: one window with the welcome tour, no Chromium first-run window', async () => {
+  const b = await launch([], { firstRun: true, args: ['--meridian-onboarding'] });
+  try {
+    await b.waitFor(`app.$.onboarding.open`, 15000);
+    await new Promise((r) => setTimeout(r, 2500));
+    const targets = await (await fetch(`${b.base}/json/list`)).json();
+    assert.equal(targets.filter((t) => t.url.startsWith('chrome://intro')).length, 0, 'no Chromium first-run window');
+    assert.equal(targets.filter((t) => t.url.startsWith('chrome://webui-browser')).length, 1, 'one browser window');
+  } finally { await b.close(); }
+});

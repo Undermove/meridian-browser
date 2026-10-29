@@ -27,7 +27,7 @@ test('a link out of a pinned tab opens in Peek; Open as Tab moves it to Today; C
   try {
     await b.waitFor(today(1));
     const space = (await b.state()).spaces[0].name;
-    await b.menu(`${SB}.querySelector('meridian-tab-row')`, `Pin to ${space}`);
+    await b.menu(`${SB}.querySelector('meridian-tab-row')`, 'Pin Tab');
     await b.waitFor(`!!${itemEl('App')}`);
     // Click the link inside the pinned page.
     const page = (await (await fetch(`${b.base}/json/list`)).json()).find((t) => t.type === 'page' && t.url.includes('/app'));

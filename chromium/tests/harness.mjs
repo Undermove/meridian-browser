@@ -45,7 +45,8 @@ async function evalUi(cdp, expr) {
 const running = new Set();
 process.on('exit', () => { for (const p of running) { try { p.kill('SIGKILL'); } catch {} } });
 
-export async function launch(urls = [], { profile: keep, args = [] } = {}) {
+// `firstRun`: start like the very first launch (without --no-first-run).
+export async function launch(urls = [], { profile: keep, args = [], firstRun = false } = {}) {
   const profile = keep || fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
   const port = 9400 + Math.floor(Math.random() * 500);
   // Never the real Arc: an empty folder unless a test gives its own.
@@ -56,7 +57,7 @@ export async function launch(urls = [], { profile: keep, args = [] } = {}) {
   const started = Date.now();
   const proc = spawn(APP, [
     `--user-data-dir=${profile}`, `--remote-debugging-port=${port}`, '--use-mock-keychain',
-    '--no-first-run', '--no-default-browser-check', '--window-size=1280,860',
+    ...(firstRun ? [] : ['--no-first-run']), '--no-default-browser-check', '--window-size=1280,860',
     // Keep drawing when the window is covered or the display sleeps (input waits for frames).
     '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
     // No on-device model downloads (≈190 MB each into the temp folder).
@@ -146,7 +147,11 @@ export async function launch(urls = [], { profile: keep, args = [] } = {}) {
       await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: r.x, y: r.y, button: 'none' });
       await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: r.x, y: r.y, button: 'right', clickCount: 1 });
       await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: r.x, y: r.y, button: 'right', clickCount: 1 });
-      await b.click(`[...${SB}.querySelectorAll('#menu .menu-item')].find((m) => m.textContent.trim() === ${JSON.stringify(label)})`);
+      // "Move to Space > Work": a row of the submenu it opens.
+      const [first, sub] = label.split(' > ');
+      const row = (menu, text) => `[...${SB}.querySelector('${menu} meridian-menu').shadowRoot.querySelectorAll('.menu-item')].find((m) => m.querySelector('.menu-label').textContent.trim() === ${JSON.stringify(text)})`;
+      await b.click(row('#menu', first));
+      if (sub) await b.click(row('#submenu', sub));
     },
     // A real mouse drag from one element to a point in another (fraction fx/fy of its box), through
     // Chromium's drag and drop: intercept the drag the press-and-move starts, then replay it as drag events.

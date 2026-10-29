@@ -227,7 +227,8 @@ function renderWelcome() {
     for (const r of info.recents.slice(0, 6)) recents.appendChild(recentRow(r, () => openRecent(r.path)));
   }
   const agents = $('#welcome-agents');
-  agents.innerHTML = '<h2>Agents on this computer</h2>';
+  agents.innerHTML = '<h2>Agents on this computer</h2><div class="agent-list"></div>';
+  const list = agents.querySelector('.agent-list');
   for (const id of agentKinds()) {
     const a = info.agents?.[id];
     const row = document.createElement('div');
@@ -238,7 +239,8 @@ function renderWelcome() {
     const st = row.querySelector('.state');
     st.textContent = a?.installed ? 'Installed' : `Not installed — ${a?.install || ''}`;
     st.classList.toggle('ok', !!a?.installed);
-    agents.appendChild(row);
+    if (!a?.installed) st.title = st.textContent;
+    list.appendChild(row);
   }
   const err = $('#terminal-error');
   err.hidden = info.terminals !== false;

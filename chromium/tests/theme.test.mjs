@@ -11,7 +11,7 @@ test('Edit Space Theme from the space menu: live colour, icon and name; Cancel r
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
     const before = await space(b);
-    await b.menu(`${SB}.querySelector('.space-header')`, 'Edit Space Theme…');
+    await b.menu(`${SB}.querySelector('.space-header')`, 'Edit Theme…');
     await b.waitFor(`app.$.themeEditor.open && !!${TE}.querySelector('.sw')`);
     // A gradient preset: the window takes it at once.
     await b.click(`${TE}.querySelector('.sw[data-index="10"]')`);
@@ -26,7 +26,7 @@ test('Edit Space Theme from the space menu: live colour, icon and name; Cancel r
     await b.waitFor(`app.$.tabstrip.state_.spaces[0].color === '${before.color}' && app.$.tabstrip.state_.spaces[0].icon === '${before.icon}'`);
 
     // Again, renamed and kept with Done.
-    await b.menu(`${SB}.querySelector('.space-header')`, 'Edit Space Theme…');
+    await b.menu(`${SB}.querySelector('.space-header')`, 'Edit Theme…');
     await b.waitFor(`app.$.themeEditor.open`);
     await b.click(`${TE}.querySelector('.sw[data-index="3"]')`);
     await b.eval(`(() => { const i = ${TE}.getElementById('name'); i.value = 'Garden'; i.dispatchEvent(new Event('input')); })()`);
