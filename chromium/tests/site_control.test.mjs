@@ -2,6 +2,9 @@
 // clicks, read back from Chromium's own site settings; and the Arc-style menus of the sidebar.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { launch, SB } from './harness.mjs';
 import { startServer } from './server.mjs';
 
@@ -78,4 +81,33 @@ test('sidebar menus look like Arc’s: a header, icons, shortcuts, and a submenu
     await b.key('Escape', 'Escape', 27);
     await b.waitFor(`${SB}.getElementById('menu').hidden`);
   } finally { await b.close(); }
+});
+
+test('extensions from Arc: listed in Settings with Add…, and counted in the Site Control Center', async () => {
+  // A fixture Arc folder (never the real one) with two Web Store extensions and a theme.
+  const arc = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-arc-'));
+  const ext = (id, manifest) => {
+    const dir = path.join(arc, 'User Data', 'Default', 'Extensions', id, '1.0');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest));
+  };
+  const darkReader = 'e'.repeat(32);
+  ext('c'.repeat(32), { name: 'uBlock Origin Lite' });
+  ext(darkReader, { name: 'Dark Reader' });
+  ext('f'.repeat(32), { name: 'Blue', theme: {} });
+  const site = await startServer();
+  const b = await launch([site.url('/p/Page')], { args: [`--meridian-arc-dir=${arc}`] });
+  const ST = 'app.$.settings.shadowRoot';
+  try {
+    await b.waitFor(`app.shadowRoot.querySelector('#urlPill .host').textContent === '127.0.0.1'`);
+    await b.click(`app.$.locationIconButton`);
+    await b.waitFor(`${SC}.getElementById('arcExtensions')?.textContent.includes('2 extensions from Arc')`);
+    await b.click(`${SC}.getElementById('arcExtensions')`);
+    await b.waitFor(`app.$.settings.open && ${ST}.querySelectorAll('.row.arc-ext').length === 2`);
+    assert.deepEqual(await b.eval(`[...${ST}.querySelectorAll('.row.arc-ext .row-label')].map((e) => e.textContent.trim())`), ['Dark Reader', 'uBlock Origin Lite']);
+    // Add… opens the extension's Web Store page in a tab.
+    await b.eval(`${ST}.querySelector('.row.arc-ext[data-id="${darkReader}"]').scrollIntoView({ block: 'center' })`);
+    await b.click(`${ST}.querySelector('.row.arc-ext[data-id="${darkReader}"] .btn')`);
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.url.startsWith('https://chromewebstore.google.com/'))`, 15000);
+  } finally { await b.close(); await site.close(); fs.rmSync(arc, { recursive: true, force: true }); }
 });

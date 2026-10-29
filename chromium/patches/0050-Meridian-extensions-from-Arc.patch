@@ -1,0 +1,557 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 30 Oct 2026 02:48:58 +0400
+Subject: [PATCH 51/51] Meridian: extensions from Arc
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Meridian reads which Web Store extensions Arc has (each profile's Extensions
+folder: names from the manifests, themes and unpacked ones left out) and lists
+them in Settings > Get started with Add…, which opens the extension's Web
+Store page; added ones show as Added. The Site Control Center says how many
+are left to add. Nothing is installed without the person.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   1 +
+ chrome/browser/meridian/arc_import.cc         | 119 ++++++++++++++++++
+ chrome/browser/meridian/arc_import.h          |  17 +++
+ .../browser/meridian/arc_import_unittest.cc   |  53 ++++++++
+ chrome/browser/meridian/sidebar.mojom         |  12 ++
+ chrome/browser/meridian/sidebar_handler.cc    |  24 ++++
+ chrome/browser/meridian/sidebar_handler.h     |   1 +
+ chrome/browser/resources/webui_browser/app.ts |   1 +
+ .../webui_browser/meridian/settings.html.ts   |  18 +++
+ .../webui_browser/meridian/settings.ts        |  15 ++-
+ .../webui_browser/meridian/site_control.css   |  23 ++++
+ .../meridian/site_control.html.ts             |   5 +
+ .../webui_browser/meridian/site_control.ts    |  18 +++
+ 13 files changed, 306 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index c502624c55..ff36a7f2c3 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -269,6 +269,7 @@ source_set("meridian") {
+     "//services/network/public/cpp",
+     "//components/viz/common",
+     "//components/zoom",
++    "//extensions/browser",
+     "//skia",
+     "//third_party/blink/public/common",
+     "//ui/events:dom_keycode_converter",
+diff --git a/chrome/browser/meridian/arc_import.cc b/chrome/browser/meridian/arc_import.cc
+index 4a4877c120..52f23be830 100644
+--- a/chrome/browser/meridian/arc_import.cc
++++ b/chrome/browser/meridian/arc_import.cc
+@@ -10,10 +10,12 @@
+ #include <set>
+ 
+ #include "base/base_paths.h"
++#include "base/files/file_enumerator.h"
+ #include "base/files/file_util.h"
+ #include "base/json/json_reader.h"
+ #include "base/path_service.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
+ #include "base/strings/stringprintf.h"
+ #include "chrome/browser/meridian/test_switches.h"
+ 
+@@ -318,4 +320,121 @@ std::optional<ArcSidebar> ReadArcSidebar() {
+   return ParseArcSidebar(root->GetDict());
+ }
+ 
++
++namespace {
++
++std::optional<base::DictValue> ReadJsonDict(const base::FilePath& path) {
++  std::string text;
++  if (!base::ReadFileToStringWithMaxSize(path, &text, 4 * 1024 * 1024)) {
++    return std::nullopt;
++  }
++  // Some extensions' messages.json start with a byte order mark.
++  if (text.starts_with("\xEF\xBB\xBF")) {
++    text.erase(0, 3);
++  }
++  std::optional<base::Value> value = base::JSONReader::Read(
++      text, base::JSON_PARSE_CHROMIUM_EXTENSIONS | base::JSON_ALLOW_TRAILING_COMMAS);
++  if (!value || !value->is_dict()) {
++    return std::nullopt;
++  }
++  return std::move(*value).TakeDict();
++}
++
++// A Chrome Web Store id: 32 letters a-p.
++bool IsWebStoreId(const std::string& id) {
++  return id.size() == 32 &&
++         std::ranges::all_of(id, [](char c) { return c >= 'a' && c <= 'p'; });
++}
++
++}  // namespace
++
++std::string ExtensionNameIn(const base::FilePath& dir) {
++  std::optional<base::DictValue> manifest =
++      ReadJsonDict(dir.Append("manifest.json"));
++  if (!manifest) {
++    return std::string();
++  }
++  // Themes change Arc's colours; Meridian has its own space themes.
++  if (manifest->Find("theme")) {
++    return std::string();
++  }
++  const std::string* name = manifest->FindString("name");
++  if (!name) {
++    return std::string();
++  }
++  std::string out = *name;
++  if (out.starts_with("__MSG_") && out.ends_with("__") && out.size() > 8) {
++    std::string key = base::ToLowerASCII(out.substr(6, out.size() - 8));
++    const std::string* locale = manifest->FindString("default_locale");
++    std::optional<base::DictValue> messages = ReadJsonDict(
++        dir.Append("_locales")
++            .AppendASCII(locale ? *locale : "en")
++            .Append("messages.json"));
++    out.clear();
++    if (messages) {
++      // Message keys are case-insensitive.
++      for (auto [k, v] : *messages) {
++        if (base::ToLowerASCII(k) == key && v.is_dict()) {
++          if (const std::string* m = v.GetDict().FindString("message")) {
++            out = *m;
++          }
++          break;
++        }
++      }
++    }
++  }
++  return std::string(base::TrimWhitespaceASCII(out, base::TRIM_ALL));
++}
++
++std::vector<ArcExtension> ReadArcExtensions() {
++  return ReadArcExtensionsIn(ArcDataDir());
++}
++
++std::vector<ArcExtension> ReadArcExtensionsIn(const base::FilePath& arc_dir) {
++  std::vector<ArcExtension> out;
++  std::set<std::string> seen;
++  base::FilePath user_data = arc_dir.Append("User Data");
++  base::FileEnumerator profiles(user_data, false,
++                                base::FileEnumerator::DIRECTORIES);
++  std::vector<base::FilePath> dirs;
++  for (base::FilePath dir = profiles.Next(); !dir.empty();
++       dir = profiles.Next()) {
++    const std::string name = dir.BaseName().value();
++    if (name == "Default" || name.starts_with("Profile ")) {
++      dirs.push_back(dir);
++    }
++  }
++  std::ranges::sort(dirs);
++  for (const base::FilePath& profile : dirs) {
++    base::FileEnumerator ids(profile.Append("Extensions"), false,
++                             base::FileEnumerator::DIRECTORIES);
++    for (base::FilePath id_dir = ids.Next(); !id_dir.empty();
++         id_dir = ids.Next()) {
++      const std::string id = id_dir.BaseName().value();
++      if (!IsWebStoreId(id) || seen.contains(id)) {
++        continue;
++      }
++      // The newest version folder.
++      base::FileEnumerator versions(id_dir, false,
++                                    base::FileEnumerator::DIRECTORIES);
++      base::FilePath newest;
++      for (base::FilePath v = versions.Next(); !v.empty(); v = versions.Next()) {
++        if (newest.empty() || v.BaseName().value() > newest.BaseName().value()) {
++          newest = v;
++        }
++      }
++      std::string ext_name = newest.empty() ? "" : ExtensionNameIn(newest);
++      if (ext_name.empty()) {
++        continue;
++      }
++      seen.insert(id);
++      out.push_back({id, ext_name});
++    }
++  }
++  std::ranges::sort(out, [](const ArcExtension& a, const ArcExtension& b) {
++    return base::ToLowerASCII(a.name) < base::ToLowerASCII(b.name);
++  });
++  return out;
++}
++
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/arc_import.h b/chrome/browser/meridian/arc_import.h
+index fd46d35935..216e86851c 100644
+--- a/chrome/browser/meridian/arc_import.h
++++ b/chrome/browser/meridian/arc_import.h
+@@ -57,6 +57,23 @@ std::optional<ArcSidebar> ParseArcSidebar(const base::DictValue& root);
+ // Reads and parses Arc's sidebar; blocking (file IO).
+ std::optional<ArcSidebar> ReadArcSidebar();
+ 
++// An extension installed in Arc (from the Chrome Web Store), to install again
++// in Meridian.
++struct ArcExtension {
++  std::string id;
++  std::string name;
++};
++
++// The extensions in Arc's profiles (User Data/<profile>/Extensions), each once,
++// by name; themes and Arc's own are left out. Blocking (file IO).
++std::vector<ArcExtension> ReadArcExtensions();
++// The same in another Arc data folder.
++std::vector<ArcExtension> ReadArcExtensionsIn(const base::FilePath& arc_dir);
++
++// The extension's name from its manifest, with a "__MSG_name__" looked up in
++// its default locale. `dir` is the folder of one version. Empty if unreadable.
++std::string ExtensionNameIn(const base::FilePath& dir);
++
+ }  // namespace meridian
+ 
+ #endif  // CHROME_BROWSER_MERIDIAN_ARC_IMPORT_H_
+diff --git a/chrome/browser/meridian/arc_import_unittest.cc b/chrome/browser/meridian/arc_import_unittest.cc
+index 728be61842..18aa1d4e36 100644
+--- a/chrome/browser/meridian/arc_import_unittest.cc
++++ b/chrome/browser/meridian/arc_import_unittest.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/meridian/arc_import.h"
+ 
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
+ #include "base/json/json_reader.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_number_conversions.h"
+@@ -149,5 +151,56 @@ TEST(ArcImportTest, ImportReplacesTheUntouchedFirstSpace) {
+   EXPECT_EQ(service.favorites().size(), 2u);
+ }
+ 
++
++// Writes an extension version folder: Extensions/<id>/<version>/.
++void WriteExtension(const base::FilePath& profile,
++                    const std::string& id,
++                    const std::string& version,
++                    const std::string& manifest,
++                    const std::string& messages = "") {
++  base::FilePath dir = profile.Append("Extensions").AppendASCII(id).AppendASCII(version);
++  ASSERT_TRUE(base::CreateDirectory(dir));
++  ASSERT_TRUE(base::WriteFile(dir.Append("manifest.json"), manifest));
++  if (!messages.empty()) {
++    base::FilePath locale = dir.Append("_locales").Append("en");
++    ASSERT_TRUE(base::CreateDirectory(locale));
++    ASSERT_TRUE(base::WriteFile(locale.Append("messages.json"), messages));
++  }
++}
++
++TEST(ArcImportTest, ReadsArcExtensionsOnceByNameWithoutThemes) {
++  base::ScopedTempDir arc;
++  ASSERT_TRUE(arc.CreateUniqueTempDir());
++  base::FilePath def = arc.GetPath().Append("User Data").Append("Default");
++  base::FilePath p2 = arc.GetPath().Append("User Data").Append("Profile 2");
++  const std::string ublock(32, 'c');
++  const std::string dark(32, 'd');
++  const std::string theme(32, 'e');
++  WriteExtension(def, ublock, "1.0", R"({"name": "uBlock Origin Lite"})");
++  // The newest version's name, with the message looked up (any case, and a
++  // byte order mark).
++  WriteExtension(def, dark, "1.0", R"({"name": "Old"})");
++  WriteExtension(def, dark, "2.0",
++                 R"({"name": "__MSG_appName__", "default_locale": "en"})",
++                 "\xEF\xBB\xBF{\"APPNAME\": {\"message\": \"Dark Reader\"}}");
++  WriteExtension(p2, ublock, "1.0", R"({"name": "uBlock Origin Lite"})");
++  WriteExtension(p2, theme, "1.0", R"({"name": "Blue", "theme": {}})");
++  // Not a Web Store id (unpacked or Arc's own).
++  WriteExtension(p2, "arc-internal", "1.0", R"({"name": "Arc Helper"})");
++
++  std::vector<ArcExtension> got = ReadArcExtensionsIn(arc.GetPath());
++  ASSERT_EQ(got.size(), 2u);
++  EXPECT_EQ(got[0].name, "Dark Reader");
++  EXPECT_EQ(got[0].id, dark);
++  EXPECT_EQ(got[1].name, "uBlock Origin Lite");
++  EXPECT_EQ(got[1].id, ublock);
++}
++
++TEST(ArcImportTest, NoArcMeansNoExtensions) {
++  base::ScopedTempDir arc;
++  ASSERT_TRUE(arc.CreateUniqueTempDir());
++  EXPECT_TRUE(ReadArcExtensionsIn(arc.GetPath()).empty());
++}
++
+ }  // namespace
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 7867dbe5cf..181d84bcec 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -145,6 +145,14 @@ struct ArcPreview {
+   bool logins_available;
+ };
+ 
++// An extension in Arc, to install in Meridian from the Chrome Web Store.
++struct ArcExtension {
++  string id;
++  string name;
++  // Already in this profile.
++  bool installed;
++};
++
+ // Where an item goes. `container` is a space id, or "favorites".
+ struct ItemPosition {
+   string container;
+@@ -466,6 +474,10 @@ interface SidebarHandler {
+   // Sends the item's live tab back to the home URL.
+   ResetItemToHome(string item_id);
+ 
++  // The extensions installed in Arc (read from its folder; nothing is
++  // installed until the person adds each one in the Web Store).
++  GetArcExtensions() => (array<ArcExtension> extensions);
++
+   // The Site Control Center, for the active tab's site. `type` "ads" is the
+   // ad and tracker blocking; settings are "allow", "block" or "ask".
+   GetSiteInfo() => (SiteInfo info);
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index aa11582bee..e9177a7f2d 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -51,6 +51,7 @@
+ #include "chrome/browser/profiles/keep_alive/scoped_profile_keep_alive.h"
+ #include "chrome/browser/meridian/tab_data.h"
+ #include "chrome/browser/meridian/site_control.h"
++#include "extensions/browser/extension_registry.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/browsing_data/chrome_browsing_data_remover_constants.h"
+ #include "chrome/browser/profiles/delete_profile_helper.h"
+@@ -2226,6 +2227,29 @@ void SidebarHandler::OnSplitTabChanged(const SplitTabChange& change) {
+   ScheduleNotify();
+ }
+ 
++void SidebarHandler::GetArcExtensions(GetArcExtensionsCallback callback) {
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&ReadArcExtensions),
++      base::BindOnce(
++          [](base::WeakPtr<SidebarHandler> self,
++             GetArcExtensionsCallback callback,
++             std::vector<ArcExtension> found) {
++            std::vector<mojom::ArcExtensionPtr> out;
++            extensions::ExtensionRegistry* registry =
++                self ? extensions::ExtensionRegistry::Get(
++                           self->browser_->GetProfile())
++                     : nullptr;
++            for (const ArcExtension& e : found) {
++              out.push_back(mojom::ArcExtension::New(
++                  e.id, e.name,
++                  registry && registry->GetInstalledExtension(e.id)));
++            }
++            std::move(callback).Run(std::move(out));
++          },
++          weak_factory_.GetWeakPtr(), std::move(callback)));
++}
++
+ void SidebarHandler::GetSiteInfo(GetSiteInfoCallback callback) {
+   std::move(callback).Run(meridian::GetSiteInfo(
+       browser_->GetProfile(), model()->GetActiveWebContents()));
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 944943cfa4..0591b1dff1 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -140,6 +140,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void SetFolderOpen(const std::string& item_id, bool open) override;
+   void OpenItem(const std::string& item_id) override;
+   void ResetItemToHome(const std::string& item_id) override;
++  void GetArcExtensions(GetArcExtensionsCallback callback) override;
+   void GetSiteInfo(GetSiteInfoCallback callback) override;
+   void SetSitePermission(const std::string& type,
+                          const std::string& setting) override;
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 7313eb4bcf..45dc8838cb 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -898,6 +898,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+         this.$.tabstrip.openUrl('https://chromewebstore.google.com/');
+         break;
+       case 'settings':
++      case 'arc-extensions':
+         this.$.settings.show(this.$.tabstrip.spaces(), 'general');
+         break;
+     }
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index a9a3443677..a12d6747dd 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -162,6 +162,24 @@ export function getHtml(this: MeridianSettingsElement) {
+                 <button id="importArc" class="btn"
+                     @click="${this.onImportArcClick_}">Import…</button>
+               </div>
++              ${this.arcExtensions_.length ? html`
++                <div class="row arc-ext-head">
++                  <div class="row-text">
++                    <div class="row-label">Extensions from Arc</div>
++                    <div class="row-desc">Add each from the Chrome Web Store;
++                      it opens in a tab.</div>
++                  </div>
++                </div>
++                ${this.arcExtensions_.map(x => html`
++                  <div class="row arc-ext" data-id="${x.id}">
++                    <div class="row-text">
++                      <div class="row-label">${x.name}</div>
++                    </div>
++                    ${x.installed ? html`
++                      <span class="ok">${icon('check', 14)} Added</span>` : html`
++                      <button class="btn" data-id="${x.id}"
++                          @click="${this.onArcExtensionClick_}">Add…</button>`}
++                  </div>`)}` : ''}
+               <div class="row">
+                 <div class="row-text">
+                   <div class="row-label">Welcome tour</div>
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 3fb282e6ba..e0b016e566 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -10,7 +10,7 @@ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+ import {browserProxyFactory, UpdateStatus} from '../sidebar.mojom-webui.js';
+-import type {AgentCli, AiProvider, Atc, Settings, SidebarHandlerInterface, Space, UpdateState} from '../sidebar.mojom-webui.js';
++import type {AgentCli, AiProvider, ArcExtension, Atc, Settings, SidebarHandlerInterface, Space, UpdateState} from '../sidebar.mojom-webui.js';
+ 
+ import './member_card.js';
+ import {getCss} from './settings.css.js';
+@@ -142,6 +142,7 @@ export class MeridianSettingsElement extends CrLitElement {
+       section_: {state: true, type: String},
+       settings_: {state: true, type: Object},
+       spaces_: {state: true, type: Array},
++      arcExtensions_: {state: true, type: Array},
+       profileRows_: {state: true, type: Array},
+       profileEdit_: {state: true, type: Object},
+       profileConfirm_: {state: true, type: Object},
+@@ -175,6 +176,8 @@ export class MeridianSettingsElement extends CrLitElement {
+   protected accessor section_: SectionId = 'general';
+   protected accessor settings_: Settings|null = null;
+   protected accessor spaces_: Space[] = [];
++  // Extensions installed in Arc, to add again here.
++  protected accessor arcExtensions_: ArcExtension[] = [];
+   protected accessor profileRows_: ProfileRow[] = [];
+   protected accessor profileEdit_: ProfileEdit|null = null;
+   protected accessor profileConfirm_: ProfileConfirm|null = null;
+@@ -231,6 +234,8 @@ export class MeridianSettingsElement extends CrLitElement {
+     this.connectResult_ = '';
+     this.connecting_ = null;
+     this.handler_.getAgentClis().then(({clis}) => this.clis_ = clis);
++    this.handler_.getArcExtensions().then(
++        ({extensions}) => this.arcExtensions_ = extensions);
+     this.keyMessage_ = '';
+     this.handler_.hasAiKey().then(({hasKey}) => this.hasAiKey_ = hasKey);
+     this.aiMessage_ = '';
+@@ -536,6 +541,14 @@ export class MeridianSettingsElement extends CrLitElement {
+     ];
+   }
+ 
++  // The extension's Web Store page, in a new tab; "Add to Chrome" there
++  // installs it in Meridian.
++  protected onArcExtensionClick_(e: Event) {
++    const id = (e.currentTarget as HTMLElement).dataset['id']!;
++    this.fire('meridian-open-url',
++              'https://chromewebstore.google.com/detail/' + id);
++  }
++
+   protected onMemberRename_(e: CustomEvent<string>) {
+     this.save_({memberName: e.detail});
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_control.css b/chrome/browser/resources/webui_browser/meridian/site_control.css
+index a0cde71722..8ae0c73d44 100644
+--- a/chrome/browser/resources/webui_browser/meridian/site_control.css
++++ b/chrome/browser/resources/webui_browser/meridian/site_control.css
+@@ -271,3 +271,26 @@ button.row:hover {
+   border-radius: 50%;
+   background: color-mix(in srgb, var(--meridian-text) 6%, transparent);
+ }
++
++.arc-hint {
++  display: flex;
++  align-items: center;
++  gap: 7px;
++  width: 100%;
++  margin-top: 6px;
++  padding: 7px 8px;
++  box-sizing: border-box;
++  border-radius: 9px;
++  font-size: 12px;
++  color: var(--meridian-text-muted);
++  background: color-mix(in srgb, var(--meridian-space) 10%, transparent);
++}
++
++.arc-hint span:first-of-type {
++  flex: 1;
++}
++
++.arc-add {
++  font-weight: 600;
++  color: var(--meridian-space);
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_control.html.ts b/chrome/browser/resources/webui_browser/meridian/site_control.html.ts
+index 5db8bb3a43..69048f2169 100644
+--- a/chrome/browser/resources/webui_browser/meridian/site_control.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/site_control.html.ts
+@@ -31,6 +31,11 @@ export function getHtml(this: MeridianSiteControlElement) {
+     <button id="addExtension" class="ext-add" title="Get extensions"
+         @click="${this.onAddExtensionClick_}">${icon('plus', 16)}</button>
+   </div>
++  ${this.arcLeft_ ? html`
++    <button id="arcExtensions" class="arc-hint" @click="${this.onArcClick_}">
++      ${icon('puzzle', 14)}<span>${this.arcLabel_()}</span>
++      <span class="arc-add">Add…</span>
++    </button>` : ''}
+ 
+   ${this.info_?.origin ? html`
+     <div class="sec">${this.info_.host}</div>
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_control.ts b/chrome/browser/resources/webui_browser/meridian/site_control.ts
+index 637ee8f2b8..d7cfe05284 100644
+--- a/chrome/browser/resources/webui_browser/meridian/site_control.ts
++++ b/chrome/browser/resources/webui_browser/meridian/site_control.ts
+@@ -66,6 +66,7 @@ export class MeridianSiteControlElement extends CrLitElement {
+       rows_: {state: true, type: Array},
+       copied_: {state: true, type: Boolean},
+       confirmClear_: {state: true, type: Boolean},
++      arcLeft_: {state: true, type: Number},
+     };
+   }
+ 
+@@ -78,6 +79,8 @@ export class MeridianSiteControlElement extends CrLitElement {
+   protected accessor copied_: boolean = false;
+   // "Clear cookies and site data" asks once more.
+   protected accessor confirmClear_: boolean = false;
++  // Extensions in Arc not added here yet.
++  protected accessor arcLeft_: number = 0;
+ 
+   private handler_: SidebarHandlerInterface =
+       browserProxyFactory.getInstance().handler;
+@@ -88,6 +91,7 @@ export class MeridianSiteControlElement extends CrLitElement {
+       this.copied_ = false;
+       this.confirmClear_ = false;
+       this.refresh_();
++      this.countArcExtensions_();
+     }
+     this.rows_ = (this.info_?.permissions || []).map(p => ({
+       type: p.type,
+@@ -103,6 +107,20 @@ export class MeridianSiteControlElement extends CrLitElement {
+     this.info_ = info;
+   }
+ 
++  private async countArcExtensions_() {
++    const {extensions} = await this.handler_.getArcExtensions();
++    this.arcLeft_ = extensions.filter(x => !x.installed).length;
++  }
++
++  protected arcLabel_(): string {
++    return this.arcLeft_ === 1 ? '1 extension from Arc' :
++                                 `${this.arcLeft_} extensions from Arc`;
++  }
++
++  protected onArcClick_() {
++    this.fire('site-control-action', 'arc-extensions');
++  }
++
+   protected copyIcon_(): IconName {
+     return this.copied_ ? 'check' : 'link';
+   }
