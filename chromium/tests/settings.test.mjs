@@ -109,3 +109,25 @@ test('AI: choosing an access level starts the agent socket; Connect shows the ex
     assert.equal(fs.existsSync(endpoint), false);
   } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
+
+test('General: the member card shows the name and since when; clicking the name changes it, and it stays', async () => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  let b = await launch(['about:blank'], { profile });
+  const MC = `${ST}.querySelector('meridian-member-card').shadowRoot`;
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    await open(b);
+    await b.waitFor(`${MC}.querySelector('.since').textContent.startsWith('Member since')`);
+    assert.match(await b.eval(`${MC}.querySelector('.no').textContent`), /^No\. \d{4} \d{4}$/);
+    await b.click(`${MC}.getElementById('name')`);
+    await b.waitFor(`${MC}.querySelector('input.name-input')`);
+    await b.eval(`(() => { const i = ${MC}.querySelector('input.name-input'); i.value = 'Ada Lovelace'; i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); })()`);
+    await b.waitFor(`${MC}.getElementById('name')?.textContent.trim() === 'Ada Lovelace'`);
+    await b.waitFor(`app.$.tabstrip.handler_.getSettings().then((r) => r.settings.memberName === 'Ada Lovelace')`);
+    await b.quit();
+    b = await launch(['about:blank'], { profile });
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length >= 1`);
+    await open(b);
+    await b.waitFor(`${MC}.getElementById('name')?.textContent.trim() === 'Ada Lovelace'`);
+  } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});

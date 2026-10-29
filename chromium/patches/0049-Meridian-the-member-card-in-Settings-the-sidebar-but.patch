@@ -1,0 +1,675 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 30 Oct 2026 02:42:51 +0400
+Subject: [PATCH 50/50] Meridian: the member card in Settings; the sidebar
+ button
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Settings > General opens with Arc's member card again (as in the Electron
+  build): the name, member since, a member number and counts, in the space's
+  colours; it tilts toward the pointer with a holographic sheen, and a click
+  on the name changes it (kept in the profile; the system's name until then).
+- The sidebar's top row starts with the Hide Sidebar button (⌘S), as in Arc.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/prefs.cc              |   1 +
+ chrome/browser/meridian/prefs.h               |   2 +
+ chrome/browser/meridian/sidebar.mojom         |   6 +
+ chrome/browser/meridian/sidebar_handler.cc    |  15 ++
+ chrome/browser/meridian/sidebar_handler.h     |   4 +
+ .../browser/meridian/sidebar_handler_mac.mm   |   4 +
+ .../browser/resources/webui_browser/BUILD.gn  |   3 +
+ .../browser/resources/webui_browser/app.css   |  26 +++
+ .../resources/webui_browser/app.html.ts       |   2 +
+ chrome/browser/resources/webui_browser/app.ts |   4 +
+ .../webui_browser/meridian/member_card.css    | 188 ++++++++++++++++++
+ .../meridian/member_card.html.ts              |  40 ++++
+ .../webui_browser/meridian/member_card.ts     | 150 ++++++++++++++
+ .../webui_browser/meridian/settings.html.ts   |   5 +
+ .../webui_browser/meridian/settings.ts        |   5 +
+ 15 files changed, 455 insertions(+)
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/member_card.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/member_card.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/member_card.ts
+
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index d710e5d190..0780ff4975 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -26,6 +26,7 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterBooleanPref(kAiTidy, true);
+   registry->RegisterBooleanPref(kAiLinkPreview, false);
+   registry->RegisterBooleanPref(kMissionNotify, true);
++  registry->RegisterStringPref(kMemberName, std::string());
+   registry->RegisterBooleanPref(kMissionNotifyIntro, false);
+ }
+ 
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index 84232c27f6..61832eae4f 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -42,6 +42,8 @@ inline constexpr char kAiTidy[] = "meridian.ai_tidy";
+ // Holding Shift over a link shows a summary of the page (needs the Claude
+ // key).
+ inline constexpr char kAiLinkPreview[] = "meridian.ai_link_preview";
++// The name on the member card in Settings (empty: the system's).
++inline constexpr char kMemberName[] = "meridian.member_name";
+ // A notification when an agent waits for the person (Mission Control).
+ inline constexpr char kMissionNotify[] = "meridian.mission_notify";
+ // The person was told that macOS will ask once about notifications.
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index bb021a1336..7867dbe5cf 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -254,6 +254,12 @@ struct Settings {
+   bool ai_link_preview;
+   // Mission Control: a notification when an agent waits.
+   bool mission_notify;
++  // The member card at the top of Settings: the name on it (empty: the
++  // person's name from the system), and when this profile began.
++  string member_name;
++  string member_default_name;
++  // Milliseconds since the epoch.
++  double member_since;
+ };
+ 
+ // Chat view conversations (ai/chats.h).
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 72016bf6d9..aa11582bee 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -1426,6 +1426,11 @@ void SidebarHandler::GetSettings(GetSettingsCallback callback) {
+   settings->ai_tidy = prefs->GetBoolean(prefs::kAiTidy);
+   settings->ai_link_preview = prefs->GetBoolean(prefs::kAiLinkPreview);
+   settings->mission_notify = prefs->GetBoolean(prefs::kMissionNotify);
++  settings->member_name = prefs->GetString(prefs::kMemberName);
++  settings->member_default_name = SystemUserFullName();
++  settings->member_since = browser_->GetProfile()
++                               ->GetCreationTime()
++                               .InMillisecondsFSinceUnixEpoch();
+   settings->adblock =
+       HostContentSettingsMapFactory::GetForProfile(browser_->GetProfile())
+           ->GetDefaultContentSetting(ContentSettingsType::ADS) ==
+@@ -1479,6 +1484,12 @@ void SidebarHandler::SetSettings(mojom::SettingsPtr settings) {
+   prefs->SetBoolean(prefs::kAiTidy, settings->ai_tidy);
+   prefs->SetBoolean(prefs::kAiLinkPreview, settings->ai_link_preview);
+   prefs->SetBoolean(prefs::kMissionNotify, settings->mission_notify);
++  {
++    std::u16string name = base::UTF8ToUTF16(base::TrimWhitespaceASCII(
++        settings->member_name, base::TRIM_ALL));
++    prefs->SetString(prefs::kMemberName,
++                     base::UTF16ToUTF8(name.substr(0, 40)));
++  }
+   // Chromium's own "Ads" site setting: blocked means filtered (per-site
+   // exceptions stay as the person set them).
+   HostContentSettingsMapFactory::GetForProfile(browser_->GetProfile())
+@@ -2280,6 +2291,10 @@ void SidebarHandler::ResetItemToHome(const std::string& item_id) {
+ 
+ #if !BUILDFLAG(IS_MAC)
+ void SidebarHandler::SetWindowControlsVisible(bool visible) {}
++
++std::string SystemUserFullName() {
++  return std::string();
++}
+ #endif
+ 
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index b6c76fe3a2..944943cfa4 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -32,10 +32,14 @@ class TabStripModel;
+ 
+ namespace meridian {
+ 
++// The person's full name from the system (the member card's default).
++std::string SystemUserFullName();
++
+ // Connects one window's sidebar (chrome://webui-browser) to the profile's
+ // SidebarService and to the window's tabs: new tabs join the active space,
+ // switching to a tab of another space switches the space, and each space
+ // remembers its last active tab.
++
+ class SidebarHandler : public mojom::SidebarHandler,
+                        public SidebarService::Observer,
+                        public ArchiveService::Observer,
+diff --git a/chrome/browser/meridian/sidebar_handler_mac.mm b/chrome/browser/meridian/sidebar_handler_mac.mm
+index 92c6ac16fd..816d94c3f9 100644
+--- a/chrome/browser/meridian/sidebar_handler_mac.mm
++++ b/chrome/browser/meridian/sidebar_handler_mac.mm
+@@ -71,6 +71,10 @@ bool IsDefault() {
+ 
+ }  // namespace
+ 
++std::string SystemUserFullName() {
++  return base::SysNSStringToUTF8(NSFullUserName());
++}
++
+ void SidebarHandler::IsDefaultBrowser(IsDefaultBrowserCallback callback) {
+   std::move(callback).Run(IsDefault());
+ }
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index 608950f6ed..e2e3cd349c 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -36,6 +36,8 @@ build_webui("build") {
+     "meridian/tidy.ts",
+     "meridian/menu.html.ts",
+     "meridian/menu.ts",
++    "meridian/member_card.html.ts",
++    "meridian/member_card.ts",
+     "meridian/site_control.html.ts",
+     "meridian/site_control.ts",
+     "meridian/chat.html.ts",
+@@ -95,6 +97,7 @@ build_webui("build") {
+     "meridian/ask.css",
+     "meridian/tidy.css",
+     "meridian/menu.css",
++    "meridian/member_card.css",
+     "meridian/site_control.css",
+     "meridian/chat.css",
+     "meridian/mission.css",
+diff --git a/chrome/browser/resources/webui_browser/app.css b/chrome/browser/resources/webui_browser/app.css
+index fd5e0bf7a3..4927d72491 100644
+--- a/chrome/browser/resources/webui_browser/app.css
++++ b/chrome/browser/resources/webui_browser/app.css
+@@ -119,6 +119,32 @@
+   margin-bottom: 8px;
+ }
+ 
++/* Hide the sidebar (⌘S), right after the traffic lights. */
++.top-btn {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  width: 28px;
++  height: 28px;
++  padding: 0;
++  border: 0;
++  border-radius: 7px;
++  background: none;
++  color: var(--meridian-text);
++  opacity: 0.75;
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
++}
++
++.top-btn:hover {
++  opacity: 1;
++  background: var(--meridian-row-hover);
++}
++
++:host([little]) #sidebarToggle {
++  display: none;
++}
++
+ #sidebarTop cr-icon-button,
+ .captionButtonsDiv cr-button {
+   app-region: no-drag;
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 7b5a6b17fe..125787075e 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -31,6 +31,8 @@ export function getHtml(this: WebuiBrowserAppElement) {
+         </cr-button>
+       </div>
+ </if>
++      <button id="sidebarToggle" class="top-btn" title="Hide Sidebar (⌘S)"
++          @click="${this.onSidebarToggleClick_}">${icon('sidebar', 17)}</button>
+       <span id="privateBadge" class="private-badge"
+           ?hidden="${!this.private_}">Private</span>
+       <div class="grow"></div>
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index e6b2a179bb..7313eb4bcf 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -483,6 +483,10 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     }
+   }
+ 
++  protected onSidebarToggleClick_() {
++    this.onMeridianToggleSidebar_();
++  }
++
+   protected onMeridianToggleSidebar_() {
+     this.sidebarHidden_ = !this.sidebarHidden_;
+     this.sidebarPeek_ = false;
+diff --git a/chrome/browser/resources/webui_browser/meridian/member_card.css b/chrome/browser/resources/webui_browser/meridian/member_card.css
+new file mode 100644
+index 0000000000..ca2add8294
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/member_card.css
+@@ -0,0 +1,188 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #scheme=relative
++ * #css_wrapper_metadata_end */
++
++:host {
++  display: flex;
++  justify-content: center;
++  margin: 4px 0 26px;
++  perspective: 900px;
++}
++
++#card {
++  --rx: 0deg;
++  --ry: 0deg;
++  --mx: 50%;
++  --my: 50%;
++  position: relative;
++  width: min(400px, 100%);
++  aspect-ratio: 1.586;
++  box-sizing: border-box;
++  border-radius: 18px;
++  overflow: hidden;
++  padding: 20px 22px;
++  display: flex;
++  flex-direction: column;
++  justify-content: space-between;
++  color: white;
++  background:
++    radial-gradient(120% 90% at 0% 0%,
++        color-mix(in oklab, var(--c1) 92%, white) 0%, transparent 60%),
++    radial-gradient(110% 100% at 100% 100%, var(--c2) 0%, transparent 65%),
++    linear-gradient(135deg, var(--c1),
++        color-mix(in oklab, var(--c1) 50%, var(--c2)) 55%, var(--c2));
++  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.35) inset,
++    0 18px 40px -12px color-mix(in srgb, var(--c1) 60%, transparent),
++    0 6px 14px -6px rgba(0, 0, 0, 0.25);
++  transform: rotateX(var(--rx)) rotateY(var(--ry));
++  transition: transform 0.5s cubic-bezier(0.2, 0.8, 0.2, 1);
++  will-change: transform;
++}
++
++#card.tilt {
++  transition: transform 0.08s linear;
++}
++
++/* Fine grain, so the gradient feels like a printed card. */
++#card::after {
++  content: '';
++  position: absolute;
++  inset: 0;
++  pointer-events: none;
++  opacity: 0.09;
++  mix-blend-mode: overlay;
++  background-image: repeating-linear-gradient(115deg,
++      rgba(255, 255, 255, 0.5) 0 1px, transparent 1px 3px);
++}
++
++.sheen {
++  position: absolute;
++  inset: -1px;
++  pointer-events: none;
++  opacity: 0;
++  transition: opacity 0.3s;
++  background:
++    radial-gradient(40% 55% at var(--mx) var(--my),
++        rgba(255, 255, 255, 0.55), transparent 70%),
++    linear-gradient(115deg, transparent 20%, rgba(255, 140, 220, 0.35) 38%,
++        rgba(140, 220, 255, 0.35) 50%, rgba(255, 240, 150, 0.3) 62%,
++        transparent 80%);
++  background-size: 100% 100%, 220% 220%;
++  background-position: 0 0, var(--mx) var(--my);
++  mix-blend-mode: soft-light;
++}
++
++#card.tilt .sheen {
++  opacity: 1;
++}
++
++.top,
++.bottom {
++  position: relative;
++  z-index: 1;
++  display: flex;
++  align-items: center;
++  gap: 8px;
++}
++
++.bottom {
++  align-items: flex-end;
++  justify-content: space-between;
++  gap: 12px;
++}
++
++.mark {
++  width: 30px;
++  height: 18px;
++  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.15));
++}
++
++.word {
++  font-size: 17px;
++  font-weight: 700;
++  letter-spacing: -0.02em;
++  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
++}
++
++.no {
++  margin-left: auto;
++  font: 500 11px ui-monospace, SFMono-Regular, Menlo, monospace;
++  letter-spacing: 0.08em;
++  opacity: 0.8;
++}
++
++.who {
++  min-width: 0;
++}
++
++.name,
++.name-input {
++  display: block;
++  max-width: 230px;
++  box-sizing: border-box;
++  margin-left: -4px;
++  padding: 1px 4px;
++  border: 0;
++  border-radius: 6px;
++  font: inherit;
++  font-size: 21px;
++  font-weight: 700;
++  letter-spacing: -0.02em;
++  text-align: left;
++  color: white;
++  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
++  background: none;
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++}
++
++.name:hover {
++  background: rgba(255, 255, 255, 0.16);
++}
++
++.name-input {
++  width: 230px;
++  outline: none;
++  background: rgba(255, 255, 255, 0.2);
++}
++
++.since {
++  margin-top: 2px;
++  font-size: 11.5px;
++  font-weight: 500;
++  opacity: 0.85;
++}
++
++.stats {
++  display: flex;
++  gap: 14px;
++  text-align: right;
++}
++
++.stat b {
++  display: block;
++  font-size: 15px;
++  font-weight: 700;
++  letter-spacing: -0.01em;
++}
++
++.stat span {
++  font-size: 10px;
++  text-transform: uppercase;
++  letter-spacing: 0.08em;
++  opacity: 0.75;
++}
++
++@media (prefers-reduced-motion: reduce) {
++  #card,
++  #card.tilt {
++    transition: none;
++    transform: none;
++  }
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/member_card.html.ts b/chrome/browser/resources/webui_browser/meridian/member_card.html.ts
+new file mode 100644
+index 0000000000..43e8b70db4
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/member_card.html.ts
+@@ -0,0 +1,40 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {MeridianMemberCardElement} from './member_card.js';
++
++export function getHtml(this: MeridianMemberCardElement) {
++  return html`<!--_html_template_start_-->
++<div id="card" style="${this.colors_}" @pointermove="${this.onPointermove_}"
++    @pointerleave="${this.onPointerleave_}">
++  <div class="sheen"></div>
++  <div class="top">
++    <svg class="mark" viewBox="230 400 564 330" aria-hidden="true">
++      <path d="M260 680 A252 252 0 0 1 764 680" fill="none"
++          stroke="currentColor" stroke-width="84" stroke-linecap="round"></path>
++      <circle cx="512" cy="680" r="46" fill="currentColor"></circle>
++    </svg>
++    <span class="word">Meridian</span>
++    <span class="no">No. ${this.number_}</span>
++  </div>
++  <div class="bottom">
++    <div class="who">
++      ${this.editing_ ? html`
++        <input class="name-input" .value="${this.shownName_}" maxlength="40"
++            spellcheck="false" aria-label="Name on your card"
++            @keydown="${this.onNameKeydown_}" @blur="${this.onNameBlur_}">` : html`
++        <button id="name" class="name" title="Change name"
++            @click="${this.onNameClick_}">${this.shownName_}</button>`}
++      <div class="since">Member since ${this.sinceText_}</div>
++    </div>
++    <div class="stats">
++      ${this.stats_.map(s => html`
++        <div class="stat"><b>${s.value}</b><span>${s.label}</span></div>`)}
++    </div>
++  </div>
++</div>
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/member_card.ts b/chrome/browser/resources/webui_browser/meridian/member_card.ts
+new file mode 100644
+index 0000000000..fa06d00f12
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/member_card.ts
+@@ -0,0 +1,150 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The member card at the top of Settings, like Arc's: your name, since when
++// you've used Meridian, in your space's colours. It tilts toward the pointer
++// with a holographic sheen; click the name to change it.
++
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {Space} from '../sidebar.mojom-webui.js';
++
++import {getCss} from './member_card.css.js';
++import {getHtml} from './member_card.html.js';
++
++export interface MemberStat {
++  value: string;
++  label: string;
++}
++
++export class MeridianMemberCardElement extends CrLitElement {
++  static get is() {
++    return 'meridian-member-card';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      name: {type: String},
++      defaultName: {type: String},
++      since: {type: Number},
++      spaces: {type: Array},
++      editing_: {state: true, type: Boolean},
++      shownName_: {state: true, type: String},
++      sinceText_: {state: true, type: String},
++      number_: {state: true, type: String},
++      stats_: {state: true, type: Array},
++      colors_: {state: true, type: String},
++    };
++  }
++
++  accessor name: string = '';
++  accessor defaultName: string = '';
++  // Milliseconds since the epoch.
++  accessor since: number = 0;
++  accessor spaces: Space[] = [];
++  protected accessor editing_: boolean = false;
++  protected accessor shownName_: string = '';
++  protected accessor sinceText_: string = '';
++  protected accessor number_: string = '';
++  protected accessor stats_: MemberStat[] = [];
++  protected accessor colors_: string = '';
++
++  override willUpdate(changed: PropertyValues<this>) {
++    super.willUpdate(changed);
++    this.shownName_ = this.name || this.defaultName || 'Meridian Member';
++    const since = this.since || Date.now();
++    this.sinceText_ = new Date(since).toLocaleDateString(
++        undefined, {month: 'long', year: 'numeric'});
++    // A stable member number from when the profile began.
++    this.number_ = String(Math.floor(since / 1000) % 100000000)
++                       .padStart(8, '0')
++                       .replace(/(\d{4})(\d{4})/, '$1 $2');
++    const first = this.spaces[0];
++    const c1 = first?.color || '#8a8fe0';
++    const c2 = this.spaces.find(s => s.color && s.color !== c1)?.color ||
++        first?.color2 || '#e48aa5';
++    this.colors_ = `--c1:${c1};--c2:${c2 === c1 ? '#e48aa5' : c2}`;
++    const pinned = this.spaces.reduce((n, s) => n + s.pinned.length, 0);
++    const days = Math.max(1, Math.round((Date.now() - since) / 86400000));
++    const fmt = (n: number) => n.toLocaleString();
++    this.stats_ = [
++      {value: fmt(this.spaces.length),
++       label: this.spaces.length === 1 ? 'space' : 'spaces'},
++      {value: fmt(pinned), label: 'pinned'},
++      {value: fmt(days), label: days === 1 ? 'day' : 'days'},
++    ];
++  }
++
++  override updated(changed: PropertyValues<this>) {
++    super.updated(changed);
++    if (changed.has('editing_' as keyof MeridianMemberCardElement) &&
++        this.editing_) {
++      const input = this.shadowRoot.querySelector<HTMLInputElement>('input');
++      input?.focus();
++      input?.select();
++    }
++  }
++
++  protected onPointermove_(e: PointerEvent) {
++    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
++      return;
++    }
++    const card = e.currentTarget as HTMLElement;
++    const r = card.getBoundingClientRect();
++    const x = (e.clientX - r.left) / r.width;
++    const y = (e.clientY - r.top) / r.height;
++    card.style.setProperty('--rx', `${(0.5 - y) * 14}deg`);
++    card.style.setProperty('--ry', `${(x - 0.5) * 18}deg`);
++    card.style.setProperty('--mx', `${x * 100}%`);
++    card.style.setProperty('--my', `${y * 100}%`);
++    card.classList.add('tilt');
++  }
++
++  protected onPointerleave_(e: PointerEvent) {
++    const card = e.currentTarget as HTMLElement;
++    card.classList.remove('tilt');
++    card.style.setProperty('--rx', '0deg');
++    card.style.setProperty('--ry', '0deg');
++  }
++
++  protected onNameClick_() {
++    this.editing_ = true;
++  }
++
++  protected onNameKeydown_(e: KeyboardEvent) {
++    if (e.key === 'Enter') {
++      (e.target as HTMLInputElement).blur();
++    } else if (e.key === 'Escape') {
++      e.stopPropagation();
++      this.editing_ = false;
++    }
++  }
++
++  protected onNameBlur_(e: Event) {
++    if (!this.editing_) {
++      return;
++    }
++    this.editing_ = false;
++    const value = (e.target as HTMLInputElement).value.trim().slice(0, 40);
++    // The system's name again when it's cleared or left as it was.
++    this.fire('member-rename', value === this.defaultName ? '' : value);
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-member-card': MeridianMemberCardElement;
++  }
++}
++
++customElements.define(MeridianMemberCardElement.is, MeridianMemberCardElement);
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index 91b610c08b..a9a3443677 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -40,6 +40,11 @@ export function getHtml(this: MeridianSettingsElement) {
+           @click="${this.onCloseClick_}">${icon('x', 16)}</button>
+       ${this.settings_ && this.section_ === 'general' ? html`
+         <section id="general">
++          <meridian-member-card .name="${this.settings_.memberName}"
++              .defaultName="${this.settings_.memberDefaultName}"
++              .since="${this.settings_.memberSince}" .spaces="${this.spaces_}"
++              @member-rename="${this.onMemberRename_}">
++          </meridian-member-card>
+           <div class="group">
+             <h2>Appearance</h2>
+             <div class="card">
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 00f3a83fef..3fb282e6ba 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -12,6 +12,7 @@ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ import {browserProxyFactory, UpdateStatus} from '../sidebar.mojom-webui.js';
+ import type {AgentCli, AiProvider, Atc, Settings, SidebarHandlerInterface, Space, UpdateState} from '../sidebar.mojom-webui.js';
+ 
++import './member_card.js';
+ import {getCss} from './settings.css.js';
+ import {getHtml} from './settings.html.js';
+ 
+@@ -535,6 +536,10 @@ export class MeridianSettingsElement extends CrLitElement {
+     ];
+   }
+ 
++  protected onMemberRename_(e: CustomEvent<string>) {
++    this.save_({memberName: e.detail});
++  }
++
+   // Saves the whole settings object (the handler validates it).
+   private save_(change: Partial<Settings>) {
+     if (!this.settings_) {
