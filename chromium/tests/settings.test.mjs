@@ -94,9 +94,10 @@ test('AI: choosing an access level starts the agent socket; Connect shows the ex
     // The CLIs, with the command Connect would run (never run here).
     await b.waitFor(`${ST}.querySelectorAll('.row-desc.mono').length === 2`);
     assert.match(await b.eval(`${ST}.querySelector('.row-desc.mono').textContent`), /mcp add -s user meridian -- .*Meridian --mcp-bridge/);
-    const found = await b.eval(`[...${ST}.querySelectorAll('#ai .card .btn')].find((x) => !x.disabled)?.dataset.id || ''`);
-    if (found) {
-      await b.eval(`${ST}.querySelector('#ai .card .btn[data-id="${found}"]').click()`);
+    // An installed CLI's Connect… (the rows with a command), not the other AI buttons.
+    const connect = `[...${ST}.querySelectorAll('.row-desc.mono')].map((d) => d.closest('.row').querySelector('.btn')).find((x) => !x.disabled)`;
+    if (await b.eval(`!!${connect}`)) {
+      await b.eval(`${connect}.click()`);
       await b.waitFor(`!!${ST}.querySelector('.command')`);
       assert.match(await b.eval(`${ST}.querySelector('.command').textContent`), /--mcp-bridge/);
       await b.eval(`[...${ST}.querySelectorAll('.confirm .btn')].find((x) => x.textContent.trim() === 'Cancel').click()`);

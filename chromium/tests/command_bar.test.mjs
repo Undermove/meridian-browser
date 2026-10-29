@@ -39,7 +39,8 @@ test('the URL pill and ⌘L edit the current tab\'s address in place', async () 
   const b = await launch([site.url('/p/Start')]);
   try {
     await b.waitFor(today(1));
-    await b.waitFor(`app.shadowRoot.querySelector('#urlPill .host').textContent === '127.0.0.1'`);
+    await b.waitFor(`app.shadowRoot.querySelector('#urlPill .host').textContent === '127.0.0.1'`, 10000,
+        `app.shadowRoot.querySelector('#urlPill')?.outerHTML`);
     await b.click(`app.shadowRoot.querySelector('#urlPill .host')`);
     await b.waitFor(open);
     assert.equal(await b.eval(`${BAR}.newTab`), false);
@@ -59,7 +60,7 @@ test('New Tab opens the command bar; Escape and a click outside close it without
     await b.waitFor(open);
     assert.equal(await b.eval(`${BAR}.newTab`), true);
     await b.key('Escape', 'Escape', 27);
-    await b.waitFor(`!${open}`);
+    await b.waitFor(`!${open}`, 10000, `[document.hasFocus(), app.shadowRoot.activeElement?.id, ${BAR}.shadowRoot?.activeElement?.id]`);
     await b.click(`${SB}.getElementById('newTabButton')`);
     await b.waitFor(open);
     await b.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: 1000, y: 700, button: 'left', clickCount: 1 });

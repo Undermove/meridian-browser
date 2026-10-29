@@ -115,12 +115,15 @@ export async function launch(urls = [], { profile: keep, args = [] } = {}) {
       };
       return p;
     },
-    async waitFor(expr, timeout = 10000) {
+    // show: an expression whose value the timeout error reports (what the page had instead).
+    async waitFor(expr, timeout = 10000, show = '') {
       const end = Date.now() + timeout; let last;
       // A DOM node can't be returned by value; it just means "found".
       const probe = `(() => { const v = (${expr}); return v instanceof Node ? true : v; })()`;
       while (Date.now() < end) { try { last = await b.eval(probe); if (last) return last; } catch (e) { last = e.message; } await sleep(100); }
-      throw new Error(`timed out waiting for: ${expr} (last: ${JSON.stringify(last)})`);
+      let shown = '';
+      if (show) { try { shown = `; ${show} = ${JSON.stringify(await b.eval(show))}`; } catch (e) { shown = `; ${show}: ${e.message}`; } }
+      throw new Error(`timed out waiting for: ${expr} (last: ${JSON.stringify(last)}${shown})`);
     },
     // Today tabs as the sidebar shows them, top to bottom.
     tabs() {

@@ -60,7 +60,8 @@ test('Workbench: opens a project, edits and saves with ⌘S, runs a terminal, st
     await wb.eval(`launch('shell').then((t) => !!t)`);
     await wb.waitFor('S.terms.length === 1');
     await wb.eval(`(() => { window.workbench.ptyWrite(S.activeTerm.id, 'echo meridian-$((40+2)) && pwd\\r'); return true; })()`);
-    const termText = `S.activeTerm.xterm.buffer.active ? Array.from({ length: S.activeTerm.xterm.buffer.active.length }, (_, i) => S.activeTerm.xterm.buffer.active.getLine(i)?.translateToString(true) || '').join('\\n') : ''`;
+    // Wrapped lines joined back (a long path wraps).
+    const termText = `S.activeTerm.xterm.buffer.active ? Array.from({ length: S.activeTerm.xterm.buffer.active.length }, (_, i) => { const l = S.activeTerm.xterm.buffer.active.getLine(i); return (l?.isWrapped ? '' : '\\n') + (l?.translateToString(true) || ''); }).join('') : ''`;
     await wb.waitFor(`(${termText}).includes('meridian-42')`, 15000);
     assert.ok((await wb.eval(termText)).includes(project));
 

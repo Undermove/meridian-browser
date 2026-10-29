@@ -21,17 +21,18 @@ test('a link from another app opens in a Little window; Open in Meridian moves i
     await b.waitFor(`${todayTitles}.includes('Main')`);
     // What macOS does when a link is clicked in another app (this exact app bundle).
     await openFromOtherApp(site.url('/p/Little'));
-    let little;
+    let little, seen = 'no other window';
     for (let i = 0; i < 100 && !little; i++) {
       await sleep(200);
       const [w] = await b.otherWindows();
       if (w && await w.eval(`app?.hasAttribute('little') && app.shadowRoot.querySelector('#littleBar .host').textContent === '127.0.0.1'`)) {
         little = w;
       } else {
+        if (w) seen = await w.eval(`[app?.hasAttribute('little'), app?.shadowRoot.querySelector('#littleBar')?.outerHTML]`).catch((e) => e.message);
         w?.close();
       }
     }
-    assert.ok(little, 'a Little window opened');
+    assert.ok(little, `a Little window opened (last seen: ${JSON.stringify(seen)})`);
     if (process.env.SHOT) await little.screenshot(process.env.SHOT);
     assert.equal(await little.eval(`getComputedStyle(app.shadowRoot.getElementById('sidebar')).display`), 'none');
     assert.equal(await little.eval(`app.$.tabstrip.state_.tabs.length`), 1);
