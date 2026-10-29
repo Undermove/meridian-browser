@@ -29,7 +29,10 @@ test('ads are blocked on every site; turning it off in Settings lets them throug
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}`;
   // A real first page, as a restored session gives: Chromium publishes the ruleset after startup.
-  const b = await launch([`${base}/page0`], { args: [`--meridian-adblock-ruleset=${path.join(dir, 'ruleset.dat')}`] });
+  // Startup ends when a visible tab has loaded, or after a failsafe (3 minutes); a test window can
+  // be on another Space and never visible, so the failsafe here is short.
+  const b = await launch([`${base}/page0`], { args: [`--meridian-adblock-ruleset=${path.join(dir, 'ruleset.dat')}`,
+    '--enable-features=ImprovedStartupBestEffortDelay:StartupDelayFailsafeTimeout/10s'] });
   const open = async (n) => {
     await fetch(`${b.base}/json/new?${base}/page${n}`, { method: 'PUT' });
     for (let i = 0; i < 50 && !hits.includes(`/ok.gif?/page${n}`); i++) await sleep(100);

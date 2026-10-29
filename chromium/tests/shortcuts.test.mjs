@@ -2,7 +2,8 @@
 // spaces; ⌘D pins; ⌘S hides the sidebar. On macOS every shortcut is resolved from the real NSEvent (menu
 // key equivalents and ChromeCommandDispatcherDelegate) into an IDC_* command, which
 // meridian::SidebarHandler::HandleCommand hands to the sidebar as a Command. DevTools key events carry no
-// NSEvent and are dropped before that, so these tests start from the Command.
+// NSEvent and are dropped before that, so most tests here start from the Command; the first one presses
+// the keys for real (--meridian-test-keys: an NSEvent through AppKit, the menus and the pages).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { launch, SB, itemEl } from './harness.mjs';
@@ -12,6 +13,36 @@ const today = (n) => `${SB}.querySelectorAll('meridian-tab-row').length === ${n}
 const activeTitle = `[...app.$.tabstrip.tabs_.values()].find((t) => t.isActive)?.title`;
 // sidebar.mojom Command enum order.
 const C = { selectTab: 0, stepTab: 1, selectSpace: 2, stepSpace: 3, togglePin: 4, toggleSidebar: 5, newFolder: 6 };
+// NSEventModifierFlags and macOS virtual key codes.
+const CMD = 1 << 20, OPT = 1 << 19, CTRL = 1 << 18;
+const K = { 1: [18, '1'], 2: [19, '2'], 3: [20, '3'], left: [123, '\uF702'], right: [124, '\uF703'] };
+
+// ⌘D and ⌘S are main menu key equivalents: AppKit hands those to the menu, which doesn't answer a test
+// window in the background, so they stay with the Command tests below.
+test('real key presses: ⌘1-3 tabs in sidebar order, ⌃1/⌃2 and ⌘⌥←/→ spaces', async () => {
+  const b = await launch([page('A'), page('B'), page('C')], { args: ['--meridian-test-keys'] });
+  const press = ([code, ch], mods) => b.eval(`app.$.tabstrip.handler_.testKeyPress(${code}, ${JSON.stringify(ch)}, ${mods})`);
+  const space = `app.$.tabstrip.state_.spaces.findIndex((s) => s.id === app.$.tabstrip.state_.activeSpaceId)`;
+  try {
+    await b.waitFor(today(3));
+    // Today is newest first: C, B, A; ⌘1 is the sidebar's first, not the tab strip's.
+    await press(K[1], CMD);
+    await b.waitFor(`${activeTitle} === 'C'`);
+    await press(K[3], CMD);
+    await b.waitFor(`${activeTitle} === 'A'`);
+    await b.eval(`app.$.tabstrip.handler_.createSpace('Work', '', '#e08a8a', '')`);
+    await b.waitFor(`app.$.tabstrip.state_.spaces.length === 2`);
+    await press(K[2], CTRL);
+    await b.waitFor(`${space} === 1`);
+    await press(K[1], CTRL);
+    await b.waitFor(`${space} === 0`);
+    await press(K.right, CMD | OPT);
+    await b.waitFor(`${space} === 1`);
+    await press(K.left, CMD | OPT);
+    await b.waitFor(`${space} === 0`);
+    await b.waitFor(`${activeTitle} === 'A'`);
+  } finally { await b.close(); }
+});
 
 
 test('⌘1-9 and ⌘⌥↓/↑ go through the sidebar order, not the raw tab strip', async () => {

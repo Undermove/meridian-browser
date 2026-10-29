@@ -1,0 +1,236 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 29 Oct 2026 21:04:10 +0400
+Subject: [PATCH 46/48] Meridian: shortcuts and menu commands work again; no
+ rubber band; greeting font
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Meridian's commands (39700-39725) have no ActionItem, and with
+  UseActionsForBrowserCommands (on by default in M158) the command updater
+  treated them as unsupported and disabled: every Meridian menu item and
+  shortcut was dead (⌘⌥←/→, ⌃1-9, ⌘S, ⌘D…), and ⌘1-9 / ⌃Tab ran the raw tab
+  strip's actions instead of the sidebar's order. They are now enabled in
+  normal windows and handed to the sidebar before the updater.
+- Space switching is reserved, like ⌘T: a page can't keep ⌘⌥←/→ or ⌃1-9.
+- The browser frame page no longer rubber-bands on a swipe.
+- Non-Latin greetings in the welcome tour use a system face (the script
+  faces have no Cyrillic).
+- Tests: TestKeyPress (--meridian-test-keys, temp profile only) sends a real
+  NSEvent through AppKit, so shortcuts are tested end to end.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar.mojom         |  4 +++
+ chrome/browser/meridian/sidebar_handler.h     |  3 ++
+ .../browser/meridian/sidebar_handler_mac.mm   | 33 +++++++++++++++++++
+ .../webui_browser/meridian/onboarding.css     |  7 ++++
+ .../webui_browser/meridian/onboarding.html.ts |  3 +-
+ .../webui_browser/webui_browser.html          |  4 +++
+ chrome/browser/ui/accelerator_table.cc        | 13 ++++++++
+ .../browser/ui/browser_command_controller.cc  | 27 +++++++++++++++
+ 8 files changed, 93 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 615618a64c..14ebda03b7 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -436,6 +436,10 @@ interface SidebarHandler {
+   // macOS: hides the window's traffic lights while the sidebar is hidden (they
+   // come back with it), like Arc.
+   SetWindowControlsVisible(bool visible);
++  // Tests only (--meridian-test-keys, with a temp profile): a key press as a
++  // real macOS event in this window, going through AppKit, the menus and the
++  // pages the way a person's does. `modifiers`: NSEventModifierFlags.
++  TestKeyPress(uint16 key_code, string characters, uint32 modifiers);
+ 
+   // Split view: the active tab and `other` side by side (⌃⇧=), back to one
+   // (⌃⇧-), and the divider position.
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index c9b581dd8a..bc8e378de9 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -137,6 +137,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void OpenItem(const std::string& item_id) override;
+   void ResetItemToHome(const std::string& item_id) override;
+   void SetWindowControlsVisible(bool visible) override;
++  void TestKeyPress(uint16_t key_code,
++                    const std::string& characters,
++                    uint32_t modifiers) override;
+   void SplitWith(const tabs_api::NodeId& other) override;
+   void Unsplit() override;
+   void SetSplitRatio(const std::string& split_id, double ratio) override;
+diff --git a/chrome/browser/meridian/sidebar_handler_mac.mm b/chrome/browser/meridian/sidebar_handler_mac.mm
+index 85aa0d32bc..92c6ac16fd 100644
+--- a/chrome/browser/meridian/sidebar_handler_mac.mm
++++ b/chrome/browser/meridian/sidebar_handler_mac.mm
+@@ -6,6 +6,9 @@
+ 
+ #include "chrome/browser/meridian/sidebar_handler.h"
+ 
++#include "base/strings/sys_string_conversions.h"
++#include "chrome/browser/meridian/test_switches.h"
++
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+ #include "content/public/browser/browser_task_traits.h"
+@@ -25,6 +28,36 @@ void SidebarHandler::SetWindowControlsVisible(bool visible) {
+   }
+ }
+ 
++void SidebarHandler::TestKeyPress(uint16_t key_code,
++                                  const std::string& characters,
++                                  uint32_t modifiers) {
++  if (!HasTestSwitch("meridian-test-keys")) {
++    return;
++  }
++  NSWindow* window =
++      browser_->GetWindow()->GetNativeWindow().GetNativeNSWindow();
++  NSString* chars = base::SysUTF8ToNSString(characters);
++  for (NSEventType type : {NSEventTypeKeyDown, NSEventTypeKeyUp}) {
++    NSEvent* event = [NSEvent keyEventWithType:type
++                                      location:NSZeroPoint
++                                 modifierFlags:modifiers
++                                     timestamp:NSProcessInfo.processInfo
++                                                   .systemUptime
++                                  windowNumber:window.windowNumber
++                                       context:nil
++                                    characters:chars
++                   charactersIgnoringModifiers:chars
++                                     isARepeat:NO
++                                       keyCode:key_code];
++    // What -[NSApplication sendEvent:] does for the key window, which a test
++    // window in the background isn't: key equivalents first, then the
++    // window's first responder.
++    if (type == NSEventTypeKeyUp || ![window performKeyEquivalent:event]) {
++      [window sendEvent:event];
++    }
++  }
++}
++
+ namespace {
+ 
+ bool IsDefault() {
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.css b/chrome/browser/resources/webui_browser/meridian/onboarding.css
+index 7732789db7..3a39cf0720 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.css
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.css
+@@ -399,6 +399,13 @@ kbd {
+   animation: write 1.5s cubic-bezier(0.55, 0.1, 0.25, 1) both;
+ }
+ 
++/* The script faces have Latin letters only; other scripts in a light system face, not a fallback
++   italic (Cyrillic cursive read as "npuben"). */
++.hello-word span.plain {
++  font: 200 0.7em / 1.1 system-ui, sans-serif;
++  letter-spacing: -0.02em;
++}
++
+ @keyframes write {
+   from {
+     clip-path: inset(-20% 100% -20% -15%);
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+index adcf22a822..9bbd9809ab 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+@@ -22,7 +22,8 @@ export function getHtml(this: MeridianOnboardingElement) {
+         ${this.step_ === 'hello' ? html`
+           <div class="hello">
+             <div class="hello-word" aria-live="polite">
+-              ${repeat([this.hello_], w => w, w => html`<span>${w}</span>`)}
++              ${repeat([this.hello_], w => w, w => html`<span class="${
++                  /^[\p{Script=Latin}]+$/u.test(w) ? '' : 'plain'}">${w}</span>`)}
+             </div>
+             <div class="hello-mark">
+               <svg width="26" height="26" viewBox="0 7 64 64" class="logo">
+diff --git a/chrome/browser/resources/webui_browser/webui_browser.html b/chrome/browser/resources/webui_browser/webui_browser.html
+index ee0269e0ba..2ffc113027 100644
+--- a/chrome/browser/resources/webui_browser/webui_browser.html
++++ b/chrome/browser/resources/webui_browser/webui_browser.html
+@@ -6,6 +6,10 @@
+       height: 100%;
+       margin: 0;
+       padding: 0;
++      /* Meridian: the browser frame never rubber-bands; a swipe over the
++         sidebar or the pages moves only what it is over. */
++      overflow: hidden;
++      overscroll-behavior: none;
+     }
+     * {
+       font-family: system-ui;
+diff --git a/chrome/browser/ui/accelerator_table.cc b/chrome/browser/ui/accelerator_table.cc
+index f074c958b0..092f068799 100644
+--- a/chrome/browser/ui/accelerator_table.cc
++++ b/chrome/browser/ui/accelerator_table.cc
+@@ -357,6 +357,19 @@ constexpr int kReservedCommandIds[] = {
+     IDC_CYCLE_TO_NEXT_TAB,
+     IDC_CYCLE_TO_PREV_TAB,
+     IDC_EXIT,
++    // Meridian: switching spaces works whatever the page does with the keys,
++    // like Arc (pages can't keep ⌘⌥←/→ or ⌃1-9 for themselves).
++    IDC_MERIDIAN_NEXT_SPACE,
++    IDC_MERIDIAN_PREVIOUS_SPACE,
++    IDC_MERIDIAN_SPACE_1,
++    IDC_MERIDIAN_SPACE_1 + 1,
++    IDC_MERIDIAN_SPACE_1 + 2,
++    IDC_MERIDIAN_SPACE_1 + 3,
++    IDC_MERIDIAN_SPACE_1 + 4,
++    IDC_MERIDIAN_SPACE_1 + 5,
++    IDC_MERIDIAN_SPACE_1 + 6,
++    IDC_MERIDIAN_SPACE_1 + 7,
++    IDC_MERIDIAN_SPACE_9,
+ #if BUILDFLAG(IS_ANDROID)
+     // On Android, pane navigation (F6 / Shift+F6) is also reserved so web
+     // pages cannot trap keyboard focus.
+diff --git a/chrome/browser/ui/browser_command_controller.cc b/chrome/browser/ui/browser_command_controller.cc
+index c9cab120e9..c4cc8808f2 100644
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -647,11 +647,30 @@ void BrowserCommandController::ShowCustomizeChromeSidePanel(
+ ////////////////////////////////////////////////////////////////////////////////
+ // BrowserCommandController, CommandUpdater implementation:
+ 
++namespace {
++
++// Meridian's own commands (chrome_command_ids.h, 39700-39725). They have no
++// ActionItem, and with UseActionsForBrowserCommands (on by default) the
++// command updater treats such a command as unsupported and disabled, which
++// left every Meridian menu item and shortcut dead. They are on in every
++// normal window and go straight to the sidebar.
++bool IsMeridianCommand(int id) {
++  return id >= IDC_MERIDIAN_TOGGLE_SIDEBAR && id <= IDC_MERIDIAN_MISSION;
++}
++
++}  // namespace
++
+ bool BrowserCommandController::SupportsCommand(int id) const {
++  if (IsMeridianCommand(id)) {
++    return true;
++  }
+   return command_updater_->SupportsCommand(id);
+ }
+ 
+ bool BrowserCommandController::IsCommandEnabled(int id) const {
++  if (IsMeridianCommand(id)) {
++    return browser_->GetType() == BrowserWindowInterface::Type::TYPE_NORMAL;
++  }
+   return command_updater_->IsCommandEnabled(id);
+ }
+ 
+@@ -664,6 +683,14 @@ bool BrowserCommandController::ExecuteCommandWithDispositionAndContext(
+     return false;
+   }
+ 
++  // Meridian: tab and space commands follow the sidebar (its favorites,
++  // pinned tabs and Today), not the raw tab strip. Here and not only in
++  // HandleCommandWithDisposition(): with actions for browser commands, the
++  // command updater runs an ActionItem and never comes back there.
++  if (meridian::SidebarHandler::HandleCommand(browser_, id)) {
++    return true;
++  }
++
+   // No commands are enabled if there is not yet any selected tab.
+   // TODO(pkasting): It seems like we should not need this, because either
+   // most/all commands should not have been enabled yet anyway or the ones that

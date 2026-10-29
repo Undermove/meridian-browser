@@ -1,0 +1,318 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 29 Oct 2026 22:59:33 +0400
+Subject: [PATCH 47/48] Meridian: no dark flash switching spaces in fullscreen;
+ history swipe works
+
+Spaces in another profile live in their own window. In native fullscreen,
+hiding the shown window closed its macOS Space, so every switch went through
+a dark transition. Now the other window is shown over the fullscreen one as
+an auxiliary window, and the fullscreen one stays; when fullscreen ends the
+shown window takes its place.
+
+The two-finger back/forward swipe asked the browser UI page for history,
+which has none; it now goes to the active tab. The browser frame no longer
+scrolls at all, so it never rubber-bands, without swallowing the swipe a page
+passes up.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |  2 +
+ chrome/browser/meridian/profile_windows.cc    | 73 ++++++++++++++++++-
+ chrome/browser/meridian/profile_windows_mac.h | 24 ++++++
+ .../browser/meridian/profile_windows_mac.mm   | 61 ++++++++++++++++
+ ...me_render_widget_host_view_mac_delegate.mm | 27 ++++++-
+ .../webui_browser/webui_browser.html          |  6 +-
+ 6 files changed, 184 insertions(+), 9 deletions(-)
+ create mode 100644 chrome/browser/meridian/profile_windows_mac.h
+ create mode 100644 chrome/browser/meridian/profile_windows_mac.mm
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 32f2717584..0a044733dd 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -231,6 +231,8 @@ source_set("meridian") {
+   if (is_mac) {
+     sources += [
+       "arc_logins_mac.mm",
++      "profile_windows_mac.h",
++      "profile_windows_mac.mm",
+       "sidebar_handler_mac.mm",
+     ]
+     frameworks = [
+diff --git a/chrome/browser/meridian/profile_windows.cc b/chrome/browser/meridian/profile_windows.cc
+index 9d3e496512..82fd55d065 100644
+--- a/chrome/browser/meridian/profile_windows.cc
++++ b/chrome/browser/meridian/profile_windows.cc
+@@ -11,6 +11,7 @@
+ #include "base/memory/weak_ptr.h"
+ #include "base/no_destructor.h"
+ #include "base/strings/string_number_conversions.h"
++#include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/meridian/little_window.h"
+ #include "chrome/browser/meridian/sidebar_handler.h"
+@@ -28,6 +29,10 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "ui/base/base_window.h"
+ 
++#if BUILDFLAG(IS_MAC)
++#include "chrome/browser/meridian/profile_windows_mac.h"
++#endif
++
+ namespace meridian {
+ 
+ namespace {
+@@ -72,6 +77,46 @@ void OnClosed(BrowserWindowInterface* browser) {
+   }
+ }
+ 
++#if BUILDFLAG(IS_MAC)
++// The frame's window in macOS full screen, if any (another profile's window
++// may be showing over it).
++BrowserWindowInterface* FullscreenWindowOf(int frame) {
++  for (auto& [b, id] : F().frame_of) {
++    if (id == frame && IsInNativeFullscreen(b)) {
++      return b;
++    }
++  }
++  return nullptr;
++}
++
++// When the full-screen window leaves full screen with another profile's
++// window over it, that one takes its place, like any swap.
++void WatchFullscreenExit(int frame, BrowserWindowInterface* base) {
++  static base::NoDestructor<std::set<BrowserWindowInterface*>> watched;
++  if (!watched->insert(base).second) {
++    return;
++  }
++  OnFullscreenExit(base, base::BindOnce(
++                             [](int frame, BrowserWindowInterface* base) {
++                               watched->erase(base);
++                               Frames& f = F();
++                               auto it = f.frame_of.find(base);
++                               auto visible = f.visible_of.find(frame);
++                               if (it == f.frame_of.end() ||
++                                   visible == f.visible_of.end() ||
++                                   visible->second == base) {
++                                 return;
++                               }
++                               BrowserWindowInterface* over = visible->second;
++                               SetOverFullscreen(over, false);
++                               over->GetWindow()->SetBounds(
++                                   base->GetWindow()->GetBounds());
++                               base->GetWindow()->Hide();
++                             },
++                             frame, base));
++}
++#endif
++
+ void Track(BrowserWindowInterface* browser, int frame) {
+   Frames& f = F();
+   f.frame_of[browser] = frame;
+@@ -220,11 +265,31 @@ void ShowSpaceInProfile(
+             }
+             Open(target, space_id, urls);
+             if (show && target != current) {
+-              target->GetWindow()->SetBounds(current->GetWindow()->GetBounds());
+               f.visible_of[frame] = target;
+-              target->GetWindow()->Show();
+-              target->GetWindow()->Activate();
+-              current->GetWindow()->Hide();
++#if BUILDFLAG(IS_MAC)
++              // In full screen the full-screen window stays put and the
++              // others show over it, in its Space: hiding it would close the
++              // Space (macOS's dark slide out of full screen and back).
++              if (BrowserWindowInterface* base = FullscreenWindowOf(frame)) {
++                if (target != base) {
++                  SetOverFullscreen(target, true);
++                  target->GetWindow()->SetBounds(base->GetWindow()->GetBounds());
++                  target->GetWindow()->Show();
++                  WatchFullscreenExit(frame, base);
++                }
++                target->GetWindow()->Activate();
++                if (current != base) {
++                  current->GetWindow()->Hide();
++                }
++              } else
++#endif
++              {
++                target->GetWindow()->SetBounds(
++                    current->GetWindow()->GetBounds());
++                target->GetWindow()->Show();
++                target->GetWindow()->Activate();
++                current->GetWindow()->Hide();
++              }
+             }
+             if (show) {
+               SidebarHandler::ActivateSpaceInWindow(target, space_id);
+diff --git a/chrome/browser/meridian/profile_windows_mac.h b/chrome/browser/meridian/profile_windows_mac.h
+new file mode 100644
+index 0000000000..ff834d08d3
+--- /dev/null
++++ b/chrome/browser/meridian/profile_windows_mac.h
+@@ -0,0 +1,24 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_PROFILE_WINDOWS_MAC_H_
++#define CHROME_BROWSER_MERIDIAN_PROFILE_WINDOWS_MAC_H_
++
++#include "base/functional/callback.h"
++
++class BrowserWindowInterface;
++
++namespace meridian {
++
++// macOS full screen (its own Space) for the windows of one frame.
++bool IsInNativeFullscreen(BrowserWindowInterface* browser);
++// Lets `browser` show in a full-screen window's Space, over it.
++void SetOverFullscreen(BrowserWindowInterface* browser, bool over);
++// Runs `exited` once, when `browser` has left full screen.
++void OnFullscreenExit(BrowserWindowInterface* browser,
++                      base::OnceClosure exited);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_PROFILE_WINDOWS_MAC_H_
+diff --git a/chrome/browser/meridian/profile_windows_mac.mm b/chrome/browser/meridian/profile_windows_mac.mm
+new file mode 100644
+index 0000000000..cc1ce477f4
+--- /dev/null
++++ b/chrome/browser/meridian/profile_windows_mac.mm
+@@ -0,0 +1,61 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/profile_windows_mac.h"
++
++#include <AppKit/AppKit.h>
++
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "ui/base/base_window.h"
++#include "ui/gfx/native_ui_types.h"
++
++namespace meridian {
++
++namespace {
++
++NSWindow* WindowOf(BrowserWindowInterface* browser) {
++  return browser->GetWindow()->GetNativeWindow().GetNativeNSWindow();
++}
++
++}  // namespace
++
++bool IsInNativeFullscreen(BrowserWindowInterface* browser) {
++  NSWindow* window = WindowOf(browser);
++  return window && (window.styleMask & NSWindowStyleMaskFullScreen);
++}
++
++void SetOverFullscreen(BrowserWindowInterface* browser, bool over) {
++  NSWindow* window = WindowOf(browser);
++  if (!window) {
++    return;
++  }
++  if (over) {
++    window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenAuxiliary;
++  } else {
++    window.collectionBehavior &= ~NSWindowCollectionBehaviorFullScreenAuxiliary;
++  }
++}
++
++void OnFullscreenExit(BrowserWindowInterface* browser,
++                      base::OnceClosure exited) {
++  NSWindow* window = WindowOf(browser);
++  if (!window) {
++    return;
++  }
++  __block base::OnceClosure block_exited = std::move(exited);
++  __block id token = nil;
++  token = [NSNotificationCenter.defaultCenter
++      addObserverForName:NSWindowDidExitFullScreenNotification
++                  object:window
++                   queue:NSOperationQueue.mainQueue
++              usingBlock:^(NSNotification*) {
++                [NSNotificationCenter.defaultCenter removeObserver:token];
++                token = nil;
++                if (block_exited) {
++                  std::move(block_exited).Run();
++                }
++              }];
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/renderer_host/chrome_render_widget_host_view_mac_delegate.mm b/chrome/browser/renderer_host/chrome_render_widget_host_view_mac_delegate.mm
+index 0da54369fc..6a21f7aecb 100644
+--- a/chrome/browser/renderer_host/chrome_render_widget_host_view_mac_delegate.mm
++++ b/chrome/browser/renderer_host/chrome_render_widget_host_view_mac_delegate.mm
+@@ -14,6 +14,8 @@
+ #import "chrome/browser/renderer_host/chrome_render_widget_host_view_mac_history_swiper.h"
+ #include "chrome/browser/renderer_host/chrome_render_widget_host_view_mac_history_swiping_control.h"
+ #include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/tabs/inactive_window_mouse_event_controller.h"
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+ #include "chrome/common/url_constants.h"
+@@ -169,9 +171,29 @@
+   return self.nsView;
+ }
+ 
++// Meridian: the WebUI browser frame (chrome://webui-browser) has no history of
++// its own; a swipe over it, or bubbled up from a page that couldn't scroll
++// further, goes back and forward in the window's active tab.
++- (content::WebContents*)historyWebContentsOnWindow:(NSWindow*)window {
++  content::WebContents* webContents = self.webContents;
++  if (!webContents) {
++    return nullptr;
++  }
++  const GURL& url = webContents->GetLastCommittedURL();
++  if (!url.SchemeIs(content::kChromeUIScheme) || url.host() != "webui-browser") {
++    return webContents;
++  }
++  BrowserWindowInterface* browser =
++      GlobalBrowserCollection::GetInstance()->FindBrowserWithWindow(
++          gfx::NativeWindow(window));
++  tabs::TabInterface* tab = browser ? browser->GetActiveTabInterface() : nullptr;
++  return tab ? tab->GetContents() : nullptr;
++}
++
+ - (BOOL)canNavigateInDirection:(history_swiper::NavigationDirection)direction
+                       onWindow:(NSWindow*)window {
+-  content::WebContents* webContents = self.webContents;
++  content::WebContents* webContents =
++      [self historyWebContentsOnWindow:window];
+   if (!webContents) {
+     return NO;
+   }
+@@ -185,7 +207,8 @@
+ 
+ - (void)navigateInDirection:(history_swiper::NavigationDirection)direction
+                    onWindow:(NSWindow*)window {
+-  content::WebContents* webContents = self.webContents;
++  content::WebContents* webContents =
++      [self historyWebContentsOnWindow:window];
+   if (!webContents) {
+     return;
+   }
+diff --git a/chrome/browser/resources/webui_browser/webui_browser.html b/chrome/browser/resources/webui_browser/webui_browser.html
+index 2ffc113027..35c976bb97 100644
+--- a/chrome/browser/resources/webui_browser/webui_browser.html
++++ b/chrome/browser/resources/webui_browser/webui_browser.html
+@@ -6,10 +6,10 @@
+       height: 100%;
+       margin: 0;
+       padding: 0;
+-      /* Meridian: the browser frame never rubber-bands; a swipe over the
+-         sidebar or the pages moves only what it is over. */
++      /* Meridian: the browser frame doesn't scroll, so it never rubber-bands;
++         a swipe moves only what it is over. (No overscroll-behavior: that
++         would also swallow the back/forward swipe a page passes up.) */
+       overflow: hidden;
+-      overscroll-behavior: none;
+     }
+     * {
+       font-family: system-ui;
