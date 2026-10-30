@@ -23,7 +23,7 @@ test('Workbench: opens a project, edits and saves with ⌘S, runs a terminal, st
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
     // The sidebar button opens it; the first screen leads with "Open a project folder".
-    await b.click(`${SB}.getElementById('workbenchButton')`);
+    await b.plus('Workbench');
     wb = await b.page('chrome://workbench');
     await wb.waitFor(`!document.querySelector('#welcome').hidden`, 15000);
     assert.equal(await wb.eval(`document.querySelector('#open-folder').textContent.trim()`), 'Open a project folder');

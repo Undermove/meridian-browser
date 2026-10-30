@@ -39,7 +39,7 @@ test('a new space starts with a new tab and its own colour; switching spaces sho
   try {
     await b.waitFor(todayCount(1));
     const tint1 = await b.eval(`getComputedStyle(app).getPropertyValue('--meridian-space').trim()`);
-    await b.click(`${SB}.getElementById('addSpace')`);
+    await b.plus('New Space');
     // The new space is active, renaming in place.
     await b.waitFor(`${SB}.querySelector('.space-header input.rename')`);
     await b.type('Work');
@@ -85,7 +85,7 @@ test('folders hold pins; favorites are shared by every space', async () => {
     // Linear to favorites; it shows as a tile in every space.
     await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Linear')`, 'Add to Favorites');
     await b.waitFor(`${SB}.querySelectorAll('meridian-fav').length === 1`);
-    await b.click(`${SB}.getElementById('addSpace')`);
+    await b.plus('New Space');
     await b.waitFor(`${SB}.querySelector('.space-header input.rename')`);
     await b.key('Escape', 'Escape', 27);
     await b.waitFor(`app.$.tabstrip.state_.spaces.length === 2 && app.$.tabstrip.state_.activeSpaceId === app.$.tabstrip.state_.spaces[1].id`);

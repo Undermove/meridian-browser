@@ -153,6 +153,11 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
       await b.click(row('#menu', first));
       if (sub) await b.click(row('#submenu', sub));
     },
+    // The + at the bottom of the sidebar (Arc's): a row of the menu it opens.
+    async plus(label) {
+      await b.click(`${SB}.getElementById('addSpace')`);
+      await b.click(`[...${SB}.querySelector('#menu meridian-menu').shadowRoot.querySelectorAll('.menu-item')].find((m) => m.querySelector('.menu-label').textContent.trim() === ${JSON.stringify(label)})`);
+    },
     // A real mouse drag from one element to a point in another (fraction fx/fy of its box), through
     // Chromium's drag and drop: intercept the drag the press-and-move starts, then replay it as drag events.
     async drag(fromExpr, toExpr, { fx = 0.5, fy = 0.5 } = {}) {

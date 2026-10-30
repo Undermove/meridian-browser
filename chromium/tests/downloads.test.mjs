@@ -51,8 +51,9 @@ test('Downloads: progress, cancel, done, Clear; ⇧⌘J toggles the popover', as
   const b = await launch([url], { profile });
   try {
     await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'Files')`);
-    // No downloads yet: no button.
-    assert.equal(await b.eval(`!!${SB}.getElementById('downloadsButton')`), false);
+    // The downloads sit in the sidebar's bottom-left corner, like Arc's (no Chrome menu there).
+    assert.equal(await b.eval(`${SB}.getElementById('bottom').firstElementChild.id`), 'downloadsButton');
+    assert.equal(await b.eval(`app.shadowRoot.getElementById('appMenuButton').hidden`), true);
     // ⇧⌘J opens the empty popover.
     await b.eval(`app.$.tabstrip.runCommand(${C.downloads}, 0)`);
     await b.waitFor(`!${SB}.getElementById('downloads').hidden`);

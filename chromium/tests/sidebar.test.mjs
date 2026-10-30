@@ -13,7 +13,7 @@ test('the sidebar holds the address field and a vertical list of tabs', async ()
     const rects = await b.eval(`[0, 1].map((i) => { const r = ${SB}.querySelectorAll('meridian-tab-row')[i].getBoundingClientRect(); return { x: r.x, y: r.y }; })`);
     assert.equal(rects[0].x, rects[1].x, 'tabs share a column');
     assert.ok(rects[1].y > rects[0].y, 'second tab is below the first');
-    assert.equal(await b.eval(`app.shadowRoot.getElementById('sidebar').getBoundingClientRect().width`), 260);
+    assert.equal(await b.eval(`app.shadowRoot.getElementById('sidebar').getBoundingClientRect().width`), 276);
     assert.ok(await b.eval(`app.shadowRoot.getElementById('sidebar').contains(app.$.urlPill)`), 'URL pill in the sidebar');
     // The page card has the same margin on the right as at the top and bottom.
     const m = await b.eval(`(() => { const r = app.$.contentRegion.getBoundingClientRect(); return { right: innerWidth - r.right, bottom: innerHeight - r.bottom, top: r.top }; })()`);
