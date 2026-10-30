@@ -1,0 +1,423 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 30 Oct 2026 15:43:42 +0400
+Subject: [PATCH 57/57] Meridian: a speaker on tabs that play sound; Mute Tab
+
+Today rows, pinned rows and favorite tiles show a speaker while their tab
+plays sound or is muted; clicking it mutes or unmutes without switching
+tabs. The tab and pinned menus offer Mute Tab / Unmute Tab
+(SidebarHandler::SetTabMuted).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar.mojom         |  3 +++
+ chrome/browser/meridian/sidebar_handler.cc    |  8 ++++++
+ chrome/browser/meridian/sidebar_handler.h     |  1 +
+ .../webui_browser/meridian/fav.html.ts        |  6 +++++
+ .../resources/webui_browser/meridian/fav.ts   | 24 ++++++++++++++++++
+ .../webui_browser/meridian/item.html.ts       |  5 ++++
+ .../resources/webui_browser/meridian/item.ts  | 25 ++++++++++++++++++-
+ .../resources/webui_browser/meridian/rows.css | 21 ++++++++++++++++
+ .../webui_browser/meridian/sidebar.ts         | 22 ++++++++++++++++
+ .../webui_browser/meridian/tab_row.html.ts    |  6 +++++
+ .../webui_browser/meridian/tab_row.ts         | 25 ++++++++++++++++++-
+ 11 files changed, 144 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 8f12df734b..126500e874 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -605,4 +605,7 @@ interface SidebarHandler {
+ 
+   // Turns a Peek into an ordinary Today tab.
+   ExpandPeek(tabs_api.mojom.NodeId tab_id);
++
++  // Mutes or unmutes a tab (the speaker in its row, Mute Tab in its menu).
++  SetTabMuted(tabs_api.mojom.NodeId tab_id, bool muted);
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index cff190c1ae..490427272d 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -30,6 +30,7 @@
+ #include "chrome/browser/meridian/ai/tidy.h"
+ #include "chrome/browser/meridian/mission/mission_control_factory.h"
+ #include "chrome/browser/meridian/update_check.h"
++#include "chrome/browser/ui/tabs/tab_muted_utils.h"
+ #include "chrome/browser/meridian/workbench/workbench_handler.h"
+ #include "chrome/browser/meridian/ai/ai_service.h"
+ #include "chrome/browser/meridian/ai/ai_service_factory.h"
+@@ -303,6 +304,13 @@ void SidebarHandler::ExpandPeek(const tabs_api::NodeId& tab_id) {
+   }
+ }
+ 
++void SidebarHandler::SetTabMuted(const tabs_api::NodeId& tab_id, bool muted) {
++  if (tabs::TabInterface* tab = TabFor(tab_id)) {
++    SetTabAudioMuted(tab->GetContents(), muted,
++                     TabMutedReason::kAudioIndicator, std::string());
++  }
++}
++
+ void SidebarHandler::Adopt(tabs::TabInterface* tab) {
+   content::WebContents* contents = tab->GetContents();
+   const TabData* data = TabData::Get(contents);
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 0591b1dff1..488cefe924 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -215,6 +215,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+                   const std::string& what,
+                   RunAiSetupCallback callback) override;
+   void ExpandPeek(const tabs_api::NodeId& tab_id) override;
++  void SetTabMuted(const tabs_api::NodeId& tab_id, bool muted) override;
+ 
+   // ArchiveService::Observer:
+   void OnArchiveChanged() override;
+diff --git a/chrome/browser/resources/webui_browser/meridian/fav.html.ts b/chrome/browser/resources/webui_browser/meridian/fav.html.ts
+index 6819d0369b..34d37b16cc 100644
+--- a/chrome/browser/resources/webui_browser/meridian/fav.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/fav.html.ts
+@@ -4,6 +4,7 @@
+ 
+ import {html} from '//resources/lit/v3_0/lit.rollup.js';
+ 
++import {icon} from './icons.js';
+ import type {MeridianFavElement} from './fav.js';
+ 
+ export function getHtml(this: MeridianFavElement) {
+@@ -15,6 +16,11 @@ ${this.item ? html`
+       title="${this.item.title}" @mousedown="${this.onTileMousedown_}"
+       @contextmenu="${this.onTileContextmenu_}">
+     <img src="${this.favicon_}" width="20" height="20" alt="">
++    ${this.audio_ ? html`
++      <button class="fav-audio" title="${this.audioTitle_}"
++          @mousedown="${this.onAudioMousedown_}"
++          @click="${this.onAudioClick_}">${icon(this.audioIcon_, 10)}</button>
++    ` : ''}
+   </div>
+ ` : ''}
+ <!--_html_template_end_-->`;
+diff --git a/chrome/browser/resources/webui_browser/meridian/fav.ts b/chrome/browser/resources/webui_browser/meridian/fav.ts
+index 92d4a7c5f8..63e2e4c1f2 100644
+--- a/chrome/browser/resources/webui_browser/meridian/fav.ts
++++ b/chrome/browser/resources/webui_browser/meridian/fav.ts
+@@ -9,8 +9,10 @@ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {Tab} from '/tab_strip_api/tab_strip_api_data_model.mojom-webui.js';
+ 
+ import type {Item} from '../sidebar.mojom-webui.js';
++import {TabAlertState} from '../tabs.mojom-webui.js';
+ 
+ import {getHtml} from './fav.html.js';
++import type {IconName} from './icons.js';
+ import {getCss} from './rows.css.js';
+ import {FAVORITES} from './sidebar.js';
+ import type {MeridianSidebarElement} from './sidebar.js';
+@@ -35,6 +37,9 @@ export class MeridianFavElement extends CrLitElement {
+       rev: {type: Number},
+       tab_: {state: true, type: Object},
+       favicon_: {state: true, type: String},
++      audio_: {state: true, type: String},
++      audioTitle_: {state: true, type: String},
++      audioIcon_: {state: true, type: String},
+     };
+   }
+ 
+@@ -43,6 +48,10 @@ export class MeridianFavElement extends CrLitElement {
+   accessor rev: number = 0;
+   protected accessor tab_: Tab|null = null;
+   protected accessor favicon_: string = '';
++  // The speaker badge: '' (silent), 'playing' or 'muted'.
++  protected accessor audio_: string = '';
++  protected accessor audioTitle_: string = '';
++  protected accessor audioIcon_: IconName = 'speaker';
+ 
+   override willUpdate(changed: PropertyValues<this>) {
+     super.willUpdate(changed);
+@@ -50,6 +59,21 @@ export class MeridianFavElement extends CrLitElement {
+       this.tab_ = this.host.liveTab(this.item.id);
+       this.favicon_ = this.host.faviconFor(this.item, this.tab_);
+     }
++    const alerts = this.tab_?.alertStates || [];
++    this.audio_ = alerts.includes(TabAlertState.kAudioMuting) ? 'muted' :
++        alerts.includes(TabAlertState.kAudioPlaying)          ? 'playing' :
++                                                                '';
++    this.audioTitle_ = this.audio_ === 'muted' ? 'Unmute Tab' : 'Mute Tab';
++    this.audioIcon_ = this.audio_ === 'muted' ? 'mute' : 'speaker';
++  }
++
++  // Not a press on the tile (which would open the favorite).
++  protected onAudioMousedown_(e: Event) {
++    e.stopPropagation();
++  }
++
++  protected onAudioClick_(e: Event) {
++    this.host?.onMuteClick(e, this.tab_!, this.audio_ !== 'muted');
+   }
+ 
+   protected onTileMousedown_(e: MouseEvent) {
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.html.ts b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+index 498e4ec79f..ac0d8f8673 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+@@ -52,6 +52,11 @@ ${this.item && !this.item.isFolder ? html`
+       <input class="rename" .value="${this.item.title}" spellcheck="false"
+           @keydown="${this.onRenameKeydown_}" @blur="${this.onRenameBlur_}">
+     ` : html`<span class="title">${this.title_}</span>`}
++    ${this.audio_ ? html`
++      <button class="row-btn audio" title="${this.audioTitle_}"
++          @mousedown="${this.onAudioMousedown_}"
++          @click="${this.onAudioClick_}">${icon(this.audioIcon_, 13)}</button>
++    ` : ''}
+     ${this.tab_ ? html`
+       <button class="row-btn close" title="Close"
+           @click="${this.onCloseClick_}">${icon('x', 14)}</button>
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.ts b/chrome/browser/resources/webui_browser/meridian/item.ts
+index 11fd5785c5..436139695c 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.ts
+@@ -9,10 +9,11 @@ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {Tab} from '/tab_strip_api/tab_strip_api_data_model.mojom-webui.js';
+ 
+-import {TabNetworkState} from '../tabs.mojom-webui.js';
++import {TabAlertState, TabNetworkState} from '../tabs.mojom-webui.js';
+ 
+ import type {Item} from '../sidebar.mojom-webui.js';
+ 
++import type {IconName} from './icons.js';
+ import {getHtml} from './item.html.js';
+ import {getCss} from './rows.css.js';
+ import type {MeridianSidebarElement} from './sidebar.js';
+@@ -44,6 +45,9 @@ export class MeridianItemElement extends CrLitElement {
+       favicon_: {state: true, type: String},
+       title_: {state: true, type: String},
+       loading_: {state: true, type: Boolean},
++      audio_: {state: true, type: String},
++      audioTitle_: {state: true, type: String},
++      audioIcon_: {state: true, type: String},
+     };
+   }
+ 
+@@ -60,6 +64,10 @@ export class MeridianItemElement extends CrLitElement {
+   protected accessor favicon_: string = '';
+   protected accessor title_: string = '';
+   protected accessor loading_: boolean = false;
++  // The speaker of its open tab: '' (silent), 'playing' or 'muted'.
++  protected accessor audio_: string = '';
++  protected accessor audioTitle_: string = '';
++  protected accessor audioIcon_: IconName = 'speaker';
+ 
+   override willUpdate(changed: PropertyValues<this>) {
+     super.willUpdate(changed);
+@@ -74,6 +82,12 @@ export class MeridianItemElement extends CrLitElement {
+     this.loading_ = !!this.tab_ &&
+         (this.tab_.networkState === TabNetworkState.kLoading ||
+          this.tab_.networkState === TabNetworkState.kWaiting);
++    const alerts = this.tab_?.alertStates || [];
++    this.audio_ = alerts.includes(TabAlertState.kAudioMuting) ? 'muted' :
++        alerts.includes(TabAlertState.kAudioPlaying)          ? 'playing' :
++                                                                '';
++    this.audioTitle_ = this.audio_ === 'muted' ? 'Unmute Tab' : 'Mute Tab';
++    this.audioIcon_ = this.audio_ === 'muted' ? 'mute' : 'speaker';
+     this.title_ = this.tab_ && this.away_ ?
+         this.tab_.title :
+         item.title || this.tab_?.title || item.url;
+@@ -95,6 +109,15 @@ export class MeridianItemElement extends CrLitElement {
+     this.host?.onItemMouseDown(e, this.item!);
+   }
+ 
++  // Not a press on the row (which would open the pinned tab).
++  protected onAudioMousedown_(e: Event) {
++    e.stopPropagation();
++  }
++
++  protected onAudioClick_(e: Event) {
++    this.host?.onMuteClick(e, this.tab_!, this.audio_ !== 'muted');
++  }
++
+   protected onRowContextmenu_(e: MouseEvent) {
+     this.host?.onItemContextMenu(e, this.item!, this.container);
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/rows.css b/chrome/browser/resources/webui_browser/meridian/rows.css
+index 356b74dfc1..da7f11b1f8 100644
+--- a/chrome/browser/resources/webui_browser/meridian/rows.css
++++ b/chrome/browser/resources/webui_browser/meridian/rows.css
+@@ -73,6 +73,11 @@ button {
+   opacity: 0;
+ }
+ 
++/* Playing or muted: always shown, like Arc's speaker. */
++.row .audio {
++  color: var(--meridian-text);
++}
++
+ .row:hover .close,
+ .row.active .close {
+   opacity: 1;
+@@ -128,6 +133,22 @@ button {
+   background: var(--meridian-row-active);
+ }
+ 
++/* A favorite that plays sound: a small speaker in its corner (Arc's). */
++.fav-audio {
++  position: absolute;
++  top: 3px;
++  right: 3px;
++  width: 16px;
++  height: 16px;
++  border-radius: 8px;
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  background: var(--meridian-surface);
++  color: var(--meridian-text);
++  box-shadow: 0 0 0 0.5px var(--meridian-border);
++}
++
+ .fav.active {
+   background: var(--meridian-row-active);
+   box-shadow: var(--meridian-row-shadow),
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 7d6ca92b16..34997b305f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -23,6 +23,7 @@ import {TabStripObservation} from '/tab_strip_api/tab_strip_observation.js';
+ import type {TabStripObserver} from '/tab_strip_api/tab_strip_observer.js';
+ 
+ import {browserProxyFactory as sidebarProxyFactory, Command, UpdateStatus} from '../sidebar.mojom-webui.js';
++import {TabAlertState} from '../tabs.mojom-webui.js';
+ import type {Download, Item, SidebarHandlerInterface, UpdateState, SidebarState, Space, TidyFolder, TidyRename} from '../sidebar.mojom-webui.js';
+ import type {TabAdded, TabClosed, TabUpdated} from '../tab_strip/events.js';
+ 
+@@ -846,6 +847,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.tabStripService_.closeNodes([tab.id]);
+   }
+ 
++  onMuteClick(e: Event, tab: Tab, muted: boolean) {
++    e.stopPropagation();
++    this.handler_.setTabMuted(tab.id, muted);
++  }
++
+   onResetClick(e: Event, item: Item) {
+     e.stopPropagation();
+     this.handler_.resetItemToHome(item.id);
+@@ -1174,6 +1180,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+         enabled: !tab.isActive,
+         action: () => this.handler_.splitWith(tab.id),
+       },
++      ...this.muteMenu_(tab),
+       {
+         label: 'Add to Favorites',
+         icon: 'star',
+@@ -1201,6 +1208,20 @@ export class MeridianSidebarElement extends CrLitElement implements
+     ]);
+   }
+ 
++  // Mute Tab / Unmute Tab, for a tab that plays sound or is muted.
++  private muteMenu_(tab: Tab): MenuEntry[] {
++    const alerts = tab.alertStates || [];
++    const muted = alerts.includes(TabAlertState.kAudioMuting);
++    if (!muted && !alerts.includes(TabAlertState.kAudioPlaying)) {
++      return [];
++    }
++    return [{
++      label: muted ? 'Unmute Tab' : 'Mute Tab',
++      icon: muted ? 'speaker' : 'mute',
++      action: () => this.handler_.setTabMuted(tab.id, !muted),
++    }];
++  }
++
+   onItemContextMenu(e: MouseEvent, item: Item, container: string) {
+     const space = this.activeSpace();
+     assert(space);
+@@ -1254,6 +1275,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+         enabled: !tab.isActive,
+         action: () => this.handler_.splitWith(tab.id),
+       }] : []),
++      ...(tab ? this.muteMenu_(tab) : []),
+       fav ? {
+         label: 'Remove from Favorites',
+         icon: 'star',
+diff --git a/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts b/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
+index cd69aeee0e..1406f5a797 100644
+--- a/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
+@@ -19,6 +19,12 @@ ${this.tab ? html`
+       <img src="${this.favicon_}" width="16" height="16" alt="">
+     </span>
+     <span class="title">${this.tab.title || this.tab.url}</span>
++    ${this.audio_ ? html`
++      <button class="row-btn audio" title="${this.audioTitle_}"
++          @mousedown="${this.onAudioMousedown_}"
++          @click="${this.onAudioClick_}">
++        ${icon(this.audioIcon_, 13)}
++      </button>` : ''}
+     <button class="row-btn close" title="Close" @click="${this.onCloseClick_}">
+       ${icon('x', 14)}
+     </button>
+diff --git a/chrome/browser/resources/webui_browser/meridian/tab_row.ts b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+index d73bab27eb..af6b6448b7 100644
+--- a/chrome/browser/resources/webui_browser/meridian/tab_row.ts
++++ b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+@@ -8,8 +8,9 @@ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {Tab} from '/tab_strip_api/tab_strip_api_data_model.mojom-webui.js';
+ 
+-import {TabNetworkState} from '../tabs.mojom-webui.js';
++import {TabAlertState, TabNetworkState} from '../tabs.mojom-webui.js';
+ 
++import type {IconName} from './icons.js';
+ import {getCss} from './rows.css.js';
+ import type {MeridianSidebarElement} from './sidebar.js';
+ import {getHtml} from './tab_row.html.js';
+@@ -36,6 +37,9 @@ export class MeridianTabRowElement extends CrLitElement {
+       agent: {type: Boolean, reflect: true},
+       favicon_: {state: true, type: String},
+       loading_: {state: true, type: Boolean},
++      audio_: {state: true, type: String},
++      audioTitle_: {state: true, type: String},
++      audioIcon_: {state: true, type: String},
+     };
+   }
+ 
+@@ -45,6 +49,10 @@ export class MeridianTabRowElement extends CrLitElement {
+   accessor host: MeridianSidebarElement|null = null;
+   protected accessor favicon_: string = '';
+   protected accessor loading_: boolean = false;
++  // The speaker: '' (silent), 'playing' or 'muted'.
++  protected accessor audio_: string = '';
++  protected accessor audioTitle_: string = '';
++  protected accessor audioIcon_: IconName = 'speaker';
+ 
+   override willUpdate(changed: PropertyValues<this>) {
+     super.willUpdate(changed);
+@@ -55,6 +63,12 @@ export class MeridianTabRowElement extends CrLitElement {
+     this.loading_ = !!this.tab &&
+         (this.tab.networkState === TabNetworkState.kLoading ||
+          this.tab.networkState === TabNetworkState.kWaiting);
++    const alerts = this.tab?.alertStates || [];
++    this.audio_ = alerts.includes(TabAlertState.kAudioMuting) ? 'muted' :
++        alerts.includes(TabAlertState.kAudioPlaying)          ? 'playing' :
++                                                                '';
++    this.audioTitle_ = this.audio_ === 'muted' ? 'Unmute Tab' : 'Mute Tab';
++    this.audioIcon_ = this.audio_ === 'muted' ? 'mute' : 'speaker';
+   }
+ 
+   protected onRowMousedown_(e: MouseEvent) {
+@@ -65,6 +79,15 @@ export class MeridianTabRowElement extends CrLitElement {
+     this.host?.onTabContextMenu(e, this.tab!);
+   }
+ 
++  // Not a press on the row (which would select or start dragging the tab).
++  protected onAudioMousedown_(e: Event) {
++    e.stopPropagation();
++  }
++
++  protected onAudioClick_(e: Event) {
++    this.host?.onMuteClick(e, this.tab!, this.audio_ !== 'muted');
++  }
++
+   protected onCloseClick_(e: Event) {
+     this.host?.onCloseClick(e, this.tab!);
+   }
