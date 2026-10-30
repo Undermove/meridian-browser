@@ -169,3 +169,16 @@ test('⇧⌥⌘C copies the page as a Markdown link; ⌥⌘N opens a Little Wind
     execFileSync('pbcopy', { input: saved });
   }
 });
+
+test('⇧⌘T brings the last closed tab back into its space’s Today', async () => {
+  const b = await launch([page('Keep'), page('Gone')], { args: ['--meridian-test-keys'] });
+  const titles = `[...${SB}.querySelectorAll('meridian-tab-row')].map((r) => r.tab.title).sort().join()`;
+  try {
+    await b.waitFor(today(2));
+    const row = `[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Gone')`;
+    await b.click(`${row}.shadowRoot.querySelector('.close')`);
+    await b.waitFor(today(1));
+    await b.eval(`app.$.tabstrip.handler_.testCommand(34028)`);  // IDC_RESTORE_TAB
+    await b.waitFor(`${titles} === 'Gone,Keep'`);
+  } finally { await b.close(); }
+});
