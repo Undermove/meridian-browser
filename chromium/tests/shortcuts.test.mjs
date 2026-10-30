@@ -155,6 +155,15 @@ test('⇧⌥⌘C copies the page as a Markdown link; ⌥⌘N opens a Little Wind
       }
     }
     assert.ok(little, 'a Little Window opened');
+    // On an empty page it starts in the command bar, with a compact home behind (Little Arc).
+    let asks = false;
+    for (let i = 0; i < 30 && !asks; i++) {
+      for (const w of await b.otherWindows()) {
+        try { asks ||= await w.eval(`app.hasAttribute('little') && app.$.commandBar.open && app.$.home.hasAttribute('little')`); } catch {}
+      }
+      if (!asks) await new Promise((r) => setTimeout(r, 150));
+    }
+    assert.ok(asks, 'the command bar, over a compact home');
   } finally {
     await b.close();
     execFileSync('pbcopy', { input: saved });
