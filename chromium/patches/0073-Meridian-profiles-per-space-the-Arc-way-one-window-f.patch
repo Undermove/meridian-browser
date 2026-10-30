@@ -1,0 +1,1952 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 30 Oct 2026 23:13:57 +0400
+Subject: [PATCH 74/74] Meridian: profiles per space the Arc way, one window
+ for every profile
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A window holds the tabs of every space, each made in its space's profile
+(links in their page's), so switching spaces never changes windows. The
+tabs' profiles survive session restore, Chrome's session rebuilds and
+⇧⌘T; the windows left by the old one-window-per-profile model are
+gathered into one, once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   6 +-
+ chrome/browser/meridian/arc_logins.cc         |   2 +-
+ chrome/browser/meridian/downloads_tracker.cc  |  26 +-
+ chrome/browser/meridian/downloads_tracker.h   |   7 +-
+ chrome/browser/meridian/little_window.cc      |  26 +-
+ chrome/browser/meridian/prefs.cc              |   1 +
+ chrome/browser/meridian/prefs.h               |   3 +
+ chrome/browser/meridian/profile_windows.cc    | 400 ------------------
+ chrome/browser/meridian/profile_windows.h     |  62 ---
+ chrome/browser/meridian/profile_windows_mac.h |  31 --
+ .../browser/meridian/profile_windows_mac.mm   | 100 -----
+ chrome/browser/meridian/sidebar_handler.cc    | 143 +++----
+ chrome/browser/meridian/sidebar_handler.h     |  11 +-
+ .../meridian/sidebar_service_factory.cc       |   2 +-
+ chrome/browser/meridian/space_profiles.cc     | 305 +++++++++++++
+ chrome/browser/meridian/space_profiles.h      |  77 ++++
+ chrome/browser/meridian/tab_data.cc           |  52 ++-
+ chrome/browser/meridian/tab_data.h            |  14 +
+ .../webui_browser/meridian/sidebar.ts         |   4 +-
+ chrome/browser/sessions/BUILD.gn              |   1 +
+ .../browser/sessions/session_service_base.cc  |   7 +
+ .../sessions/session_tab_helper_factory.cc    |  10 +
+ chrome/browser/ui/BUILD.gn                    |   1 +
+ chrome/browser/ui/browser_live_tab_context.cc |   4 +
+ chrome/browser/ui/browser_tabrestore.cc       |  27 +-
+ chrome/browser/ui/navigator/BUILD.gn          |   1 +
+ .../browser/ui/navigator/browser_navigator.cc |  19 +-
+ .../ui/webui_browser/webui_browser_window.cc  |   2 -
+ 28 files changed, 626 insertions(+), 718 deletions(-)
+ delete mode 100644 chrome/browser/meridian/profile_windows.cc
+ delete mode 100644 chrome/browser/meridian/profile_windows.h
+ delete mode 100644 chrome/browser/meridian/profile_windows_mac.h
+ delete mode 100644 chrome/browser/meridian/profile_windows_mac.mm
+ create mode 100644 chrome/browser/meridian/space_profiles.cc
+ create mode 100644 chrome/browser/meridian/space_profiles.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index c4dac7ed5f..19a06fcaf6 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -214,8 +214,8 @@ source_set("meridian") {
+     "downloads_tracker.cc",
+     "downloads_tracker.h",
+     "little_window.cc",
+-    "profile_windows.cc",
+-    "profile_windows.h",
++    "space_profiles.cc",
++    "space_profiles.h",
+     "little_window.h",
+     "sidebar_handler.cc",
+     "sidebar_handler.h",
+@@ -235,8 +235,6 @@ source_set("meridian") {
+   if (is_mac) {
+     sources += [
+       "arc_logins_mac.mm",
+-      "profile_windows_mac.h",
+-      "profile_windows_mac.mm",
+       "sidebar_handler_mac.mm",
+     ]
+     frameworks = [
+diff --git a/chrome/browser/meridian/arc_logins.cc b/chrome/browser/meridian/arc_logins.cc
+index bb634da53e..28c8e7a267 100644
+--- a/chrome/browser/meridian/arc_logins.cc
++++ b/chrome/browser/meridian/arc_logins.cc
+@@ -24,7 +24,7 @@
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/meridian/arc_import.h"
+-#include "chrome/browser/meridian/profile_windows.h"
++#include "chrome/browser/meridian/space_profiles.h"
+ #include "chrome/browser/meridian/test_switches.h"
+ #include "chrome/browser/profiles/profile_manager.h"
+ #include "chrome/browser/profiles/profile.h"
+diff --git a/chrome/browser/meridian/downloads_tracker.cc b/chrome/browser/meridian/downloads_tracker.cc
+index 9c7765ca37..3547dd7147 100644
+--- a/chrome/browser/meridian/downloads_tracker.cc
++++ b/chrome/browser/meridian/downloads_tracker.cc
+@@ -66,15 +66,31 @@ std::string DangerOf(download::DownloadItem* item) {
+ 
+ DownloadsTracker::DownloadsTracker(Profile* profile,
+                                    base::RepeatingClosure changed)
+-    : profile_(profile),
+-      changed_(std::move(changed)),
+-      notifier_(profile->GetDownloadManager(), this) {}
++    : profile_(profile), changed_(std::move(changed)) {
++  Watch(profile);
++}
+ 
+ DownloadsTracker::~DownloadsTracker() = default;
+ 
++void DownloadsTracker::Watch(Profile* profile) {
++  content::DownloadManager* manager = profile->GetDownloadManager();
++  if (std::ranges::none_of(notifiers_, [&](const auto& notifier) {
++        return notifier->GetManager() == manager;
++      })) {
++    notifiers_.push_back(
++        std::make_unique<download::AllDownloadItemNotifier>(manager, this));
++  }
++}
++
+ download::DownloadItem* DownloadsTracker::Find(const std::string& id) {
+-  content::DownloadManager* manager = notifier_.GetManager();
+-  return manager ? manager->GetDownloadByGuid(id) : nullptr;
++  for (const auto& notifier : notifiers_) {
++    content::DownloadManager* manager = notifier->GetManager();
++    if (download::DownloadItem* item =
++            manager ? manager->GetDownloadByGuid(id) : nullptr) {
++      return item;
++    }
++  }
++  return nullptr;
+ }
+ 
+ std::vector<mojom::DownloadPtr> DownloadsTracker::List() {
+diff --git a/chrome/browser/meridian/downloads_tracker.h b/chrome/browser/meridian/downloads_tracker.h
+index 049a56f1a0..9b4a349bf4 100644
+--- a/chrome/browser/meridian/downloads_tracker.h
++++ b/chrome/browser/meridian/downloads_tracker.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_MERIDIAN_DOWNLOADS_TRACKER_H_
+ #define CHROME_BROWSER_MERIDIAN_DOWNLOADS_TRACKER_H_
+ 
++#include <memory>
+ #include <set>
+ #include <string>
+ #include <vector>
+@@ -30,6 +31,10 @@ class DownloadsTracker : public download::AllDownloadItemNotifier::Observer {
+   DownloadsTracker& operator=(const DownloadsTracker&) = delete;
+   ~DownloadsTracker() override;
+ 
++  // Also the downloads of `profile` (a space's, whose tabs are in this
++  // window).
++  void Watch(Profile* profile);
++
+   std::vector<mojom::DownloadPtr> List();
+   // "reveal", "open", "cancel", "keep" (a dangerous file) or "discard".
+   void Act(const std::string& id, const std::string& action);
+@@ -52,7 +57,7 @@ class DownloadsTracker : public download::AllDownloadItemNotifier::Observer {
+   base::RepeatingClosure changed_;
+   // Newest first.
+   std::vector<std::string> ids_;
+-  download::AllDownloadItemNotifier notifier_;
++  std::vector<std::unique_ptr<download::AllDownloadItemNotifier>> notifiers_;
+   base::WeakPtrFactory<DownloadsTracker> weak_factory_{this};
+ };
+ 
+diff --git a/chrome/browser/meridian/little_window.cc b/chrome/browser/meridian/little_window.cc
+index 15248e43ff..9a001bd3ea 100644
+--- a/chrome/browser/meridian/little_window.cc
++++ b/chrome/browser/meridian/little_window.cc
+@@ -10,7 +10,7 @@
+ #include "base/no_destructor.h"
+ #include "chrome/browser/meridian/atc.h"
+ #include "chrome/browser/meridian/prefs.h"
+-#include "chrome/browser/meridian/profile_windows.h"
++#include "chrome/browser/meridian/space_profiles.h"
+ #include "chrome/browser/meridian/sidebar_service.h"
+ #include "chrome/browser/meridian/sidebar_service_factory.h"
+ #include "chrome/browser/meridian/tab_data.h"
+@@ -81,11 +81,12 @@ BrowserWindowInterface* FindOrCreateMainWindow(
+     Profile* profile,
+     const BrowserWindowInterface* except) {
+   BrowserWindowInterface* found = nullptr;
++  profile = MainProfileFor(profile);
+   ProfileBrowserCollection::GetForProfile(profile)->ForEach(
+       [&](BrowserWindowInterface* browser) {
+         if (browser != except &&
+             browser->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
+-            !IsLittleWindow(browser) && !IsHiddenInFrame(browser)) {
++            !IsLittleWindow(browser)) {
+           found = browser;
+           return false;
+         }
+@@ -112,13 +113,11 @@ void OpenExternalLink(Profile* profile, const GURL& url) {
+     OpenLittleWindow(profile, url);
+     return;
+   }
+-  // The frame in front, whichever profile shows there.
++  // The window in front.
+   BrowserWindowInterface* browser = nullptr;
+   ForEachCurrentBrowserWindowInterfaceOrderedByActivation(
+       [&](BrowserWindowInterface* b) {
+-        if (b->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
+-            !IsLittleWindow(b) && !b->GetProfile()->IsOffTheRecord() &&
+-            !IsHiddenInFrame(b) &&
++        if (HoldsSpaceTabs(b) &&
+             SidebarServiceFactory::GetForProfile(b->GetProfile()) == service) {
+           browser = b;
+           return false;
+@@ -134,22 +133,11 @@ void OpenExternalLink(Profile* profile, const GURL& url) {
+   std::string space_id = route.target == AtcRoute::Target::kSpace
+                              ? route.space_id
+                              : service->active_space_id();
+-  const Space* space = service->FindSpace(space_id);
+-  if (space && (space->profile != ProfileIdOf(browser->GetProfile()) ||
+-                IsHiddenInFrame(browser))) {
+-    // A space of another profile (or a window hidden in a frame): the
+-    // space's window comes to the front of the frame.
+-    ShowSpaceInProfile(browser, space->profile, space_id, {url},
+-                       /*show=*/true);
++  if (!service->FindSpace(space_id)) {
+     return;
+   }
+   service->SetActiveSpace(space_id);
+-  NavigateParams nav(browser, url, ui::PAGE_TRANSITION_LINK);
+-  nav.disposition = WindowOpenDisposition::kNewForegroundTab;
+-  Navigate(&nav);
+-  if (nav.navigated_or_inserted_contents) {
+-    TabData::Set(nav.navigated_or_inserted_contents, space_id, std::string());
+-  }
++  OpenInSpace(browser, space_id, url, /*active=*/true);
+   browser->GetWindow()->Show();
+ }
+ 
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index 0780ff4975..ddc11f35d1 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -13,6 +13,7 @@ namespace meridian::prefs {
+ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterDictionaryPref(kAtc);
+   registry->RegisterBooleanPref(kOnboarded, false);
++  registry->RegisterBooleanPref(kWindowsGathered, false);
+   registry->RegisterStringPref(kMode, "everyday");
+   registry->RegisterBooleanPref(kSidebarRight, false);
+   registry->RegisterIntegerPref(kArchiveAfterHours, 12);
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index 61832eae4f..7c4107e355 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -15,6 +15,9 @@ namespace meridian::prefs {
+ inline constexpr char kAtc[] = "meridian.atc";
+ // The welcome tour was finished or skipped.
+ inline constexpr char kOnboarded[] = "meridian.onboarded";
++// Whether the windows left by the old one-window-per-profile model were
++// gathered into one (once).
++inline constexpr char kWindowsGathered[] = "meridian.windows_gathered";
+ // "everyday", "creative" or "developer": which tools Meridian offers.
+ inline constexpr char kMode[] = "meridian.mode";
+ // The sidebar on the right of the window.
+diff --git a/chrome/browser/meridian/profile_windows.cc b/chrome/browser/meridian/profile_windows.cc
+deleted file mode 100644
+index 1102c8e0ab..0000000000
+--- a/chrome/browser/meridian/profile_windows.cc
++++ /dev/null
+@@ -1,400 +0,0 @@
+-// Copyright 2026 The Meridian Authors
+-// Use of this source code is governed by a BSD-style license that can be
+-// found in the LICENSE file.
+-
+-#include "chrome/browser/meridian/profile_windows.h"
+-
+-#include <map>
+-#include <set>
+-
+-#include "base/files/file_util.h"
+-#include "base/functional/bind.h"
+-#include "base/memory/weak_ptr.h"
+-#include "base/no_destructor.h"
+-#include "base/strings/string_number_conversions.h"
+-#include "base/task/sequenced_task_runner.h"
+-#include "base/time/time.h"
+-#include "build/build_config.h"
+-#include "chrome/browser/browser_process.h"
+-#include "chrome/browser/meridian/little_window.h"
+-#include "chrome/browser/meridian/sidebar_handler.h"
+-#include "chrome/browser/meridian/sidebar_service.h"
+-#include "chrome/browser/meridian/sidebar_service_factory.h"
+-#include "chrome/browser/meridian/tab_data.h"
+-#include "chrome/browser/profiles/profile.h"
+-#include "chrome/browser/profiles/profile_attributes_storage.h"
+-#include "chrome/browser/profiles/profile_manager.h"
+-#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+-#include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+-#include "chrome/browser/ui/browser_window/public/create_browser_window.h"
+-#include "chrome/browser/ui/navigator/browser_navigator.h"
+-#include "chrome/browser/ui/navigator/browser_navigator_params.h"
+-#include "chrome/browser/ui/tabs/tab_strip_model.h"
+-#include "ui/base/base_window.h"
+-
+-#if BUILDFLAG(IS_MAC)
+-#include "chrome/browser/meridian/profile_windows_mac.h"
+-#endif
+-
+-namespace meridian {
+-
+-namespace {
+-
+-constexpr char kPrefix[] = "Meridian Profile ";
+-
+-struct Frames {
+-  int next = 1;
+-  std::map<BrowserWindowInterface*, int> frame_of;
+-  std::map<int, BrowserWindowInterface*> visible_of;
+-  std::map<BrowserWindowInterface*, base::CallbackListSubscription> closing;
+-};
+-
+-Frames& F() {
+-  static base::NoDestructor<Frames> frames;
+-  return *frames;
+-}
+-
+-void OnClosed(BrowserWindowInterface* browser) {
+-  Frames& f = F();
+-  f.closing.erase(browser);
+-  auto it = f.frame_of.find(browser);
+-  if (it == f.frame_of.end()) {
+-    return;
+-  }
+-  int id = it->second;
+-  f.frame_of.erase(it);
+-  if (f.visible_of[id] != browser) {
+-    return;
+-  }
+-  f.visible_of.erase(id);
+-  // The frame closes with its visible window.
+-  std::vector<BrowserWindowInterface*> hidden;
+-  for (auto& [b, frame] : f.frame_of) {
+-    if (frame == id) {
+-      hidden.push_back(b);
+-    }
+-  }
+-  for (BrowserWindowInterface* b : hidden) {
+-    f.frame_of.erase(b);
+-    b->GetWindow()->Close();
+-  }
+-}
+-
+-#if BUILDFLAG(IS_MAC)
+-// The frame's window in macOS full screen, if any (another profile's window
+-// may be showing over it).
+-BrowserWindowInterface* FullscreenWindowOf(int frame) {
+-  for (auto& [b, id] : F().frame_of) {
+-    if (id == frame && IsInNativeFullscreen(b)) {
+-      return b;
+-    }
+-  }
+-  return nullptr;
+-}
+-
+-// When the full-screen window leaves full screen with another profile's
+-// window over it, that one takes its place, like any swap.
+-void WatchFullscreenExit(int frame, BrowserWindowInterface* base) {
+-  static base::NoDestructor<std::set<BrowserWindowInterface*>> watched;
+-  if (!watched->insert(base).second) {
+-    return;
+-  }
+-  OnFullscreenExit(base, base::BindOnce(
+-                             [](int frame, BrowserWindowInterface* base) {
+-                               watched->erase(base);
+-                               Frames& f = F();
+-                               auto it = f.frame_of.find(base);
+-                               auto visible = f.visible_of.find(frame);
+-                               if (it == f.frame_of.end() ||
+-                                   visible == f.visible_of.end() ||
+-                                   visible->second == base) {
+-                                 return;
+-                               }
+-                               BrowserWindowInterface* over = visible->second;
+-                               SetOverFullscreen(over, false);
+-                               over->GetWindow()->SetBounds(
+-                                   base->GetWindow()->GetBounds());
+-                               base->GetWindow()->Hide();
+-                             },
+-                             frame, base));
+-}
+-#endif
+-
+-void Track(BrowserWindowInterface* browser, int frame) {
+-  Frames& f = F();
+-  f.frame_of[browser] = frame;
+-  if (!f.closing.contains(browser)) {
+-    f.closing[browser] =
+-        browser->RegisterBrowserDidClose(base::BindRepeating(&OnClosed));
+-  }
+-}
+-
+-// The frame of `browser`, a new one (with it visible) if it has none.
+-int FrameOf(BrowserWindowInterface* browser) {
+-  Frames& f = F();
+-  auto it = f.frame_of.find(browser);
+-  if (it != f.frame_of.end()) {
+-    return it->second;
+-  }
+-  int id = f.next++;
+-  Track(browser, id);
+-  f.visible_of[id] = browser;
+-  return id;
+-}
+-
+-bool IsMainWindow(BrowserWindowInterface* b) {
+-  return b->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
+-         !IsLittleWindow(b) && !b->GetProfile()->IsOffTheRecord();
+-}
+-
+-// Brings `target` (already showing behind `current`) to the front and hides
+-// `current` once it has had time to paint: a new window needs its first
+-// frame, a hidden one a fresh one. Either may have closed meanwhile.
+-void SwapSoon(int frame,
+-              BrowserWindowInterface* target,
+-              BrowserWindowInterface* current,
+-              bool fresh) {
+-  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
+-      FROM_HERE,
+-      base::BindOnce(
+-          [](int frame, BrowserWindowInterface* target,
+-             BrowserWindowInterface* current) {
+-            Frames& f = F();
+-            auto in_frame = [&](BrowserWindowInterface* b) {
+-              auto it = f.frame_of.find(b);
+-              return it != f.frame_of.end() && it->second == frame;
+-            };
+-            if (!in_frame(target) || f.visible_of[frame] != target) {
+-              return;
+-            }
+-            // Show() too: Activate() alone doesn't bring an inactive app's
+-            // window forward.
+-            target->GetWindow()->Show();
+-            target->GetWindow()->Activate();
+-#if BUILDFLAG(IS_MAC)
+-            ShowOnActiveSpace(target, false);
+-#endif
+-            if (current && in_frame(current)) {
+-              current->GetWindow()->Hide();
+-            }
+-          },
+-          frame, target, current),
+-      fresh ? base::Milliseconds(350) : base::Milliseconds(120));
+-}
+-
+-void Open(BrowserWindowInterface* target,
+-          const std::string& space_id,
+-          const std::vector<GURL>& urls) {
+-  TabStripModel* model = target->GetTabStripModel();
+-  bool has_tab = false;
+-  for (int i = 0; i < model->count(); ++i) {
+-    const TabData* data = TabData::Get(model->GetWebContentsAt(i));
+-    has_tab |= data && data->space_id() == space_id;
+-  }
+-  std::vector<GURL> open = urls;
+-  if (open.empty() && !has_tab) {
+-    open.push_back(GURL("chrome://newtab/"));  // an empty space, like Arc
+-  }
+-  for (const GURL& url : open) {
+-    NavigateParams nav(target, url, ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
+-    nav.disposition = WindowOpenDisposition::kNewForegroundTab;
+-    Navigate(&nav);
+-    if (nav.navigated_or_inserted_contents) {
+-      TabData::Set(nav.navigated_or_inserted_contents, space_id,
+-                   std::string());
+-    }
+-  }
+-}
+-
+-}  // namespace
+-
+-std::string ProfileIdOf(Profile* profile) {
+-  std::string base = profile->GetOriginalProfile()->GetPath().BaseName().value();
+-  return base.starts_with(kPrefix) ? base : std::string();
+-}
+-
+-bool IsSpaceProfile(Profile* profile) {
+-  return !ProfileIdOf(profile).empty();
+-}
+-
+-base::FilePath ProfilePathFor(const std::string& profile_id) {
+-  const base::FilePath& dir = g_browser_process->profile_manager()->user_data_dir();
+-  return profile_id.empty()
+-             ? dir.Append(ProfileManager::GetInitialProfileDir())
+-             : dir.Append(profile_id);
+-}
+-
+-Profile* MainProfileFor(Profile* profile) {
+-  if (!IsSpaceProfile(profile)) {
+-    return profile;
+-  }
+-  ProfileManager* manager = g_browser_process->profile_manager();
+-  base::FilePath main = ProfilePathFor(std::string());
+-  if (Profile* loaded = manager->GetProfileByPath(main)) {
+-    return loaded;
+-  }
+-  // Only after a restart with just another profile's windows open (loads
+-  // synchronously; ProfileImpl allows its own blocking).
+-  return manager->GetProfile(main);
+-}
+-
+-std::string NewProfileId(const std::vector<std::string>& taken) {
+-  ProfileManager* manager = g_browser_process->profile_manager();
+-  ProfileAttributesStorage& known = manager->GetProfileAttributesStorage();
+-  for (int n = 1;; ++n) {
+-    std::string id = kPrefix + base::NumberToString(n);
+-    if (std::ranges::find(taken, id) == taken.end() &&
+-        !known.GetProfileAttributesWithPath(
+-            manager->user_data_dir().Append(id))) {
+-      return id;
+-    }
+-  }
+-}
+-
+-void ShowSpaceInProfile(
+-    BrowserWindowInterface* from,
+-    const std::string& profile_id,
+-    const std::string& space_id,
+-    std::vector<GURL> urls,
+-    bool show,
+-    base::OnceCallback<void(BrowserWindowInterface*)> done) {
+-  int frame = FrameOf(from);
+-  g_browser_process->profile_manager()->CreateProfileAsync(
+-      ProfilePathFor(profile_id),
+-      base::BindOnce(
+-          [](int frame, std::string space_id, std::vector<GURL> urls,
+-             bool show, base::OnceCallback<void(BrowserWindowInterface*)> done,
+-             Profile* profile) {
+-            Frames& f = F();
+-            auto visible = f.visible_of.find(frame);
+-            if (!profile || visible == f.visible_of.end()) {
+-              if (done) {
+-                std::move(done).Run(nullptr);
+-              }
+-              return;
+-            }
+-            BrowserWindowInterface* current = visible->second;
+-            BrowserWindowInterface* target = nullptr;
+-            bool fresh = false;
+-            for (auto& [b, id] : f.frame_of) {
+-              if (id == frame && b->GetProfile() == profile) {
+-                target = b;
+-              }
+-            }
+-            if (!target) {
+-              BrowserWindowCreateParams params(*profile,
+-                                               /*from_user_gesture=*/true);
+-              params.initial_bounds = current->GetWindow()->GetBounds();
+-              params.initial_origin_specified =
+-                  BrowserWindowCreateParams::ValueSpecified::kSpecified;
+-              params.should_trigger_session_restore = false;
+-              target = CreateBrowserWindow(std::move(params));
+-              if (!target) {
+-                if (done) {
+-                  std::move(done).Run(nullptr);
+-                }
+-                return;
+-              }
+-              Track(target, frame);
+-              fresh = true;
+-            }
+-            SidebarService* service =
+-                SidebarServiceFactory::GetForProfile(profile);
+-            if (show) {
+-              service->SetActiveSpace(space_id);
+-            }
+-            Open(target, space_id, urls);
+-            if (show && target != current) {
+-              f.visible_of[frame] = target;
+-#if BUILDFLAG(IS_MAC)
+-              // Where the person is now, not where the window was made.
+-              ShowOnActiveSpace(target, true);
+-#endif
+-#if BUILDFLAG(IS_MAC)
+-              // In full screen the full-screen window stays put and the
+-              // others show over it, in its Space: hiding it would close the
+-              // Space (macOS's dark slide out of full screen and back).
+-              if (BrowserWindowInterface* base = FullscreenWindowOf(frame)) {
+-                if (target != base) {
+-                  SetOverFullscreen(target, true);
+-                  target->GetWindow()->SetBounds(base->GetWindow()->GetBounds());
+-                  // Behind the window showing over the full-screen one; over
+-                  // the full-screen one itself, which never hides.
+-                  if (current != base) {
+-                    ShowBehind(target, current);
+-                  } else {
+-                    target->GetWindow()->Show();
+-                  }
+-                  WatchFullscreenExit(frame, base);
+-                }
+-                SidebarHandler::ActivateSpaceInWindow(target, space_id);
+-                SwapSoon(frame, target, current != base ? current : nullptr,
+-                         fresh);
+-              } else
+-#endif
+-              {
+-                target->GetWindow()->SetBounds(
+-                    current->GetWindow()->GetBounds());
+-#if BUILDFLAG(IS_MAC)
+-                ShowBehind(target, current);
+-#else
+-                target->GetWindow()->Show();
+-#endif
+-                SidebarHandler::ActivateSpaceInWindow(target, space_id);
+-                SwapSoon(frame, target, current, fresh);
+-              }
+-            } else if (show) {
+-              SidebarHandler::ActivateSpaceInWindow(target, space_id);
+-            }
+-            if (done) {
+-              std::move(done).Run(target);
+-            }
+-          },
+-          frame, space_id, std::move(urls), show, std::move(done)));
+-}
+-
+-bool IsHiddenInFrame(BrowserWindowInterface* browser) {
+-  Frames& f = F();
+-  auto it = f.frame_of.find(browser);
+-  return it != f.frame_of.end() && f.visible_of[it->second] != browser;
+-}
+-
+-void JoinFrameIfBehind(BrowserWindowInterface* browser,
+-                       const std::string& active_profile_id) {
+-  Frames& f = F();
+-  if (!IsMainWindow(browser) || f.frame_of.contains(browser)) {
+-    return;
+-  }
+-  bool active = ProfileIdOf(browser->GetProfile()) == active_profile_id;
+-  std::vector<BrowserWindowInterface*> others;
+-  ForEachCurrentBrowserWindowInterfaceOrderedByActivation(
+-      [&](BrowserWindowInterface* b) {
+-        if (b != browser && IsMainWindow(b) &&
+-            b->GetProfile() != browser->GetProfile()) {
+-          others.push_back(b);
+-        }
+-        return true;
+-      });
+-  if (!active) {
+-    // Behind a visible window of the active space's profile.
+-    for (BrowserWindowInterface* b : others) {
+-      if (ProfileIdOf(b->GetProfile()) == active_profile_id &&
+-          !IsHiddenInFrame(b)) {
+-        Track(browser, FrameOf(b));
+-        browser->GetWindow()->Hide();
+-        return;
+-      }
+-    }
+-    return;
+-  }
+-  // The other profiles' separate windows go behind this one.
+-  int frame = FrameOf(browser);
+-  for (BrowserWindowInterface* b : others) {
+-    if (!f.frame_of.contains(b)) {
+-      Track(b, frame);
+-      b->GetWindow()->Hide();
+-    }
+-  }
+-}
+-
+-}  // namespace meridian
+diff --git a/chrome/browser/meridian/profile_windows.h b/chrome/browser/meridian/profile_windows.h
+deleted file mode 100644
+index c98e298052..0000000000
+--- a/chrome/browser/meridian/profile_windows.h
++++ /dev/null
+@@ -1,62 +0,0 @@
+-// Copyright 2026 The Meridian Authors
+-// Use of this source code is governed by a BSD-style license that can be
+-// found in the LICENSE file.
+-
+-#ifndef CHROME_BROWSER_MERIDIAN_PROFILE_WINDOWS_H_
+-#define CHROME_BROWSER_MERIDIAN_PROFILE_WINDOWS_H_
+-
+-#include <string>
+-#include <vector>
+-
+-#include "base/files/file_path.h"
+-#include "base/functional/callback.h"
+-#include "url/gurl.h"
+-
+-class BrowserWindowInterface;
+-class Profile;
+-
+-namespace meridian {
+-
+-// Spaces with their own profile, Arc's model on Chromium: every Meridian
+-// profile is a Chromium profile ("Meridian Profile N" next to the main one),
+-// and a Meridian window is a frame of one browser window per profile, stacked
+-// in the same place. Switching to a space of another profile shows that
+-// profile's window where the current one was and hides the current one;
+-// closing the visible window closes the hidden ones of its frame. The sidebar
+-// model is the main profile's (SidebarServiceFactory).
+-
+-// "" for the main profile (or any profile Meridian didn't create), else the
+-// profile's folder name.
+-std::string ProfileIdOf(Profile* profile);
+-bool IsSpaceProfile(Profile* profile);
+-// The folder of a Meridian profile id.
+-base::FilePath ProfilePathFor(const std::string& profile_id);
+-// The main profile, loaded if it isn't yet (blocking then).
+-Profile* MainProfileFor(Profile* profile);
+-// A folder name for a new profile, unused on disk and in `taken`.
+-std::string NewProfileId(const std::vector<std::string>& taken);
+-
+-// Shows `space_id` (of `profile_id`) in the frame of `from`: activates the
+-// space in that profile's window, creating the window at `from`'s place if
+-// needed, and opens `urls` there as tabs of the space. With `show` false the
+-// frame stays as it is (the tabs open in the hidden window). `done` gets the
+-// window, or nullptr if the profile couldn't be loaded.
+-void ShowSpaceInProfile(
+-    BrowserWindowInterface* from,
+-    const std::string& profile_id,
+-    const std::string& space_id,
+-    std::vector<GURL> urls,
+-    bool show,
+-    base::OnceCallback<void(BrowserWindowInterface*)> done = {});
+-
+-// Whether `browser` is a hidden window of a frame.
+-bool IsHiddenInFrame(BrowserWindowInterface* browser);
+-// After a restart the windows of a frame come back as separate windows:
+-// `browser`, of a profile other than the active space's, joins (hidden) the
+-// frame of a visible window of that profile, if there is one.
+-void JoinFrameIfBehind(BrowserWindowInterface* browser,
+-                       const std::string& active_profile_id);
+-
+-}  // namespace meridian
+-
+-#endif  // CHROME_BROWSER_MERIDIAN_PROFILE_WINDOWS_H_
+diff --git a/chrome/browser/meridian/profile_windows_mac.h b/chrome/browser/meridian/profile_windows_mac.h
+deleted file mode 100644
+index daaca7a151..0000000000
+--- a/chrome/browser/meridian/profile_windows_mac.h
++++ /dev/null
+@@ -1,31 +0,0 @@
+-// Copyright 2026 The Meridian Authors
+-// Use of this source code is governed by a BSD-style license that can be
+-// found in the LICENSE file.
+-
+-#ifndef CHROME_BROWSER_MERIDIAN_PROFILE_WINDOWS_MAC_H_
+-#define CHROME_BROWSER_MERIDIAN_PROFILE_WINDOWS_MAC_H_
+-
+-#include "base/functional/callback.h"
+-
+-class BrowserWindowInterface;
+-
+-namespace meridian {
+-
+-// macOS full screen (its own Space) for the windows of one frame.
+-bool IsInNativeFullscreen(BrowserWindowInterface* browser);
+-// Lets `browser` show in a full-screen window's Space, over it.
+-void SetOverFullscreen(BrowserWindowInterface* browser, bool over);
+-// Runs `exited` once, when `browser` has left full screen.
+-void OnFullscreenExit(BrowserWindowInterface* browser,
+-                      base::OnceClosure exited);
+-// While `on`, showing `browser` brings it to the Space on screen (a full
+-// screen one too) instead of the one it was last on: a profile's window made
+-// on the desktop and hidden would otherwise come back there.
+-void ShowOnActiveSpace(BrowserWindowInterface* browser, bool on);
+-// Shows `target` right behind `front`, without macOS's window animation, so
+-// it can paint before `front` goes away (a swap with no blank frame).
+-void ShowBehind(BrowserWindowInterface* target, BrowserWindowInterface* front);
+-
+-}  // namespace meridian
+-
+-#endif  // CHROME_BROWSER_MERIDIAN_PROFILE_WINDOWS_MAC_H_
+diff --git a/chrome/browser/meridian/profile_windows_mac.mm b/chrome/browser/meridian/profile_windows_mac.mm
+deleted file mode 100644
+index bd43a844d5..0000000000
+--- a/chrome/browser/meridian/profile_windows_mac.mm
++++ /dev/null
+@@ -1,100 +0,0 @@
+-// Copyright 2026 The Meridian Authors
+-// Use of this source code is governed by a BSD-style license that can be
+-// found in the LICENSE file.
+-
+-#include "chrome/browser/meridian/profile_windows_mac.h"
+-
+-#include <AppKit/AppKit.h>
+-
+-#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+-#include "ui/base/base_window.h"
+-#include "ui/gfx/native_ui_types.h"
+-
+-namespace meridian {
+-
+-namespace {
+-
+-NSWindow* WindowOf(BrowserWindowInterface* browser) {
+-  return browser->GetWindow()->GetNativeWindow().GetNativeNSWindow();
+-}
+-
+-}  // namespace
+-
+-bool IsInNativeFullscreen(BrowserWindowInterface* browser) {
+-  NSWindow* window = WindowOf(browser);
+-  return window && (window.styleMask & NSWindowStyleMaskFullScreen);
+-}
+-
+-void SetOverFullscreen(BrowserWindowInterface* browser, bool over) {
+-  NSWindow* window = WindowOf(browser);
+-  if (!window) {
+-    return;
+-  }
+-  // Over it, not full screen itself: macOS puts a window that can be
+-  // full screen into a full screen Space of its own when its app is in full
+-  // screen (that was a "new window" on every switch).
+-  if (over) {
+-    window.collectionBehavior =
+-        (window.collectionBehavior &
+-         ~NSWindowCollectionBehaviorFullScreenPrimary) |
+-        NSWindowCollectionBehaviorFullScreenAuxiliary;
+-    window.tabbingMode = NSWindowTabbingModeDisallowed;
+-  } else {
+-    window.collectionBehavior =
+-        (window.collectionBehavior &
+-         ~NSWindowCollectionBehaviorFullScreenAuxiliary) |
+-        NSWindowCollectionBehaviorFullScreenPrimary;
+-  }
+-}
+-
+-void OnFullscreenExit(BrowserWindowInterface* browser,
+-                      base::OnceClosure exited) {
+-  NSWindow* window = WindowOf(browser);
+-  if (!window) {
+-    return;
+-  }
+-  __block base::OnceClosure block_exited = std::move(exited);
+-  __block id token = nil;
+-  token = [NSNotificationCenter.defaultCenter
+-      addObserverForName:NSWindowDidExitFullScreenNotification
+-                  object:window
+-                   queue:NSOperationQueue.mainQueue
+-              usingBlock:^(NSNotification*) {
+-                [NSNotificationCenter.defaultCenter removeObserver:token];
+-                token = nil;
+-                if (block_exited) {
+-                  std::move(block_exited).Run();
+-                }
+-              }];
+-}
+-
+-void ShowOnActiveSpace(BrowserWindowInterface* browser, bool on) {
+-  NSWindow* window = WindowOf(browser);
+-  if (!window) {
+-    return;
+-  }
+-  // A full-screen window owns its Space.
+-  if (on && (window.styleMask & NSWindowStyleMaskFullScreen)) {
+-    return;
+-  }
+-  if (on) {
+-    window.collectionBehavior |= NSWindowCollectionBehaviorMoveToActiveSpace;
+-  } else {
+-    window.collectionBehavior &= ~NSWindowCollectionBehaviorMoveToActiveSpace;
+-  }
+-}
+-
+-void ShowBehind(BrowserWindowInterface* target, BrowserWindowInterface* front) {
+-  NSWindow* window = WindowOf(target);
+-  NSWindow* over = WindowOf(front);
+-  if (!window || !over) {
+-    target->GetWindow()->Show();
+-    return;
+-  }
+-  window.animationBehavior = NSWindowAnimationBehaviorNone;
+-  over.animationBehavior = NSWindowAnimationBehaviorNone;
+-  target->GetWindow()->ShowInactive();
+-  [window orderWindow:NSWindowBelow relativeTo:over.windowNumber];
+-}
+-
+-}  // namespace meridian
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 8e1595ec14..2e15c29c07 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -53,7 +53,7 @@
+ #include "ui/base/clipboard/scoped_clipboard_writer.h"
+ #include "chrome/browser/meridian/prefs.h"
+ #include "chrome/browser/meridian/setup_profile.h"
+-#include "chrome/browser/meridian/profile_windows.h"
++#include "chrome/browser/meridian/space_profiles.h"
+ #include "chrome/browser/meridian/sidebar_service_factory.h"
+ #include "chrome/browser/profiles/keep_alive/profile_keep_alive_types.h"
+ #include "chrome/browser/profiles/keep_alive/scoped_profile_keep_alive.h"
+@@ -345,6 +345,8 @@ void SidebarHandler::ControlMedia(const tabs_api::NodeId& tab_id,
+ 
+ void SidebarHandler::Adopt(tabs::TabInterface* tab) {
+   content::WebContents* contents = tab->GetContents();
++  // A space's tab downloads into its profile.
++  downloads_->Watch(Profile::FromBrowserContext(contents->GetBrowserContext()));
+   const TabData* data = TabData::Get(contents);
+   if (data && service_->FindSpace(data->space_id())) {
+     // A restored tab whose item was unpinned meanwhile joins Today.
+@@ -353,12 +355,25 @@ void SidebarHandler::Adopt(tabs::TabInterface* tab) {
+     }
+     return;
+   }
+-  // Into the active space, or the first one of this window's profile.
++  // Its opener's space (a link opened in a new tab stays with its page).
++  int index = model()->GetIndexOfTab(tab);
++  if (tabs::TabInterface* opener = index == TabStripModel::kNoTab
++                                       ? nullptr
++                                       : model()->GetOpenerOfTabAt(index)) {
++    const TabData* from = TabData::Get(opener->GetContents());
++    if (from && service_->FindSpace(from->space_id())) {
++      TabData::Set(contents, from->space_id(), std::string());
++      return;
++    }
++  }
++  // The active space, or the first one of the tab's profile.
++  std::string profile_id = ProfileIdOf(
++      Profile::FromBrowserContext(contents->GetBrowserContext()));
+   std::string space_id = service_->active_space_id();
+   const Space* active = service_->FindSpace(space_id);
+-  if (active && active->profile != profile_id_) {
++  if (active && active->profile != profile_id) {
+     for (const Space& space : service_->spaces()) {
+-      if (space.profile == profile_id_) {
++      if (space.profile == profile_id) {
+         space_id = space.id;
+         break;
+       }
+@@ -367,8 +382,13 @@ void SidebarHandler::Adopt(tabs::TabInterface* tab) {
+   TabData::Set(contents, space_id, std::string());
+ }
+ 
++std::string SidebarHandler::ActiveProfileId() const {
++  const Space* active = service_->FindSpace(service_->active_space_id());
++  return active && HoldsSpaceTabs(browser_) ? active->profile : profile_id_;
++}
++
+ std::string SidebarHandler::Favorites() const {
+-  return SidebarService::FavoritesOf(profile_id_);
++  return SidebarService::FavoritesOf(ActiveProfileId());
+ }
+ 
+ namespace {
+@@ -424,7 +444,7 @@ bool SidebarHandler::PinTabContents(content::WebContents* contents,
+   const TabData* data = TabData::Get(contents);
+   if (data && !data->item_id().empty()) {
+     bool in_favorites = std::ranges::any_of(
+-        self->service_->favorites(self->profile_id_),
++        self->service_->favorites(self->ActiveProfileId()),
+         [&](const Item& f) { return f.id == data->item_id(); });
+     if (favorite && !in_favorites) {
+       self->service_->MoveItem(data->item_id(), self->Favorites(),
+@@ -1645,20 +1665,8 @@ void SidebarHandler::OnArcRead(ImportArcCallback callback,
+     }
+   }
+   // Arc's open tabs: Today tabs of their space, loaded when first opened.
++  // (Made in their space's profile, by the space in the extra data.)
+   for (size_t i = 0; i < arc->spaces.size(); ++i) {
+-    if (arc->spaces[i].profile != profile_id_) {
+-      // In their profile's window, behind this one.
+-      std::vector<GURL> urls;
+-      for (const ArcSidebar::Tab& tab : arc->today[i]) {
+-        urls.push_back(tab.url);
+-      }
+-      if (!urls.empty()) {
+-        ShowSpaceInProfile(browser_, arc->spaces[i].profile,
+-                           arc->spaces[i].id, std::move(urls),
+-                           /*show=*/false);
+-      }
+-      continue;
+-    }
+     for (const ArcSidebar::Tab& tab : arc->today[i]) {
+       sessions::SerializedNavigationEntry entry;
+       entry.set_index(0);
+@@ -1674,7 +1682,8 @@ void SidebarHandler::OnArcRead(ImportArcCallback callback,
+           base::TimeTicks::Now(), base::Time::Now(),
+           /*session_storage_namespace=*/nullptr,
+           sessions::SerializedUserAgentOverride(),
+-          /*extra_data=*/{}, /*from_session_restore=*/false,
++          TabData::ExtraDataFor(arc->spaces[i].id, arc->spaces[i].profile),
++          /*from_session_restore=*/false,
+           /*is_active_browser=*/std::nullopt);
+       if (contents) {
+         TabData::Set(contents, arc->spaces[i].id, std::string());
+@@ -1719,12 +1728,15 @@ void SidebarHandler::OnSidebarChanged() {
+   for (int i = 0; i < model()->count(); ++i) {
+     Adopt(model()->GetTabAtIndex(i));
+   }
+-  if (!joined_frame_) {
+-    // After a restart: this window goes behind (or in front of) the windows
+-    // of the other profiles, as one frame.
+-    joined_frame_ = true;
+-    const Space* active = service_->FindSpace(service_->active_space_id());
+-    JoinFrameIfBehind(browser_, active ? active->profile : std::string());
++  if (!gathered_ && !browser_->GetProfile()->IsOffTheRecord() &&
++      !IsLittleWindow(browser_)) {
++    // Once loaded: the space profiles load in the background, and windows
++    // left by the old one-window-per-profile model join this one (posted:
++    // they may be restoring still).
++    gathered_ = true;
++    PreloadSpaceProfiles(MainProfileFor(browser_->GetProfile()));
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&GatherSpaceWindows));
+   }
+   ScheduleNotify();
+ }
+@@ -1739,6 +1751,8 @@ void SidebarHandler::OnTabStripModelChanged(
+   if (change.type() == TabStripModelChange::kInserted) {
+     for (const auto& inserted : change.GetInsert()->contents) {
+       Adopt(inserted.tab);
++      // With this window's session (it may come from another window).
++      TabData::Save(inserted.tab->GetContents());
+       MaybePeek(inserted.tab);
+     }
+   }
+@@ -1781,7 +1795,7 @@ mojom::SidebarStatePtr SidebarHandler::BuildState() {
+     state->spaces.push_back(std::move(s));
+   }
+   state->active_space_id = service_->active_space_id();
+-  for (const Item& item : service_->favorites(profile_id_)) {
++  for (const Item& item : service_->favorites(ActiveProfileId())) {
+     state->favorites.push_back(ToMojo(item));
+   }
+   for (const ProfileInfo& p : service_->profiles()) {
+@@ -1790,7 +1804,7 @@ mojom::SidebarStatePtr SidebarHandler::BuildState() {
+     profile->name = p.name;
+     state->profiles.push_back(std::move(profile));
+   }
+-  state->profile_id = profile_id_;
++  state->profile_id = ActiveProfileId();
+   for (int i = 0; i < model()->count(); ++i) {
+     tabs::TabInterface* tab = model()->GetTabAtIndex(i);
+     const TabData* data = TabData::Get(tab->GetContents());
+@@ -1934,12 +1948,6 @@ void SidebarHandler::ActivateSpace(const std::string& space_id) {
+   if (!space) {
+     return;
+   }
+-  if (space->profile != profile_id_ && !browser_->GetProfile()->IsOffTheRecord() &&
+-      !IsLittleWindow(browser_)) {
+-    // Another profile: its window takes this one's place.
+-    ShowSpaceInProfile(browser_, space->profile, space_id, {}, /*show=*/true);
+-    return;
+-  }
+   ActivateSpaceHere(space_id);
+ }
+ 
+@@ -1971,10 +1979,7 @@ void SidebarHandler::ActivateSpaceHere(const std::string& space_id) {
+     return;
+   }
+   // An empty space starts with a new tab, like Arc.
+-  NavigateParams params(browser_, GURL("chrome://newtab/"),
+-                        ui::PAGE_TRANSITION_AUTO_TOPLEVEL);
+-  params.disposition = WindowOpenDisposition::kNewForegroundTab;
+-  Navigate(&params);
++  OpenInSpace(browser_, space_id, GURL("chrome://newtab/"), /*active=*/true);
+ }
+ 
+ void SidebarHandler::MoveTabToSpace(const tabs_api::NodeId& tab_id,
+@@ -1991,22 +1996,14 @@ void SidebarHandler::MoveTabToSpace(const tabs_api::NodeId& tab_id,
+     item_id.clear();
+   }
+   const Space* target = service_->FindSpace(space_id);
+-  if (target->profile != profile_id_ && !IsLittleWindow(browser_) &&
+-      !browser_->GetProfile()->IsOffTheRecord()) {
++  if (target->profile != ProfileIdOf(Profile::FromBrowserContext(
++                             tab->GetContents()->GetBrowserContext())) &&
++      HoldsSpaceTabs(browser_)) {
+     // A page can't change profiles: it reopens there (signed out, maybe).
+-    GURL url = tab->GetContents()->GetLastCommittedURL();
+-    base::WeakPtr<content::WebContents> old =
+-        tab->GetContents()->GetWeakPtr();
+-    ShowSpaceInProfile(
+-        browser_, target->profile, space_id, {url}, /*show=*/false,
+-        base::BindOnce(
+-            [](base::WeakPtr<content::WebContents> old,
+-               BrowserWindowInterface* opened) {
+-              if (opened && old) {
+-                old->ClosePage();
+-              }
+-            },
+-            old));
++    content::WebContents* old = tab->GetContents();
++    OpenInSpace(browser_, space_id, old->GetLastCommittedURL(),
++                tab->IsActivated(), item_id);
++    old->ClosePage();
+     return;
+   }
+   TabData::Set(tab->GetContents(), space_id, item_id);
+@@ -2178,20 +2175,18 @@ void SidebarHandler::SetSpaceProfile(const std::string& space_id,
+   }
+   bool active = service_->active_space_id() == space_id;
+   service_->SetSpaceProfile(space_id, profile_id);
+-  // The tabs close once the new window has its own (a window losing its last
+-  // tab would close).
+-  ShowSpaceInProfile(
+-      browser_, profile_id, space_id, std::move(urls), /*show=*/active,
+-      base::BindOnce(
+-          [](std::vector<base::WeakPtr<content::WebContents>> old,
+-             BrowserWindowInterface*) {
+-            for (const auto& contents : old) {
+-              if (contents) {
+-                contents->ClosePage();
+-              }
+-            }
+-          },
+-          std::move(old)));
++  // The new tabs first: a window losing its last tab would close.
++  for (size_t i = 0; i < urls.size(); ++i) {
++    OpenInSpace(browser_, space_id, urls[i], active && i == 0);
++  }
++  if (active && urls.empty()) {
++    OpenInSpace(browser_, space_id, GURL("chrome://newtab/"), /*active=*/true);
++  }
++  for (const auto& contents : old) {
++    if (contents) {
++      contents->ClosePage();
++    }
++  }
+ }
+ 
+ void SidebarHandler::PinTab(const tabs_api::NodeId& tab_id,
+@@ -2328,14 +2323,21 @@ void SidebarHandler::GetArcExtensions(GetArcExtensionsCallback callback) {
+           weak_factory_.GetWeakPtr(), std::move(callback)));
+ }
+ 
++// The site's settings are its tab's profile's (a space's, maybe).
++Profile* SidebarHandler::ActiveTabProfile() {
++  content::WebContents* contents = model()->GetActiveWebContents();
++  return contents ? Profile::FromBrowserContext(contents->GetBrowserContext())
++                  : browser_->GetProfile();
++}
++
+ void SidebarHandler::GetSiteInfo(GetSiteInfoCallback callback) {
+   std::move(callback).Run(meridian::GetSiteInfo(
+-      browser_->GetProfile(), model()->GetActiveWebContents()));
++      ActiveTabProfile(), model()->GetActiveWebContents()));
+ }
+ 
+ void SidebarHandler::SetSitePermission(const std::string& type,
+                                        const std::string& setting) {
+-  meridian::SetSitePermission(browser_->GetProfile(),
++  meridian::SetSitePermission(ActiveTabProfile(),
+                               model()->GetActiveWebContents(), type, setting);
+ }
+ 
+@@ -2344,8 +2346,7 @@ void SidebarHandler::ZoomSite(int32_t step) {
+ }
+ 
+ void SidebarHandler::ClearSiteData(ClearSiteDataCallback callback) {
+-  meridian::ClearSiteData(browser_->GetProfile(),
+-                          model()->GetActiveWebContents(),
++  meridian::ClearSiteData(ActiveTabProfile(), model()->GetActiveWebContents(),
+                           std::move(callback));
+ }
+ 
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 8cfccd51c6..a73785e5c6 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -279,9 +279,14 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void Notify();
+   tabs::TabInterface* TabFor(const tabs_api::NodeId& id);
+   tabs::TabInterface* LiveTabOf(const std::string& item_id);
+-  // Gives a tab without (valid) Meridian data the active space.
++  // Gives a tab without (valid) Meridian data a space: its opener's, or the
++  // active one if that is of the tab's profile.
+   void Adopt(tabs::TabInterface* tab);
+-  // The favorites container of this window's profile.
++  // The Meridian profile shown: the active space's in a window that holds
++  // every profile's tabs, else this window's.
++  std::string ActiveProfileId() const;
++  Profile* ActiveTabProfile();
++  // The favorites container of the profile shown (Arc's are per profile).
+   std::string Favorites() const;
+   // The space in this window, without switching windows.
+   void ActivateSpaceHere(const std::string& space_id);
+@@ -298,7 +303,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   // profile kept loaded while it shows its sidebar.
+   std::string profile_id_;
+   std::unique_ptr<ScopedProfileKeepAlive> main_keep_alive_;
+-  bool joined_frame_ = false;
++  bool gathered_ = false;
+   std::unique_ptr<DownloadsTracker> downloads_;
+   base::OneShotTimer downloads_timer_;
+   raw_ptr<SidebarService> service_;
+diff --git a/chrome/browser/meridian/sidebar_service_factory.cc b/chrome/browser/meridian/sidebar_service_factory.cc
+index 60294cc662..ee42090c52 100644
+--- a/chrome/browser/meridian/sidebar_service_factory.cc
++++ b/chrome/browser/meridian/sidebar_service_factory.cc
+@@ -5,7 +5,7 @@
+ #include "chrome/browser/meridian/sidebar_service_factory.h"
+ 
+ #include "chrome/browser/meridian/archive_service.h"
+-#include "chrome/browser/meridian/profile_windows.h"
++#include "chrome/browser/meridian/space_profiles.h"
+ #include "chrome/browser/meridian/sidebar_service.h"
+ #include "chrome/browser/profiles/profile.h"
+ 
+diff --git a/chrome/browser/meridian/space_profiles.cc b/chrome/browser/meridian/space_profiles.cc
+new file mode 100644
+index 0000000000..3a7e949f34
+--- /dev/null
++++ b/chrome/browser/meridian/space_profiles.cc
+@@ -0,0 +1,305 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/space_profiles.h"
++
++#include <map>
++#include <memory>
++#include <vector>
++
++#include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/meridian/little_window.h"
++#include "chrome/browser/meridian/prefs.h"
++#include "chrome/browser/meridian/sidebar_service.h"
++#include "chrome/browser/meridian/sidebar_service_factory.h"
++#include "chrome/browser/meridian/tab_data.h"
++#include "chrome/browser/profiles/keep_alive/profile_keep_alive_types.h"
++#include "chrome/browser/profiles/keep_alive/scoped_profile_keep_alive.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_attributes_storage.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/sessions/session_service.h"
++#include "chrome/browser/sessions/session_service_factory.h"
++#include "chrome/browser/tab_contents/tab_util.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
++#include "chrome/browser/ui/browser_window/public/create_browser_window.h"
++#include "chrome/browser/ui/tabs/tab_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/prefs/pref_service.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/base_window.h"
++
++namespace meridian {
++
++namespace {
++
++constexpr char kPrefix[] = "Meridian Profile ";
++
++// Space profiles kept loaded: their tabs are in the main profile's windows,
++// which keep only that one alive.
++std::map<Profile*, std::unique_ptr<ScopedProfileKeepAlive>>& KeptAlive() {
++  static base::NoDestructor<
++      std::map<Profile*, std::unique_ptr<ScopedProfileKeepAlive>>>
++      kept;
++  return *kept;
++}
++
++void KeepAlive(Profile* profile) {
++  if (!KeptAlive().contains(profile)) {
++    KeptAlive()[profile] = std::make_unique<ScopedProfileKeepAlive>(
++        profile, ProfileKeepAliveOrigin::kBrowserWindow);
++  }
++}
++
++// The active space of `browser`'s sidebar, if it has loaded.
++const Space* ActiveSpace(BrowserWindowInterface* browser) {
++  SidebarService* service =
++      SidebarServiceFactory::GetForProfile(browser->GetProfile());
++  return service ? service->FindSpace(service->active_space_id()) : nullptr;
++}
++
++}  // namespace
++
++std::string ProfileIdOf(Profile* profile) {
++  std::string base = profile->GetOriginalProfile()->GetPath().BaseName().value();
++  return base.starts_with(kPrefix) ? base : std::string();
++}
++
++bool IsSpaceProfile(Profile* profile) {
++  return !ProfileIdOf(profile).empty();
++}
++
++base::FilePath ProfilePathFor(const std::string& profile_id) {
++  const base::FilePath& dir = g_browser_process->profile_manager()->user_data_dir();
++  return profile_id.empty()
++             ? dir.Append(ProfileManager::GetInitialProfileDir())
++             : dir.Append(profile_id);
++}
++
++Profile* MainProfileFor(Profile* profile) {
++  if (!IsSpaceProfile(profile)) {
++    return profile;
++  }
++  ProfileManager* manager = g_browser_process->profile_manager();
++  base::FilePath main = ProfilePathFor(std::string());
++  if (Profile* loaded = manager->GetProfileByPath(main)) {
++    return loaded;
++  }
++  // Only after a restart with just another profile's windows open (loads
++  // synchronously; ProfileImpl allows its own blocking).
++  return manager->GetProfile(main);
++}
++
++std::string NewProfileId(const std::vector<std::string>& taken) {
++  ProfileManager* manager = g_browser_process->profile_manager();
++  ProfileAttributesStorage& known = manager->GetProfileAttributesStorage();
++  for (int n = 1;; ++n) {
++    std::string id = kPrefix + base::NumberToString(n);
++    if (std::ranges::find(taken, id) == taken.end() &&
++        !known.GetProfileAttributesWithPath(
++            manager->user_data_dir().Append(id))) {
++      return id;
++    }
++  }
++}
++
++Profile* LoadSpaceProfile(Profile* main, const std::string& profile_id) {
++  if (profile_id.empty()) {
++    return main;
++  }
++  ProfileManager* manager = g_browser_process->profile_manager();
++  base::FilePath path = ProfilePathFor(profile_id);
++  Profile* profile = manager->GetProfileByPath(path);
++  if (!profile) {
++    // Loads synchronously; ProfileImpl allows its own blocking. Rare: the
++    // space profiles load in the background at startup.
++    profile = manager->GetProfile(path);
++  }
++  if (profile) {
++    KeepAlive(profile);
++  }
++  return profile;
++}
++
++void PreloadSpaceProfiles(Profile* main) {
++  SidebarService* service = SidebarServiceFactory::GetForProfile(main);
++  if (!service) {
++    return;
++  }
++  ProfileManager* manager = g_browser_process->profile_manager();
++  for (const Space& space : service->spaces()) {
++    if (space.profile.empty()) {
++      continue;
++    }
++    if (Profile* loaded =
++            manager->GetProfileByPath(ProfilePathFor(space.profile))) {
++      KeepAlive(loaded);
++      continue;
++    }
++    manager->CreateProfileAsync(ProfilePathFor(space.profile),
++                                base::BindOnce([](Profile* profile) {
++                                  if (profile) {
++                                    KeepAlive(profile);
++                                  }
++                                }));
++  }
++}
++
++bool HoldsSpaceTabs(BrowserWindowInterface* browser) {
++  return browser->GetType() == BrowserWindowInterface::TYPE_NORMAL &&
++         !IsLittleWindow(browser) && !browser->GetProfile()->IsOffTheRecord() &&
++         !IsSpaceProfile(browser->GetProfile());
++}
++
++Profile* ProfileForNewTab(BrowserWindowInterface* browser, Profile* source) {
++  Profile* own = browser->GetProfile();
++  if (!HoldsSpaceTabs(browser)) {
++    return own;
++  }
++  if (source && source != own && !source->IsOffTheRecord() &&
++      IsSpaceProfile(source)) {
++    return source;
++  }
++  if (source == own) {
++    return own;
++  }
++  const Space* space = ActiveSpace(browser);
++  Profile* profile = space ? LoadSpaceProfile(own, space->profile) : nullptr;
++  return profile ? profile : own;
++}
++
++content::WebContents* OpenInSpace(BrowserWindowInterface* browser,
++                                  const std::string& space_id,
++                                  const GURL& url,
++                                  bool active,
++                                  const std::string& item_id) {
++  Profile* profile = browser->GetProfile();
++  SidebarService* service = SidebarServiceFactory::GetForProfile(profile);
++  const Space* space = service ? service->FindSpace(space_id) : nullptr;
++  if (space && HoldsSpaceTabs(browser)) {
++    if (Profile* own = LoadSpaceProfile(profile, space->profile)) {
++      profile = own;
++    }
++  }
++  content::WebContents::CreateParams params(
++      profile, tab_util::GetSiteInstanceForNewTab(profile, url));
++  params.initially_hidden = !active;
++  std::unique_ptr<content::WebContents> created =
++      content::WebContents::Create(params);
++  content::WebContents* contents = created.get();
++  // Its space before the sidebar sees it; saved with the session once it is
++  // in the window.
++  TabData::Set(contents, space_id, item_id);
++  TabStripModel* model = browser->GetTabStripModel();
++  model->InsertWebContentsAt(model->count(), std::move(created),
++                             active ? AddTabTypes::ADD_ACTIVE
++                                    : AddTabTypes::ADD_NONE);
++  contents->GetController().LoadURL(url, content::Referrer(),
++                                    ui::PAGE_TRANSITION_AUTO_TOPLEVEL,
++                                    std::string());
++  TabData::Save(contents);
++  return contents;
++}
++
++Profile* ProfileForRestoredTab(
++    BrowserWindowInterface* browser,
++    const std::map<std::string, std::string>& extra_data) {
++  Profile* own = browser->GetProfile();
++  std::string profile_id = TabData::ProfileIdOf(extra_data);
++  if (!HoldsSpaceTabs(browser) || profile_id.empty()) {
++    return own;
++  }
++  // Never a profile deleted meanwhile (loading it would make it again).
++  ProfileManager* manager = g_browser_process->profile_manager();
++  if (!manager->GetProfileAttributesStorage().GetProfileAttributesWithPath(
++          ProfilePathFor(profile_id))) {
++    return own;
++  }
++  Profile* profile = LoadSpaceProfile(own, profile_id);
++  return profile ? profile : own;
++}
++
++void GatherSpaceWindows() {
++  BrowserWindowInterface* into = nullptr;
++  std::vector<BrowserWindowInterface*> strays;
++  std::vector<BrowserWindowInterface*> mains;
++  ForEachCurrentBrowserWindowInterfaceOrderedByActivation(
++      [&](BrowserWindowInterface* b) {
++        if (b->GetType() != BrowserWindowInterface::TYPE_NORMAL ||
++            IsLittleWindow(b) || b->GetProfile()->IsOffTheRecord()) {
++          return true;
++        }
++        if (IsSpaceProfile(b->GetProfile())) {
++          strays.push_back(b);
++        } else if (!into) {
++          into = b;
++        } else {
++          mains.push_back(b);
++        }
++        return true;
++      });
++  Profile* main = into ? into->GetProfile()
++                 : strays.empty()
++                     ? nullptr
++                     : MainProfileFor(strays.front()->GetProfile());
++  if (!main) {
++    return;
++  }
++  // Once, right after the first start with this model (the restored
++  // windows): the old window swapping left the main profile's windows
++  // scattered too. Windows opened later stay.
++  static bool first_call = true;
++  if (first_call && !main->GetPrefs()->GetBoolean(prefs::kWindowsGathered)) {
++    strays.insert(strays.end(), mains.begin(), mains.end());
++  }
++  first_call = false;
++  main->GetPrefs()->SetBoolean(prefs::kWindowsGathered, true);
++  if (strays.empty()) {
++    return;
++  }
++  if (!into) {
++    BrowserWindowCreateParams params(*main, /*from_user_gesture=*/false);
++    params.initial_bounds = strays.front()->GetWindow()->GetBounds();
++    params.should_trigger_session_restore = false;
++    into = CreateBrowserWindow(std::move(params));
++    if (!into) {
++      return;
++    }
++    into->GetWindow()->Show();
++  }
++  TabStripModel* to = into->GetTabStripModel();
++  for (BrowserWindowInterface* stray : strays) {
++    // Its tabs outlive its window.
++    if (IsSpaceProfile(stray->GetProfile())) {
++      KeepAlive(stray->GetProfile());
++    }
++    TabStripModel* from = stray->GetTabStripModel();
++    for (int i = 0; i < from->count(); ++i) {
++      if (std::optional<split_tabs::SplitTabId> split =
++              from->GetTabAtIndex(i)->GetSplit()) {
++        from->RemoveSplit(*split);
++      }
++    }
++    while (from->count()) {
++      std::unique_ptr<tabs::TabModel> tab = from->DetachTabAtForInsertion(0);
++      // Pinned tabs of the old windows were Chromium's, not the sidebar's.
++      tab->SetPinned(false);
++      to->InsertDetachedTabAt(to->count(), std::move(tab), AddTabTypes::ADD_NONE);
++    }
++    stray->GetWindow()->Close();
++  }
++  // The moved tabs' pages were recorded in their old window's session (another
++  // profile's, maybe): this one's records them all again.
++  if (SessionService* session =
++          SessionServiceFactory::GetForProfile(into->GetProfile())) {
++    session->ResetFromCurrentBrowsers();
++  }
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/space_profiles.h b/chrome/browser/meridian/space_profiles.h
+new file mode 100644
+index 0000000000..dd949ee851
+--- /dev/null
++++ b/chrome/browser/meridian/space_profiles.h
+@@ -0,0 +1,77 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_SPACE_PROFILES_H_
++#define CHROME_BROWSER_MERIDIAN_SPACE_PROFILES_H_
++
++#include <map>
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++
++class BrowserWindowInterface;
++class GURL;
++class Profile;
++
++namespace content {
++class WebContents;
++}
++
++namespace meridian {
++
++// Spaces with their own profile, Arc's model on Chromium: every Meridian
++// profile is a Chromium profile ("Meridian Profile N" next to the main one)
++// with its own cookies, history and logins. A Meridian window is the main
++// profile's and holds the tabs of every space, whatever their profile: a
++// space's tabs are made in its profile, so switching spaces never changes
++// windows. The sidebar model is the main profile's (SidebarServiceFactory).
++
++// "" for the main profile (or any profile Meridian didn't create), else the
++// profile's folder name.
++std::string ProfileIdOf(Profile* profile);
++bool IsSpaceProfile(Profile* profile);
++// The folder of a Meridian profile id.
++base::FilePath ProfilePathFor(const std::string& profile_id);
++// The main profile, loaded if it isn't yet (blocking then).
++Profile* MainProfileFor(Profile* profile);
++// A folder name for a new profile, unused on disk and in `taken`.
++std::string NewProfileId(const std::vector<std::string>& taken);
++
++// The profile of a Meridian profile id, loaded if it isn't yet (blocking
++// then) and kept loaded while the app runs: its tabs live in windows of the
++// main profile, which don't keep it alive. nullptr if it can't be loaded.
++Profile* LoadSpaceProfile(Profile* main, const std::string& profile_id);
++// Loads the profiles of all spaces in the background, so a switch to one
++// doesn't wait for it.
++void PreloadSpaceProfiles(Profile* main);
++
++// Whether `browser` holds tabs of every profile: a normal window of the main
++// profile, not a Little Window or a private one.
++bool HoldsSpaceTabs(BrowserWindowInterface* browser);
++// The profile for a new tab in `browser`: the profile of `source` (the page it
++// is opened from) if it has one, else the active space's. The browser's own
++// for any other window.
++Profile* ProfileForNewTab(BrowserWindowInterface* browser, Profile* source);
++// Opens `url` as a new tab of `space_id` (the live tab of `item_id`, if not
++// empty) at the end of `browser`, made in the space's profile.
++content::WebContents* OpenInSpace(BrowserWindowInterface* browser,
++                                  const std::string& space_id,
++                                  const GURL& url,
++                                  bool active,
++                                  const std::string& item_id = std::string());
++// The profile for a tab of `browser` restored from the session, by its saved
++// space (`extra_data`).
++Profile* ProfileForRestoredTab(
++    BrowserWindowInterface* browser,
++    const std::map<std::string, std::string>& extra_data);
++// Windows of space profiles (left from when every profile had its own
++// window) give their tabs to a window that holds space tabs, and close. The
++// first run with this also gathers the main profile's extra windows: the old
++// window swapping left many behind.
++void GatherSpaceWindows();
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_SPACE_PROFILES_H_
+diff --git a/chrome/browser/meridian/tab_data.cc b/chrome/browser/meridian/tab_data.cc
+index 1d985484b7..61209caaff 100644
+--- a/chrome/browser/meridian/tab_data.cc
++++ b/chrome/browser/meridian/tab_data.cc
+@@ -4,9 +4,12 @@
+ 
+ #include "chrome/browser/meridian/tab_data.h"
+ 
++#include "chrome/browser/meridian/space_profiles.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/sessions/session_service.h"
+ #include "chrome/browser/sessions/session_service_factory.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "components/sessions/content/session_tab_helper.h"
+ #include "content/public/browser/web_contents.h"
+ 
+@@ -15,6 +18,9 @@ namespace meridian {
+ namespace {
+ constexpr char kSpaceKey[] = "meridian.space";
+ constexpr char kItemKey[] = "meridian.item";
++// The tab's Meridian profile: it comes back in it (session restore runs
++// before the sidebar model, which knows the spaces' profiles, has loaded).
++constexpr char kProfileKey[] = "meridian.profile";
+ }  // namespace
+ 
+ TabData::TabData(content::WebContents* contents)
+@@ -62,10 +68,50 @@ void TabData::RestoreFromExtraData(
+   data->item_id_ = item == extra_data.end() ? std::string() : item->second;
+ }
+ 
++// static
++void TabData::Save(content::WebContents* contents) {
++  if (TabData* data = FromWebContents(contents)) {
++    data->Persist();
++  }
++}
++
++// static
++std::map<std::string, std::string> TabData::ExtraDataFor(
++    const std::string& space_id,
++    const std::string& profile_id) {
++  return {{kSpaceKey, space_id}, {kProfileKey, profile_id}};
++}
++
++// static
++std::map<std::string, std::string> TabData::ExtraDataOf(
++    content::WebContents* contents) {
++  const TabData* data = Get(contents);
++  if (!data) {
++    return {};
++  }
++  std::map<std::string, std::string> extra = ExtraDataFor(
++      data->space_id(), meridian::ProfileIdOf(Profile::FromBrowserContext(
++                            contents->GetBrowserContext())));
++  extra[kItemKey] = data->item_id();
++  return extra;
++}
++
++// static
++std::string TabData::ProfileIdOf(
++    const std::map<std::string, std::string>& extra_data) {
++  auto profile = extra_data.find(kProfileKey);
++  return profile == extra_data.end() ? std::string() : profile->second;
++}
++
+ void TabData::Persist() {
+   content::WebContents* contents = &GetWebContents();
++  // Its window's session: a tab of another profile is saved with the window
++  // it is in.
++  tabs::TabInterface* tab = tabs::TabInterface::MaybeGetFromContents(contents);
+   Profile* profile =
+-      Profile::FromBrowserContext(contents->GetBrowserContext());
++      tab && tab->GetBrowserWindowInterface()
++          ? tab->GetBrowserWindowInterface()->GetProfile()
++          : Profile::FromBrowserContext(contents->GetBrowserContext());
+   SessionService* session = SessionServiceFactory::GetForProfile(profile);
+   if (!session) {
+     return;  // incognito, or session saving is off
+@@ -78,6 +124,10 @@ void TabData::Persist() {
+   }
+   session->AddTabExtraData(window_id, tab_id, kSpaceKey, space_id_);
+   session->AddTabExtraData(window_id, tab_id, kItemKey, item_id_);
++  session->AddTabExtraData(
++      window_id, tab_id, kProfileKey,
++      meridian::ProfileIdOf(
++          Profile::FromBrowserContext(contents->GetBrowserContext())));
+ }
+ 
+ WEB_CONTENTS_USER_DATA_KEY_IMPL(TabData);
+diff --git a/chrome/browser/meridian/tab_data.h b/chrome/browser/meridian/tab_data.h
+index 324537332f..1327eade80 100644
+--- a/chrome/browser/meridian/tab_data.h
++++ b/chrome/browser/meridian/tab_data.h
+@@ -29,6 +29,20 @@ class TabData : public content::WebContentsUserData<TabData> {
+       content::WebContents* contents,
+       const std::map<std::string, std::string>& extra_data);
+ 
++  // Saves `contents`' data again, with the session of the window it is in
++  // now (a tab moved between windows, or just inserted).
++  static void Save(content::WebContents* contents);
++  // Extra data for a tab of `space_id` in Meridian profile `profile_id`, or
++  // for `contents` (closed, for ⇧⌘T).
++  static std::map<std::string, std::string> ExtraDataFor(
++      const std::string& space_id,
++      const std::string& profile_id);
++  static std::map<std::string, std::string> ExtraDataOf(
++      content::WebContents* contents);
++  // The Meridian profile saved in a tab's extra data ("" for the main one).
++  static std::string ProfileIdOf(
++      const std::map<std::string, std::string>& extra_data);
++
+   const std::string& space_id() const { return space_id_; }
+   const std::string& item_id() const { return item_id_; }
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index a5784e3b44..d9b9fd1e7e 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -1285,8 +1285,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.slidTo_ = target.id;
+     await this.animateSlide_(-this.ghostDir_ * this.pageWidth_());
+     this.handler_.activateSpace(target.id);
+-    // A space in another profile shows in its own window, and this one
+-    // never switches: tidy up anyway.
++    // If the switch never comes back (the space went meanwhile): tidy up
++    // anyway.
+     clearTimeout(this.slideReset_);
+     this.slideReset_ = setTimeout(() => this.resetSlide_(), 1500);
+   }
+diff --git a/chrome/browser/sessions/BUILD.gn b/chrome/browser/sessions/BUILD.gn
+index f69c5d5ceb..9709768396 100644
+--- a/chrome/browser/sessions/BUILD.gn
++++ b/chrome/browser/sessions/BUILD.gn
+@@ -138,6 +138,7 @@ source_set("impl") {
+     ]
+ 
+     deps += [
++      "//chrome/browser/meridian",
+       "//chrome/browser:after_startup_task_utils",
+       "//chrome/browser/content_settings:content_settings_factory",
+       "//chrome/browser/devtools",
+diff --git a/chrome/browser/sessions/session_service_base.cc b/chrome/browser/sessions/session_service_base.cc
+index ee887add6a..53bd82ef3f 100644
+--- a/chrome/browser/sessions/session_service_base.cc
++++ b/chrome/browser/sessions/session_service_base.cc
+@@ -19,6 +19,7 @@
+ #include "base/strings/to_string.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "build/build_config.h"
++#include "chrome/browser/meridian/tab_data.h"
+ #include "chrome/browser/apps/app_service/web_contents_app_id_utils.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -675,6 +676,12 @@ void SessionServiceBase::BuildCommandsForTab(
+         sessions::CreatePinnedStateCommand(session_id, true));
+   }
+ 
++  // Meridian: the tab's space and profile, which a rebuild would drop.
++  for (const auto& [key, value] : meridian::TabData::ExtraDataOf(tab)) {
++    command_storage_manager()->AppendRebuildCommand(
++        sessions::CreateAddTabExtraDataCommand(session_id, key, value));
++  }
++
+   // Record the association between the sessionStorage namespace and the tab.
+   content::SessionStorageNamespaceHandle* session_storage_namespace =
+       tab->GetController().GetDefaultSessionStorageNamespace();
+diff --git a/chrome/browser/sessions/session_tab_helper_factory.cc b/chrome/browser/sessions/session_tab_helper_factory.cc
+index e634ae6fb0..89d1e8189e 100644
+--- a/chrome/browser/sessions/session_tab_helper_factory.cc
++++ b/chrome/browser/sessions/session_tab_helper_factory.cc
+@@ -14,6 +14,8 @@
+ #include "chrome/browser/sessions/session_service.h"
+ #include "chrome/browser/sessions/session_service_factory.h"
+ #include "chrome/browser/sessions/session_service_lookup.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/web_contents.h"
+ #endif
+ 
+@@ -32,6 +34,14 @@ sessions::SessionTabHelperDelegate* GetSessionTabHelperDelegate(
+     return AppSessionServiceFactory::GetForProfile(
+         Profile::FromBrowserContext(web_contents->GetBrowserContext()));
+   }
++  // Meridian: its window's session, so a tab of another profile (a space's)
++  // is saved and restored with the window it is in.
++  if (tabs::TabInterface* tab =
++          tabs::TabInterface::MaybeGetFromContents(web_contents)) {
++    if (BrowserWindowInterface* window = tab->GetBrowserWindowInterface()) {
++      return SessionServiceFactory::GetForProfile(window->GetProfile());
++    }
++  }
+   return SessionServiceFactory::GetForProfile(
+       Profile::FromBrowserContext(web_contents->GetBrowserContext()));
+ }
+diff --git a/chrome/browser/ui/BUILD.gn b/chrome/browser/ui/BUILD.gn
+index 3277e827b8..a27934442c 100644
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -557,6 +557,7 @@ if (!is_android) {
+     sources = [ "browser_live_tab_context.cc" ]
+     public_deps = [ ":browser_live_tab_context" ]
+     deps = [
++      "//chrome/browser/meridian",
+       ":browser_commands",
+       ":browser_init_state",
+       ":browser_tab_strip",
+diff --git a/chrome/browser/ui/browser_live_tab_context.cc b/chrome/browser/ui/browser_live_tab_context.cc
+index cc8786f0d1..0aa96eba82 100644
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -8,6 +8,8 @@
+ #include <memory>
+ #include <numeric>
+ #include <optional>
++
++#include "chrome/browser/meridian/tab_data.h"
+ #include <utility>
+ 
+ #include "base/check_deref.h"
+@@ -202,6 +204,8 @@ std::map<std::string, std::string> BrowserLiveTabContext::GetExtraDataForTab(
+   tabs::TabInterface* const tab = tab_strip_model_->GetTabAtIndex(index);
+ 
+   glic::PopulateGlicExtraData(tab, &extra_data);
++  // Meridian: its space, so ⇧⌘T brings it back there, in its profile.
++  extra_data.merge(meridian::TabData::ExtraDataOf(tab->GetContents()));
+   if (auto* contextual_tasks_controller =
+           contextual_tasks::ContextualTasksPanelController::From(
+               &browser_.get())) {
+diff --git a/chrome/browser/ui/browser_tabrestore.cc b/chrome/browser/ui/browser_tabrestore.cc
+index c84010e980..30ac2028b1 100644
+--- a/chrome/browser/ui/browser_tabrestore.cc
++++ b/chrome/browser/ui/browser_tabrestore.cc
+@@ -2,9 +2,11 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#include "chrome/browser/meridian/tab_data.h"
+ #include "chrome/browser/ui/browser_tabrestore.h"
+ 
++#include "chrome/browser/meridian/space_profiles.h"
++#include "chrome/browser/meridian/tab_data.h"
++
+ #include <map>
+ #include <memory>
+ #include <utility>
+@@ -69,20 +71,23 @@ std::unique_ptr<WebContents> CreateRestoredTab(
+   // SessionStorageNamespaceHandle objects. Also remove the
+   // session_storage_namespace_handle.h include since we only need that to
+   // assign into the map.
+-  content::SessionStorageNamespaceHandleMap session_storage_namespace_map =
+-      content::CreateMapWithDefaultSessionStorageNamespace(
+-          browser->GetProfile(), session_storage_namespace);
+-  WebContents::CreateParams create_params(browser->GetProfile());
++  // Meridian: a tab of a space in another profile comes back in that
++  // profile (with its own session storage).
++  Profile* profile = meridian::ProfileForRestoredTab(browser, extra_data);
++  WebContents::CreateParams create_params(profile);
+   create_params.initially_hidden = initially_hidden;
+   create_params.desired_renderer_state =
+       WebContents::CreateParams::kNoRendererProcess;
+   create_params.last_active_time_ticks = last_active_time_ticks;
+   create_params.last_active_time = last_active_time;
+   std::unique_ptr<WebContents> web_contents =
+-      WebContents::CreateWithSessionStorage(create_params,
+-                                            session_storage_namespace_map);
+-  apps::SetAppIdForWebContents(browser->GetProfile(), web_contents.get(),
+-                               extension_app_id);
++      profile == browser->GetProfile()
++          ? WebContents::CreateWithSessionStorage(
++                create_params,
++                content::CreateMapWithDefaultSessionStorageNamespace(
++                    profile, session_storage_namespace))
++          : WebContents::Create(create_params);
++  apps::SetAppIdForWebContents(profile, web_contents.get(), extension_app_id);
+ 
+   glic::RestoreGlicStateFromExtraData(web_contents.get(), extra_data);
+   contextual_tasks::ContextualTasksTabRestoreData::RestoreFromExtraData(
+@@ -92,8 +97,8 @@ std::unique_ptr<WebContents> CreateRestoredTab(
+   meridian::TabData::RestoreFromExtraData(web_contents.get(), extra_data);
+ 
+   std::vector<std::unique_ptr<NavigationEntry>> entries =
+-      ContentSerializedNavigationBuilder::ToNavigationEntries(
+-          navigations, browser->GetProfile());
++      ContentSerializedNavigationBuilder::ToNavigationEntries(navigations,
++                                                              profile);
+ 
+   blink::UserAgentOverride ua_override;
+   ua_override.ua_string_override = user_agent_override.ua_string_override;
+diff --git a/chrome/browser/ui/navigator/BUILD.gn b/chrome/browser/ui/navigator/BUILD.gn
+index 335b892348..9d9c31e2d5 100644
+--- a/chrome/browser/ui/navigator/BUILD.gn
++++ b/chrome/browser/ui/navigator/BUILD.gn
+@@ -89,6 +89,7 @@ source_set("impl") {
+     deps += [
+       "//chrome/browser/apps/app_service",
+       "//chrome/browser/apps/link_capturing",
++      "//chrome/browser/meridian",
+       "//chrome/browser/ui:browser_init_state",
+       "//chrome/browser/ui:browser_window_header",
+       "//chrome/browser/ui:singleton_tabs",
+diff --git a/chrome/browser/ui/navigator/browser_navigator.cc b/chrome/browser/ui/navigator/browser_navigator.cc
+index d5d5691f0b..5efeccb762 100644
+--- a/chrome/browser/ui/navigator/browser_navigator.cc
++++ b/chrome/browser/ui/navigator/browser_navigator.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+ 
++#include "chrome/browser/meridian/space_profiles.h"
++
+ #include <algorithm>
+ #include <memory>
+ #include <optional>
+@@ -575,13 +577,18 @@ std::unique_ptr<content::WebContents> CreateTargetContents(
+   // subsequent navigation is cross-process (i.e. cross-SiteInstance), then it
+   // will stay in the same BrowsingInstance (creating frame proxies as needed)
+   // preserving the requested opener relationship along the way.
++  // Meridian: a window holds the tabs of every space, each in its space's
++  // profile (a link's in its page's).
++  Profile* profile = meridian::ProfileForNewTab(
++      params.browser, params.source_contents || params.source_site_instance
++                          ? GetSourceProfile(const_cast<NavigateParams*>(&params))
++                          : nullptr);
+   scoped_refptr<content::SiteInstance> initial_site_instance_for_new_contents =
+       params.opener ? params.opener->GetSiteInstance()
+-                    : tab_util::GetSiteInstanceForNewTab(
+-                          params.browser->GetProfile(), url);
++                    : tab_util::GetSiteInstanceForNewTab(profile, url);
+ 
+   WebContents::CreateParams create_params(
+-      params.browser->GetProfile(), initial_site_instance_for_new_contents);
++      profile, initial_site_instance_for_new_contents);
+   create_params.main_frame_name = params.frame_name;
+   if (params.opener) {
+     create_params.opener_id = params.opener->GetGlobalId();
+@@ -939,7 +946,11 @@ base::WeakPtr<content::NavigationHandle> NavigateImpl(
+ 
+   // Navigate() must not return early after this point.
+ 
+-  if (GetSourceProfile(params) != params->browser->GetProfile()) {
++  // Meridian: a page of another space's profile opens its links in that
++  // profile, in this window (CreateTargetContents).
++  if (GetSourceProfile(params) != params->browser->GetProfile() &&
++      meridian::ProfileForNewTab(params->browser, GetSourceProfile(params)) !=
++          GetSourceProfile(params)) {
+     // A tab is being opened from a link from a different profile, we must reset
+     // source information that may cause state to be shared.
+     params->opener = nullptr;
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index 6c7aa4ec53..26d024ceb3 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -371,8 +371,6 @@ void WebUIBrowserWindow::ShowInactive() {
+   widget_->ShowInactive();
+ }
+ 
+-// Meridian: a window of a space in another profile hides behind the shown
+-// one (profile_windows.h).
+ void WebUIBrowserWindow::Hide() {
+   widget_->Hide();
+ }

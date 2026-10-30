@@ -41,7 +41,7 @@ async function evalUi(cdp, expr) {
 
 // `profile`: reuse a profile dir (to test what survives a restart); it's then left for the caller to delete.
 // Browsers still running when this test process ends (a test timed out, --test-force-exit) are
-// killed with it, so a later test's `open -a` never reaches a leftover one.
+// killed with it, so a later test never reaches a leftover one.
 const running = new Set();
 process.on('exit', () => { for (const p of running) { try { p.kill('SIGKILL'); } catch {} } });
 

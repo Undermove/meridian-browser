@@ -104,22 +104,15 @@ test('Arc logins: cookies come over, so sites stay signed in; Deny imports nothi
       assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
       const home = (await b.eval(`${H}.getState().then(({state}) => state)`)).spaces.find((s) => s.name === 'Home');
       await b.eval(`${H}.activateSpace(${JSON.stringify(home.id)})`);
-      let w;
-      for (let i = 0; i < 60 && !w; i++) {
-        for (const o of await b.otherWindows()) {
-          try { if ((await o.eval(`${H}.getState().then(({state}) => state.profileId)`)) === 'Meridian Profile Arc 2') w = o; else o.close(); } catch {}
-        }
-        if (!w) await new Promise((r) => setTimeout(r, 250));
-      }
-      assert.ok(w, 'Home opens in its profile');
-      await w.eval(`app.$.tabstrip.openUrl('http://127.0.0.1:${port}/')`);
+      // In this window, its tabs in Arc's Profile 2's Meridian profile.
+      await b.waitFor(`app.$.tabstrip.state_.profileId === 'Meridian Profile Arc 2'`);
+      await b.eval(`app.$.tabstrip.openUrl('http://127.0.0.1:${port}/')`);
       let titles = [];
       for (let i = 0; i < 50 && !titles.includes('cookie:sid=other'); i++) {
-        titles = await w.eval(`[...${SB}.querySelectorAll('meridian-tab-row')].map((r) => r.tab.title)`);
+        titles = await b.eval(`[...${SB}.querySelectorAll('meridian-tab-row')].map((r) => r.tab.title)`);
         await new Promise((r) => setTimeout(r, 100));
       }
       assert.ok(titles.includes('cookie:sid=other'), JSON.stringify(titles));
-      w.close();
     } finally { await b.close(); }
   } finally { server.close(); fs.rmSync(arcDir, { recursive: true, force: true }); }
 });

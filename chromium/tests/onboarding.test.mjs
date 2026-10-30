@@ -90,22 +90,15 @@ test('with Arc: Bring everything, after saying macOS will ask; File > Import fro
     assert.equal(await b.eval(`!!${OB}.getElementById('fresh')`), false);
     await b.click(`${OB}.getElementById('skip')`);
     await b.waitFor(`!app.$.onboarding.open`);
-    // Home came from Arc's second profile, so it opens in a profile made by the import: no second tour there.
+    // Home came from Arc's second profile: in this window, in a profile made by the import, and
+    // no second tour (nor window) for it.
     const H = `app.$.tabstrip.handler_`;
     const home = (await b.state()).spaces.find((s) => s.name === 'Home');
     await b.eval(`${H}.activateSpace(${JSON.stringify(home.id)})`);
-    let w;
-    for (let i = 0; i < 60 && !w; i++) {
-      for (const o of await b.otherWindows()) {
-        try { if ((await o.eval(`${H}.getState().then(({state}) => state.profileId)`)) === 'Meridian Profile Arc 2') w = o; else o.close(); } catch {}
-      }
-      if (!w) await new Promise((r) => setTimeout(r, 250));
-    }
-    assert.ok(w, 'Home opens in its profile');
-    assert.equal(await w.eval(`${H}.getState().then(({state}) => state.onboarding)`), false);
+    await b.waitFor(`app.$.tabstrip.state_.profileId === 'Meridian Profile Arc 2'`);
     await new Promise((r) => setTimeout(r, 500));
-    assert.equal(await w.eval(`app.$.onboarding.open`), false);
-    w.close();
+    assert.equal(await b.eval(`app.$.onboarding.open`), false);
+    assert.equal((await (await fetch(`${b.base}/json/list`)).json()).filter((t) => t.url.startsWith('chrome://webui-browser')).length, 1);
   } finally { await b.close(); fs.rmSync(arcDir, { recursive: true, force: true }); }
 });
 

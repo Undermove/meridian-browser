@@ -1,6 +1,6 @@
-// Spaces with their own profile: Settings > Profiles makes one, a space's menu picks it, and switching
-// to that space shows that profile's window in place of the current one (cookies kept apart); switching
-// back brings the first window back; closing the visible window closes the hidden one.
+// Spaces with their own profile, Arc's way: Settings > Profiles makes one, a space's menu picks it,
+// and the space's tabs live in its profile (own cookies) in the same window as every other space's.
+// Switching spaces never changes windows; the tabs' profiles survive links, ⇧⌘T and a restart.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -11,217 +11,218 @@ import { launch, SB } from './harness.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ST = 'app.$.settings.shadowRoot';
+const T = 'app.$.tabstrip';
 
-test('Profiles: a space in its own profile has its own cookies, in a window that takes the frame', async () => {
+// A site that shows its cookie and how many times it was loaded: /main and /work set one.
+function cookieSite() {
+  let hits = 0;
   const server = http.createServer((req, res) => {
     const headers = { 'content-type': 'text/html' };
-    if (req.url === '/set') headers['set-cookie'] = 'who=main; Path=/; Max-Age=3600';
+    if (req.url === '/main') headers['set-cookie'] = 'who=main; Path=/; Max-Age=3600';
+    if (req.url === '/work') headers['set-cookie'] = 'who=work; Path=/; Max-Age=3600';
     res.writeHead(200, headers);
-    res.end(`<title>cookie: ${req.headers.cookie || 'none'}</title>`);
+    res.end(`<title>${req.headers.cookie || 'none'} ${req.url} #${++hits}</title>
+      <a id="blank" href="/child" target="_blank">new tab</a> <a id="link" href="/meta">link</a>`);
   });
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  const url = (p) => `http://127.0.0.1:${server.address().port}${p}`;
-  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
-  const b = await launch([url('/set')], { profile });
-  const state = (w = b) => w.eval('app.$.tabstrip.handler_.getState().then(({state}) => state)');
-  const titles = (w = b) => w.eval(`[...${SB}.querySelectorAll('meridian-tab-row')].map((r) => r.tab.title)`);
-  let others = [];
+  return new Promise((r) => server.listen(0, '127.0.0.1', () => r({
+    server, url: (p) => `http://127.0.0.1:${server.address().port}${p}`,
+  })));
+}
+
+const windowCount = async (b) => (await (await fetch(`${b.base}/json/list`)).json())
+    .filter((t) => t.url.startsWith('chrome://webui-browser')).length;
+const titles = (b) => b.eval(`[...${SB}.querySelectorAll('meridian-tab-row')].map((r) => r.tab.title)`);
+// Activates the tab whose title has `part`, reloads it (⌘R) and returns its title once reloaded.
+async function reload(b, part) {
+  await b.click(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title.includes(${JSON.stringify(part)})).shadowRoot.querySelector('.row')`);
+  await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive)?.tab.title.includes(${JSON.stringify(part)})`);
+  await sleep(300);
+  const before = await activeTitle(b);
+  await b.eval(`${T}.handler_.testCommand(33002)`);  // IDC_RELOAD
+  return until(async () => { const t = await activeTitle(b); return t !== before && /#\d+$/.test(t) ? t : null; });
+}
+const activeTitle = (b) => b.eval(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive)?.tab.title`);
+async function until(fn, ms = 10000) {
+  const end = Date.now() + ms;
+  let last;
+  while (Date.now() < end) { if ((last = await fn())) return last; await sleep(150); }
+  return last;
+}
+// Runs `expr` in the page whose address ends with `suffix`, as a click would (a user gesture).
+async function inPage(b, suffix, expr) {
+  const t = (await (await fetch(`${b.base}/json/list`)).json()).find((x) => x.type === 'page' && x.url.endsWith(suffix));
+  assert.ok(t, `a page at ${suffix}`);
+  const ws = new WebSocket(t.webSocketDebuggerUrl);
+  await new Promise((r) => (ws.onopen = r));
+  await new Promise((r) => { ws.onmessage = r; ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: expr, userGesture: true } })); });
+  ws.close();
+}
+
+async function workSpace(b) {
+  const { profileId } = await b.eval(`${T}.handler_.addProfile('Work')`);
+  const { spaceId } = await b.eval(`${T}.handler_.createSpace('Client', '', '', '')`);
+  await b.eval(`${T}.handler_.setSpaceProfile(${JSON.stringify(spaceId)}, ${JSON.stringify(profileId)})`);
+  await b.waitFor(`${T}.state_.spaces.find((s) => s.name === 'Client')?.profileId === ${JSON.stringify(profileId)}`);
+  return { profileId, spaceId };
+}
+
+test('Profiles: a space in its own profile has its own cookies, in the same window', async () => {
+  const { server, url } = await cookieSite();
+  const b = await launch([url('/main')], { args: ['--meridian-test-keys'] });
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-    await b.eval(`app.$.tabstrip.openUrl(${JSON.stringify(url('/show'))})`);
-    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'cookie: who=main')`);
+    const first = await b.eval(`${T}.state_.spaces[0].id`);
 
     // Settings > Profiles > New Profile "Work".
-    await b.eval(`app.$.settings.show(app.$.tabstrip.state_.spaces, 'profiles')`);
+    await b.eval(`app.$.settings.show(${T}.state_.spaces, 'profiles')`);
     await b.waitFor(`!!${ST}.getElementById('newProfile')`);
     await b.click(`${ST}.getElementById('newProfile')`);
     await b.waitFor(`!!${ST}.getElementById('profileName')`);
     await b.eval(`(() => { const i = ${ST}.getElementById('profileName'); i.value = 'Work'; i.dispatchEvent(new Event('input')); return true; })()`);
     await b.click(`${ST}.getElementById('profileSave')`);
     await b.waitFor(`[...${ST}.querySelectorAll('.row.profile .row-label')].map((e) => e.textContent).join() === 'Default,Work'`);
-    const work = (await state()).profiles.find((p) => p.name === 'Work');
+    const work = (await b.eval(`${T}.handler_.getState().then(({state}) => state)`)).profiles.find((p) => p.name === 'Work');
     assert.match(work.id, /^Meridian Profile \d+$/);
     await b.eval('app.$.settings.open = false');
 
-    // A space "Client" picks Work in its menu.
-    const { spaceId } = await b.eval(`app.$.tabstrip.handler_.createSpace('Client', '', '', '')`);
-    await b.waitFor(`app.$.tabstrip.state_.spaces.length === 2`);
-    await b.eval(`app.$.tabstrip.handler_.setSpaceProfile(${JSON.stringify(spaceId)}, ${JSON.stringify(work.id)})`);
-    await b.waitFor(`app.$.tabstrip.state_.spaces.find((s) => s.name === 'Client').profileId === ${JSON.stringify(work.id)}`);
-
-    // Switching to it: Work's window takes the frame; the first one hides.
-    await b.eval(`app.$.tabstrip.handler_.activateSpace(${JSON.stringify(spaceId)})`);
-    let w;
-    for (let i = 0; i < 60 && !w; i++) {
-      for (const o of others) o.close();
-      others = await b.otherWindows();
-      for (const o of others) {
-        try { if ((await state(o)).profileId === work.id) w = o; } catch {}
-      }
-      if (!w) await sleep(250);
-    }
-    assert.ok(w, 'a window of the Work profile');
-    for (let i = 0; i < 40 && (await b.eval('document.visibilityState')) !== 'hidden'; i++) await sleep(100);
-    assert.equal(await b.eval('document.visibilityState'), 'hidden', 'the first window is hidden');
-    assert.equal(await w.eval('document.visibilityState'), 'visible');
-    assert.equal((await state(w)).activeSpaceId, spaceId);
+    // A space "Client" picks Work in its menu; switching to it stays in this window.
+    const { spaceId } = await b.eval(`${T}.handler_.createSpace('Client', '', '', '')`);
+    await b.eval(`${T}.handler_.setSpaceProfile(${JSON.stringify(spaceId)}, ${JSON.stringify(work.id)})`);
+    await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(spaceId)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(spaceId)}`);
+    assert.equal(await b.eval(`${T}.state_.profileId`), work.id, 'the window shows Work');
 
     // Its own cookie jar: the site doesn't know it.
-    await w.eval(`app.$.tabstrip.openUrl(${JSON.stringify(url('/show'))})`);
-    for (let i = 0; i < 50 && !(await titles(w)).includes('cookie: none'); i++) await sleep(100);
-    assert.ok((await titles(w)).includes('cookie: none'), JSON.stringify(await titles(w)));
+    await b.eval(`${T}.openUrl(${JSON.stringify(url('/show'))})`);
+    assert.match(await until(async () => (await titles(b)).find((t) => t.includes('/show #'))), /^none \/show/);
+    assert.ok(!(await titles(b)).some((t) => t.includes('/main')), 'the first space’s tab isn’t listed here');
 
-    // Back to the first space: the first window returns with its tabs.
-    const first = (await state(w)).spaces.find((s) => s.name !== 'Client').id;
-    await w.eval(`app.$.tabstrip.handler_.activateSpace(${JSON.stringify(first)})`);
-    for (let i = 0; i < 40 && (await b.eval('document.visibilityState')) !== 'visible'; i++) await sleep(100);
-    assert.equal(await b.eval('document.visibilityState'), 'visible');
-    assert.ok((await titles()).includes('cookie: who=main'));
-    for (let i = 0; i < 40 && (await w.eval('document.visibilityState')) !== 'hidden'; i++) await sleep(100);
-    assert.equal(await w.eval('document.visibilityState'), 'hidden');
+    // A new-tab link and a ⌘-click from it open in Work too, in this space and window.
+    await inPage(b, '/show', 'document.getElementById("blank").click()');
+    assert.match(await until(async () => (await titles(b)).find((t) => t.includes('/child #'))), /^none \/child/);
+    await inPage(b, '/show', 'document.getElementById("link").dispatchEvent(new MouseEvent("click", { metaKey: true, bubbles: true, cancelable: true }))');
+    assert.match(await until(async () => (await titles(b)).find((t) => t.includes('/meta #'))), /^none \/meta/);
+
+    // Back and forth: the same window, each space with its tabs and cookies.
+    for (let i = 0; i < 3; i++) {
+      await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(first)})`);
+      await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(first)}`);
+      assert.ok((await until(() => titles(b))).some((t) => t.startsWith('none /main')));
+      await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(spaceId)})`);
+      await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(spaceId)}`);
+      assert.ok((await titles(b)).some((t) => t.includes('/show')));
+    }
+    // Reloaded (⌘R) it still has Work's cookies; the main space's tab has the main ones.
+    assert.match(await reload(b, '/show'), /^none \/show/);
+    assert.equal(await windowCount(b), 1, 'one window all along');
 
     // The profile can't go while a space uses it.
-    assert.equal((await b.eval(`app.$.tabstrip.handler_.deleteProfile(${JSON.stringify(work.id)})`)).deleted, false);
-
-    // Closing the visible window closes the hidden one of its frame.
-    for (const o of others) o.close();
-    others = [];
-    await b.eval(`(() => { app.$.tabstrip.tabStripService_.closeNodes(app.$.tabstrip.state_.tabs.map((t) => t.tabId)); return true; })()`);
-    let left = 2;
-    for (let i = 0; i < 50 && left; i++) {
-      left = (await (await fetch(`${b.base}/json/list`)).json()).filter((t) => t.url.startsWith('chrome://webui-browser')).length;
-      if (left) await sleep(200);
-    }
-    assert.equal(left, 0, 'both windows of the frame are gone');
+    assert.equal((await b.eval(`${T}.handler_.deleteProfile(${JSON.stringify(work.id)})`)).deleted, false);
   } finally {
-    for (const o of others) o.close();
+    await b.close();
+    server.close();
+  }
+});
+
+test('Profiles: favorites per profile; after a restart and ⇧⌘T the tabs are back in their profile', async () => {
+  const { server, url } = await cookieSite();
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  let b = await launch([url('/main')], { profile, args: ['--meridian-test-keys'] });
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    const first = await b.eval(`${T}.state_.spaces[0].id`);
+    const { spaceId } = await workSpace(b);
+    await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(spaceId)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(spaceId)}`);
+    await b.eval(`${T}.openUrl(${JSON.stringify(url('/work'))})`);
+    assert.match(await until(async () => (await titles(b)).find((t) => t.includes('/work #'))), /^none \/work/);
+    await b.eval(`${T}.openUrl('data:text/html,<title>Jira</title>')`);
+    await until(async () => (await titles(b)).includes('Jira'));
+
+    // A favorite made in Work's space is Work's only.
+    const jira = await b.eval(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Jira').tab.id`);
+    await b.eval(`${T}.handler_.pinTab(${JSON.stringify(jira)}, {container: 'favorites', parentId: '', index: -1}, 'Jira')`);
+    await b.waitFor(`${T}.state_.favorites.map((f) => f.title).join() === 'Jira'`);
+    await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(first)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(first)} && ${T}.state_.favorites.length === 0`);
+
+    // Quit with Work's space in front, then start again: one window, the tabs in their profiles.
+    await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(spaceId)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(spaceId)}`);
+    await sleep(1500);  // the session is saved
+    await b.quit();
+    b = await launch([], { profile, args: ['--meridian-test-keys'] });
+    await b.waitFor(`${T}.state_?.activeSpaceId === ${JSON.stringify(spaceId)}`, 15000);
+    await sleep(1000);
+    assert.equal(await windowCount(b), 1, 'one window after the restart');
+    const targets = await (await fetch(`${b.base}/json/list`)).json();
+    assert.ok(!targets.some((t) => t.url.startsWith('chrome://profile-picker')), 'no profile picker');
+    assert.equal(await b.eval(`${T}.state_.favorites.map((f) => f.title).join()`), 'Jira');
+    assert.match(await reload(b, '/work'), /^who=work \/work/, 'the restored tab has Work’s cookie');
+
+    // Closed and brought back with ⇧⌘T: still Work's.
+    await b.eval(`${T}.handler_.testCommand(34015)`);  // IDC_CLOSE_TAB
+    await until(async () => !(await titles(b)).some((t) => t.includes('/work')));
+    await b.eval(`${T}.handler_.testCommand(34028)`);  // IDC_RESTORE_TAB
+    assert.ok(await until(async () => (await titles(b)).some((t) => t.includes('/work'))), 'back in its space');
+    assert.match(await reload(b, '/work'), /^who=work \/work/, 'the reopened tab has Work’s cookie');
+
+    // The main profile's space still has its own.
+    await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(first)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(first)}`);
+    assert.match(await reload(b, '/main'), /^who=main \/main/);
+    assert.equal(await windowCount(b), 1);
+  } finally {
     await b.close();
     server.close();
     fs.rmSync(profile, { recursive: true, force: true });
   }
 });
 
-test('Profiles: favorites per profile; after a restart the windows are one frame again, no profile picker', async () => {
-  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
-  let b = await launch(['data:text/html,<title>Main tab</title>'], { profile });
-  const state = (w) => w.eval('app.$.tabstrip.handler_.getState().then(({state}) => state)');
-  const windows = async () => {
-    const list = [b, ...(await b.otherWindows())];
-    const out = [];
-    for (const w of list) {
-      try { out.push({ w, s: await state(w), visible: (await w.eval('document.visibilityState')) === 'visible' }); } catch {}
-    }
-    return out;
-  };
-  let work;
+test('Profiles: a window opened later stays its own (only the old model’s windows are gathered)', async () => {
+  const b = await launch(['data:text/html,<title>A</title>']);
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-    const { profileId } = await b.eval(`app.$.tabstrip.handler_.addProfile('Work')`);
-    work = profileId;
-    const { spaceId } = await b.eval(`app.$.tabstrip.handler_.createSpace('Client', '', '', '')`);
-    await b.eval(`app.$.tabstrip.handler_.setSpaceProfile(${JSON.stringify(spaceId)}, ${JSON.stringify(work)})`);
-    await b.eval(`app.$.tabstrip.handler_.activateSpace(${JSON.stringify(spaceId)})`);
-    let w;
-    for (let i = 0; i < 60 && !w; i++) {
-      w = (await windows()).find((x) => x.s.profileId === work && x.visible)?.w;
-      if (!w) await sleep(250);
-    }
-    assert.ok(w);
-    // A favorite in Work's window is Work's only.
-    await w.eval(`app.$.tabstrip.openUrl('data:text/html,<title>Jira</title>')`);
-    let tab;
-    for (let i = 0; i < 50 && !tab; i++) {
-      tab = (await state(w)).tabs.find((t) => t.spaceId === spaceId && !t.itemId);
-      if (!tab) await sleep(100);
-    }
-    await w.eval(`(() => { const t = app.$.tabstrip.state_.tabs.find((t) => t.spaceId === ${JSON.stringify(spaceId)}); app.$.tabstrip.handler_.pinTab(t.tabId, {container: 'favorites', parentId: '', index: -1}, 'Jira'); return true; })()`);
-    for (let i = 0; i < 50 && !(await state(w)).favorites.length; i++) await sleep(100);
-    assert.deepEqual((await state(w)).favorites.map((f) => f.title), ['Jira']);
-    assert.deepEqual((await state(b)).favorites.map((f) => f.title), []);
-
-    // Quit with Work in front, then start again.
-    await b.quit();
-    b = await launch([], { profile });
-    let all = [];
-    for (let i = 0; i < 60; i++) {
-      all = await windows();
-      if (all.length === 2 && all.filter((x) => x.visible).length === 1) break;
-      await sleep(250);
-    }
-    assert.equal(all.length, 2, 'both profiles’ windows came back');
-    const shown = all.filter((x) => x.visible);
-    assert.equal(shown.length, 1, 'one frame: one visible window');
-    assert.equal(shown[0].s.profileId, work);
-    assert.deepEqual(shown[0].s.favorites.map((f) => f.title), ['Jira']);
-    const targets = await (await fetch(`${b.base}/json/list`)).json();
-    assert.ok(!targets.some((t) => t.url.startsWith('chrome://profile-picker')), 'no profile picker');
-  } finally {
-    await b.close();
-    fs.rmSync(profile, { recursive: true, force: true });
-  }
+    const v = await (await fetch(`${b.base}/json/version`)).json();
+    const ws = new WebSocket(v.webSocketDebuggerUrl);
+    await new Promise((r) => (ws.onopen = r));
+    await new Promise((r) => { ws.onmessage = r; ws.send(JSON.stringify({ id: 1, method: 'Target.createTarget', params: { url: 'data:text/html,<title>B</title>', newWindow: true } })); });
+    ws.close();
+    assert.equal(await until(async () => (await windowCount(b)) === 2 ? 2 : 0), 2, 'a second window');
+    await sleep(2000);
+    assert.equal(await windowCount(b), 2, 'it stays');
+    assert.equal(await b.eval('1 + 1'), 2, 'the first one too');
+  } finally { await b.close(); }
 });
 
-// Switching spaces back and forth across profiles (⌃1-3, the keys people use) swaps the two
-// windows in place: never a third window, and the one in front is the one with the space.
+// Switching spaces back and forth across profiles (⌃1-3, the keys people use) never opens or
+// moves a window: one window, in front, on the Space on screen, showing the space.
 async function switchAcrossProfiles(fullscreen) {
   const b = await launch(['about:blank'], { args: ['--meridian-test-keys'] });
-  const T = 'app.$.tabstrip';
   const CTRL = 1 << 18;
   const KEYS = { 1: [18, '1'], 2: [19, '2'], 3: [20, '3'] };
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-    const { profileId } = await b.eval(`${T}.handler_.addProfile('Work')`);
-    const { spaceId } = await b.eval(`${T}.handler_.createSpace('Client', '', '#e08a8a', '')`);
-    await b.eval(`${T}.handler_.setSpaceProfile(${JSON.stringify(spaceId)}, ${JSON.stringify(profileId)})`);
+    await workSpace(b);
     await b.eval(`${T}.handler_.createSpace('Home', '', '#7cc4a4', '')`);
     await b.waitFor(`${T}.state_.spaces.length === 3`);
     await b.eval(`${T}.handler_.activateSpace(${T}.state_.spaces[0].id)`);
     const first = await b.eval(`${T}.state_.spaces[0].name`);
     if (fullscreen) {
-      // macOS full screen (its own Space), where hiding a window closes the Space.
-      await b.eval(`${T}.handler_.testCommand(34030)`);  // IDC_FULLSCREEN
+      await b.eval(`${T}.handler_.testCommand(34030)`);  // IDC_FULLSCREEN: macOS's own Space
       await sleep(2500);
     }
-
-    // Every window: whether it is shown, on the Space on screen, its place front to back (from the
-    // browser itself: a page's visibility can't tell a window on another Space), and its space.
-    const windows = async () => {
-      const all = [{ eval: (e) => b.eval(e) }, ...(await b.otherWindows())];
-      const out = [];
-      for (const w of all) {
-        try {
-          const st = await w.eval(`${T}.handler_.testWindowState()`);
-          out.push({ w, ...st, space: await w.eval(`${T}.activeSpace()?.name`), profile: await w.eval(`${T}.state_.profileId`) || 'main' });
-        } catch {}
-      }
-      return out;
-    };
-    const frontOf = (ws) => ws.filter((x) => x.visible && x.onActiveSpace && x.order >= 0)
-        .sort((a, c) => a.order - c.order)[0];
-    const press = async (n) => {
-      const front = frontOf(await windows());
-      await front.w.eval(`${T}.handler_.testKeyPress(${KEYS[n][0]}, '${KEYS[n][1]}', ${CTRL})`);
-    };
-    const settle = async (space) => {
-      let ws = [];
-      for (let i = 0; i < 60 && frontOf(ws = await windows())?.space !== space; i++) await sleep(150);
-      await sleep(600);  // anything that would open or move late
-      ws = await windows();
-      const seen = JSON.stringify(ws.map(({ visible, onActiveSpace, order, space: sp, profile }) => ({ profile, visible, onActiveSpace, order, sp })));
-      assert.ok(ws.length <= 2, `at most a window per profile: ${seen}`);
-      // The bug: the other profile's window showing on the Space it was made on (the desktop), not
-      // over the one in front. Every shown window is on the Space on screen.
-      assert.ok(ws.every((x) => !x.visible || x.onActiveSpace), `a window on another Space: ${seen}`);
-      assert.equal(frontOf(ws)?.space, space, seen);
-    };
-
     for (const [key, space] of [[2, 'Client'], [3, 'Home'], [2, 'Client'], [1, first], [2, 'Client'], [1, first]]) {
-      await press(key);
-      await settle(space);
+      await b.eval(`${T}.handler_.testKeyPress(${KEYS[key][0]}, '${KEYS[key][1]}', ${CTRL})`);
+      await b.waitFor(`${T}.activeSpace()?.name === ${JSON.stringify(space)}`);
+      await sleep(400);  // anything that would open or move late
+      const st = await b.eval(`${T}.handler_.testWindowState()`);
+      assert.equal(await windowCount(b), 1, `one window (${space})`);
+      assert.ok(st.visible && st.onActiveSpace, `the window is on screen (${space}): ${JSON.stringify(st)}`);
     }
   } finally { await b.close(); }
 }
 
-test('Profiles: ⌃1–3 across profiles swap the two windows in place, never opening another', () => switchAcrossProfiles(false));
+test('Profiles: ⌃1–3 across profiles stay in the one window', () => switchAcrossProfiles(false));
 
 test('Profiles: the same in macOS full screen', () => switchAcrossProfiles(true));

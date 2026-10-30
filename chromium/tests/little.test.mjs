@@ -7,11 +7,22 @@ import { promisify } from 'node:util';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { launch, APP, SB } from './harness.mjs';
+import { launch, SB } from './harness.mjs';
 import { startServer } from './server.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const openFromOtherApp = (url) => promisify(execFile)('open', ['-g', '-a', path.resolve(APP, '../../..'), url]);
+// What macOS does when a link is clicked in another app: a GetURL Apple event, sent to this test's
+// browser by pid (`open -a` picks by bundle id: with the installed Meridian running, it went there).
+let opener;
+async function openFromOtherApp(b, url) {
+  if (!opener) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-open-'));
+    process.on('exit', () => fs.rmSync(dir, { recursive: true, force: true }));
+    opener = path.join(dir, 'open_url');
+    await promisify(execFile)('swiftc', ['-O', path.join(path.dirname(new URL(import.meta.url).pathname), 'tools', 'open_url.swift'), '-o', opener]);
+  }
+  await promisify(execFile)(opener, [String(b.proc.pid), url]);
+}
 const todayTitles = `[...${SB}.querySelectorAll('meridian-tab-row')].map((r) => r.tab.title)`;
 
 test('a link from another app opens in a Little window; Open in Meridian moves it to the main window', async () => {
@@ -19,8 +30,7 @@ test('a link from another app opens in a Little window; Open in Meridian moves i
   const b = await launch([site.url('/p/Main')]);
   try {
     await b.waitFor(`${todayTitles}.includes('Main')`);
-    // What macOS does when a link is clicked in another app (this exact app bundle).
-    await openFromOtherApp(site.url('/p/Little'));
+    await openFromOtherApp(b, site.url('/p/Little'));
     let little, seen = 'no other window';
     for (let i = 0; i < 100 && !little; i++) {
       await sleep(200);
@@ -60,13 +70,13 @@ test('Air Traffic Control: a matching rule sends the link to the main window ins
   const b = await launch([site.url('/p/Main')], { profile });
   try {
     await b.waitFor(`${todayTitles}.includes('Main')`);
-    await openFromOtherApp(site.url('/p/Work'));
+    await openFromOtherApp(b, site.url('/p/Work'));
     await b.waitFor(`${todayTitles}.includes('Work')`);
     await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Work')?.tab.isActive`);
     const count = async () => { const ws = await b.otherWindows(); ws.forEach((w) => w.close()); return ws.length; };
     assert.equal(await count(), 0, 'no Little window for a matching link');
     // Anything else still goes to the Little window.
-    await openFromOtherApp(site.url('/p/Elsewhere'));
+    await openFromOtherApp(b, site.url('/p/Elsewhere'));
     for (let i = 0; i < 50 && !(await count()); i++) await sleep(200);
     assert.equal(await count(), 1);
     assert.ok(!(await b.eval(todayTitles)).includes('Elsewhere'));
