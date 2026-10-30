@@ -1,0 +1,401 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Sat, 31 Oct 2026 00:09:36 +0400
+Subject: [PATCH 76/77] =?UTF-8?q?Meridian:=20=E2=8C=98T=20with=20the=20key?=
+ =?UTF-8?q?board=20only,=20like=20Arc?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The field gets the keys from a focused page (an embedded tab loses the
+page focus when its element blurs, crbug.com/508638062), and the page
+gets them back on close; Esc reaches the bar while a tab loads. The arrows
+go through one list, the suggestions and then the matching tabs (just the
+tabs with nothing typed, no zero-suggest taking the selection), and stop
+autocomplete so the rows hold still.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../resources/webui_browser/app.html.ts       |  3 +-
+ chrome/browser/resources/webui_browser/app.ts |  6 ++
+ .../meridian/command_bar.html.ts              |  5 +-
+ .../webui_browser/meridian/command_bar.ts     | 72 +++++++++++++------
+ .../webui_browser_searchbox.html.ts           |  4 +-
+ .../webui_browser/webui_browser_searchbox.ts  | 29 ++++++++
+ .../resources/webui_browser/webview.ts        | 12 ++--
+ .../webui_browser_web_contents_delegate.cc    | 14 ++++
+ .../browser/surface_embed_host.cc             |  9 ++-
+ .../surface_embed_connector_impl.cc           |  4 ++
+ .../surface_embed_connector_impl.h            |  1 +
+ .../public/browser/surface_embed_connector.h  |  6 ++
+ 12 files changed, 132 insertions(+), 33 deletions(-)
+
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 043ab29bea..58de5880e3 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -115,7 +115,8 @@ export function getHtml(this: WebuiBrowserAppElement) {
+     </webui-browser-bookmark-bar>
+   </div>
+   <meridian-command-bar id="commandBar" .tabs="${this.commandBarTabs_}"
+-      @command-bar-switch-tab="${this.onCommandBarSwitchTab_}">
++      @command-bar-switch-tab="${this.onCommandBarSwitchTab_}"
++      @command-bar-closed="${this.onCommandBarClosed_}">
+   </meridian-command-bar>
+   <meridian-archive id="archive"></meridian-archive>
+   <meridian-onboarding id="onboarding"></meridian-onboarding>
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index e624872a83..0f47c3e522 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -954,6 +954,12 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.$.commandBar.show(newTab, text);
+   }
+ 
++  // The keys back to the page, through its element here, so this page and
++  // the browser agree on who has the focus (the next ⌘T's field takes it).
++  protected onCommandBarClosed_() {
++    this.$.contentRegion.activeWebview?.focusContent();
++  }
++
+   protected onCommandBarSwitchTab_(e: CustomEvent<string>) {
+     this.$.tabstrip.activateTab(e.detail);
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+index 8efddd025e..940b0bdf32 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+@@ -9,8 +9,7 @@ import {icon} from './icons.js';
+ 
+ export function getHtml(this: MeridianCommandBarElement) {
+   return html`<!--_html_template_start_-->
+-<div id="overlay" @mousedown="${this.onOverlayMousedown_}"
+-    @keydown="${this.onOverlayKeydown_}">
++<div id="overlay" @mousedown="${this.onOverlayMousedown_}">
+   <div id="bar">
+     <webui-browser-searchbox id="address" ?new-tab="${this.newTab}"
+         .newTab="${this.newTab}" .inlineDropdown="${true}"
+@@ -28,7 +27,7 @@ export function getHtml(this: MeridianCommandBarElement) {
+           <span class="go">⇥</span>
+         </button>` : ''}
+       ${this.tabRows_.length ? html`
+-        <div id="tabs" class="tabs" slot="before-matches">
++        <div id="tabs" class="tabs" slot="after-matches">
+           ${this.tabRows_.map((t, i) => html`
+             <button class="tab-row ${i === this.tabSel_ ? 'sel' : ''}"
+                 data-id="${t.id}" @mousedown="${this.onTabRowMousedown_}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index c2ce4e6ecf..262d3a69e4 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -82,8 +82,13 @@ export class MeridianCommandBarElement extends CrLitElement {
+     }
+   }
+ 
+-  // What is typed (the field's own input events stay inside it).
+-  protected onAddressKeyup_() {
++  // What is typed (the field's own input events stay inside it); not what a
++  // picked suggestion fills in.
++  protected onAddressKeyup_(e: KeyboardEvent) {
++    if (['ArrowDown', 'ArrowUp', 'Enter', 'Escape', 'Tab', 'Shift', 'Meta',
++         'Control', 'Alt'].includes(e.key)) {
++      return;
++    }
+     const input = this.$.address.shadowRoot.querySelector('cr-searchbox-input')
+                       ?.shadowRoot?.querySelector<HTMLInputElement>('input');
+     const query = input?.value || '';
+@@ -142,6 +147,7 @@ export class MeridianCommandBarElement extends CrLitElement {
+ 
+   override connectedCallback() {
+     super.connectedCallback();
++    this.addEventListener('keydown', this.onKeydownCapture_, true);
+     this.aiListener_ =
+         browserProxyFactory.getInstance().callbackRouter.onAiEvent.addListener(
+             (session: string, type: string, text: string) => {
+@@ -162,6 +168,7 @@ export class MeridianCommandBarElement extends CrLitElement {
+ 
+   override disconnectedCallback() {
+     super.disconnectedCallback();
++    this.removeEventListener('keydown', this.onKeydownCapture_, true);
+     if (this.aiListener_ !== null) {
+       browserProxyFactory.getInstance().callbackRouter.removeListener(
+           this.aiListener_);
+@@ -248,41 +255,64 @@ export class MeridianCommandBarElement extends CrLitElement {
+     this.ask_();
+   }
+ 
+-  protected onOverlayKeydown_(e: KeyboardEvent) {
+-    if (e.key === 'Enter' && e.metaKey) {
++  // Before the field sees the key (capture): the arrows go through one list,
++  // the suggestions and then the open tabs, like Arc's; with nothing typed,
++  // just the tabs (the field would fetch suggestions nobody asked for).
++  private onKeydownCapture_ = (e: KeyboardEvent) => {
++    if (!this.open) {
++      return;
++    }
++    const own = () => {
+       e.preventDefault();
+       e.stopPropagation();
++    };
++    if (e.key === 'Enter' && e.metaKey) {
++      own();
+       this.ask_();
+       return;
+     }
+     if (e.key === 'Escape') {
+-      e.preventDefault();
+-      e.stopPropagation();
++      own();
+       this.hide();
+       return;
+     }
+     // ⇥ takes the other layout's reading.
+     if (e.key === 'Tab' && !e.shiftKey && this.layoutFix_) {
+-      e.preventDefault();
+-      e.stopPropagation();
++      own();
+       this.applyLayoutFix_();
+       return;
+     }
+-    // With nothing typed, the arrows go through the open tabs.
+-    if (!this.query_.trim() && this.tabRows_.length &&
+-        (e.key === 'ArrowDown' || e.key === 'ArrowUp' ||
+-         (e.key === 'Enter' && this.tabSel_ >= 0))) {
+-      e.preventDefault();
+-      e.stopPropagation();
+-      if (e.key === 'Enter') {
+-        this.switchTo_(this.tabRows_[this.tabSel_]!.id);
+-        return;
++    if (e.key === 'Enter' && this.tabSel_ >= 0 &&
++        this.tabSel_ < this.tabRows_.length) {
++      own();
++      this.switchTo_(this.tabRows_[this.tabSel_]!.id);
++      return;
++    }
++    if ((e.key !== 'ArrowDown' && e.key !== 'ArrowUp') || e.altKey ||
++        e.ctrlKey || e.metaKey || e.shiftKey) {
++      return;
++    }
++    own();
++    const box = this.$.address;
++    const matches = this.query_.trim() ? box.matchCount() : 0;
++    const total = matches + this.tabRows_.length;
++    if (!total) {
++      return;
++    }
++    const at = this.tabSel_ >= 0 ? matches + this.tabSel_ : box.selectedLine();
++    const next = e.key === 'ArrowDown' ? (at + 1) % total :
++                                         (at < 0 ? total - 1 :
++                                                   (at - 1 + total) % total);
++    if (next < matches) {
++      this.tabSel_ = -1;
++      box.selectLine(next);
++    } else {
++      this.tabSel_ = next - matches;
++      if (matches) {
++        box.selectLine(-1);
+       }
+-      const n = this.tabRows_.length;
+-      this.tabSel_ = e.key === 'ArrowDown' ? (this.tabSel_ + 1) % n :
+-                                             (this.tabSel_ - 1 + n) % n;
+     }
+-  }
++  };
+ 
+   protected onAddressSearchboxNavigated_() {
+     this.hide();
+diff --git a/chrome/browser/resources/webui_browser/webui_browser_searchbox.html.ts b/chrome/browser/resources/webui_browser/webui_browser_searchbox.html.ts
+index 0e3da210cc..e70c394423 100644
+--- a/chrome/browser/resources/webui_browser/webui_browser_searchbox.html.ts
++++ b/chrome/browser/resources/webui_browser/webui_browser_searchbox.html.ts
+@@ -43,7 +43,8 @@ export function getHtml(this: WebuiBrowserSearchboxElement) {
+     ` : ''}
+   </cr-searchbox-input>
+   <div class="dropdownContainer">
+-    <!-- Meridian: the command bar's open tabs, above the suggestions. -->
++    <!-- Meridian: the command bar's rows above and below the suggestions
++         (the other-layout reading; the open tabs). -->
+     <slot name="before-matches"></slot>
+     <cr-searchbox-dropdown id="matches" part="searchbox-dropdown"
+         exportparts="dropdown-content" role="listbox" .result="${this.result}"
+@@ -55,6 +56,7 @@ export function getHtml(this: WebuiBrowserSearchboxElement) {
+         @match-click="${this.onMatchClick}"
+         ?hidden="${!this.dropdownIsVisible}">
+     </cr-searchbox-dropdown>
++    <slot name="after-matches"></slot>
+   </div>
+ </div>`;
+ }
+diff --git a/chrome/browser/resources/webui_browser/webui_browser_searchbox.ts b/chrome/browser/resources/webui_browser/webui_browser_searchbox.ts
+index 79ffc6c614..f3f36a30df 100644
+--- a/chrome/browser/resources/webui_browser/webui_browser_searchbox.ts
++++ b/chrome/browser/resources/webui_browser/webui_browser_searchbox.ts
+@@ -16,6 +16,7 @@ import {loadTimeData} from '//resources/js/load_time_data.js';
+ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {AutocompleteResult, PageCallbackRouter, PageHandlerInterface} from '//resources/mojo/components/omnibox/browser/searchbox.mojom-webui.js';
++import {SelectionLineState} from '//resources/mojo/components/omnibox/browser/searchbox.mojom-webui.js';
+ 
+ import {getCss} from './webui_browser_searchbox.css.js';
+ import {getHtml} from './webui_browser_searchbox.html.js';
+@@ -170,6 +171,34 @@ export class WebuiBrowserSearchboxElement extends
+     this.fire('searchbox-navigated');
+   }
+ 
++  // Meridian: the command bar's own rows share the arrows with the
++  // suggestions, so it moves the selection itself.
++  matchCount(): number {
++    return this.dropdownIsVisible ?
++        this.getDropdownElement().selectableMatchElements.length :
++        0;
++  }
++
++  selectedLine(): number {
++    return this.dropdownIsVisible ? this.selectedMatchIndex : -1;
++  }
++
++  // -1: none (the field shows what was typed). Like an arrow in the
++  // omnibox, it stops the suggestions coming, so they stay where they are.
++  async selectLine(line: number) {
++    this.pageHandler().stopAutocomplete(/*clearResult=*/ false);
++    const dropdown = this.getDropdownElement();
++    if (line < 0) {
++      dropdown.unselect();
++    } else {
++      dropdown.selectIndex(line);
++    }
++    await dropdown.updateComplete;
++    await this.updateComplete;
++    this.fillInputForSelection({line, state: SelectionLineState.kNormal,
++                                actionIndex: 0});
++  }
++
+   // Meridian: the command bar draws the suggestions inside its own card
+   // instead of in a separate OS window.
+   set inlineDropdown(value: boolean) {
+diff --git a/chrome/browser/resources/webui_browser/webview.ts b/chrome/browser/resources/webui_browser/webview.ts
+index 7ca12aacd8..33ff8a30e2 100644
+--- a/chrome/browser/resources/webui_browser/webview.ts
++++ b/chrome/browser/resources/webui_browser/webview.ts
+@@ -114,16 +114,18 @@ export class TabWebviewElement extends WebviewElement {
+   setActive(active: boolean) {
+     if (active) {
+       this.classList.add('active');
+-      const content = this.shadowRoot.querySelector<HTMLElement>('.content');
+-      // The .content element might not be available during browser startup.
+-      if (content) {
+-        content.focus();
+-      }
++      this.focusContent();
+     } else {
+       this.classList.remove('active');
+     }
+   }
+ 
++  // The keys to the page.
++  focusContent() {
++    // The .content element might not be available during browser startup.
++    this.shadowRoot.querySelector<HTMLElement>('.content')?.focus();
++  }
++
+   override updated(changedProperties: PropertyValues<this>) {
+     super.updated(changedProperties);
+     // Focus the content element when guestId is set and the tab is active.
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_web_contents_delegate.cc b/chrome/browser/ui/webui_browser/webui_browser_web_contents_delegate.cc
+index 4840e84f61..78d865584c 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_web_contents_delegate.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_web_contents_delegate.cc
+@@ -8,7 +8,11 @@
+ #include "chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser_window.h"
+ #include "chrome/common/chrome_render_frame.mojom.h"
++#include "components/input/native_web_keyboard_event.h"
++#include "content/public/browser/keyboard_event_processing_result.h"
++#include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/web_contents.h"
++#include "ui/events/keycodes/keyboard_codes.h"
+ #include "content/public/browser/web_contents_observer.h"
+ #include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"
+ #include "third_party/blink/public/mojom/page/draggable_region.mojom.h"
+@@ -64,6 +68,16 @@ content::KeyboardEventProcessingResult
+ WebUIBrowserWebContentsDelegate::PreHandleKeyboardEvent(
+     content::WebContents* source,
+     const input::NativeWebKeyboardEvent& event) {
++  // Meridian: Escape typed in this page itself (not in a tab it shows, nor a
++  // full-screen tab's Escape passed up) is this page's: it closes the command
++  // bar and the other overlays. Before, a tab still loading took it
++  // (IDC_CLOSE_FIND_OR_STOP).
++  content::RenderFrameHost* focused = source->GetFocusedFrame();
++  if (event.windows_key_code == ui::VKEY_ESCAPE &&
++      !(event.GetModifiers() & blink::WebInputEvent::kKeyModifiers) &&
++      focused && content::WebContents::FromRenderFrameHost(focused) == source) {
++    return content::KeyboardEventProcessingResult::NOT_HANDLED;
++  }
+   return window_->PreHandleKeyboardEvent(event);
+ }
+ 
+diff --git a/components/surface_embed/browser/surface_embed_host.cc b/components/surface_embed/browser/surface_embed_host.cc
+index 036eaf20f4..3d27fffcd4 100644
+--- a/components/surface_embed/browser/surface_embed_host.cc
++++ b/components/surface_embed/browser/surface_embed_host.cc
+@@ -221,8 +221,13 @@ void SurfaceEmbedHost::OnEmbedElementFocused(
+   }
+ 
+   if (!focused) {
+-    // TODO(crbug.com/508638062): the <embed> element in the parent frame lost
+-    // focus. Should we remove the page focus from the embedded page?
++    // Meridian: the <embed> element in the parent frame lost focus to another
++    // element there, so the embedded page loses the page focus: keys go to
++    // the parent (crbug.com/508638062).
++    if (content::SurfaceEmbedConnector* connector = GetConnector();
++        connector && focus_type != blink::mojom::FocusType::kPage) {
++      connector->OnEmbedElementBlurred();
++    }
+     return;
+   }
+ 
+diff --git a/content/browser/surface_embed/surface_embed_connector_impl.cc b/content/browser/surface_embed/surface_embed_connector_impl.cc
+index 25b4666327..b4243ba5d5 100644
+--- a/content/browser/surface_embed/surface_embed_connector_impl.cc
++++ b/content/browser/surface_embed/surface_embed_connector_impl.cc
+@@ -348,6 +348,10 @@ void SurfaceEmbedConnectorImpl::SetFocusedFrameTree(
+       ->SetPageFocus(true);
+ }
+ 
++void SurfaceEmbedConnectorImpl::OnEmbedElementBlurred() {
++  ClearFocusOnInnerWebContents();
++}
++
+ void SurfaceEmbedConnectorImpl::ClearFocusOnInnerWebContents() {
+   if (!parent_web_contents_) {
+     // Don't expect parent to be destroyed before child outside of tests.
+diff --git a/content/browser/surface_embed/surface_embed_connector_impl.h b/content/browser/surface_embed/surface_embed_connector_impl.h
+index d91a8f6369..747e8171af 100644
+--- a/content/browser/surface_embed/surface_embed_connector_impl.h
++++ b/content/browser/surface_embed/surface_embed_connector_impl.h
+@@ -82,6 +82,7 @@ class CONTENT_EXPORT SurfaceEmbedConnectorImpl
+                                     bool display_locked) override;
+   const viz::FrameSinkId& GetFrameSinkId() const override;
+   double GetCssZoomFactorForTesting() override;
++  void OnEmbedElementBlurred() override;
+   const gfx::Size& GetLocalFrameSizeInPixelsForTesting() override;
+   bool IsThrottledForTesting() override;
+   bool IsSubtreeThrottledForTesting() override;
+diff --git a/content/public/browser/surface_embed_connector.h b/content/public/browser/surface_embed_connector.h
+index 95b2b18de7..01ca5d9600 100644
+--- a/content/public/browser/surface_embed_connector.h
++++ b/content/public/browser/surface_embed_connector.h
+@@ -111,6 +111,12 @@ class CONTENT_EXPORT SurfaceEmbedConnector {
+                                             bool subtree_throttled,
+                                             bool display_locked) = 0;
+ 
++  // Called by the SurfaceEmbedHost when the embedding element in the parent
++  // lost focus to another element there: the child no longer has the page's
++  // focus, so key events go to the parent (Meridian: the command bar's field
++  // over a focused tab).
++  virtual void OnEmbedElementBlurred() = 0;
++
+   // Gets the FrameSinkId of the child's view.
+   virtual const viz::FrameSinkId& GetFrameSinkId() const = 0;
+ 
