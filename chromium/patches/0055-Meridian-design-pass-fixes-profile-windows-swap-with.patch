@@ -1,0 +1,366 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 30 Oct 2026 15:38:15 +0400
+Subject: [PATCH 56/56] Meridian: design pass fixes; profile windows swap
+ without a blank frame
+
+- Command bar: readable suggestions in the dark theme (Meridian's colours);
+  pressing a Switch to Tab row keeps the field focused, so the rows don't
+  jump and the click lands.
+- Site Control Center closes when the sidebar hides or the peek ends.
+- URL pill names browser pages (Workbench, Settings) and local files.
+- About shows Meridian's version and the Chromium it is built on; the ad
+  blocking hint points at the sliders in the address bar.
+- Home: the developer card's button fits on one line.
+- Theme editor: the focus ring uses the space colour.
+- A space in another profile: its window shows behind the current one with
+  no macOS animation and comes forward once painted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/profile_windows.cc    | 60 ++++++++++++++++---
+ chrome/browser/meridian/profile_windows_mac.h |  3 +
+ .../browser/meridian/profile_windows_mac.mm   | 13 ++++
+ chrome/browser/meridian/sidebar.mojom         |  2 +
+ chrome/browser/meridian/sidebar_handler.cc    |  4 +-
+ chrome/browser/resources/webui_browser/app.ts | 11 ++++
+ .../webui_browser/meridian/command_bar.css    | 15 +++++
+ .../meridian/command_bar.html.ts              |  3 +-
+ .../webui_browser/meridian/command_bar.ts     |  6 ++
+ .../resources/webui_browser/meridian/home.ts  |  2 +-
+ .../webui_browser/meridian/settings.html.ts   |  6 +-
+ .../webui_browser/meridian/theme_editor.css   |  7 +++
+ 12 files changed, 118 insertions(+), 14 deletions(-)
+
+diff --git a/chrome/browser/meridian/profile_windows.cc b/chrome/browser/meridian/profile_windows.cc
+index 82fd55d065..f6454fe1eb 100644
+--- a/chrome/browser/meridian/profile_windows.cc
++++ b/chrome/browser/meridian/profile_windows.cc
+@@ -8,9 +8,12 @@
+ #include <set>
+ 
+ #include "base/files/file_util.h"
++#include "base/functional/bind.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/no_destructor.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/meridian/little_window.h"
+@@ -144,6 +147,35 @@ bool IsMainWindow(BrowserWindowInterface* b) {
+          !IsLittleWindow(b) && !b->GetProfile()->IsOffTheRecord();
+ }
+ 
++// Brings `target` (already showing behind `current`) to the front and hides
++// `current` once it has had time to paint: a new window needs its first
++// frame, a hidden one a fresh one. Either may have closed meanwhile.
++void SwapSoon(int frame,
++              BrowserWindowInterface* target,
++              BrowserWindowInterface* current,
++              bool fresh) {
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(
++          [](int frame, BrowserWindowInterface* target,
++             BrowserWindowInterface* current) {
++            Frames& f = F();
++            auto in_frame = [&](BrowserWindowInterface* b) {
++              auto it = f.frame_of.find(b);
++              return it != f.frame_of.end() && it->second == frame;
++            };
++            if (!in_frame(target) || f.visible_of[frame] != target) {
++              return;
++            }
++            target->GetWindow()->Activate();
++            if (current && in_frame(current)) {
++              current->GetWindow()->Hide();
++            }
++          },
++          frame, target, current),
++      fresh ? base::Milliseconds(350) : base::Milliseconds(120));
++}
++
+ void Open(BrowserWindowInterface* target,
+           const std::string& space_id,
+           const std::vector<GURL>& urls) {
+@@ -237,6 +269,7 @@ void ShowSpaceInProfile(
+             }
+             BrowserWindowInterface* current = visible->second;
+             BrowserWindowInterface* target = nullptr;
++            bool fresh = false;
+             for (auto& [b, id] : f.frame_of) {
+               if (id == frame && b->GetProfile() == profile) {
+                 target = b;
+@@ -257,6 +290,7 @@ void ShowSpaceInProfile(
+                 return;
+               }
+               Track(target, frame);
++              fresh = true;
+             }
+             SidebarService* service =
+                 SidebarServiceFactory::GetForProfile(profile);
+@@ -274,24 +308,32 @@ void ShowSpaceInProfile(
+                 if (target != base) {
+                   SetOverFullscreen(target, true);
+                   target->GetWindow()->SetBounds(base->GetWindow()->GetBounds());
+-                  target->GetWindow()->Show();
++                  // Behind the window showing over the full-screen one; over
++                  // the full-screen one itself, which never hides.
++                  if (current != base) {
++                    ShowBehind(target, current);
++                  } else {
++                    target->GetWindow()->Show();
++                  }
+                   WatchFullscreenExit(frame, base);
+                 }
+-                target->GetWindow()->Activate();
+-                if (current != base) {
+-                  current->GetWindow()->Hide();
+-                }
++                SidebarHandler::ActivateSpaceInWindow(target, space_id);
++                SwapSoon(frame, target, current != base ? current : nullptr,
++                         fresh);
+               } else
+ #endif
+               {
+                 target->GetWindow()->SetBounds(
+                     current->GetWindow()->GetBounds());
++#if BUILDFLAG(IS_MAC)
++                ShowBehind(target, current);
++#else
+                 target->GetWindow()->Show();
+-                target->GetWindow()->Activate();
+-                current->GetWindow()->Hide();
++#endif
++                SidebarHandler::ActivateSpaceInWindow(target, space_id);
++                SwapSoon(frame, target, current, fresh);
+               }
+-            }
+-            if (show) {
++            } else if (show) {
+               SidebarHandler::ActivateSpaceInWindow(target, space_id);
+             }
+             if (done) {
+diff --git a/chrome/browser/meridian/profile_windows_mac.h b/chrome/browser/meridian/profile_windows_mac.h
+index ff834d08d3..645119add1 100644
+--- a/chrome/browser/meridian/profile_windows_mac.h
++++ b/chrome/browser/meridian/profile_windows_mac.h
+@@ -18,6 +18,9 @@ void SetOverFullscreen(BrowserWindowInterface* browser, bool over);
+ // Runs `exited` once, when `browser` has left full screen.
+ void OnFullscreenExit(BrowserWindowInterface* browser,
+                       base::OnceClosure exited);
++// Shows `target` right behind `front`, without macOS's window animation, so
++// it can paint before `front` goes away (a swap with no blank frame).
++void ShowBehind(BrowserWindowInterface* target, BrowserWindowInterface* front);
+ 
+ }  // namespace meridian
+ 
+diff --git a/chrome/browser/meridian/profile_windows_mac.mm b/chrome/browser/meridian/profile_windows_mac.mm
+index cc1ce477f4..6f4a5472a9 100644
+--- a/chrome/browser/meridian/profile_windows_mac.mm
++++ b/chrome/browser/meridian/profile_windows_mac.mm
+@@ -58,4 +58,17 @@ void OnFullscreenExit(BrowserWindowInterface* browser,
+               }];
+ }
+ 
++void ShowBehind(BrowserWindowInterface* target, BrowserWindowInterface* front) {
++  NSWindow* window = WindowOf(target);
++  NSWindow* over = WindowOf(front);
++  if (!window || !over) {
++    target->GetWindow()->Show();
++    return;
++  }
++  window.animationBehavior = NSWindowAnimationBehaviorNone;
++  over.animationBehavior = NSWindowAnimationBehaviorNone;
++  target->GetWindow()->ShowInactive();
++  [window orderWindow:NSWindowBelow relativeTo:over.windowNumber];
++}
++
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 7172bf1a48..8f12df734b 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -252,7 +252,9 @@ struct Settings {
+   bool agent_allow_js;
+   Atc atc;
+   bool is_default_browser;
++  // Meridian's version and the Chromium it is built on.
+   string version;
++  string chromium_version;
+   // Who answers Ask and ⌘J: "" (automatic), "api" (Claude) or a provider id.
+   string ai_provider;
+   // "Other agents" (Codex, Cursor…) are offered.
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index e9177a7f2d..cff190c1ae 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -29,6 +29,7 @@
+ #include "chrome/browser/meridian/ai/providers.h"
+ #include "chrome/browser/meridian/ai/tidy.h"
+ #include "chrome/browser/meridian/mission/mission_control_factory.h"
++#include "chrome/browser/meridian/update_check.h"
+ #include "chrome/browser/meridian/workbench/workbench_handler.h"
+ #include "chrome/browser/meridian/ai/ai_service.h"
+ #include "chrome/browser/meridian/ai/ai_service_factory.h"
+@@ -1436,7 +1437,8 @@ void SidebarHandler::GetSettings(GetSettingsCallback callback) {
+       HostContentSettingsMapFactory::GetForProfile(browser_->GetProfile())
+           ->GetDefaultContentSetting(ContentSettingsType::ADS) ==
+       CONTENT_SETTING_BLOCK;
+-  settings->version = std::string(version_info::GetVersionNumber());
++  settings->version = update::kVersion;
++  settings->chromium_version = std::string(version_info::GetVersionNumber());
+   IsDefaultBrowser(base::BindOnce(
+       [](GetSettingsCallback callback, mojom::SettingsPtr settings,
+          bool is_default) {
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 15347c0767..778a7b8878 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -76,6 +76,14 @@ function hostForPill(url: string): string {
+     if (u.protocol === 'http:' || u.protocol === 'https:') {
+       return u.hostname.replace(/^www\./, '');
+     }
++    // Browser pages by name, like Arc: "Workbench", "Settings".
++    if (u.protocol === 'chrome:' && u.hostname) {
++      return u.hostname.charAt(0).toUpperCase() +
++          u.hostname.slice(1).replace(/-/g, ' ');
++    }
++    if (u.protocol === 'file:') {
++      return decodeURIComponent(u.pathname.split('/').pop() || u.pathname);
++    }
+   } catch {
+     // Not a URL; show it as is.
+   }
+@@ -495,6 +503,8 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   }
+ 
+   protected onMeridianToggleSidebar_() {
++    // It is anchored to the URL pill, which moves or hides with the sidebar.
++    this.closeSiteControl_();
+     this.sidebarHidden_ = !this.sidebarHidden_;
+     this.sidebarPeek_ = false;
+     try {
+@@ -537,6 +547,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+         this.closePeekSoon_();
+         return;
+       }
++      this.closeSiteControl_();
+       this.sidebarPeek_ = false;
+     }, 450);
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.css b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+index f3b5f4851a..3d68278357 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.css
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+@@ -67,6 +67,21 @@ webui-browser-searchbox {
+   --cr-searchbox-match-padding: 6px 0;
+   --color-searchbox-background: var(--meridian-surface);
+   --color-searchbox-results-background: var(--meridian-surface);
++  /* Meridian's own light/dark theme, not the system one the stock colours
++   * follow (dark text on a dark card otherwise). */
++  --color-searchbox-foreground: var(--meridian-text);
++  --color-searchbox-placeholder: var(--meridian-text-muted);
++  --color-searchbox-results-foreground: var(--meridian-text);
++  --color-searchbox-results-foreground-selected: var(--meridian-text);
++  --color-searchbox-results-foreground-dimmed: var(--meridian-text-muted);
++  --color-searchbox-results-dim-selected: var(--meridian-text-muted);
++  --color-searchbox-results-typed-prefix: var(--meridian-text-muted);
++  --color-searchbox-results-url: var(--meridian-text-muted);
++  --color-searchbox-results-url-selected: var(--meridian-text-muted);
++  --color-searchbox-results-icon: var(--meridian-text-muted);
++  --color-searchbox-results-icon-selected: var(--meridian-text);
++  --color-searchbox-results-background-hovered: var(--meridian-surface-2);
++  --color-searchbox-results-background-selected: var(--meridian-surface-2);
+   display: block;
+   /* The card grows with the suggestions (the stock box has a fixed height
+    * and lets them overflow). */
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+index 3b0ebd5c87..53521287bc 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+@@ -22,7 +22,8 @@ export function getHtml(this: MeridianCommandBarElement) {
+         <div class="tabs-head">Switch to Tab</div>
+         ${this.tabRows_.map((t, i) => html`
+           <button class="tab-row ${i === this.tabSel_ ? 'sel' : ''}"
+-              data-id="${t.id}" @click="${this.onTabRowClick_}">
++              data-id="${t.id}" @mousedown="${this.onTabRowMousedown_}"
++              @click="${this.onTabRowClick_}">
+             <img src="${t.favicon}" width="16" height="16" alt="">
+             <span class="tab-title">${t.title || t.url}</span>
+             <span class="tab-host">${this.tabHost_(t.url)}</span>
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index 7998c3da42..c01002ad9f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -89,6 +89,12 @@ export class MeridianCommandBarElement extends CrLitElement {
+     }
+   }
+ 
++  // The field keeps the focus: losing it hides the suggestions, the rows
++  // move up and the press and the release land on different rows.
++  protected onTabRowMousedown_(e: Event) {
++    e.preventDefault();
++  }
++
+   protected onTabRowClick_(e: Event) {
+     this.switchTo_((e.currentTarget as HTMLElement).dataset['id']!);
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/home.ts b/chrome/browser/resources/webui_browser/meridian/home.ts
+index b00d2a4c51..53d7654cad 100644
+--- a/chrome/browser/resources/webui_browser/meridian/home.ts
++++ b/chrome/browser/resources/webui_browser/meridian/home.ts
+@@ -91,7 +91,7 @@ const CARDS: HomeCard[] = [
+       {keys: [], label: 'MCP', text: 'Coding agents can read and drive the browser'},
+       {keys: keys('⇧ ⌘ M'), label: '', text: 'Mission Control shows every running agent'},
+     ],
+-    tryLabel: 'Open Workbench',
++    tryLabel: 'Try ⇧⌘E',
+     tryAction: 'workbench',
+   },
+ ];
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index a12d6747dd..2a31b7e3ea 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -612,7 +612,8 @@ export function getHtml(this: MeridianSettingsElement) {
+                 <div class="row-text">
+                   <div class="row-label">Block ads and trackers</div>
+                   <div class="row-desc">EasyList and EasyPrivacy, on every
+-                    site. Allow a site in Site settings > Intrusive ads.</div>
++                    site. To allow a site, open its controls with the sliders in
++                    the address bar.</div>
+                 </div>
+                 <label class="switch"><input type="checkbox" id="adblock"
+                     .checked="${this.settings_.adblock}"
+@@ -640,7 +641,8 @@ export function getHtml(this: MeridianSettingsElement) {
+               <div class="row">
+                 <div class="row-text">
+                   <div class="row-label">Meridian ${this.settings_.version}</div>
+-                  <div class="row-desc">Built on Chromium. MIT licensed, not
++                  <div class="row-desc">Built on Chromium
++                    ${this.settings_.chromiumVersion}. MIT licensed, not
+                     affiliated with The Browser Company.</div>
+                 </div>
+                 <button class="btn" data-page="help"
+diff --git a/chrome/browser/resources/webui_browser/meridian/theme_editor.css b/chrome/browser/resources/webui_browser/meridian/theme_editor.css
+index a9943fc7b3..ea24a8c571 100644
+--- a/chrome/browser/resources/webui_browser/meridian/theme_editor.css
++++ b/chrome/browser/resources/webui_browser/meridian/theme_editor.css
+@@ -246,6 +246,13 @@ button:disabled {
+   color: #fff;
+ }
+ 
++/* Done has the focus when the editor opens (Enter applies); a ring in the
++ * space's colour, not the system's. */
++.btn:focus-visible {
++  outline: 2px solid color-mix(in srgb, var(--meridian-space) 55%, transparent);
++  outline-offset: 2px;
++}
++
+ @media (prefers-color-scheme: dark) {
+   .tp-page {
+     background: rgba(30, 30, 34, 0.92);
