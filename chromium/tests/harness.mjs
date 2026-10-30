@@ -57,6 +57,7 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
   const started = Date.now();
   const proc = spawn(APP, [
     `--user-data-dir=${profile}`, `--remote-debugging-port=${port}`, '--use-mock-keychain',
+    '--meridian-keep-keyboard-layout',
     ...(firstRun ? [] : ['--no-first-run']), '--no-default-browser-check', '--window-size=1280,860',
     // Keep drawing when the window is covered or the display sleeps (input waits for frames).
     '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',

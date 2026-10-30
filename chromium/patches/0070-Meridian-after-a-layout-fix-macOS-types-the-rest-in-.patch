@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 30 Oct 2026 19:21:47 +0400
+Subject: [PATCH 71/71] Meridian: after a layout fix, macOS types the rest in
+ that layout
+
+The command bar asks SwitchKeyboardLayout for an enabled input source of
+the meant language (TISSelectInputSource). Test browsers
+(--meridian-keep-keyboard-layout) leave the keyboard alone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |  1 +
+ chrome/browser/meridian/sidebar.mojom         |  5 +++
+ chrome/browser/meridian/sidebar_handler.cc    |  2 ++
+ chrome/browser/meridian/sidebar_handler.h     |  1 +
+ .../browser/meridian/sidebar_handler_mac.mm   | 32 +++++++++++++++++++
+ .../webui_browser/meridian/command_bar.ts     |  3 ++
+ 6 files changed, 44 insertions(+)
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 11a23265bd..c4dac7ed5f 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -241,6 +241,7 @@ source_set("meridian") {
+     ]
+     frameworks = [
+       "AppKit.framework",
++      "Carbon.framework",
+       "Security.framework",
+     ]
+   }
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index ba603b70bb..9780d84e95 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -634,4 +634,9 @@ interface SidebarHandler {
+   // and its buttons: "play", "pause", "next", "previous" or "pip".
+   GetNowPlaying() => (NowPlaying? now);
+   ControlMedia(tabs_api.mojom.NodeId tab_id, string action);
++
++  // The command bar took text as meant in the other keyboard layout: macOS
++  // switches to an enabled layout for `language` ("ru", "en") so the rest is
++  // typed right.
++  SwitchKeyboardLayout(string language);
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 42c891d677..3d79735691 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -2394,6 +2394,8 @@ void SidebarHandler::ResetItemToHome(const std::string& item_id) {
+ #if !BUILDFLAG(IS_MAC)
+ void SidebarHandler::SetWindowControlsVisible(bool visible) {}
+ 
++void SidebarHandler::SwitchKeyboardLayout(const std::string& language) {}
++
+ std::string SystemUserFullName() {
+   return std::string();
+ }
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 950e316e14..ae42c546ae 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -151,6 +151,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void ClearSiteData(ClearSiteDataCallback callback) override;
+   void SetWindowControlsVisible(bool visible) override;
+   void TestCommand(int32_t command_id) override;
++  void SwitchKeyboardLayout(const std::string& language) override;
+   void TestKeyPress(uint16_t key_code,
+                     const std::string& characters,
+                     uint32_t modifiers) override;
+diff --git a/chrome/browser/meridian/sidebar_handler_mac.mm b/chrome/browser/meridian/sidebar_handler_mac.mm
+index 816d94c3f9..512a63ae58 100644
+--- a/chrome/browser/meridian/sidebar_handler_mac.mm
++++ b/chrome/browser/meridian/sidebar_handler_mac.mm
+@@ -3,9 +3,11 @@
+ // found in the LICENSE file.
+ 
+ #include <AppKit/AppKit.h>
++#include <Carbon/Carbon.h>
+ 
+ #include "chrome/browser/meridian/sidebar_handler.h"
+ 
++#include "base/command_line.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "chrome/browser/meridian/test_switches.h"
+ 
+@@ -28,6 +30,36 @@ void SidebarHandler::SetWindowControlsVisible(bool visible) {
+   }
+ }
+ 
++void SidebarHandler::SwitchKeyboardLayout(const std::string& language) {
++  // Test browsers leave the person's keyboard alone.
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "meridian-keep-keyboard-layout")) {
++    return;
++  }
++  NSDictionary* filter = @{
++    (__bridge NSString*)kTISPropertyInputSourceCategory :
++        (__bridge NSString*)kTISCategoryKeyboardInputSource,
++    (__bridge NSString*)kTISPropertyInputSourceIsSelectCapable : @YES,
++  };
++  CFArrayRef sources =
++      TISCreateInputSourceList((__bridge CFDictionaryRef)filter, false);
++  if (!sources) {
++    return;
++  }
++  NSString* wanted = base::SysUTF8ToNSString(language);
++  for (CFIndex i = 0; i < CFArrayGetCount(sources); ++i) {
++    TISInputSourceRef source =
++        (TISInputSourceRef)CFArrayGetValueAtIndex(sources, i);
++    NSArray* languages = (__bridge NSArray*)TISGetInputSourceProperty(
++        source, kTISPropertyInputSourceLanguages);
++    if ([languages.firstObject hasPrefix:wanted]) {
++      TISSelectInputSource(source);
++      break;
++    }
++  }
++  CFRelease(sources);
++}
++
+ void SidebarHandler::TestKeyPress(uint16_t key_code,
+                                   const std::string& characters,
+                                   uint32_t modifiers) {
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index 0f2d761e02..c2ce4e6ecf 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -106,6 +106,9 @@ export class MeridianCommandBarElement extends CrLitElement {
+     }
+     input.value = this.layoutFix_;
+     input.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
++    // And macOS types the rest in that layout.
++    browserProxyFactory.getInstance().handler.switchKeyboardLayout(
++        /[а-яё]/i.test(this.layoutFix_) ? 'ru' : 'en');
+     this.query_ = this.layoutFix_;
+     this.tabSel_ = -1;
+   }
