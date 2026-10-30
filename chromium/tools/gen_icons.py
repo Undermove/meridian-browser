@@ -23,8 +23,14 @@ import type {TemplateResult} from '//resources/lit/v3_0/lit.rollup.js';
 '''
 
 
-# Icons the Electron build defines elsewhere (Mission Control's own).
+# Icons the Electron build defines elsewhere (Mission Control's own) or doesn't
+# have (the sidebar's mini player).
 EXTRA = {
+    'pause': '<rect x="7" y="5.5" width="3.2" height="13" rx="1" fill="currentColor" stroke="none"/><rect x="13.8" y="5.5" width="3.2" height="13" rx="1" fill="currentColor" stroke="none"/>',
+    'playFilled': '<path d="M8 5.5l10.5 6.5L8 18.5z" fill="currentColor" stroke-linejoin="round"/>',
+    'next': '<path d="M5.5 6l8 6-8 6z" fill="currentColor" stroke-linejoin="round"/><path d="M18 6v12"/>',
+    'previous': '<path d="M18.5 6l-8 6 8 6z" fill="currentColor" stroke-linejoin="round"/><path d="M6 6v12"/>',
+    'pip': '<rect x="3.5" y="5" width="17" height="14" rx="2"/><rect x="11.5" y="11.5" width="6.5" height="5" rx="1" fill="currentColor" stroke="none"/>',
     'agents': '<circle cx="12" cy="12" r="2.2"/><path d="M12 4.5a7.5 7.5 0 0 1 7.5 7.5"/><path d="M4.5 12A7.5 7.5 0 0 1 12 4.5" opacity=".55"/><path d="M19.5 12A7.5 7.5 0 0 1 12 19.5"/><path d="M12 19.5A7.5 7.5 0 0 1 4.5 12" opacity=".55"/><circle cx="19.5" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="4.5" cy="12" r="1.3" fill="currentColor" stroke="none"/>',
 }
 

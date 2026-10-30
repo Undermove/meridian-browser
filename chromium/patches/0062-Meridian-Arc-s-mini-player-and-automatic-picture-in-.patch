@@ -1,0 +1,600 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 30 Oct 2026 17:30:57 +0400
+Subject: [PATCH 63/63] Meridian: Arc's mini player and automatic
+ picture-in-picture
+
+- Media playing or paused in a tab other than the active one shows above
+  the sidebar's bottom bar: track and artist (or the site), previous,
+  play/pause, next and picture-in-picture when the page offers them; a
+  click goes to the tab (meridian::FindNowPlaying, ControlMedia).
+- Browser-initiated automatic picture-in-picture is on, and allowed by
+  default: a video playing with sound floats when its tab is left. A site
+  can be blocked in the Site Control Center.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |  4 +
+ chrome/browser/meridian/now_playing.cc        | 96 +++++++++++++++++++
+ chrome/browser/meridian/now_playing.h         | 29 ++++++
+ chrome/browser/meridian/sidebar.mojom         | 18 ++++
+ chrome/browser/meridian/sidebar_handler.cc    | 12 +++
+ chrome/browser/meridian/sidebar_handler.h     |  3 +
+ .../metrics/chrome_feature_list_creator.cc    | 15 ++-
+ .../resources/webui_browser/meridian/icons.ts | 17 +++-
+ .../webui_browser/meridian/sidebar.css        | 72 ++++++++++++++
+ .../webui_browser/meridian/sidebar.html.ts    | 31 ++++++
+ .../webui_browser/meridian/sidebar.ts         | 61 +++++++++++-
+ .../core/browser/content_settings_registry.cc |  4 +-
+ 12 files changed, 355 insertions(+), 7 deletions(-)
+ create mode 100644 chrome/browser/meridian/now_playing.cc
+ create mode 100644 chrome/browser/meridian/now_playing.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index ff36a7f2c3..ca2699dfcb 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -221,6 +221,8 @@ source_set("meridian") {
+     "sidebar_handler.h",
+     "sidebar_service_factory.cc",
+     "sidebar_service_factory.h",
++    "now_playing.cc",
++    "now_playing.h",
+     "site_control.cc",
+     "site_control.h",
+     "status_bubble.cc",
+@@ -257,6 +259,8 @@ source_set("meridian") {
+     ":agent_embed",
+     ":ai_providers",
+     ":workbench_core",
++    "//services/media_session/public/cpp",
++    "//services/media_session/public/mojom",
+     "//third_party/re2",
+     "//chrome/browser/content_settings",
+     "//chrome/browser/history",
+diff --git a/chrome/browser/meridian/now_playing.cc b/chrome/browser/meridian/now_playing.cc
+new file mode 100644
+index 0000000000..395a4690ae
+--- /dev/null
++++ b/chrome/browser/meridian/now_playing.cc
+@@ -0,0 +1,96 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/now_playing.h"
++
++#include <algorithm>
++
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/browser_apis/tab_strip/types/node_id.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/media_session.h"
++#include "content/public/browser/web_contents.h"
++#include "services/media_session/public/cpp/media_metadata.h"
++#include "services/media_session/public/mojom/media_session.mojom.h"
++
++namespace meridian {
++
++namespace {
++
++using media_session::mojom::MediaPlaybackState;
++using media_session::mojom::MediaSessionAction;
++using media_session::mojom::MediaSessionInfo;
++
++bool Can(const std::vector<MediaSessionAction>& actions,
++         MediaSessionAction action) {
++  return std::ranges::find(actions, action) != actions.end();
++}
++
++}  // namespace
++
++mojom::NowPlayingPtr FindNowPlaying(TabStripModel* model) {
++  tabs::TabInterface* active = model->GetActiveTab();
++  mojom::NowPlayingPtr best;
++  for (int i = 0; i < model->count(); ++i) {
++    tabs::TabInterface* tab = model->GetTabAtIndex(i);
++    if (tab == active) {
++      continue;
++    }
++    content::WebContents* contents = tab->GetContents();
++    content::MediaSession* session = content::MediaSession::GetIfExists(contents);
++    if (!session) {
++      continue;
++    }
++    media_session::mojom::MediaSessionInfoPtr info =
++        session->GetMediaSessionInfoSync();
++    if (!info || !info->is_controllable ||
++        info->state == MediaSessionInfo::SessionState::kInactive) {
++      continue;
++    }
++    bool playing = info->playback_state == MediaPlaybackState::kPlaying;
++    if (best && (best->playing || !playing)) {
++      continue;
++    }
++    const media_session::MediaMetadata& metadata =
++        session->GetMediaSessionMetadata();
++    std::vector<MediaSessionAction> actions =
++        session->GetMediaSessionActionsSync();
++    auto now = mojom::NowPlaying::New();
++    now->tab_id = tabs_api::NodeId::FromTabHandle(tab->GetHandle());
++    now->title = base::UTF16ToUTF8(metadata.title);
++    if (now->title.empty()) {
++      now->title = base::UTF16ToUTF8(contents->GetTitle());
++    }
++    now->artist = base::UTF16ToUTF8(metadata.artist);
++    now->source = contents->GetLastCommittedURL().host();
++    now->playing = playing;
++    now->can_previous = Can(actions, MediaSessionAction::kPreviousTrack);
++    now->can_next = Can(actions, MediaSessionAction::kNextTrack);
++    now->can_pip = Can(actions, MediaSessionAction::kEnterPictureInPicture);
++    best = std::move(now);
++  }
++  return best;
++}
++
++void ControlMedia(content::WebContents* contents, const std::string& action) {
++  content::MediaSession* session = content::MediaSession::GetIfExists(contents);
++  if (!session) {
++    return;
++  }
++  using SuspendType = media_session::mojom::MediaSession::SuspendType;
++  if (action == "play") {
++    session->Resume(SuspendType::kUI);
++  } else if (action == "pause") {
++    session->Suspend(SuspendType::kUI);
++  } else if (action == "next") {
++    session->NextTrack();
++  } else if (action == "previous") {
++    session->PreviousTrack();
++  } else if (action == "pip") {
++    session->EnterPictureInPicture();
++  }
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/now_playing.h b/chrome/browser/meridian/now_playing.h
+new file mode 100644
+index 0000000000..e3dc29afe4
+--- /dev/null
++++ b/chrome/browser/meridian/now_playing.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_NOW_PLAYING_H_
++#define CHROME_BROWSER_MERIDIAN_NOW_PLAYING_H_
++
++#include <string>
++
++#include "chrome/browser/meridian/sidebar.mojom.h"
++
++class TabStripModel;
++
++namespace content {
++class WebContents;
++}
++
++namespace meridian {
++
++// The sidebar's mini player (Arc's): media playing, or paused, in a tab of
++// `model` other than the active one; playing beats paused. Null if none.
++mojom::NowPlayingPtr FindNowPlaying(TabStripModel* model);
++
++// "play", "pause", "next", "previous" or "pip" for the media in `contents`.
++void ControlMedia(content::WebContents* contents, const std::string& action);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_NOW_PLAYING_H_
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 126500e874..c811b82c59 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -196,6 +196,19 @@ enum Command {
+   kDownloads,
+ };
+ 
++// The sidebar's mini player: media in a tab other than the active one.
++struct NowPlaying {
++  tabs_api.mojom.NodeId tab_id;
++  string title;
++  string artist;
++  // The site, e.g. "www.youtube.com".
++  string source;
++  bool playing;
++  bool can_previous;
++  bool can_next;
++  bool can_pip;
++};
++
+ // The Site Control Center (the sliders in the URL pill).
+ struct SitePermission {
+   // "camera", "microphone", "location", "notifications", "popups",
+@@ -608,4 +621,9 @@ interface SidebarHandler {
+ 
+   // Mutes or unmutes a tab (the speaker in its row, Mute Tab in its menu).
+   SetTabMuted(tabs_api.mojom.NodeId tab_id, bool muted);
++
++  // The mini player: what plays (or was paused) in another tab, if anything,
++  // and its buttons: "play", "pause", "next", "previous" or "pip".
++  GetNowPlaying() => (NowPlaying? now);
++  ControlMedia(tabs_api.mojom.NodeId tab_id, string action);
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 9726379490..c421157668 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -45,6 +45,7 @@
+ #include "chrome/browser/themes/theme_service_factory.h"
+ #include "components/version_info/version_info.h"
+ #include "chrome/browser/meridian/little_window.h"
++#include "chrome/browser/meridian/now_playing.h"
+ #include "chrome/browser/meridian/prefs.h"
+ #include "chrome/browser/meridian/setup_profile.h"
+ #include "chrome/browser/meridian/profile_windows.h"
+@@ -311,6 +312,17 @@ void SidebarHandler::SetTabMuted(const tabs_api::NodeId& tab_id, bool muted) {
+   }
+ }
+ 
++void SidebarHandler::GetNowPlaying(GetNowPlayingCallback callback) {
++  std::move(callback).Run(FindNowPlaying(model()));
++}
++
++void SidebarHandler::ControlMedia(const tabs_api::NodeId& tab_id,
++                                  const std::string& action) {
++  if (tabs::TabInterface* tab = TabFor(tab_id)) {
++    meridian::ControlMedia(tab->GetContents(), action);
++  }
++}
++
+ void SidebarHandler::Adopt(tabs::TabInterface* tab) {
+   content::WebContents* contents = tab->GetContents();
+   const TabData* data = TabData::Get(contents);
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 488cefe924..5af3d0fde1 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -216,6 +216,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+                   RunAiSetupCallback callback) override;
+   void ExpandPeek(const tabs_api::NodeId& tab_id) override;
+   void SetTabMuted(const tabs_api::NodeId& tab_id, bool muted) override;
++  void GetNowPlaying(GetNowPlayingCallback callback) override;
++  void ControlMedia(const tabs_api::NodeId& tab_id,
++                    const std::string& action) override;
+ 
+   // ArchiveService::Observer:
+   void OnArchiveChanged() override;
+diff --git a/chrome/browser/metrics/chrome_feature_list_creator.cc b/chrome/browser/metrics/chrome_feature_list_creator.cc
+index dbf10a26ea..d92f135bc1 100644
+--- a/chrome/browser/metrics/chrome_feature_list_creator.cc
++++ b/chrome/browser/metrics/chrome_feature_list_creator.cc
+@@ -38,6 +38,7 @@
+ #include "components/variations/variations_switches.h"
+ #include "components/webui/flags/pref_service_flags_storage.h"
+ #include "content/public/common/content_switch_dependent_feature_overrides.h"
++#include "third_party/blink/public/common/features_generated.h"
+ #include "content/public/common/content_switches.h"
+ #include "services/network/public/cpp/network_switches.h"
+ #include "services/network/public/cpp/shared_url_loader_factory.h"
+@@ -256,11 +257,17 @@ void ChromeFeatureListCreator::SetUpFieldTrials() {
+ 
+   variations::VariationsService* variations_service =
+       metrics_services_manager_->GetVariationsService();
+-  variations_service->SetUpFieldTrials(
+-      variation_ids,
++  std::vector<base::FeatureList::FeatureOverrideInfo> overrides =
+       content::GetSwitchDependentFeatureOverrides(
+-          *base::CommandLine::ForCurrentProcess()),
+-      std::move(feature_list), browser_field_trials_.get());
++          *base::CommandLine::ForCurrentProcess());
++  // Meridian: Arc's automatic picture-in-picture, a playing video floats when
++  // its tab is left (--disable-features still turns it off).
++  overrides.emplace_back(
++      std::cref(blink::features::kBrowserInitiatedAutomaticPictureInPicture),
++      base::FeatureList::OVERRIDE_ENABLE_FEATURE);
++  variations_service->SetUpFieldTrials(
++      variation_ids, overrides, std::move(feature_list),
++      browser_field_trials_.get());
+   metrics_services_manager_client_->OnFieldTrialsInitialized();
+ 
+   initial_seed_.reset();
+diff --git a/chrome/browser/resources/webui_browser/meridian/icons.ts b/chrome/browser/resources/webui_browser/meridian/icons.ts
+index 3a124ee6fd..d296f2ff9e 100644
+--- a/chrome/browser/resources/webui_browser/meridian/icons.ts
++++ b/chrome/browser/resources/webui_browser/meridian/icons.ts
+@@ -85,7 +85,12 @@ export type IconName =
+     'arrowUp'|
+     'stop'|
+     'wand'|
+-    'agents';
++    'agents'|
++    'pause'|
++    'playFilled'|
++    'next'|
++    'previous'|
++    'pip';
+ 
+ export function icon(name: IconName, size = 16): TemplateResult {
+   switch (name) {
+@@ -239,5 +244,15 @@ export function icon(name: IconName, size = 16): TemplateResult {
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 19l10-10M13 7l2-2 2 2-2 2"/><path d="M18.5 3.5v2M17.5 4.5h2M19.5 10.5v2M18.5 11.5h2M9.5 3.5v2M8.5 4.5h2"/></svg>`;
+     case 'agents':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="2.2"/><path d="M12 4.5a7.5 7.5 0 0 1 7.5 7.5"/><path d="M4.5 12A7.5 7.5 0 0 1 12 4.5" opacity=".55"/><path d="M19.5 12A7.5 7.5 0 0 1 12 19.5"/><path d="M12 19.5A7.5 7.5 0 0 1 4.5 12" opacity=".55"/><circle cx="19.5" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="4.5" cy="12" r="1.3" fill="currentColor" stroke="none"/></svg>`;
++    case 'pause':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="7" y="5.5" width="3.2" height="13" rx="1" fill="currentColor" stroke="none"/><rect x="13.8" y="5.5" width="3.2" height="13" rx="1" fill="currentColor" stroke="none"/></svg>`;
++    case 'playFilled':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 5.5l10.5 6.5L8 18.5z" fill="currentColor" stroke-linejoin="round"/></svg>`;
++    case 'next':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5.5 6l8 6-8 6z" fill="currentColor" stroke-linejoin="round"/><path d="M18 6v12"/></svg>`;
++    case 'previous':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18.5 6l-8 6 8 6z" fill="currentColor" stroke-linejoin="round"/><path d="M6 6v12"/></svg>`;
++    case 'pip':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2"/><rect x="11.5" y="11.5" width="6.5" height="5" rx="1" fill="currentColor" stroke="none"/></svg>`;
+   }
+ }
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.css b/chrome/browser/resources/webui_browser/meridian/sidebar.css
+index 0bef1bf699..55239ac174 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.css
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.css
+@@ -152,6 +152,78 @@ button {
+   justify-content: center;
+ }
+ 
++/* ------------------------------------------------------------ player */
++/* Arc's mini player: what plays in another tab, above the bottom bar. */
++
++.player {
++  display: flex;
++  align-items: center;
++  gap: 4px;
++  margin: 6px 0 2px;
++  padding: 6px 6px 6px 8px;
++  border-radius: 12px;
++  background: color-mix(in srgb, var(--meridian-row-active) 70%, transparent);
++  box-shadow: var(--meridian-row-shadow);
++  animation: player-in 0.18s ease;
++}
++
++@keyframes player-in {
++  from {
++    opacity: 0;
++    transform: translateY(6px);
++  }
++}
++
++.player-main {
++  flex: 1;
++  min-width: 0;
++  display: flex;
++  align-items: center;
++  gap: 9px;
++  text-align: left;
++  cursor: pointer;
++}
++
++.player-icon {
++  flex: none;
++  border-radius: 4px;
++}
++
++.player-text {
++  min-width: 0;
++  display: flex;
++  flex-direction: column;
++}
++
++.player-title,
++.player-sub {
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++}
++
++.player-title {
++  font-size: 12.5px;
++  font-weight: 600;
++}
++
++.player-sub {
++  font-size: 11px;
++  color: var(--meridian-text-muted);
++}
++
++.player-controls {
++  flex: none;
++  display: flex;
++  align-items: center;
++}
++
++.player-controls .icon-btn {
++  width: 26px;
++  height: 26px;
++  color: var(--meridian-text);
++}
++
+ /* ------------------------------------------------------------ bottom */
+ 
+ #bottom {
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+index eb2a4e0387..4722cde3f0 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+@@ -83,6 +83,37 @@ ${this.updateReady_() ? html`
+     <span class="ic">${icon('reload', 14)}</span>
+     <span>Restart to update to ${this.update_!.version}</span>
+   </button>` : ''}
++${this.nowPlaying_ ? html`
++  <div id="player" class="player">
++    <button class="player-main" title="Go to the tab"
++        @click="${this.onPlayerClick_}">
++      <img class="player-icon" src="${this.playerFavicon_}" width="16"
++          height="16" alt="">
++      <span class="player-text">
++        <span class="player-title">${this.nowPlaying_.title}</span>
++        <span class="player-sub">${this.playerSub_}</span>
++      </span>
++    </button>
++    <div class="player-controls">
++      ${this.nowPlaying_.canPrevious ? html`
++        <button class="icon-btn" data-action="previous" title="Previous"
++            @click="${this.onPlayerActionClick_}">${icon('previous', 14)}</button>
++      ` : ''}
++      <button id="playerToggle" class="icon-btn play"
++          data-action="${this.playerToggle_}" title="Play or Pause"
++          @click="${this.onPlayerActionClick_}">
++        ${icon(this.playerToggleIcon_, 16)}
++      </button>
++      ${this.nowPlaying_.canNext ? html`
++        <button class="icon-btn" data-action="next" title="Next"
++            @click="${this.onPlayerActionClick_}">${icon('next', 14)}</button>
++      ` : ''}
++      ${this.nowPlaying_.canPip ? html`
++        <button class="icon-btn" data-action="pip" title="Picture in Picture"
++            @click="${this.onPlayerActionClick_}">${icon('pip', 15)}</button>
++      ` : ''}
++    </div>
++  </div>` : ''}
+ <div id="bottom">
+   <!-- Arc's corner: the latest downloads. -->
+   <button id="downloadsButton"
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index b56f373dab..07928149e9 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -24,7 +24,7 @@ import type {TabStripObserver} from '/tab_strip_api/tab_strip_observer.js';
+ 
+ import {browserProxyFactory as sidebarProxyFactory, Command, UpdateStatus} from '../sidebar.mojom-webui.js';
+ import {TabAlertState} from '../tabs.mojom-webui.js';
+-import type {Download, Item, SidebarHandlerInterface, UpdateState, SidebarState, Space, TidyFolder, TidyRename} from '../sidebar.mojom-webui.js';
++import type {Download, Item, NowPlaying, SidebarHandlerInterface, UpdateState, SidebarState, Space, TidyFolder, TidyRename} from '../sidebar.mojom-webui.js';
+ import type {TabAdded, TabClosed, TabUpdated} from '../tab_strip/events.js';
+ 
+ import './fav.js';
+@@ -161,6 +161,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+       ghostToday_: {state: true, type: Array},
+       plusOpen_: {state: true, type: Boolean},
+       plusIcon_: {state: true, type: String},
++      nowPlaying_: {state: true, type: Object},
++      playerFavicon_: {state: true, type: String},
++      playerSub_: {state: true, type: String},
++      playerToggle_: {state: true, type: String},
++      playerToggleIcon_: {state: true, type: String},
+     };
+   }
+ 
+@@ -195,6 +200,14 @@ export class MeridianSidebarElement extends CrLitElement implements
+   // The + menu is open: the + shows as ×.
+   protected accessor plusOpen_: boolean = false;
+   protected accessor plusIcon_: IconName = 'plus';
++  // The mini player (Arc's): media playing or paused in another tab.
++  protected accessor nowPlaying_: NowPlaying|null = null;
++  protected accessor playerFavicon_: string = '';
++  protected accessor playerSub_: string = '';
++  protected accessor playerToggle_: string = 'pause';
++  protected accessor playerToggleIcon_: IconName = 'pause';
++  private nowPlayingTimer_ = 0;
++  private nowPlayingPoll_ = 0;
+   // Which side it comes from: 1 the right (the next space), -1 the left.
+   private ghostDir_ = 1;
+   // How far the page has moved (px; negative is to the left).
+@@ -275,6 +288,12 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.handler_.getUpdateState().then(({state}) => this.update_ ??= state);
+     document.addEventListener('mousedown', this.onDocumentMouseDown_, true);
+     this.addEventListener('wheel', this.onSwipeWheel_, {passive: false});
++    // A new track doesn't change the tabs: while something plays, look again.
++    this.nowPlayingPoll_ = setInterval(() => {
++      if (this.nowPlaying_) {
++        this.refreshNowPlaying_();
++      }
++    }, 2500);
+     window.addEventListener('blur', this.closeMenu_);
+     document.addEventListener('keydown', this.onMenuKeydown_, true);
+     this.shadowRoot.addEventListener('dragstart', this.onDragStart_ as EventListener);
+@@ -286,6 +305,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+   override disconnectedCallback() {
+     super.disconnectedCallback();
+     this.removeEventListener('wheel', this.onSwipeWheel_);
++    clearInterval(this.nowPlayingPoll_);
++    clearTimeout(this.nowPlayingTimer_);
+     this.observation_ = undefined;
+     for (const id of [this.listenerId_, this.commandBarListenerId_,
+                       this.commandListenerId_, this.statusListenerId_,
+@@ -1085,6 +1106,32 @@ export class MeridianSidebarElement extends CrLitElement implements
+     }
+   }
+ 
++  // ------------------------------------------------------------ mini player
++
++  private async refreshNowPlaying_() {
++    const {now} = await this.handler_.getNowPlaying();
++    this.nowPlaying_ = now ?? null;
++  }
++
++  protected onPlayerClick_() {
++    if (this.nowPlaying_) {
++      this.tabStripService_.activateTab(this.nowPlaying_.tabId);
++    }
++  }
++
++  protected onPlayerActionClick_(e: Event) {
++    const action = (e.currentTarget as HTMLElement).dataset['action']!;
++    if (!this.nowPlaying_) {
++      return;
++    }
++    this.handler_.controlMedia(this.nowPlaying_.tabId, action);
++    if (action === 'play' || action === 'pause') {
++      // Right away; the page confirms in a moment.
++      this.nowPlaying_ = {...this.nowPlaying_, playing: action === 'play'};
++    }
++    setTimeout(() => this.refreshNowPlaying_(), 400);
++  }
++
+   // ------------------------------------------------- switching spaces (Arc)
+   // The page slides out and the next space slides in, coloured on the way.
+   // A two-finger swipe on the sidebar drags it; let go past a third of the
+@@ -1424,6 +1471,12 @@ export class MeridianSidebarElement extends CrLitElement implements
+       this.lastActive_.set(active.id, performance.now());
+     }
+     this.plusOpen_ = !!this.menu_?.plus;
++    const now = this.nowPlaying_;
++    const nowTab = now ? this.tabs_.get(now.tabId) : undefined;
++    this.playerFavicon_ = nowTab ? this.faviconFor(null, nowTab) : '';
++    this.playerSub_ = now ? (now.artist || now.source.replace(/^www\./, '')) : '';
++    this.playerToggle_ = now?.playing ? 'pause' : 'play';
++    this.playerToggleIcon_ = now?.playing ? 'pause' : 'playFilled';
+     this.plusIcon_ = this.plusOpen_ ? 'x' : 'plus';
+   }
+ 
+@@ -1432,6 +1485,12 @@ export class MeridianSidebarElement extends CrLitElement implements
+     if (changed.has('ghost_' as keyof MeridianSidebarElement)) {
+       this.paintSlide_();
+     }
++    // Play, pause and switching tabs change the tabs: ask again (soon, once).
++    if (changed.has('tabs_' as keyof MeridianSidebarElement) ||
++        changed.has('rev_' as keyof MeridianSidebarElement)) {
++      clearTimeout(this.nowPlayingTimer_);
++      this.nowPlayingTimer_ = setTimeout(() => this.refreshNowPlaying_(), 200);
++    }
+     // The switch a slide finished is showing: the page takes over from the
+     // neighbour, before this frame paints.
+     if (this.slidTo_ && this.space_?.id === this.slidTo_) {
+diff --git a/components/content_settings/core/browser/content_settings_registry.cc b/components/content_settings/core/browser/content_settings_registry.cc
+index fe3eded783..91f6544c08 100644
+--- a/components/content_settings/core/browser/content_settings_registry.cc
++++ b/components/content_settings/core/browser/content_settings_registry.cc
+@@ -640,8 +640,10 @@ void ContentSettingsRegistry::Init() {
+            ContentSettingsInfo::INHERIT_IN_INCOGNITO,
+            PermissionSettingsInfo::EXCEPTIONS_ON_SECURE_ORIGINS_ONLY);
+ 
++  // Meridian: allowed by default, like Arc (a site can be blocked in the
++  // Site Control Center).
+   Register(ContentSettingsType::AUTO_PICTURE_IN_PICTURE,
+-           "auto-picture-in-picture", CONTENT_SETTING_ASK,
++           "auto-picture-in-picture", CONTENT_SETTING_ALLOW,
+            WebsiteSettingsInfo::UNSYNCABLE, /*allowlisted_primary_schemes=*/{},
+            /*valid_settings=*/
+            {CONTENT_SETTING_ALLOW, CONTENT_SETTING_BLOCK, CONTENT_SETTING_ASK},
