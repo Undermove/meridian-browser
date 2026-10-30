@@ -1,0 +1,226 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 30 Oct 2026 17:46:43 +0400
+Subject: [PATCH 64/64] =?UTF-8?q?Meridian:=20Arc's=20=E2=87=A7=E2=8C=A5?=
+ =?UTF-8?q?=E2=8C=98C=20Copy=20URL=20as=20Markdown=20and=20=E2=8C=A5?=
+ =?UTF-8?q?=E2=8C=98N=20New=20Little=20Window?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Both in the menus (Tab, File) with Arc's shortcuts. TestCommand runs a
+browser command for tests, the way its menu item does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/app/chrome_command_ids.h               |  2 ++
+ chrome/app/meridian_strings.grdp              |  6 ++++
+ chrome/browser/meridian/BUILD.gn              |  1 +
+ chrome/browser/meridian/sidebar.mojom         |  3 ++
+ chrome/browser/meridian/sidebar_handler.cc    | 31 +++++++++++++++++++
+ chrome/browser/meridian/sidebar_handler.h     |  1 +
+ .../browser/ui/browser_command_controller.cc  |  7 +++--
+ chrome/browser/ui/cocoa/accelerators_cocoa.mm |  4 +++
+ chrome/browser/ui/cocoa/main_menu_builder.mm  |  5 +++
+ 9 files changed, 57 insertions(+), 3 deletions(-)
+
+diff --git a/chrome/app/chrome_command_ids.h b/chrome/app/chrome_command_ids.h
+index 4d40567cf3..4ccf44295b 100644
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -131,6 +131,8 @@
+ #define IDC_MERIDIAN_CHAT             39723
+ #define IDC_MERIDIAN_WORKBENCH        39724
+ #define IDC_MERIDIAN_MISSION          39725
++#define IDC_MERIDIAN_COPY_MARKDOWN    39726
++#define IDC_MERIDIAN_LITTLE_WINDOW    39727
+ // Spaces 1-9: IDC_MERIDIAN_SPACE_1 + n.
+ #define IDC_MERIDIAN_SPACE_1          39710
+ #define IDC_MERIDIAN_SPACE_9          39718
+diff --git a/chrome/app/meridian_strings.grdp b/chrome/app/meridian_strings.grdp
+index f3c50d0404..fd308ac195 100644
+--- a/chrome/app/meridian_strings.grdp
++++ b/chrome/app/meridian_strings.grdp
+@@ -40,6 +40,12 @@
+   <message name="IDS_MERIDIAN_MISSION_MAC" desc="View menu item: open Mission Control, which shows every AI agent working with the browser.">
+     Mission Control
+   </message>
++  <message name="IDS_MERIDIAN_COPY_MARKDOWN_MAC" desc="Tab menu item: copy the page's address as a Markdown link with its title.">
++    Copy URL as Markdown
++  </message>
++  <message name="IDS_MERIDIAN_LITTLE_WINDOW_MAC" desc="File menu item: open a small window for a quick look at a page, like Arc's Little Arc.">
++    New Little Window
++  </message>
+   <message name="IDS_MERIDIAN_CHAT_MAC" desc="View menu item: open the Chat view, a full-size chat with the built-in AI.">
+     Chat
+   </message>
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index ca2699dfcb..11a23265bd 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -259,6 +259,7 @@ source_set("meridian") {
+     ":agent_embed",
+     ":ai_providers",
+     ":workbench_core",
++    "//ui/base/clipboard",
+     "//services/media_session/public/cpp",
+     "//services/media_session/public/mojom",
+     "//third_party/re2",
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index c811b82c59..f6cbdc0d2c 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -509,6 +509,9 @@ interface SidebarHandler {
+   // real macOS event in this window, going through AppKit, the menus and the
+   // pages the way a person's does. `modifiers`: NSEventModifierFlags.
+   TestKeyPress(uint16 key_code, string characters, uint32 modifiers);
++  // Tests (--meridian-test-keys): runs a browser command (IDC_*) the way its
++  // menu item does; menus don't answer a test window in the background.
++  TestCommand(int32 command_id);
+ 
+   // Split view: the active tab and `other` side by side (⌃⇧=), back to one
+   // (⌃⇧-), and the divider position.
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index c421157668..bb70c46e4e 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -12,6 +12,7 @@
+ #include "base/i18n/rtl.h"
+ #include "base/no_destructor.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/thread_pool.h"
+@@ -46,6 +47,10 @@
+ #include "components/version_info/version_info.h"
+ #include "chrome/browser/meridian/little_window.h"
+ #include "chrome/browser/meridian/now_playing.h"
++#include "chrome/browser/meridian/test_switches.h"
++#include "chrome/browser/ui/browser_commands.h"
++#include "chrome/common/webui_url_constants.h"
++#include "ui/base/clipboard/scoped_clipboard_writer.h"
+ #include "chrome/browser/meridian/prefs.h"
+ #include "chrome/browser/meridian/setup_profile.h"
+ #include "chrome/browser/meridian/profile_windows.h"
+@@ -312,6 +317,12 @@ void SidebarHandler::SetTabMuted(const tabs_api::NodeId& tab_id, bool muted) {
+   }
+ }
+ 
++void SidebarHandler::TestCommand(int32_t command_id) {
++  if (HasTestSwitch("meridian-test-keys")) {
++    chrome::ExecuteCommand(browser_, command_id);
++  }
++}
++
+ void SidebarHandler::GetNowPlaying(GetNowPlayingCallback callback) {
+   std::move(callback).Run(FindNowPlaying(model()));
+ }
+@@ -511,6 +522,26 @@ bool SidebarHandler::HandleCommand(BrowserWindowInterface* browser,
+   if (id == IDC_NEW_TAB) {
+     return ShowCommandBar(browser);
+   }
++  // ⇧⌥⌘C: "[title](url)" of the page (Arc's Copy URL as Markdown).
++  if (id == IDC_MERIDIAN_COPY_MARKDOWN) {
++    tabs::TabInterface* tab = browser->GetActiveTabInterface();
++    if (!tab) {
++      return true;
++    }
++    content::WebContents* contents = tab->GetContents();
++    std::u16string title = contents->GetTitle();
++    base::ReplaceChars(title, u"[]", u"", &title);
++    ui::ScopedClipboardWriter(ui::ClipboardBuffer::kCopyPaste)
++        .WriteText(u"[" + title + u"](" +
++                   base::UTF8ToUTF16(contents->GetVisibleURL().spec()) +
++                   u")");
++    return true;
++  }
++  // ⌥⌘N: a Little Window (Arc's Little Arc) on a new tab page.
++  if (id == IDC_MERIDIAN_LITTLE_WINDOW) {
++    OpenLittleWindow(browser->GetProfile(), GURL(chrome::kChromeUINewTabURL));
++    return true;
++  }
+   mojom::Command command;
+   int arg = 0;
+   if (id >= IDC_SELECT_TAB_0 && id <= IDC_SELECT_TAB_7) {
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 5af3d0fde1..831ccc9f76 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -147,6 +147,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void ZoomSite(int32_t step) override;
+   void ClearSiteData(ClearSiteDataCallback callback) override;
+   void SetWindowControlsVisible(bool visible) override;
++  void TestCommand(int32_t command_id) override;
+   void TestKeyPress(uint16_t key_code,
+                     const std::string& characters,
+                     uint32_t modifiers) override;
+diff --git a/chrome/browser/ui/browser_command_controller.cc b/chrome/browser/ui/browser_command_controller.cc
+index c4cc8808f2..6fc3f1d0f4 100644
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -649,13 +649,13 @@ void BrowserCommandController::ShowCustomizeChromeSidePanel(
+ 
+ namespace {
+ 
+-// Meridian's own commands (chrome_command_ids.h, 39700-39725). They have no
++// Meridian's own commands (chrome_command_ids.h, 39700-39727). They have no
+ // ActionItem, and with UseActionsForBrowserCommands (on by default) the
+ // command updater treats such a command as unsupported and disabled, which
+ // left every Meridian menu item and shortcut dead. They are on in every
+ // normal window and go straight to the sidebar.
+ bool IsMeridianCommand(int id) {
+-  return id >= IDC_MERIDIAN_TOGGLE_SIDEBAR && id <= IDC_MERIDIAN_MISSION;
++  return id >= IDC_MERIDIAN_TOGGLE_SIDEBAR && id <= IDC_MERIDIAN_LITTLE_WINDOW;
+ }
+ 
+ }  // namespace
+@@ -2099,7 +2099,8 @@ void BrowserCommandController::InitCommandState() {
+         IDC_MERIDIAN_ARCHIVE, IDC_MERIDIAN_CLEAR_TODAY,
+         IDC_MERIDIAN_WELCOME_TOUR, IDC_MERIDIAN_IMPORT_ARC,
+         IDC_MERIDIAN_ASK, IDC_MERIDIAN_CHAT, IDC_MERIDIAN_WORKBENCH,
+-        IDC_MERIDIAN_MISSION}) {
++        IDC_MERIDIAN_MISSION, IDC_MERIDIAN_COPY_MARKDOWN,
++        IDC_MERIDIAN_LITTLE_WINDOW}) {
+     command_updater_->UpdateCommandEnabled(meridian_command, supports_tabs);
+   }
+   for (int i = IDC_MERIDIAN_SPACE_1; i <= IDC_MERIDIAN_SPACE_9; ++i) {
+diff --git a/chrome/browser/ui/cocoa/accelerators_cocoa.mm b/chrome/browser/ui/cocoa/accelerators_cocoa.mm
+index 1b71244927..440d8d6320 100644
+--- a/chrome/browser/ui/cocoa/accelerators_cocoa.mm
++++ b/chrome/browser/ui/cocoa/accelerators_cocoa.mm
+@@ -57,6 +57,10 @@ const struct AcceleratorMapping {
+     {IDC_MERIDIAN_NEW_FOLDER,
+      ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN | ui::EF_SHIFT_DOWN, ui::VKEY_N},
+     {IDC_COPY_URL, ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN, ui::VKEY_C},
++    {IDC_MERIDIAN_COPY_MARKDOWN,
++     ui::EF_COMMAND_DOWN | ui::EF_SHIFT_DOWN | ui::EF_ALT_DOWN, ui::VKEY_C},
++    {IDC_MERIDIAN_LITTLE_WINDOW, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN,
++     ui::VKEY_N},
+     {IDC_MERIDIAN_ARCHIVE, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN, ui::VKEY_A},
+     {IDC_MERIDIAN_ASK, ui::EF_COMMAND_DOWN, ui::VKEY_J},
+     {IDC_MERIDIAN_CHAT, ui::EF_COMMAND_DOWN | ui::EF_ALT_DOWN, ui::VKEY_J},
+diff --git a/chrome/browser/ui/cocoa/main_menu_builder.mm b/chrome/browser/ui/cocoa/main_menu_builder.mm
+index 6b9b5d2692..a9e682b26c 100644
+--- a/chrome/browser/ui/cocoa/main_menu_builder.mm
++++ b/chrome/browser/ui/cocoa/main_menu_builder.mm
+@@ -128,6 +128,9 @@ NSMenuItem* BuildFileMenu(NSApplication* nsapp,
+                   .remove_if(is_pwa),
+               Item(IDS_NEW_WINDOW_MAC)
+                   .command_id(IDC_NEW_WINDOW),
++              Item(IDS_MERIDIAN_LITTLE_WINDOW_MAC)
++                  .command_id(IDC_MERIDIAN_LITTLE_WINDOW)
++                  .remove_if(is_pwa),
+               Item(IDS_NEW_INCOGNITO_WINDOW_MAC)
+                   .command_id(IDC_NEW_INCOGNITO_WINDOW)
+                   .remove_if(is_pwa),
+@@ -590,6 +593,8 @@ NSMenuItem* BuildTabMenu(NSApplication* nsapp,
+                   .command_id(IDC_MERIDIAN_NEW_FOLDER),
+               Item(IDS_COPY_URL)
+                   .command_id(IDC_COPY_URL),
++              Item(IDS_MERIDIAN_COPY_MARKDOWN_MAC)
++                  .command_id(IDC_MERIDIAN_COPY_MARKDOWN),
+               Item(IDS_TAB_CXMENU_CLOSEOTHERTABS)
+                   .command_id(IDC_WINDOW_CLOSE_OTHER_TABS),
+               Item(is_rtl ? IDS_TAB_CXMENU_CLOSETABSTOLEFT

@@ -124,3 +124,35 @@ test('a real ⌘T opens the command bar, not a new tab', async () => {
     assert.equal(await b.eval(`app.$.tabstrip.tabs_.size`), 1, 'no tab opened');
   } finally { await b.close(); }
 });
+
+// chrome_command_ids.h. Menu commands run as their menu item would (TestCommand).
+const IDC = { copyMarkdown: 39726, littleWindow: 39727 };
+
+test('⇧⌥⌘C copies the page as a Markdown link; ⌥⌘N opens a Little Window', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const saved = execFileSync('pbpaste');  // the person's clipboard comes back afterwards
+  const b = await launch(['data:text/html,<title>A [b] c</title>'], { args: ['--meridian-test-keys'] });
+  try {
+    await b.waitFor(today(1));
+    await b.waitFor(`${activeTitle} === 'A [b] c'`);
+    await b.eval(`app.$.tabstrip.handler_.testCommand(${IDC.copyMarkdown})`);
+    let text = '';
+    for (let i = 0; i < 20 && !text.startsWith('[A b c]'); i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      text = execFileSync('pbpaste').toString();
+    }
+    assert.equal(text, '[A b c](data:text/html,<title>A [b] c</title>)');
+    await b.eval(`app.$.tabstrip.handler_.testCommand(${IDC.littleWindow})`);
+    let little = false;
+    for (let i = 0; i < 40 && !little; i++) {
+      await new Promise((r) => setTimeout(r, 150));
+      for (const w of await b.otherWindows()) {
+        try { little ||= await w.eval(`app.hasAttribute('little')`); } catch {}
+      }
+    }
+    assert.ok(little, 'a Little Window opened');
+  } finally {
+    await b.close();
+    execFileSync('pbcopy', { input: saved });
+  }
+});
