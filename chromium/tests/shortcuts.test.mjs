@@ -126,7 +126,7 @@ test('a real ⌘T opens the command bar, not a new tab', async () => {
 });
 
 // chrome_command_ids.h. Menu commands run as their menu item would (TestCommand).
-const IDC = { copyMarkdown: 39726, littleWindow: 39727 };
+const IDC = { copyUrl: 34071, copyMarkdown: 39726, littleWindow: 39727 };
 
 test('⇧⌥⌘C copies the page as a Markdown link; ⌥⌘N opens a Little Window', async () => {
   const { execFileSync } = await import('node:child_process');
@@ -142,6 +142,10 @@ test('⇧⌥⌘C copies the page as a Markdown link; ⌥⌘N opens a Little Wind
       text = execFileSync('pbpaste').toString();
     }
     assert.equal(text, '[A b c](data:text/html,<title>A [b] c</title>)');
+    // Both say so at the bottom of the window, like Arc.
+    await b.waitFor(`app.shadowRoot.querySelector('#missionToast .mt-title')?.textContent.trim() === 'Copied as Markdown'`);
+    await b.eval(`app.$.tabstrip.handler_.testCommand(${IDC.copyUrl})`);
+    await b.waitFor(`app.shadowRoot.querySelector('#missionToast .mt-title')?.textContent.trim() === 'Copied link'`);
     await b.eval(`app.$.tabstrip.handler_.testCommand(${IDC.littleWindow})`);
     let little = false;
     for (let i = 0; i < 40 && !little; i++) {
