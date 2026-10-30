@@ -90,7 +90,7 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
       return Promise.all(list.map(async (t) => {
         const c = await new Cdp(t.webSocketDebuggerUrl).open();
         return {
-          eval: (expr) => evalUi(c, expr), close: () => c.close(),
+          eval: (expr) => evalUi(c, expr), close: () => c.close(), send: (m, p) => c.send(m, p),
           async screenshot(file) { const { data } = await c.send('Page.captureScreenshot', { format: 'png' }); fs.writeFileSync(file, Buffer.from(data, 'base64')); },
         };
       }));

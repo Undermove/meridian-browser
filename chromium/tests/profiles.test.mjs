@@ -160,3 +160,68 @@ test('Profiles: favorites per profile; after a restart the windows are one frame
     fs.rmSync(profile, { recursive: true, force: true });
   }
 });
+
+// Switching spaces back and forth across profiles (⌃1-3, the keys people use) swaps the two
+// windows in place: never a third window, and the one in front is the one with the space.
+async function switchAcrossProfiles(fullscreen) {
+  const b = await launch(['about:blank'], { args: ['--meridian-test-keys'] });
+  const T = 'app.$.tabstrip';
+  const CTRL = 1 << 18;
+  const KEYS = { 1: [18, '1'], 2: [19, '2'], 3: [20, '3'] };
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    const { profileId } = await b.eval(`${T}.handler_.addProfile('Work')`);
+    const { spaceId } = await b.eval(`${T}.handler_.createSpace('Client', '', '#e08a8a', '')`);
+    await b.eval(`${T}.handler_.setSpaceProfile(${JSON.stringify(spaceId)}, ${JSON.stringify(profileId)})`);
+    await b.eval(`${T}.handler_.createSpace('Home', '', '#7cc4a4', '')`);
+    await b.waitFor(`${T}.state_.spaces.length === 3`);
+    await b.eval(`${T}.handler_.activateSpace(${T}.state_.spaces[0].id)`);
+    const first = await b.eval(`${T}.state_.spaces[0].name`);
+    if (fullscreen) {
+      // macOS full screen (its own Space), where hiding a window closes the Space.
+      await b.eval(`${T}.handler_.testCommand(34030)`);  // IDC_FULLSCREEN
+      await sleep(2500);
+    }
+
+    // Every window: whether it is shown, on the Space on screen, its place front to back (from the
+    // browser itself: a page's visibility can't tell a window on another Space), and its space.
+    const windows = async () => {
+      const all = [{ eval: (e) => b.eval(e) }, ...(await b.otherWindows())];
+      const out = [];
+      for (const w of all) {
+        try {
+          const st = await w.eval(`${T}.handler_.testWindowState()`);
+          out.push({ w, ...st, space: await w.eval(`${T}.activeSpace()?.name`), profile: await w.eval(`${T}.state_.profileId`) || 'main' });
+        } catch {}
+      }
+      return out;
+    };
+    const frontOf = (ws) => ws.filter((x) => x.visible && x.onActiveSpace && x.order >= 0)
+        .sort((a, c) => a.order - c.order)[0];
+    const press = async (n) => {
+      const front = frontOf(await windows());
+      await front.w.eval(`${T}.handler_.testKeyPress(${KEYS[n][0]}, '${KEYS[n][1]}', ${CTRL})`);
+    };
+    const settle = async (space) => {
+      let ws = [];
+      for (let i = 0; i < 60 && frontOf(ws = await windows())?.space !== space; i++) await sleep(150);
+      await sleep(600);  // anything that would open or move late
+      ws = await windows();
+      const seen = JSON.stringify(ws.map(({ visible, onActiveSpace, order, space: sp, profile }) => ({ profile, visible, onActiveSpace, order, sp })));
+      assert.ok(ws.length <= 2, `at most a window per profile: ${seen}`);
+      // The bug: the other profile's window showing on the Space it was made on (the desktop), not
+      // over the one in front. Every shown window is on the Space on screen.
+      assert.ok(ws.every((x) => !x.visible || x.onActiveSpace), `a window on another Space: ${seen}`);
+      assert.equal(frontOf(ws)?.space, space, seen);
+    };
+
+    for (const [key, space] of [[2, 'Client'], [3, 'Home'], [2, 'Client'], [1, first], [2, 'Client'], [1, first]]) {
+      await press(key);
+      await settle(space);
+    }
+  } finally { await b.close(); }
+}
+
+test('Profiles: ⌃1–3 across profiles swap the two windows in place, never opening another', () => switchAcrossProfiles(false));
+
+test('Profiles: the same in macOS full screen', () => switchAcrossProfiles(true));

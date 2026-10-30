@@ -1,0 +1,182 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 30 Oct 2026 19:54:14 +0400
+Subject: [PATCH 72/72] Meridian: switching to another profile's space in full
+ screen stays in it
+
+macOS put the other profile's window, shown over the full-screen one, into
+a full screen Space of its own (a window that can be full screen, of an app
+in full screen): every switch looked like a new window. Over a full-screen
+window it is now auxiliary only, without tabbing; and a swapped window shows
+on the Space on screen, not the one it was made on.
+
+TestWindowState tells tests whether a window is shown, on the active Space
+and where it is front to back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/profile_windows.cc    |  7 +++++
+ chrome/browser/meridian/profile_windows_mac.h |  4 +++
+ .../browser/meridian/profile_windows_mac.mm   | 30 +++++++++++++++++--
+ chrome/browser/meridian/sidebar.mojom         |  3 ++
+ chrome/browser/meridian/sidebar_handler.cc    |  4 +++
+ chrome/browser/meridian/sidebar_handler.h     |  1 +
+ .../browser/meridian/sidebar_handler_mac.mm   | 13 ++++++++
+ 7 files changed, 60 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/meridian/profile_windows.cc b/chrome/browser/meridian/profile_windows.cc
+index 05ba6e35ce..1102c8e0ab 100644
+--- a/chrome/browser/meridian/profile_windows.cc
++++ b/chrome/browser/meridian/profile_windows.cc
+@@ -171,6 +171,9 @@ void SwapSoon(int frame,
+             // window forward.
+             target->GetWindow()->Show();
+             target->GetWindow()->Activate();
++#if BUILDFLAG(IS_MAC)
++            ShowOnActiveSpace(target, false);
++#endif
+             if (current && in_frame(current)) {
+               current->GetWindow()->Hide();
+             }
+@@ -303,6 +306,10 @@ void ShowSpaceInProfile(
+             Open(target, space_id, urls);
+             if (show && target != current) {
+               f.visible_of[frame] = target;
++#if BUILDFLAG(IS_MAC)
++              // Where the person is now, not where the window was made.
++              ShowOnActiveSpace(target, true);
++#endif
+ #if BUILDFLAG(IS_MAC)
+               // In full screen the full-screen window stays put and the
+               // others show over it, in its Space: hiding it would close the
+diff --git a/chrome/browser/meridian/profile_windows_mac.h b/chrome/browser/meridian/profile_windows_mac.h
+index 645119add1..daaca7a151 100644
+--- a/chrome/browser/meridian/profile_windows_mac.h
++++ b/chrome/browser/meridian/profile_windows_mac.h
+@@ -18,6 +18,10 @@ void SetOverFullscreen(BrowserWindowInterface* browser, bool over);
+ // Runs `exited` once, when `browser` has left full screen.
+ void OnFullscreenExit(BrowserWindowInterface* browser,
+                       base::OnceClosure exited);
++// While `on`, showing `browser` brings it to the Space on screen (a full
++// screen one too) instead of the one it was last on: a profile's window made
++// on the desktop and hidden would otherwise come back there.
++void ShowOnActiveSpace(BrowserWindowInterface* browser, bool on);
+ // Shows `target` right behind `front`, without macOS's window animation, so
+ // it can paint before `front` goes away (a swap with no blank frame).
+ void ShowBehind(BrowserWindowInterface* target, BrowserWindowInterface* front);
+diff --git a/chrome/browser/meridian/profile_windows_mac.mm b/chrome/browser/meridian/profile_windows_mac.mm
+index 6f4a5472a9..bd43a844d5 100644
+--- a/chrome/browser/meridian/profile_windows_mac.mm
++++ b/chrome/browser/meridian/profile_windows_mac.mm
+@@ -30,10 +30,20 @@ void SetOverFullscreen(BrowserWindowInterface* browser, bool over) {
+   if (!window) {
+     return;
+   }
++  // Over it, not full screen itself: macOS puts a window that can be
++  // full screen into a full screen Space of its own when its app is in full
++  // screen (that was a "new window" on every switch).
+   if (over) {
+-    window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenAuxiliary;
++    window.collectionBehavior =
++        (window.collectionBehavior &
++         ~NSWindowCollectionBehaviorFullScreenPrimary) |
++        NSWindowCollectionBehaviorFullScreenAuxiliary;
++    window.tabbingMode = NSWindowTabbingModeDisallowed;
+   } else {
+-    window.collectionBehavior &= ~NSWindowCollectionBehaviorFullScreenAuxiliary;
++    window.collectionBehavior =
++        (window.collectionBehavior &
++         ~NSWindowCollectionBehaviorFullScreenAuxiliary) |
++        NSWindowCollectionBehaviorFullScreenPrimary;
+   }
+ }
+ 
+@@ -58,6 +68,22 @@ void OnFullscreenExit(BrowserWindowInterface* browser,
+               }];
+ }
+ 
++void ShowOnActiveSpace(BrowserWindowInterface* browser, bool on) {
++  NSWindow* window = WindowOf(browser);
++  if (!window) {
++    return;
++  }
++  // A full-screen window owns its Space.
++  if (on && (window.styleMask & NSWindowStyleMaskFullScreen)) {
++    return;
++  }
++  if (on) {
++    window.collectionBehavior |= NSWindowCollectionBehaviorMoveToActiveSpace;
++  } else {
++    window.collectionBehavior &= ~NSWindowCollectionBehaviorMoveToActiveSpace;
++  }
++}
++
+ void ShowBehind(BrowserWindowInterface* target, BrowserWindowInterface* front) {
+   NSWindow* window = WindowOf(target);
+   NSWindow* over = WindowOf(front);
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 9780d84e95..d672cd34be 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -517,6 +517,9 @@ interface SidebarHandler {
+   // Tests (--meridian-test-keys): runs a browser command (IDC_*) the way its
+   // menu item does; menus don't answer a test window in the background.
+   TestCommand(int32 command_id);
++  // Tests (--meridian-test-keys): where this window is. `order`: its place
++  // among the app's windows, front to back (-1 if not ordered in).
++  TestWindowState() => (bool visible, bool on_active_space, int32 order);
+ 
+   // Split view: the active tab and `other` side by side (⌃⇧=), back to one
+   // (⌃⇧-), and the divider position.
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 3d79735691..8e1595ec14 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -2396,6 +2396,10 @@ void SidebarHandler::SetWindowControlsVisible(bool visible) {}
+ 
+ void SidebarHandler::SwitchKeyboardLayout(const std::string& language) {}
+ 
++void SidebarHandler::TestWindowState(TestWindowStateCallback callback) {
++  std::move(callback).Run(false, false, -1);
++}
++
+ std::string SystemUserFullName() {
+   return std::string();
+ }
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index ae42c546ae..8cfccd51c6 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -151,6 +151,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void ClearSiteData(ClearSiteDataCallback callback) override;
+   void SetWindowControlsVisible(bool visible) override;
+   void TestCommand(int32_t command_id) override;
++  void TestWindowState(TestWindowStateCallback callback) override;
+   void SwitchKeyboardLayout(const std::string& language) override;
+   void TestKeyPress(uint16_t key_code,
+                     const std::string& characters,
+diff --git a/chrome/browser/meridian/sidebar_handler_mac.mm b/chrome/browser/meridian/sidebar_handler_mac.mm
+index 512a63ae58..8ab2cc22af 100644
+--- a/chrome/browser/meridian/sidebar_handler_mac.mm
++++ b/chrome/browser/meridian/sidebar_handler_mac.mm
+@@ -30,6 +30,19 @@ void SidebarHandler::SetWindowControlsVisible(bool visible) {
+   }
+ }
+ 
++void SidebarHandler::TestWindowState(TestWindowStateCallback callback) {
++  NSWindow* window =
++      browser_->GetWindow()->GetNativeWindow().GetNativeNSWindow();
++  if (!HasTestSwitch("meridian-test-keys") || !window) {
++    std::move(callback).Run(false, false, -1);
++    return;
++  }
++  NSUInteger order = [NSApp.orderedWindows indexOfObject:window];
++  std::move(callback).Run(
++      window.isVisible, window.isOnActiveSpace,
++      order == NSNotFound ? -1 : static_cast<int32_t>(order));
++}
++
+ void SidebarHandler::SwitchKeyboardLayout(const std::string& language) {
+   // Test browsers leave the person's keyboard alone.
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch(
