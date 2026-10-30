@@ -129,3 +129,45 @@ test('spaces, pins and which space each tab is in survive a restart', async () =
     } finally { await b.close(); }
   } finally { fs.rmSync(profile, { recursive: true, force: true }); }
 });
+
+test('a two-finger swipe on the sidebar drags to the next space: past a third it switches, less springs back; a dot slides too', async () => {
+  const b = await launch([page('Home')]);
+  const T = 'app.$.tabstrip';
+  const active = `${T}.activeSpace().name`;
+  const transform = (id) => `${SB}.getElementById('${id}')?.style.transform || ''`;
+  try {
+    await b.waitFor(todayCount(1));
+    const first = await b.eval(active);
+    const { spaceId } = await b.eval(`${T}.handler_.createSpace('Work', '', '#e0a070', '#f0c8a0')`);
+    await b.waitFor(`${T}.state_.spaces.length === 2`);
+    await b.eval(`${T}.handler_.activateSpace(${T}.state_.spaces[0].id)`);
+    await b.waitFor(`${active} === ${JSON.stringify(first)}`);
+
+    // A short swipe: the next space shows beside the page while the fingers move, then springs back.
+    await b.swipe(`${SB}.getElementById('pages')`, 50, {
+      during: async () => {
+        assert.equal(await b.eval(`${T}.ghost_?.name`), 'Work');
+        assert.match(await b.eval(transform('spacePage')), /translateX\(-\d/);
+        assert.match(await b.eval(transform('ghostPage')), /translateX\(\d/);
+      },
+    });
+    await b.waitFor(`!${T}.ghost_ && !${SB}.getElementById('spacePage').style.transform`);
+    assert.equal(await b.eval(active), first);
+
+    // Past a third of the way: it switches.
+    await b.swipe(`${SB}.getElementById('pages')`, 140);
+    await b.waitFor(`${active} === 'Work'`);
+    await b.waitFor(`!${T}.ghost_ && !${SB}.getElementById('spacePage').style.transform`);
+    assert.equal(await b.eval(`${T}.state_.activeSpaceId`), spaceId);
+
+    // Past the last space it only gives a little and stays.
+    await b.swipe(`${SB}.getElementById('pages')`, 140);
+    await b.waitFor(`!${SB}.getElementById('spacePage').style.transform`);
+    assert.equal(await b.eval(active), 'Work');
+
+    // A dot slides back to the first space.
+    await b.click(`${SB}.querySelectorAll('.space-dot')[0]`);
+    await b.waitFor(`${active} === ${JSON.stringify(first)}`);
+    await b.waitFor(`!${T}.ghost_`);
+  } finally { await b.close(); }
+});

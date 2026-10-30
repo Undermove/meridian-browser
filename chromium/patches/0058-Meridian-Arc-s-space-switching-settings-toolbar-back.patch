@@ -1,0 +1,920 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 30 Oct 2026 16:27:29 +0400
+Subject: [PATCH 59/59] Meridian: Arc's space switching, settings toolbar, back
+ arrow over the page
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- A two-finger swipe on the sidebar drags between spaces: the page follows
+  the fingers, the neighbour slides in beside it and the window colour
+  blends; past a third it completes, otherwise it springs back. Space dots,
+  ⌃1–9 and ⌃⇥ switch with the same slide.
+- Settings has Arc's toolbar: the open tab's name on top and a row of tabs
+  (icon over label), the first one the member's name with the card and Get
+  started.
+- The back/forward swipe arrow comes in at the edge of the active page, not
+  of the window over the sidebar.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ ...me_render_widget_host_view_mac_delegate.mm |  45 +++-
+ chrome/browser/resources/webui_browser/app.ts |   6 +-
+ .../webui_browser/meridian/settings.css       |  80 ++++--
+ .../webui_browser/meridian/settings.html.ts   | 150 ++++++-----
+ .../webui_browser/meridian/settings.ts        |  26 +-
+ .../webui_browser/meridian/sidebar.css        |  23 +-
+ .../webui_browser/meridian/sidebar.html.ts    |  22 ++
+ .../webui_browser/meridian/sidebar.ts         | 246 +++++++++++++++++-
+ .../ui/cocoa/history_overlay_controller.mm    |   4 +-
+ 9 files changed, 501 insertions(+), 101 deletions(-)
+
+diff --git a/chrome/browser/renderer_host/chrome_render_widget_host_view_mac_delegate.mm b/chrome/browser/renderer_host/chrome_render_widget_host_view_mac_delegate.mm
+index 6a21f7aecb..d0b36a4d7f 100644
+--- a/chrome/browser/renderer_host/chrome_render_widget_host_view_mac_delegate.mm
++++ b/chrome/browser/renderer_host/chrome_render_widget_host_view_mac_delegate.mm
+@@ -34,10 +34,22 @@
+ #include "content/public/browser/render_widget_host.h"
+ #include "content/public/browser/render_widget_host_view.h"
+ #include "content/public/browser/web_contents.h"
++#include "ui/gfx/mac/coordinate_conversion.h"
+ #include "mojo/public/cpp/bindings/remote.h"
+ #include "services/service_manager/public/cpp/interface_provider.h"
+ #include "ui/base/window_open_disposition.h"
+ 
++// Meridian: holds the history swipe arrow over the active tab's page, clipped
++// to it. It never takes the mouse.
++@interface MeridianHistoryOverlayHost : NSView
++@end
++
++@implementation MeridianHistoryOverlayHost
++- (NSView*)hitTest:(NSPoint)point {
++  return nil;
++}
++@end
++
+ @interface ChromeRenderWidgetHostViewMacDelegate () <HistorySwiperDelegate>
+ 
+ @property(readonly) content::WebContents* webContents;
+@@ -53,6 +65,9 @@
+ 
+   // Responsible for 2-finger swipes history navigation.
+   HistorySwiper* __strong _historySwiper;
++
++  // Meridian: where the arrow shows over the WebUI browser frame.
++  MeridianHistoryOverlayHost* __strong _historyOverlayHost;
+ }
+ 
+ - (instancetype)initWithRenderWidgetHost:
+@@ -167,8 +182,36 @@
+   return !swiping_control || swiping_control->ShouldAllowHistorySwiping();
+ }
+ 
++// Meridian: over the WebUI browser frame the arrow comes in at the edge of the
++// active tab's page, not of the window (over the sidebar).
+ - (NSView*)viewThatWantsHistoryOverlay {
+-  return self.nsView;
++  NSView* view = self.nsView;
++  content::WebContents* page =
++      view.window ? [self historyWebContentsOnWindow:view.window] : nullptr;
++  content::RenderWidgetHostView* pageView =
++      page && page != self.webContents ? page->GetRenderWidgetHostView()
++                                       : nullptr;
++  if (!pageView) {
++    return view;
++  }
++  NSRect rect = [view
++      convertRect:[view.window convertRectFromScreen:gfx::ScreenRectToNSRect(
++                                                         pageView->GetViewBounds())]
++         fromView:nil];
++  rect = NSIntersectionRect(rect, view.bounds);
++  if (NSIsEmptyRect(rect) || NSEqualRects(rect, view.bounds)) {
++    return view;
++  }
++  if (!_historyOverlayHost) {
++    _historyOverlayHost = [[MeridianHistoryOverlayHost alloc] init];
++    _historyOverlayHost.wantsLayer = YES;
++    _historyOverlayHost.clipsToBounds = YES;
++  }
++  _historyOverlayHost.frame = rect;
++  if (_historyOverlayHost.superview != view) {
++    [view addSubview:_historyOverlayHost];
++  }
++  return _historyOverlayHost;
+ }
+ 
+ // Meridian: the WebUI browser frame (chrome://webui-browser) has no history of
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 778a7b8878..252f32e58b 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -737,7 +737,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+ 
+   protected onMeridianShowSettings_(e: CustomEvent<SectionId|undefined>) {
+     this.closeSiteControl_();
+-    this.$.settings.show(this.$.tabstrip.spaces(), e.detail || 'general');
++    this.$.settings.show(this.$.tabstrip.spaces(), e.detail || 'member');
+   }
+ 
+   protected onMeridianAsk_() {
+@@ -924,9 +924,11 @@ export class WebuiBrowserAppElement extends CrLitElement {
+         this.$.tabstrip.openUrl('https://chromewebstore.google.com/');
+         break;
+       case 'settings':
+-      case 'arc-extensions':
+         this.$.settings.show(this.$.tabstrip.spaces(), 'general');
+         break;
++      case 'arc-extensions':
++        this.$.settings.show(this.$.tabstrip.spaces(), 'member');
++        break;
+     }
+   }
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.css b/chrome/browser/resources/webui_browser/meridian/settings.css
+index 1efa7008ae..9dec90c912 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.css
++++ b/chrome/browser/resources/webui_browser/meridian/settings.css
+@@ -63,9 +63,10 @@ button:disabled {
+ 
+ #panel {
+   position: relative;
+-  width: min(820px, 92vw);
+-  height: min(620px, 86vh);
++  width: min(860px, 92vw);
++  height: min(640px, 88vh);
+   display: flex;
++  flex-direction: column;
+   border-radius: 14px;
+   background: var(--meridian-surface);
+   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35),
+@@ -74,34 +75,50 @@ button:disabled {
+   outline: none;
+ }
+ 
+-/* ------------------------------------------------------------ tabs */
++/* ------------------------------------------------------------ toolbar */
++/* Arc's settings window: the open tab's name on top, then a row of tabs,
++ * icon over label. */
+ 
+-#tabs {
+-  width: 180px;
++#toolbar {
++  position: relative;
+   flex: none;
+-  padding: 16px 10px;
+   display: flex;
+   flex-direction: column;
+-  gap: 2px;
+-  background: color-mix(in srgb, var(--meridian-space) 10%, transparent);
+-  border-right: 1px solid var(--meridian-border);
++  align-items: center;
++  padding: 10px 16px 8px;
++  border-bottom: 1px solid var(--meridian-border);
+ }
+ 
+-#tabs .title {
+-  font-size: 15px;
++#toolbar .title {
++  font-size: 13px;
+   font-weight: 650;
+-  margin: 0 10px 12px;
++  color: var(--meridian-text);
++  margin-bottom: 8px;
++}
++
++#tabs {
++  display: flex;
++  gap: 4px;
++  overflow-x: auto;
++  max-width: 100%;
++}
++
++#tabs::-webkit-scrollbar {
++  height: 0;
+ }
+ 
+ .tab {
++  min-width: 72px;
+   display: flex;
++  flex-direction: column;
+   align-items: center;
+-  gap: 10px;
+-  height: 34px;
+-  padding: 0 10px;
+-  border-radius: 8px;
++  gap: 4px;
++  padding: 7px 10px 6px;
++  border-radius: 9px;
+   color: var(--meridian-text-muted);
++  font-size: 12px;
+   font-weight: 500;
++  white-space: nowrap;
+ }
+ 
+ .tab:hover {
+@@ -110,8 +127,35 @@ button:disabled {
+ }
+ 
+ .tab.on {
+-  background: color-mix(in srgb, var(--meridian-space) 18%, transparent);
+-  color: var(--meridian-text);
++  background: var(--meridian-surface-2);
++  color: color-mix(in srgb, var(--meridian-space) 70%, var(--meridian-text));
++  box-shadow: 0 0 0 0.5px var(--meridian-border),
++      0 1px 2px rgba(0, 0, 0, 0.06);
++}
++
++/* The member: the card on the left, the rest beside it. */
++#member {
++  display: grid;
++  grid-template-columns: minmax(0, 300px) minmax(0, 1fr);
++  gap: 26px;
++  align-items: start;
++}
++
++#member .hint {
++  margin: 10px 0 0;
++  text-align: center;
++  font-size: 12px;
++  color: var(--meridian-text-muted);
++}
++
++#member .group:first-child h2 {
++  margin-top: 0;
++}
++
++@media (max-width: 700px) {
++  #member {
++    grid-template-columns: minmax(0, 1fr);
++  }
+ }
+ 
+ /* ------------------------------------------------------------ body */
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index 2a31b7e3ea..abcd52c2f2 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -12,39 +12,92 @@ export function getHtml(this: MeridianSettingsElement) {
+ <div id="overlay" @click="${this.onOverlayClick_}">
+   <div id="panel" role="dialog" aria-label="Settings" tabindex="-1"
+       @keydown="${this.onPanelKeydown_}">
+-    <nav id="tabs" role="tablist">
+-      <div class="title">Settings</div>
+-      <button class="tab ${this.section_ === 'general' ? 'on' : ''}"
+-          data-id="general" role="tab" @click="${this.onTabClick_}">
+-        ${icon('palette', 18)}<span>General</span>
+-      </button>
+-      <button class="tab ${this.section_ === 'links' ? 'on' : ''}"
+-          data-id="links" role="tab" @click="${this.onTabClick_}">
+-        ${icon('link', 18)}<span>Links</span>
+-      </button>
+-      <button class="tab ${this.section_ === 'ai' ? 'on' : ''}"
+-          data-id="ai" role="tab" @click="${this.onTabClick_}">
+-        ${icon('sparkles', 18)}<span>AI</span>
+-      </button>
+-      <button class="tab ${this.section_ === 'profiles' ? 'on' : ''}"
+-          data-id="profiles" role="tab" @click="${this.onTabClick_}">
+-        ${icon('users', 18)}<span>Profiles</span>
+-      </button>
+-      <button class="tab ${this.section_ === 'advanced' ? 'on' : ''}"
+-          data-id="advanced" role="tab" @click="${this.onTabClick_}">
+-        ${icon('more', 18)}<span>Advanced</span>
+-      </button>
+-    </nav>
+-    <div id="body">
++    <header id="toolbar">
++      <div class="title">${this.sectionLabel_}</div>
++      <nav id="tabs" role="tablist">
++        <button class="tab ${this.section_ === 'member' ? 'on' : ''}"
++            data-id="member" role="tab" @click="${this.onTabClick_}">
++          ${icon('user', 22)}<span>${this.memberLabel_}</span>
++        </button>
++        <button class="tab ${this.section_ === 'general' ? 'on' : ''}"
++            data-id="general" role="tab" @click="${this.onTabClick_}">
++          ${icon('settings', 22)}<span>General</span>
++        </button>
++        <button class="tab ${this.section_ === 'profiles' ? 'on' : ''}"
++            data-id="profiles" role="tab" @click="${this.onTabClick_}">
++          ${icon('users', 22)}<span>Profiles</span>
++        </button>
++        <button class="tab ${this.section_ === 'ai' ? 'on' : ''}"
++            data-id="ai" role="tab" @click="${this.onTabClick_}">
++          ${icon('sparkles', 22)}<span>AI</span>
++        </button>
++        <button class="tab ${this.section_ === 'links' ? 'on' : ''}"
++            data-id="links" role="tab" @click="${this.onTabClick_}">
++          ${icon('link', 22)}<span>Links</span>
++        </button>
++        <button class="tab ${this.section_ === 'advanced' ? 'on' : ''}"
++            data-id="advanced" role="tab" @click="${this.onTabClick_}">
++          ${icon('sliders', 22)}<span>Advanced</span>
++        </button>
++      </nav>
+       <button id="close" class="icon-btn" title="Close"
+           @click="${this.onCloseClick_}">${icon('x', 16)}</button>
++    </header>
++    <div id="body">
++      ${this.settings_ && this.section_ === 'member' ? html`
++        <section id="member">
++          <div class="member-card-col">
++            <meridian-member-card .name="${this.settings_.memberName}"
++                .defaultName="${this.settings_.memberDefaultName}"
++                .since="${this.settings_.memberSince}" .spaces="${this.spaces_}"
++                @member-rename="${this.onMemberRename_}">
++            </meridian-member-card>
++            <p class="hint">Click your name to change it.</p>
++          </div>
++          <div class="member-side">
++            <div class="group">
++              <h2>Get started</h2>
++              <div class="card">
++                <div class="row">
++                  <div class="row-text">
++                    <div class="row-label">Import from Arc</div>
++                    <div class="row-desc">Spaces, pinned tabs, folders, favorites
++                      and sign-ins.</div>
++                  </div>
++                  <button id="importArc" class="btn"
++                      @click="${this.onImportArcClick_}">Import…</button>
++                </div>
++                ${this.arcExtensions_.length ? html`
++                  <div class="row arc-ext-head">
++                    <div class="row-text">
++                      <div class="row-label">Extensions from Arc</div>
++                      <div class="row-desc">Add each from the Chrome Web Store;
++                        it opens in a tab.</div>
++                    </div>
++                  </div>
++                  ${this.arcExtensions_.map(x => html`
++                    <div class="row arc-ext" data-id="${x.id}">
++                      <div class="row-text">
++                        <div class="row-label">${x.name}</div>
++                      </div>
++                      ${x.installed ? html`
++                        <span class="ok">${icon('check', 14)} Added</span>` : html`
++                        <button class="btn" data-id="${x.id}"
++                            @click="${this.onArcExtensionClick_}">Add…</button>`}
++                    </div>`)}` : ''}
++                <div class="row">
++                  <div class="row-text">
++                    <div class="row-label">Welcome tour</div>
++                  </div>
++                  <button id="tour" class="btn" @click="${this.onTourClick_}">
++                    Show Again</button>
++                </div>
++              </div>
++            </div>
++          </div>
++        </section>` : ''}
+       ${this.settings_ && this.section_ === 'general' ? html`
+         <section id="general">
+-          <meridian-member-card .name="${this.settings_.memberName}"
+-              .defaultName="${this.settings_.memberDefaultName}"
+-              .since="${this.settings_.memberSince}" .spaces="${this.spaces_}"
+-              @member-rename="${this.onMemberRename_}">
+-          </meridian-member-card>
+           <div class="group">
+             <h2>Appearance</h2>
+             <div class="card">
+@@ -150,45 +203,6 @@ export function getHtml(this: MeridianSettingsElement) {
+               </div>
+             </div>
+           </div>
+-          <div class="group">
+-            <h2>Get started</h2>
+-            <div class="card">
+-              <div class="row">
+-                <div class="row-text">
+-                  <div class="row-label">Import from Arc</div>
+-                  <div class="row-desc">Spaces, pinned tabs, folders, favorites
+-                    and sign-ins.</div>
+-                </div>
+-                <button id="importArc" class="btn"
+-                    @click="${this.onImportArcClick_}">Import…</button>
+-              </div>
+-              ${this.arcExtensions_.length ? html`
+-                <div class="row arc-ext-head">
+-                  <div class="row-text">
+-                    <div class="row-label">Extensions from Arc</div>
+-                    <div class="row-desc">Add each from the Chrome Web Store;
+-                      it opens in a tab.</div>
+-                  </div>
+-                </div>
+-                ${this.arcExtensions_.map(x => html`
+-                  <div class="row arc-ext" data-id="${x.id}">
+-                    <div class="row-text">
+-                      <div class="row-label">${x.name}</div>
+-                    </div>
+-                    ${x.installed ? html`
+-                      <span class="ok">${icon('check', 14)} Added</span>` : html`
+-                      <button class="btn" data-id="${x.id}"
+-                          @click="${this.onArcExtensionClick_}">Add…</button>`}
+-                  </div>`)}` : ''}
+-              <div class="row">
+-                <div class="row-text">
+-                  <div class="row-label">Welcome tour</div>
+-                </div>
+-                <button id="tour" class="btn" @click="${this.onTourClick_}">
+-                  Show Again</button>
+-              </div>
+-            </div>
+-          </div>
+           <div class="group">
+             <h2>Updates</h2>
+             <div class="card">
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index e0b016e566..31ddb34fbd 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -16,7 +16,16 @@ import './member_card.js';
+ import {getCss} from './settings.css.js';
+ import {getHtml} from './settings.html.js';
+ 
+-export type SectionId = 'general'|'links'|'ai'|'profiles'|'advanced';
++export type SectionId = 'member'|'general'|'links'|'ai'|'profiles'|'advanced';
++
++const SECTION_LABELS: Record<SectionId, string> = {
++  member: '',
++  general: 'General',
++  profiles: 'Profiles',
++  ai: 'AI',
++  links: 'Links',
++  advanced: 'Advanced',
++};
+ 
+ // Settings > Profiles: a row per profile.
+ interface ProfileRow {
+@@ -140,6 +149,8 @@ export class MeridianSettingsElement extends CrLitElement {
+     return {
+       open: {type: Boolean, reflect: true},
+       section_: {state: true, type: String},
++      memberLabel_: {state: true, type: String},
++      sectionLabel_: {state: true, type: String},
+       settings_: {state: true, type: Object},
+       spaces_: {state: true, type: Array},
+       arcExtensions_: {state: true, type: Array},
+@@ -173,7 +184,10 @@ export class MeridianSettingsElement extends CrLitElement {
+   }
+ 
+   accessor open: boolean = false;
+-  protected accessor section_: SectionId = 'general';
++  protected accessor section_: SectionId = 'member';
++  // The first tab is the member's name (Arc's); the title is the open tab's.
++  protected accessor memberLabel_: string = '';
++  protected accessor sectionLabel_: string = '';
+   protected accessor settings_: Settings|null = null;
+   protected accessor spaces_: Space[] = [];
+   // Extensions installed in Arc, to add again here.
+@@ -223,7 +237,7 @@ export class MeridianSettingsElement extends CrLitElement {
+         (state: UpdateState) => this.update_ = state);
+   }
+ 
+-  async show(spaces: Space[], section: SectionId = 'general') {
++  async show(spaces: Space[], section: SectionId = 'member') {
+     this.spaces_ = spaces;
+     this.section_ = section;
+     this.tryResult_ = '';
+@@ -490,6 +504,12 @@ export class MeridianSettingsElement extends CrLitElement {
+ 
+   override willUpdate(changed: PropertyValues<this>) {
+     super.willUpdate(changed);
++    this.memberLabel_ = (this.settings_?.memberName ||
++                         this.settings_?.memberDefaultName || 'You')
++                            .split(' ')[0]!;
++    this.sectionLabel_ = this.section_ === 'member' ?
++        this.memberLabel_ :
++        SECTION_LABELS[this.section_];
+     const chosen = this.settings_?.aiProvider || '';
+     this.otherAgents_ = !!this.settings_?.aiOtherAgents;
+     this.autoOn_ = chosen === '';
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.css b/chrome/browser/resources/webui_browser/meridian/sidebar.css
+index 0eabeb5c20..b34ad9af36 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.css
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.css
+@@ -49,15 +49,34 @@ button {
+ 
+ /* ------------------------------------------------------------ space page */
+ 
+-#spacePage {
++/* The space page, and during a swipe or a switch the neighbour sliding in
++ * beside it (Arc). */
++#pages {
+   flex: 1;
+   min-height: 0;
++  position: relative;
++  overflow: hidden;
++  margin: 0 -4px;
++}
++
++#spacePage {
++  height: 100%;
++  box-sizing: border-box;
+   overflow-y: auto;
+   overflow-x: hidden;
+-  margin: 0 -4px;
+   padding: 0 4px;
+ }
+ 
++#ghostPage {
++  position: absolute;
++  inset: 0;
++  padding: 0 4px;
++  overflow: hidden;
++  pointer-events: none;
++  /* Shown once placed beside the page (paintSlide_). */
++  visibility: hidden;
++}
++
+ #spacePage::-webkit-scrollbar {
+   width: 0;
+ }
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+index 730e7ac799..144d28078e 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+@@ -15,6 +15,7 @@ export function getHtml(this: MeridianSidebarElement) {
+     <meridian-fav .item="${f}" .host="${this}" .rev="${this.rev_}">
+     </meridian-fav>`)}
+ </div>
++<div id="pages">
+ <div id="spacePage" @contextmenu="${this.onBackgroundContextmenu_}">
+   ${this.space_ ? html`
+     <div class="space-header" data-space="${this.space_.id}"
+@@ -54,6 +55,27 @@ export function getHtml(this: MeridianSidebarElement) {
+     </div>
+   ` : ''}
+ </div>
++${this.ghost_ ? html`
++  <div id="ghostPage" aria-hidden="true">
++    <div class="space-header">
++      ${this.ghost_.icon ? html`
++        <span class="space-icon">${this.ghost_.icon}</span>` : ''}
++      <span class="space-name">${this.ghost_.name}</span>
++    </div>
++    <div class="pinned">
++      ${repeat(this.ghost_.pinned, i => i.id, i => html`
++        <meridian-item .item="${i}" .depth="${0}" .container="${this.ghost_!.id}"
++            .host="${this}" .rev="${this.rev_}"></meridian-item>`)}
++    </div>
++    <div class="divider"><span>Today</span></div>
++    <div class="row new-tab">
++      <span class="ic">${icon('plus', 16)}</span>
++      <span class="title">New Tab</span>
++    </div>
++    ${repeat(this.ghostToday_, t => t.id, t => html`
++      <meridian-tab-row .tab="${t}" .host="${this}"></meridian-tab-row>`)}
++  </div>` : ''}
++</div>
+ ${this.updateReady_() ? html`
+   <button id="updateBanner" class="update-banner"
+       title="Meridian quits and opens again with your tabs"
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 34997b305f..721c41ab47 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -108,6 +108,23 @@ export function downloadStatus(d: Download): string {
+   }
+ }
+ 
++// `a` and `b` (#rrggbb) blended, `t` of the way to `b`.
++function mixColor(a: string, b: string, t: number): string {
++  const rgb = (c: string) => /^#[0-9a-f]{6}$/i.test(c) ?
++      [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16)) :
++      null;
++  const x = rgb(a);
++  const y = rgb(b);
++  if (!x || !y) {
++    return t < 0.5 ? a : b;
++  }
++  return '#' +
++      x.map((v, i) => Math.round(v + (y[i]! - v) * t)
++                          .toString(16)
++                          .padStart(2, '0'))
++          .join('');
++}
++
+ export class MeridianSidebarElement extends CrLitElement implements
+     TabStripObserver {
+   static get is() {
+@@ -138,6 +155,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+       downloads_: {state: true, type: Array},
+       downloadsOpen_: {state: true, type: Boolean},
+       update_: {state: true, type: Object},
++      ghost_: {state: true, type: Object},
++      ghostToday_: {state: true, type: Array},
+     };
+   }
+ 
+@@ -165,6 +184,21 @@ export class MeridianSidebarElement extends CrLitElement implements
+   protected accessor downloadsOpen_: boolean = false;
+   // Meridian's updater: a "Restart to update" pill when one is ready.
+   protected accessor update_: UpdateState|null = null;
++  // The neighbour space sliding in beside the page (a swipe or a switch), and
++  // its Today tabs.
++  protected accessor ghost_: Space|null = null;
++  protected accessor ghostToday_: Tab[] = [];
++  // Which side it comes from: 1 the right (the next space), -1 the left.
++  private ghostDir_ = 1;
++  // How far the page has moved (px; negative is to the left).
++  private slideOffset_ = 0;
++  // The space a finished slide switched to, until the sidebar shows it.
++  private slidTo_ = '';
++  private slideReset_ = 0;
++  // The two-finger swipe: horizontal wheel deltas so far; whether it decided
++  // already (the momentum that follows is swallowed until the wheel goes
++  // quiet).
++  private swipe_ = {acc: 0, tracking: false, locked: false, idle: 0};
+ 
+   private order_ = new Map<NodeId, number>();
+   // Shorter titles for Today tabs (Tidy Today), until the tab closes.
+@@ -231,6 +265,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+     // update that came first wins.
+     this.handler_.getUpdateState().then(({state}) => this.update_ ??= state);
+     document.addEventListener('mousedown', this.onDocumentMouseDown_, true);
++    this.addEventListener('wheel', this.onSwipeWheel_, {passive: false});
+     window.addEventListener('blur', this.closeMenu_);
+     document.addEventListener('keydown', this.onMenuKeydown_, true);
+     this.shadowRoot.addEventListener('dragstart', this.onDragStart_ as EventListener);
+@@ -241,6 +276,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+ 
+   override disconnectedCallback() {
+     super.disconnectedCallback();
++    this.removeEventListener('wheel', this.onSwipeWheel_);
+     this.observation_ = undefined;
+     for (const id of [this.listenerId_, this.commandBarListenerId_,
+                       this.commandListenerId_, this.statusListenerId_,
+@@ -398,8 +434,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+   }
+ 
+   // Today: the active space's tabs that aren't a pinned item, newest first.
+-  todayTabs(): Tab[] {
+-    const space = this.activeSpace();
++  todayTabs(of?: Space): Tab[] {
++    const space = of || this.activeSpace();
+     if (!space || !this.state_) {
+       return [];
+     }
+@@ -416,7 +452,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+       }
+     }
+     // Tabs the browser created after the last state push: the active space.
+-    for (const tab of this.tabs_.values()) {
++    for (const tab of of ? [] : this.tabs_.values()) {
+       if (!known.has(tab.id)) {
+         result.push(tab);
+       }
+@@ -738,14 +774,14 @@ export class MeridianSidebarElement extends CrLitElement implements
+       }
+       case Command.kSelectSpace:
+         if (spaces[arg]) {
+-          this.handler_.activateSpace(spaces[arg].id);
++          this.slideTo_(spaces[arg]);
+         }
+         break;
+       case Command.kStepSpace: {
+         const at = spaces.findIndex(s => s.id === space?.id);
+         const next = spaces[(at + arg + spaces.length) % spaces.length];
+         if (next && spaces.length > 1) {
+-          this.handler_.activateSpace(next.id);
++          this.slideTo_(next, arg > 0 ? 1 : -1);
+         }
+         break;
+       }
+@@ -1031,10 +1067,199 @@ export class MeridianSidebarElement extends CrLitElement implements
+   protected onSpaceDotClick_(e: Event) {
+     const space = this.spaceFromEvent_(e);
+     if (space) {
+-      this.handler_.activateSpace(space.id);
++      this.slideTo_(space);
+     }
+   }
+ 
++  // ------------------------------------------------- switching spaces (Arc)
++  // The page slides out and the next space slides in, coloured on the way.
++  // A two-finger swipe on the sidebar drags it; let go past a third of the
++  // way and it completes, otherwise it springs back.
++
++  private neighbour_(dir: number): Space|null {
++    const spaces = this.state_?.spaces || [];
++    const at = spaces.findIndex(sp => sp.id === this.space_?.id);
++    return at < 0 ? null : spaces[at + dir] || null;
++  }
++
++  private pageWidth_(): number {
++    return this.shadowRoot.getElementById('pages')?.clientWidth || 260;
++  }
++
++  private onSwipeWheel_ = (e: WheelEvent) => {
++    if ((this.state_?.spaces.length || 0) < 2 || e.ctrlKey ||
++        this.state_?.offTheRecord || this.menu_ || this.slidTo_) {
++      return;
++    }
++    const swipe = this.swipe_;
++    const horizontal = Math.abs(e.deltaX) > Math.abs(e.deltaY) * 1.2;
++    if (!swipe.tracking && !swipe.locked &&
++        (!horizontal || Math.abs(e.deltaX) < 1)) {
++      return;
++    }
++    e.preventDefault();
++    clearTimeout(swipe.idle);
++    swipe.idle = setTimeout(() => this.endSwipe_(), 140);
++    if (swipe.locked) {
++      return;
++    }
++    swipe.tracking = true;
++    swipe.acc += e.deltaX;
++    this.dragSlide_(-swipe.acc);
++    // Flung most of the way: it completes without waiting for the end.
++    if (this.ghost_ &&
++        Math.abs(this.slideOffset_) > this.pageWidth_() * 0.6) {
++      swipe.locked = true;
++      this.finishSlide_();
++    }
++  };
++
++  private endSwipe_() {
++    const swipe = this.swipe_;
++    const dragging = swipe.tracking && !swipe.locked;
++    swipe.acc = 0;
++    swipe.tracking = false;
++    swipe.locked = false;
++    if (!dragging) {
++      return;
++    }
++    if (this.ghost_ &&
++        Math.abs(this.slideOffset_) > this.pageWidth_() * 0.3) {
++      this.finishSlide_();
++    } else {
++      this.springBack_();
++    }
++  }
++
++  // The page `offset` px along, the neighbour on that side beside it (past
++  // the first or last space it only gives a little).
++  private dragSlide_(offset: number) {
++    const dir = offset < 0 ? 1 : -1;
++    const next = this.neighbour_(dir);
++    const width = this.pageWidth_();
++    if (!next) {
++      offset = Math.max(-width * 0.12, Math.min(width * 0.12, offset / 4));
++    }
++    this.slideOffset_ = Math.max(-width, Math.min(width, offset));
++    if (next && next.id !== this.ghost_?.id) {
++      this.ghostDir_ = dir;
++      this.ghost_ = next;  // painted once rendered (updated())
++    }
++    this.paintSlide_();
++  }
++
++  private paintSlide_() {
++    const page = this.shadowRoot.getElementById('spacePage');
++    const ghost = this.shadowRoot.getElementById('ghostPage');
++    const width = this.pageWidth_();
++    const offset = this.slideOffset_;
++    if (page) {
++      page.style.transform = offset ? `translateX(${offset}px)` : '';
++    }
++    if (ghost) {
++      ghost.style.transform =
++          `translateX(${offset + this.ghostDir_ * width}px)`;
++      ghost.style.visibility = 'visible';
++    }
++    this.tintSlide_(Math.min(1, Math.abs(offset) / width));
++  }
++
++  // The window's colour, `t` of the way to the neighbour's.
++  private tintSlide_(t: number) {
++    const from = this.space_;
++    const to = this.ghost_;
++    if (!from) {
++      return;
++    }
++    this.fire('meridian-space-changed', {
++      color: to ? mixColor(from.color, to.color, t) : from.color,
++      color2: to ? mixColor(from.color2, to.color2, t) : from.color2,
++    });
++  }
++
++  // Animates the page from where it is to `to` px (the neighbour alongside),
++  // the colour with it.
++  private animateSlide_(to: number): Promise<void> {
++    const page = this.shadowRoot.getElementById('spacePage');
++    const ghost = this.shadowRoot.getElementById('ghostPage');
++    const width = this.pageWidth_();
++    const from = this.slideOffset_;
++    const duration = 160 + 120 * Math.abs(to - from) / width;
++    const opts: KeyframeAnimationOptions =
++        {duration, easing: 'cubic-bezier(0.25, 0.8, 0.25, 1)', fill: 'forwards'};
++    const shift = this.ghostDir_ * width;
++    page?.animate([{transform: `translateX(${from}px)`},
++                   {transform: `translateX(${to}px)`}], opts);
++    const done = ghost ?
++        ghost.animate([{transform: `translateX(${from + shift}px)`},
++                       {transform: `translateX(${to + shift}px)`}], opts)
++            .finished :
++        new Promise(r => setTimeout(r, duration));
++    const start = performance.now();
++    const tint = () => {
++      const k = Math.min(1, (performance.now() - start) / duration);
++      const eased = 1 - Math.pow(1 - k, 3);
++      this.tintSlide_(Math.abs(from + (to - from) * eased) / width);
++      if (k < 1) {
++        requestAnimationFrame(tint);
++      }
++    };
++    requestAnimationFrame(tint);
++    this.slideOffset_ = to;
++    return done.then(() => {});
++  }
++
++  private async finishSlide_() {
++    const target = this.ghost_;
++    if (!target) {
++      return;
++    }
++    this.slidTo_ = target.id;
++    await this.animateSlide_(-this.ghostDir_ * this.pageWidth_());
++    this.handler_.activateSpace(target.id);
++    // A space in another profile shows in its own window, and this one
++    // never switches: tidy up anyway.
++    clearTimeout(this.slideReset_);
++    this.slideReset_ = setTimeout(() => this.resetSlide_(), 1500);
++  }
++
++  private async springBack_() {
++    await this.animateSlide_(0);
++    this.resetSlide_();
++  }
++
++  private resetSlide_() {
++    clearTimeout(this.slideReset_);
++    for (const id of ['spacePage', 'ghostPage']) {
++      const el = this.shadowRoot.getElementById(id);
++      el?.getAnimations().forEach(a => a.cancel());
++      el?.style.removeProperty('transform');
++    }
++    this.slideOffset_ = 0;
++    this.slidTo_ = '';
++    this.ghost_ = null;
++    this.tintSlide_(0);
++  }
++
++  // Switches to `target` with the slide (a space dot, ⌃1–9, ⌃⇥).
++  private async slideTo_(target: Space, dir?: number) {
++    const spaces = this.state_?.spaces || [];
++    const from = spaces.findIndex(sp => sp.id === this.space_?.id);
++    const to = spaces.indexOf(target);
++    if (from < 0 || to === from || this.slidTo_ || this.swipe_.tracking ||
++        window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
++      if (to !== from) {
++        this.handler_.activateSpace(target.id);
++      }
++      return;
++    }
++    this.ghostDir_ = dir || (to > from ? 1 : -1);
++    this.slideOffset_ = 0;
++    this.ghost_ = target;
++    await this.updateComplete;
++    this.finishSlide_();
++  }
++
+   protected onSpaceDotContextmenu_(e: MouseEvent) {
+     const space = this.spaceFromEvent_(e);
+     if (space) {
+@@ -1131,10 +1356,19 @@ export class MeridianSidebarElement extends CrLitElement implements
+         this.state_?.offTheRecord ? 'Private' : this.space_?.name || '';
+     this.favorites_ = this.state_?.favorites || [];
+     this.today_ = this.todayTabs();
++    this.ghostToday_ = this.ghost_ ? this.todayTabs(this.ghost_) : [];
+   }
+ 
+   override updated(changed: PropertyValues<this>) {
+     super.updated(changed);
++    if (changed.has('ghost_' as keyof MeridianSidebarElement)) {
++      this.paintSlide_();
++    }
++    // The switch a slide finished is showing: the page takes over from the
++    // neighbour, before this frame paints.
++    if (this.slidTo_ && this.space_?.id === this.slidTo_) {
++      this.resetSlide_();
++    }
+     if (changed.has('menu_' as keyof MeridianSidebarElement)) {
+       this.placeMenus_();
+     }
+diff --git a/chrome/browser/ui/cocoa/history_overlay_controller.mm b/chrome/browser/ui/cocoa/history_overlay_controller.mm
+index 278340d773..f52924cd1c 100644
+--- a/chrome/browser/ui/cocoa/history_overlay_controller.mm
++++ b/chrome/browser/ui/cocoa/history_overlay_controller.mm
+@@ -128,7 +128,9 @@ const CGFloat kShieldHeightCompletionAdjust = 10;
+ 
+ - (void)setProgress:(CGFloat)gestureAmount finished:(BOOL)finished {
+   DCHECK(self.view.superview);
+-  NSRect parentFrame = self.view.superview.frame;
++  // Meridian: the superview's own coordinates (it may sit inside another
++  // view, over a page).
++  NSRect parentFrame = self.view.superview.bounds;
+   // When tracking the gesture, the height is constant and the alpha value
+   // changes from [0.25, 0.65].
+   CGFloat height = kShieldHeight;

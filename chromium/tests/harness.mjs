@@ -181,6 +181,16 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
       await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', clickCount: 1 });
       await cdp.send('Input.setInterceptDrags', { enabled: false });
     },
+    // A two-finger horizontal swipe: `dx` px of wheel deltas over the element, in `steps` events
+    // a frame apart; `during` runs after the last one, before the gesture goes quiet.
+    async swipe(elExpr, dx, { steps = 10, during } = {}) {
+      const r = await b.point(elExpr);
+      for (let i = 0; i < steps; i++) {
+        await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: r.x, y: r.y, deltaX: dx / steps, deltaY: 0 });
+        await sleep(16);
+      }
+      if (during) await during();
+    },
     async type(text) {
       await cdp.send('Input.insertText', { text });
     },

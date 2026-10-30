@@ -8,7 +8,15 @@ import { launch, SB } from './harness.mjs';
 
 const ST = 'app.$.settings.shadowRoot';
 const C = { showSettings: 13 };
-const open = (b) => b.eval(`app.$.tabstrip.runCommand(${C.showSettings}, 0)`).then(() => b.waitFor(`app.$.settings.open && !!${ST}.getElementById('general')`));
+// Settings opens on the member's tab (Arc's); most tests then go to General.
+const open = async (b, section = 'general') => {
+  await b.eval(`app.$.tabstrip.runCommand(${C.showSettings}, 0)`);
+  await b.waitFor(`app.$.settings.open && !!${ST}.getElementById('member')`);
+  if (section !== 'member') {
+    await b.click(`[...${ST}.querySelectorAll('.tab')].find((t) => t.dataset.id === ${JSON.stringify(section)})`);
+    await b.waitFor(`!!${ST}.getElementById(${JSON.stringify(section)})`);
+  }
+};
 const settings = (b) => b.eval(`app.$.tabstrip.handler_.getSettings().then((r) => r.settings)`);
 
 test('General: sidebar side, theme and archive time apply and are kept', async () => {
@@ -110,24 +118,27 @@ test('AI: choosing an access level starts the agent socket; Connect shows the ex
   } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
 
-test('General: the member card shows the name and since when; clicking the name changes it, and it stays', async () => {
+test('The member tab: the card shows the name and since when; clicking the name changes it, and it stays', async () => {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
   let b = await launch(['about:blank'], { profile });
   const MC = `${ST}.querySelector('meridian-member-card').shadowRoot`;
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-    await open(b);
+    await open(b, 'member');
     await b.waitFor(`${MC}.querySelector('.since').textContent.startsWith('Member since')`);
     assert.match(await b.eval(`${MC}.querySelector('.no').textContent`), /^No\. \d{4} \d{4}$/);
     await b.click(`${MC}.getElementById('name')`);
     await b.waitFor(`${MC}.querySelector('input.name-input')`);
     await b.eval(`(() => { const i = ${MC}.querySelector('input.name-input'); i.value = 'Ada Lovelace'; i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); })()`);
     await b.waitFor(`${MC}.getElementById('name')?.textContent.trim() === 'Ada Lovelace'`);
+    // The first tab and the title carry the first name, like Arc.
+    await b.waitFor(`${ST}.querySelector('.tab[data-id="member"]').textContent.trim() === 'Ada'`);
+    assert.equal(await b.eval(`${ST}.querySelector('#toolbar .title').textContent.trim()`), 'Ada');
     await b.waitFor(`app.$.tabstrip.handler_.getSettings().then((r) => r.settings.memberName === 'Ada Lovelace')`);
     await b.quit();
     b = await launch(['about:blank'], { profile });
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length >= 1`);
-    await open(b);
+    await open(b, 'member');
     await b.waitFor(`${MC}.getElementById('name')?.textContent.trim() === 'Ada Lovelace'`);
   } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
