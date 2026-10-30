@@ -1,0 +1,285 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 30 Oct 2026 19:16:00 +0400
+Subject: [PATCH 70/70] Meridian: the command bar reads text typed in the wrong
+ keyboard layout
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+"ghbdtn" offers "привет", "пщщпду" offers "google" (Russian ЙЦУКЕН and
+US QWERTY): when the other layout's letters read far more like its language
+than the typed ones (no English vowels, letter frequencies), or match a
+popular site or an open tab's host. A row above the suggestions; ⇥ or a
+click puts it in the field.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/resources/webui_browser/BUILD.gn  |   1 +
+ .../webui_browser/meridian/command_bar.css    |  10 ++
+ .../meridian/command_bar.html.ts              |  10 ++
+ .../webui_browser/meridian/command_bar.ts     |  33 +++++
+ .../webui_browser/meridian/layout_fix.ts      | 123 ++++++++++++++++++
+ 5 files changed, 177 insertions(+)
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/layout_fix.ts
+
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index e2e3cd349c..7c3d7c4645 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -47,6 +47,7 @@ build_webui("build") {
+     "meridian/archive.ts",
+     "meridian/command_bar.html.ts",
+     "meridian/command_bar.ts",
++    "meridian/layout_fix.ts",
+     "meridian/fav.html.ts",
+     "meridian/fav.ts",
+     "meridian/home.html.ts",
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.css b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+index ebe332d273..8a36247da3 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.css
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+@@ -241,3 +241,13 @@ webui-browser-searchbox {
+   background: #fff;
+   color: #1d1d22;
+ }
++
++/* "ghbdtn" → "привет": the typed text in the other keyboard layout. */
++.tab-row.fix {
++  width: calc(100% - 16px);
++  margin: 8px 8px 0;
++}
++
++.tab-row.fix .tab-title {
++  font-weight: 600;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+index 914061a171..8efddd025e 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+@@ -17,6 +17,16 @@ export function getHtml(this: MeridianCommandBarElement) {
+         .placeholderText="${'Search or Enter URL…'}"
+         @keyup="${this.onAddressKeyup_}"
+         @searchbox-navigated="${this.onAddressSearchboxNavigated_}">
++      ${this.layoutFix_ ? html`
++        <button id="layoutFix" class="tab-row fix" slot="before-matches"
++            title="Typed in the other keyboard layout? (⇥)"
++            @mousedown="${this.onTabRowMousedown_}"
++            @click="${this.onLayoutFixClick_}">
++          <span class="tab-icon">${icon('keyboard', 18)}</span>
++          <span class="tab-title">${this.layoutFix_}</span>
++          <span class="switch">Other layout</span>
++          <span class="go">⇥</span>
++        </button>` : ''}
+       ${this.tabRows_.length ? html`
+         <div id="tabs" class="tabs" slot="before-matches">
+           ${this.tabRows_.map((t, i) => html`
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index e771119ee5..0f2d761e02 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -18,6 +18,7 @@ import {browserProxyFactory} from '../sidebar.mojom-webui.js';
+ 
+ import {getCss} from './command_bar.css.js';
+ import {getHtml} from './command_bar.html.js';
++import {fixLayout} from './layout_fix.js';
+ import {renderMarkdown} from './markdown.js';
+ 
+ export interface MeridianCommandBarElement {
+@@ -58,6 +59,7 @@ export class MeridianCommandBarElement extends CrLitElement {
+       tabs: {type: Array},
+       query_: {state: true, type: String},
+       tabRows_: {state: true, type: Array},
++      layoutFix_: {state: true, type: String},
+       tabSel_: {state: true, type: Number},
+     };
+   }
+@@ -68,6 +70,8 @@ export class MeridianCommandBarElement extends CrLitElement {
+   protected accessor query_: string = '';
+   protected accessor tabRows_: CommandBarTab[] = [];
+   protected accessor tabSel_: number = -1;
++  // What was typed, read in the other keyboard layout ("ghbdtn": "привет").
++  protected accessor layoutFix_: string = '';
+ 
+   protected tabHost_(url: string): string {
+     try {
+@@ -89,6 +93,23 @@ export class MeridianCommandBarElement extends CrLitElement {
+     }
+   }
+ 
++  protected onLayoutFixClick_() {
++    this.applyLayoutFix_();
++  }
++
++  // The field takes the text as meant, and the suggestions follow it.
++  private applyLayoutFix_() {
++    const input = this.$.address.shadowRoot.querySelector('cr-searchbox-input')
++                      ?.shadowRoot?.querySelector<HTMLInputElement>('input');
++    if (!input || !this.layoutFix_) {
++      return;
++    }
++    input.value = this.layoutFix_;
++    input.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
++    this.query_ = this.layoutFix_;
++    this.tabSel_ = -1;
++  }
++
+   // The field keeps the focus: losing it hides the suggestions, the rows
+   // move up and the press and the release land on different rows.
+   protected onTabRowMousedown_(e: Event) {
+@@ -153,6 +174,11 @@ export class MeridianCommandBarElement extends CrLitElement {
+             .slice(0, 3) :
+         this.tabs.slice(0, 4);
+     this.tabRows_ = rows;
++    if (changed.has('query_' as keyof MeridianCommandBarElement) ||
++        changed.has('tabs' as keyof MeridianCommandBarElement)) {
++      const hosts = this.tabs.map(t => this.tabHost_(t.url).split('.')[0]!);
++      this.layoutFix_ = fixLayout(this.query_.trim(), hosts);
++    }
+     if (this.tabSel_ >= rows.length) {
+       this.tabSel_ = -1;
+     }
+@@ -232,6 +258,13 @@ export class MeridianCommandBarElement extends CrLitElement {
+       this.hide();
+       return;
+     }
++    // ⇥ takes the other layout's reading.
++    if (e.key === 'Tab' && !e.shiftKey && this.layoutFix_) {
++      e.preventDefault();
++      e.stopPropagation();
++      this.applyLayoutFix_();
++      return;
++    }
+     // With nothing typed, the arrows go through the open tabs.
+     if (!this.query_.trim() && this.tabRows_.length &&
+         (e.key === 'ArrowDown' || e.key === 'ArrowUp' ||
+diff --git a/chrome/browser/resources/webui_browser/meridian/layout_fix.ts b/chrome/browser/resources/webui_browser/meridian/layout_fix.ts
+new file mode 100644
+index 0000000000..069098ac23
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/layout_fix.ts
+@@ -0,0 +1,123 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Text typed in the wrong keyboard layout ("ghbdtn" for "привет", "пщщпду"
++// for "google"): the same keys in the other layout (Russian ЙЦУКЕН and US
++// QWERTY), when its letters are much more like that language's than the typed
++// ones are like theirs (letter frequencies, per letter on average).
++
++const EN = '`qwertyuiop[]asdfghjkl;\'zxcvbnm,./';
++const RU = 'ёйцукенгшщзхъфывапролджэячсмитьбю.';
++
++// Letter frequencies, in percent.
++const EN_FREQ: Record<string, number> = {
++  e: 12.7, t: 9.06, a: 8.17, o: 7.51, i: 6.97, n: 6.75, s: 6.33, h: 6.09,
++  r: 5.99, d: 4.25, l: 4.03, c: 2.78, u: 2.76, m: 2.41, w: 2.36, f: 2.23,
++  g: 2.02, y: 1.97, p: 1.93, b: 1.29, v: 0.98, k: 0.77, j: 0.15, x: 0.15,
++  q: 0.10, z: 0.07,
++};
++const RU_FREQ: Record<string, number> = {
++  'о': 10.97, 'е': 8.45, 'а': 8.01, 'и': 7.35, 'н': 6.70, 'т': 6.26,
++  'с': 5.47, 'р': 4.73, 'в': 4.54, 'л': 4.40, 'к': 3.49, 'м': 3.21,
++  'д': 2.98, 'п': 2.81, 'у': 2.62, 'я': 2.01, 'ы': 1.90, 'ь': 1.74,
++  'г': 1.70, 'з': 1.65, 'б': 1.59, 'ч': 1.44, 'й': 1.21, 'х': 0.97,
++  'ж': 0.94, 'ш': 0.73, 'ю': 0.64, 'ц': 0.48, 'щ': 0.36, 'э': 0.32,
++  'ф': 0.26, 'ъ': 0.04, 'ё': 0.04,
++};
++
++// How much more likely the converted text has to be, in nats per letter.
++const MARGIN = 0.6;
++
++function convert(text: string, from: string, to: string): string {
++  let out = '';
++  for (const ch of text) {
++    const lower = ch.toLowerCase();
++    const i = from.indexOf(lower);
++    if (i < 0) {
++      out += ch;
++      continue;
++    }
++    const mapped = to[i]!;
++    out += ch === lower ? mapped : mapped.toUpperCase();
++  }
++  return out;
++}
++
++// The mean log-frequency of `text`'s letters; null without any.
++function score(text: string, freq: Record<string, number>): number|null {
++  let sum = 0;
++  let n = 0;
++  for (const ch of text.toLowerCase()) {
++    const f = freq[ch];
++    if (f !== undefined) {
++      sum += Math.log(f);
++      n++;
++    }
++  }
++  return n ? sum / n : null;
++}
++
++// Sites people type by name; with the open tabs' hosts they catch "пшерги"
++// (github), where letters alone can't tell.
++const SITES = [
++  'google', 'gmail', 'github', 'gitlab', 'youtube', 'yandex', 'wikipedia',
++  'facebook', 'instagram', 'twitter', 'reddit', 'linkedin', 'amazon',
++  'netflix', 'spotify', 'notion', 'figma', 'slack', 'telegram', 'whatsapp',
++  'chatgpt', 'openai', 'claude', 'anthropic', 'stackoverflow', 'medium',
++  'habr', 'translate', 'maps', 'drive', 'docs', 'calendar', 'outlook',
++  'apple', 'microsoft', 'booking', 'airbnb', 'ozon', 'wildberries', 'avito',
++  'kinopoisk', 'twitch', 'discord', 'zoom', 'jira', 'confluence', 'trello',
++];
++
++const EN_VOWELS = 'aeiouy';
++const RU_VOWELS = 'аеёиоуыэюя';
++
++function vowelShare(text: string, vowels: string): number {
++  const letters = text.toLowerCase().replace(/[^\p{L}]/gu, '');
++  return letters ?
++      [...letters].filter(ch => vowels.includes(ch)).length / letters.length :
++      0;
++}
++
++// What was meant, or '' when `text` looks typed in the right layout. `known`:
++// more names to recognise (the open tabs' hosts).
++export function fixLayout(text: string, known: string[] = []): string {
++  // Addresses and numbers are typed as they are.
++  if (/\d|:\/\/|\.\w{2,}(\/|$)/.test(text)) {
++    return '';
++  }
++  // Three letters are too few to tell ("sql").
++  const letters = text.replace(/[^\p{L}]/gu, '');
++  if (letters.length < 4) {
++    return '';
++  }
++  if (/^[a-z]+$/i.test(letters)) {
++    const ru = convert(text, EN, RU);
++    const vowels = vowelShare(text, EN_VOWELS);
++    const typed = score(text, EN_FREQ)!;
++    const other = score(ru, RU_FREQ)!;
++    // Russian vowels sit on English consonant keys: hardly any vowels left
++    // (and the Russian reads no worse: not "html", "strengths").
++    if (vowels < 0.15 && vowelShare(ru, RU_VOWELS) >= 0.25 &&
++        other >= typed) {
++      return ru;
++    }
++    return vowels < 0.3 && other - typed >= MARGIN ? ru : '';
++  }
++  if (/^[а-яё]+$/i.test(letters)) {
++    const en = convert(text, RU, EN);
++    const word = en.toLowerCase().replace(/[^a-z]/g, '');
++    if (word.length >= 4 &&
++        [...SITES, ...known].some(name => name.startsWith(word))) {
++      return en;
++    }
++    const typed = score(text, RU_FREQ)!;
++    const other = score(en, EN_FREQ)!;
++    return vowelShare(text, RU_VOWELS) < 0.4 &&
++            vowelShare(en, EN_VOWELS) >= 0.25 && other - typed >= MARGIN ?
++        en :
++        '';
++  }
++  return '';
++}

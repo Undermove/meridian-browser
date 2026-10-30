@@ -111,3 +111,20 @@ test('⌘T lists the open tabs (Switch to Tab), filters them as you type, and sw
     await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive)?.tab.title === ${JSON.stringify(first)}`);
   } finally { await b.close(); await site.close(); }
 });
+
+test('typed in the other keyboard layout: the command bar offers what was meant; ⇥ takes it', async () => {
+  const b = await launch(['about:blank']);
+  const CB = `${BAR}.shadowRoot`;
+  const field = `${BAR}.$.address.shadowRoot.querySelector('cr-searchbox-input').shadowRoot.querySelector('input')`;
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    await b.click(`${SB}.getElementById('newTabButton')`);
+    await b.waitFor(open);
+    await b.type('ghbdtn');
+    await b.key('ArrowRight', 'ArrowRight', 39);  // a key up: the bar reads the field
+    await b.waitFor(`${CB}.getElementById('layoutFix')?.querySelector('.tab-title').textContent.trim() === 'привет'`);
+    await b.key('Tab', 'Tab', 9);
+    await b.waitFor(`${field}.value === 'привет'`);
+    await b.waitFor(`!${CB}.getElementById('layoutFix')`);
+  } finally { await b.close(); }
+});
