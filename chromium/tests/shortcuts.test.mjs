@@ -15,7 +15,7 @@ const activeTitle = `[...app.$.tabstrip.tabs_.values()].find((t) => t.isActive)?
 const C = { selectTab: 0, stepTab: 1, selectSpace: 2, stepSpace: 3, togglePin: 4, toggleSidebar: 5, newFolder: 6 };
 // NSEventModifierFlags and macOS virtual key codes.
 const CMD = 1 << 20, OPT = 1 << 19, CTRL = 1 << 18;
-const K = { 1: [18, '1'], 2: [19, '2'], 3: [20, '3'], left: [123, '\uF702'], right: [124, '\uF703'] };
+const K = { 1: [18, '1'], 2: [19, '2'], 3: [20, '3'], t: [17, 't'], left: [123, '\uF702'], right: [124, '\uF703'] };
 
 // ⌘D and ⌘S are main menu key equivalents: AppKit hands those to the menu, which doesn't answer a test
 // window in the background, so they stay with the Command tests below.
@@ -111,5 +111,16 @@ test('⌘S hides the sidebar; the window edge brings it back over the page', asy
     await b.waitFor(`!app.hasAttribute('sidebar-peek')`);
     await b.eval(`app.$.tabstrip.runCommand(${C.toggleSidebar}, 0)`);
     await b.waitFor(`!app.hasAttribute('sidebar-hidden')`);
+  } finally { await b.close(); }
+});
+
+test('a real ⌘T opens the command bar, not a new tab', async () => {
+  const b = await launch([page('A')], { args: ['--meridian-test-keys'] });
+  const press = ([code, ch], mods) => b.eval(`app.$.tabstrip.handler_.testKeyPress(${code}, ${JSON.stringify(ch)}, ${mods})`);
+  try {
+    await b.waitFor(today(1));
+    await press(K.t, CMD);
+    await b.waitFor(`app.$.commandBar.open`);
+    assert.equal(await b.eval(`app.$.tabstrip.tabs_.size`), 1, 'no tab opened');
   } finally { await b.close(); }
 });

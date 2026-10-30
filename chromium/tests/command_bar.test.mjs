@@ -91,12 +91,21 @@ test('⌘T lists the open tabs (Switch to Tab), filters them as you type, and sw
     await b.click(`${CB}.querySelector('.tab-row')`);
     await b.waitFor(`!${open}`);
     await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive)?.tab.title === 'Beta'`);
-    // With nothing typed, ↓ and Return pick a tab.
+    // With nothing typed the latest tab comes first and is picked (Arc): the one just left.
+    const left = await b.eval(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive).tab.title`);
+    await b.eval(`app.$.tabstrip.activateTab([...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Gamma').tab.id)`);
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive)?.tab.title === 'Gamma'`);
     await b.click(`${SB}.getElementById('newTabButton')`);
     await b.waitFor(`${open} && ${CB}.querySelectorAll('.tab-row').length === 2`);
-    const first = await b.eval(`${CB}.querySelector('.tab-row .tab-title').textContent`);
+    const rows = `[...${CB}.querySelectorAll('.tab-row')]`;
+    assert.equal(await b.eval(`${rows}[0].querySelector('.tab-title').textContent`), left);
+    assert.equal(await b.eval(`${rows}.findIndex((r) => r.classList.contains('sel'))`), 0);
+    // ↓ and ↑ move the pick; Return switches to it.
     await b.key('ArrowDown', 'ArrowDown', 40);
-    await b.waitFor(`${CB}.querySelector('.tab-row.sel')`);
+    await b.waitFor(`${rows}.findIndex((r) => r.classList.contains('sel')) === 1`);
+    await b.key('ArrowUp', 'ArrowUp', 38);
+    await b.waitFor(`${rows}.findIndex((r) => r.classList.contains('sel')) === 0`);
+    const first = left;
     await b.key('Enter', 'Enter', 13);
     await b.waitFor(`!${open}`);
     await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive)?.tab.title === ${JSON.stringify(first)}`);
