@@ -12,4 +12,5 @@ cd "$HERE"
 args=(--test --test-force-exit --test-concurrency=1 --test-timeout=90000)
 [ $# -gt 0 ] && args+=(--test-name-pattern="$1")
 node "${args[@]}" ./*.test.mjs || fail=1
+"$HERE/../tools/clean_temp.sh" || true
 exit $fail

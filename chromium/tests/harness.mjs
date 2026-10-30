@@ -230,6 +230,12 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
         const p = path.join(os.tmpdir(), name);
         try { if (fs.statSync(p).mtimeMs >= started - 1000) fs.rmSync(p, { recursive: true, force: true }); } catch {}
       }
+      // The app copy Chromium makes at launch (code_sign_clone) and only removes on a normal quit.
+      const clones = path.join(path.dirname(os.tmpdir()), 'X', 'dev.meridian.browser.code_sign_clone');
+      for (const name of fs.existsSync(clones) ? fs.readdirSync(clones) : []) {
+        const p = path.join(clones, name);
+        try { if (fs.statSync(p).birthtimeMs >= started - 1000) fs.rmSync(p, { recursive: true, force: true }); } catch {}
+      }
     },
   };
   return b;

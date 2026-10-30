@@ -14,6 +14,7 @@ if [ "$ARGS" != "$(cat "$DIR/src/out/Release/args.gn" 2>/dev/null)" ]; then
   printf '%s\n' "$ARGS" > "$DIR/src/out/Release/args.gn"
   (cd "$DIR/src" && gn gen out/Release >/dev/null)
 fi
+"$HERE/tools/clean_temp.sh" || true
 cd "$DIR/src" && caffeinate -i autoninja -C out/Release chrome
 # Ad blocking rules: fetched again when missing or older than a week.
 RULES="$DIR/src/out/Release/Meridian.app/Contents/Resources/meridian_adblock.dat"
