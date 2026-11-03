@@ -202,3 +202,29 @@ test('a space of another profile: ⌘T suggests from that profile\'s history onl
     assert.doesNotMatch(got, /kiwi-work/, `not Work's: ${got}`);
   } finally { await b.close(); s.close(); }
 });
+
+test('macOS full screen: ⌘T, the arrows, Return and Esc work the same', async () => {
+  const { b, s, press, state } = await start(['One', 'Two', 'Three']);
+  try {
+    await b.eval(`app.$.tabstrip.handler_.testCommand(34030)`);  // IDC_FULLSCREEN
+    await sleep(2500);
+    await b.click('app.$.contentRegion');
+    await b.waitFor(`app.$.contentRegion.activeWebview?.shadowRoot.activeElement?.classList.contains('content')`);
+    await press(KEY.t, CMD);
+    await b.waitFor(`app.$.commandBar.open`);
+    await press(KEY.down);
+    assert.deepEqual((await state()).tabs, ['Two', '>One']);
+    await press(KEY.enter);
+    await until(async () => (await state()).active === 'One');
+    assert.equal((await state()).active, 'One');
+    assert.ok(await until(async () => (await state()).pageFocused), 'the page has the keys again');
+    await press(KEY.t, CMD);
+    await b.waitFor(`app.$.commandBar.open`);
+    await press(KEY.x);
+    assert.equal(await until(async () => (await state()).input), 'x');
+    await press(KEY.esc);
+    assert.ok(await until(async () => !(await state()).open), 'Esc closed it');
+    await b.eval(`app.$.tabstrip.handler_.testCommand(34030)`);
+    await sleep(1500);
+  } finally { await b.close(); s.close(); }
+});

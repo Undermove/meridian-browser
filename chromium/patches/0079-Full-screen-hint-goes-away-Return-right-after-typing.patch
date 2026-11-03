@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 3 Nov 2026 20:02:14 +0400
+Subject: [PATCH 80/80] Full screen hint goes away; Return right after typing;
+ test keys like the menu
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- The "exit full screen" hint stayed for as long as full screen lasted: its
+  hide timer waited for presentation feedback that never comes in the WebUI
+  window's full screen. It now starts a second after the hint shows anyway.
+- ⌘L/⌘T: Return pressed right after typing, before the first suggestions,
+  was dropped (the searchbox ignored keys with no matches yet). It now
+  waits for them and opens the default match, as the omnibox does.
+- testKeyPress: Close Tab/Close Window chosen for ⌘W/⇧⌘W as the menu does
+  for a key window with tabs; upper-case key equivalents imply Shift.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/meridian/sidebar_handler_mac.mm   | 25 ++++++++++++++++---
+ .../exclusive_access_bubble_views.cc          | 16 ++++++++++++
+ .../exclusive_access_bubble_views.h           |  2 ++
+ .../searchbox/searchbox_mixin.ts              |  5 +++-
+ 4 files changed, 44 insertions(+), 4 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar_handler_mac.mm b/chrome/browser/meridian/sidebar_handler_mac.mm
+index 055fe8a7b6..ac57068f0a 100644
+--- a/chrome/browser/meridian/sidebar_handler_mac.mm
++++ b/chrome/browser/meridian/sidebar_handler_mac.mm
+@@ -9,12 +9,14 @@
+ 
+ #include "base/command_line.h"
+ #include "base/strings/sys_string_conversions.h"
++#include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/meridian/test_switches.h"
+ 
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+ #include "content/public/browser/browser_task_traits.h"
+ #include "content/public/browser/browser_thread.h"
++#include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "ui/base/base_window.h"
+ #include "ui/gfx/native_ui_types.h"
+@@ -87,9 +89,16 @@ NSMenuItem* MenuItemFor(NSMenu* menu, NSString* chars, uint32_t modifiers) {
+       }
+     } else if (item.action && item.keyEquivalent.length &&
+                [item.keyEquivalent.lowercaseString
+-                   isEqualToString:chars.lowercaseString] &&
+-               (item.keyEquivalentModifierMask & mask) == (modifiers & mask)) {
+-      return item;
++                   isEqualToString:chars.lowercaseString]) {
++      // An upper-case key equivalent ("T") implies Shift.
++      NSEventModifierFlags wanted = item.keyEquivalentModifierMask & mask;
++      if (![item.keyEquivalent isEqualToString:item.keyEquivalent
++                                                   .lowercaseString]) {
++        wanted |= NSEventModifierFlagShift;
++      }
++      if (wanted == (modifiers & mask)) {
++        return item;
++      }
+     }
+   }
+   return nil;
+@@ -131,6 +140,16 @@ void SidebarHandler::TestKeyPress(uint16_t key_code,
+     if (NSMenuItem* item = (modifiers & NSEventModifierFlagCommand)
+                                ? MenuItemFor(NSApp.mainMenu, chars, modifiers)
+                                : nil) {
++      // ⌘W and ⇧⌘W swap between Close Tab and Close Window by the key window
++      // (AppController's updateMenuItemKeyEquivalents); for a window with
++      // tabs, ⌘W closes the tab.
++      if (item.tag == IDC_CLOSE_WINDOW || item.tag == IDC_CLOSE_TAB) {
++        chrome::ExecuteCommand(browser_,
++                               (modifiers & NSEventModifierFlagShift)
++                                   ? IDC_CLOSE_WINDOW
++                                   : IDC_CLOSE_TAB);
++        continue;
++      }
+       [NSApp sendAction:item.action to:window from:item];
+       continue;
+     }
+diff --git a/chrome/browser/ui/views/exclusive_access/exclusive_access_bubble_views.cc b/chrome/browser/ui/views/exclusive_access/exclusive_access_bubble_views.cc
+index a9d11501ee..72d07f0d2e 100644
+--- a/chrome/browser/ui/views/exclusive_access/exclusive_access_bubble_views.cc
++++ b/chrome/browser/ui/views/exclusive_access/exclusive_access_bubble_views.cc
+@@ -9,6 +9,7 @@
+ #include "base/i18n/case_conversion.h"
+ #include "base/location.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
+@@ -540,11 +541,25 @@ void ExclusiveAccessBubbleViews::SimulateBrowserWindowPresentedForTesting() {
+ }
+ 
+ void ExclusiveAccessBubbleViews::ShowAndStartTimers() {
++  presented_ = false;
+   presentation_cb_ =
+       base::BindOnce(&ExclusiveAccessBubbleViews::OnFirstPresentation,
+                      weak_ptr_factory_.GetWeakPtr());
+   Show();
+   Snooze();
++  // Meridian: in the WebUI window's full screen the popup's presentation
++  // feedback never arrives, so the hint stayed until full screen ended. Start
++  // the hide timer anyway once the fade-in had time to be seen.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(
++          [](base::WeakPtr<ExclusiveAccessBubbleViews> bubble) {
++            if (bubble && !bubble->presented_) {
++              bubble->OnFirstPresentation({});
++            }
++          },
++          weak_ptr_factory_.GetWeakPtr()),
++      base::Seconds(1));
+ }
+ 
+ void ExclusiveAccessBubbleViews::OnWidgetDestroyed(views::Widget* widget) {
+@@ -566,6 +581,7 @@ void ExclusiveAccessBubbleViews::OnWidgetDestroyed(views::Widget* widget) {
+ 
+ void ExclusiveAccessBubbleViews::OnFirstPresentation(
+     const viz::FrameTimingDetails& details) {
++  presented_ = true;
+   waiting_for_bubble_presentation_ = false;
+   presentation_watchdog_timer_.Stop();
+   StartHideTimer();
+diff --git a/chrome/browser/ui/views/exclusive_access/exclusive_access_bubble_views.h b/chrome/browser/ui/views/exclusive_access/exclusive_access_bubble_views.h
+index afc54685ff..ee689f0df6 100644
+--- a/chrome/browser/ui/views/exclusive_access/exclusive_access_bubble_views.h
++++ b/chrome/browser/ui/views/exclusive_access/exclusive_access_bubble_views.h
+@@ -107,6 +107,8 @@ class ExclusiveAccessBubbleViews : public ExclusiveAccessBubble,
+   void RunHideCallbackIfNeeded(ExclusiveAccessBubbleHideReason reason);
+ 
+   void OnFirstPresentation(const viz::FrameTimingDetails& details);
++  // Meridian: whether OnFirstPresentation() ran (see ShowAndStartTimers()).
++  bool presented_ = false;
+ 
+   // Arms `presentation_watchdog_timer_` once the browser window is presented.
+   void ArmPresentationWatchdog();
+diff --git a/ui/webui/resources/cr_components/searchbox/searchbox_mixin.ts b/ui/webui/resources/cr_components/searchbox/searchbox_mixin.ts
+index 115229f9bf..b5cdd8d988 100644
+--- a/ui/webui/resources/cr_components/searchbox/searchbox_mixin.ts
++++ b/ui/webui/resources/cr_components/searchbox/searchbox_mixin.ts
+@@ -1014,7 +1014,10 @@ export const SearchboxMixin = <T extends Constructor<CrLitElement>>(
+       }
+ 
+       // Do not handle the following keys if there are no matches available.
+-      if (!this.result || this.result.matches.length === 0) {
++      // Enter still goes on: typed and pressed quickly, before the first
++      // matches, it waits for them (see handleEnterNavigation_()).
++      if ((!this.result || this.result.matches.length === 0) &&
++          e.key !== 'Enter') {
+         return;
+       }
+ 

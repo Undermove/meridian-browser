@@ -45,7 +45,8 @@ async function selection(b, suffix) {
 
 async function findBar(b) {
   const { bubbles } = await b.eval(`${T}.handler_.testBubbles('bounds')`);
-  const m = bubbles.map((s) => s.match(/ (-?\d+),(-?\d+) (\d+)x(\d+)$/)).find((x) => x && +x[4] < 200);
+  // The find bar's widget shows a plain View (its clip view); not the full screen hint.
+  const m = bubbles.map((s) => s.match(/^View (-?\d+),(-?\d+) (\d+)x(\d+)$/)).find(Boolean);
   return m && { x: +m[1], y: +m[2], w: +m[3], h: +m[4] };
 }
 
@@ -95,6 +96,12 @@ test('⌘F finds on the page, over the page, in any profile and with the sidebar
     // The sidebar hidden (⌘S): the bar still sits over the page.
     await press(KEY.s, CMD);
     await b.waitFor(`app.$.contentRegion.getBoundingClientRect().left < 40`);
+    await findNeedle(b, press, '/work');
+
+    // macOS full screen (its own Space).
+    await press(KEY.s, CMD);
+    await b.eval(`${T}.handler_.testCommand(34030)`);  // IDC_FULLSCREEN
+    await sleep(2500);
     await findNeedle(b, press, '/work');
   } finally { await b.close(); s.close(); }
 });

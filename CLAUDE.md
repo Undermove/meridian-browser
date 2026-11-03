@@ -22,10 +22,16 @@ feature is broken. Most of the rules below follow from that.
   the menus and the focused page (needs `--meridian-test-keys`). CDP `Input.insertText` and
   `dispatchKeyEvent` bypass native focus, so they don't count for keyboard features.
 - Mouse: `b.click()` (a CDP mouse event at the element's centre).
-- Menu-only shortcuts don't reach a background test window: use `handler_.testCommand(IDC_…)`.
+- `testKeyPress` gives ⌘-shortcuts to the matching main-menu item and aims it at the test window,
+  as the menu does for the key window (⌘W is Close Tab there). One thing it can't do: a key the
+  page gets first and hands back (⇧⌘T) is redispatched only to the key window, which a test window
+  in the background never is. Use `handler_.testCommand(IDC_…)` for those, with a comment.
 - Links from other apps: `tests/tools/open_url.swift` sends a GetURL Apple event to the test
   browser's pid. **Never** use `open -a`: it picks by bundle id, and the user's Meridian gets the
   link.
+- Native widgets (find bar, bubbles, the full screen hint): `handler_.testBubbles('bounds')` lists
+  them with their rects (`--meridian-test-bubbles`).
+- Type the way people do: Return right after the last letter, not after the suggestions settle.
 - Assert on structured state, not pixels. Dump focus chains, the selected row and the visible
   rows (`command_bar_keys.test.mjs` `state()` does this). Use window truth from
   `handler_.testWindowState()`.
