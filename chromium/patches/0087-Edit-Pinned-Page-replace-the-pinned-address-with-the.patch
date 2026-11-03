@@ -1,0 +1,176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 4 Nov 2026 01:58:54 +0400
+Subject: [PATCH 88/90] Edit Pinned Page: replace the pinned address with the
+ current one, or type it
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Arc's right-click > Edit Pinned Page > Replace Pinned URL with Current, and
+Edit… (the address in place of the title, typed).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar.mojom         |  2 ++
+ chrome/browser/meridian/sidebar_handler.cc    |  7 ++++++
+ chrome/browser/meridian/sidebar_handler.h     |  1 +
+ chrome/browser/meridian/sidebar_service.cc    | 10 ++++++++
+ chrome/browser/meridian/sidebar_service.h     |  2 ++
+ .../webui_browser/meridian/item.html.ts       |  5 +++-
+ .../resources/webui_browser/meridian/item.ts  |  4 +++
+ .../webui_browser/meridian/sidebar.ts         | 25 +++++++++++++++++++
+ 8 files changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 80e0aef344..6b30462cb9 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -488,6 +488,8 @@ interface SidebarHandler {
+   // Removing a folder unpins everything in it.
+   RemoveItem(string item_id);
+   RenameItem(string item_id, string title);
++  // A pinned tab's or favorite's home address (Edit Pinned Page): http(s).
++  SetItemUrl(string item_id, url.mojom.Url url);
+   SetFolderOpen(string item_id, bool open);
+   // Activates the item's live tab, or opens its home URL in a new tab.
+   OpenItem(string item_id);
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index d485cdcc92..e06ae18ed6 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -2320,6 +2320,13 @@ void SidebarHandler::RenameItem(const std::string& item_id,
+   service_->RenameItem(item_id, title);
+ }
+ 
++void SidebarHandler::SetItemUrl(const std::string& item_id,
++                                const GURL& url) {
++  if (url.SchemeIsHTTPOrHTTPS()) {
++    service_->SetItemUrl(item_id, url);
++  }
++}
++
+ void SidebarHandler::SetFolderOpen(const std::string& item_id, bool open) {
+   service_->SetFolderOpen(item_id, open);
+ }
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index ae6f3d6503..88b90a8d4a 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -138,6 +138,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void MoveItem(const std::string& item_id,
+                 mojom::ItemPositionPtr position) override;
+   void RemoveItem(const std::string& item_id) override;
++  void SetItemUrl(const std::string& item_id, const GURL& url) override;
+   void RenameItem(const std::string& item_id,
+                   const std::string& title) override;
+   void SetFolderOpen(const std::string& item_id, bool open) override;
+diff --git a/chrome/browser/meridian/sidebar_service.cc b/chrome/browser/meridian/sidebar_service.cc
+index 233d27c259..e145002516 100644
+--- a/chrome/browser/meridian/sidebar_service.cc
++++ b/chrome/browser/meridian/sidebar_service.cc
+@@ -625,6 +625,16 @@ bool SidebarService::RenameItem(const std::string& item_id,
+   return true;
+ }
+ 
++bool SidebarService::SetItemUrl(const std::string& item_id, const GURL& url) {
++  Item* item = const_cast<Item*>(FindItem(item_id));
++  if (!item || item->is_folder || !url.is_valid()) {
++    return false;
++  }
++  item->url = url;
++  Changed();
++  return true;
++}
++
+ bool SidebarService::SetFolderOpen(const std::string& item_id, bool open) {
+   Item* item = const_cast<Item*>(FindItem(item_id));
+   if (!item || !item->is_folder) {
+diff --git a/chrome/browser/meridian/sidebar_service.h b/chrome/browser/meridian/sidebar_service.h
+index 3ac4f508e1..cf4385b89d 100644
+--- a/chrome/browser/meridian/sidebar_service.h
++++ b/chrome/browser/meridian/sidebar_service.h
+@@ -147,6 +147,8 @@ class SidebarService : public KeyedService {
+                 int index);
+   bool RemoveItem(const std::string& item_id);
+   bool RenameItem(const std::string& item_id, const std::string& title);
++  // A pinned tab's or favorite's home address (Arc's Edit Pinned Page).
++  bool SetItemUrl(const std::string& item_id, const GURL& url);
+   bool SetFolderOpen(const std::string& item_id, bool open);
+ 
+   // Import (from Arc): adds `spaces` after the existing ones, or in place of
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.html.ts b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+index ac0d8f8673..888d14f712 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+@@ -51,7 +51,10 @@ ${this.item && !this.item.isFolder ? html`
+     ${this.renaming === this.item.id ? html`
+       <input class="rename" .value="${this.item.title}" spellcheck="false"
+           @keydown="${this.onRenameKeydown_}" @blur="${this.onRenameBlur_}">
+-    ` : html`<span class="title">${this.title_}</span>`}
++    ` : html`${this.renaming === 'url:' + this.item.id ? html`
++      <input class="rename url" .value="${this.item.url}" spellcheck="false"
++          @keydown="${this.onRenameKeydown_}" @blur="${this.onUrlBlur_}">
++    ` : html`<span class="title">${this.title_}</span>`}`}
+     ${this.audio_ ? html`
+       <button class="row-btn audio" title="${this.audioTitle_}"
+           @mousedown="${this.onAudioMousedown_}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.ts b/chrome/browser/resources/webui_browser/meridian/item.ts
+index 436139695c..0b21bc741b 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.ts
+@@ -140,6 +140,10 @@ export class MeridianItemElement extends CrLitElement {
+   protected onRenameBlur_(e: Event) {
+     this.host?.onRenameBlur(e, this.item!.id, false);
+   }
++
++  protected onUrlBlur_(e: Event) {
++    this.host?.onRenameBlur(e, 'url:' + this.item!.id, false);
++  }
+ }
+ 
+ declare global {
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 00403fd42e..284d251ee2 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -1460,6 +1460,14 @@ export class MeridianSidebarElement extends CrLitElement implements
+     }
+     const value = (e.target as HTMLInputElement).value.trim();
+     this.renaming_ = '';
++    // Edit Pinned Page > Edit…: the item's home address.
++    if (id.startsWith('url:')) {
++      if (value) {
++        this.handler_.setItemUrl(
++            id.slice(4), /^[a-z]+:\/\//i.test(value) ? value : 'https://' + value);
++      }
++      return;
++    }
+     if (isSpace) {
+       this.openNamedSpace_();
+     }
+@@ -1717,6 +1725,23 @@ export class MeridianSidebarElement extends CrLitElement implements
+         action: () => this.handler_.removeItem(item.id),
+       }]),
+       {label: 'Rename…', icon: 'pencil', action: () => this.renaming_ = item.id},
++      {
++        label: 'Edit Pinned Page',
++        icon: 'link',
++        submenu: [
++          {
++            label: 'Replace Pinned URL with Current',
++            icon: 'link',
++            enabled: !!tab && tab.url !== item.url,
++            action: () => tab && this.handler_.setItemUrl(item.id, tab.url),
++          },
++          ...(fav ? [] : [{
++            label: 'Edit…',
++            icon: 'pencil' as IconName,
++            action: () => this.renaming_ = 'url:' + item.id,
++          }]),
++        ],
++      },
+       ...(tab && tab.url !== item.url ? [{
+         label: 'Go Back to Pinned URL',
+         icon: 'home' as IconName,

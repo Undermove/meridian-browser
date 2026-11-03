@@ -53,3 +53,25 @@ test('a link out of a pinned tab opens in Peek; Open as Tab moves it to Today; C
     ws.close();
   } finally { await b.close(); site.close(); }
 });
+
+test('a ⇧-clicked link opens in Peek over the page, not in a new window (Arc)', async () => {
+  const site = await twoSites();
+  const b = await launch([site.url]);
+  try {
+    await b.waitFor(today(1));
+    const page = await b.page(site.url);
+    await page.waitFor(`!!document.getElementById('out')`);
+    const r = await page.eval(`(() => { const e = document.getElementById('out').getBoundingClientRect(); return { x: e.x + e.width / 2, y: e.y + e.height / 2 }; })()`);
+    // A real mouse click with Shift held, in the page.
+    for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+      await page.cdp.send('Input.dispatchMouseEvent', { type, x: r.x, y: r.y, button: type === 'mouseMoved' ? 'none' : 'left', clickCount: 1, modifiers: 8 });
+    }
+    page.close();
+    await b.waitFor(`${CR}.hasAttribute('peek')`);
+    const windows = (await (await fetch(`${b.base}/json/list`)).json()).filter((t) => t.url.startsWith('chrome://webui-browser'));
+    assert.equal(windows.length, 1, 'no new window');
+    assert.equal((await b.tabs()).length, 1, 'not in Today');
+    await b.click(`${CR}.shadowRoot.querySelector('#peekBar button[data-action="close"]')`);
+    await b.waitFor(`!${CR}.hasAttribute('peek')`);
+  } finally { await b.close(); site.close(); }
+});
