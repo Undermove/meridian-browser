@@ -123,3 +123,64 @@ test('Bubbles: a submitted password is offered for saving, and Save stores it', 
     fs.rmSync(profile, { recursive: true, force: true });
   }
 });
+
+test('Bubbles in a space of another profile: a permission prompt, and a password saved in that profile only', async () => {
+  const { s, url, b } = await open();
+  const T = 'app.$.tabstrip';
+  try {
+    const { profileId } = await b.eval(`${T}.handler_.addProfile('Work')`);
+    const { spaceId } = await b.eval(`${T}.handler_.createSpace('Client', '', '', '')`);
+    await b.eval(`${T}.handler_.setSpaceProfile(${JSON.stringify(spaceId)}, ${JSON.stringify(profileId)})`);
+    await b.waitFor(`${T}.state_.spaces.find((x) => x.name === 'Client')?.profileId === ${JSON.stringify(profileId)}`);
+    await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(spaceId)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(spaceId)}`);
+    const workUrl = url + '?work';
+    await b.eval(`${T}.openUrl(${JSON.stringify(workUrl)})`);
+    const page = await b.page(workUrl);
+    await page.waitFor(`!!document.getElementById('u')`);
+    const bubbles = (action = '') => b.eval(`${T}.handler_.testBubbles(${JSON.stringify(action)}).then((r) => r.bubbles)`);
+    const waitBubble = async (name, ms = 5000) => {
+      for (const end = Date.now() + ms; Date.now() < end; await sleep(100)) if ((await bubbles()).includes(name)) return;
+      assert.fail(`no ${name}: ${JSON.stringify(await bubbles())}`);
+    };
+
+    // Notifications, allowed, in the Work tab.
+    await page.cdp.send('Runtime.evaluate', { expression: `Notification.requestPermission().then((r) => { window.notif = r; })`, userGesture: true });
+    await waitBubble(PROMPT);
+    await bubbles('accept');
+    await page.waitFor(`window.notif === 'granted'`);
+
+    // A password typed and submitted there: offered, saved.
+    const type = async (id, text) => {
+      await page.eval(`(document.getElementById('${id}').focus(), true)`);
+      await page.cdp.send('Input.insertText', { text });
+    };
+    await type('u', 'work-user');
+    await type('p', 'staple-battery-9');
+    await page.cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' });
+    await page.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await waitBubble('PasswordSaveUpdateView', 15000);
+    await bubbles('accept');
+    for (let i = 0; i < 30 && (await bubbles()).length; i++) await sleep(100);
+    page.close();
+
+    // The password manager of each profile, opened from its own space.
+    const passwordsHere = async () => {
+      await b.eval(`${T}.openUrl('chrome://password-manager/passwords')`);
+      const pm = await b.page('chrome://password-manager');
+      const has = async () => pm.eval(`(() => { const deep = (root) => [root, ...[...root.querySelectorAll('*')].filter((e) => e.shadowRoot).flatMap((e) => deep(e.shadowRoot))]; return deep(document).some((r) => r.textContent?.includes('localhost')); })()`);
+      let found = false;
+      for (const end = Date.now() + 8000; Date.now() < end && !found; await sleep(300)) found = await has();
+      pm.close();
+      await b.eval(`(() => { const t = [...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.url.startsWith('chrome://password-manager')); app.$.tabstrip.tabStripService_.closeNodes([t.tab.id]); return true; })()`);
+      await sleep(500);
+      return found;
+    };
+    assert.equal(await passwordsHere(), true, "in Work's password manager");
+    await b.eval(`${T}.handler_.activateSpace(${T}.state_.spaces[0].id)`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${T}.state_.spaces[0].id`);
+    assert.equal(await passwordsHere(), false, "not in the main profile's");
+  } finally {
+    await b.close(); s.closeAllConnections(); s.close();
+  }
+});

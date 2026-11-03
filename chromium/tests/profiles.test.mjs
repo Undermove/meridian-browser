@@ -226,3 +226,59 @@ async function switchAcrossProfiles(fullscreen) {
 test('Profiles: ⌃1–3 across profiles stay in the one window', () => switchAcrossProfiles(false));
 
 test('Profiles: the same in macOS full screen', () => switchAcrossProfiles(true));
+
+test('Profiles: Peek, Open as Tab and Split in a Work space keep the Work profile', async () => {
+  // /work sets Work's cookie on 127.0.0.1; /app links out to localhost (another site: Peek).
+  const server = http.createServer((req, res) => {
+    const headers = { 'content-type': 'text/html' };
+    if (req.url === '/work') headers['set-cookie'] = 'who=work; Path=/; Max-Age=3600';
+    res.writeHead(200, headers);
+    const port = server.address().port;
+    res.end(req.url === '/app' ? `<title>App</title><a id=out target=_blank href="http://localhost:${port}/other">out</a>` : `<title>${req.url.slice(1)}</title>`);
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = (host, p) => `http://${host}:${server.address().port}${p}`;
+  const CR = 'app.$.contentRegion';
+  const b = await launch(['about:blank']);
+  // The 127.0.0.1 cookie the profile of the tab at `u` has.
+  const cookieAt = async (u) => {
+    const t = (await (await fetch(`${b.base}/json/list`)).json()).find((x) => x.type === 'page' && x.url === u);
+    assert.ok(t, `a tab at ${u}`);
+    const ws = new WebSocket(t.webSocketDebuggerUrl);
+    await new Promise((r) => (ws.onopen = r));
+    const reply = await new Promise((r) => { ws.onmessage = (m) => r(JSON.parse(m.data)); ws.send(JSON.stringify({ id: 1, method: 'Network.getCookies', params: { urls: [url('127.0.0.1', '/')] } })); });
+    ws.close();
+    return reply.result.cookies.find((c) => c.name === 'who')?.value;
+  };
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    const { spaceId } = await workSpace(b);
+    await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(spaceId)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(spaceId)}`);
+    await b.eval(`${T}.openUrl(${JSON.stringify(url('127.0.0.1', '/work'))})`);
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'work')`);
+    await b.eval(`${T}.openUrl(${JSON.stringify(url('127.0.0.1', '/app'))})`);
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'App')`);
+    assert.equal(await cookieAt(url('127.0.0.1', '/app')), 'work');
+
+    // Pinned, its link out opens in Peek: still Work.
+    await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'App')`, 'Pin Tab');
+    await b.waitFor(`${T}.state_.spaces.find((x) => x.id === ${JSON.stringify(spaceId)}).pinned.length === 1`);
+    await inPage(b, '/app', `document.getElementById('out').click()`);
+    await b.waitFor(`${CR}.hasAttribute('peek')`);
+    const other = url('localhost', '/other');
+    for (let i = 0; i < 50 && !(await (await fetch(`${b.base}/json/list`)).json()).some((x) => x.url === other); i++) await sleep(100);
+    assert.equal(await cookieAt(other), 'work', 'the Peek page is Work\'s');
+    // Open as Tab: still Work.
+    await b.click(`${CR}.shadowRoot.querySelector('#peekBar button[data-action="expand"]')`);
+    await b.waitFor(`!${CR}.hasAttribute('peek')`);
+    assert.equal(await cookieAt(other), 'work', 'and so is the tab it became');
+
+    // Split with the other Today tab: both halves Work's.
+    await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'work')`, 'Open in Split View');
+    await b.waitFor(`${CR}.hasAttribute('split')`);
+    assert.equal(await cookieAt(url('127.0.0.1', '/work')), 'work');
+    assert.equal(await cookieAt(other), 'work');
+    assert.equal(await windowCount(b), 1, 'one window throughout');
+  } finally { await b.close(); server.close(); }
+});
