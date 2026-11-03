@@ -1,5 +1,6 @@
 // Drives the built Meridian (Chromium) over the DevTools protocol. The browser's own UI is the page
 // chrome://webui-browser, so tests evaluate in it and send real mouse/keyboard input to it.
+import { afterEach } from 'node:test';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -12,12 +13,13 @@ export const APP = process.env.MERIDIAN_APP ||
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 class Cdp {
-  constructor(url) { this.url = url; this.id = 0; this.pending = new Map(); }
+  constructor(url) { this.url = url; this.id = 0; this.pending = new Map(); this.listeners = []; }
   async open() {
     this.ws = new WebSocket(this.url);
     await new Promise((res, rej) => { this.ws.onopen = res; this.ws.onerror = rej; });
     this.ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
+      if (m.method) { for (const fn of this.listeners) fn(m.method, m.params); return; }
       const p = this.pending.get(m.id);
       if (p) { this.pending.delete(m.id); m.error ? p.rej(new Error(m.error.message)) : p.res(m.result); }
     };
@@ -44,6 +46,78 @@ async function evalUi(cdp, expr) {
   });
   if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
   return r.result.value;
+}
+
+// Invariants: what must hold after any action in any test (Arc's behaviour, and no errors), checked
+// in the background half a second after each click, key, command or drag. A violation that is
+// still there on a second look fails the test that caused it (afterEach below), so it can't hide
+// behind a test that only looks at something else. A test that breaks one on purpose sets
+// `b.invariants = false`.
+const INVARIANTS = `(() => {
+  const sb = app.$.tabstrip, root = sb?.shadowRoot;
+  if (!root || !sb.state_) return [];
+  const out = [];
+  const pinned = [];
+  const walk = (r) => { for (const it of r.querySelectorAll('meridian-item')) { const row = it.shadowRoot?.querySelector('.row.pinned.active'); if (row) pinned.push(row); if (it.shadowRoot) walk(it.shadowRoot); } };
+  walk(root);
+  const today = [...root.querySelectorAll('meridian-tab-row')].map((r) => r.shadowRoot?.querySelector('.row.active')).filter(Boolean);
+  const favs = [...root.querySelectorAll('meridian-fav')].map((f) => f.shadowRoot?.querySelector('.fav.active')).filter(Boolean);
+  const n = today.length + pinned.length + favs.length;
+  if (n > 1) out.push(n + ' rows look active in the sidebar');
+  // The active row is in the sidebar's view (Arc scrolls along), unless the sidebar is away or
+  // the row is inside a closed folder.
+  const scroller = root.getElementById('spacePage');
+  const row = today[0] || pinned[0];
+  if (row && scroller && !sb.ghost_) {
+    const v = scroller.getBoundingClientRect(), r = row.getBoundingClientRect();
+    if (v.width > 0 && v.right > 0 && r.height > 0 && (r.top < v.top - 1 || r.bottom > v.bottom + 1)) {
+      out.push('the active tab is out of the sidebar\'s view');
+    }
+  }
+  return out;
+})()`;
+const violations = [];
+const checks = new Set();
+afterEach(async () => {
+  await Promise.all([...checks]);
+  if (violations.length) {
+    const found = [...new Set(violations.splice(0))];
+    throw new Error(`invariants broken:\n  ${found.join('\n  ')}`);
+  }
+});
+function watchInvariants(b) {
+  let timer = null;
+  b.invariants = true;
+  b.lastAction = '';
+  const look = () => evalUi(b.cdp, INVARIANTS).catch(() => []);
+  b.afterAction = (what) => {
+    b.lastAction = what;
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      const check = (async () => {
+        if (b.closed || !b.invariants) return;
+        const first = await look();
+        if (!first.length) return;
+        await sleep(700);
+        if (b.closed || !b.invariants) return;
+        const again = await look();
+        for (const v of again) if (first.includes(v)) violations.push(`${v} (after ${b.lastAction})`);
+      })();
+      checks.add(check);
+      check.finally(() => checks.delete(check));
+    }, 500);
+  };
+  // Uncaught errors and rejections in the browser UI.
+  const listen = (c) => {
+    c.send('Runtime.enable').catch(() => {});
+    c.listeners.push((method, params) => {
+      if (method !== 'Runtime.exceptionThrown' || !b.invariants || b.closed) return;
+      const d = params.exceptionDetails;
+      violations.push(`UI error: ${(d.exception?.description || d.text || '').split('\n').slice(0, 12).join(' | ')} [${d.url || ''}:${d.lineNumber}] (after ${b.lastAction || 'start'})`);
+    });
+  };
+  listen(b.cdp);
+  b.onAttach = listen;
 }
 
 // `profile`: reuse a profile dir (to test what survives a restart); it's then left for the caller to delete.
@@ -97,8 +171,12 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
         if (!next) throw new Error('no browser window left');
         ui = next;
         b.cdp = await new Cdp(next.webSocketDebuggerUrl).open();
+        b.onAttach?.(b.cdp);
       }
-      return evalUi(b.cdp, expr);
+      const r = await evalUi(b.cdp, expr);
+      const act = /\b(testKeyPress|testCommand|runCommand|openUrl|activateSpace|activateTab|closeNodes)\(/.exec(expr);
+      if (act) b.afterAction?.(act[1]);
+      return r;
     },
     // The UI pages of the other browser windows (a Little window, say), each with eval/close.
     async otherWindows() {
@@ -203,6 +281,7 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
       }
       await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', clickCount: 1 });
       await b.cdp.send('Input.setInterceptDrags', { enabled: false });
+      b.afterAction?.('a drag');
     },
     // A two-finger horizontal swipe: `dx` px of wheel deltas over the element, in `steps` events
     // a frame apart; `during` runs after the last one, before the gesture goes quiet.
@@ -213,6 +292,7 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
         await sleep(16);
       }
       if (during) await during();
+      b.afterAction?.('a swipe');
     },
     async type(text) {
       await b.cdp.send('Input.insertText', { text });
@@ -220,6 +300,7 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
     async key(key, code = key, keyCode = 0) {
       await b.cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, windowsVirtualKeyCode: keyCode });
       await b.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: keyCode });
+      b.afterAction?.(`the ${key} key`);
     },
     // A real mouse click at the centre of an element found by a JS expression in the UI page.
     // The centre of an element once it has stopped moving (menus place themselves after opening).
@@ -239,6 +320,7 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
       for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
         await b.cdp.send('Input.dispatchMouseEvent', { type, x: r.x, y: r.y, button: type === 'mouseMoved' ? 'none' : button, clickCount: 1 });
       }
+      b.afterAction?.('a click');
     },
     async screenshot(file) {
       const { data } = await b.cdp.send('Page.captureScreenshot', { format: 'png' });
@@ -246,6 +328,7 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
     },
     // Quits like the user does (⌘Q), so the session and the sidebar are saved.
     async quit() {
+      b.closed = true;
       const done = exited();
       b.cdp.send('Browser.close').catch(() => {});  // never answers: the process exits
       await Promise.race([done, sleep(15000)]);
@@ -253,6 +336,7 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
       if (proc.exitCode === null) { proc.kill(); await exited(); }
     },
     async close() {
+      b.closed = true;
       b.cdp.close();
       if (proc.exitCode === null && proc.signalCode === null) { proc.kill(); await exited(); }
       if (!keep) fs.rmSync(profile, { recursive: true, force: true });
@@ -271,6 +355,7 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
       }
     },
   };
+  watchInvariants(b);
   return b;
 }
 

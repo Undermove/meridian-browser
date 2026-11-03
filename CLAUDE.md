@@ -36,6 +36,16 @@ feature is broken. Most of the rules below follow from that.
   rows (`command_bar_keys.test.mjs` `state()` does this). Use window truth from
   `handler_.testWindowState()`.
 
+## 2b. Invariants, checked for you
+`harness.mjs` checks, half a second after every click, key, command or drag in every test, that:
+- one sidebar row at most looks active;
+- the active tab is in the sidebar's view (Arc scrolls along);
+- the browser UI threw no uncaught error.
+
+A violation still there on a second look fails the test. A new rule that holds for every Arc
+state belongs there, not in one test. A test that breaks one on purpose sets `b.invariants = false`.
+`chromium/ARC_SPEC.md` lists Arc's documented behaviour, item by item, for new tests.
+
 ## 3. The starting-state matrix
 Before calling a UI feature done, run it from each of these starting states:
 - focus in the **page** vs in the sidebar/UI (⌘T from a focused page is the common case);
