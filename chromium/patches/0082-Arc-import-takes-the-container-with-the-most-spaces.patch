@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 3 Nov 2026 23:31:28 +0400
+Subject: [PATCH 83/84] Arc import takes the container with the most spaces
+
+Arc sometimes keeps a second, partial container of items next to the full
+one. The import took the first it met; when that was the partial one, it
+offered "1 spaces" and brought over one empty space.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/arc_import.cc         | 12 ++++++++++--
+ .../browser/meridian/arc_import_unittest.cc   | 19 +++++++++++++++++++
+ 2 files changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/meridian/arc_import.cc b/chrome/browser/meridian/arc_import.cc
+index 52f23be830..7297dbec78 100644
+--- a/chrome/browser/meridian/arc_import.cc
++++ b/chrome/browser/meridian/arc_import.cc
+@@ -220,12 +220,20 @@ base::FilePath ArcDataDir() {
+ std::optional<ArcSidebar> ParseArcSidebar(const base::DictValue& root) {
+   const base::ListValue* containers =
+       root.FindListByDottedPath("sidebar.containers");
++  // Arc sometimes keeps more than one container of items (a second, smaller
++  // one with just some of the spaces): take the one with the most spaces.
+   const base::DictValue* container = nullptr;
++  size_t most = 0;
+   if (containers) {
+     for (const base::Value& c : *containers) {
+-      if (c.is_dict() && c.GetDict().FindList("items")) {
++      if (!c.is_dict() || !c.GetDict().FindList("items")) {
++        continue;
++      }
++      const base::ListValue* spaces = c.GetDict().FindList("spaces");
++      size_t n = spaces ? spaces->size() : 0;
++      if (!container || n > most) {
+         container = &c.GetDict();
+-        break;
++        most = n;
+       }
+     }
+   }
+diff --git a/chrome/browser/meridian/arc_import_unittest.cc b/chrome/browser/meridian/arc_import_unittest.cc
+index 18aa1d4e36..e635760e89 100644
+--- a/chrome/browser/meridian/arc_import_unittest.cc
++++ b/chrome/browser/meridian/arc_import_unittest.cc
+@@ -78,6 +78,25 @@ TEST(ArcImportTest, ReadsSpacesPinsFoldersTodayAndFavorites) {
+   EXPECT_EQ(arc.favorites[1].title, "YouTube");
+ }
+ 
++// Arc sometimes keeps a second, partial container of items next to the full
++// one (seen with just one space of another profile): the full one counts.
++TEST(ArcImportTest, TakesTheContainerWithTheMostSpaces) {
++  std::string partial = R"({"sidebar": {"containers": [{"global": {}}, {
++    "spaces": ["s-p3", {"title": "Other", "profile": {"custom": {"_0":
++        {"directoryBasename": "Profile 3"}}}, "containerIDs": ["pinned", "op"]}],
++    "items": ["op", {"childrenIds": []}]}, )";
++  std::string full = kArc;
++  // kArc's containers, after the partial one.
++  full = partial + full.substr(full.find("{\"global\": {}}, ") + 16);
++  std::optional<base::Value> root = base::JSONReader::Read(full, 0);
++  ASSERT_TRUE(root);
++  std::optional<ArcSidebar> arc = ParseArcSidebar(root->GetDict());
++  ASSERT_TRUE(arc);
++  ASSERT_EQ(arc->spaces.size(), 2u);
++  EXPECT_EQ(arc->spaces[0].name, "Work");
++  EXPECT_EQ(arc->spaces[0].pinned.size(), 2u);
++}
++
+ TEST(ArcImportTest, RejectsOtherFiles) {
+   std::optional<base::Value> root = base::JSONReader::Read(R"({"a": 1})", 0);
+   EXPECT_FALSE(ParseArcSidebar(root->GetDict()));

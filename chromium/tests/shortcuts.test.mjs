@@ -182,3 +182,38 @@ test('⇧⌘T brings the last closed tab back into its space’s Today', async (
     await b.waitFor(`${titles} === 'Gone,Keep'`);
   } finally { await b.close(); }
 });
+
+// Arc: the sidebar scrolls along with the active tab, whatever moved it there.
+test('⌘⌥↑/↓ through a long Today keep the active tab in sight; so does a tab picked elsewhere', async () => {
+  const names = Array.from({ length: 30 }, (_, i) => `Tab ${String(i + 1).padStart(2, '0')}`);
+  const b = await launch(names.map(page), { args: ['--meridian-test-keys'] });
+  const press = ([code, ch], mods) => b.eval(`app.$.tabstrip.handler_.testKeyPress(${code}, ${JSON.stringify(ch)}, ${mods})`);
+  const DOWN = [125, ''], UP = [126, ''];
+  // The active row's place against the scrolling sidebar's visible box.
+  const inSight = () => b.eval(`(() => {
+    const scroller = ${SB}.getElementById('spacePage');
+    const row = [...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive);
+    if (!row) return 'no active row';
+    const v = scroller.getBoundingClientRect(), r = row.getBoundingClientRect();
+    return r.top >= v.top - 1 && r.bottom <= v.bottom + 1 ? true : row.tab.title + ' at ' + Math.round(r.top) + '..' + Math.round(r.bottom) + ', visible ' + Math.round(v.top) + '..' + Math.round(v.bottom);
+  })()`);
+  const settled = async () => { await new Promise((r) => setTimeout(r, 400)); return inSight(); };
+  try {
+    await b.waitFor(today(30));
+    assert.ok(await b.eval(`${SB}.getElementById('spacePage').scrollHeight > ${SB}.getElementById('spacePage').clientHeight + 200`), 'the list scrolls');
+    // Start at the top.
+    await b.eval(`app.$.tabstrip.runCommand(${C.selectTab}, 0)`);
+    await b.eval(`${SB}.getElementById('spacePage').scrollTop = 0`);
+    for (let i = 0; i < 29; i++) {
+      await press(DOWN, CMD | OPT);
+      assert.equal(await settled(), true, `after ${i + 1} × ⌘⌥↓`);
+    }
+    for (let i = 0; i < 29; i++) {
+      await press(UP, CMD | OPT);
+      assert.equal(await settled(), true, `after ${i + 1} × ⌘⌥↑`);
+    }
+    // Picked in the command bar's Switch to Tab, far down the list.
+    await b.eval(`app.$.tabstrip.tabStripService_.activateTab([...app.$.tabstrip.tabs_.values()].find((t) => t.title === 'Tab 28').id)`);
+    assert.equal(await settled(), true, 'a tab activated from elsewhere');
+  } finally { await b.close(); }
+});
