@@ -21,9 +21,16 @@ class Cdp {
       const p = this.pending.get(m.id);
       if (p) { this.pending.delete(m.id); m.error ? p.rej(new Error(m.error.message)) : p.res(m.result); }
     };
+    // The target went away (its window closed): nothing pending waits forever.
+    this.ws.onclose = () => {
+      this.closed = true;
+      for (const p of this.pending.values()) p.rej(new Error('target closed'));
+      this.pending.clear();
+    };
     return this;
   }
   send(method, params = {}) {
+    if (this.closed) return Promise.reject(new Error('target closed'));
     const id = ++this.id;
     return new Promise((res, rej) => { this.pending.set(id, { res, rej }); this.ws.send(JSON.stringify({ id, method, params })); });
   }
@@ -45,8 +52,9 @@ async function evalUi(cdp, expr) {
 const running = new Set();
 process.on('exit', () => { for (const p of running) { try { p.kill('SIGKILL'); } catch {} } });
 
-// `firstRun`: start like the very first launch (without --no-first-run).
-export async function launch(urls = [], { profile: keep, args = [], firstRun = false } = {}) {
+// `firstRun`: start like the very first launch (without --no-first-run). `app`: another binary
+// for this launch (an older release, to test updating from it).
+export async function launch(urls = [], { profile: keep, args = [], firstRun = false, app = APP } = {}) {
   const profile = keep || fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
   const port = 9400 + Math.floor(Math.random() * 500);
   // Never the real Arc: an empty folder unless a test gives its own.
@@ -55,7 +63,7 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
     if (!args.some((a) => a.startsWith(sw + '='))) args = [...args, `${sw}=${empty}`];
   }
   const started = Date.now();
-  const proc = spawn(APP, [
+  const proc = spawn(app, [
     `--user-data-dir=${profile}`, `--remote-debugging-port=${port}`, '--use-mock-keychain',
     '--meridian-keep-keyboard-layout',
     ...(firstRun ? [] : ['--no-first-run']), '--no-default-browser-check', '--window-size=1280,860',
@@ -82,7 +90,16 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
   const b = {
     proc, profile, base, cdp,
     // Evaluates an expression in the browser UI page; `app` is the <webui-browser-app> element.
-    eval(expr) { return evalUi(cdp, expr); },
+    // If that window closed (a window gathered into another at startup), the next one's.
+    async eval(expr) {
+      if (b.cdp.closed) {
+        const next = (await (await fetch(`${base}/json/list`)).json()).find((t) => t.url.startsWith('chrome://webui-browser'));
+        if (!next) throw new Error('no browser window left');
+        ui = next;
+        b.cdp = await new Cdp(next.webSocketDebuggerUrl).open();
+      }
+      return evalUi(b.cdp, expr);
+    },
     // The UI pages of the other browser windows (a Little window, say), each with eval/close.
     async otherWindows() {
       const list = (await (await fetch(`${base}/json/list`)).json())
@@ -145,9 +162,9 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
     // Opens a row's context menu and picks an entry by its label.
     async menu(elExpr, label) {
       const r = await b.point(elExpr);
-      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: r.x, y: r.y, button: 'none' });
-      await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: r.x, y: r.y, button: 'right', clickCount: 1 });
-      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: r.x, y: r.y, button: 'right', clickCount: 1 });
+      await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: r.x, y: r.y, button: 'none' });
+      await b.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: r.x, y: r.y, button: 'right', clickCount: 1 });
+      await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: r.x, y: r.y, button: 'right', clickCount: 1 });
       // "Move to Space > Work": a row of the submenu it opens.
       const [first, sub] = label.split(' > ');
       const row = (menu, text) => `[...${SB}.querySelector('${menu} meridian-menu').shadowRoot.querySelectorAll('.menu-item')].find((m) => m.querySelector('.menu-label').textContent.trim() === ${JSON.stringify(text)})`;
@@ -165,44 +182,44 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
       const box = (expr) => b.waitFor(`(() => { const el = ${expr}; if (!el) return null; const r = el.getBoundingClientRect(); return r.width ? { x: r.x, y: r.y, w: r.width, h: r.height } : null; })()`);
       const a = await box(fromExpr);
       const from = { x: a.x + a.w / 2, y: a.y + a.h / 2 };
-      await cdp.send('Input.setInterceptDrags', { enabled: true });
+      await b.cdp.send('Input.setInterceptDrags', { enabled: true });
       const intercepted = new Promise((resolve) => {
         const on = (e) => { const m = JSON.parse(e.data); if (m.method === 'Input.dragIntercepted') { cdp.ws.removeEventListener('message', on); resolve(m.params.data); } };
         cdp.ws.addEventListener('message', on);
       });
-      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y });
-      await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', clickCount: 1 });
+      await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y });
+      await b.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', clickCount: 1 });
       for (let i = 1; i <= 3; i++) {
-        await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y + i * 4, button: 'left', buttons: 1 });
+        await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y + i * 4, button: 'left', buttons: 1 });
       }
       const data = await Promise.race([intercepted, sleep(3000).then(() => null)]);
       if (!data) throw new Error('the drag never started');
-      await cdp.send('Input.dispatchDragEvent', { type: 'dragEnter', x: from.x, y: from.y + 12, data });
+      await b.cdp.send('Input.dispatchDragEvent', { type: 'dragEnter', x: from.x, y: from.y + 12, data });
       await sleep(50);  // drop zones that open on dragstart
       const z = await box(toExpr);
       const to = { x: z.x + z.w * fx, y: z.y + z.h * fy };
       for (const type of ['dragOver', 'drop']) {
-        await cdp.send('Input.dispatchDragEvent', { type, x: to.x, y: to.y, data });
+        await b.cdp.send('Input.dispatchDragEvent', { type, x: to.x, y: to.y, data });
       }
-      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', clickCount: 1 });
-      await cdp.send('Input.setInterceptDrags', { enabled: false });
+      await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', clickCount: 1 });
+      await b.cdp.send('Input.setInterceptDrags', { enabled: false });
     },
     // A two-finger horizontal swipe: `dx` px of wheel deltas over the element, in `steps` events
     // a frame apart; `during` runs after the last one, before the gesture goes quiet.
     async swipe(elExpr, dx, { steps = 10, during } = {}) {
       const r = await b.point(elExpr);
       for (let i = 0; i < steps; i++) {
-        await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: r.x, y: r.y, deltaX: dx / steps, deltaY: 0 });
+        await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: r.x, y: r.y, deltaX: dx / steps, deltaY: 0 });
         await sleep(16);
       }
       if (during) await during();
     },
     async type(text) {
-      await cdp.send('Input.insertText', { text });
+      await b.cdp.send('Input.insertText', { text });
     },
     async key(key, code = key, keyCode = 0) {
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, windowsVirtualKeyCode: keyCode });
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: keyCode });
+      await b.cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, windowsVirtualKeyCode: keyCode });
+      await b.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: keyCode });
     },
     // A real mouse click at the centre of an element found by a JS expression in the UI page.
     // The centre of an element once it has stopped moving (menus place themselves after opening).
@@ -220,23 +237,23 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
     async click(elExpr, { button = 'left' } = {}) {
       const r = await b.point(elExpr);
       for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
-        await cdp.send('Input.dispatchMouseEvent', { type, x: r.x, y: r.y, button: type === 'mouseMoved' ? 'none' : button, clickCount: 1 });
+        await b.cdp.send('Input.dispatchMouseEvent', { type, x: r.x, y: r.y, button: type === 'mouseMoved' ? 'none' : button, clickCount: 1 });
       }
     },
     async screenshot(file) {
-      const { data } = await cdp.send('Page.captureScreenshot', { format: 'png' });
+      const { data } = await b.cdp.send('Page.captureScreenshot', { format: 'png' });
       fs.writeFileSync(file, Buffer.from(data, 'base64'));
     },
     // Quits like the user does (⌘Q), so the session and the sidebar are saved.
     async quit() {
       const done = exited();
-      cdp.send('Browser.close').catch(() => {});  // never answers: the process exits
+      b.cdp.send('Browser.close').catch(() => {});  // never answers: the process exits
       await Promise.race([done, sleep(15000)]);
-      cdp.close();
+      b.cdp.close();
       if (proc.exitCode === null) { proc.kill(); await exited(); }
     },
     async close() {
-      cdp.close();
+      b.cdp.close();
       if (proc.exitCode === null && proc.signalCode === null) { proc.kill(); await exited(); }
       if (!keep) fs.rmSync(profile, { recursive: true, force: true });
       fs.rmSync(empty, { recursive: true, force: true });

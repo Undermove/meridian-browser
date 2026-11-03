@@ -171,3 +171,25 @@ test('a two-finger swipe on the sidebar drags to the next space: past a third it
     await b.waitFor(`!${T}.ghost_`);
   } finally { await b.close(); }
 });
+
+test('a space and a pin made just before a crash are still there after it', async () => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-crash-'));
+  const T = 'app.$.tabstrip';
+  try {
+    let b = await launch([page('Keep')], { profile });
+    try {
+      await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+      await b.eval(`${T}.handler_.createSpace('Fresh', '', '', '')`);
+      await b.eval(`${T}.handler_.pinTab(${T}.state_.tabs[0].tabId, { container: ${T}.state_.activeSpaceId, parentId: '', index: 0 }, '')`);
+      await b.waitFor(`${T}.state_.spaces.length === 2 && ${T}.state_.spaces[0].pinned.length === 1`);
+      await new Promise((r) => setTimeout(r, 2000));
+      b.proc.kill('SIGKILL');  // a crash: nothing is written on the way out
+    } finally { await b.close(); }
+    b = await launch([], { profile });
+    try {
+      await b.waitFor(`${T}.state_?.spaces.length === 2`, 15000, `${T}.state_?.spaces.map((s) => s.name)`);
+      assert.equal(await b.eval(`${T}.state_.spaces[1].name`), 'Fresh');
+      assert.equal(await b.eval(`${T}.state_.spaces[0].pinned.length`), 1, 'the pin');
+    } finally { await b.close(); }
+  } finally { fs.rmSync(profile, { recursive: true, force: true }); }
+});
