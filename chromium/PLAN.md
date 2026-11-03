@@ -26,7 +26,7 @@ We ship one release, once everything below is done and covered by tests.
 | Sidebar, vertical tabs, page card | WebUI browser (`kWebium`) restyled ✅ |
 | Name, icon, bundle id, About | `chrome/app/theme/meridian` branding + `is_chrome_branded=false` product strings |
 | Spaces (colour, icon, gradient theme) | `MeridianSpacesService` (per profile, persisted in the profile dir). Tabs carry a space id; the UI shows the current space. Window tint from the space |
-| Spaces with their own profile | One `Browser` window per Chromium profile, stacked in the same frame; switching to a space in another profile swaps the visible window (Arc's model on Chromium) |
+| Spaces with their own profile | Arc's model: one window holds the tabs of every profile (`space_profiles.h`); a tab's profile comes from its opener or its space and is kept in the session (`meridian.profile` tab data) |
 | Pinned tabs + folders, home URL, `/` back to home | sidebar model in `MeridianSpacesService`; tab ↔ item link |
 | Favorites grid (per profile) | same model, profile-wide |
 | Today + auto-archive after N h, Archive view | `MeridianArchiveService` (SQLite in the profile dir), archive WebUI |

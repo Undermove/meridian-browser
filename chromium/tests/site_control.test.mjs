@@ -110,6 +110,7 @@ test('extensions from Arc: listed in Settings with Add…, and counted in the Si
     // Add… opens the extension's Web Store page in a tab.
     await b.eval(`${ST}.querySelector('.row.arc-ext[data-id="${darkReader}"]').scrollIntoView({ block: 'center' })`);
     await b.click(`${ST}.querySelector('.row.arc-ext[data-id="${darkReader}"] .btn')`);
-    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.url.startsWith('https://chromewebstore.google.com/'))`, 15000);
+    // (In the EU a fresh profile meets Google's consent page first, with the store page to continue to.)
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.url.startsWith('https://chromewebstore.google.com/') || /^https:\\/\\/consent\\.google\\.com\\/.*continue=https:\\/\\/chromewebstore\\.google\\.com\\//.test(r.tab.url))`, 15000);
   } finally { await b.close(); await site.close(); fs.rmSync(arc, { recursive: true, force: true }); }
 });

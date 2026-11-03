@@ -1,0 +1,421 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 3 Nov 2026 18:55:21 +0400
+Subject: [PATCH 78/78] =?UTF-8?q?Find=20bar=20over=20the=20page,=20?=
+ =?UTF-8?q?=E2=8C=98T=20history=20per=20profile?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- The find bar (⌘F) sits over the page at the top right, like Arc. It was
+  placed under the URL pill, which is in the sidebar.
+- Its slide runs on a timer: the WebUI window's compositor drew no frames
+  for it, so the bar stayed slid out of sight and never closed on Esc.
+- ⌘T in a space of another profile suggests from that profile's history:
+  the command bar makes its field again when the profile changes and the
+  browser binds it to the active space's profile.
+- Test hooks: testKeyPress sends menu shortcuts to the test window (the
+  menu targets the key window); testBubbles reads widgets from the view
+  tree (the find bar's widget_delegate dangles) and can give bounds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar_handler.cc    | 46 +++++++++++++++----
+ .../browser/meridian/sidebar_handler_mac.mm   | 43 +++++++++++++++--
+ chrome/browser/resources/webui_browser/app.ts |  1 +
+ .../meridian/command_bar.html.ts              |  3 +-
+ .../webui_browser/meridian/command_bar.ts     | 39 +++++++++++-----
+ .../webui_browser/meridian/sidebar.ts         |  5 ++
+ chrome/browser/ui/views/find_bar_host.cc      |  5 +-
+ .../find_bar_owner_webui_browser.cc           | 23 +++-------
+ .../ui/webui_browser/webui_browser_ui.cc      | 11 ++++-
+ 9 files changed, 130 insertions(+), 46 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 2e15c29c07..a700a830b6 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -89,9 +89,13 @@
+ #include "content/public/browser/web_contents.h"
+ #include "net/base/registry_controlled_domains/registry_controlled_domain.h"
+ #include "ui/base/base_window.h"
++#include "ui/views/bubble/bubble_dialog_delegate_view.h"
++#include "ui/views/view_utils.h"
+ #include "ui/views/widget/widget.h"
+ #include "ui/views/widget/widget_delegate.h"
++#include "ui/views/window/client_view.h"
+ #include "ui/views/window/dialog_delegate.h"
++#include "ui/views/window/non_client_view.h"
+ #include "ui/base/page_transition_types.h"
+ #include "ui/base/window_open_disposition.h"
+ 
+@@ -2052,26 +2056,50 @@ void SidebarHandler::TestBubbles(const std::string& action,
+     std::move(callback).Run(std::move(names));
+     return;
+   }
+-  views::DialogDelegate* newest = nullptr;
++  // The shown widgets' contents, from the view tree: some widgets (the find
++  // bar) keep a dangling widget_delegate().
++  std::vector<std::pair<views::Widget*, views::View*>> shown;
+   for (views::Widget* widget :
+        views::Widget::GetAllOwnedWidgets(window->GetNativeView())) {
+-    if (widget->IsClosed() || !widget->widget_delegate()) {
++    if (widget->IsClosed() || !widget->IsVisible()) {
+       continue;
+     }
+-    newest = widget->widget_delegate()->AsDialogDelegate();
++    views::View* contents = widget->GetContentsView();
++    // A dialog's own view is the first child of its client view.
++    if (widget->non_client_view() &&
++        widget->non_client_view()->client_view() &&
++        !widget->non_client_view()->client_view()->children().empty()) {
++      contents = widget->non_client_view()->client_view()->children().front();
++    }
++    if (contents) {
++      shown.emplace_back(widget, contents);
++    }
++  }
++  views::DialogDelegate* newest = nullptr;
++  for (auto [widget, contents] : shown) {
++    if (auto* dialog = views::AsViewClass<views::DialogDelegateView>(contents)) {
++      newest = dialog;
++    } else if (auto* bubble =
++                   views::AsViewClass<views::BubbleDialogDelegateView>(
++                       contents)) {
++      newest = bubble;
++    }
+   }
+   if (newest && action == "accept") {
+     newest->AcceptDialog();
+   } else if (newest && action == "cancel") {
+     newest->CancelDialog();
+   }
+-  for (views::Widget* widget :
+-       views::Widget::GetAllOwnedWidgets(window->GetNativeView())) {
+-    if (!widget->IsClosed() && widget->widget_delegate() &&
+-        widget->widget_delegate()->GetContentsView()) {
+-      names.emplace_back(
+-          widget->widget_delegate()->GetContentsView()->GetClassName());
++  // "ClassName" for each shown widget; with "bounds", "ClassName x,y wxh"
++  // (in the window).
++  for (auto [widget, contents] : shown) {
++    std::string name(contents->GetClassName());
++    if (action == "bounds") {
++      gfx::Rect r = widget->GetWindowBoundsInScreen() -
++                    window->GetWindowBoundsInScreen().OffsetFromOrigin();
++      name += " " + r.ToString();
+     }
++    names.push_back(std::move(name));
+   }
+   std::move(callback).Run(std::move(names));
+ }
+diff --git a/chrome/browser/meridian/sidebar_handler_mac.mm b/chrome/browser/meridian/sidebar_handler_mac.mm
+index 8ab2cc22af..055fe8a7b6 100644
+--- a/chrome/browser/meridian/sidebar_handler_mac.mm
++++ b/chrome/browser/meridian/sidebar_handler_mac.mm
+@@ -73,6 +73,30 @@ void SidebarHandler::SwitchKeyboardLayout(const std::string& language) {
+   CFRelease(sources);
+ }
+ 
++namespace {
++
++// The enabled main-menu item whose shortcut is `chars` with `modifiers`.
++NSMenuItem* MenuItemFor(NSMenu* menu, NSString* chars, uint32_t modifiers) {
++  const NSEventModifierFlags mask =
++      NSEventModifierFlagCommand | NSEventModifierFlagShift |
++      NSEventModifierFlagOption | NSEventModifierFlagControl;
++  for (NSMenuItem* item in menu.itemArray) {
++    if (item.submenu) {
++      if (NSMenuItem* found = MenuItemFor(item.submenu, chars, modifiers)) {
++        return found;
++      }
++    } else if (item.action && item.keyEquivalent.length &&
++               [item.keyEquivalent.lowercaseString
++                   isEqualToString:chars.lowercaseString] &&
++               (item.keyEquivalentModifierMask & mask) == (modifiers & mask)) {
++      return item;
++    }
++  }
++  return nil;
++}
++
++}  // namespace
++
+ void SidebarHandler::TestKeyPress(uint16_t key_code,
+                                   const std::string& characters,
+                                   uint32_t modifiers) {
+@@ -95,11 +119,22 @@ void SidebarHandler::TestKeyPress(uint16_t key_code,
+                                      isARepeat:NO
+                                        keyCode:key_code];
+     // What -[NSApplication sendEvent:] does for the key window, which a test
+-    // window in the background isn't: key equivalents first, then the
+-    // window's first responder.
+-    if (type == NSEventTypeKeyUp || ![window performKeyEquivalent:event]) {
+-      [window sendEvent:event];
++    // window in the background isn't: key equivalents first (the window's,
++    // then the main menu's), then the window's first responder.
++    if (type == NSEventTypeKeyUp || [window performKeyEquivalent:event]) {
++      if (type == NSEventTypeKeyUp) {
++        [window sendEvent:event];
++      }
++      continue;
++    }
++    // The main menu sends its items to the key window; aim them at this one.
++    if (NSMenuItem* item = (modifiers & NSEventModifierFlagCommand)
++                               ? MenuItemFor(NSApp.mainMenu, chars, modifiers)
++                               : nil) {
++      [NSApp sendAction:item.action to:window from:item];
++      continue;
+     }
++    [window sendEvent:event];
+   }
+ }
+ 
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 0f47c3e522..d10c89de40 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -951,6 +951,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   private showCommandBar_(newTab: boolean, text: string) {
+     this.closeSiteControl_();
+     this.commandBarTabs_ = this.$.tabstrip.openTabsForCommandBar();
++    this.$.commandBar.profileId = this.$.tabstrip.activeProfileId();
+     this.$.commandBar.show(newTab, text);
+   }
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+index 940b0bdf32..d332195410 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+@@ -11,6 +11,7 @@ export function getHtml(this: MeridianCommandBarElement) {
+   return html`<!--_html_template_start_-->
+ <div id="overlay" @mousedown="${this.onOverlayMousedown_}">
+   <div id="bar">
++    ${this.searchboxShown_ ? html`
+     <webui-browser-searchbox id="address" ?new-tab="${this.newTab}"
+         .newTab="${this.newTab}" .inlineDropdown="${true}"
+         .placeholderText="${'Search or Enter URL…'}"
+@@ -40,7 +41,7 @@ export function getHtml(this: MeridianCommandBarElement) {
+               <span class="go">${icon('forward', 16)}</span>
+             </button>`)}
+         </div>` : ''}
+-    </webui-browser-searchbox>
++    </webui-browser-searchbox>` : ''}
+     ${this.hasAiKey_ ? html`
+       <button id="ask" class="ask" @click="${this.onAskClick_}">
+         <span class="tab-icon spark">${icon('sparkles', 18)}</span>
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index 262d3a69e4..92b423d026 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -12,6 +12,8 @@ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {TemplateResult} from '//resources/lit/v3_0/lit.rollup.js';
+ 
++import {SearchboxBrowserProxy} from '//resources/cr_components/searchbox/searchbox_browser_proxy.js';
++
+ import type {WebuiBrowserSearchboxElement} from '../webui_browser_searchbox.js';
+ 
+ import {browserProxyFactory} from '../sidebar.mojom-webui.js';
+@@ -21,12 +23,6 @@ import {getHtml} from './command_bar.html.js';
+ import {fixLayout} from './layout_fix.js';
+ import {renderMarkdown} from './markdown.js';
+ 
+-export interface MeridianCommandBarElement {
+-  $: {
+-    address: WebuiBrowserSearchboxElement,
+-  };
+-}
+-
+ // An open tab, for "Switch to Tab".
+ export interface CommandBarTab {
+   id: string;
+@@ -61,6 +57,7 @@ export class MeridianCommandBarElement extends CrLitElement {
+       tabRows_: {state: true, type: Array},
+       layoutFix_: {state: true, type: String},
+       tabSel_: {state: true, type: Number},
++      searchboxShown_: {state: true, type: Boolean},
+     };
+   }
+ 
+@@ -72,6 +69,17 @@ export class MeridianCommandBarElement extends CrLitElement {
+   protected accessor tabSel_: number = -1;
+   // What was typed, read in the other keyboard layout ("ghbdtn": "привет").
+   protected accessor layoutFix_: string = '';
++  // The active space's profile: the suggestions come from its history.
++  profileId: string = '';
++  // The field is made again for another profile (the browser binds each new
++  // one to the active space's profile).
++  protected accessor searchboxShown_: boolean = true;
++  private searchboxProfile_: string|null = null;
++
++  private get address_(): WebuiBrowserSearchboxElement {
++    return this.shadowRoot.querySelector<WebuiBrowserSearchboxElement>(
++        '#address')!;
++  }
+ 
+   protected tabHost_(url: string): string {
+     try {
+@@ -89,7 +97,7 @@ export class MeridianCommandBarElement extends CrLitElement {
+          'Control', 'Alt'].includes(e.key)) {
+       return;
+     }
+-    const input = this.$.address.shadowRoot.querySelector('cr-searchbox-input')
++    const input = this.address_.shadowRoot.querySelector('cr-searchbox-input')
+                       ?.shadowRoot?.querySelector<HTMLInputElement>('input');
+     const query = input?.value || '';
+     if (query !== this.query_) {
+@@ -104,7 +112,7 @@ export class MeridianCommandBarElement extends CrLitElement {
+ 
+   // The field takes the text as meant, and the suggestions follow it.
+   private applyLayoutFix_() {
+-    const input = this.$.address.shadowRoot.querySelector('cr-searchbox-input')
++    const input = this.address_.shadowRoot.querySelector('cr-searchbox-input')
+                       ?.shadowRoot?.querySelector<HTMLInputElement>('input');
+     if (!input || !this.layoutFix_) {
+       return;
+@@ -201,9 +209,16 @@ export class MeridianCommandBarElement extends CrLitElement {
+     this.clearAnswer_();
+     browserProxyFactory.getInstance().handler.getAiStatus().then(
+         ({ready}) => this.hasAiKey_ = ready);
++    if (this.searchboxProfile_ !== this.profileId) {
++      this.searchboxShown_ = false;
++      await this.updateComplete;
++      SearchboxBrowserProxy.setInstance(new SearchboxBrowserProxy());
++      this.searchboxShown_ = true;
++      this.searchboxProfile_ = this.profileId;
++    }
+     // A display:none field can't take the focus: wait for the render.
+     await this.updateComplete;
+-    const box = this.$.address;
++    const box = this.address_;
+     this.query_ = text;
+     // ⌘T: the latest tab is picked, so Return goes back to it (Arc).
+     this.tabSel_ = text ? -1 : 0;
+@@ -218,7 +233,7 @@ export class MeridianCommandBarElement extends CrLitElement {
+     }
+     this.open = false;
+     this.query_ = '';
+-    this.$.address.reset('');
++    this.address_.reset('');
+     this.clearAnswer_();
+     this.fire('command-bar-closed');
+   }
+@@ -240,7 +255,7 @@ export class MeridianCommandBarElement extends CrLitElement {
+   }
+ 
+   private ask_() {
+-    const text = this.$.address.text().trim();
++    const text = this.address_.text().trim();
+     if (!text || !this.hasAiKey_) {
+       return;
+     }
+@@ -293,7 +308,7 @@ export class MeridianCommandBarElement extends CrLitElement {
+       return;
+     }
+     own();
+-    const box = this.$.address;
++    const box = this.address_;
+     const matches = this.query_.trim() ? box.matchCount() : 0;
+     const total = matches + this.tabRows_.length;
+     if (!total) {
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index d9b9fd1e7e..7238d5d01a 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -724,6 +724,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+ 
+   // ----------------------------------------------------------- commands
+ 
++  // The active space's profile ("" until the state arrives).
++  activeProfileId(): string {
++    return this.state_?.profileId ?? '';
++  }
++
+   // The open tabs in sidebar order, for the command bar's Switch to Tab.
+   openTabsForCommandBar(): CommandBarTab[] {
+     const out: CommandBarTab[] = [];
+diff --git a/chrome/browser/ui/views/find_bar_host.cc b/chrome/browser/ui/views/find_bar_host.cc
+index 39e363d752..3154d459de 100644
+--- a/chrome/browser/ui/views/find_bar_host.cc
++++ b/chrome/browser/ui/views/find_bar_host.cc
+@@ -136,7 +136,10 @@ gfx::Rect GetLocationForFindBarView(gfx::Rect view_location,
+ // FindBarHost, public:
+ 
+ FindBarHost::FindBarHost(FindBarOwner* find_bar_owner)
+-    : AnimationDelegateViews(find_bar_owner->GetOwnerWidget()),
++    // Meridian: a plain timer drives the slide. The owner's compositor (a
++    // window that only shows a WebUI page) draws no frames for it, so the bar
++    // stayed slid out of sight and never finished hiding.
++    : AnimationDelegateViews(static_cast<views::View*>(nullptr)),
+       find_bar_owner_(find_bar_owner) {
+   auto find_bar_view = std::make_unique<FindBarView>(this);
+   // The |clip_view| exists to paint to a layer so that it can clip descendent
+diff --git a/chrome/browser/ui/webui_browser/find_bar_owner_webui_browser.cc b/chrome/browser/ui/webui_browser/find_bar_owner_webui_browser.cc
+index 0cc85ac5d8..9ab581fa9e 100644
+--- a/chrome/browser/ui/webui_browser/find_bar_owner_webui_browser.cc
++++ b/chrome/browser/ui/webui_browser/find_bar_owner_webui_browser.cc
+@@ -36,26 +36,15 @@ gfx::Rect FindBarOwnerWebUIBrowser::GetFindBarBoundingBox() {
+     return gfx::Rect();
+   }
+ 
+-  ui::TrackedElement* location_bar = BrowserElements::From(window_->browser())
+-                                         ->GetElement(kLocationBarElementId);
+-  if (!location_bar) {
+-    return gfx::Rect();
+-  }
+-
++  // Meridian: the location bar is a pill in the sidebar, so the find bar goes
++  // over the page itself (top right, like Arc), sidebar shown or not.
+   ui::TrackedElement* contents_container =
+       BrowserElements::From(window_->browser())
+           ->GetElement(kContentsContainerViewElementId);
+-  CHECK(contents_container);
+-
+-  gfx::Rect location_bar_bounds = location_bar->GetScreenBounds();
+-  gfx::Rect contents_container_bounds = contents_container->GetScreenBounds();
+-  // The bounding box spans vertically from the bottom of the location bar to
+-  // the bottom of the contents container and has the same width as the location
+-  // bar.
+-  gfx::Rect bounding_box_in_screen(
+-      location_bar_bounds.x(), location_bar_bounds.bottom(),
+-      location_bar_bounds.width(),
+-      contents_container_bounds.bottom() - location_bar_bounds.bottom());
++  if (!contents_container) {
++    return gfx::Rect();
++  }
++  gfx::Rect bounding_box_in_screen = contents_container->GetScreenBounds();
+   gfx::Rect bounding_box_in_owner =
+       bounding_box_in_screen -
+       window_->widget()->GetWindowBoundsInScreen().OffsetFromOrigin();
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_ui.cc b/chrome/browser/ui/webui_browser/webui_browser_ui.cc
+index da62a3c37c..aab104bcd7 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_ui.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_ui.cc
+@@ -11,6 +11,7 @@
+ #include "chrome/browser/bookmarks/bookmark_model_factory.h"
+ #include "chrome/browser/contextual_search/contextual_search_service_factory.h"
+ #include "chrome/browser/meridian/sidebar_handler.h"
++#include "chrome/browser/meridian/space_profiles.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/bookmarks/bookmark_bar_controller.h"
+ #include "chrome/browser/ui/bookmarks/bookmarks_service_feature.h"
+@@ -204,9 +205,15 @@ void WebUIBrowserUI::CreatePageHandler(
+   content::WebContents* web_contents = web_ui()->GetWebContents();
+   // TODO(crbug.com/445510209): Pass `metrics_reporter_` after installing a
+   // WebUIOmniboxHandler.
++  // Meridian: suggestions from the history of the active space's profile
++  // (the command bar asks for a new handler when that changes).
++  Profile* profile = Profile::FromWebUI(web_ui());
++  if (WebUIBrowserWindow* window =
++          WebUIBrowserWindow::FromWebShellWebContents(web_contents)) {
++    profile = meridian::ProfileForNewTab(window->browser(), nullptr);
++  }
+   realbox_handler_ = std::make_unique<RealboxHandler>(
+-      std::move(pending_page_handler), std::move(page),
+-      Profile::FromWebUI(web_ui()), web_contents,
++      std::move(pending_page_handler), std::move(page), profile, web_contents,
+       base::BindRepeating(&WebUIBrowserUI::GetOrCreateContextualSessionHandle,
+                           base::Unretained(this)));
+ }

@@ -42,7 +42,7 @@ async function start(names) {
       open: app.$.commandBar.open,
       input: ${INPUT}.value,
       tabs: [...${CB}.querySelectorAll('#tabs .tab-row')].map((r) => (r.classList.contains('sel') ? '>' : '') + r.querySelector('.tab-title').textContent),
-      matches: visible ? [...dd.shadowRoot.querySelectorAll('cr-searchbox-match')].map((m) => (m.hasAttribute('selected') ? '>' : '') + (m.match?.destinationUrl?.url || '')) : [],
+      matches: visible ? [...dd.shadowRoot.querySelectorAll('cr-searchbox-match')].map((m) => (m.hasAttribute('selected') ? '>' : '') + (m.match?.destinationUrl?.url ?? m.match?.destinationUrl ?? '')) : [],
       active: [...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive)?.tab.title,
       pageFocused: app.$.contentRegion.activeWebview?.shadowRoot.activeElement?.classList.contains('content') ?? false,
     };
@@ -148,5 +148,57 @@ test('Esc closes the bar while the tab is still loading (it used to stop the loa
     assert.equal(await until(async () => (await state()).input), 'x');
     await press(KEY.esc);
     assert.ok(await until(async () => !(await state()).open), 'closed');
+  } finally { await b.close(); s.close(); }
+});
+
+test('a space of another profile: ⌘T suggests from that profile\'s history only (Arc keeps them apart)', async () => {
+  const { b, s, press, state } = await start(['Home', 'Other']);
+  const T = 'app.$.tabstrip';
+  // What ⌘T suggests for the test site here, once the suggestions settle.
+  const suggest = async () => {
+    await press(KEY.t, CMD);
+    await b.waitFor(`app.$.commandBar.open`);
+    // "127.0.0.1": the test site's pages from this profile's history.
+    const keys = { 1: 18, 2: 19, 7: 26, 0: 29, '.': 47 };
+    for (const ch of '127.0.0.1') await press([keys[ch], ch]);
+    let seen = '', since = Date.now(), st;
+    for (const end = Date.now() + 8000; Date.now() < end; await sleep(100)) {
+      st = await state();
+      const now = JSON.stringify(st.matches);
+      if (now !== seen) { seen = now; since = Date.now(); } else if (Date.now() - since > 700 && st.matches.length) break;
+    }
+    await press(KEY.esc);
+    await until(async () => !(await state()).open);
+    return st.matches.join(' ');
+  };
+  try {
+    const main = await b.eval(`${T}.state_.spaces[0].id`);
+    // Visited earlier, then left for another page.
+    await b.eval(`${T}.openUrl(${JSON.stringify(s.url('kiwi-main'))})`);
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'kiwi-main')`);
+    await b.eval(`${T}.openUrl(${JSON.stringify(s.url('later-main'))})`);
+    const { profileId } = await b.eval(`${T}.handler_.addProfile('Work')`);
+    const { spaceId } = await b.eval(`${T}.handler_.createSpace('Client', '', '', '')`);
+    await b.eval(`${T}.handler_.setSpaceProfile(${JSON.stringify(spaceId)}, ${JSON.stringify(profileId)})`);
+    await b.waitFor(`${T}.state_.spaces.find((s) => s.name === 'Client')?.profileId === ${JSON.stringify(profileId)}`);
+    await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(spaceId)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(spaceId)}`);
+    await b.eval(`${T}.openUrl(${JSON.stringify(s.url('kiwi-work'))})`);
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive)?.tab.title === 'kiwi-work'`);
+    await b.eval(`${T}.openUrl(${JSON.stringify(s.url('later-work'))})`);
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive)?.tab.title === 'later-work'`);
+    await sleep(1000);
+    await b.click('app.$.contentRegion');
+
+    let got = await suggest();
+    assert.match(got, /kiwi-work/, `the Work history: ${got}`);
+    assert.doesNotMatch(got, /kiwi-main/, `not the main profile's: ${got}`);
+
+    await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(main)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(main)}`);
+    await b.click('app.$.contentRegion');
+    got = await suggest();
+    assert.match(got, /kiwi-main/, `the main history: ${got}`);
+    assert.doesNotMatch(got, /kiwi-work/, `not Work's: ${got}`);
   } finally { await b.close(); s.close(); }
 });
