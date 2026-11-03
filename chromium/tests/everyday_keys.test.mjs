@@ -82,3 +82,28 @@ test('everyday keys from a focused page: ⌘L, ⌘[ ⌘], ⌘R, ⌃⇥, ⌘W, �
     assert.ok(await until(async () => (await rows()).some((r) => r.endsWith('b'))), `⇧⌘T brought it back: ${await rows()}`);
   } finally { await b.close(); s.close(); }
 });
+
+test('Arc: ⌘T or ⌘L again closes the command bar; ⌘L and Return as it is reloads the page', async () => {
+  const s = await site();
+  const b = await launch([s.url('a'), s.url('b')], { args: ['--meridian-test-keys'] });
+  const press = (code, ch, mods = 0) => b.eval(`${T}.handler_.testKeyPress(${code}, ${JSON.stringify(ch)}, ${mods})`);
+  const active = () => b.eval(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive)?.tab.title`);
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 2`);
+    await b.click('app.$.contentRegion');
+    for (const [code, ch] of [[17, 't'], [37, 'l']]) {
+      await press(code, ch, CMD);
+      await b.waitFor(`app.$.commandBar.open`);
+      await press(code, ch, CMD);
+      assert.ok(await until(async () => !(await b.eval('app.$.commandBar.open'))), `⌘${ch.toUpperCase()} again closed it`);
+    }
+    // ⌘L, Return: the same page again.
+    const before = await active();
+    await press(37, 'l', CMD);
+    await b.waitFor(`app.$.commandBar.open`);
+    await new Promise((r) => setTimeout(r, 300));
+    await press(36, '\r');
+    assert.ok(await until(async () => { const t = await active(); return t !== before && t?.split(' #')[0] === before.split(' #')[0]; }), `reloaded: ${before} → ${await active()}`);
+    assert.equal((await b.eval(`${SB}.querySelectorAll('meridian-tab-row').length`)), 2, 'no new tab');
+  } finally { await b.close(); s.close(); }
+});

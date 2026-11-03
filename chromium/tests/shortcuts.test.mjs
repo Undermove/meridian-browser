@@ -217,3 +217,31 @@ test('⌘⌥↑/↓ through a long Today keep the active tab in sight; so does a
     assert.equal(await settled(), true, 'a tab activated from elsewhere');
   } finally { await b.close(); }
 });
+
+// Arc: ⇧⌘C copies the address without tracking parameters; so does the link button by it.
+test('⇧⌘C and the link button copy the address without utm_ and other tracking parameters', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const saved = execFileSync('pbpaste');  // the person's clipboard comes back afterwards
+  const url = 'data:text/html,<title>T</title>';
+  const http = await import('node:http');
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<title>Shared</title>'); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const page = `http://127.0.0.1:${server.address().port}/post?id=7&utm_source=news&fbclid=abc`;
+  const clean = `http://127.0.0.1:${server.address().port}/post?id=7`;
+  const b = await launch([page], { args: ['--meridian-test-keys'] });
+  const clip = async (want) => { let t = ''; for (let i = 0; i < 30 && t !== want; i++) { await new Promise((r) => setTimeout(r, 100)); t = execFileSync('pbpaste').toString(); } return t; };
+  try {
+    await b.waitFor(`${activeTitle} === 'Shared'`);
+    execFileSync('pbcopy', { input: url });
+    await b.click('app.$.contentRegion');
+    await b.eval(`app.$.tabstrip.handler_.testKeyPress(8, 'c', ${CMD | (1 << 17)})`);  // ⇧⌘C
+    assert.equal(await clip(clean), clean);
+    await b.waitFor(`app.shadowRoot.querySelector('#missionToast .mt-title')?.textContent.trim() === 'Copied link'`);
+    execFileSync('pbcopy', { input: url });
+    await b.eval(`app.shadowRoot.getElementById('copyLinkButton').click()`);
+    assert.equal(await clip(clean), clean, 'the link button too');
+  } finally {
+    await b.close(); server.close();
+    execFileSync('pbcopy', { input: saved });
+  }
+});

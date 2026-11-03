@@ -1,0 +1,301 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 4 Nov 2026 01:55:44 +0400
+Subject: [PATCH 87/87] =?UTF-8?q?=E2=87=A7=E2=8C=98C=20copies=20the=20addr?=
+ =?UTF-8?q?ess=20without=20tracking=20parameters?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+As Arc does: utm_*, fbclid, gclid, YouTube's si and the like are dropped;
+the link button by the address copies the same.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |  4 ++
+ chrome/browser/meridian/clean_url.cc          | 67 +++++++++++++++++++
+ chrome/browser/meridian/clean_url.h           | 18 +++++
+ chrome/browser/meridian/clean_url_unittest.cc | 33 +++++++++
+ chrome/browser/meridian/sidebar.mojom         |  4 ++
+ chrome/browser/meridian/sidebar_handler.cc    | 27 +++++++-
+ chrome/browser/meridian/sidebar_handler.h     |  1 +
+ chrome/browser/resources/webui_browser/app.ts |  2 +-
+ .../webui_browser/meridian/sidebar.ts         |  5 ++
+ 9 files changed, 157 insertions(+), 4 deletions(-)
+ create mode 100644 chrome/browser/meridian/clean_url.cc
+ create mode 100644 chrome/browser/meridian/clean_url.h
+ create mode 100644 chrome/browser/meridian/clean_url_unittest.cc
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 19a06fcaf6..93ff6c828e 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -33,6 +33,8 @@ source_set("model") {
+     "archive_service.h",
+     "atc.cc",
+     "atc.h",
++    "clean_url.cc",
++    "clean_url.h",
+     "prefs.cc",
+     "prefs.h",
+     "setup_profile.cc",
+@@ -51,6 +53,7 @@ source_set("model") {
+   ]
+   deps = [
+     "//components/pref_registry",
++    "//net",
+     "//third_party/boringssl",
+   ]
+ }
+@@ -314,6 +317,7 @@ test("meridian_unittests") {
+     "arc_import_unittest.cc",
+     "archive_service_unittest.cc",
+     "atc_unittest.cc",
++    "clean_url_unittest.cc",
+     "setup_profile_unittest.cc",
+     "sidebar_service_unittest.cc",
+     "update_check_unittest.cc",
+diff --git a/chrome/browser/meridian/clean_url.cc b/chrome/browser/meridian/clean_url.cc
+new file mode 100644
+index 0000000000..1962df51ca
+--- /dev/null
++++ b/chrome/browser/meridian/clean_url.cc
+@@ -0,0 +1,67 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/clean_url.h"
++
++#include <string>
++#include <string_view>
++
++#include "base/containers/fixed_flat_set.h"
++#include "base/strings/string_util.h"
++#include "net/base/url_util.h"
++#include "url/gurl.h"
++
++namespace meridian {
++
++namespace {
++
++bool IsTracking(std::string_view key) {
++  static constexpr auto kKeys = base::MakeFixedFlatSet<std::string_view>({
++      "_hsenc", "_hsmi", "dclid", "fbclid", "gbraid", "gclid", "gclsrc",
++      "igsh", "igshid", "mc_cid", "mc_eid", "mkt_tok", "msclkid", "oly_anon_id",
++      "oly_enc_id", "rb_clickid", "s_cid", "twclid", "vero_id", "wbraid",
++      "yclid",
++  });
++  return base::StartsWith(key, "utm_") || kKeys.contains(key);
++}
++
++}  // namespace
++
++GURL WithoutTracking(const GURL& url) {
++  if (!url.SchemeIsHTTPOrHTTPS() || !url.has_query()) {
++    return url;
++  }
++  std::string query;
++  bool removed = false;
++  for (net::QueryIterator it(url); !it.IsAtEnd(); it.Advance()) {
++    std::string_view key = it.GetKey();
++    // YouTube's share id ("si") says who shared the link.
++    if (IsTracking(key) ||
++        (key == "si" && (url.DomainIs("youtube.com") ||
++                         url.DomainIs("youtu.be")))) {
++      removed = true;
++      continue;
++    }
++    if (!query.empty()) {
++      query += '&';
++    }
++    query += key;
++    if (!it.GetValue().empty()) {
++      query += '=';
++      query += it.GetValue();
++    }
++  }
++  if (!removed) {
++    return url;
++  }
++  GURL::Replacements replacements;
++  if (query.empty()) {
++    replacements.ClearQuery();
++  } else {
++    replacements.SetQueryStr(query);
++  }
++  return url.ReplaceComponents(replacements);
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/clean_url.h b/chrome/browser/meridian/clean_url.h
+new file mode 100644
+index 0000000000..40152d14a2
+--- /dev/null
++++ b/chrome/browser/meridian/clean_url.h
+@@ -0,0 +1,18 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_CLEAN_URL_H_
++#define CHROME_BROWSER_MERIDIAN_CLEAN_URL_H_
++
++class GURL;
++
++namespace meridian {
++
++// `url` without tracking parameters (utm_*, fbclid, gclid and the like), as
++// Arc copies links with ⇧⌘C.
++GURL WithoutTracking(const GURL& url);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_CLEAN_URL_H_
+diff --git a/chrome/browser/meridian/clean_url_unittest.cc b/chrome/browser/meridian/clean_url_unittest.cc
+new file mode 100644
+index 0000000000..fbb2f8ce3b
+--- /dev/null
++++ b/chrome/browser/meridian/clean_url_unittest.cc
+@@ -0,0 +1,33 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/clean_url.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++#include "url/gurl.h"
++
++namespace meridian {
++namespace {
++
++std::string Clean(const char* url) {
++  return WithoutTracking(GURL(url)).spec();
++}
++
++TEST(CleanUrlTest, DropsTrackingKeepsTheRest) {
++  EXPECT_EQ(Clean("https://example.com/a?utm_source=x&id=7&utm_medium=y"),
++            "https://example.com/a?id=7");
++  EXPECT_EQ(Clean("https://example.com/?fbclid=abc"), "https://example.com/");
++  EXPECT_EQ(Clean("https://example.com/p?gclid=1&q=a%20b#top"),
++            "https://example.com/p?q=a%20b#top");
++  EXPECT_EQ(Clean("https://youtu.be/xyz?si=share&t=42"),
++            "https://youtu.be/xyz?t=42");
++  // "si" is YouTube's; elsewhere it may mean something.
++  EXPECT_EQ(Clean("https://example.com/?si=1"), "https://example.com/?si=1");
++  EXPECT_EQ(Clean("https://example.com/?a=1&b"), "https://example.com/?a=1&b");
++  EXPECT_EQ(Clean("chrome://settings/?utm_source=x"),
++            "chrome://settings/?utm_source=x");
++}
++
++}  // namespace
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index d672cd34be..80e0aef344 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -642,4 +642,8 @@ interface SidebarHandler {
+   // switches to an enabled layout for `language` ("ru", "en") so the rest is
+   // typed right.
+   SwitchKeyboardLayout(string language);
++
++  // Copies the active tab's address without tracking parameters (⇧⌘C and the
++  // link button by the address).
++  CopyLink();
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index a700a830b6..d485cdcc92 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -41,6 +41,7 @@
+ #include "mojo/public/cpp/bindings/callback_helpers.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/meridian/atc.h"
++#include "chrome/browser/meridian/clean_url.h"
+ #include "components/content_settings/core/browser/host_content_settings_map.h"
+ #include "chrome/browser/themes/theme_service.h"
+ #include "chrome/browser/themes/theme_service_factory.h"
+@@ -547,6 +548,26 @@ void SidebarHandler::ShowLinkPreview(BrowserWindowInterface* browser,
+   }
+ }
+ 
++namespace {
++
++// The active tab's address, without tracking parameters, to the clipboard.
++void CopyActiveLink(BrowserWindowInterface* browser) {
++  tabs::TabInterface* tab = browser->GetActiveTabInterface();
++  if (!tab) {
++    return;
++  }
++  ui::ScopedClipboardWriter(ui::ClipboardBuffer::kCopyPaste)
++      .WriteText(base::UTF8ToUTF16(
++          WithoutTracking(tab->GetContents()->GetVisibleURL()).spec()));
++  SidebarHandler::ShowToast(browser, "Copied link");
++}
++
++}  // namespace
++
++void SidebarHandler::CopyLink() {
++  CopyActiveLink(browser_);
++}
++
+ // static
+ bool SidebarHandler::HandleCommand(BrowserWindowInterface* browser,
+                                    int id) {
+@@ -555,10 +576,10 @@ bool SidebarHandler::HandleCommand(BrowserWindowInterface* browser,
+   if (id == IDC_NEW_TAB) {
+     return ShowCommandBar(browser);
+   }
+-  // ⇧⌘C copies as Chrome does; Arc says so.
++  // ⇧⌘C: the address without tracking parameters (Arc), and Arc's toast.
+   if (id == IDC_COPY_URL) {
+-    ShowToast(browser, "Copied link");
+-    return false;
++    CopyActiveLink(browser);
++    return true;
+   }
+   // ⇧⌥⌘C: "[title](url)" of the page (Arc's Copy URL as Markdown).
+   if (id == IDC_MERIDIAN_COPY_MARKDOWN) {
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index a73785e5c6..ae6f3d6503 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -153,6 +153,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void TestCommand(int32_t command_id) override;
+   void TestWindowState(TestWindowStateCallback callback) override;
+   void SwitchKeyboardLayout(const std::string& language) override;
++  void CopyLink() override;
+   void TestKeyPress(uint16_t key_code,
+                     const std::string& characters,
+                     uint32_t modifiers) override;
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 6bb6972325..2bb3e29cd6 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -981,7 +981,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+ 
+   protected onCopyLinkClick_(e: Event) {
+     e.stopPropagation();
+-    navigator.clipboard.writeText(this.url_);
++    this.$.tabstrip.copyLink();
+     this.linkCopied_ = true;
+     setTimeout(() => this.linkCopied_ = false, 1400);
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 104d91a0c5..00403fd42e 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -726,6 +726,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+ 
+   // ----------------------------------------------------------- commands
+ 
++  // The page's address, without tracking parameters, to the clipboard.
++  copyLink() {
++    this.handler_.copyLink();
++  }
++
+   // The active space's profile ("" until the state arrives).
+   activeProfileId(): string {
+     return this.state_?.profileId ?? '';
