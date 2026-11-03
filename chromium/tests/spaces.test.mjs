@@ -179,9 +179,11 @@ test('a space and a pin made just before a crash are still there after it', asyn
     let b = await launch([page('Keep')], { profile });
     try {
       await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+      await b.waitFor(`${SB}.querySelector('meridian-tab-row').tab.title === 'Keep'`);
+      await b.eval(`${T}.handler_.pinTab(${SB}.querySelector('meridian-tab-row').tab.id, { container: ${T}.state_.activeSpaceId, parentId: '', index: 0 }, '')`);
+      await b.waitFor(`${T}.state_.spaces[0].pinned.length === 1`, 10000, `${T}.state_.spaces[0].pinned`);
       await b.eval(`${T}.handler_.createSpace('Fresh', '', '', '')`);
-      await b.eval(`${T}.handler_.pinTab(${T}.state_.tabs[0].tabId, { container: ${T}.state_.activeSpaceId, parentId: '', index: 0 }, '')`);
-      await b.waitFor(`${T}.state_.spaces.length === 2 && ${T}.state_.spaces[0].pinned.length === 1`);
+      await b.waitFor(`${T}.state_.spaces.length === 2`);
       await new Promise((r) => setTimeout(r, 2000));
       b.proc.kill('SIGKILL');  // a crash: nothing is written on the way out
     } finally { await b.close(); }
