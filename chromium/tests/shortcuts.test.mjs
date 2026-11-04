@@ -15,7 +15,7 @@ const activeTitle = `[...app.$.tabstrip.tabs_.values()].find((t) => t.isActive)?
 const C = { selectTab: 0, stepTab: 1, selectSpace: 2, stepSpace: 3, togglePin: 4, toggleSidebar: 5, newFolder: 6 };
 // NSEventModifierFlags and macOS virtual key codes.
 const CMD = 1 << 20, OPT = 1 << 19, CTRL = 1 << 18;
-const K = { 1: [18, '1'], 2: [19, '2'], 3: [20, '3'], t: [17, 't'], left: [123, '\uF702'], right: [124, '\uF703'] };
+const K = { 1: [18, '1'], 2: [19, '2'], 3: [20, '3'], t: [17, 't'], left: [123, '\uF702'], right: [124, '\uF703'], up: [126, '\uF700'], down: [125, '\uF701'] };
 
 // ⌘D and ⌘S are main menu key equivalents: AppKit hands those to the menu, which doesn't answer a test
 // window in the background, so they stay with the Command tests below.
@@ -244,4 +244,78 @@ test('⇧⌘C and the link button copy the address without utm_ and other tracki
     await b.close(); server.close();
     execFileSync('pbcopy', { input: saved });
   }
+});
+
+// Arc: ⌘⌥↑/↓ step tabs whatever the page does with arrow keys (a page that keeps every arrow press
+// for itself, like an editor or a slideshow, with the focus in it). The commands are reserved, so
+// the browser takes them before the page. (A test window is never the key window, and only the
+// key window hands keys to the page first, so this can't show the page taking them on 0.5.13.)
+test('⌘⌥↑/↓ step tabs from a page that keeps the arrow keys for itself', async () => {
+  const greedy = (t) => `data:text/html,<title>${t}</title><script>addEventListener('keydown', (e) => { if (e.key.startsWith('Arrow')) e.preventDefault(); }, true)</script><textarea autofocus></textarea>`;
+  const b = await launch([greedy('A'), greedy('B'), greedy('C')], { args: ['--meridian-test-keys'] });
+  const press = ([code, ch], mods) => b.eval(`app.$.tabstrip.handler_.testKeyPress(${code}, ${JSON.stringify(ch)}, ${mods})`);
+  const order = () => b.eval(`[...${SB}.querySelectorAll('meridian-tab-row')].map((r) => r.tab.title)`);
+  try {
+    await b.waitFor(today(3));
+    const [top, middle, bottom] = await order();
+    await b.click(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === '${top}').shadowRoot.querySelector('.row')`);
+    await b.click('app.$.contentRegion');
+    await b.waitFor(`app.$.contentRegion.activeWebview?.shadowRoot.activeElement?.classList.contains('content')`);
+    await press(K.down, CMD | OPT);
+    await b.waitFor(`${activeTitle} === '${middle}'`);
+    await press(K.down, CMD | OPT);
+    await b.waitFor(`${activeTitle} === '${bottom}'`);
+    await press(K.up, CMD | OPT);
+    await b.waitFor(`${activeTitle} === '${middle}'`);
+  } finally { await b.close(); }
+});
+
+// Arc: stepping through a big folder of pinned tabs that aren't loaded yet (after an import or a
+// restart) keeps the one opening in sight; it shows in Today for a moment before its item comes back.
+test('⌘⌥↓ through an open folder of unloaded pinned tabs, under closed nested folders, keeps the active one in sight', async () => {
+  const http = await import('node:http');
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  // Pages that take a moment, as real ones do.
+  const server = http.createServer((req, res) => setTimeout(() => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(`<title>${req.url.slice(1)}</title><p>x`); }, 300));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = (p) => `http://127.0.0.1:${server.address().port}/${p}`;
+  let n = 0;
+  const tabs = (k) => Array.from({ length: k }, () => { n++; return { id: `t${n}`, title: `T${n}`, url: url(`T${n}`) }; });
+  const folder = (open, children) => ({ id: `f${++n}`, title: `F${n}`, folder: true, open, children });
+  const steps = folder(true, tabs(33));
+  const pinned = [
+    folder(false, [folder(false, tabs(13)), folder(false, tabs(2)), folder(false, tabs(7))]),
+    folder(false, []), folder(false, tabs(19)), steps, folder(false, tabs(20)), ...tabs(9),
+  ];
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-folders-'));
+  fs.mkdirSync(path.join(profile, 'Default'));
+  fs.writeFileSync(path.join(profile, 'Default', 'Meridian Sidebar.json'), JSON.stringify({
+    version: 1, activeSpace: 's1', mainProfileName: '', profiles: [], favorites: [],
+    spaces: [{ id: 's1', name: 'Work', color: '#888888', color2: '', icon: '', pinned }],
+  }));
+  const b = await launch([url('today1'), url('today2')], { profile, args: ['--meridian-test-keys'] });
+  const press = ([code, ch], mods) => b.eval(`app.$.tabstrip.handler_.testKeyPress(${code}, ${JSON.stringify(ch)}, ${mods})`);
+  const inSight = () => b.eval(`(() => {
+    const scroller = ${SB}.getElementById('spacePage');
+    const deep = (root) => { for (const it of root?.querySelectorAll('meridian-item') || []) { const own = it.shadowRoot?.querySelector('.row.pinned.active'); if (own) return own; const inner = deep(it.shadowRoot); if (inner) return inner; } return null; };
+    const row = [...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive) || deep(${SB});
+    if (!row) return 'no active row';
+    const v = scroller.getBoundingClientRect(), r = row.getBoundingClientRect();
+    return r.top >= v.top - 1 && r.bottom <= v.bottom + 1 ? true : Math.round(r.top) + '..' + Math.round(r.bottom) + ', visible ' + Math.round(v.top) + '..' + Math.round(v.bottom);
+  })()`);
+  try {
+    await b.waitFor(`app.$.tabstrip.state_?.spaces[0]?.pinned.length === ${pinned.length}`);
+    await b.eval(`app.$.tabstrip.handler_.openItem('${steps.children[0].id}')`);
+    await b.waitFor(`${activeTitle} === 'T${steps.children[0].title.slice(1)}'`, { timeout: 10000 }).catch(() => {});
+    const seen = [];
+    for (let i = 1; i <= 40; i++) {
+      await press(K.down, CMD | OPT);
+      await new Promise((r) => setTimeout(r, 700));
+      seen.push(await b.eval(activeTitle));
+      assert.equal(await inSight(), true, `after ${i} × ⌘⌥↓ (${seen.at(-1)})`);
+    }
+    assert.equal(new Set(seen).size, 40, `each press moved on: ${seen}`);
+  } finally { await b.close(); server.closeAllConnections(); server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
