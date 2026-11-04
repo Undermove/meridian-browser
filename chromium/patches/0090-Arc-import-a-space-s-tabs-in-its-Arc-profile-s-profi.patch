@@ -1,0 +1,176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 4 Nov 2026 10:58:36 +0400
+Subject: [PATCH 91/91] Arc import: a space's tabs in its Arc profile's profile
+
+Onboarding imports the sidebar before the sign-ins, so the open tabs of a
+space in another Arc profile were made before that profile existed, in the
+main one. Every tab opened from the sidebar then took the active tab as its
+source and followed it there, so the whole space was signed in as the main
+profile, also after a restart.
+
+- The import loads its spaces' profiles before making their tabs.
+- What the browser opens (the sidebar, a menu) takes the active space's
+  profile, not the active tab's; a page's links keep their page's.
+- Tabs outside their space's profile move into it at startup, unloaded and
+  not archived (repairs 0.5.13's imports).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar_handler.cc    | 65 ++++++++++++++++++-
+ chrome/browser/meridian/sidebar_handler.h     |  5 ++
+ .../browser/ui/navigator/browser_navigator.cc | 15 +++--
+ 3 files changed, 79 insertions(+), 6 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index e06ae18ed6..db8b447ad5 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -81,6 +81,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "components/browser_apis/tab_strip/types/node_id.h"
+ #include "components/prefs/pref_service.h"
++#include "components/sessions/content/content_serialized_navigation_builder.h"
+ #include "components/sessions/core/serialized_navigation_entry.h"
+ #include "components/sessions/core/serialized_user_agent_override.h"
+ #include "components/split_tabs/split_tab_id.h"
+@@ -1690,7 +1691,11 @@ void SidebarHandler::OnArcRead(ImportArcCallback callback,
+     }
+   }
+   // Arc's open tabs: Today tabs of their space, loaded when first opened.
+-  // (Made in their space's profile, by the space in the extra data.)
++  // (Made in their space's profile, by the space in the extra data: so that
++  // profile first, or they would be made in the main one.)
++  for (const Space& space : arc->spaces) {
++    LoadSpaceProfile(MainProfileFor(browser_->GetProfile()), space.profile);
++  }
+   for (size_t i = 0; i < arc->spaces.size(); ++i) {
+     for (const ArcSidebar::Tab& tab : arc->today[i]) {
+       sessions::SerializedNavigationEntry entry;
+@@ -1762,10 +1767,66 @@ void SidebarHandler::OnSidebarChanged() {
+     PreloadSpaceProfiles(MainProfileFor(browser_->GetProfile()));
+     base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+         FROM_HERE, base::BindOnce(&GatherSpaceWindows));
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&SidebarHandler::RehomeTabs,
++                                  weak_factory_.GetWeakPtr()));
+   }
+   ScheduleNotify();
+ }
+ 
++void SidebarHandler::RehomeTabs() {
++  if (!HoldsSpaceTabs(browser_)) {
++    return;
++  }
++  std::vector<content::WebContents*> strays;
++  for (int i = 0; i < model()->count(); ++i) {
++    tabs::TabInterface* tab = model()->GetTabAtIndex(i);
++    const TabData* data = TabData::Get(tab->GetContents());
++    const Space* space = data ? service_->FindSpace(data->space_id()) : nullptr;
++    if (space && !tab->GetSplit() &&
++        space->profile != ProfileIdOf(Profile::FromBrowserContext(
++                              tab->GetContents()->GetBrowserContext()))) {
++      strays.push_back(tab->GetContents());
++    }
++  }
++  for (content::WebContents* old : strays) {
++    int index = model()->GetIndexOfWebContents(old);
++    const TabData* data = TabData::Get(old);
++    const Space* space = service_->FindSpace(data->space_id());
++    content::NavigationController& history = old->GetController();
++    std::vector<sessions::SerializedNavigationEntry> entries;
++    for (int i = 0; i < history.GetEntryCount(); ++i) {
++      entries.push_back(
++          sessions::ContentSerializedNavigationBuilder::FromNavigationEntry(
++              i, history.GetEntryAtIndex(i)));
++    }
++    if (index == TabStripModel::kNoTab || !space || entries.empty()) {
++      continue;
++    }
++    std::string space_id = data->space_id();
++    std::string item_id = data->item_id();
++    bool active = model()->GetActiveWebContents() == old;
++    // The same page, its history kept, loaded when opened (a page can't
++    // change profiles: it is signed in as that profile is).
++    content::WebContents* made = chrome::AddRestoredTab(
++        browser_, entries, index + 1,
++        std::max(history.GetCurrentEntryIndex(), 0),
++        /*extension_app_id=*/std::string(), /*group=*/std::nullopt, active,
++        /*pin=*/false, base::TimeTicks::Now(), base::Time::Now(),
++        /*session_storage_namespace=*/nullptr,
++        sessions::SerializedUserAgentOverride(),
++        TabData::ExtraDataFor(space_id, space->profile),
++        /*from_session_restore=*/false, /*is_active_browser=*/std::nullopt);
++    if (!made) {
++      continue;
++    }
++    TabData::Set(made, space_id, item_id);
++    rehoming_ = old;
++    model()->DetachAndDeleteWebContentsAt(model()->GetIndexOfWebContents(old));
++    rehoming_ = nullptr;
++  }
++}
++
+ void SidebarHandler::OnTabStripModelChanged(
+     TabStripModel* tab_strip_model,
+     const TabStripModelChange& change,
+@@ -1786,7 +1847,7 @@ void SidebarHandler::OnTabStripModelChanged(
+       !tab_strip_model->closing_all()) {
+     for (const auto& removed : change.GetRemove()->contents) {
+       if (removed.remove_reason != TabRemovedReason::kDeleted ||
+-          !IsTodayTab(removed.tab)) {
++          !IsTodayTab(removed.tab) || removed.contents == rehoming_) {
+         continue;
+       }
+       content::WebContents* contents = removed.contents;
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 88b90a8d4a..feaf2d965f 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -284,6 +284,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+   // Gives a tab without (valid) Meridian data a space: its opener's, or the
+   // active one if that is of the tab's profile.
+   void Adopt(tabs::TabInterface* tab);
++  // Tabs made outside their space's profile (by 0.5.13's Arc import, before
++  // that profile existed) move into it.
++  void RehomeTabs();
+   // The Meridian profile shown: the active space's in a window that holds
+   // every profile's tabs, else this window's.
+   std::string ActiveProfileId() const;
+@@ -306,6 +309,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+   std::string profile_id_;
+   std::unique_ptr<ScopedProfileKeepAlive> main_keep_alive_;
+   bool gathered_ = false;
++  // The tab RehomeTabs() is replacing (not archived as it closes).
++  raw_ptr<content::WebContents> rehoming_ = nullptr;
+   std::unique_ptr<DownloadsTracker> downloads_;
+   base::OneShotTimer downloads_timer_;
+   raw_ptr<SidebarService> service_;
+diff --git a/chrome/browser/ui/navigator/browser_navigator.cc b/chrome/browser/ui/navigator/browser_navigator.cc
+index 105d396433..59803b3029 100644
+--- a/chrome/browser/ui/navigator/browser_navigator.cc
++++ b/chrome/browser/ui/navigator/browser_navigator.cc
+@@ -579,11 +579,18 @@ std::unique_ptr<content::WebContents> CreateTargetContents(
+   // will stay in the same BrowsingInstance (creating frame proxies as needed)
+   // preserving the requested opener relationship along the way.
+   // Meridian: a window holds the tabs of every space, each in its space's
+-  // profile (a link's in its page's).
++  // profile (a link's in its page's). Not the active tab's, which Navigate()
++  // makes the source of what the browser opens (from the sidebar, a menu).
++  bool from_page =
++      params.source_site_instance ||
++      (params.source_contents &&
++       (params.is_renderer_initiated || !params.browser ||
++        params.source_contents !=
++            params.browser->GetTabStripModel()->GetActiveWebContents()));
+   Profile* profile = meridian::ProfileForNewTab(
+-      params.browser, params.source_contents || params.source_site_instance
+-                          ? GetSourceProfile(const_cast<NavigateParams*>(&params))
+-                          : nullptr);
++      params.browser,
++      from_page ? GetSourceProfile(const_cast<NavigateParams*>(&params))
++                : nullptr);
+   scoped_refptr<content::SiteInstance> initial_site_instance_for_new_contents =
+       params.opener ? params.opener->GetSiteInstance()
+                     : tab_util::GetSiteInstanceForNewTab(profile, url);
