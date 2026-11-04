@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 4 Nov 2026 14:49:57 +0400
+Subject: [PATCH 94/94] Reserved shortcuts never reach the page, however AppKit
+ delivers them
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A page focused in the key window (a Google Sheets grid) could still get
+⌘⌥↑/↓ first and keep it: the browser now checks every key it is about to
+hand to a page against the reserved shortcuts, by the key's Mac key code
+and modifiers (what reaches a page may lack the characters the menus
+match by), and runs the command instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../ui/webui_browser/webui_browser_window.cc  |  9 +++++
+ .../ui/webui_browser/webui_browser_window.h   |  7 ++++
+ .../webui_browser/webui_browser_window_mac.mm | 37 +++++++++++++++++++
+ 3 files changed, 53 insertions(+)
+
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index 26d024ceb3..5fd88ce5a0 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -1081,6 +1081,15 @@ WebUIBrowserWindow::PreHandleKeyboardEvent(
+   // - If the |browser_| is not for an app, and the |accelerator| is associated
+   //   with the browser, and it is not a reserved one, do nothing.
+ 
++#if BUILDFLAG(IS_MAC)
++  // Meridian: a reserved shortcut never reaches the page (Arc: a
++  // spreadsheet or an editor can't keep ⌘⌥↑/↓ for itself).
++  if (int command = ReservedCommandForKeyEvent(event)) {
++    chrome::ExecuteCommand(browser_.get(), command);
++    return content::KeyboardEventProcessingResult::HANDLED;
++  }
++#endif
++
+   if (browser_->GetType() == BrowserWindowInterface::Type::TYPE_APP ||
+       browser_->GetType() == BrowserWindowInterface::Type::TYPE_APP_POPUP) {
+     // Let all keys fall through to a v1 app's web content, even accelerators.
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.h b/chrome/browser/ui/webui_browser/webui_browser_window.h
+index d4a5cbd25f..5acec44884 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.h
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.h
+@@ -9,6 +9,7 @@
+ 
+ #include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
++#include "build/build_config.h"
+ #include "chrome/browser/ui/bookmarks/bookmark_bar.h"
+ #include "chrome/browser/ui/bookmarks/bookmark_bar_controller.h"
+ #include "chrome/browser/ui/browser_window.h"
+@@ -144,6 +145,12 @@ class WebUIBrowserWindow : public BrowserWindow,
+   content::KeyboardEventProcessingResult PreHandleKeyboardEvent(
+       const input::NativeWebKeyboardEvent& event) override;
+   bool HandleKeyboardEvent(const input::NativeWebKeyboardEvent& event) override;
++#if BUILDFLAG(IS_MAC)
++  // Meridian: the reserved command `event` is the shortcut of (⌘⌥↑/↓,
++  // ⌘⌥←/→…), or 0. AppKit normally runs those before the page; this catches
++  // a key that reached the page's way anyway.
++  int ReservedCommandForKeyEvent(const input::NativeWebKeyboardEvent& event);
++#endif
+   std::unique_ptr<FindBar> CreateFindBar() override;
+   web_modal::WebContentsModalDialogHost* GetWebContentsModalDialogHost()
+       override;
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm b/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
+index 7188576c05..9cf4ab3632 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
++++ b/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
+@@ -13,6 +13,7 @@
+ #include "chrome/browser/ui/browser_command_controller.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/global_keyboard_shortcuts_mac.h"
+ #import "chrome/browser/ui/cocoa/browser_window_command_handler.h"
+ #import "chrome/browser/ui/cocoa/chrome_command_dispatcher_delegate.h"
+ #include "components/input/native_web_keyboard_event.h"
+@@ -56,6 +57,42 @@ bool ShouldHandleKeyboardEvent(const input::NativeWebKeyboardEvent& event) {
+ 
+ }  // namespace
+ 
++int WebUIBrowserWindow::ReservedCommandForKeyEvent(
++    const input::NativeWebKeyboardEvent& event) {
++  if (event.GetType() != blink::WebInputEvent::Type::kRawKeyDown) {
++    return 0;
++  }
++  int command = NO_COMMAND;
++  if (event.os_event && event.os_event.Get().type == NSEventTypeKeyDown) {
++    command = CommandForKeyEvent(event.os_event.Get()).chrome_command;
++  }
++  if (command == NO_COMMAND) {
++    // The key on its own, by its Mac key code and modifiers: what reaches a
++    // page may lack the characters the menus match by (an arrow's, say).
++    int modifiers = event.GetModifiers();
++    for (const KeyboardShortcutData& shortcut :
++         GetShortcutsNotPresentInMainMenu()) {
++      if (shortcut.vkey_code == event.native_key_code &&
++          shortcut.command_key ==
++              !!(modifiers & blink::WebInputEvent::kMetaKey) &&
++          shortcut.shift_key ==
++              !!(modifiers & blink::WebInputEvent::kShiftKey) &&
++          shortcut.cntrl_key ==
++              !!(modifiers & blink::WebInputEvent::kControlKey) &&
++          shortcut.opt_key == !!(modifiers & blink::WebInputEvent::kAltKey)) {
++        command = shortcut.chrome_command;
++        break;
++      }
++    }
++  }
++  if (command == NO_COMMAND ||
++      !chrome::BrowserCommandController::From(browser_.get())
++           ->IsReservedCommandOrKey(command, event)) {
++    return 0;
++  }
++  return command;
++}
++
+ bool WebUIBrowserWindow::HandleKeyboardEvent(
+     const input::NativeWebKeyboardEvent& event) {
+   if (!ShouldHandleKeyboardEvent(event)) {

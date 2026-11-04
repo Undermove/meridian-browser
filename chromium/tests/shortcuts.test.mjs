@@ -246,27 +246,40 @@ test('⇧⌘C and the link button copy the address without utm_ and other tracki
   }
 });
 
-// Arc: ⌘⌥↑/↓ step tabs whatever the page does with arrow keys (a page that keeps every arrow press
-// for itself, like an editor or a slideshow, with the focus in it). The commands are reserved, so
-// the browser takes them before the page. (A test window is never the key window, and only the
-// key window hands keys to the page first, so this can't show the page taking them on 0.5.13.)
+// Arc: ⌘⌥↑/↓ step tabs whatever the page does with arrow keys (a spreadsheet or an editor keeps
+// every arrow press for itself). The key is sent into the page itself, the way AppKit hands it to a
+// page focused in the key window; the browser takes it before the page sees it.
 test('⌘⌥↑/↓ step tabs from a page that keeps the arrow keys for itself', async () => {
-  const greedy = (t) => `data:text/html,<title>${t}</title><script>addEventListener('keydown', (e) => { if (e.key.startsWith('Arrow')) e.preventDefault(); }, true)</script><textarea autofocus></textarea>`;
-  const b = await launch([greedy('A'), greedy('B'), greedy('C')], { args: ['--meridian-test-keys'] });
-  const press = ([code, ch], mods) => b.eval(`app.$.tabstrip.handler_.testKeyPress(${code}, ${JSON.stringify(ch)}, ${mods})`);
+  const greedy = (t) => `data:text/html,<title>${t}</title><script>let n = 0; addEventListener('keydown', (e) => { if (e.key.startsWith('Arrow')) { e.preventDefault(); document.title = '${t} ' + ++n; } }, true)</script><textarea autofocus></textarea>`;
+  const b = await launch([greedy('A'), greedy('B'), greedy('C')]);
   const order = () => b.eval(`[...${SB}.querySelectorAll('meridian-tab-row')].map((r) => r.tab.title)`);
+  // ⌘⌥ and an arrow, into the active tab's page.
+  const pressInPage = async (down) => {
+    const id = await b.eval(`[...app.$.tabstrip.tabs_.values()].find((t) => t.isActive).id`);
+    const title = await b.eval(`app.$.tabstrip.tabs_.get(${JSON.stringify(id)})?.title ?? [...app.$.tabstrip.tabs_.values()].find((t) => t.isActive).title`);
+    const t = (await (await fetch(`${b.base}/json/list`)).json()).find((x) => x.type === 'page' && x.title.startsWith(title[0]) && x.url.startsWith('data:'));
+    const ws = new WebSocket(t.webSocketDebuggerUrl);
+    await new Promise((r) => (ws.onopen = r));
+    let id2 = 0;
+    const send = (method, params) => new Promise((r) => { const my = ++id2; ws.addEventListener('message', function on(m) { if (JSON.parse(m.data).id === my) { ws.removeEventListener('message', on); r(); } }); ws.send(JSON.stringify({ id: my, method, params })); });
+    const key = down ? { key: 'ArrowDown', code: 'ArrowDown', windowsVirtualKeyCode: 40, nativeVirtualKeyCode: 125, unmodifiedText: '\uF701' }
+                     : { key: 'ArrowUp', code: 'ArrowUp', windowsVirtualKeyCode: 38, nativeVirtualKeyCode: 126, unmodifiedText: '\uF700' };
+    await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', modifiers: 1 | 4, ...key });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', modifiers: 1 | 4, ...key });
+    ws.close();
+  };
   try {
     await b.waitFor(today(3));
     const [top, middle, bottom] = await order();
     await b.click(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === '${top}').shadowRoot.querySelector('.row')`);
-    await b.click('app.$.contentRegion');
-    await b.waitFor(`app.$.contentRegion.activeWebview?.shadowRoot.activeElement?.classList.contains('content')`);
-    await press(K.down, CMD | OPT);
-    await b.waitFor(`${activeTitle} === '${middle}'`);
-    await press(K.down, CMD | OPT);
-    await b.waitFor(`${activeTitle} === '${bottom}'`);
-    await press(K.up, CMD | OPT);
-    await b.waitFor(`${activeTitle} === '${middle}'`);
+    await b.waitFor(`${activeTitle} === '${top}'`);
+    await pressInPage(true);
+    await b.waitFor(`${activeTitle}?.startsWith('${middle}')`);
+    await pressInPage(true);
+    await b.waitFor(`${activeTitle}?.startsWith('${bottom}')`);
+    await pressInPage(false);
+    await b.waitFor(`${activeTitle}?.startsWith('${middle}')`);
+    assert.deepEqual((await order()).filter((t) => / \d+$/.test(t)), [], 'no page saw the keys');
   } finally { await b.close(); }
 });
 
