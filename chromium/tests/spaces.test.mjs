@@ -229,3 +229,53 @@ test('each space keeps where its list was scrolled to across switches', async ()
     }
   } finally { await b.close(); }
 });
+
+// After a crash the window can open on a new tab of the main profile while the sidebar comes back
+// on a space of another profile. That space's tab is shown; and a pinned tab clicked there opens in
+// it (it used to follow the shown tab into the other space, the sidebar with it).
+test('starting on a space whose tab isn\'t shown: its tab comes up; its pinned tab opens in it', async () => {
+  const http = await import('node:http');
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(`<title>${req.url.slice(1)}</title>`); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const u = (p) => `http://127.0.0.1:${server.address().port}/${p}`;
+  const T = 'app.$.tabstrip';
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-startspace-'));
+  let work;
+  try {
+    let b = await launch([u('main')], { profile });
+    try {
+      await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+      const { profileId } = await b.eval(`${T}.handler_.addProfile('Work')`);
+      ({ spaceId: work } = await b.eval(`${T}.handler_.createSpace('Work', '', '', '')`));
+      await b.eval(`${T}.handler_.setSpaceProfile(${JSON.stringify(work)}, ${JSON.stringify(profileId)})`);
+      await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(work)})`);
+      await b.waitFor(`${T}.state_.profileId === ${JSON.stringify(profileId)}`);
+      await b.eval(`${T}.openUrl(${JSON.stringify(u('sheet'))})`);
+      await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'sheet')`);
+      const id = await b.eval(`[...${T}.tabs_.values()].find((t) => t.title === 'sheet').id`);
+      await b.eval(`${T}.handler_.pinTab(${JSON.stringify(id)}, { container: ${JSON.stringify(work)}, parentId: '', index: -1 }, '')`);
+      await b.waitFor(`${T}.state_.spaces.find((s) => s.id === ${JSON.stringify(work)}).pinned.length === 1`);
+      // Back to the first space, its tab shown; Work's pinned tab unloaded.
+      await b.eval(`${T}.handler_.activateSpace(${T}.state_.spaces[0].id)`);
+      await b.waitFor(`[...${T}.tabs_.values()].find((t) => t.isActive)?.title === 'main'`);
+      await b.eval(`${T}.closeTab(${JSON.stringify(id)})`);
+      await new Promise((r) => setTimeout(r, 2500));
+      await b.quit();
+    } finally { await b.close(); }
+    // The sidebar comes back on Work (as the crash left it); the session on the first space's tab.
+    const file = path.join(profile, 'Default', 'Meridian Sidebar.json');
+    const sidebar = JSON.parse(fs.readFileSync(file, 'utf8'));
+    sidebar.activeSpace = work;
+    fs.writeFileSync(file, JSON.stringify(sidebar));
+    b = await launch([], { profile });
+    try {
+      await b.waitFor(`${T}.state_?.activeSpaceId === ${JSON.stringify(work)}`);
+      // The shown tab is Work's.
+      await b.waitFor(`${T}.state_.tabs.find((t) => t.tabId === [...${T}.tabs_.values()].find((x) => x.isActive)?.id)?.spaceId === ${JSON.stringify(work)}`);
+      await b.click(`[...${SB}.querySelectorAll('#pinned > meridian-item')].find((e) => e.item.title === 'sheet' || e.item.url?.includes('/sheet')).shadowRoot.querySelector('.row')`);
+      await b.waitFor(`[...${T}.tabs_.values()].find((t) => t.isActive)?.title === 'sheet'`);
+      await new Promise((r) => setTimeout(r, 1000));
+      assert.equal(await b.eval(`${T}.state_.activeSpaceId`), work, 'still in Work');
+    } finally { await b.close(); }
+  } finally { server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});

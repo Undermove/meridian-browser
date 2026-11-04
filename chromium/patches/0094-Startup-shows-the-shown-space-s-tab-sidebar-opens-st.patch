@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 5 Nov 2026 01:22:33 +0400
+Subject: [PATCH 95/95] Startup shows the shown space's tab; sidebar opens stay
+ in their space; no crash on a stale root view
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- At startup (after a crash, say) the window could show a new tab of the
+  main space while the sidebar came back on a space of another profile; a
+  pinned tab clicked there then followed that tab (its opener) into the
+  main space, the sidebar with it. The shown space's tab comes up, and
+  only a link's tab joins its opener's space.
+- ⌘⌥↑/↓ taken before the page run after the key is handled, not inside
+  the page's input handling.
+- RenderWidgetHostViewMac::GetRootFrameSinkId() after Destroy(): no
+  compositor, no root (a focus change in a tab crashed the browser).
+- Test hook: a key through NSApp with the window made key (1 << 30).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar_handler.cc    | 29 +++++++++++++++++--
+ chrome/browser/meridian/sidebar_handler.h     |  3 ++
+ .../browser/meridian/sidebar_handler_mac.mm   | 22 ++++++++++++++
+ .../ui/webui_browser/webui_browser_window.cc  | 15 +++++++++-
+ .../ui/webui_browser/webui_browser_window.h   |  3 ++
+ .../render_widget_host_view_mac.mm            |  6 ++++
+ 6 files changed, 74 insertions(+), 4 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 5bacd43eef..e286c3cd00 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -372,10 +372,17 @@ void SidebarHandler::Adopt(tabs::TabInterface* tab) {
+     return;
+   }
+   // Its opener's space (a link opened in a new tab stays with its page).
++  // Only a link's: Navigate() also makes the active tab the opener of what
++  // the sidebar opens, which goes to its own space.
+   int index = model()->GetIndexOfTab(tab);
+-  if (tabs::TabInterface* opener = index == TabStripModel::kNoTab
+-                                       ? nullptr
+-                                       : model()->GetOpenerOfTabAt(index)) {
++  content::NavigationEntry* entry = contents->GetController().GetVisibleEntry();
++  bool from_link = entry && ui::PageTransitionCoreTypeIs(
++                                entry->GetTransitionType(),
++                                ui::PAGE_TRANSITION_LINK);
++  if (tabs::TabInterface* opener =
++          index == TabStripModel::kNoTab || !from_link
++              ? nullptr
++              : model()->GetOpenerOfTabAt(index)) {
+     const TabData* from = TabData::Get(opener->GetContents());
+     if (from && service_->FindSpace(from->space_id())) {
+       TabData::Set(contents, from->space_id(), std::string());
+@@ -1780,10 +1787,26 @@ void SidebarHandler::OnSidebarChanged() {
+     base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+         FROM_HERE, base::BindOnce(&SidebarHandler::RehomeTabs,
+                                   weak_factory_.GetWeakPtr()));
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&SidebarHandler::ShowActiveSpaceTab,
++                                  weak_factory_.GetWeakPtr()));
+   }
+   ScheduleNotify();
+ }
+ 
++void SidebarHandler::ShowActiveSpaceTab() {
++  tabs::TabInterface* active = model()->GetActiveTab();
++  const TabData* data = active ? TabData::Get(active->GetContents()) : nullptr;
++  const std::string& space_id = service_->active_space_id();
++  if (!HoldsSpaceTabs(browser_) || !service_->FindSpace(space_id) ||
++      (data && data->space_id() == space_id) ||
++      (data && !data->item_id().empty() &&
++       IsFavorites(service_->ContainerOf(data->item_id())))) {
++    return;
++  }
++  ActivateSpaceHere(space_id);
++}
++
+ void SidebarHandler::RehomeTabs() {
+   if (!HoldsSpaceTabs(browser_)) {
+     return;
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index feaf2d965f..66c7aeea6e 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -287,6 +287,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+   // Tabs made outside their space's profile (by 0.5.13's Arc import, before
+   // that profile existed) move into it.
+   void RehomeTabs();
++  // At startup: the window shows a tab of the space the sidebar shows (one
++  // started in another, like the new tab after a crash, isn't shown).
++  void ShowActiveSpaceTab();
+   // The Meridian profile shown: the active space's in a window that holds
+   // every profile's tabs, else this window's.
+   std::string ActiveProfileId() const;
+diff --git a/chrome/browser/meridian/sidebar_handler_mac.mm b/chrome/browser/meridian/sidebar_handler_mac.mm
+index ac57068f0a..cb3f8da20d 100644
+--- a/chrome/browser/meridian/sidebar_handler_mac.mm
++++ b/chrome/browser/meridian/sidebar_handler_mac.mm
+@@ -115,6 +115,28 @@ void SidebarHandler::TestKeyPress(uint16_t key_code,
+   NSWindow* window =
+       browser_->GetWindow()->GetNativeWindow().GetNativeNSWindow();
+   NSString* chars = base::SysUTF8ToNSString(characters);
++  // 1 << 30: the whole of AppKit's way, as for a key typed in the key
++  // window: the window made key (without bringing the app forward) and the
++  // event given to NSApp.
++  constexpr uint32_t kThroughApp = 1u << 30;
++  if (modifiers & kThroughApp) {
++    modifiers &= ~kThroughApp;
++    [window makeKeyWindow];
++    for (NSEventType type : {NSEventTypeKeyDown, NSEventTypeKeyUp}) {
++      [NSApp sendEvent:[NSEvent keyEventWithType:type
++                                        location:NSZeroPoint
++                                   modifierFlags:modifiers
++                                       timestamp:NSProcessInfo.processInfo
++                                                     .systemUptime
++                                    windowNumber:window.windowNumber
++                                         context:nil
++                                      characters:chars
++                     charactersIgnoringModifiers:chars
++                                       isARepeat:NO
++                                         keyCode:key_code]];
++    }
++    return;
++  }
+   for (NSEventType type : {NSEventTypeKeyDown, NSEventTypeKeyUp}) {
+     NSEvent* event = [NSEvent keyEventWithType:type
+                                       location:NSZeroPoint
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index 5fd88ce5a0..02469630a3 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -8,8 +8,10 @@
+ 
+ #include "base/check.h"
+ #include "base/feature_list.h"
++#include "base/functional/bind.h"
+ #include "base/notimplemented.h"
+ #include "base/strings/stringprintf.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "chrome/browser/app_mode/app_mode_utils.h"
+ #include "chrome/browser/lifetime/browser_shutdown.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+@@ -1084,8 +1086,19 @@ WebUIBrowserWindow::PreHandleKeyboardEvent(
+ #if BUILDFLAG(IS_MAC)
+   // Meridian: a reserved shortcut never reaches the page (Arc: a
+   // spreadsheet or an editor can't keep ⌘⌥↑/↓ for itself).
++  // Run after this key is done with: switching tabs right inside the page's
++  // input handling tore its view down under it (a crash on its next focus
++  // change).
+   if (int command = ReservedCommandForKeyEvent(event)) {
+-    chrome::ExecuteCommand(browser_.get(), command);
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(
++                       [](base::WeakPtr<WebUIBrowserWindow> window,
++                          int command) {
++                         if (window) {
++                           chrome::ExecuteCommand(window->browser(), command);
++                         }
++                       },
++                       weak_factory_.GetWeakPtr(), command));
+     return content::KeyboardEventProcessingResult::HANDLED;
+   }
+ #endif
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.h b/chrome/browser/ui/webui_browser/webui_browser_window.h
+index 5acec44884..e528e26ada 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.h
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.h
+@@ -9,6 +9,7 @@
+ 
+ #include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/ui/bookmarks/bookmark_bar.h"
+ #include "chrome/browser/ui/bookmarks/bookmark_bar_controller.h"
+@@ -321,6 +322,8 @@ class WebUIBrowserWindow : public BrowserWindow,
+   base::CallbackListSubscription theme_changed_subscription_;
+ 
+   base::CallbackListSubscription zoom_changed_subscription_;
++
++  base::WeakPtrFactory<WebUIBrowserWindow> weak_factory_{this};
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_WEBUI_BROWSER_WEBUI_BROWSER_WINDOW_H_
+diff --git a/content/browser/renderer_host/render_widget_host_view_mac.mm b/content/browser/renderer_host/render_widget_host_view_mac.mm
+index d96670e866..6a36747070 100644
+--- a/content/browser/renderer_host/render_widget_host_view_mac.mm
++++ b/content/browser/renderer_host/render_widget_host_view_mac.mm
+@@ -1801,6 +1801,12 @@ bool RenderWidgetHostViewMac::TransformPointToCoordSpaceForView(
+ }
+ 
+ viz::FrameSinkId RenderWidgetHostViewMac::GetRootFrameSinkId() {
++  // Meridian: a frame inside a tab can still name this view as its root
++  // after it was destroyed (Destroy() drops the compositor); a focus change
++  // reported then crashed the browser.
++  if (!browser_compositor_) {
++    return viz::FrameSinkId();
++  }
+   return browser_compositor_->GetRootFrameSinkId();
+ }
+ 
