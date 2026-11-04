@@ -75,3 +75,29 @@ test('a ⇧-clicked link opens in Peek over the page, not in a new window (Arc)'
     await b.waitFor(`!${CR}.hasAttribute('peek')`);
   } finally { await b.close(); site.close(); }
 });
+
+// Arc: a pinned tab clicked in the sidebar just opens, even while a pinned tab of another site is
+// shown (the browser makes the active tab the new one's opener; that isn't a link out of it).
+test('a pinned tab of another site opened from the sidebar is a tab, not a Peek', async () => {
+  const site = await twoSites();
+  const other = site.url.replace('127.0.0.1', 'localhost').replace('/app', '/other');
+  const b = await launch([site.url, other]);
+  try {
+    await b.waitFor(today(2));
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].map((r) => r.tab.title).sort().join() === 'App,Other site'`);
+    for (const title of ['App', 'Other site']) {
+      await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === '${title}')`, 'Pin Tab');
+      await b.waitFor(`!!${itemEl(title)}`);
+    }
+    // Unload the Other site's pinned tab, show App's, then click Other site's row.
+    await b.eval(`app.$.tabstrip.closeTab([...app.$.tabstrip.tabs_.values()].find((t) => t.title === 'Other site').id)`);
+    await b.waitFor(`[...app.$.tabstrip.tabs_.values()].length === 1`);
+    await b.click(`${itemEl('App')}.shadowRoot.querySelector('.row')`);
+    await b.waitFor(`${itemEl('App')}.shadowRoot.querySelector('.row.active')`);
+    await b.click(`${itemEl('Other site')}.shadowRoot.querySelector('.row')`);
+    await b.waitFor(`[...app.$.tabstrip.tabs_.values()].find((t) => t.isActive)?.title === 'Other site'`);
+    await new Promise((r) => setTimeout(r, 1000));
+    assert.equal(await b.eval(`${CR}.hasAttribute('peek')`), false, 'no Peek');
+    await b.waitFor(`${itemEl('Other site')}.shadowRoot.querySelector('.row.active')`);
+  } finally { await b.close(); site.close(); }
+});

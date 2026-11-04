@@ -195,3 +195,37 @@ test('a space and a pin made just before a crash are still there after it', asyn
     } finally { await b.close(); }
   } finally { fs.rmSync(profile, { recursive: true, force: true }); }
 });
+
+// Arc: each space keeps its place in the list; switching away and back doesn't move it.
+test('each space keeps where its list was scrolled to across switches', async () => {
+  const page = (t) => `data:text/html,<title>${t}</title>`;
+  const b = await launch(Array.from({ length: 30 }, (_, i) => page(`A${i + 1}`)));
+  const T = 'app.$.tabstrip';
+  const top = () => b.eval(`${SB}.getElementById('spacePage').scrollTop`);
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 30`);
+    const one = await b.eval(`${T}.state_.activeSpaceId`);
+    const { spaceId: two } = await b.eval(`${T}.handler_.createSpace('Two', '', '', '')`);
+    await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(two)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(two)}`);
+    for (let i = 0; i < 30; i++) await b.eval(`${T}.openUrl(${JSON.stringify(page(`B${i + 1}`))})`);
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length >= 30`);
+    await new Promise((r) => setTimeout(r, 800));
+    await b.eval(`${SB}.getElementById('spacePage').scrollTop = 150`);
+    await new Promise((r) => setTimeout(r, 300));
+    const twoAt = await top();
+    await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(one)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(one)}`);
+    await new Promise((r) => setTimeout(r, 800));
+    await b.eval(`${SB}.getElementById('spacePage').scrollTop = 300`);
+    await new Promise((r) => setTimeout(r, 300));
+    const oneAt = await top();
+    for (const [id, want, name] of [[two, twoAt, 'Two'], [one, oneAt, 'the first'], [two, twoAt, 'Two again']]) {
+      await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(id)})`);
+      await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(id)}`);
+      const seen = [];
+      for (let i = 0; i < 8; i++) { await new Promise((r) => setTimeout(r, 100)); seen.push(Math.round(await top())); }
+      assert.deepEqual([...new Set(seen)], [Math.round(want)], `${name}: where it was, without jumping (${seen})`);
+    }
+  } finally { await b.close(); }
+});

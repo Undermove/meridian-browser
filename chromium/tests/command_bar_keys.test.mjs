@@ -1,7 +1,8 @@
 // The command bar with the keyboard only, the way people use it: real key presses (an NSEvent
 // through AppKit, --meridian-test-keys), starting from a page that has the focus. ⌘T takes the
 // keys from the page and Esc gives them back; the arrows go through one list (the suggestions,
-// then the open tabs; just the tabs with nothing typed) and Return opens what is picked.
+// then the open tabs; the tabs first when their names start with what was typed; just the tabs
+// with nothing typed) and Return opens what is picked.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -94,7 +95,7 @@ test('⌘T takes the keys from the page, Esc gives them back; with nothing typed
   } finally { await b.close(); s.close(); }
 });
 
-test('typed: the arrows go down the suggestions and on to the matching tabs; Return opens the picked one', async () => {
+test('typed the start of open tabs\' names: the arrows go down those tabs and on to the suggestions; Return opens the picked one', async () => {
   const { b, s, press, state } = await start(['Alpha docs', 'Alpha news', 'Beta']);
   try {
     await press(KEY.t, CMD);
@@ -105,37 +106,33 @@ test('typed: the arrows go down the suggestions and on to the matching tabs; Ret
     for (const end = Date.now() + 8000; Date.now() < end; await sleep(100)) {
       st = await state();
       const now = JSON.stringify(st.matches);
-      if (now !== seen) { seen = now; since = Date.now(); } else if (Date.now() - since > 500 && st.matches.length >= 2 && st.matches[0].startsWith('>')) break;
+      if (now !== seen) { seen = now; since = Date.now(); } else if (Date.now() - since > 500 && st.matches.length >= 1) break;
     }
     assert.ok(st, 'suggestions for "alph"');
     const n = st.matches.length;
-    assert.ok(st.matches[0].startsWith('>'), `the first suggestion is picked: ${JSON.stringify(st)}`);
-    assert.deepEqual(st.tabs, ['Alpha news', 'Alpha docs'], 'the matching tabs, below');
-    // Down to the end of the suggestions, then into the tabs; the tabs stay (a picked suggestion
-    // fills the field, which isn't what was typed).
-    for (let i = 1; i < n; i++) await press(KEY.down);
-    st = await state();
-    assert.ok(st.matches[n - 1].startsWith('>'), JSON.stringify(st));
-    assert.deepEqual(st.tabs, ['Alpha news', 'Alpha docs']);
-    await press(KEY.down);
-    st = await state();
+    // Arc: the open tabs that start that way come first, the latest one picked.
     assert.deepEqual(st.tabs, ['>Alpha news', 'Alpha docs'], JSON.stringify(st));
-    assert.ok(!st.matches.some((m) => m.startsWith('>')), 'no suggestion picked meanwhile');
-    assert.match(st.input, /^alph/i, 'the field shows what was typed again');
+    assert.ok(!st.matches.some((m) => m.startsWith('>')), `no suggestion picked too: ${JSON.stringify(st)}`);
     await press(KEY.down);
     assert.deepEqual((await state()).tabs, ['Alpha news', '>Alpha docs']);
-    await press(KEY.up);
-    await press(KEY.up);
+    // On into the suggestions, and back up.
+    await press(KEY.down);
     st = await state();
-    assert.ok(st.matches[n - 1].startsWith('>'), 'back up into the suggestions');
-    await press(KEY.down);
-    await press(KEY.down);
+    assert.ok(st.matches[0].startsWith('>'), JSON.stringify(st));
+    assert.deepEqual(st.tabs, ['Alpha news', 'Alpha docs']);
+    for (let i = 1; i < n; i++) await press(KEY.down);
+    assert.ok((await state()).matches[n - 1].startsWith('>'), 'the last suggestion');
+    for (let i = 0; i < n; i++) await press(KEY.up);
+    st = await state();
+    assert.deepEqual(st.tabs, ['Alpha news', '>Alpha docs'], JSON.stringify(st));
+    assert.ok(!st.matches.some((m) => m.startsWith('>')), 'no suggestion picked meanwhile');
     await press(KEY.enter);
     await until(async () => (await state()).active === 'Alpha docs');
     assert.equal((await state()).active, 'Alpha docs');
     assert.equal((await state()).open, false);
   } finally { await b.close(); s.close(); }
 });
+
 
 test('Esc closes the bar while the tab is still loading (it used to stop the load instead)', async () => {
   const { b, s, press, state } = await start(['Done', 'Other']);
@@ -226,5 +223,26 @@ test('macOS full screen: ⌘T, the arrows, Return and Esc work the same', async 
     assert.ok(await until(async () => !(await state()).open), 'Esc closed it');
     await b.eval(`app.$.tabstrip.handler_.testCommand(34030)`);
     await sleep(1500);
+  } finally { await b.close(); s.close(); }
+});
+
+// Arc: typing the start of an open tab's name finds the tab, ready for Return, ahead of a search.
+test('⌘T and the start of an open tab\'s name: that tab comes first, picked; Return switches to it', async () => {
+  const { b, s, press, state } = await start(['Knowledgebase admin', 'Notes', 'Mail']);
+  const K = { k: [40, 'k'], n: [45, 'n'], o: [31, 'o'], w: [13, 'w'] };
+  try {
+    await press(KEY.t, CMD);
+    await b.waitFor('app.$.commandBar.open');
+    for (const ch of 'know') await press(K[ch]);
+    // The suggestions come in after a moment; the tab stays picked through them.
+    await sleep(1500);
+    const st = await state();
+    assert.equal(st.input, 'know');
+    assert.equal(st.tabs[0], '>Knowledgebase admin', JSON.stringify(st));
+    assert.ok(!st.matches.some((m) => m.startsWith('>')), `no suggestion picked too: ${JSON.stringify(st.matches)}`);
+    assert.ok(await b.eval(`${CB}.getElementById('tabs').slot === 'before-matches'`), 'the tabs above the suggestions');
+    await press(KEY.enter);
+    assert.ok(await until(async () => { const x = await state(); return !x.open && x.active === 'Knowledgebase admin'; }), `switched: ${JSON.stringify(await state())}`);
+    assert.equal(await b.eval(`${SB}.querySelectorAll('meridian-tab-row').length`), 3, 'no new tab');
   } finally { await b.close(); s.close(); }
 });

@@ -1,0 +1,421 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 4 Nov 2026 14:21:11 +0400
+Subject: [PATCH 93/93] Command bar finds open tabs and sites first; spaces
+ keep their place; pinned tabs aren't Peeks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- ⌘T/⌘L work like the omnibox, not the New Tab page's search box: a site
+  from history can be the default, completed inline, instead of the
+  search always coming first (Arc).
+- An open tab whose site or a word of whose title starts with what was
+  typed comes first, picked: Return switches to it.
+- Each space keeps where its list was scrolled to; switching back no
+  longer jumps (it scrolled to the active tab, from the other space's
+  place).
+- Peek only for what a page opened: a pinned tab or favorite clicked in
+  the sidebar while a pinned tab of another site was shown opened as a
+  Peek (Navigate() makes the active tab the opener).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar_handler.cc    | 12 ++++-
+ .../webui_browser/meridian/command_bar.css    |  5 ++
+ .../meridian/command_bar.html.ts              |  3 +-
+ .../webui_browser/meridian/command_bar.ts     | 43 ++++++++++++++--
+ .../webui_browser/meridian/sidebar.html.ts    |  3 +-
+ .../webui_browser/meridian/sidebar.ts         | 50 +++++++++++++++++++
+ .../webui_browser/webui_browser_searchbox.ts  | 21 +++++++-
+ .../ui/webui/searchbox/realbox_handler.cc     | 22 +++++---
+ .../ui/webui/searchbox/realbox_handler.h      |  6 ++-
+ .../ui/webui_browser/webui_browser_ui.cc      |  3 +-
+ 10 files changed, 151 insertions(+), 17 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index db8b447ad5..5bacd43eef 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -83,6 +83,7 @@
+ #include "components/prefs/pref_service.h"
+ #include "components/sessions/content/content_serialized_navigation_builder.h"
+ #include "components/sessions/core/serialized_navigation_entry.h"
++#include "content/public/browser/navigation_entry.h"
+ #include "components/sessions/core/serialized_user_agent_override.h"
+ #include "components/split_tabs/split_tab_id.h"
+ #include "components/split_tabs/split_tab_visual_data.h"
+@@ -301,7 +302,16 @@ void SidebarHandler::MaybePeek(tabs::TabInterface* tab) {
+   if (!to.SchemeIsHTTPOrHTTPS()) {
+     return;  // not known yet
+   }
+-  bool peek = !net::registry_controlled_domains::SameDomainOrHost(
++  // Only what the page opened (a link, window.open): Navigate() also makes
++  // the active tab the opener of what the sidebar or the command bar opens.
++  content::NavigationEntry* entry =
++      tab->GetContents()->GetController().GetVisibleEntry();
++  const TabData* own = TabData::Get(tab->GetContents());
++  bool from_page = entry &&
++                   ui::PageTransitionCoreTypeIs(entry->GetTransitionType(),
++                                                ui::PAGE_TRANSITION_LINK) &&
++                   !(own && !own->item_id().empty());
++  bool peek = from_page && !net::registry_controlled_domains::SameDomainOrHost(
+       candidate->second, to,
+       net::registry_controlled_domains::INCLUDE_PRIVATE_REGISTRIES);
+   peek_candidates_.erase(candidate);
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.css b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+index 8a36247da3..7d62a67ae8 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.css
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+@@ -165,6 +165,11 @@ webui-browser-searchbox {
+   border-top: 1px solid var(--meridian-border);
+ }
+ 
++.tabs.first {
++  border-top: none;
++  border-bottom: 1px solid var(--meridian-border);
++}
++
+ .tab-row {
+   display: flex;
+   align-items: center;
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+index d332195410..13061d6169 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+@@ -28,7 +28,8 @@ export function getHtml(this: MeridianCommandBarElement) {
+           <span class="go">⇥</span>
+         </button>` : ''}
+       ${this.tabRows_.length ? html`
+-        <div id="tabs" class="tabs" slot="after-matches">
++        <div id="tabs" class="tabs ${this.tabsFirst_ ? 'first' : ''}"
++            slot="${this.tabsFirst_ ? 'before-matches' : 'after-matches'}">
+           ${this.tabRows_.map((t, i) => html`
+             <button class="tab-row ${i === this.tabSel_ ? 'sel' : ''}"
+                 data-id="${t.id}" @mousedown="${this.onTabRowMousedown_}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index 256192d689..74674a2eac 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -57,6 +57,7 @@ export class MeridianCommandBarElement extends CrLitElement {
+       tabRows_: {state: true, type: Array},
+       layoutFix_: {state: true, type: String},
+       tabSel_: {state: true, type: Number},
++      tabsFirst_: {state: true, type: Boolean},
+       searchboxShown_: {state: true, type: Boolean},
+     };
+   }
+@@ -67,6 +68,8 @@ export class MeridianCommandBarElement extends CrLitElement {
+   protected accessor query_: string = '';
+   protected accessor tabRows_: CommandBarTab[] = [];
+   protected accessor tabSel_: number = -1;
++  // The open tabs above the suggestions (one of them matched well).
++  protected accessor tabsFirst_: boolean = false;
+   // What was typed, read in the other keyboard layout ("ghbdtn": "привет").
+   protected accessor layoutFix_: string = '';
+   // The active space's profile: the suggestions come from its history.
+@@ -195,12 +198,24 @@ export class MeridianCommandBarElement extends CrLitElement {
+   override willUpdate(changed: PropertyValues<this>) {
+     super.willUpdate(changed);
+     const q = this.query_.trim().toLowerCase();
++    // Arc: an open tab whose site or a word of whose title starts with what
++    // was typed comes first, ready for Return (the tab, not a search).
++    const starts = (t: CommandBarTab) =>
++        this.tabHost_(t.url).toLowerCase().split('.').some(
++            l => l.startsWith(q)) ||
++        t.title.toLowerCase().split(/[\s\p{P}]+/u).some(w => w.startsWith(q));
+     const rows = q ?
+         this.tabs.filter(t => t.title.toLowerCase().includes(q) ||
+                               t.url.toLowerCase().includes(q))
++            .sort((a, b) => Number(starts(b)) - Number(starts(a)))
+             .slice(0, 3) :
+         this.tabs.slice(0, 4);
+     this.tabRows_ = rows;
++    const first = q !== '' && !!rows[0] && starts(rows[0]);
++    if (changed.has('query_' as keyof MeridianCommandBarElement)) {
++      this.tabsFirst_ = first;
++      this.tabSel_ = first ? 0 : -1;
++    }
+     if (changed.has('query_' as keyof MeridianCommandBarElement) ||
+         changed.has('tabs' as keyof MeridianCommandBarElement)) {
+       const hosts = this.tabs.map(t => this.tabHost_(t.url).split('.')[0]!);
+@@ -211,6 +226,19 @@ export class MeridianCommandBarElement extends CrLitElement {
+     }
+   }
+ 
++  override updated(changed: PropertyValues<this>) {
++    super.updated(changed);
++    if (!this.searchboxShown_ || !this.address_) {
++      return;
++    }
++    // An open tab picked for Return: the suggestions don't take it back.
++    const box = this.address_;
++    box.holdSelection = this.tabSel_ >= 0;
++    if (this.tabSel_ >= 0) {
++      box.unselectLine();
++    }
++  }
++
+   // `text`: what the field starts with (the current URL for ⌘L), selected.
+   async show(newTab: boolean, text: string) {
+     this.newTab = newTab;
+@@ -332,15 +360,22 @@ export class MeridianCommandBarElement extends CrLitElement {
+     if (!total) {
+       return;
+     }
+-    const at = this.tabSel_ >= 0 ? matches + this.tabSel_ : box.selectedLine();
++    // The rows top to bottom: the tabs first when they are shown first.
++    const tabsAt = this.tabsFirst_ ? 0 : matches;
++    const matchesAt = this.tabsFirst_ ? this.tabRows_.length : 0;
++    const line = box.selectedLine();
++    const at = this.tabSel_ >= 0 ? tabsAt + this.tabSel_ :
++                                   (line < 0 ? -1 : matchesAt + line);
+     const next = e.key === 'ArrowDown' ? (at + 1) % total :
+                                          (at < 0 ? total - 1 :
+                                                    (at - 1 + total) % total);
+-    if (next < matches) {
++    if (next >= matchesAt && next < matchesAt + matches) {
+       this.tabSel_ = -1;
+-      box.selectLine(next);
++      box.holdSelection = false;
++      box.selectLine(next - matchesAt);
+     } else {
+-      this.tabSel_ = next - matches;
++      this.tabSel_ = next - tabsAt;
++      box.holdSelection = true;
+       if (matches) {
+         box.selectLine(-1);
+       }
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+index 4722cde3f0..1b0b7d53e2 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+@@ -16,7 +16,8 @@ export function getHtml(this: MeridianSidebarElement) {
+     </meridian-fav>`)}
+ </div>
+ <div id="pages">
+-<div id="spacePage" @contextmenu="${this.onBackgroundContextmenu_}">
++<div id="spacePage" @contextmenu="${this.onBackgroundContextmenu_}"
++    @scroll="${this.onPageScroll_}">
+   ${this.space_ ? html`
+     <div class="space-header" data-space="${this.space_.id}"
+         @contextmenu="${this.onSpaceHeaderContextmenu_}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 3d04359d7f..2725308cdf 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -210,6 +210,14 @@ export class MeridianSidebarElement extends CrLitElement implements
+   // The active tab the sidebar last scrolled to, and its row (Arc keeps it
+   // in sight).
+   private shownActive_: {id: string, row: HTMLElement}|null = null;
++  // Arc: each space keeps its place in the list. The space shown, and where
++  // each one was scrolled to.
++  private shownSpaceId_ = '';
++  // The space keepActiveInSight_() last looked at, and whether it left the
++  // active row where the space was (just switched to), not scrolled to it.
++  private sightSpaceId_ = '';
++  private keptPlace_ = false;
++  private scrollOf_ = new Map<string, number>();
+   private nowPlayingPoll_ = 0;
+   // Which side it comes from: 1 the right (the next space), -1 the left.
+   private ghostDir_ = 1;
+@@ -1511,8 +1519,19 @@ export class MeridianSidebarElement extends CrLitElement implements
+   override updated(changed: PropertyValues<this>) {
+     super.updated(changed);
+     if (changed.has('ghost_' as keyof MeridianSidebarElement)) {
++      // The neighbour sliding in shows where it was left.
++      const ghost = this.shadowRoot.getElementById('ghostPage');
++      if (ghost && this.ghost_) {
++        ghost.scrollTop = this.scrollOf_.get(this.ghost_.id) ?? 0;
++      }
+       this.paintSlide_();
+     }
++    // Another space in the page: back to its place (before this frame
++    // paints; the active row is looked at after, and is there).
++    if (this.space_ && this.space_.id !== this.shownSpaceId_) {
++      this.shownSpaceId_ = this.space_.id;
++      this.restoreScroll_(this.space_.id);
++    }
+     // Play, pause and switching tabs change the tabs: ask again (soon, once).
+     if (changed.has('tabs_' as keyof MeridianSidebarElement) ||
+         changed.has('rev_' as keyof MeridianSidebarElement)) {
+@@ -1583,10 +1602,41 @@ export class MeridianSidebarElement extends CrLitElement implements
+         return;
+       }
+       this.shownActive_ = {id: active.id, row};
++      // Another space shown: it is where it was left (Arc), wherever its
++      // active tab is.
++      this.keptPlace_ = this.sightSpaceId_ !== this.shownSpaceId_;
++      if (this.keptPlace_) {
++        this.sightSpaceId_ = this.shownSpaceId_;
++        return;
++      }
+       row.scrollIntoView({block: 'nearest'});
+     });
+   }
+ 
++  // Its rows render after the page (their own updates, still before the
++  // frame paints): until then the list is too short to be scrolled there.
++  private async restoreScroll_(spaceId: string) {
++    const page = this.shadowRoot.getElementById('spacePage');
++    if (!page) {
++      return;
++    }
++    const want = this.scrollOf_.get(spaceId) ?? 0;
++    page.scrollTop = want;
++    const rows = [...page.querySelectorAll<HTMLElement&{updateComplete: Promise<unknown>}>(
++        'meridian-tab-row, meridian-item')];
++    await Promise.all(rows.map(r => r.updateComplete));
++    if (this.shownSpaceId_ === spaceId) {
++      page.scrollTop = want;
++      this.scrollOf_.set(spaceId, want);
++    }
++  }
++
++  protected onPageScroll_(e: Event) {
++    if (this.shownSpaceId_) {
++      this.scrollOf_.set(this.shownSpaceId_, (e.target as HTMLElement).scrollTop);
++    }
++  }
++
+   // --------------------------------------------------------------- menus
+ 
+   // The other spaces, as a "Move to Space" submenu.
+diff --git a/chrome/browser/resources/webui_browser/webui_browser_searchbox.ts b/chrome/browser/resources/webui_browser/webui_browser_searchbox.ts
+index f3f36a30df..5511cf7dd7 100644
+--- a/chrome/browser/resources/webui_browser/webui_browser_searchbox.ts
++++ b/chrome/browser/resources/webui_browser/webui_browser_searchbox.ts
+@@ -121,7 +121,11 @@ export class WebuiBrowserSearchboxElement extends
+   private lines_: number[] = [];
+   private browserResult_: AutocompleteResult|null = null;
+ 
+-  override onAutocompleteResultChanged(result: AutocompleteResult) {
++  // Meridian: the command bar has one of its own rows selected (an open
++  // tab), so new suggestions don't take the selection.
++  holdSelection: boolean = false;
++
++  override async onAutocompleteResultChanged(result: AutocompleteResult) {
+     const indexed = result.matches.map((match, line) => ({match, line}));
+     const [first, ...rest] = indexed;
+     const pages = rest.filter(m => !m.match.isSearchType);
+@@ -129,8 +133,12 @@ export class WebuiBrowserSearchboxElement extends
+     const order = first ? [first, ...pages, ...searches] : [];
+     this.lines_ = order.map(m => m.line);
+     this.browserResult_ = result;
+-    return super.onAutocompleteResultChanged(
++    await super.onAutocompleteResultChanged(
+         {...result, matches: order.map(m => m.match)});
++    if (this.holdSelection && this.dropdownIsVisible) {
++      this.getDropdownElement().unselect();
++      this.getInputElement().setInput({inline: ''});
++    }
+   }
+ 
+   override navigateToMatch(matchIndex: number, e: KeyboardEvent|MouseEvent) {
+@@ -183,6 +191,15 @@ export class WebuiBrowserSearchboxElement extends
+     return this.dropdownIsVisible ? this.selectedMatchIndex : -1;
+   }
+ 
++  // No suggestion selected, the suggestions still coming (the command bar
++  // selected one of its own rows).
++  unselectLine() {
++    if (this.dropdownIsVisible) {
++      this.getDropdownElement().unselect();
++      this.getInputElement().setInput({inline: ''});
++    }
++  }
++
+   // -1: none (the field shows what was typed). Like an arrow in the
+   // omnibox, it stops the suggestions coming, so they stay where they are.
+   async selectLine(line: number) {
+diff --git a/chrome/browser/ui/webui/searchbox/realbox_handler.cc b/chrome/browser/ui/webui/searchbox/realbox_handler.cc
+index 7be9fb9c61..57c76bf8a4 100644
+--- a/chrome/browser/ui/webui/searchbox/realbox_handler.cc
++++ b/chrome/browser/ui/webui/searchbox/realbox_handler.cc
+@@ -45,24 +45,32 @@ namespace {
+ 
+ class RealboxOmniboxClient final : public ContextualOmniboxClient {
+  public:
+-  RealboxOmniboxClient(Profile* profile, content::WebContents* web_contents);
++  RealboxOmniboxClient(Profile* profile,
++                       content::WebContents* web_contents,
++                       bool like_omnibox);
+   ~RealboxOmniboxClient() override;
+ 
+   // OmniboxClient:
+   metrics::OmniboxEventProto::PageClassification GetPageClassification(
+       bool is_prefetch) const override;
+   void OnBookmarkLaunched() override;
++
++ private:
++  const bool like_omnibox_;
+ };
+ 
+ RealboxOmniboxClient::RealboxOmniboxClient(Profile* profile,
+-                                           content::WebContents* web_contents)
+-    : ContextualOmniboxClient(profile, web_contents) {}
++                                           content::WebContents* web_contents,
++                                           bool like_omnibox)
++    : ContextualOmniboxClient(profile, web_contents),
++      like_omnibox_(like_omnibox) {}
+ 
+ RealboxOmniboxClient::~RealboxOmniboxClient() = default;
+ 
+ metrics::OmniboxEventProto::PageClassification
+ RealboxOmniboxClient::GetPageClassification(bool is_prefetch) const {
+-  return metrics::OmniboxEventProto::NTP_REALBOX;
++  return like_omnibox_ ? metrics::OmniboxEventProto::OTHER
++                       : metrics::OmniboxEventProto::NTP_REALBOX;
+ }
+ 
+ void RealboxOmniboxClient::OnBookmarkLaunched() {
+@@ -79,13 +87,15 @@ RealboxHandler::RealboxHandler(
+     mojo::PendingRemote<searchbox::mojom::Page> pending_page,
+     Profile* profile,
+     content::WebContents* web_contents,
+-    GetSessionHandleCallback get_session_callback)
++    GetSessionHandleCallback get_session_callback,
++    bool like_omnibox)
+     : ContextualSearchboxHandler(
+           std::move(pending_page_handler),
+           std::move(pending_page),
+           profile,
+           web_contents,
+-          std::make_unique<RealboxOmniboxClient>(profile, web_contents),
++          std::make_unique<RealboxOmniboxClient>(profile, web_contents,
++                                                 like_omnibox),
+           std::move(get_session_callback)) {
+   // Set the callback for getting suggest inputs from the session.
+   // The session is owned by WebUI controller and accessed via callback.
+diff --git a/chrome/browser/ui/webui/searchbox/realbox_handler.h b/chrome/browser/ui/webui/searchbox/realbox_handler.h
+index 19b1e4f2ab..a2498a508e 100644
+--- a/chrome/browser/ui/webui/searchbox/realbox_handler.h
++++ b/chrome/browser/ui/webui/searchbox/realbox_handler.h
+@@ -26,7 +26,11 @@ class RealboxHandler : public ContextualSearchboxHandler {
+       mojo::PendingRemote<searchbox::mojom::Page> pending_page,
+       Profile* profile,
+       content::WebContents* web_contents,
+-      GetSessionHandleCallback get_session_callback);
++      GetSessionHandleCallback get_session_callback,
++      // Meridian: the command bar works like the omnibox (a page from
++      // history can be the default, completed inline), not like the New Tab
++      // page's search box, which always puts the search first.
++      bool like_omnibox = false);
+ 
+   RealboxHandler(const RealboxHandler&) = delete;
+   RealboxHandler& operator=(const RealboxHandler&) = delete;
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_ui.cc b/chrome/browser/ui/webui_browser/webui_browser_ui.cc
+index aab104bcd7..7f2952ab92 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_ui.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_ui.cc
+@@ -215,7 +215,8 @@ void WebUIBrowserUI::CreatePageHandler(
+   realbox_handler_ = std::make_unique<RealboxHandler>(
+       std::move(pending_page_handler), std::move(page), profile, web_contents,
+       base::BindRepeating(&WebUIBrowserUI::GetOrCreateContextualSessionHandle,
+-                          base::Unretained(this)));
++                          base::Unretained(this)),
++      /*like_omnibox=*/true);
+ }
+ 
+ void WebUIBrowserUI::BindInterface(

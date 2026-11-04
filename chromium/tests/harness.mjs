@@ -64,11 +64,11 @@ const INVARIANTS = `(() => {
   const favs = [...root.querySelectorAll('meridian-fav')].map((f) => f.shadowRoot?.querySelector('.fav.active')).filter(Boolean);
   const n = today.length + pinned.length + favs.length;
   if (n > 1) out.push(n + ' rows look active in the sidebar');
-  // The active row is in the sidebar's view (Arc scrolls along), unless the sidebar is away or
-  // the row is inside a closed folder.
+  // The active row is in the sidebar's view (Arc scrolls along), unless the sidebar is away, the
+  // row is inside a closed folder, or the space was just switched to (it shows where it was left).
   const scroller = root.getElementById('spacePage');
   const row = today[0] || pinned[0];
-  if (row && scroller && !sb.ghost_) {
+  if (row && scroller && !sb.ghost_ && !sb.keptPlace_) {
     const v = scroller.getBoundingClientRect(), r = row.getBoundingClientRect();
     if (v.width > 0 && v.right > 0 && r.height > 0 && (r.top < v.top - 1 || r.bottom > v.bottom + 1)) {
       out.push('the active tab is out of the sidebar\'s view');

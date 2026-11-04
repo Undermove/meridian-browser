@@ -147,10 +147,22 @@ async function cookieEcho() {
 // the cookie each page got.
 async function homeCookies(b, u) {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // The cookie in the jar of the profile the tab is in (a restored tab's title can still be the
+  // one it was saved with, before it loads again).
   const cookieOf = async (p) => {
     for (let i = 0; i < 80; i++) {
-      const t = (await (await fetch(`${b.base}/json/list`)).json()).find((x) => x.type === 'page' && x.url === u(p) && x.title.startsWith('/'));
-      if (t) return t.title.split(' ')[1];
+      const t = (await (await fetch(`${b.base}/json/list`)).json()).find((x) => x.type === 'page' && x.url === u(p));
+      if (t) {
+        const ws = new WebSocket(t.webSocketDebuggerUrl);
+        await new Promise((r) => (ws.onopen = r));
+        const reply = await new Promise((r) => {
+          ws.onmessage = (m) => r(JSON.parse(m.data));
+          ws.send(JSON.stringify({ id: 1, method: 'Network.getCookies', params: { urls: [u('')] } }));
+        });
+        ws.close();
+        const sid = reply.result?.cookies?.find((c) => c.name === 'sid');
+        if (sid) return `sid=${sid.value}`;
+      }
       await sleep(100);
     }
     return 'not loaded';
