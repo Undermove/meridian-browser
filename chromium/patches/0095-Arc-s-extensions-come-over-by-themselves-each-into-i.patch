@@ -1,0 +1,422 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 5 Nov 2026 13:41:54 +0400
+Subject: [PATCH 96/96] Arc's extensions come over by themselves, each into its
+ Arc profile's spaces
+
+Added from the Chrome Web Store the way sync adds an account's extensions,
+with the permissions the person granted in Arc; once per profile, after an
+import (or at startup for a sidebar imported before). The Arc list in
+Settings and the site menu show only the shown space's profile's.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/arc_import.cc         |   8 +-
+ chrome/browser/meridian/arc_import.h          |   7 +-
+ .../browser/meridian/arc_import_unittest.cc   |   9 +-
+ chrome/browser/meridian/prefs.cc              |   2 +
+ chrome/browser/meridian/prefs.h               |   5 +
+ chrome/browser/meridian/sidebar_handler.cc    | 182 +++++++++++++++++-
+ chrome/browser/meridian/sidebar_handler.h     |   7 +
+ .../webui_browser/meridian/settings.html.ts   |   4 +-
+ 8 files changed, 209 insertions(+), 15 deletions(-)
+
+diff --git a/chrome/browser/meridian/arc_import.cc b/chrome/browser/meridian/arc_import.cc
+index 7297dbec78..166ab7457c 100644
+--- a/chrome/browser/meridian/arc_import.cc
++++ b/chrome/browser/meridian/arc_import.cc
+@@ -400,7 +400,6 @@ std::vector<ArcExtension> ReadArcExtensions() {
+ 
+ std::vector<ArcExtension> ReadArcExtensionsIn(const base::FilePath& arc_dir) {
+   std::vector<ArcExtension> out;
+-  std::set<std::string> seen;
+   base::FilePath user_data = arc_dir.Append("User Data");
+   base::FileEnumerator profiles(user_data, false,
+                                 base::FileEnumerator::DIRECTORIES);
+@@ -414,6 +413,8 @@ std::vector<ArcExtension> ReadArcExtensionsIn(const base::FilePath& arc_dir) {
+   }
+   std::ranges::sort(dirs);
+   for (const base::FilePath& profile : dirs) {
++    const std::string profile_id = ProfileIdForArcDir(profile.BaseName().value());
++    std::set<std::string> seen;
+     base::FileEnumerator ids(profile.Append("Extensions"), false,
+                              base::FileEnumerator::DIRECTORIES);
+     for (base::FilePath id_dir = ids.Next(); !id_dir.empty();
+@@ -436,10 +437,11 @@ std::vector<ArcExtension> ReadArcExtensionsIn(const base::FilePath& arc_dir) {
+         continue;
+       }
+       seen.insert(id);
+-      out.push_back({id, ext_name});
++      out.push_back({id, ext_name, profile_id});
+     }
+   }
+-  std::ranges::sort(out, [](const ArcExtension& a, const ArcExtension& b) {
++  std::ranges::stable_sort(out, [](const ArcExtension& a,
++                                  const ArcExtension& b) {
+     return base::ToLowerASCII(a.name) < base::ToLowerASCII(b.name);
+   });
+   return out;
+diff --git a/chrome/browser/meridian/arc_import.h b/chrome/browser/meridian/arc_import.h
+index 216e86851c..9e6dff8fb2 100644
+--- a/chrome/browser/meridian/arc_import.h
++++ b/chrome/browser/meridian/arc_import.h
+@@ -62,10 +62,13 @@ std::optional<ArcSidebar> ReadArcSidebar();
+ struct ArcExtension {
+   std::string id;
+   std::string name;
++  // The Meridian profile of the Arc profile it is in (ProfileIdForArcDir).
++  std::string profile;
+ };
+ 
+-// The extensions in Arc's profiles (User Data/<profile>/Extensions), each once,
+-// by name; themes and Arc's own are left out. Blocking (file IO).
++// The extensions in Arc's profiles (User Data/<profile>/Extensions), each once
++// per profile, by name; themes and Arc's own are left out. Blocking (file
++// IO).
+ std::vector<ArcExtension> ReadArcExtensions();
+ // The same in another Arc data folder.
+ std::vector<ArcExtension> ReadArcExtensionsIn(const base::FilePath& arc_dir);
+diff --git a/chrome/browser/meridian/arc_import_unittest.cc b/chrome/browser/meridian/arc_import_unittest.cc
+index e635760e89..f9b607bfb5 100644
+--- a/chrome/browser/meridian/arc_import_unittest.cc
++++ b/chrome/browser/meridian/arc_import_unittest.cc
+@@ -187,7 +187,7 @@ void WriteExtension(const base::FilePath& profile,
+   }
+ }
+ 
+-TEST(ArcImportTest, ReadsArcExtensionsOnceByNameWithoutThemes) {
++TEST(ArcImportTest, ReadsArcExtensionsOncePerProfileByNameWithoutThemes) {
+   base::ScopedTempDir arc;
+   ASSERT_TRUE(arc.CreateUniqueTempDir());
+   base::FilePath def = arc.GetPath().Append("User Data").Append("Default");
+@@ -208,11 +208,16 @@ TEST(ArcImportTest, ReadsArcExtensionsOnceByNameWithoutThemes) {
+   WriteExtension(p2, "arc-internal", "1.0", R"({"name": "Arc Helper"})");
+ 
+   std::vector<ArcExtension> got = ReadArcExtensionsIn(arc.GetPath());
+-  ASSERT_EQ(got.size(), 2u);
++  ASSERT_EQ(got.size(), 3u);
+   EXPECT_EQ(got[0].name, "Dark Reader");
+   EXPECT_EQ(got[0].id, dark);
++  EXPECT_EQ(got[0].profile, "");
++  // In both profiles: once in each, for each one's Meridian profile.
+   EXPECT_EQ(got[1].name, "uBlock Origin Lite");
+   EXPECT_EQ(got[1].id, ublock);
++  EXPECT_EQ(got[1].profile, "");
++  EXPECT_EQ(got[2].id, ublock);
++  EXPECT_EQ(got[2].profile, "Meridian Profile Arc 2");
+ }
+ 
+ TEST(ArcImportTest, NoArcMeansNoExtensions) {
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index ddc11f35d1..8c7e7db918 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -29,6 +29,8 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterBooleanPref(kMissionNotify, true);
+   registry->RegisterStringPref(kMemberName, std::string());
+   registry->RegisterBooleanPref(kMissionNotifyIntro, false);
++  registry->RegisterListPref(kArcExtensionsAdded);
++  registry->RegisterBooleanPref(kArcImported, false);
+ }
+ 
+ }  // namespace meridian::prefs
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index 7c4107e355..5b617dd0b3 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -52,6 +52,11 @@ inline constexpr char kMissionNotify[] = "meridian.mission_notify";
+ // The person was told that macOS will ask once about notifications.
+ inline constexpr char kMissionNotifyIntro[] = "meridian.mission_notify_intro";
+ // "Other agents" (Codex, Cursor…) are offered.
++// The Meridian profiles Arc's extensions were added to (once each: one taken
++// out later isn't added again). In the main profile.
++inline constexpr char kArcExtensionsAdded[] = "meridian.arc_extensions_added";
++// Whether the sidebar came from Arc (its extensions follow).
++inline constexpr char kArcImported[] = "meridian.arc_imported";
+ inline constexpr char kAiOtherAgents[] = "meridian.ai_other_agents";
+ 
+ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index e286c3cd00..6568b7b09d 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -5,12 +5,15 @@
+ #include "chrome/browser/meridian/sidebar_handler.h"
+ 
+ #include <functional>
++#include <map>
++#include <set>
+ #include <utility>
+ #include <vector>
+ 
+ #include "base/command_line.h"
+ #include "base/i18n/rtl.h"
+ #include "base/no_destructor.h"
++#include "base/scoped_observation.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+@@ -21,6 +24,9 @@
+ #include "base/files/file_util.h"
+ #include "base/memory/ref_counted.h"
+ #include "base/process/launch.h"
++#include "base/auto_reset.h"
++#include "base/memory/raw_ptr.h"
++#include "base/version.h"
+ #include "components/prefs/scoped_user_pref_update.h"
+ #include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
+@@ -60,7 +66,18 @@
+ #include "chrome/browser/profiles/keep_alive/scoped_profile_keep_alive.h"
+ #include "chrome/browser/meridian/tab_data.h"
+ #include "chrome/browser/meridian/site_control.h"
++#include "chrome/browser/extensions/extension_service.h"
++#include "extensions/browser/disable_reason.h"
++#include "extensions/browser/extension_prefs.h"
++#include "extensions/browser/extension_registrar.h"
+ #include "extensions/browser/extension_registry.h"
++#include "extensions/browser/extension_registry_observer.h"
++#include "extensions/browser/permissions/permissions_updater.h"
++#include "extensions/browser/extension_system.h"
++#include "extensions/browser/pending_extension_manager.h"
++#include "extensions/common/extension.h"
++#include "extensions/common/extension_urls.h"
++#include "extensions/common/verifier_formats.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/browsing_data/chrome_browsing_data_remover_constants.h"
+ #include "chrome/browser/profiles/delete_profile_helper.h"
+@@ -1737,6 +1754,10 @@ void SidebarHandler::OnArcRead(ImportArcCallback callback,
+       }
+     }
+   }
++  MainProfileFor(browser_->GetProfile())
++      ->GetPrefs()
++      ->SetBoolean(prefs::kArcImported, true);
++  AddArcExtensions();
+   ActivateSpace(service_->active_space_id());
+   ScheduleNotify();
+   std::move(callback).Run(true);
+@@ -1790,6 +1811,19 @@ void SidebarHandler::OnSidebarChanged() {
+     base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+         FROM_HERE, base::BindOnce(&SidebarHandler::ShowActiveSpaceTab,
+                                   weak_factory_.GetWeakPtr()));
++    // A sidebar from Arc whose extensions haven't come yet (imported before
++    // they were added, or in a profile made since). Before kArcImported,
++    // spaces of Arc's other profiles tell an import.
++    PrefService* main_prefs = MainProfileFor(browser_->GetProfile())->GetPrefs();
++    if (!main_prefs->GetBoolean(prefs::kArcImported) &&
++        std::ranges::any_of(service_->spaces(), [](const Space& space) {
++          return space.profile.starts_with("Meridian Profile Arc ");
++        })) {
++      main_prefs->SetBoolean(prefs::kArcImported, true);
++    }
++    if (main_prefs->GetBoolean(prefs::kArcImported)) {
++      AddArcExtensions();
++    }
+   }
+   ScheduleNotify();
+ }
+@@ -2450,6 +2484,69 @@ void SidebarHandler::OnSplitTabChanged(const SplitTabChange& change) {
+   ScheduleNotify();
+ }
+ 
++namespace {
++
++// Arc's extensions being added to one profile. The person granted their
++// permissions in Arc, so they are granted here too, and each is turned on
++// when it arrives (an extension added by sync waits for its permissions
++// otherwise). Deletes itself once all arrived, or with the profile.
++class ArcExtensionsArrival : public extensions::ExtensionRegistryObserver {
++ public:
++  ArcExtensionsArrival(Profile* profile, std::set<std::string> ids)
++      : profile_(profile), ids_(std::move(ids)) {
++    observation_.Observe(extensions::ExtensionRegistry::Get(profile));
++  }
++
++  void OnExtensionInstalled(content::BrowserContext* browser_context,
++                            const extensions::Extension* extension,
++                            bool is_update) override {
++    if (!ids_.erase(extension->id())) {
++      return;
++    }
++    // After the install's own permission check.
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(
++            [](base::WeakPtr<Profile> profile, std::string id) {
++              if (!profile) {
++                return;
++              }
++              const extensions::Extension* extension =
++                  extensions::ExtensionRegistry::Get(profile.get())
++                      ->GetInstalledExtension(id);
++              if (!extension) {
++                return;
++              }
++              extensions::PermissionsUpdater(profile.get())
++                  .GrantActivePermissions(extension);
++              extensions::ExtensionPrefs::Get(profile.get())
++                  ->RemoveDisableReason(
++                      id, extensions::disable_reason::
++                              DISABLE_PERMISSIONS_INCREASE);
++              extensions::ExtensionRegistrar::Get(profile.get())
++                  ->EnableExtension(id);
++            },
++            profile_->GetWeakPtr(), extension->id()));
++    if (ids_.empty()) {
++      delete this;
++    }
++  }
++
++  void OnShutdown(extensions::ExtensionRegistry* registry) override {
++    delete this;
++  }
++
++ private:
++  raw_ptr<Profile> profile_;
++  std::set<std::string> ids_;
++  base::ScopedObservation<extensions::ExtensionRegistry,
++                          extensions::ExtensionRegistryObserver>
++      observation_{this};
++};
++
++}  // namespace
++
++// Those of the shown space's Arc profile, added or not in its profile.
+ void SidebarHandler::GetArcExtensions(GetArcExtensionsCallback callback) {
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+@@ -2459,20 +2556,93 @@ void SidebarHandler::GetArcExtensions(GetArcExtensionsCallback callback) {
+              GetArcExtensionsCallback callback,
+              std::vector<ArcExtension> found) {
+             std::vector<mojom::ArcExtensionPtr> out;
++            Profile* profile = self ? self->ActiveSpaceProfile() : nullptr;
++            if (!profile) {
++              std::move(callback).Run(std::move(out));
++              return;
++            }
++            const std::string profile_id = ProfileIdOf(profile);
+             extensions::ExtensionRegistry* registry =
+-                self ? extensions::ExtensionRegistry::Get(
+-                           self->browser_->GetProfile())
+-                     : nullptr;
++                extensions::ExtensionRegistry::Get(profile);
+             for (const ArcExtension& e : found) {
+-              out.push_back(mojom::ArcExtension::New(
+-                  e.id, e.name,
+-                  registry && registry->GetInstalledExtension(e.id)));
++              if (e.profile == profile_id) {
++                out.push_back(mojom::ArcExtension::New(
++                    e.id, e.name, !!registry->GetInstalledExtension(e.id)));
++              }
+             }
+             std::move(callback).Run(std::move(out));
+           },
+           weak_factory_.GetWeakPtr(), std::move(callback)));
+ }
+ 
++Profile* SidebarHandler::ActiveSpaceProfile() {
++  Profile* main = MainProfileFor(browser_->GetProfile());
++  const Space* space = service_->FindSpace(service_->active_space_id());
++  return space ? LoadSpaceProfile(main, space->profile) : main;
++}
++
++void SidebarHandler::AddArcExtensions() {
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&ReadArcExtensions),
++      base::BindOnce(&SidebarHandler::OnArcExtensionsRead,
++                     weak_factory_.GetWeakPtr()));
++}
++
++void SidebarHandler::OnArcExtensionsRead(std::vector<ArcExtension> found) {
++  // Tests serve their own extensions, not signed by the Web Store (with
++  // --apps-gallery-update-url).
++  if (HasTestSwitch("meridian-test-unsigned-store")) {
++    static base::NoDestructor<base::AutoReset<bool>> unsigned_store(
++        extensions::DisablePublisherKeyVerificationForTests());
++  }
++  Profile* main = MainProfileFor(browser_->GetProfile());
++  PrefService* prefs = main->GetPrefs();
++  std::set<std::string> done;
++  for (const base::Value& id : prefs->GetList(prefs::kArcExtensionsAdded)) {
++    if (id.is_string()) {
++      done.insert(id.GetString());
++    }
++  }
++  std::map<Profile*, std::set<std::string>> added;
++  std::set<std::string> now_done;
++  for (const ArcExtension& e : found) {
++    // Only into Meridian's own profiles: the main one and the spaces'.
++    if (done.contains(e.profile) ||
++        (!e.profile.empty() && !service_->FindProfile(e.profile))) {
++      continue;
++    }
++    Profile* profile = LoadSpaceProfile(main, e.profile);
++    if (!profile) {
++      continue;
++    }
++    now_done.insert(e.profile);
++    if (extensions::ExtensionRegistry::Get(profile)->GetExtensionById(
++            e.id, extensions::ExtensionRegistry::EVERYTHING)) {
++      continue;
++    }
++    if (extensions::PendingExtensionManager::Get(profile)->AddFromSync(
++            e.id, extension_urls::GetWebstoreUpdateUrl(), base::Version(),
++            [](const extensions::Extension* extension,
++               content::BrowserContext*) { return !extension->is_theme(); },
++            /*remote_install=*/false)) {
++      added[profile].insert(e.id);
++    }
++  }
++  for (auto& [profile, ids] : added) {
++    new ArcExtensionsArrival(profile, std::move(ids));
++    extensions::ExtensionSystem::Get(profile)
++        ->extension_service()
++        ->CheckForUpdatesSoon();
++  }
++  if (!now_done.empty()) {
++    ScopedListPrefUpdate update(prefs, prefs::kArcExtensionsAdded);
++    for (const std::string& id : now_done) {
++      update->Append(id);
++    }
++  }
++}
++
+ // The site's settings are its tab's profile's (a space's, maybe).
+ Profile* SidebarHandler::ActiveTabProfile() {
+   content::WebContents* contents = model()->GetActiveWebContents();
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 66c7aeea6e..23bdde2977 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -276,6 +276,13 @@ class SidebarHandler : public mojom::SidebarHandler,
+   TabStripModel* model();
+   mojom::SidebarStatePtr BuildState();
+   void OnArcRead(ImportArcCallback callback, std::optional<ArcSidebar> arc);
++  // Arc's extensions, each added to its Arc profile's Meridian profile from
++  // the Chrome Web Store the way Chrome adds an account's extensions on a new
++  // computer (sync): once per profile, after an Arc import.
++  void AddArcExtensions();
++  void OnArcExtensionsRead(std::vector<ArcExtension> found);
++  // The profile of the space shown.
++  Profile* ActiveSpaceProfile();
+   // Coalesces notifications into one OnStateChanged per task.
+   void ScheduleNotify();
+   void Notify();
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index abcd52c2f2..65f91dd828 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -71,8 +71,8 @@ export function getHtml(this: MeridianSettingsElement) {
+                   <div class="row arc-ext-head">
+                     <div class="row-text">
+                       <div class="row-label">Extensions from Arc</div>
+-                      <div class="row-desc">Add each from the Chrome Web Store;
+-                        it opens in a tab.</div>
++                      <div class="row-desc">They come from the Chrome Web Store
++                        into their space's profile; add any that didn't here.</div>
+                     </div>
+                   </div>
+                   ${this.arcExtensions_.map(x => html`

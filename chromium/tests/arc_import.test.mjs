@@ -9,7 +9,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { launch, SB } from './harness.mjs';
+import { execFileSync } from 'node:child_process';
+import { launch, SB, APP } from './harness.mjs';
 
 const ARC = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures/arc');
 const H = 'app.$.tabstrip.handler_';
@@ -238,3 +239,135 @@ test('tabs 0.5.13 put in the main profile move to their space\'s profile, unarch
     } finally { await b.close(); }
   } finally { s.close(); fs.rmSync(arcDir, { recursive: true, force: true }); fs.rmSync(profile, { recursive: true, force: true }); }
 });
+
+// An extension that marks the pages it runs on with its name, packed as a CRX with a new key, and
+// its Web Store id (the key's hash in a–p).
+function packExtension(dir, name) {
+  const src = path.join(dir, name);
+  fs.mkdirSync(src, { recursive: true });
+  fs.writeFileSync(path.join(src, 'manifest.json'), JSON.stringify({
+    manifest_version: 3, name: `Mark ${name}`, version: '1.0',
+    content_scripts: [{ matches: ['http://127.0.0.1/*'], js: ['mark.js'], run_at: 'document_start' }],
+  }));
+  fs.writeFileSync(path.join(src, 'mark.js'), `document.documentElement.dataset['mark' + ${JSON.stringify(name)}] = '1';`);
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const pem = path.join(dir, `${name}.pem`);
+  fs.writeFileSync(pem, privateKey.export({ type: 'pkcs8', format: 'pem' }));
+  const hash = crypto.createHash('sha256').update(publicKey.export({ type: 'spki', format: 'der' })).digest('hex').slice(0, 32);
+  const id = [...hash].map((c) => String.fromCharCode(97 + parseInt(c, 16))).join('');
+  const udd = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-pack-'));
+  try {
+    execFileSync(APP, [`--user-data-dir=${udd}`, `--pack-extension=${src}`, `--pack-extension-key=${pem}`, '--no-message-box'], { stdio: 'ignore', timeout: 60000 });
+  } finally { fs.rmSync(udd, { recursive: true, force: true }); }
+  return { id, crx: fs.readFileSync(`${src}.crx`) };
+}
+
+// A Web Store of `extensions` (update checks and downloads), and what was asked of it.
+async function store(extensions) {
+  const asked = [];
+  const server = http.createServer((req, res) => {
+    asked.push(req.method + ' ' + req.url.slice(0, 80));
+    const u = new URL(req.url, 'http://x');
+    const crx = u.pathname.match(/^\/crx\/(\w+)$/);
+    if (crx) {
+      const e = extensions.find((x) => x.id === crx[1]);
+      res.writeHead(e ? 200 : 404, { 'content-type': 'application/x-chrome-extension' });
+      return res.end(e?.crx);
+    }
+    const ids = u.searchParams.getAll('x').map((x) => new URLSearchParams(x).get('id'));
+    const port = server.address().port;
+    res.writeHead(200, { 'content-type': 'text/xml' });
+    res.end(`<?xml version='1.0' encoding='UTF-8'?><gupdate xmlns='http://www.google.com/update2/response' protocol='2.0'>${
+      ids.map((id) => extensions.some((x) => x.id === id)
+        ? `<app appid='${id}' status='ok'><updatecheck status='ok' codebase='http://127.0.0.1:${port}/crx/${id}' version='1.0' /></app>`
+        : `<app appid='${id}' status='ok'><updatecheck status='noupdate' /></app>`).join('')}</gupdate>`);
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  return { url: `http://127.0.0.1:${server.address().port}/update`, asked, close: () => { server.closeAllConnections(); server.close(); } };
+}
+
+// Arc's extensions as Arc keeps them (User Data/<profile>/Extensions/<id>/<version>/manifest.json).
+function arcExtension(arcDir, profileDir, id, name) {
+  const dir = path.join(arcDir, 'User Data', profileDir, 'Extensions', id, '1.0_0');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify({ manifest_version: 3, name, version: '1.0' }));
+}
+
+// The marks of the extensions that ran on the page at `url`.
+async function marksOn(b, url) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 50; i++) {
+    const t = (await (await fetch(`${b.base}/json/list`)).json()).find((x) => x.type === 'page' && x.url === url);
+    if (t) {
+      const ws = new WebSocket(t.webSocketDebuggerUrl);
+      await new Promise((r) => (ws.onopen = r));
+      const reply = await new Promise((r) => {
+        ws.onmessage = (m) => r(JSON.parse(m.data));
+        ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: `document.readyState === 'complete' ? Object.keys(document.documentElement.dataset).filter((k) => k.startsWith('mark')).sort().join(',') : null`, returnByValue: true } }));
+      });
+      ws.close();
+      const v = reply.result?.result?.value;
+      if (v !== null && v !== undefined) return v;
+    }
+    await sleep(200);
+  }
+  return 'not loaded';
+}
+
+// Arc: each Arc profile's extensions are there in Meridian, in that profile's spaces only, with
+// nothing to add by hand: imported now, or before Meridian added them (0.5.13).
+for (const imported of ['now', 'by 0.5.13']) {
+  test(`Arc's extensions come over into their own profile's spaces (imported ${imported})`, { skip: imported !== 'now' && !fs.existsSync(OLD) && 'no 0.5.13 app' }, async () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-ext-'));
+    const personal = packExtension(work, 'Personal');
+    const office = packExtension(work, 'Office');
+    const web = await store([personal, office]);
+    const s = await cookieEcho();
+    const arcDir = arcWithTwoProfiles(s.u);
+    arcExtension(arcDir, 'Default', personal.id, 'Mark Personal');
+    arcExtension(arcDir, 'Profile 2', office.id, 'Mark Office');
+    const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-arc-'));
+    const args = [`--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=test-pass', `--apps-gallery-update-url=${web.url}`, '--meridian-test-unsigned-store'];
+    try {
+      if (imported !== 'now') {
+        const old = await launch(['about:blank'], { profile, args, app: OLD });
+        try {
+          await old.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+          assert.equal((await old.eval(`${H}.importArc()`)).ok, true);
+          await old.quit();
+        } finally { await old.close(); }
+      }
+      const b = await launch(imported === 'now' ? ['about:blank'] : [], { profile, args });
+      try {
+        await b.waitFor(`app.$.tabstrip.state_?.spaces.length >= 1`);
+        if (imported === 'now') {
+          await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+          assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
+        }
+        const spaces = (await b.eval(`${H}.getState().then(({state}) => state)`)).spaces;
+        const inSpace = async (name, page) => {
+          await b.eval(`${H}.activateSpace(${JSON.stringify(spaces.find((x) => x.name === name).id)})`);
+          await b.eval(`app.$.tabstrip.openUrl(${JSON.stringify(s.u(page))})`);
+          return marksOn(b, s.u(page));
+        };
+        const left = async () => (await b.eval(`${H}.getArcExtensions().then(({extensions}) => extensions.filter((x) => !x.installed).map((x) => x.name))`));
+        // Installed in the background: wait until both arrived.
+        const main = spaces.find((x) => !x.profileId).name;
+        let personalMarks = '', homeMarks = '';
+        for (let i = 0, end = Date.now() + 60000; Date.now() < end && !(personalMarks === 'markPersonal' && homeMarks === 'markOffice'); i++) {
+          if (i) await new Promise((r) => setTimeout(r, 2000));
+          personalMarks = await inSpace(main, `p${i}`);
+          homeMarks = await inSpace('Home', `h${i}`);
+        }
+        assert.equal(personalMarks, 'markPersonal', `the personal extension, only, in ${main}; store: ${web.asked.join(' | ')}`);
+        assert.equal(homeMarks, 'markOffice', 'the work one, only, in Home');
+        assert.deepEqual(await left(), [], 'nothing left to add in Home');
+        await b.eval(`${H}.activateSpace(${JSON.stringify(spaces.find((x) => x.name === main).id)})`);
+        assert.deepEqual(await left(), [], `nothing left to add in ${main} (and not Home's)`);
+      } finally { await b.close(); }
+    } finally {
+      s.close(); web.close();
+      for (const d of [work, arcDir, profile]) fs.rmSync(d, { recursive: true, force: true });
+    }
+  });
+}
