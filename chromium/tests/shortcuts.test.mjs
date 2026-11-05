@@ -234,7 +234,7 @@ test('⇧⌘C and the link button copy the address without utm_ and other tracki
     await b.waitFor(`${activeTitle} === 'Shared'`);
     execFileSync('pbcopy', { input: url });
     await b.click('app.$.contentRegion');
-    await b.eval(`app.$.tabstrip.handler_.testKeyPress(8, 'c', ${CMD | (1 << 17)})`);  // ⇧⌘C
+    await b.eval(`app.$.tabstrip.handler_.testKeyPress(8, 'C', ${CMD | (1 << 17)})`);  // ⇧⌘C: Shift makes the character a capital
     assert.equal(await clip(clean), clean);
     await b.waitFor(`app.shadowRoot.querySelector('#missionToast .mt-title')?.textContent.trim() === 'Copied link'`);
     execFileSync('pbcopy', { input: url });
