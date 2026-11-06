@@ -177,3 +177,43 @@ test('other AIs: Ollama, a cloud key with a model picker, and Codex (sessions, S
     fs.rmSync(bin, { recursive: true, force: true });
   }
 });
+
+test('LM Studio installed but off: Start server turns it on, then it answers', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-lms-'));
+  const started = path.join(dir, 'started');
+  // LM Studio's OpenAI-compatible server: off (refused) until `lms server start`.
+  const lm = await serve((req, res, json) => {
+    if (!fs.existsSync(started)) { res.writeHead(503); return res.end(); }
+    if (req.url === '/v1/models') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ data: [{ id: 'qwen3-4b' }] })); }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    const question = json.messages[json.messages.length - 1].content.split('\n').pop();
+    for (const piece of ['LM Studio ', `heard: ${question}`]) res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: piece } }] })}\n\n`);
+    res.end('data: [DONE]\n\n');
+  });
+  const lms = path.join(dir, 'lms');
+  fs.writeFileSync(lms, `#!/bin/sh\n[ "$1 $2" = "server start" ] && touch ${JSON.stringify(started)}\n`, { mode: 0o755 });
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
+  const b = await launch(['about:blank'], { args: [`--meridian-agents-path=${bin}`, `--meridian-lmstudio-url=${lm.base}`, `--meridian-lms-path=${lms}`] });
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    await b.eval('app.$.tabstrip.runCommand(13, 0)');
+    await b.waitFor(`app.$.settings.open && !!${ST}.querySelector('[data-id="ai"]')`);
+    await b.click(`${ST}.querySelector('[data-id="ai"]')`);
+    await b.waitFor(`${ST}.getElementById('ai-lmstudio')?.textContent.includes('Server off')`);
+    await b.click(`${ST}.querySelector('#ai-lmstudio button[data-action="start"]')`);
+    await b.waitFor(`${ST}.getElementById('aiMessage').textContent.includes('LM Studio is running')`);
+    assert.ok(fs.existsSync(started), 'lms server start ran');
+    assert.match(await b.eval(`${ST}.getElementById('ai-lmstudio').textContent`), /Ready/);
+    await b.click(`${ST}.getElementById('ai-lmstudio')`);
+    await b.waitFor(`${ST}.getElementById('ai-lmstudio').classList.contains('on')`);
+    await b.eval('app.$.settings.hide()');
+    await b.eval('app.$.tabstrip.runCommand(14, 0)');
+    await b.waitFor(`app.$.ask.open && !!${AK}.getElementById('input')`);
+    await b.eval(`(() => { const i = ${AK}.getElementById('input'); i.value = 'hi lm'; ${AK}.getElementById('send').click(); })()`);
+    await b.waitFor(`[...${AK}.querySelectorAll('.msg.assistant')].pop()?.textContent.includes('LM Studio heard: hi lm')`);
+    assert.equal(lm.requests.find((r) => r.url === '/v1/chat/completions')?.body.model, 'qwen3-4b');
+  } finally {
+    await b.close(); lm.server.close();
+    for (const d of [dir, bin]) fs.rmSync(d, { recursive: true, force: true });
+  }
+});

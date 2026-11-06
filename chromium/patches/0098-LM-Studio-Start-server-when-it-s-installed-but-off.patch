@@ -1,0 +1,210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 6 Nov 2026 14:12:48 +0400
+Subject: [PATCH 99/99] LM Studio: Start server when it's installed but off
+
+Settings > AI showed LM Studio as "Not running" with install docs even
+when it was installed. Now it says Server off and starts it with LM
+Studio's own lms CLI in the background.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/ai/local_agents.cc    | 23 +++++++++++++++++
+ chrome/browser/meridian/ai/local_agents.h     |  7 ++++++
+ chrome/browser/meridian/sidebar.mojom         |  4 +++
+ chrome/browser/meridian/sidebar_handler.cc    | 17 ++++++++++++-
+ .../webui_browser/meridian/chat.html.ts       |  4 +--
+ .../webui_browser/meridian/settings.ts        | 25 ++++++++++++++++++-
+ 6 files changed, 76 insertions(+), 4 deletions(-)
+
+diff --git a/chrome/browser/meridian/ai/local_agents.cc b/chrome/browser/meridian/ai/local_agents.cc
+index 32808744fd..f8fc7da890 100644
+--- a/chrome/browser/meridian/ai/local_agents.cc
++++ b/chrome/browser/meridian/ai/local_agents.cc
+@@ -132,6 +132,17 @@ std::pair<std::string, std::string> InstallFor(const Provider& p,
+   return {std::string(), missing};
+ }
+ 
++// LM Studio's CLI, which starts its server (LM Studio installs it in
++// ~/.lmstudio/bin). Tests set their own or get none.
++std::string LmsPath(const std::string& home) {
++  std::string test = TestSwitchValue("meridian-lms-path");
++  if (!test.empty() || !TestPath().empty()) {
++    return test;
++  }
++  base::FilePath lms = base::FilePath(home).Append(".lmstudio/bin/lms");
++  return base::PathExists(lms) ? lms.value() : std::string();
++}
++
+ // Blocking: what's installed and signed in, and how to install the rest.
+ std::vector<LocalAgents::Status> ListBlocking() {
+   std::map<std::string, std::string> env = ChildEnv();
+@@ -145,6 +156,9 @@ std::vector<LocalAgents::Status> ListBlocking() {
+     status.id = p.id;
+     std::tie(status.install_command, status.install_missing) =
+         InstallFor(p, path);
++    if (p.id == "lmstudio") {
++      status.start_with = LmsPath(env["HOME"]);
++    }
+     if (p.kind == Kind::kCli) {
+       std::string bin = FindBin(p, path);
+       status.installed = !bin.empty();
+@@ -366,6 +380,15 @@ class LocalAgents::LineStream : public network::SimpleURLLoaderStreamConsumer {
+   int status_ = 0;
+ };
+ 
++// static
++bool LocalAgents::StartServerBlocking(const std::string& start_with) {
++  std::map<std::string, std::string> env = ChildEnv();
++  int code = -1;
++  CaptureOutput({start_with, "server", "start"}, env, env["HOME"],
++                base::Seconds(30), &code);
++  return code == 0;
++}
++
+ LocalAgents::LocalAgents(Profile* profile)
+     : profile_(profile), workdir_(profile->GetPath().Append("Agent Chat")) {}
+ 
+diff --git a/chrome/browser/meridian/ai/local_agents.h b/chrome/browser/meridian/ai/local_agents.h
+index 8d9e83e77b..08cf01a04d 100644
+--- a/chrome/browser/meridian/ai/local_agents.h
++++ b/chrome/browser/meridian/ai/local_agents.h
+@@ -42,8 +42,15 @@ class LocalAgents {
+     std::string install_command;
+     // What the install command needs and this computer lacks.
+     std::string install_missing;
++    // A local server that is installed but off: the CLI that starts it
++    // (LM Studio's `lms`), else empty.
++    std::string start_with;
+   };
+ 
++  // Blocking: `<start_with> server start`, in the background; whether it
++  // started.
++  static bool StartServerBlocking(const std::string& start_with);
++
+   // "text" (a delta), "session" (internal: the CLI's session id), "done"
+   // ("stopped" when the person stopped it) or "error".
+   using EventCallback =
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 35e9afb79c..2019e5d653 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -364,6 +364,9 @@ struct AiProvider {
+   string install_command;
+   // What `install_command` needs and this computer lacks.
+   string install_missing;
++  // A local server that is installed but off and Meridian can start
++  // (RunAiSetup "start").
++  bool can_start;
+   string login_command;
+   string docs;
+ };
+@@ -648,6 +651,7 @@ interface SidebarHandler {
+   // Installs or signs in to a CLI in Terminal, where the person can answer
+   // its questions; `what` is "install" or "login". The command comes from
+   // Meridian's own table.
++  // "start" starts the local server in the background (no Terminal).
+   RunAiSetup(string id, string what) => (bool ok, string error);
+ 
+   // Turns a Peek into an ordinary Today tab.
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 9edb616ac1..5905d06f8a 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -975,6 +975,7 @@ void SidebarHandler::GetAiProviders(bool fresh,
+               m->account = s.account;
+               m->install_command = s.install_command;
+               m->install_missing = s.install_missing;
++              m->can_start = !s.installed && !s.start_with.empty();
+               m->login_command = p->login;
+               m->docs = p->docs;
+               out.push_back(std::move(m));
+@@ -1230,7 +1231,7 @@ void SidebarHandler::RunAiSetup(const std::string& id,
+                                 RunAiSetupCallback callback) {
+   AiService* ai = AiServiceFactory::GetForProfile(browser_->GetProfile());
+   const ai::Provider* p = ai::FindProvider(id);
+-  if (!ai || !p || (what != "install" && what != "login")) {
++  if (!ai || !p || (what != "install" && what != "login" && what != "start")) {
+     std::move(callback).Run(false, "Unknown AI.");
+     return;
+   }
+@@ -1245,6 +1246,20 @@ void SidebarHandler::RunAiSetup(const std::string& id,
+               if (s.id == id && what == "install") {
+                 command = s.install_command;
+               }
++              if (s.id == id && what == "start" && !s.start_with.empty()) {
++                base::ThreadPool::PostTaskAndReplyWithResult(
++                    FROM_HERE, {base::MayBlock()},
++                    base::BindOnce(&ai::LocalAgents::StartServerBlocking,
++                                   s.start_with),
++                    base::BindOnce(
++                        [](RunAiSetupCallback callback, std::string label,
++                           bool ok) {
++                          std::move(callback).Run(
++                              ok, ok ? "" : label + "’s server didn’t start.");
++                        },
++                        std::move(callback), p->label));
++                return;
++              }
+             }
+             if (command.empty()) {
+               std::move(callback).Run(false,
+diff --git a/chrome/browser/resources/webui_browser/meridian/chat.html.ts b/chrome/browser/resources/webui_browser/meridian/chat.html.ts
+index 09fef44b02..2294b149fd 100644
+--- a/chrome/browser/resources/webui_browser/meridian/chat.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/chat.html.ts
+@@ -37,8 +37,8 @@ export function getHtml(this: MeridianChatElement) {
+       ${!this.ready_ ? html`
+         <div class="welcome">
+           <h1>Chat with an AI</h1>
+-          <p>Set up who answers first: an API key, or a free local model like
+-            Ollama.</p>
++          <p>Set up who answers first: an API key, or a free local model in
++            Ollama or LM Studio.</p>
+           <button id="setup" class="btn primary"
+               @click="${this.onSettingsClick_}">Set up AI</button>
+         </div>` : ''}
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 334b62578f..43a29ccf11 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -461,7 +461,12 @@ export class MeridianSettingsElement extends CrLitElement {
+     let statusKind = 'ok';
+     let action = '';
+     let actionLabel = '';
+-    if (!installed) {
++    if (!installed && p.canStart) {
++      status = 'Server off';
++      statusKind = '';
++      action = 'start';
++      actionLabel = 'Start server';
++    } else if (!installed) {
+       status = p.kind === 'local' ? 'Not running' : 'Not installed';
+       statusKind = '';
+       action = p.installCommand ? 'install' : 'docs';
+@@ -776,6 +781,24 @@ export class MeridianSettingsElement extends CrLitElement {
+       this.hide();
+       return;
+     }
++    // Installed but off: starts its server here, in the background.
++    if (action === 'start') {
++      button.disabled = true;
++      this.aiMessage_ = `Starting ${p.label}’s server…`;
++      const {ok, error} = await this.handler_.runAiSetup(id, 'start');
++      button.disabled = false;
++      if (!ok) {
++        this.aiMessage_ = error;
++        return;
++      }
++      await this.loadProviders_(true);
++      const now = this.providers_.find(x => x.id === id);
++      this.aiMessage_ = now?.installed ?
++          `${p.label} is running. Pick it above to use it.` :
++          `${p.label}’s server is on, but it has no model yet: download one ` +
++              `in ${p.label}.`;
++      return;
++    }
+     if (action === 'check') {
+       button.disabled = true;
+       this.aiMessage_ = `Asking ${p.label} a test question…`;
