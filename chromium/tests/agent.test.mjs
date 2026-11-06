@@ -140,3 +140,101 @@ test('ask: every action is put to the person; read-only refuses changes; off has
     assert.match((await mcp2.call('list_tabs')).error, /not running, or AI agent access is off/);
   } finally { mcp2.close(); await b2.close(); fs.rmSync(off, { recursive: true, force: true }); }
 });
+
+// Runs `expression` in the page target whose URL starts with `prefix` (CDP), or sends `method`.
+async function inPage(b, prefix, method, params) {
+  const t = (await (await fetch(`${b.base}/json/list`)).json()).find((x) => x.type === 'page' && x.url.startsWith(prefix));
+  const ws = new WebSocket(t.webSocketDebuggerUrl);
+  await new Promise((r) => (ws.onopen = r));
+  const reply = await new Promise((r) => { ws.onmessage = (m) => r(JSON.parse(m.data)); ws.send(JSON.stringify({ id: 1, method, params })); });
+  ws.close();
+  return reply.result;
+}
+const pageEval = async (b, prefix, expression) => (await inPage(b, prefix, 'Runtime.evaluate', { expression, returnByValue: true })).result.value;
+
+test('guide: the agent highlights a step with a note (read-only access), waits for the person to do it, then clears', async () => {
+  const s = await site();
+  const profile = profileWith({ agent_access: 'read' });
+  const b = await launch([s.url('/form')], { profile });
+  const mcp = bridge(profile);
+  const prefix = s.url('/');
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { protocolVersion: '2025-06-18', clientInfo: { name: 'test-client', version: '1' }, capabilities: {} });
+    const init = (await mcp.request('tools/list')).result.tools.map((t) => t.name);
+    for (const name of ['translate_page', 'highlight', 'wait_for_user', 'clear_highlights']) assert.ok(init.includes(name), name);
+    assert.match((await mcp.call('wait_for_user', { timeout_seconds: 1 })).error, /nothing is highlighted/);
+
+    const els = (await mcp.call('get_interactive_elements')).value;
+    const input = els.find((e) => e.label === 'Your name');
+    const shown = await mcp.call('highlight', { element_index: input.i, note: 'Type your name here', step: 1 });
+    assert.equal(shown.error, null, 'read-only access may guide');
+    assert.equal(shown.value.highlighted, 'Your name');
+    assert.equal(await pageEval(b, prefix, '!!document.querySelector("meridian-guide")'), true, 'the overlay is on the page');
+    // Nothing done yet.
+    assert.equal((await mcp.call('wait_for_user', { timeout_seconds: 1 })).value.did, 'nothing yet');
+    // The person clicks the field (a real click on the page) while the agent waits.
+    const waiting = mcp.call('wait_for_user', { timeout_seconds: 20 });
+    await sleep(500);
+    const [x, y] = await pageEval(b, prefix, '(() => { const r = document.getElementById("name").getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; })()');
+    for (const type of ['mousePressed', 'mouseReleased']) await inPage(b, prefix, 'Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 });
+    assert.equal((await waiting).value.did, 'clicked');
+    // The next step replaces it; the page still works under the overlay.
+    assert.equal((await mcp.call('highlight', { text: 'Say hello', note: 'Then press this', step: 2 })).value.marks, 1);
+    assert.equal((await mcp.call('clear_highlights')).value.cleared, 1);
+    assert.match((await mcp.call('wait_for_user', { timeout_seconds: 1 })).error, /nothing is highlighted/);
+    assert.match((await mcp.call('highlight', { selector: '#nothing-here', note: 'x' })).error, /not found/);
+  } finally {
+    mcp.close(); await b.close(); s.server.close();
+    fs.rmSync(profile, { recursive: true, force: true });
+  }
+});
+
+// Needs the network: Chromium's language model and Google Translate.
+test('translate: the site controls translate a Georgian page to English and back; so does translate_page', async (t) => {
+  try { await fetch('https://translate.googleapis.com/translate_a/l?client=chrome', { signal: AbortSignal.timeout(4000) }); } catch { return t.skip('offline'); }
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(`<html lang="ka"><title>გადასახადები</title><h1>გადასახადის გადახდა</h1>
+      <p>ამ გვერდზე შეგიძლიათ გადაიხადოთ ქონების გადასახადი. შეიყვანეთ თქვენი პირადი ნომერი და დააჭირეთ ღილაკს.</p>
+      <p>საქართველოს შემოსავლების სამსახური გთავაზობთ ელექტრონულ მომსახურებას ყველა გადამხდელისთვის.</p>
+      <button>გადახდა</button></html>`);
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}/tax`;
+  const profile = profileWith({ agent_access: 'read' });
+  // Lets Chromium fetch its language detection model, as it does for people.
+  const b = await launch([url], { profile, args: ['--disable-features=OptimizationGuideOnDeviceModel'] });
+  const mcp = bridge(profile);
+  const SC = 'app.$.siteControl.shadowRoot';
+  const info = async () => (await b.eval(`app.$.tabstrip.handler_.getSiteInfo()`)).info;
+  const translated = () => pageEval(b, url, 'document.documentElement.className.includes("translated")');
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 40 && (await info()).pageLanguage !== 'ka'; i++) await sleep(500);
+    assert.equal((await info()).pageLanguage, 'ka');
+    await b.click('app.$.locationIconButton');
+    await b.waitFor(`app.$.siteControl.open && !!${SC}.getElementById('translateRow')`);
+    assert.match(await b.eval(`${SC}.getElementById('translateRow').textContent`), /Translate to English[\s\S]*The page is in Georgian/);
+    await b.click(`${SC}.getElementById('translateRow')`);
+    await b.waitFor(`${SC}.getElementById('translateRow')?.textContent.includes('From Georgian')`, 20000);
+    for (let i = 0; i < 40 && !(await translated()); i++) await sleep(250);
+    assert.equal(await translated(), true, 'the page shows the translation');
+    await b.click(`${SC}.getElementById('translateRow')`);
+    await b.waitFor(`${SC}.getElementById('translateRow')?.textContent.includes('The page is in Georgian')`, 10000);
+    assert.equal(await translated(), false, 'back to the original');
+    await b.eval(`${SC}.getElementById('shield').dispatchEvent(new MouseEvent('mousedown', {bubbles: true}))`);
+
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { protocolVersion: '2025-06-18', clientInfo: { name: 'test-client', version: '1' }, capabilities: {} });
+    const r = await mcp.call('translate_page', { to: 'en' });
+    assert.equal(r.error, null);
+    assert.deepEqual(r.value, { translated_to: 'en', from: 'ka' });
+    assert.match((await mcp.call('read_page')).value.text, /tax/i, 'the agent reads it in English');
+    assert.deepEqual((await mcp.call('translate_page', { original: true })).value, { shown: 'original' });
+  } finally {
+    mcp.close(); await b.close(); server.close();
+    fs.rmSync(profile, { recursive: true, force: true });
+  }
+});
