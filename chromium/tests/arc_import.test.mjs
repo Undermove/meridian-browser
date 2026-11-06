@@ -92,13 +92,13 @@ test('Arc logins: cookies come over, so sites stay signed in; Deny imports nothi
     try {
       await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
       assert.equal((await b.eval(`${H}.getArcPreview()`)).preview.loginsAvailable, true);
-      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 0, error: 'denied' });
+      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 0, passwords: 0, error: 'denied' });
     } finally { await b.close(); }
 
     b = await launch(['about:blank'], { args: [`--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=test-pass'] });
     try {
       await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 2, error: '' });
+      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 2, passwords: 0, error: '' });
       await b.eval(`app.$.tabstrip.tabStripService_.createTabAt(null, 'http://127.0.0.1:${port}/')`);
       await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'cookie:sid=signed-in')`);
       // The sidebar after the sign-ins: Home (Arc's Profile 2) has that profile's cookie.
@@ -198,7 +198,7 @@ test('a space of another Arc profile is signed in as that profile: its pinned, o
     try {
       await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
       assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
-      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 2, error: '' });
+      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 2, passwords: 0, error: '' });
       assert.deepEqual(await homeCookies(b, s.u), WORK);
       await b.quit();
     } finally { await b.close(); }
@@ -450,5 +450,100 @@ test('the site controls show the shown space\'s extensions; a click opens its po
   } finally {
     await b.close(); s.close(); web.close();
     for (const d of [work, arcDir]) fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+// Arc's "Login Data": its saved passwords, encrypted like its cookies (no host hash).
+function writeArcPasswords(dir, password, rows) {
+  fs.mkdirSync(dir, { recursive: true });
+  const db = new DatabaseSync(path.join(dir, 'Login Data'));
+  db.exec(`CREATE TABLE logins(origin_url VARCHAR NOT NULL, action_url VARCHAR, username_element VARCHAR,
+    username_value VARCHAR, password_element VARCHAR, password_value BLOB, submit_element VARCHAR,
+    signon_realm VARCHAR NOT NULL, date_created INTEGER NOT NULL, blacklisted_by_user INTEGER NOT NULL,
+    scheme INTEGER NOT NULL, password_type INTEGER, times_used INTEGER, form_data BLOB, display_name VARCHAR,
+    icon_url VARCHAR, federation_url VARCHAR, skip_zero_click INTEGER, generation_upload_status INTEGER,
+    possible_username_pairs BLOB, id INTEGER PRIMARY KEY AUTOINCREMENT, date_last_used INTEGER NOT NULL DEFAULT 0,
+    moving_blocked_for BLOB, date_password_modified INTEGER NOT NULL DEFAULT 0)`);
+  const key = crypto.pbkdf2Sync(password, 'saltysalt', 1003, 16, 'sha1');
+  const now = BigInt(Date.now()) * 1000n + 11644473600000000n;
+  const insert = db.prepare(`INSERT INTO logins(origin_url, action_url, username_element, username_value, password_element,
+    password_value, submit_element, signon_realm, date_created, blacklisted_by_user, scheme, times_used, federation_url)
+    VALUES (?, ?, 'user', ?, 'pass', ?, '', ?, ?, 0, 0, 1, ?)`);
+  for (const r of rows) {
+    const c = crypto.createCipheriv('aes-128-cbc', key, Buffer.alloc(16, 0x20));
+    const enc = Buffer.concat([Buffer.from('v10'), c.update(Buffer.from(r.password)), c.final()]);
+    const origin = new URL(r.url).origin;
+    insert.run(r.url, r.url, r.username, enc, `${origin}/`, now, r.federation || '');
+  }
+  db.close();
+}
+
+// The usernames and sites in chrome://password-manager of the shown space's profile.
+async function savedPasswords(b) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  await b.eval(`app.$.tabstrip.openUrl('chrome://password-manager/passwords')`);
+  for (let i = 0; i < 50; i++) {
+    await sleep(200);
+    const t = (await (await fetch(`${b.base}/json/list`)).json()).find((x) => x.type === 'page' && x.url.startsWith('chrome://password-manager'));
+    if (!t) continue;
+    const ws = new WebSocket(t.webSocketDebuggerUrl);
+    await new Promise((r) => (ws.onopen = r));
+    const reply = await new Promise((r) => {
+      ws.onmessage = (m) => r(JSON.parse(m.data));
+      ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: 'chrome.passwordsPrivate.getSavedPasswordList().then((l) => l.map((x) => `${x.username}@${x.affiliatedDomains[0].name}`).sort())', awaitPromise: true, returnByValue: true } }));
+    });
+    ws.close();
+    const list = reply.result?.result?.value;
+    if (list) {
+      // Closes that tab (it's in the space's list).
+      await fetch(`${b.base}/json/close/${t.id}`);
+      return list;
+    }
+  }
+  return null;
+}
+
+test('Arc\'s saved passwords come over from Settings, each into its space\'s profile; again adds nothing', async () => {
+  const s = await cookieEcho();
+  const arcDir = arcWithTwoProfiles(s.u);
+  writeArcPasswords(path.join(arcDir, 'User Data', 'Default'), 'test-pass', [
+    { url: 'https://bank.example/login', username: 'alice', password: 'pa55-personal' },
+    // A federated sign-in has no password: it stays behind.
+    { url: 'https://social.example/', username: 'alice', password: '', federation: 'https://accounts.google.com' },
+  ]);
+  writeArcPasswords(path.join(arcDir, 'User Data', 'Profile 2'), 'test-pass', [
+    { url: 'https://tax.example/signin', username: 'bob', password: 'pa55-work' },
+  ]);
+  const b = await launch(['about:blank'], { args: [`--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=test-pass'] });
+  const ST = 'app.$.settings.shadowRoot';
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    // Arc's spaces came in earlier (without its sign-ins).
+    assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
+    const press = async () => {
+      await b.eval(`app.$.tabstrip.runCommand(13, 0)`);  // Meridian > Settings
+      await b.waitFor(`app.$.settings.open && !!${ST}.getElementById('importArcPasswords')`);
+      await b.click(`${ST}.getElementById('importArcPasswords')`);
+      await b.waitFor(`!/Bringing/.test(${ST}.getElementById('arcPasswordsNote').textContent) && /\\./.test(${ST}.getElementById('arcPasswordsNote').textContent)`);
+      const note = (await b.eval(`${ST}.getElementById('arcPasswordsNote').textContent`)).trim();
+      await b.eval(`${ST}.getElementById('close').click()`);
+      await b.waitFor('!app.$.settings.open');
+      return note;
+    };
+    assert.equal(await press(), '2 passwords brought over.');
+    const spaces = (await b.eval(`${H}.getState().then(({state}) => state)`)).spaces;
+    const main = spaces.find((x) => !x.profileId);
+    const home = spaces.find((x) => x.name === 'Home');
+    await b.eval(`${H}.activateSpace(${JSON.stringify(main.id)})`);
+    assert.deepEqual(await savedPasswords(b), ['alice@bank.example'], 'the personal space has Arc Default\'s password');
+    await b.eval(`${H}.activateSpace(${JSON.stringify(home.id)})`);
+    await b.waitFor(`app.$.tabstrip.state_.profileId === 'Meridian Profile Arc 2'`);
+    assert.deepEqual(await savedPasswords(b), ['bob@tax.example'], 'Home has Arc Profile 2\'s password');
+    // Again: they're all there, nothing doubles.
+    assert.equal(await press(), 'They’re all here already.');
+    assert.deepEqual(await savedPasswords(b), ['bob@tax.example']);
+  } finally {
+    await b.close(); s.close();
+    fs.rmSync(arcDir, { recursive: true, force: true });
   }
 });
