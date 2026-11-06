@@ -1,0 +1,493 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 6 Nov 2026 12:12:34 +0400
+Subject: [PATCH 97/97] Site controls: Arc's Extensions row with the shown
+ space's extensions
+
+Every extension with a toolbar action of the active tab's profile (a
+space's), as tiles with its icon and badge for the tab, not only pinned
+ones; a click runs it on the tab and its popup opens, in the extension's
+profile, under the sliders. Manage opens chrome://extensions of that
+space. Chromium's toolbar stays, hidden, for its shortcuts and bubbles.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../extensions/extension_view_host_factory.cc |  17 ++-
+ chrome/browser/meridian/sidebar.mojom         |  16 +++
+ chrome/browser/meridian/sidebar_handler.cc    |  11 ++
+ chrome/browser/meridian/sidebar_handler.h     |   3 +
+ chrome/browser/meridian/site_control.cc       | 128 ++++++++++++++++++
+ chrome/browser/meridian/site_control.h        |  14 ++
+ chrome/browser/resources/webui_browser/app.ts |   3 +
+ .../webui_browser/meridian/site_control.css   |  51 +++++++
+ .../meridian/site_control.html.ts             |  15 +-
+ .../webui_browser/meridian/site_control.ts    |  30 +++-
+ 10 files changed, 284 insertions(+), 4 deletions(-)
+
+diff --git a/chrome/browser/extensions/extension_view_host_factory.cc b/chrome/browser/extensions/extension_view_host_factory.cc
+index 378e992577..52ee8c173f 100644
+--- a/chrome/browser/extensions/extension_view_host_factory.cc
++++ b/chrome/browser/extensions/extension_view_host_factory.cc
+@@ -14,6 +14,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/common/url_constants.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/keyboard_event_processing_result.h"
+@@ -269,7 +270,21 @@ std::unique_ptr<ExtensionViewHost> ExtensionViewHostFactory::CreatePopupHost(
+   auto delegate = std::make_unique<ExtensionViewHostDelegateAndroid>();
+ #endif
+ 
+-  return CreateExtensionViewHost(extension, url, browser->GetProfile(),
++  // Meridian: a window holds tabs of every profile (its spaces'); the popup
++  // is in the profile of the extension, the active tab's.
++  Profile* profile = browser->GetProfile();
++  if (content::WebContents* active =
++          browser->GetTabStripModel()->GetActiveWebContents()) {
++    Profile* tab_profile =
++        Profile::FromBrowserContext(active->GetBrowserContext());
++    if (tab_profile != profile &&
++        ExtensionRegistry::Get(tab_profile)
++            ->enabled_extensions()
++            .Contains(extension.id())) {
++      profile = tab_profile;
++    }
++  }
++  return CreateExtensionViewHost(extension, url, profile,
+                                  mojom::ViewType::kExtensionPopup,
+                                  std::move(delegate));
+ }
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 6b30462cb9..5419ed0ea3 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -155,6 +155,17 @@ struct ArcExtension {
+   bool installed;
+ };
+ 
++// An extension of the shown space's profile with a toolbar action (Arc's
++// Extensions row in the Site Control Center).
++struct SpaceExtension {
++  string id;
++  // Its action's title for the tab, or its name.
++  string title;
++  // The action's icon for the tab, a PNG data: URL.
++  string icon;
++  string badge;
++};
++
+ // Where an item goes. `container` is a space id, or "favorites".
+ struct ItemPosition {
+   string container;
+@@ -499,6 +510,11 @@ interface SidebarHandler {
+   // The extensions installed in Arc (read from its folder; nothing is
+   // installed until the person adds each one in the Web Store).
+   GetArcExtensions() => (array<ArcExtension> extensions);
++  // The shown space's extensions (Arc's Extensions row); clicking one runs it
++  // on the active tab: its popup opens by the site controls (`popup`), or it
++  // gets its click.
++  GetSpaceExtensions() => (array<SpaceExtension> extensions);
++  RunSpaceExtension(string id) => (bool popup);
+ 
+   // The Site Control Center, for the active tab's site. `type` "ads" is the
+   // ad and tracker blocking; settings are "allow", "block" or "ask".
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 6568b7b09d..6d9f39a8cc 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -2575,6 +2575,17 @@ void SidebarHandler::GetArcExtensions(GetArcExtensionsCallback callback) {
+           weak_factory_.GetWeakPtr(), std::move(callback)));
+ }
+ 
++void SidebarHandler::GetSpaceExtensions(GetSpaceExtensionsCallback callback) {
++  std::move(callback).Run(
++      meridian::GetSpaceExtensions(model()->GetActiveWebContents()));
++}
++
++void SidebarHandler::RunSpaceExtension(const std::string& id,
++                                       RunSpaceExtensionCallback callback) {
++  std::move(callback).Run(meridian::RunSpaceExtension(
++      browser_, model()->GetActiveWebContents(), id));
++}
++
+ Profile* SidebarHandler::ActiveSpaceProfile() {
+   Profile* main = MainProfileFor(browser_->GetProfile());
+   const Space* space = service_->FindSpace(service_->active_space_id());
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 23bdde2977..fdef5f632f 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -145,6 +145,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void OpenItem(const std::string& item_id) override;
+   void ResetItemToHome(const std::string& item_id) override;
+   void GetArcExtensions(GetArcExtensionsCallback callback) override;
++  void GetSpaceExtensions(GetSpaceExtensionsCallback callback) override;
++  void RunSpaceExtension(const std::string& id,
++                         RunSpaceExtensionCallback callback) override;
+   void GetSiteInfo(GetSiteInfoCallback callback) override;
+   void SetSitePermission(const std::string& type,
+                          const std::string& setting) override;
+diff --git a/chrome/browser/meridian/site_control.cc b/chrome/browser/meridian/site_control.cc
+index 8f69b7d00a..a59e66371a 100644
+--- a/chrome/browser/meridian/site_control.cc
++++ b/chrome/browser/meridian/site_control.cc
+@@ -4,12 +4,35 @@
+ 
+ #include "chrome/browser/meridian/site_control.h"
+ 
++#include <algorithm>
+ #include <memory>
+ #include <utility>
+ 
+ #include "base/memory/weak_ptr.h"
++#include "base/strings/string_util.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
++#include "chrome/browser/extensions/extension_action_runner.h"
++#include "chrome/browser/extensions/extension_view_host.h"
++#include "chrome/browser/extensions/extension_view_host_factory.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_element_identifiers.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/extensions/extension_popup_types.h"
++#include "chrome/browser/ui/toolbar/toolbar_actions_model.h"
++#include "chrome/browser/ui/views/extensions/extension_popup.h"
++#include "components/sessions/content/session_tab_helper.h"
++#include "extensions/browser/extension_action.h"
++#include "extensions/browser/extension_action_manager.h"
++#include "extensions/browser/extension_registry.h"
++#include "extensions/common/extension.h"
++#include "ui/base/base_window.h"
++#include "ui/base/interaction/element_tracker.h"
++#include "ui/base/webui/web_ui_util.h"
++#include "ui/gfx/image/image.h"
++#include "ui/gfx/image/image_skia.h"
++#include "ui/gfx/image/image_skia_rep.h"
++#include "ui/views/interaction/element_tracker_views.h"
++#include "ui/views/widget/widget.h"
+ #include "components/content_settings/core/browser/host_content_settings_map.h"
+ #include "components/content_settings/core/common/content_settings.h"
+ #include "components/content_settings/core/common/content_settings_types.h"
+@@ -234,4 +257,109 @@ void ClearSiteData(Profile* profile,
+       std::move(filter), new ClearObserver(contents, std::move(done)));
+ }
+ 
++namespace {
++
++const extensions::Extension* SpaceExtension(Profile* profile,
++                                            const std::string& id) {
++  return extensions::ExtensionRegistry::Get(profile)
++      ->enabled_extensions()
++      .GetByID(id);
++}
++
++}  // namespace
++
++std::vector<mojom::SpaceExtensionPtr> GetSpaceExtensions(
++    content::WebContents* contents) {
++  std::vector<mojom::SpaceExtensionPtr> out;
++  if (!contents) {
++    return out;
++  }
++  Profile* profile = Profile::FromBrowserContext(contents->GetBrowserContext());
++  ToolbarActionsModel* model = ToolbarActionsModel::Get(profile);
++  if (!model) {
++    return out;
++  }
++  const int tab_id = sessions::SessionTabHelper::IdForTab(contents).id();
++  for (const std::string& id : model->action_ids()) {
++    const extensions::Extension* extension = SpaceExtension(profile, id);
++    extensions::ExtensionAction* action =
++        extension ? extensions::ExtensionActionManager::Get(profile)
++                        ->GetExtensionAction(*extension)
++                  : nullptr;
++    if (!action) {
++      continue;
++    }
++    gfx::Image image = action->GetExplicitlySetIcon(tab_id);
++    if (image.IsEmpty()) {
++      image = action->GetDeclarativeIcon(tab_id);
++    }
++    if (image.IsEmpty() && action->default_icon_image()) {
++      image = action->GetDefaultIconImage();
++    }
++    if (image.IsEmpty()) {
++      image = action->GetPlaceholderIconImage();
++    }
++    std::string icon;
++    if (!image.IsEmpty()) {
++      const gfx::ImageSkiaRep& rep =
++          image.AsImageSkia().GetRepresentation(2.0f);
++      if (!rep.is_null()) {
++        icon = webui::GetBitmapDataUrl(rep.GetBitmap());
++      }
++    }
++    std::string title = action->GetTitle(tab_id);
++    out.push_back(mojom::SpaceExtension::New(
++        id, title.empty() ? extension->name() : title, icon,
++        action->GetDisplayBadgeText(tab_id)));
++  }
++  std::ranges::sort(out, [](const mojom::SpaceExtensionPtr& a,
++                            const mojom::SpaceExtensionPtr& b) {
++    return base::ToLowerASCII(a->title) < base::ToLowerASCII(b->title);
++  });
++  return out;
++}
++
++bool RunSpaceExtension(BrowserWindowInterface* browser,
++                       content::WebContents* contents,
++                       const std::string& id) {
++  if (!contents) {
++    return false;
++  }
++  Profile* profile = Profile::FromBrowserContext(contents->GetBrowserContext());
++  const extensions::Extension* extension = SpaceExtension(profile, id);
++  extensions::ExtensionActionRunner* runner =
++      extensions::ExtensionActionRunner::GetForWebContents(contents);
++  if (!extension || !runner) {
++    return false;
++  }
++  if (runner->RunAction(extension, /*grant_tab_permissions=*/true) !=
++      extensions::ExtensionAction::ShowAction::kShowPopup) {
++    return false;
++  }
++  extensions::ExtensionAction* action =
++      extensions::ExtensionActionManager::Get(profile)->GetExtensionAction(
++          *extension);
++  const int tab_id = sessions::SessionTabHelper::IdForTab(contents).id();
++  // The popup is the extension's profile's, under the sliders it was opened
++  // from.
++  std::unique_ptr<extensions::ExtensionViewHost> host =
++      extensions::ExtensionViewHostFactory::CreatePopupHost(
++          *extension, action->GetPopupUrl(tab_id), browser);
++  views::Widget* widget = views::Widget::GetWidgetForNativeWindow(
++      browser->GetWindow()->GetNativeWindow());
++  ui::TrackedElement* anchor =
++      widget ? ui::ElementTracker::GetElementTracker()->GetFirstMatchingElement(
++                   kLocationIconElementId,
++                   views::ElementTrackerViews::GetContextForWidget(widget))
++             : nullptr;
++  if (!host || !anchor) {
++    return false;
++  }
++  ExtensionPopup::ShowPopup(browser, std::move(host),
++                            views::BubbleAnchor(anchor),
++                            views::BubbleBorder::TOP_RIGHT,
++                            PopupShowAction::kShow, ShowPopupCallback());
++  return true;
++}
++
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/site_control.h b/chrome/browser/meridian/site_control.h
+index a13c57c2d0..75ad12c9a8 100644
+--- a/chrome/browser/meridian/site_control.h
++++ b/chrome/browser/meridian/site_control.h
+@@ -6,10 +6,12 @@
+ #define CHROME_BROWSER_MERIDIAN_SITE_CONTROL_H_
+ 
+ #include <string>
++#include <vector>
+ 
+ #include "base/functional/callback_forward.h"
+ #include "chrome/browser/meridian/sidebar.mojom.h"
+ 
++class BrowserWindowInterface;
+ class Profile;
+ 
+ namespace content {
+@@ -34,6 +36,18 @@ void SetSitePermission(Profile* profile,
+ // `step`: +1 zooms in, -1 out, 0 back to 100%.
+ void ZoomSite(content::WebContents* contents, int step);
+ 
++// The extensions with a toolbar action in the profile of `contents` (a
++// space's: a window holds tabs of every profile), with their icon and badge
++// for that tab, by name.
++std::vector<mojom::SpaceExtensionPtr> GetSpaceExtensions(
++    content::WebContents* contents);
++
++// Runs the extension `id` of the profile of `contents` on it, as a click on
++// its toolbar button does; its popup (true) opens under the site controls.
++bool RunSpaceExtension(BrowserWindowInterface* browser,
++                       content::WebContents* contents,
++                       const std::string& id);
++
+ // Removes the site's cookies, storage and cache, then reloads the page.
+ void ClearSiteData(Profile* profile,
+                    content::WebContents* contents,
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 2bb3e29cd6..f9b0fdb529 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -945,6 +945,9 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       case 'web-store':
+         this.$.tabstrip.openUrl('https://chromewebstore.google.com/');
+         break;
++      case 'manage-extensions':
++        this.$.tabstrip.openUrl('chrome://extensions/');
++        break;
+       case 'settings':
+         this.$.settings.show(this.$.tabstrip.spaces(), 'general');
+         break;
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_control.css b/chrome/browser/resources/webui_browser/meridian/site_control.css
+index 611f92d0ae..2f79f5c82d 100644
+--- a/chrome/browser/resources/webui_browser/meridian/site_control.css
++++ b/chrome/browser/resources/webui_browser/meridian/site_control.css
+@@ -119,6 +119,57 @@ svg {
+   gap: 6px;
+ }
+ 
++.sec-row {
++  display: flex;
++  align-items: baseline;
++  justify-content: space-between;
++}
++
++.manage {
++  margin: 0 4px;
++  font-size: 12px;
++  font-weight: 600;
++  color: var(--meridian-text-muted);
++}
++
++.manage:hover {
++  color: var(--meridian-text);
++}
++
++/* Arc: each extension a tile, the "+" after them. */
++.ext-btn {
++  position: relative;
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  width: 40px;
++  height: 32px;
++  border-radius: 9px;
++  background: color-mix(in srgb, var(--meridian-text) 6%, transparent);
++}
++
++.ext-btn:hover {
++  background: color-mix(in srgb, var(--meridian-text) 11%, transparent);
++}
++
++.ext-btn img {
++  width: 18px;
++  height: 18px;
++}
++
++.ext-btn .badge {
++  position: absolute;
++  right: 2px;
++  bottom: 1px;
++  padding: 0 3px;
++  border-radius: 4px;
++  background: var(--meridian-accent, #3b6cf6);
++  color: white;
++  font-size: 9px;
++  font-weight: 700;
++  line-height: 12px;
++}
++
+ .ext-add {
+   display: inline-flex;
+   align-items: center;
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_control.html.ts b/chrome/browser/resources/webui_browser/meridian/site_control.html.ts
+index e3c31e5117..21bfaf61d2 100644
+--- a/chrome/browser/resources/webui_browser/meridian/site_control.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/site_control.html.ts
+@@ -26,12 +26,23 @@ export function getHtml(this: MeridianSiteControlElement) {
+     </button>
+   </div>
+ 
+-  <div class="sec">Extensions</div>
++  <div class="sec-row">
++    <div class="sec">Extensions</div>
++    <button id="manageExtensions" class="manage"
++        @click="${this.onManageExtensionsClick_}">Manage</button>
++  </div>
+   <div class="ext">
+-    <slot name="extensions"></slot>
++    ${this.extensions_.map(x => html`
++      <button class="ext-btn" data-id="${x.id}" title="${x.title}"
++          aria-label="${x.title}" @click="${this.onExtensionClick_}">
++        ${x.icon ? html`<img src="${x.icon}" alt="">` : ''}
++        ${x.badge ? html`<span class="badge">${x.badge}</span>` : ''}
++      </button>`)}
+     <button id="addExtension" class="ext-add" title="Get extensions"
+         @click="${this.onAddExtensionClick_}">${icon('plus', 16)}</button>
+   </div>
++  <!-- Chromium's toolbar (hidden): its keyboard shortcuts and bubbles. -->
++  <slot name="extensions" hidden></slot>
+   ${this.arcLeft_ ? html`
+     <button id="arcExtensions" class="arc-hint" @click="${this.onArcClick_}">
+       ${icon('puzzle', 14)}<span>${this.arcLabel_()}</span>
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_control.ts b/chrome/browser/resources/webui_browser/meridian/site_control.ts
+index 5af5be3918..c486f84775 100644
+--- a/chrome/browser/resources/webui_browser/meridian/site_control.ts
++++ b/chrome/browser/resources/webui_browser/meridian/site_control.ts
+@@ -11,7 +11,7 @@ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+ import {browserProxyFactory} from '../sidebar.mojom-webui.js';
+-import type {SidebarHandlerInterface, SiteInfo} from '../sidebar.mojom-webui.js';
++import type {SidebarHandlerInterface, SiteInfo, SpaceExtension} from '../sidebar.mojom-webui.js';
+ 
+ import type {IconName} from './icons.js';
+ import {getCss} from './site_control.css.js';
+@@ -66,6 +66,7 @@ export class MeridianSiteControlElement extends CrLitElement {
+       copied_: {state: true, type: Boolean},
+       confirmClear_: {state: true, type: Boolean},
+       arcLeft_: {state: true, type: Number},
++      extensions_: {state: true, type: Array},
+     };
+   }
+ 
+@@ -80,6 +81,8 @@ export class MeridianSiteControlElement extends CrLitElement {
+   protected accessor confirmClear_: boolean = false;
+   // Extensions in Arc not added here yet.
+   protected accessor arcLeft_: number = 0;
++  // The shown space's extensions (Arc's row: all of them, not just pinned).
++  protected accessor extensions_: SpaceExtension[] = [];
+ 
+   private handler_: SidebarHandlerInterface =
+       browserProxyFactory.getInstance().handler;
+@@ -91,6 +94,7 @@ export class MeridianSiteControlElement extends CrLitElement {
+       this.confirmClear_ = false;
+       this.refresh_();
+       this.countArcExtensions_();
++      this.loadExtensions_();
+     }
+     this.rows_ = (this.info_?.permissions || []).map(p => ({
+       type: p.type,
+@@ -106,6 +110,30 @@ export class MeridianSiteControlElement extends CrLitElement {
+     this.info_ = info;
+   }
+ 
++  private async loadExtensions_() {
++    const {extensions} = await this.handler_.getSpaceExtensions();
++    this.extensions_ = extensions;
++    // Icons not read from disk yet come blank: once more when they are.
++    setTimeout(async () => {
++      if (this.open) {
++        this.extensions_ =
++            (await this.handler_.getSpaceExtensions()).extensions;
++      }
++    }, 400);
++  }
++
++  // Runs it on the page, as its toolbar button does (its popup opens under
++  // the sliders).
++  protected async onExtensionClick_(e: Event) {
++    const id = (e.currentTarget as HTMLElement).dataset['id']!;
++    this.fire('site-control-action', 'close');
++    await this.handler_.runSpaceExtension(id);
++  }
++
++  protected onManageExtensionsClick_() {
++    this.fire('site-control-action', 'manage-extensions');
++  }
++
+   private async countArcExtensions_() {
+     const {extensions} = await this.handler_.getArcExtensions();
+     this.arcLeft_ = extensions.filter(x => !x.installed).length;

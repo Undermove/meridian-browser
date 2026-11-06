@@ -242,13 +242,16 @@ test('tabs 0.5.13 put in the main profile move to their space\'s profile, unarch
 
 // An extension that marks the pages it runs on with its name, packed as a CRX with a new key, and
 // its Web Store id (the key's hash in a–p).
-function packExtension(dir, name) {
+// With `popup`, its toolbar button opens popup.html ("Popup <name>").
+function packExtension(dir, name, { popup = false } = {}) {
   const src = path.join(dir, name);
   fs.mkdirSync(src, { recursive: true });
   fs.writeFileSync(path.join(src, 'manifest.json'), JSON.stringify({
     manifest_version: 3, name: `Mark ${name}`, version: '1.0',
     content_scripts: [{ matches: ['http://127.0.0.1/*'], js: ['mark.js'], run_at: 'document_start' }],
+    ...(popup ? { action: { default_popup: 'popup.html', default_title: `Mark ${name}` } } : {}),
   }));
+  if (popup) fs.writeFileSync(path.join(src, 'popup.html'), `<title>Popup ${name}</title><p>${name}`);
   fs.writeFileSync(path.join(src, 'mark.js'), `document.documentElement.dataset['mark' + ${JSON.stringify(name)}] = '1';`);
   const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
   const pem = path.join(dir, `${name}.pem`);
@@ -371,3 +374,81 @@ for (const imported of ['now', 'by 0.5.13']) {
     }
   });
 }
+
+// Arc: the site controls (the sliders) show the shown space's extensions as tiles, all of them,
+// not only pinned; a click opens the extension's popup, from its own profile.
+test('the site controls show the shown space\'s extensions; a click opens its popup', async () => {
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-ext-'));
+  const personal = packExtension(work, 'Personal', { popup: true });
+  const office = packExtension(work, 'Office', { popup: true });
+  const web = await store([personal, office]);
+  const s = await cookieEcho();
+  const arcDir = arcWithTwoProfiles(s.u);
+  arcExtension(arcDir, 'Default', personal.id, 'Mark Personal');
+  arcExtension(arcDir, 'Profile 2', office.id, 'Mark Office');
+  const args = [`--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=test-pass', `--apps-gallery-update-url=${web.url}`, '--meridian-test-unsigned-store'];
+  const b = await launch(['about:blank'], { args });
+  const SC = 'app.$.siteControl.shadowRoot';
+  const tiles = () => b.eval(`[...${SC}.querySelectorAll('.ext-btn')].map((t) => t.title)`);
+  const popups = async () => (await (await fetch(`${b.base}/json/list`)).json()).filter((t) => t.url.endsWith('/popup.html')).map((t) => t.title);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
+    const spaces = (await b.eval(`${H}.getState().then(({state}) => state)`)).spaces;
+    const main = spaces.find((x) => !x.profileId);
+    const home = spaces.find((x) => x.name === 'Home');
+    for (const [space, want, other] of [[main, 'Mark Personal', 'Mark Office'], [home, 'Mark Office', 'Mark Personal']]) {
+      await b.eval(`${H}.activateSpace(${JSON.stringify(space.id)})`);
+      await b.eval(`app.$.tabstrip.openUrl(${JSON.stringify(s.u(`page-${space.name}`))})`);
+      await b.waitFor(`app.$.tabstrip.state_.profileId === ${JSON.stringify(space.profileId || '')}`);
+      // Installed in the background: open the controls until its tile is there.
+      let got = [];
+      for (let i = 0; i < 30 && !got.includes(want); i++) {
+        if (await b.eval('app.$.siteControl.open')) await b.eval(`${SC}.getElementById('shield').dispatchEvent(new MouseEvent('mousedown', {bubbles: true}))`);
+        await b.waitFor(`!app.$.locationIconButton.hidden`);
+        await b.click('app.$.locationIconButton');
+        await b.waitFor('app.$.siteControl.open');
+        await sleep(600);
+        got = await tiles();
+        if (!got.includes(want)) await sleep(1000);
+      }
+      assert.deepEqual(got, [want], `${space.name}: only its own extension, shown without pinning (not ${other})`);
+      await b.click(`[...${SC}.querySelectorAll('.ext-btn')].find((t) => t.title === ${JSON.stringify(want)})`);
+      const name = want.split(' ')[1];
+      let open = [];
+      for (let i = 0; i < 40 && !open.includes(`Popup ${name}`); i++) { await sleep(150); open = await popups(); }
+      assert.ok(open.includes(`Popup ${name}`), `${space.name}: its popup opened: ${JSON.stringify(open)}`);
+      assert.equal(await b.eval('app.$.siteControl.open'), false, 'the controls closed for it');
+      // Closes the popup (Escape in it) before the next space.
+      const t = (await (await fetch(`${b.base}/json/list`)).json()).find((x) => x.url.endsWith('/popup.html'));
+      const ws = new WebSocket(t.webSocketDebuggerUrl);
+      await new Promise((r) => (ws.onopen = r));
+      ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: 'window.close()' } }));
+      await sleep(300); ws.close();
+      for (let i = 0; i < 20 && (await popups()).length; i++) await sleep(150);
+    }
+    // Manage (in Home): chrome://extensions of Home's profile.
+    await b.click('app.$.locationIconButton');
+    await b.waitFor('app.$.siteControl.open');
+    await b.click(`${SC}.getElementById('manageExtensions')`);
+    let listed = null;
+    for (let i = 0; i < 40 && !listed; i++) {
+      await sleep(200);
+      const t = (await (await fetch(`${b.base}/json/list`)).json()).find((x) => x.type === 'page' && x.url.startsWith('chrome://extensions'));
+      if (!t) continue;
+      const ws = new WebSocket(t.webSocketDebuggerUrl);
+      await new Promise((r) => (ws.onopen = r));
+      const reply = await new Promise((r) => {
+        ws.onmessage = (m) => r(JSON.parse(m.data));
+        ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: 'chrome.developerPrivate.getExtensionsInfo().then((l) => l.map((x) => x.name).filter((n) => n.startsWith("Mark")))', awaitPromise: true, returnByValue: true } }));
+      });
+      ws.close();
+      listed = reply.result?.result?.value || null;
+    }
+    assert.deepEqual(listed, ['Mark Office'], 'Manage in Home lists Home\'s extensions');
+  } finally {
+    await b.close(); s.close(); web.close();
+    for (const d of [work, arcDir]) fs.rmSync(d, { recursive: true, force: true });
+  }
+});
