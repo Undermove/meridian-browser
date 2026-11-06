@@ -1,0 +1,2230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 6 Nov 2026 17:23:17 +0400
+Subject: [PATCH 101/101] The rest of Arc comes over: history, forms,
+ addresses, cards, permissions, site searches, sites' data, Air Traffic
+ Control and the archive
+
+Each Arc profile's into its space's profile; what Meridian has wins, and
+importing again adds nothing twice. Cards come with the passwords (Arc's
+key opens both). Sites' databases move in when the profile next opens.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |  20 +
+ chrome/browser/meridian/arc_data.cc           | 967 ++++++++++++++++++
+ chrome/browser/meridian/arc_data.h            |  57 ++
+ chrome/browser/meridian/arc_import.cc         |   1 +
+ chrome/browser/meridian/arc_import.h          |   3 +
+ chrome/browser/meridian/arc_logins.cc         | 270 ++++-
+ chrome/browser/meridian/arc_logins.h          |  34 +-
+ chrome/browser/meridian/arc_staged.cc         |  47 +
+ chrome/browser/meridian/arc_staged.h          |  23 +
+ chrome/browser/meridian/archive_service.cc    |  30 +
+ chrome/browser/meridian/archive_service.h     |   3 +
+ chrome/browser/meridian/prefs.cc              |   2 +
+ chrome/browser/meridian/prefs.h               |   3 +
+ chrome/browser/meridian/sidebar.mojom         |  38 +-
+ chrome/browser/meridian/sidebar_handler.cc    |  31 +-
+ chrome/browser/meridian/sidebar_handler.h     |   1 +
+ chrome/browser/profiles/BUILD.gn              |   1 +
+ chrome/browser/profiles/profile_impl.cc       |   6 +
+ .../browser/resources/webui_browser/BUILD.gn  |   1 +
+ .../webui_browser/meridian/arc_summary.ts     |  33 +
+ .../webui_browser/meridian/onboarding.html.ts |   8 +-
+ .../webui_browser/meridian/onboarding.ts      |  21 +-
+ .../webui_browser/meridian/settings.html.ts   |  17 +-
+ .../webui_browser/meridian/settings.ts        |  28 +-
+ 24 files changed, 1569 insertions(+), 76 deletions(-)
+ create mode 100644 chrome/browser/meridian/arc_data.cc
+ create mode 100644 chrome/browser/meridian/arc_data.h
+ create mode 100644 chrome/browser/meridian/arc_staged.cc
+ create mode 100644 chrome/browser/meridian/arc_staged.h
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/arc_summary.ts
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 6ddb943714..c2b269a874 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -24,6 +24,16 @@ source_set("test_switches") {
+   public_deps = [ "//base" ]
+ }
+ 
++# Moves sites' databases brought from Arc into a profile before it opens
++# (chrome/browser/profiles/profile_impl.cc): no browser deps.
++source_set("arc_staged") {
++  sources = [
++    "arc_staged.cc",
++    "arc_staged.h",
++  ]
++  public_deps = [ "//base" ]
++}
++
+ # The sidebar model alone (no browser deps), so its tests stay small.
+ source_set("model") {
+   sources = [
+@@ -212,6 +222,8 @@ source_set("meridian") {
+     "agent/agent_service.h",
+     "agent/agent_service_factory.cc",
+     "agent/agent_service_factory.h",
++    "arc_data.cc",
++    "arc_data.h",
+     "arc_logins.cc",
+     "arc_logins.h",
+     "downloads_tracker.cc",
+@@ -259,6 +271,14 @@ source_set("meridian") {
+   deps = [
+     "//chrome/app:command_ids",
+     ":agent_embed",
++    ":arc_staged",
++    "//chrome/browser/autofill",
++    "//chrome/browser/webdata_services",
++    "//components/autofill/core/browser",
++    "//components/services/storage/public/mojom",
++    "//components/webdata/common",
++    "//storage/common",
++    "//third_party/leveldatabase",
+     ":ai_providers",
+     ":workbench_core",
+     "//ui/base/clipboard",
+diff --git a/chrome/browser/meridian/arc_data.cc b/chrome/browser/meridian/arc_data.cc
+new file mode 100644
+index 0000000000..6d02c59598
+--- /dev/null
++++ b/chrome/browser/meridian/arc_data.cc
+@@ -0,0 +1,967 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/arc_data.h"
++
++#include <algorithm>
++#include <map>
++#include <memory>
++#include <optional>
++#include <set>
++#include <utility>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/containers/to_vector.h"
++#include "base/files/file_enumerator.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/json/json_reader.h"
++#include "base/memory/ref_counted.h"
++#include "base/scoped_observation.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "base/uuid.h"
++#include "chrome/browser/autofill/personal_data_manager_factory.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/content_settings/host_content_settings_map_factory.h"
++#include "chrome/browser/history/history_service_factory.h"
++#include "chrome/browser/meridian/arc_import.h"
++#include "chrome/browser/meridian/arc_logins.h"
++#include "chrome/browser/meridian/arc_staged.h"
++#include "chrome/browser/meridian/archive_service.h"
++#include "chrome/browser/meridian/prefs.h"
++#include "chrome/browser/meridian/sidebar_service.h"
++#include "chrome/browser/meridian/sidebar_service_factory.h"
++#include "chrome/browser/meridian/space_profiles.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/search_engines/template_url_service_factory.h"
++#include "chrome/browser/webdata_services/web_data_service_factory.h"
++#include "components/autofill/core/browser/data_manager/addresses/address_data_manager.h"
++#include "components/autofill/core/browser/data_manager/personal_data_manager.h"
++#include "components/autofill/core/browser/data_manager/personal_data_manager_observer.h"
++#include "components/autofill/core/browser/data_model/addresses/autofill_profile.h"
++#include "components/autofill/core/browser/field_types.h"
++#include "components/autofill/core/browser/webdata/autocomplete/autocomplete_entry.h"
++#include "components/autofill/core/browser/webdata/autofill_webdata_service.h"
++#include "components/content_settings/core/browser/content_settings_info.h"
++#include "components/content_settings/core/browser/content_settings_registry.h"
++#include "components/content_settings/core/browser/host_content_settings_map.h"
++#include "components/content_settings/core/browser/website_settings_info.h"
++#include "components/content_settings/core/browser/website_settings_registry.h"
++#include "components/content_settings/core/common/content_settings_pattern.h"
++#include "components/history/core/browser/history_service.h"
++#include "components/history/core/browser/url_row.h"
++#include "components/keyed_service/core/service_access_type.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++#include "components/search_engines/template_url.h"
++#include "components/search_engines/template_url_data.h"
++#include "components/search_engines/template_url_service.h"
++#include "components/services/storage/public/mojom/local_storage_control.mojom.h"
++#include "content/public/browser/storage_partition.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "sql/database.h"
++#include "sql/statement.h"
++#include "storage/common/database/database_identifier.h"
++#include "third_party/blink/public/common/storage_key/storage_key.h"
++#include "third_party/blink/public/mojom/dom_storage/storage_area.mojom.h"
++#include "third_party/leveldatabase/env_chromium.h"
++#include "third_party/leveldatabase/src/include/leveldb/db.h"
++#include "third_party/leveldatabase/src/include/leveldb/iterator.h"
++#include "url/gurl.h"
++#include "url/origin.h"
++
++namespace meridian {
++
++namespace {
++
++using internal::OpenCopy;
++using internal::SelectOf;
++
++// Arc's dates: seconds since 2001 (Apple's reference date).
++base::Time FromAppleSeconds(double s) {
++  return base::Time::FromSecondsSinceUnixEpoch(s + 978307200);
++}
++
++// Content settings worth bringing: the ones a person answers or sets for a
++// site (Arc's automatic grants, like durable storage, stay behind).
++constexpr const char* kPermissionTypes[] = {
++    "notifications",     "geolocation",       "media_stream_camera",
++    "media_stream_mic",  "automatic_downloads", "popups",
++    "javascript",        "images",            "sound",
++    "clipboard",         "midi_sysex",        "sensors",
++    "idle_detection",    "window_placement",  "local_fonts",
++    "auto_picture_in_picture", "protected_media_identifier", "ar", "vr",
++    "camera_pan_tilt_zoom", "storage_access", "hid_guard", "serial_guard",
++    "usb_guard",         "bluetooth_guard",   "file_system_write_guard",
++    "captured_surface_control", "keyboard_lock", "pointer_lock",
++    "local_network_access", "local_network", "loopback_network"};
++
++struct Permission {
++  std::string type;
++  std::string primary;
++  std::string secondary;
++  int setting = 0;
++};
++
++struct SiteStorage {
++  url::Origin origin;
++  std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> entries;
++};
++
++// What one Meridian profile gets.
++struct ProfileRead {
++  ProfileRead() = default;
++  ProfileRead(ProfileRead&&) = default;
++  ProfileRead& operator=(ProfileRead&&) = default;
++  history::URLRows history;
++  std::vector<autofill::AutocompleteEntry> forms;
++  std::vector<autofill::AutofillProfile> addresses;
++  std::vector<Permission> permissions;
++  std::vector<TemplateURLData> engines;
++  std::vector<SiteStorage> storage;
++  int site_databases = 0;
++};
++
++struct LinkRule {
++  std::string pattern;
++  // "little", "main" or "arc-space:<Arc's space id>".
++  std::string target;
++};
++
++struct ArcDataRead {
++  ArcDataRead() = default;
++  ArcDataRead(ArcDataRead&&) = default;
++  ArcDataRead& operator=(ArcDataRead&&) = default;
++  // By Meridian profile id ("" for the main one).
++  std::map<std::string, ProfileRead> profiles;
++  // The archive, with Arc's space ids.
++  std::vector<std::pair<ArchivedTab, std::string>> archive;
++  std::vector<LinkRule> link_rules;
++  std::string link_fallback;
++  // Arc's space id -> its name.
++  std::map<std::string, std::string> arc_space_names;
++  bool found = false;
++};
++
++// ---------------------------------------------------------------- reading
++
++void ReadHistory(const base::FilePath& file, history::URLRows& out) {
++  base::ScopedTempDir tmp;
++  sql::Database db(sql::Database::Tag("History"));
++  if (!OpenCopy(file, tmp, db) || !db.DoesTableExist("urls")) {
++    return;
++  }
++  static constexpr base::cstring_view kColumns[] = {
++      "url", "title", "visit_count", "typed_count", "last_visit_time",
++      "hidden"};
++  sql::Statement s(db.GetUniqueStatement(SelectOf(db, "urls", kColumns)));
++  while (s.Step()) {
++    GURL url(s.ColumnString(0));
++    base::Time last = internal::FromWindows(s.ColumnInt64(4));
++    if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS() || last.is_null()) {
++      continue;
++    }
++    history::URLRow row(url);
++    row.set_title(s.ColumnString16(1));
++    row.set_visit_count(std::max(1, s.ColumnInt(2)));
++    row.set_typed_count(std::max(0, s.ColumnInt(3)));
++    row.set_last_visit(last);
++    row.set_hidden(s.ColumnInt(5) != 0);
++    out.push_back(std::move(row));
++  }
++}
++
++void ReadForms(sql::Database& db,
++               std::vector<autofill::AutocompleteEntry>& out) {
++  if (!db.DoesTableExist("autofill")) {
++    return;
++  }
++  static constexpr base::cstring_view kColumns[] = {
++      "name", "value", "date_created", "date_last_used"};
++  sql::Statement s(db.GetUniqueStatement(SelectOf(db, "autofill", kColumns)));
++  while (s.Step()) {
++    std::u16string name = s.ColumnString16(0);
++    std::u16string value = s.ColumnString16(1);
++    if (name.empty() || value.empty()) {
++      continue;
++    }
++    base::Time created = base::Time::FromTimeT(s.ColumnInt64(2));
++    base::Time used = base::Time::FromTimeT(s.ColumnInt64(3));
++    out.emplace_back(autofill::AutocompleteKey(name, value), created,
++                     std::max(created, used));
++  }
++}
++
++void ReadAddresses(sql::Database& db,
++                   std::vector<autofill::AutofillProfile>& out) {
++  if (!db.DoesTableExist("addresses") ||
++      !db.DoesTableExist("address_type_tokens")) {
++    return;
++  }
++  sql::Statement s(db.GetUniqueStatement(
++      "SELECT guid, use_count, use_date, date_modified, language_code FROM "
++      "addresses WHERE record_type = 0"));
++  while (s.Step()) {
++    std::string guid = s.ColumnString(0);
++    sql::Statement t(db.GetUniqueStatement(
++        "SELECT type, value, verification_status FROM address_type_tokens "
++        "WHERE guid = ?"));
++    t.BindString(0, guid);
++    std::vector<std::tuple<autofill::FieldType, std::u16string, int>> tokens;
++    std::string country;
++    while (t.Step()) {
++      std::optional<autofill::FieldType> type =
++          autofill::ToSafeFieldType(t.ColumnInt(0));
++      if (!type ||
++          !autofill::AutofillProfile::kDatabaseStoredTypes.contains(*type)) {
++        continue;
++      }
++      std::u16string value = t.ColumnString16(1);
++      if (*type == autofill::ADDRESS_HOME_COUNTRY) {
++        country = base::UTF16ToUTF8(value);
++      }
++      tokens.emplace_back(*type, std::move(value), t.ColumnInt(2));
++    }
++    if (tokens.empty()) {
++      continue;
++    }
++    autofill::AutofillProfile profile(
++        base::Uuid::GenerateRandomV4().AsLowercaseString(),
++        autofill::AutofillProfile::RecordType::kLocalOrSyncable,
++        autofill::AddressCountryCode(country));
++    for (auto& [type, value, status] : tokens) {
++      if (status < 0 ||
++          status > static_cast<int>(autofill::VerificationStatus::kMaxValue)) {
++        status = 0;
++      }
++      profile.SetRawInfoWithVerificationStatus(
++          type, value, static_cast<autofill::VerificationStatus>(status));
++    }
++    profile.usage_history().set_use_count(std::max(0, s.ColumnInt(1)));
++    profile.usage_history().set_use_date(
++        base::Time::FromTimeT(s.ColumnInt64(2)));
++    profile.usage_history().set_modification_date(
++        base::Time::FromTimeT(s.ColumnInt64(3)));
++    profile.set_language_code(s.ColumnString(4));
++    profile.FinalizeAfterImport();
++    out.push_back(std::move(profile));
++  }
++}
++
++// The site searches a person made (Arc's built-in engines and the ones sites
++// add by themselves stay behind).
++void ReadEngines(sql::Database& db, std::vector<TemplateURLData>& out) {
++  if (!db.DoesTableExist("keywords")) {
++    return;
++  }
++  static constexpr base::cstring_view kColumns[] = {
++      "short_name",     "keyword",         "favicon_url",
++      "url",            "suggest_url",     "date_created",
++      "last_modified",  "usage_count",     "input_encodings",
++      "alternate_urls", "prepopulate_id",  "safe_for_autoreplace",
++      "created_by_policy", "starter_pack_id", "last_visited"};
++  sql::Statement s(db.GetUniqueStatement(SelectOf(db, "keywords", kColumns)));
++  while (s.Step()) {
++    if (s.ColumnInt(10) != 0 || s.ColumnInt(11) != 0 || s.ColumnInt(12) != 0 ||
++        s.ColumnInt(13) != 0) {
++      continue;
++    }
++    TemplateURLData data;
++    data.SetShortName(s.ColumnString16(0));
++    data.SetKeyword(s.ColumnString16(1));
++    data.SetURL(s.ColumnString(3));
++    if (data.short_name().empty() || data.keyword().empty() ||
++        !GURL(data.url()).is_valid()) {
++      continue;
++    }
++    data.favicon_url = GURL(s.ColumnString(2));
++    data.suggestions_url = s.ColumnString(4);
++    data.date_created = internal::FromWindows(s.ColumnInt64(5));
++    data.last_modified = internal::FromWindows(s.ColumnInt64(6));
++    data.usage_count = s.ColumnInt(7);
++    data.input_encodings = base::SplitString(
++        s.ColumnString(8), ";", base::TRIM_WHITESPACE,
++        base::SPLIT_WANT_NONEMPTY);
++    if (std::optional<base::Value> alternates =
++            base::JSONReader::Read(s.ColumnString(9), 0);
++        alternates && alternates->is_list()) {
++      for (const base::Value& a : alternates->GetList()) {
++        if (a.is_string()) {
++          data.alternate_urls.push_back(a.GetString());
++        }
++      }
++    }
++    data.last_visited = internal::FromWindows(s.ColumnInt64(14));
++    data.safe_for_autoreplace = false;
++    data.is_active = TemplateURLData::ActiveStatus::kTrue;
++    data.sync_guid = base::Uuid::GenerateRandomV4().AsLowercaseString();
++    out.push_back(std::move(data));
++  }
++}
++
++void ReadPermissions(const base::FilePath& file,
++                     std::vector<Permission>& out) {
++  std::string json;
++  if (!base::ReadFileToString(file, &json)) {
++    return;
++  }
++  std::optional<base::Value> root = base::JSONReader::Read(json, 0);
++  const base::DictValue* exceptions =
++      root && root->is_dict() ? root->GetDict().FindDictByDottedPath(
++                                    "profile.content_settings.exceptions")
++                              : nullptr;
++  if (!exceptions) {
++    return;
++  }
++  for (const char* type : kPermissionTypes) {
++    const base::DictValue* entries = exceptions->FindDict(type);
++    if (!entries) {
++      continue;
++    }
++    for (const auto [patterns, value] : *entries) {
++      const base::DictValue* entry = value.GetIfDict();
++      std::optional<int> setting =
++          entry ? entry->FindInt("setting") : std::nullopt;
++      const std::string* expiration =
++          entry ? entry->FindString("expiration") : nullptr;
++      // Temporary grants (one time, or for a while) stay behind.
++      if (!setting || (expiration && *expiration != "0")) {
++        continue;
++      }
++      std::vector<std::string> parts = base::SplitString(
++          patterns, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
++      if (parts.empty() || parts.size() > 2 || parts[0].empty()) {
++        continue;
++      }
++      out.push_back({type, parts[0], parts.size() == 2 ? parts[1] : "*",
++                     *setting});
++    }
++  }
++}
++
++// Arc's localStorage ("Local Storage/leveldb"), from a private copy: by site,
++// the entries as the page stored them.
++void ReadLocalStorage(const base::FilePath& dir, std::vector<SiteStorage>& out) {
++  if (!base::DirectoryExists(dir)) {
++    return;
++  }
++  base::ScopedTempDir tmp;
++  if (!tmp.CreateUniqueTempDir()) {
++    return;
++  }
++  base::FilePath copy = tmp.GetPath().Append("leveldb");
++  if (!base::CreateDirectory(copy)) {
++    return;
++  }
++  base::FileEnumerator files(dir, false, base::FileEnumerator::FILES);
++  for (base::FilePath f = files.Next(); !f.empty(); f = files.Next()) {
++    if (f.BaseName().value() != "LOCK") {
++      base::CopyFile(f, copy.Append(f.BaseName()));
++    }
++  }
++  leveldb_env::Options options;
++  options.create_if_missing = false;
++  options.paranoid_checks = false;
++  std::unique_ptr<leveldb::DB> db;
++  if (!leveldb_env::OpenDB(options, copy.AsUTF8Unsafe(), &db).ok()) {
++    return;
++  }
++  std::map<std::string, size_t> index;
++  std::unique_ptr<leveldb::Iterator> it(db->NewIterator(leveldb::ReadOptions()));
++  for (it->Seek("_"); it->Valid() && it->key().starts_with("_"); it->Next()) {
++    std::string_view key = leveldb_env::MakeStringView(it->key());
++    size_t sep = key.find('\0');
++    if (sep == std::string_view::npos) {
++      continue;
++    }
++    std::string site(key.substr(1, sep - 1));
++    auto found = index.find(site);
++    if (found == index.end()) {
++      // A partitioned (third-party) key has "^" parts: those stay behind.
++      GURL url(site);
++      if (site.find('^') != std::string::npos || !url.SchemeIsHTTPOrHTTPS()) {
++        index[site] = SIZE_MAX;
++        continue;
++      }
++      found = index.emplace(site, out.size()).first;
++      out.push_back({url::Origin::Create(url), {}});
++    }
++    if (found->second == SIZE_MAX) {
++      continue;
++    }
++    std::string_view script_key = key.substr(sep + 1);
++    out[found->second].entries.emplace_back(
++        std::vector<uint8_t>(script_key.begin(), script_key.end()),
++        base::ToVector(base::as_byte_span(leveldb_env::MakeStringView(it->value()))));
++  }
++  std::erase_if(out, [](const SiteStorage& s) { return s.entries.empty(); });
++}
++
++// Puts Arc's IndexedDB sites that `meridian_profile` doesn't have next to it,
++// to move in when it next opens. Returns how many.
++int StageIndexedDB(const base::FilePath& arc_dir,
++                   const base::FilePath& meridian_profile) {
++  base::FilePath from = arc_dir.Append("IndexedDB");
++  if (!base::DirectoryExists(from)) {
++    return 0;
++  }
++  base::FilePath staged = StagedArcIndexedDBDir(meridian_profile);
++  base::FilePath own = meridian_profile.Append("IndexedDB");
++  int n = 0;
++  base::FileEnumerator sites(from, false, base::FileEnumerator::DIRECTORIES,
++                             FILE_PATH_LITERAL("*.indexeddb.leveldb"));
++  for (base::FilePath site = sites.Next(); !site.empty(); site = sites.Next()) {
++    std::string id = site.BaseName().RemoveFinalExtension()
++                         .RemoveFinalExtension().MaybeAsASCII();
++    url::Origin origin = storage::GetOriginFromIdentifier(id);
++    if (origin.opaque() || (origin.scheme() != url::kHttpsScheme &&
++                            origin.scheme() != url::kHttpScheme)) {
++      continue;
++    }
++    base::FilePath blob = site.ReplaceExtension(FILE_PATH_LITERAL(".blob"));
++    if (base::PathExists(own.Append(site.BaseName())) ||
++        base::PathExists(own.Append(blob.BaseName())) ||
++        base::PathExists(staged.Append(site.BaseName()))) {
++      continue;
++    }
++    if (!base::CreateDirectory(staged) ||
++        !base::CopyDirectory(site, staged.Append(site.BaseName()), true)) {
++      continue;
++    }
++    if (base::DirectoryExists(blob)) {
++      base::CopyDirectory(blob, staged.Append(blob.BaseName()), true);
++    }
++    ++n;
++  }
++  return n;
++}
++
++void ReadArchive(const base::FilePath& file, ArcDataRead& out) {
++  std::string json;
++  if (!base::ReadFileToString(file, &json)) {
++    return;
++  }
++  std::optional<base::Value> root = base::JSONReader::Read(json, 0);
++  const base::ListValue* items =
++      root && root->is_dict() ? root->GetDict().FindList("items") : nullptr;
++  if (!items) {
++    return;
++  }
++  // [id, item, id, item, ...]
++  for (const base::Value& v : *items) {
++    const base::DictValue* item = v.GetIfDict();
++    const base::DictValue* tab =
++        item ? item->FindDictByDottedPath("sidebarItem.data.tab") : nullptr;
++    std::optional<double> at = item ? item->FindDouble("archivedAt")
++                                    : std::nullopt;
++    if (!tab || !at) {
++      continue;
++    }
++    const std::string* url = tab->FindString("savedURL");
++    GURL gurl = url ? GURL(*url) : GURL();
++    if (!gurl.is_valid() || !gurl.SchemeIsHTTPOrHTTPS()) {
++      continue;
++    }
++    ArchivedTab entry;
++    entry.url = gurl;
++    const std::string* title = item->FindStringByDottedPath("sidebarItem.title");
++    const std::string* saved_title = tab->FindString("savedTitle");
++    entry.title = title && !title->empty()               ? *title
++                  : saved_title && !saved_title->empty() ? *saved_title
++                                                         : gurl.spec();
++    entry.archived_at = FromAppleSeconds(*at);
++    const std::string* space = item->FindStringByDottedPath("source.space._0");
++    out.archive.emplace_back(std::move(entry), space ? *space : std::string());
++  }
++}
++
++// Arc's destination: {"littleArc": ...} or {"space": {"_0": {"mostRecent":
++// {}}}} or a space of its own (its id somewhere in "_0").
++std::string LinkTarget(const base::DictValue* destination) {
++  if (!destination || destination->Find("littleArc")) {
++    return "little";
++  }
++  const base::DictValue* space = destination->FindDictByDottedPath("space._0");
++  if (!space) {
++    return destination->Find("space") ? "main" : std::string();
++  }
++  for (const auto [kind, value] : *space) {
++    if (kind == "mostRecent") {
++      continue;
++    }
++    const std::string* id = value.is_string() ? &value.GetString()
++                            : value.is_dict() ? value.GetDict().FindString("_0")
++                                              : nullptr;
++    if (id && !id->empty()) {
++      return "arc-space:" + *id;
++    }
++  }
++  return "main";
++}
++
++// Arc's "URL contains / starts with / is / ends with" as Meridian's pattern.
++std::string LinkPattern(const base::DictValue& match) {
++  const base::DictValue* how = match.FindDict("_0");
++  const std::string* text = match.FindString("_1");
++  if (!how || !text || text->empty() || text->find('*') != std::string::npos) {
++    return std::string();
++  }
++  if (how->Find("contains")) {
++    return "*" + *text + "*";
++  }
++  if (how->Find("startsWith") || how->Find("hasPrefix") || how->Find("prefix")) {
++    return *text + "*";
++  }
++  if (how->Find("endsWith") || how->Find("hasSuffix") || how->Find("suffix")) {
++    return "*" + *text;
++  }
++  if (how->Find("is") || how->Find("equals") || how->Find("exact")) {
++    return *text;
++  }
++  return std::string();
++}
++
++void ReadLinkRules(const base::FilePath& file, ArcDataRead& out) {
++  std::string json;
++  if (!base::ReadFileToString(file, &json)) {
++    return;
++  }
++  std::optional<base::Value> root = base::JSONReader::Read(json, 0);
++  if (!root || !root->is_dict()) {
++    return;
++  }
++  std::string fallback = LinkTarget(root->GetDict().FindDict("defaultDestination"));
++  out.link_fallback = fallback == "little" ? "little" : "main";
++  const base::ListValue* rules = root->GetDict().FindList("rules");
++  if (!rules) {
++    return;
++  }
++  for (const base::Value& r : *rules) {
++    const base::DictValue* rule = r.GetIfDict();
++    const base::ListValue* sources =
++        rule ? rule->FindList("sourceComponents") : nullptr;
++    std::string target =
++        rule ? LinkTarget(rule->FindDict("destination")) : std::string();
++    if (!sources || target.empty()) {
++      continue;
++    }
++    // Every part must be a URL match: a rule about the app a link comes from
++    // can't be kept as it is.
++    std::vector<std::string> patterns;
++    bool all = true;
++    for (const base::Value& c : *sources) {
++      const base::DictValue* match =
++          c.is_dict() ? c.GetDict().FindDictByDottedPath("componentType.urlMatch")
++                      : nullptr;
++      std::string pattern = match ? LinkPattern(*match) : std::string();
++      if (pattern.empty()) {
++        all = false;
++        break;
++      }
++      patterns.push_back(std::move(pattern));
++    }
++    if (!all) {
++      continue;
++    }
++    for (std::string& pattern : patterns) {
++      out.link_rules.push_back({std::move(pattern), target});
++    }
++  }
++}
++
++ArcDataRead ReadArcData(base::FilePath main_profile, base::FilePath user_data) {
++  ArcDataRead out;
++  base::FilePath arc = ArcDataDir();
++  if (arc.empty() || !base::DirectoryExists(arc)) {
++    return out;
++  }
++  if (std::optional<ArcSidebar> sidebar = ReadArcSidebar()) {
++    out.arc_space_names = sidebar->arc_space_names;
++  }
++  ReadArchive(arc.Append("StorableArchiveItems.json"), out);
++  ReadLinkRules(arc.Append("StorableLinkRouting.json"), out);
++  out.found = !out.archive.empty() || !out.link_rules.empty();
++
++  base::FileEnumerator dirs(arc.Append("User Data"), false,
++                            base::FileEnumerator::DIRECTORIES);
++  for (base::FilePath dir = dirs.Next(); !dir.empty(); dir = dirs.Next()) {
++    std::string name = dir.BaseName().value();
++    int n = 0;
++    if (name != "Default" && !(name.starts_with("Profile ") &&
++                               base::StringToInt(name.substr(8), &n))) {
++      continue;
++    }
++    std::string id = ProfileIdForArcDir(name);
++    ProfileRead& p = out.profiles[id];
++    ReadHistory(dir.Append("History"), p.history);
++    {
++      base::ScopedTempDir tmp;
++      sql::Database db(sql::Database::Tag("Web"));
++      if (OpenCopy(dir.Append("Web Data"), tmp, db)) {
++        ReadForms(db, p.forms);
++        ReadAddresses(db, p.addresses);
++        ReadEngines(db, p.engines);
++      }
++    }
++    ReadPermissions(dir.Append("Preferences"), p.permissions);
++    ReadLocalStorage(dir.Append("Local Storage").Append("leveldb"), p.storage);
++    p.site_databases = StageIndexedDB(
++        dir, id.empty() ? main_profile : user_data.Append(id));
++    if (p.history.empty() && p.forms.empty() && p.addresses.empty() &&
++        p.permissions.empty() && p.engines.empty() && p.storage.empty() &&
++        !p.site_databases) {
++      out.profiles.erase(id);
++      continue;
++    }
++    out.found = true;
++  }
++  return out;
++}
++
++// ---------------------------------------------------------------- writing
++
++// Collects what was brought over; reports when the last part lets go of it.
++class Collector : public base::RefCounted<Collector> {
++ public:
++  explicit Collector(base::OnceCallback<void(ArcDataResult)> done)
++      : done_(std::move(done)) {}
++  ArcDataResult& result() { return result_; }
++
++ private:
++  friend class base::RefCounted<Collector>;
++  ~Collector() { std::move(done_).Run(result_); }
++
++  ArcDataResult result_;
++  base::OnceCallback<void(ArcDataResult)> done_;
++};
++
++// Adds Arc's addresses once the profile's are loaded, skipping ones it has.
++// Deletes itself.
++class AddressAdder : public autofill::PersonalDataManagerObserver {
++ public:
++  AddressAdder(autofill::PersonalDataManager* pdm,
++               std::vector<autofill::AutofillProfile> addresses,
++               scoped_refptr<Collector> collector)
++      : pdm_(pdm),
++        addresses_(std::move(addresses)),
++        collector_(std::move(collector)) {
++    if (pdm_->IsDataLoaded()) {
++      Add();
++      return;
++    }
++    observation_.Observe(pdm_);
++  }
++
++  void OnPersonalDataChanged() override {
++    if (pdm_->IsDataLoaded()) {
++      observation_.Reset();
++      Add();
++    }
++  }
++
++ private:
++  void Add() {
++    autofill::AddressDataManager& manager = pdm_->address_data_manager();
++    for (autofill::AutofillProfile& address : addresses_) {
++      bool known = std::ranges::any_of(
++          manager.GetProfiles(), [&](const autofill::AutofillProfile* p) {
++            for (autofill::FieldType type :
++                 autofill::AutofillProfile::kDatabaseStoredTypes) {
++              if (p->GetRawInfo(type) != address.GetRawInfo(type)) {
++                return false;
++              }
++            }
++            return true;
++          });
++      if (!known) {
++        manager.AddProfile(address);
++        ++collector_->result().addresses;
++      }
++    }
++    delete this;
++  }
++
++  raw_ptr<autofill::PersonalDataManager> pdm_;
++  std::vector<autofill::AutofillProfile> addresses_;
++  scoped_refptr<Collector> collector_;
++  base::ScopedObservation<autofill::PersonalDataManager,
++                          autofill::PersonalDataManagerObserver>
++      observation_{this};
++};
++
++// Adds Arc's site searches once the profile's search engines are loaded,
++// skipping keywords taken here. Deletes itself.
++class EngineAdder {
++ public:
++  EngineAdder(TemplateURLService* service,
++              std::vector<TemplateURLData> engines,
++              scoped_refptr<Collector> collector)
++      : service_(service),
++        engines_(std::move(engines)),
++        collector_(std::move(collector)) {
++    if (service_->loaded()) {
++      Add();
++      return;
++    }
++    loaded_ = service_->RegisterOnLoadedCallback(
++        base::BindOnce(&EngineAdder::Add, base::Unretained(this)));
++    service_->Load();
++  }
++
++ private:
++  void Add() {
++    for (TemplateURLData& data : engines_) {
++      if (service_->GetTemplateURLForKeyword(data.keyword())) {
++        continue;
++      }
++      if (service_->Add(std::make_unique<TemplateURL>(data))) {
++        ++collector_->result().search_engines;
++      }
++    }
++    engines_.clear();
++    collector_.reset();
++    // Not while the subscription runs this.
++    base::SequencedTaskRunner::GetCurrentDefault()->DeleteSoon(FROM_HERE, this);
++  }
++
++  raw_ptr<TemplateURLService> service_;
++  std::vector<TemplateURLData> engines_;
++  scoped_refptr<Collector> collector_;
++  base::CallbackListSubscription loaded_;
++};
++
++// One site's localStorage: written only if the site has none here.
++class StorageWriter : public base::RefCounted<StorageWriter> {
++ public:
++  StorageWriter(SiteStorage site, scoped_refptr<Collector> collector)
++      : site_(std::move(site)), collector_(std::move(collector)) {}
++
++  void Start(content::StoragePartition* partition) {
++    partition->GetLocalStorageControl()->BindStorageArea(
++        blink::StorageKey::CreateFirstParty(site_.origin),
++        area_.BindNewPipeAndPassReceiver());
++    area_->GetAll(mojo::NullRemote(),
++                  base::BindOnce(&StorageWriter::OnHave,
++                                 base::WrapRefCounted(this)));
++  }
++
++ private:
++  friend class base::RefCounted<StorageWriter>;
++  ~StorageWriter() = default;
++
++  void OnHave(std::vector<blink::mojom::KeyValuePtr> have) {
++    if (!have.empty()) {
++      return;
++    }
++    ++collector_->result().sites;
++    for (auto& [key, value] : site_.entries) {
++      area_->Put(key, value, std::nullopt, /*source=*/nullptr,
++                 base::BindOnce([](scoped_refptr<StorageWriter>, bool) {},
++                                base::WrapRefCounted(this)));
++    }
++    site_.entries.clear();
++  }
++
++  SiteStorage site_;
++  scoped_refptr<Collector> collector_;
++  mojo::Remote<blink::mojom::StorageArea> area_;
++};
++
++void WriteProfile(scoped_refptr<Collector> collector,
++                  ProfileRead data,
++                  Profile* profile) {
++  if (!profile) {
++    return;
++  }
++  PrefService* prefs = profile->GetPrefs();
++  // History and form entries newer than the last import (Arc may have been
++  // used since).
++  base::Time since = prefs->GetTime(prefs::kArcDataImportedAt);
++  base::Time now = base::Time::Now();
++  std::erase_if(data.history, [&](const history::URLRow& row) {
++    return row.last_visit() <= since;
++  });
++  std::erase_if(data.forms, [&](const autofill::AutocompleteEntry& e) {
++    return e.date_last_used() <= since;
++  });
++  prefs->SetTime(prefs::kArcDataImportedAt, now);
++
++  if (!data.history.empty()) {
++    if (history::HistoryService* history =
++            HistoryServiceFactory::GetForProfile(
++                profile, ServiceAccessType::EXPLICIT_ACCESS)) {
++      collector->result().history += data.history.size();
++      history->AddPagesWithDetails(data.history,
++                                   history::SOURCE_OS_MIGRATION_IMPORTED);
++    }
++  }
++  if (!data.forms.empty()) {
++    if (scoped_refptr<autofill::AutofillWebDataService> web_data =
++            WebDataServiceFactory::GetAutofillWebDataForProfile(
++                profile, ServiceAccessType::EXPLICIT_ACCESS)) {
++      collector->result().form_entries += data.forms.size();
++      web_data->UpdateAutocompleteEntries(data.forms);
++    }
++  }
++  if (!data.addresses.empty()) {
++    if (autofill::PersonalDataManager* pdm =
++            autofill::PersonalDataManagerFactory::GetForBrowserContext(
++                profile)) {
++      new AddressAdder(pdm, std::move(data.addresses), collector);
++    }
++  }
++  if (!data.permissions.empty()) {
++    HostContentSettingsMap* map =
++        HostContentSettingsMapFactory::GetForProfile(profile);
++    auto* websites = content_settings::WebsiteSettingsRegistry::GetInstance();
++    auto* registry = content_settings::ContentSettingsRegistry::GetInstance();
++    for (const Permission& p : data.permissions) {
++      const content_settings::WebsiteSettingsInfo* info =
++          websites->GetByName(p.type);
++      const content_settings::ContentSettingsInfo* content =
++          info ? registry->Get(info->type()) : nullptr;
++      ContentSetting setting = static_cast<ContentSetting>(p.setting);
++      ContentSettingsPattern primary = ContentSettingsPattern::FromString(p.primary);
++      ContentSettingsPattern secondary =
++          ContentSettingsPattern::FromString(p.secondary);
++      if (!content || !content->IsSettingValid(setting) || !primary.IsValid() ||
++          !secondary.IsValid()) {
++        continue;
++      }
++      bool set_here = std::ranges::any_of(
++          map->GetSettingsForOneType(info->type()),
++          [&](const ContentSettingPatternSource& s) {
++            return s.source == content_settings::ProviderType::kPrefProvider &&
++                   s.primary_pattern == primary &&
++                   s.secondary_pattern == secondary;
++          });
++      if (set_here) {
++        continue;
++      }
++      map->SetContentSettingCustomScope(primary, secondary, info->type(),
++                                        setting);
++      ++collector->result().permissions;
++    }
++  }
++  if (!data.engines.empty()) {
++    if (TemplateURLService* service =
++            TemplateURLServiceFactory::GetForProfile(profile)) {
++      new EngineAdder(service, std::move(data.engines), collector);
++    }
++  }
++  content::StoragePartition* partition = profile->GetDefaultStoragePartition();
++  for (SiteStorage& site : data.storage) {
++    base::MakeRefCounted<StorageWriter>(std::move(site), collector)
++        ->Start(partition);
++  }
++  collector->result().site_databases += data.site_databases;
++}
++
++// Arc's space id as the Meridian space of the same name ("main" if none).
++std::string MeridianTarget(const std::string& target,
++                           const ArcDataRead& read,
++                           const SidebarService* sidebar) {
++  if (!target.starts_with("arc-space:")) {
++    return target;
++  }
++  auto name = read.arc_space_names.find(target.substr(10));
++  if (sidebar && name != read.arc_space_names.end()) {
++    for (const Space& space : sidebar->spaces()) {
++      if (space.name == name->second) {
++        return "space:" + space.id;
++      }
++    }
++  }
++  return "main";
++}
++
++void WriteMain(scoped_refptr<Collector> collector,
++               ArcDataRead& read,
++               Profile* profile) {
++  SidebarService* sidebar = SidebarServiceFactory::GetForProfile(profile);
++  if (ArchiveService* archive = ArchiveServiceFactory::GetForProfile(profile);
++      archive && !read.archive.empty()) {
++    std::vector<ArchivedTab> tabs;
++    for (auto& [tab, arc_space] : read.archive) {
++      std::string target =
++          MeridianTarget("arc-space:" + arc_space, read, sidebar);
++      tab.space_id = target.starts_with("space:") ? target.substr(6)
++                                                  : std::string();
++      tabs.push_back(std::move(tab));
++    }
++    collector->result().archived += archive->Import(std::move(tabs));
++  }
++  if (!read.link_rules.empty()) {
++    ScopedDictPrefUpdate update(profile->GetPrefs(), prefs::kAtc);
++    base::ListValue* rules = update->EnsureList("rules");
++    bool had_rules = !rules->empty();
++    for (const LinkRule& rule : read.link_rules) {
++      bool known = std::ranges::any_of(*rules, [&](const base::Value& r) {
++        const std::string* p =
++            r.is_dict() ? r.GetDict().FindString("pattern") : nullptr;
++        return p && *p == rule.pattern;
++      });
++      if (known) {
++        continue;
++      }
++      rules->Append(base::DictValue()
++                        .Set("id", base::Uuid::GenerateRandomV4()
++                                       .AsLowercaseString())
++                        .Set("pattern", rule.pattern)
++                        .Set("target", MeridianTarget(rule.target, read,
++                                                      sidebar)));
++      ++collector->result().link_rules;
++    }
++    // Where other links go: Arc's choice, unless rules were made here.
++    if (!had_rules && !read.link_fallback.empty()) {
++      update->Set("fallback", read.link_fallback);
++    }
++  }
++}
++
++void Write(base::WeakPtr<Profile> profile,
++           base::OnceCallback<void(ArcDataResult)> done,
++           ArcDataRead read) {
++  if (!profile || !read.found) {
++    ArcDataResult result;
++    result.error = "no-data";
++    std::move(done).Run(result);
++    return;
++  }
++  auto collector = base::MakeRefCounted<Collector>(std::move(done));
++  WriteMain(collector, read, profile.get());
++  for (auto& [id, data] : read.profiles) {
++    if (id.empty()) {
++      WriteProfile(collector, std::move(data), profile.get());
++      continue;
++    }
++    g_browser_process->profile_manager()->CreateProfileAsync(
++        ProfilePathFor(id),
++        base::BindOnce(&WriteProfile, collector, std::move(data)));
++  }
++}
++
++}  // namespace
++
++bool ArcDataAvailable() {
++  base::FilePath arc = ArcDataDir();
++  return !arc.empty() && base::DirectoryExists(arc.Append("User Data"));
++}
++
++void ImportArcData(Profile* profile,
++                   base::OnceCallback<void(ArcDataResult)> done) {
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&ReadArcData, profile->GetPath(),
++                     g_browser_process->profile_manager()->user_data_dir()),
++      base::BindOnce(&Write, profile->GetWeakPtr(), std::move(done)));
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/arc_data.h b/chrome/browser/meridian/arc_data.h
+new file mode 100644
+index 0000000000..4a24a583c3
+--- /dev/null
++++ b/chrome/browser/meridian/arc_data.h
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_ARC_DATA_H_
++#define CHROME_BROWSER_MERIDIAN_ARC_DATA_H_
++
++#include <string>
++
++#include "base/functional/callback.h"
++
++class Profile;
++
++namespace meridian {
++
++// The rest of Arc, after the sidebar (arc_import.h) and the sign-ins
++// (arc_logins.h): browsing history, form entries and addresses, site
++// permissions, custom site searches, the sites' own storage, Air Traffic
++// Control's rules and the archive. None of it is encrypted, so macOS doesn't
++// ask.
++//
++// Like the rest of the import, Arc is only read (from private copies) and
++// nothing leaves the machine. Each Arc profile's data goes to its Meridian
++// profile (ProfileIdForArcDir), created if needed; the archive and the rules
++// go to `profile`. What Meridian already has wins: a permission set here, a
++// keyword taken, a site with storage of its own are left alone. Doing it again
++// adds nothing twice.
++//
++// Sites' databases (IndexedDB) can't be written while the profile runs: they
++// are put next to it and move in when it next opens (MoveStagedArcSiteData).
++struct ArcDataResult {
++  // Pages of history.
++  int history = 0;
++  // Things typed into forms (suggested again in the same fields).
++  int form_entries = 0;
++  int addresses = 0;
++  int permissions = 0;
++  int search_engines = 0;
++  // Sites whose storage came over now (localStorage), and those whose
++  // databases come over when Meridian next opens.
++  int sites = 0;
++  int site_databases = 0;
++  int link_rules = 0;
++  int archived = 0;
++  // Empty on success, else "no-data".
++  std::string error;
++};
++
++// Whether Arc's data folder is there (blocking: file IO).
++bool ArcDataAvailable();
++
++void ImportArcData(Profile* profile,
++                   base::OnceCallback<void(ArcDataResult)> done);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_ARC_DATA_H_
+diff --git a/chrome/browser/meridian/arc_import.cc b/chrome/browser/meridian/arc_import.cc
+index 166ab7457c..c964f183c6 100644
+--- a/chrome/browser/meridian/arc_import.cc
++++ b/chrome/browser/meridian/arc_import.cc
+@@ -285,6 +285,7 @@ std::optional<ArcSidebar> ParseArcSidebar(const base::DictValue& root) {
+     }
+     space.color = SpaceColor(custom_info);
+     space.color2 = space.color;
++    out.arc_space_names[arc_id] = space.name;
+     std::string arc_dir = ArcDirOf(s->Find("profile"));
+     space.profile = ProfileIdForArcDir(arc_dir);
+     if (!space.profile.empty() && !out.profile_names.contains(space.profile)) {
+diff --git a/chrome/browser/meridian/arc_import.h b/chrome/browser/meridian/arc_import.h
+index 9e6dff8fb2..ad33823d7a 100644
+--- a/chrome/browser/meridian/arc_import.h
++++ b/chrome/browser/meridian/arc_import.h
+@@ -39,6 +39,9 @@ struct ArcSidebar {
+   std::map<std::string, std::vector<Item>> profile_favorites;
+   // The other Arc profiles: id -> name (the first space using it).
+   std::map<std::string, std::string> profile_names;
++  // Arc's space ids -> their names (the archive and Air Traffic Control's
++  // rules point at spaces by id).
++  std::map<std::string, std::string> arc_space_names;
+ };
+ 
+ // The Meridian profile for an Arc profile folder: "" (the main one) for
+diff --git a/chrome/browser/meridian/arc_logins.cc b/chrome/browser/meridian/arc_logins.cc
+index 814e77ce9a..a9757d7a78 100644
+--- a/chrome/browser/meridian/arc_logins.cc
++++ b/chrome/browser/meridian/arc_logins.cc
+@@ -23,6 +23,9 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/thread_pool.h"
+ #include "build/build_config.h"
++#include "base/scoped_observation.h"
++#include "base/uuid.h"
++#include "chrome/browser/autofill/personal_data_manager_factory.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/meridian/arc_import.h"
+ #include "chrome/browser/meridian/space_profiles.h"
+@@ -30,6 +33,11 @@
+ #include "chrome/browser/password_manager/factories/profile_password_store_factory.h"
+ #include "chrome/browser/profiles/profile_manager.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "components/autofill/core/browser/data_manager/payments/payments_data_manager.h"
++#include "components/autofill/core/browser/data_manager/personal_data_manager.h"
++#include "components/autofill/core/browser/data_manager/personal_data_manager_observer.h"
++#include "components/autofill/core/browser/data_model/payments/credit_card.h"
++#include "components/autofill/core/browser/field_types.h"
+ #include "components/keyed_service/core/service_access_type.h"
+ #include "components/password_manager/core/browser/password_store/password_store_consumer.h"
+ #include "components/password_manager/core/browser/password_store/password_store_interface.h"
+@@ -50,8 +58,56 @@
+ 
+ namespace meridian {
+ 
++namespace internal {
++
++bool OpenCopy(const base::FilePath& db_file,
++              base::ScopedTempDir& tmp,
++              sql::Database& db) {
++  if (!tmp.CreateUniqueTempDir()) {
++    return false;
++  }
++  base::FilePath copy = tmp.GetPath().Append(db_file.BaseName());
++  if (!base::CopyFile(db_file, copy)) {
++    return false;
++  }
++  for (const char* ext : {"-wal", "-journal"}) {
++    base::FilePath side(db_file.value() + ext);
++    if (base::PathExists(side)) {
++      base::CopyFile(side, base::FilePath(copy.value() + ext));
++    }
++  }
++  return db.Open(copy);
++}
++
++std::string SelectOf(sql::Database& db,
++                     base::cstring_view table,
++                     base::span<const base::cstring_view> columns) {
++  std::string select = "SELECT ";
++  bool first = true;
++  for (base::cstring_view column : columns) {
++    if (!first) {
++      select += ", ";
++    }
++    first = false;
++    select += db.DoesColumnExist(table, column) ? std::string(column)
++                                                : std::string("NULL");
++  }
++  return select + " FROM " + std::string(table);
++}
++
++base::Time FromWindows(int64_t us) {
++  return us ? base::Time::FromDeltaSinceWindowsEpoch(base::Microseconds(us))
++            : base::Time();
++}
++
++}  // namespace internal
++
+ namespace {
+ 
++using internal::FromWindows;
++using internal::OpenCopy;
++using internal::SelectOf;
++
+ // Tests: the keychain password for a fake Arc folder (--meridian-arc-dir);
+ // "__deny__" acts like the person clicking Deny.
+ constexpr char kArcSafeStorageSwitch[] = "meridian-arc-safe-storage";
+@@ -65,6 +121,8 @@ struct ArcProfile {
+   // Empty if this profile has none.
+   base::FilePath cookies;
+   std::vector<base::FilePath> logins;
++  // "Web Data" (payment cards), empty if none.
++  base::FilePath web_data;
+ };
+ 
+ // "Default" first, then "Profile N" in order; "Guest Profile" and the like
+@@ -94,7 +152,10 @@ std::vector<ArcProfile> FindArcProfiles() {
+         p.logins.push_back(dir.Append(rel));
+       }
+     }
+-    if (!p.cookies.empty() || !p.logins.empty()) {
++    if (base::PathExists(dir.Append("Web Data"))) {
++      p.web_data = dir.Append("Web Data");
++    }
++    if (!p.cookies.empty() || !p.logins.empty() || !p.web_data.empty()) {
+       out.push_back(std::move(p));
+     }
+   }
+@@ -175,48 +236,6 @@ net::CookieSameSite SameSite(int v) {
+   }
+ }
+ 
+-// Opens a private copy of an Arc database (Arc may be running).
+-bool OpenCopy(const base::FilePath& db_file,
+-              base::ScopedTempDir& tmp,
+-              sql::Database& db) {
+-  if (!tmp.CreateUniqueTempDir()) {
+-    return false;
+-  }
+-  base::FilePath copy = tmp.GetPath().Append(db_file.BaseName());
+-  if (!base::CopyFile(db_file, copy)) {
+-    return false;
+-  }
+-  for (const char* ext : {"-wal", "-journal"}) {
+-    base::FilePath side(db_file.value() + ext);
+-    if (base::PathExists(side)) {
+-      base::CopyFile(side, base::FilePath(copy.value() + ext));
+-    }
+-  }
+-  return db.Open(copy);
+-}
+-
+-// SELECT of `columns` from `table`, NULL for the ones this version lacks.
+-std::string SelectOf(sql::Database& db,
+-                     base::cstring_view table,
+-                     base::span<const base::cstring_view> columns) {
+-  std::string select = "SELECT ";
+-  bool first = true;
+-  for (base::cstring_view column : columns) {
+-    if (!first) {
+-      select += ", ";
+-    }
+-    first = false;
+-    select += db.DoesColumnExist(table, column) ? std::string(column)
+-                                                : std::string("NULL");
+-  }
+-  return select + " FROM " + std::string(table);
+-}
+-
+-base::Time FromWindows(int64_t us) {
+-  return us ? base::Time::FromDeltaSinceWindowsEpoch(base::Microseconds(us))
+-            : base::Time();
+-}
+-
+ // Reads one Arc cookie database (from a private copy) into cookies.
+ bool ReadProfile(const base::FilePath& db_file,
+                  base::span<const uint8_t> key,
+@@ -392,6 +411,73 @@ bool ReadPasswords(const base::FilePath& db_file,
+   return true;
+ }
+ 
++// Reads the payment cards saved in one Arc "Web Data" database (from a private
++// copy), with their security codes if Arc kept them.
++bool ReadCards(const base::FilePath& db_file,
++               base::span<const uint8_t> key,
++               std::set<std::u16string>& seen,
++               std::vector<autofill::CreditCard>& cards,
++               int& failed) {
++  base::ScopedTempDir tmp;
++  sql::Database db(sql::Database::Tag("Web"));
++  if (!OpenCopy(db_file, tmp, db) || !db.DoesTableExist("credit_cards")) {
++    return false;
++  }
++  std::map<std::string, std::u16string> cvcs;
++  if (db.DoesTableExist("local_stored_cvc")) {
++    sql::Statement c(db.GetUniqueStatement(
++        "SELECT guid, value_encrypted FROM local_stored_cvc"));
++    while (c.Step()) {
++      std::optional<std::string> cvc =
++          Decrypt(c.ColumnBlob(1), key, std::string(), 0);
++      if (cvc && !cvc->empty()) {
++        cvcs[c.ColumnString(0)] = base::UTF8ToUTF16(*cvc);
++        OPENSSL_cleanse(cvc->data(), cvc->size());
++      }
++    }
++  }
++  static constexpr base::cstring_view kColumns[] = {
++      "guid",       "name_on_card", "expiration_month", "expiration_year",
++      "card_number_encrypted", "date_modified", "use_count", "use_date",
++      "nickname"};
++  sql::Statement s(
++      db.GetUniqueStatement(SelectOf(db, "credit_cards", kColumns)));
++  while (s.Step()) {
++    std::optional<std::string> number =
++        Decrypt(s.ColumnBlob(4), key, std::string(), 0);
++    if (!number || number->empty()) {
++      if (!number) {
++        ++failed;
++      }
++      continue;
++    }
++    std::u16string number16 = base::UTF8ToUTF16(*number);
++    OPENSSL_cleanse(number->data(), number->size());
++    if (!seen.insert(number16).second) {
++      continue;
++    }
++    autofill::CreditCard card(
++        base::Uuid::GenerateRandomV4().AsLowercaseString());
++    card.SetRawInfo(autofill::CREDIT_CARD_NAME_FULL, s.ColumnString16(1));
++    card.SetNumber(std::move(number16));
++    card.SetExpirationMonth(s.ColumnInt(2));
++    card.SetExpirationYear(s.ColumnInt(3));
++    card.SetNickname(s.ColumnString16(8));
++    card.usage_history().set_modification_date(
++        base::Time::FromTimeT(s.ColumnInt64(5)));
++    card.usage_history().set_use_count(std::max(0, s.ColumnInt(6)));
++    card.usage_history().set_use_date(base::Time::FromTimeT(s.ColumnInt64(7)));
++    if (auto cvc = cvcs.find(s.ColumnString(0)); cvc != cvcs.end()) {
++      card.set_cvc(cvc->second);
++    }
++    cards.push_back(std::move(card));
++  }
++  for (auto& [guid, cvc] : cvcs) {
++    std::fill(cvc.begin(), cvc.end(), u'\0');
++  }
++  return true;
++}
++
+ struct ReadResult {
+   ReadResult() = default;
+   ReadResult(ReadResult&&) = default;
+@@ -399,6 +485,7 @@ struct ReadResult {
+   // By Meridian profile id ("" for the main one).
+   std::map<std::string, std::vector<net::CanonicalCookie>> cookies;
+   std::map<std::string, std::vector<StoredCredential>> passwords;
++  std::map<std::string, std::vector<autofill::CreditCard>> cards;
+   ArcLoginsResult result;
+ };
+ 
+@@ -406,7 +493,9 @@ ReadResult ReadArc(bool with_cookies) {
+   ReadResult out;
+   std::vector<ArcProfile> profiles = FindArcProfiles();
+   if (!with_cookies) {
+-    std::erase_if(profiles, [](const ArcProfile& p) { return p.logins.empty(); });
++    std::erase_if(profiles, [](const ArcProfile& p) {
++      return p.logins.empty() && p.web_data.empty();
++    });
+   }
+   if (profiles.empty()) {
+     out.result.error = "no-data";
+@@ -434,6 +523,7 @@ ReadResult ReadArc(bool with_cookies) {
+            std::set<std::tuple<std::string, std::string, std::string>>>
+       seen;
+   std::map<std::string, std::set<LoginKey>> seen_logins;
++  std::map<std::string, std::set<std::u16string>> seen_cards;
+   bool any = false;
+   for (const ArcProfile& p : profiles) {
+     std::string target = ProfileIdForArcDir(p.dir);
+@@ -445,6 +535,10 @@ ReadResult ReadArc(bool with_cookies) {
+       any |= ReadPasswords(db, key, seen_logins[target], out.passwords[target],
+                            out.result.failed);
+     }
++    if (!p.web_data.empty()) {
++      any |= ReadCards(p.web_data, key, seen_cards[target], out.cards[target],
++                       out.result.failed);
++    }
+   }
+   std::erase_if(out.cookies, [](const auto& entry) {
+     return entry.second.empty();
+@@ -452,6 +546,9 @@ ReadResult ReadArc(bool with_cookies) {
+   std::erase_if(out.passwords, [](const auto& entry) {
+     return entry.second.empty();
+   });
++  std::erase_if(out.cards, [](const auto& entry) {
++    return entry.second.empty();
++  });
+   OPENSSL_cleanse(key.data(), key.size());
+   if (!any) {
+     out.result.error = "read";
+@@ -479,6 +576,8 @@ class Writer : public base::RefCounted<Writer> {
+ 
+   void AddedPasswords(int n) { result_.passwords += n; }
+ 
++  void AddedCards(int n) { result_.cards += n; }
++
+   void Finish() { std::move(done_).Run(result_); }
+ 
+  private:
+@@ -549,6 +648,61 @@ class PasswordAdder : public password_manager::PasswordStoreConsumer {
+   base::WeakPtrFactory<PasswordAdder> weak_factory_{this};
+ };
+ 
++// Adds Arc's cards to one profile once its cards are loaded, keeping the
++// ones saved there with the same number. Deletes itself when done.
++class CardAdder : public autofill::PersonalDataManagerObserver {
++ public:
++  CardAdder(autofill::PersonalDataManager* pdm,
++            std::vector<autofill::CreditCard> cards,
++            scoped_refptr<Writer> writer,
++            base::OnceClosure done)
++      : pdm_(pdm),
++        cards_(std::move(cards)),
++        writer_(std::move(writer)),
++        done_(std::move(done)) {
++    if (pdm_->IsDataLoaded()) {
++      Add();
++      return;
++    }
++    observation_.Observe(pdm_);
++  }
++
++  void OnPersonalDataChanged() override {
++    if (pdm_->IsDataLoaded()) {
++      observation_.Reset();
++      Add();
++    }
++  }
++
++ private:
++  void Add() {
++    autofill::PaymentsDataManager& payments = pdm_->payments_data_manager();
++    std::set<std::u16string> have;
++    for (const autofill::CreditCard* card : payments.GetLocalCreditCards()) {
++      have.insert(card->number());
++    }
++    int added = 0;
++    for (autofill::CreditCard& card : cards_) {
++      if (have.insert(card.number()).second) {
++        payments.AddCreditCard(card);
++        ++added;
++      }
++    }
++    cards_.clear();
++    writer_->AddedCards(added);
++    std::move(done_).Run();
++    delete this;
++  }
++
++  raw_ptr<autofill::PersonalDataManager> pdm_;
++  std::vector<autofill::CreditCard> cards_;
++  scoped_refptr<Writer> writer_;
++  base::OnceClosure done_;
++  base::ScopedObservation<autofill::PersonalDataManager,
++                          autofill::PersonalDataManagerObserver>
++      observation_{this};
++};
++
+ // What one Meridian profile gets.
+ struct ProfileData {
+   ProfileData() = default;
+@@ -556,23 +710,39 @@ struct ProfileData {
+   ProfileData& operator=(ProfileData&&) = default;
+   std::vector<net::CanonicalCookie> cookies;
+   std::vector<StoredCredential> passwords;
++  std::vector<autofill::CreditCard> cards;
+ };
+ 
+-// Runs `barrier` once per cookie and once for the passwords (if any).
++// Runs `barrier` once per cookie, once for the passwords and once for the
++// cards (if any).
+ void WriteTo(scoped_refptr<Writer> writer,
+              base::RepeatingClosure barrier,
+              ProfileData data,
+              Profile* profile) {
+   if (!profile) {
+-    writer->Failed(data.cookies.size() + data.passwords.size());
++    writer->Failed(data.cookies.size() + data.passwords.size() +
++                   data.cards.size());
+     for (size_t i = 0; i < data.cookies.size(); ++i) {
+       barrier.Run();
+     }
+     if (!data.passwords.empty()) {
+       barrier.Run();
+     }
++    if (!data.cards.empty()) {
++      barrier.Run();
++    }
+     return;
+   }
++  if (!data.cards.empty()) {
++    if (autofill::PersonalDataManager* pdm =
++            autofill::PersonalDataManagerFactory::GetForBrowserContext(
++                profile)) {
++      new CardAdder(pdm, std::move(data.cards), writer, barrier);
++    } else {
++      writer->Failed(data.cards.size());
++      barrier.Run();
++    }
++  }
+   if (!data.passwords.empty()) {
+     scoped_refptr<password_manager::PasswordStoreInterface> store =
+         ProfilePasswordStoreFactory::GetForProfile(
+@@ -609,7 +779,7 @@ void Write(base::WeakPtr<Profile> profile,
+            base::OnceCallback<void(ArcLoginsResult)> done,
+            ReadResult read) {
+   if (!profile || !read.result.error.empty() ||
+-      (read.cookies.empty() && read.passwords.empty())) {
++      (read.cookies.empty() && read.passwords.empty() && read.cards.empty())) {
+     if (read.result.error.empty()) {
+       read.result.error = "no-data";
+     }
+@@ -626,6 +796,10 @@ void Write(base::WeakPtr<Profile> profile,
+     ++total;
+     by_profile[id].passwords = std::move(passwords);
+   }
++  for (auto& [id, cards] : read.cards) {
++    ++total;
++    by_profile[id].cards = std::move(cards);
++  }
+   auto writer =
+       base::MakeRefCounted<Writer>(std::move(read.result), std::move(done));
+   base::RepeatingClosure barrier =
+@@ -650,7 +824,7 @@ bool ArcLoginsAvailable() {
+ 
+ bool ArcPasswordsAvailable() {
+   return std::ranges::any_of(FindArcProfiles(), [](const ArcProfile& p) {
+-    return !p.logins.empty();
++    return !p.logins.empty() || !p.web_data.empty();
+   });
+ }
+ 
+diff --git a/chrome/browser/meridian/arc_logins.h b/chrome/browser/meridian/arc_logins.h
+index 355a8a1d68..e6fbeca58c 100644
+--- a/chrome/browser/meridian/arc_logins.h
++++ b/chrome/browser/meridian/arc_logins.h
+@@ -7,14 +7,27 @@
+ 
+ #include <string>
+ 
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
+ #include "base/functional/callback.h"
++#include "base/strings/cstring_view.h"
++#include "base/time/time.h"
+ 
+ class Profile;
+ 
++namespace base {
++class ScopedTempDir;
++}
++
++namespace sql {
++class Database;
++}
++
+ namespace meridian {
+ 
+ // Brings Arc's cookies (the sites you're signed in to) and saved passwords
+-// into this profile, so you stay signed in. macOS only.
++// into this profile, so you stay signed in, with the payment cards saved in
++// Arc (their numbers are encrypted the same way). macOS only.
+ //
+ // Arc is Chromium: each profile folder in Arc's "User Data" has a Cookies
+ // database and a "Login Data" one (saved passwords) whose values are
+@@ -37,6 +50,8 @@ struct ArcLoginsResult {
+   int imported = 0;
+   // Passwords added (the ones already here are not counted).
+   int passwords = 0;
++  // Cards added, the same way.
++  int cards = 0;
+   int failed = 0;
+   // Empty on success, else "no-data", "not-found" (no key in the keychain),
+   // "denied" (the person said no) or "read".
+@@ -45,13 +60,13 @@ struct ArcLoginsResult {
+ 
+ // Whether Arc's cookie or password databases are there (blocking: file IO).
+ bool ArcLoginsAvailable();
+-// Whether Arc has saved passwords to bring (blocking: file IO).
++// Whether Arc has saved passwords or cards to bring (blocking: file IO).
+ bool ArcPasswordsAvailable();
+ 
+-// Cookies and passwords.
++// Cookies, passwords and cards.
+ void ImportArcLogins(Profile* profile,
+                      base::OnceCallback<void(ArcLoginsResult)> done);
+-// Passwords only (one keychain prompt).
++// Passwords and cards only (one keychain prompt).
+ void ImportArcPasswords(Profile* profile,
+                         base::OnceCallback<void(ArcLoginsResult)> done);
+ 
+@@ -59,6 +74,17 @@ namespace internal {
+ // macOS: "Arc Safe Storage" from the login keychain (macOS asks first);
+ // empty with `error` set if it isn't there or the person said no.
+ std::string ReadArcKeychainPassword(std::string* error);
++
++// Opens a private copy of an Arc database (Arc may be running) in `tmp`.
++bool OpenCopy(const base::FilePath& db_file,
++              base::ScopedTempDir& tmp,
++              sql::Database& db);
++// SELECT of `columns` from `table`, NULL for the ones this version lacks.
++std::string SelectOf(sql::Database& db,
++                     base::cstring_view table,
++                     base::span<const base::cstring_view> columns);
++// Chromium's time in a database: microseconds since 1601; 0 is null.
++base::Time FromWindows(int64_t us);
+ }  // namespace internal
+ 
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/arc_staged.cc b/chrome/browser/meridian/arc_staged.cc
+new file mode 100644
+index 0000000000..7c0d44254e
+--- /dev/null
++++ b/chrome/browser/meridian/arc_staged.cc
+@@ -0,0 +1,47 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/arc_staged.h"
++
++#include "base/files/file_enumerator.h"
++#include "base/files/file_util.h"
++
++namespace meridian {
++
++namespace {
++constexpr char kStaged[] = "Meridian Arc Staged";
++}  // namespace
++
++base::FilePath StagedArcIndexedDBDir(const base::FilePath& profile_path) {
++  return profile_path.Append(kStaged).Append("IndexedDB");
++}
++
++void MoveStagedArcSiteData(const base::FilePath& profile_path) {
++  base::FilePath staged = profile_path.Append(kStaged);
++  if (!base::DirectoryExists(staged)) {
++    return;
++  }
++  base::FilePath from = StagedArcIndexedDBDir(profile_path);
++  base::FilePath to = profile_path.Append("IndexedDB");
++  if (base::DirectoryExists(from) && base::CreateDirectory(to)) {
++    // "<site>.indexeddb.leveldb", with its files in "<site>.indexeddb.blob".
++    base::FileEnumerator sites(from, false, base::FileEnumerator::DIRECTORIES,
++                               FILE_PATH_LITERAL("*.indexeddb.leveldb"));
++    for (base::FilePath site = sites.Next(); !site.empty();
++         site = sites.Next()) {
++      base::FilePath blob = site.ReplaceExtension(FILE_PATH_LITERAL(".blob"));
++      base::FilePath dest = to.Append(site.BaseName());
++      base::FilePath dest_blob = to.Append(blob.BaseName());
++      if (base::PathExists(dest) || base::PathExists(dest_blob)) {
++        continue;
++      }
++      if (base::Move(site, dest) && base::PathExists(blob)) {
++        base::Move(blob, dest_blob);
++      }
++    }
++  }
++  base::DeletePathRecursively(staged);
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/arc_staged.h b/chrome/browser/meridian/arc_staged.h
+new file mode 100644
+index 0000000000..c1d2d81a7e
+--- /dev/null
++++ b/chrome/browser/meridian/arc_staged.h
+@@ -0,0 +1,23 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_ARC_STAGED_H_
++#define CHROME_BROWSER_MERIDIAN_ARC_STAGED_H_
++
++#include "base/files/file_path.h"
++
++namespace meridian {
++
++// Where the Arc import (arc_data.h) leaves sites' databases for a profile
++// until it next opens: "<profile>/Meridian Arc Staged/IndexedDB/<site>".
++base::FilePath StagedArcIndexedDBDir(const base::FilePath& profile_path);
++
++// Moves them into the profile's IndexedDB folder (a site that has its own by
++// now keeps it) and removes the rest. Blocking (file IO); run before the
++// profile's storage opens (Profile::CreateProfile).
++void MoveStagedArcSiteData(const base::FilePath& profile_path);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_ARC_STAGED_H_
+diff --git a/chrome/browser/meridian/archive_service.cc b/chrome/browser/meridian/archive_service.cc
+index d345f3f99a..0405047cd9 100644
+--- a/chrome/browser/meridian/archive_service.cc
++++ b/chrome/browser/meridian/archive_service.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/meridian/archive_service.h"
+ 
+ #include <algorithm>
++#include <set>
+ #include <utility>
+ 
+ #include "base/files/file_util.h"
+@@ -135,6 +136,35 @@ void ArchiveService::Add(const GURL& url,
+   Changed();
+ }
+ 
++int ArchiveService::Import(std::vector<ArchivedTab> tabs) {
++  if (off_the_record_) {
++    return 0;
++  }
++  std::set<GURL> have;
++  for (const ArchivedTab& e : entries_) {
++    have.insert(e.url);
++  }
++  int added = 0;
++  for (ArchivedTab& tab : tabs) {
++    if (!WorthKeeping(tab.url) || !have.insert(tab.url).second) {
++      continue;
++    }
++    tab.id = base::Uuid::GenerateRandomV4().AsLowercaseString();
++    entries_.push_back(std::move(tab));
++    ++added;
++  }
++  if (!added) {
++    return 0;
++  }
++  std::ranges::stable_sort(entries_, std::ranges::greater(),
++                           &ArchivedTab::archived_at);
++  if (entries_.size() > kMaxEntries) {
++    entries_.resize(kMaxEntries);
++  }
++  Changed();
++  return added;
++}
++
+ std::optional<ArchivedTab> ArchiveService::Take(const std::string& id) {
+   auto it = std::ranges::find(entries_, id, &ArchivedTab::id);
+   if (it == entries_.end()) {
+diff --git a/chrome/browser/meridian/archive_service.h b/chrome/browser/meridian/archive_service.h
+index c1899475e3..d7df3a5bee 100644
+--- a/chrome/browser/meridian/archive_service.h
++++ b/chrome/browser/meridian/archive_service.h
+@@ -59,6 +59,9 @@ class ArchiveService : public KeyedService {
+            const std::string& title,
+            const std::string& space_id,
+            base::Time when);
++  // Adds tabs archived elsewhere (Arc's), in date order with the rest; pages
++  // already here are skipped. Returns how many were added.
++  int Import(std::vector<ArchivedTab> tabs);
+   // Removes and returns the entry, for reopening.
+   std::optional<ArchivedTab> Take(const std::string& id);
+   void Remove(const std::string& id);
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index 8c7e7db918..936095ec53 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <string>
+ 
++#include "base/time/time.h"
+ #include "components/pref_registry/pref_registry_syncable.h"
+ 
+ namespace meridian::prefs {
+@@ -17,6 +18,7 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterStringPref(kMode, "everyday");
+   registry->RegisterBooleanPref(kSidebarRight, false);
+   registry->RegisterIntegerPref(kArchiveAfterHours, 12);
++  registry->RegisterTimePref(kArcDataImportedAt, base::Time());
+   registry->RegisterStringPref(kAgentAccess, "off");
+   registry->RegisterBooleanPref(kAgentAllowJs, false);
+   registry->RegisterStringPref(kAiKey, std::string());
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index 5b617dd0b3..b670b29853 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -24,6 +24,9 @@ inline constexpr char kMode[] = "meridian.mode";
+ inline constexpr char kSidebarRight[] = "meridian.sidebar_right";
+ // Hours a Today tab may go unvisited before it is archived; 0 = never.
+ inline constexpr char kArchiveAfterHours[] = "meridian.archive_after_hours";
++// When Arc's history and form entries were last brought over (arc_data.h);
++// the next import brings only what's newer.
++inline constexpr char kArcDataImportedAt[] = "meridian.arc_data_imported_at";
+ // What AI agents (MCP clients) may do: "off", "read", "ask" (the person
+ // confirms every action) or "full".
+ inline constexpr char kAgentAccess[] = "meridian.agent_access";
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index e8ea642a8b..e4b297fccd 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -145,8 +145,25 @@ struct ArcPreview {
+   array<Space> spaces;
+   // Arc's cookies or passwords are there to bring over (ImportArcLogins).
+   bool logins_available;
+-  // Arc has saved passwords (ImportArcPasswords).
++  // Arc has saved passwords or cards (ImportArcPasswords).
+   bool passwords_available;
++  // Arc's history and the rest are there (ImportArcData).
++  bool data_available;
++};
++
++// What ImportArcData brought over (arc_data.h).
++struct ArcDataResult {
++  int32 history;
++  int32 form_entries;
++  int32 addresses;
++  int32 permissions;
++  int32 search_engines;
++  int32 sites;
++  int32 site_databases;
++  int32 link_rules;
++  int32 archived;
++  // Empty, or "no-data".
++  string error;
+ };
+ 
+ // An extension in Arc, to install in Meridian from the Chrome Web Store.
+@@ -577,13 +594,18 @@ interface SidebarHandler {
+   // Brings Arc's spaces, pinned tabs, folders and favorites in; Arc's open
+   // tabs come in as Today tabs that load when first opened.
+   ImportArc() => (bool ok);
+-  // Arc's sign-ins (cookies) and saved passwords, each Arc profile's into its
+-  // spaces' profile. macOS asks the person before Meridian may read Arc's
+-  // key, so the page says so first. `error`: empty, "no-data", "not-found",
+-  // "denied" or "read".
+-  ImportArcLogins() => (int32 imported, int32 passwords, string error);
+-  // Arc's saved passwords only (the ones already here stay as they are).
+-  ImportArcPasswords() => (int32 imported, string error);
++  // Arc's sign-ins (cookies), saved passwords and payment cards, each Arc
++  // profile's into its spaces' profile. macOS asks the person before Meridian
++  // may read Arc's key, so the page says so first. `error`: empty, "no-data",
++  // "not-found", "denied" or "read".
++  ImportArcLogins() => (int32 imported, int32 passwords, int32 cards,
++                        string error);
++  // Arc's saved passwords and cards only (the ones already here stay as they
++  // are).
++  ImportArcPasswords() => (int32 imported, int32 cards, string error);
++  // Arc's history, form entries, addresses, site permissions, site searches,
++  // sites' storage, Air Traffic Control's rules and archive; nothing to ask.
++  ImportArcData() => (ArcDataResult result);
+ 
+   // Welcome tour. `use_apps`: look at the installed apps (else a plain
+   // everyday setup); `persona` (developer, designer, manager, everyday)
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index e5e090402b..af21cea527 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -43,6 +43,7 @@
+ #include "chrome/browser/meridian/ai/ai_service_factory.h"
+ #include "chrome/browser/meridian/agent/agent_service.h"
+ #include "chrome/browser/meridian/agent/agent_service_factory.h"
++#include "chrome/browser/meridian/arc_data.h"
+ #include "chrome/browser/meridian/arc_logins.h"
+ #include "mojo/public/cpp/bindings/callback_helpers.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+@@ -1398,6 +1399,7 @@ struct ArcRead {
+   std::optional<ArcSidebar> sidebar;
+   bool logins = false;
+   bool passwords = false;
++  bool data = false;
+ };
+ }  // namespace
+ 
+@@ -1406,7 +1408,7 @@ void SidebarHandler::GetArcPreview(GetArcPreviewCallback callback) {
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+       base::BindOnce([] {
+         return ArcRead{ReadArcSidebar(), ArcLoginsAvailable(),
+-                       ArcPasswordsAvailable()};
++                       ArcPasswordsAvailable(), ArcDataAvailable()};
+       }),
+       base::BindOnce(
+           [](GetArcPreviewCallback callback,
+@@ -1424,6 +1426,7 @@ void SidebarHandler::GetArcPreview(GetArcPreviewCallback callback) {
+             }
+             preview->logins_available = read.logins;
+             preview->passwords_available = read.passwords;
++            preview->data_available = read.data;
+             std::function<int(const std::vector<Item>&)> count =
+                 [&](const std::vector<Item>& items) {
+                   int n = 0;
+@@ -1464,7 +1467,7 @@ void SidebarHandler::ImportArcLogins(ImportArcLoginsCallback callback) {
+       base::BindOnce(
+           [](ImportArcLoginsCallback callback, ArcLoginsResult result) {
+             std::move(callback).Run(result.imported, result.passwords,
+-                                    result.error);
++                                    result.cards, result.error);
+           },
+           std::move(callback)));
+ }
+@@ -1474,7 +1477,29 @@ void SidebarHandler::ImportArcPasswords(ImportArcPasswordsCallback callback) {
+       browser_->GetProfile(),
+       base::BindOnce(
+           [](ImportArcPasswordsCallback callback, ArcLoginsResult result) {
+-            std::move(callback).Run(result.passwords, result.error);
++            std::move(callback).Run(result.passwords, result.cards,
++                                    result.error);
++          },
++          std::move(callback)));
++}
++
++void SidebarHandler::ImportArcData(ImportArcDataCallback callback) {
++  meridian::ImportArcData(
++      browser_->GetProfile(),
++      base::BindOnce(
++          [](ImportArcDataCallback callback, ArcDataResult r) {
++            auto m = mojom::ArcDataResult::New();
++            m->history = r.history;
++            m->form_entries = r.form_entries;
++            m->addresses = r.addresses;
++            m->permissions = r.permissions;
++            m->search_engines = r.search_engines;
++            m->sites = r.sites;
++            m->site_databases = r.site_databases;
++            m->link_rules = r.link_rules;
++            m->archived = r.archived;
++            m->error = r.error;
++            std::move(callback).Run(std::move(m));
+           },
+           std::move(callback)));
+ }
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 042960d478..4c636b6781 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -175,6 +175,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void ImportArc(ImportArcCallback callback) override;
+   void ImportArcLogins(ImportArcLoginsCallback callback) override;
+   void ImportArcPasswords(ImportArcPasswordsCallback callback) override;
++  void ImportArcData(ImportArcDataCallback callback) override;
+   void ProposeSetup(bool use_apps,
+                     const std::string& persona,
+                     ProposeSetupCallback callback) override;
+diff --git a/chrome/browser/profiles/BUILD.gn b/chrome/browser/profiles/BUILD.gn
+index 6a905b4f2b..6d5fb6ea39 100644
+--- a/chrome/browser/profiles/BUILD.gn
++++ b/chrome/browser/profiles/BUILD.gn
+@@ -62,6 +62,7 @@ source_set("misc") {
+ 
+   deps = [
+     ":profile",
++    "//chrome/browser/meridian:arc_staged",
+     ":profile_downloader",
+     ":profile_manager",
+     ":profile_util",
+diff --git a/chrome/browser/profiles/profile_impl.cc b/chrome/browser/profiles/profile_impl.cc
+index cfe5a46eb1..b6037739e4 100644
+--- a/chrome/browser/profiles/profile_impl.cc
++++ b/chrome/browser/profiles/profile_impl.cc
+@@ -66,6 +66,7 @@
+ #if BUILDFLAG(ENABLE_EXTENSIONS)
+ #include "chrome/browser/extensions/api/autofill_private/autofill_private_event_router_factory.h"
+ #endif
++#include "chrome/browser/meridian/arc_staged.h"
+ #include "chrome/browser/safe_browsing/chrome_ping_manager_factory.h"
+ #include "chrome/browser/send_tab_to_self/send_tab_to_self_client_service_factory.h"
+ #include "chrome/browser/file_system_access/chrome_file_system_access_permission_context.h"
+@@ -387,10 +388,15 @@ std::unique_ptr<Profile> Profile::CreateProfile(const base::FilePath& path,
+     case CreateMode::kAsynchronous:
+       CHECK(delegate, base::NotFatalUntil::M162);
+       creation_time = CreateProfileDirectory(io_task_runner.get(), path, true);
++      // Meridian: sites' databases brought from Arc move in before the
++      // profile's storage opens (the same sequence reads its prefs first).
++      io_task_runner->PostTask(
++          FROM_HERE, base::BindOnce(&meridian::MoveStagedArcSiteData, path));
+       break;
+     case CreateMode::kSynchronous:
+       if (base::PathExists(path)) {
+         creation_time = GetCreationTimeForPath(path);
++        meridian::MoveStagedArcSiteData(path);
+       } else {
+         // TODO(rogerta): http://crbug.com/40293891 - Bad things happen if we
+         // can't write to the profile directory.  We should eventually be able
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index 7c3d7c4645..2ac477f7ca 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -28,6 +28,7 @@ build_webui("build") {
+     "extensions_bar.ts",
+     "icons.html.ts",
+     "meridian/agent.html.ts",
++    "meridian/arc_summary.ts",
+     "meridian/agent.ts",
+     "meridian/archive.html.ts",
+     "meridian/ask.html.ts",
+diff --git a/chrome/browser/resources/webui_browser/meridian/arc_summary.ts b/chrome/browser/resources/webui_browser/meridian/arc_summary.ts
+new file mode 100644
+index 0000000000..75b36f16af
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/arc_summary.ts
+@@ -0,0 +1,33 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import type {ArcDataResult} from '../sidebar.mojom-webui.js';
++
++function count(n: number, one: string, many: string = one + 's'): string {
++  return n ? `${n.toLocaleString()} ${n === 1 ? one : many}` : '';
++}
++
++// "Brought over: 1,204 pages of history, 31 form entries, …", or that it was
++// all here already.
++export function arcDataSummary(r: ArcDataResult): string {
++  const later = r.siteDatabases ?
++      ` (${count(r.siteDatabases, 'more site', 'more sites')} when Meridian ` +
++          'next opens)' :
++      '';
++  const sites = r.sites || r.siteDatabases ?
++      `data of ${count(r.sites, 'site') || 'no sites yet'}${later}` :
++      '';
++  const parts = [
++    count(r.history, 'page of history', 'pages of history'),
++    count(r.formEntries, 'form entry', 'form entries'),
++    count(r.addresses, 'address', 'addresses'),
++    count(r.permissions, 'site permission'),
++    count(r.searchEngines, 'site search', 'site searches'),
++    sites,
++    count(r.linkRules, 'Air Traffic Control rule'),
++    count(r.archived, 'archived tab'),
++  ].filter(x => x);
++  return parts.length ? `Brought over: ${parts.join(', ')}.` :
++                        'It’s all here already.';
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+index 5c6be5dfd5..4b3a22e98d 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+@@ -58,8 +58,8 @@ export function getHtml(this: MeridianOnboardingElement) {
+                   @click="${this.onLoginsClick_}">
+                 <span class="opt-ic">${icon('lock', 16)}</span>
+                 <span><b>Stay signed in to your sites</b>
+-                  <em>Sign-ins and saved passwords, so you don’t have to log
+-                    in everywhere again</em></span>
++                  <em>Sign-ins, saved passwords and cards, so you don’t have
++                    to log in everywhere again</em></span>
+                 <span class="tick">${icon('check', 13)}</span>
+               </button>` : ''}
+           </div>
+@@ -170,8 +170,8 @@ export function getHtml(this: MeridianOnboardingElement) {
+     <div class="confirm" role="dialog" aria-modal="true">
+       <div class="card">
+         <h3>Your Mac will ask for permission</h3>
+-        <p>To keep you signed in to your sites, Meridian copies Arc’s sign-ins
+-          and saved passwords.
++        <p>To keep you signed in to your sites, Meridian copies Arc’s
++          sign-ins, saved passwords and cards.
+           Your Mac will ask whether Meridian may read them: click
+           <b>Allow</b> (and type your Mac password if asked). Meridian needs
+           this only now, so there’s no need for Always Allow.</p>
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+index d9d3ad1275..b59a615efb 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+@@ -376,15 +376,28 @@ export class MeridianOnboardingElement extends CrLitElement {
+     this.busy_ = 'Moving in…';
+     const {ok} = await this.handler_.importArc();
+     if (ok && this.withLogins_ && this.arc_?.loginsAvailable) {
+-      const {imported, passwords, error} =
++      const {imported, passwords, cards, error} =
+           await this.handler_.importArcLogins();
++      const more = [
++        passwords ? `${passwords.toLocaleString()} passwords` : '',
++        cards ? `${cards.toLocaleString()} ${cards === 1 ? 'card' : 'cards'}` :
++                '',
++      ].filter(x => x);
+       this.note_ = error === 'denied' ?
+           'Sign-ins weren’t brought over. You can try again from File > Import from Arc.' :
+           error ? 'Arc’s sign-ins couldn’t be read.' :
+                   `You’re still signed in to your sites (${
+-                      imported.toLocaleString()} sign-ins${
+-                      passwords ? ` and ${passwords.toLocaleString()} passwords` :
+-                                  ''} brought over).`;
++                      [`${imported.toLocaleString()} sign-ins`, ...more].join(
++                          ', ')} brought over).`;
++    }
++    // History, permissions, sites' data and the rest: nothing to ask.
++    if (ok && this.arc_?.dataAvailable) {
++      const {result} = await this.handler_.importArcData();
++      if (!result.error) {
++        this.note_ = [this.note_, 'Your history and the rest came too.']
++                         .filter(x => x)
++                         .join(' ');
++      }
+     }
+     this.advance_();
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index dd55d83cca..dc0c895e16 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -70,7 +70,7 @@ export function getHtml(this: MeridianSettingsElement) {
+                 ${this.arcPasswords_ ? html`
+                   <div class="row">
+                     <div class="row-text">
+-                      <div class="row-label">Passwords from Arc</div>
++                      <div class="row-label">Passwords and cards from Arc</div>
+                       <div id="arcPasswordsNote" class="row-desc">${
+                           this.arcPasswordsNote_ ||
+                           html`Each into its space’s profile. Your Mac asks
+@@ -82,6 +82,21 @@ export function getHtml(this: MeridianSettingsElement) {
+                         @click="${this.onImportArcPasswordsClick_}">
+                       Import…</button>
+                   </div>` : ''}
++                ${this.arcData_ ? html`
++                  <div class="row">
++                    <div class="row-text">
++                      <div class="row-label">History and the rest from Arc</div>
++                      <div id="arcDataNote" class="row-desc">${
++                          this.arcDataNote_ ||
++                          html`History, form entries, site permissions and
++                            data, site searches, Air Traffic Control and the
++                            archive. Nothing to allow.`}</div>
++                    </div>
++                    <button id="importArcData" class="btn"
++                        ?disabled="${this.arcDataNote_ === 'Bringing it over…'}"
++                        @click="${this.onImportArcDataClick_}">
++                      Import…</button>
++                  </div>` : ''}
+                 ${this.arcExtensions_.length ? html`
+                   <div class="row arc-ext-head">
+                     <div class="row-text">
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 43a29ccf11..772786faa6 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -12,6 +12,7 @@ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ import {browserProxyFactory, UpdateStatus} from '../sidebar.mojom-webui.js';
+ import type {AgentCli, AiProvider, ArcExtension, Atc, Settings, SidebarHandlerInterface, Space, UpdateState} from '../sidebar.mojom-webui.js';
+ 
++import {arcDataSummary} from './arc_summary.js';
+ import './member_card.js';
+ import {getCss} from './settings.css.js';
+ import {getHtml} from './settings.html.js';
+@@ -156,6 +157,8 @@ export class MeridianSettingsElement extends CrLitElement {
+       arcExtensions_: {state: true, type: Array},
+       arcPasswords_: {state: true, type: Boolean},
+       arcPasswordsNote_: {state: true, type: String},
++      arcData_: {state: true, type: Boolean},
++      arcDataNote_: {state: true, type: String},
+       profileRows_: {state: true, type: Array},
+       profileEdit_: {state: true, type: Object},
+       profileConfirm_: {state: true, type: Object},
+@@ -197,6 +200,8 @@ export class MeridianSettingsElement extends CrLitElement {
+   // Arc has saved passwords to bring over; what bringing them did.
+   protected accessor arcPasswords_: boolean = false;
+   protected accessor arcPasswordsNote_: string = '';
++  protected accessor arcData_: boolean = false;
++  protected accessor arcDataNote_: string = '';
+   protected accessor profileRows_: ProfileRow[] = [];
+   protected accessor profileEdit_: ProfileEdit|null = null;
+   protected accessor profileConfirm_: ProfileConfirm|null = null;
+@@ -256,7 +261,10 @@ export class MeridianSettingsElement extends CrLitElement {
+     this.handler_.getArcExtensions().then(
+         ({extensions}) => this.arcExtensions_ = extensions);
+     this.handler_.getArcPreview().then(
+-        ({preview}) => this.arcPasswords_ = !!preview?.passwordsAvailable);
++        ({preview}) => {
++          this.arcPasswords_ = !!preview?.passwordsAvailable;
++          this.arcData_ = !!preview?.dataAvailable;
++        });
+     this.keyMessage_ = '';
+     this.handler_.hasAiKey().then(({hasKey}) => this.hasAiKey_ = hasKey);
+     this.aiMessage_ = '';
+@@ -584,13 +592,25 @@ export class MeridianSettingsElement extends CrLitElement {
+   // macOS asks before Meridian may read Arc's key; the row says so.
+   protected async onImportArcPasswordsClick_() {
+     this.arcPasswordsNote_ = 'Bringing them over…';
+-    const {imported, error} = await this.handler_.importArcPasswords();
++    const {imported, cards, error} = await this.handler_.importArcPasswords();
++    const brought = [
++      imported ? `${imported.toLocaleString()} passwords` : '',
++      cards ? `${cards.toLocaleString()} ${cards === 1 ? 'card' : 'cards'}` :
++              '',
++    ].filter(x => x).join(' and ');
+     this.arcPasswordsNote_ = error === 'denied' ?
+         'Not brought over: your Mac wasn’t allowed to share Arc’s key.' :
+         error === 'no-data' ? 'Arc has no saved passwords.' :
+         error ? 'Arc’s passwords couldn’t be read.' :
+-        imported ? `${imported.toLocaleString()} passwords brought over.` :
+-                   'They’re all here already.';
++        brought ? `${brought} brought over.` :
++                  'They’re all here already.';
++  }
++
++  protected async onImportArcDataClick_() {
++    this.arcDataNote_ = 'Bringing it over…';
++    const {result} = await this.handler_.importArcData();
++    this.arcDataNote_ = result.error ? 'Arc has nothing more to bring.' :
++                                       arcDataSummary(result);
+   }
+ 
+   protected onMemberRename_(e: CustomEvent<string>) {

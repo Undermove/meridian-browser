@@ -92,13 +92,13 @@ test('Arc logins: cookies come over, so sites stay signed in; Deny imports nothi
     try {
       await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
       assert.equal((await b.eval(`${H}.getArcPreview()`)).preview.loginsAvailable, true);
-      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 0, passwords: 0, error: 'denied' });
+      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 0, passwords: 0, cards: 0, error: 'denied' });
     } finally { await b.close(); }
 
     b = await launch(['about:blank'], { args: [`--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=test-pass'] });
     try {
       await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 2, passwords: 0, error: '' });
+      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 2, passwords: 0, cards: 0, error: '' });
       await b.eval(`app.$.tabstrip.tabStripService_.createTabAt(null, 'http://127.0.0.1:${port}/')`);
       await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'cookie:sid=signed-in')`);
       // The sidebar after the sign-ins: Home (Arc's Profile 2) has that profile's cookie.
@@ -198,7 +198,7 @@ test('a space of another Arc profile is signed in as that profile: its pinned, o
     try {
       await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
       assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
-      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 2, passwords: 0, error: '' });
+      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 2, passwords: 0, cards: 0, error: '' });
       assert.deepEqual(await homeCookies(b, s.u), WORK);
       await b.quit();
     } finally { await b.close(); }
@@ -545,5 +545,321 @@ test('Arc\'s saved passwords come over from Settings, each into its space\'s pro
   } finally {
     await b.close(); s.close();
     fs.rmSync(arcDir, { recursive: true, force: true });
+  }
+});
+
+// ------------------------------------------------------------------ the rest of Arc
+
+const chromeTime = (ms) => BigInt(Math.round(ms)) * 1000n + 11644473600000000n;
+
+// Arc's "History": pages with how often they were visited and typed.
+function writeArcHistory(dir, rows) {
+  fs.mkdirSync(dir, { recursive: true });
+  const db = new DatabaseSync(path.join(dir, 'History'));
+  db.exec(`CREATE TABLE urls(id INTEGER PRIMARY KEY AUTOINCREMENT, url LONGVARCHAR, title LONGVARCHAR,
+    visit_count INTEGER DEFAULT 0 NOT NULL, typed_count INTEGER DEFAULT 0 NOT NULL,
+    last_visit_time INTEGER NOT NULL, hidden INTEGER DEFAULT 0 NOT NULL)`);
+  const insert = db.prepare('INSERT INTO urls(url, title, visit_count, typed_count, last_visit_time) VALUES (?, ?, 5, 2, ?)');
+  for (const r of rows) insert.run(r.url, r.title, chromeTime(r.at ?? Date.now() - 3600000));
+  db.close();
+}
+
+// Arc's "Web Data": things typed into forms, an address, a card (its number and security code
+// encrypted like the passwords) and site searches (one made by the person, one Arc's own).
+function writeArcWebData(dir, password, { forms = [], address, card, engines = [] }) {
+  fs.mkdirSync(dir, { recursive: true });
+  const db = new DatabaseSync(path.join(dir, 'Web Data'));
+  db.exec(`CREATE TABLE meta(key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR);
+    INSERT INTO meta VALUES('version', '154');
+    CREATE TABLE autofill(name VARCHAR, value VARCHAR, value_lower VARCHAR, date_created INTEGER DEFAULT 0,
+      date_last_used INTEGER DEFAULT 0, count INTEGER DEFAULT 1, PRIMARY KEY (name, value));
+    CREATE TABLE addresses(guid VARCHAR PRIMARY KEY, use_count INTEGER NOT NULL DEFAULT 0, use_date INTEGER NOT NULL DEFAULT 0,
+      date_modified INTEGER NOT NULL DEFAULT 0, language_code VARCHAR, label VARCHAR, initial_creator_id INTEGER DEFAULT 0,
+      record_type INTEGER);
+    CREATE TABLE address_type_tokens(guid VARCHAR, type INTEGER, value VARCHAR, verification_status INTEGER DEFAULT 0,
+      observations BLOB, PRIMARY KEY (guid, type));
+    CREATE TABLE credit_cards(guid VARCHAR PRIMARY KEY, name_on_card VARCHAR, expiration_month INTEGER, expiration_year INTEGER,
+      card_number_encrypted BLOB, date_modified INTEGER NOT NULL DEFAULT 0, use_count INTEGER NOT NULL DEFAULT 0,
+      use_date INTEGER NOT NULL DEFAULT 0, billing_address_id VARCHAR, nickname VARCHAR, is_user_confirmed INTEGER DEFAULT 0);
+    CREATE TABLE local_stored_cvc(guid VARCHAR PRIMARY KEY, value_encrypted BLOB, last_updated_timestamp INTEGER);
+    CREATE TABLE keywords(id INTEGER PRIMARY KEY, short_name VARCHAR NOT NULL, keyword VARCHAR NOT NULL, favicon_url VARCHAR NOT NULL,
+      url VARCHAR NOT NULL, safe_for_autoreplace INTEGER, originating_url VARCHAR, date_created INTEGER DEFAULT 0,
+      usage_count INTEGER DEFAULT 0, input_encodings VARCHAR, suggest_url VARCHAR, prepopulate_id INTEGER DEFAULT 0,
+      created_by_policy INTEGER DEFAULT 0, last_modified INTEGER DEFAULT 0, sync_guid VARCHAR, alternate_urls VARCHAR,
+      image_url VARCHAR, search_url_post_params VARCHAR, suggest_url_post_params VARCHAR, image_url_post_params VARCHAR,
+      new_tab_url VARCHAR, last_visited INTEGER DEFAULT 0, created_from_play_api INTEGER DEFAULT 0, is_active INTEGER DEFAULT 0,
+      starter_pack_id INTEGER DEFAULT 0, enforced_by_policy INTEGER DEFAULT 0, featured_by_policy INTEGER DEFAULT 0, url_hash BLOB)`);
+  const now = Math.floor(Date.now() / 1000) - 60;
+  for (const [name, value] of forms) {
+    db.prepare('INSERT INTO autofill VALUES (?, ?, ?, ?, ?, 1)').run(name, value, value.toLowerCase(), now - 600, now);
+  }
+  if (address) {
+    db.prepare('INSERT INTO addresses VALUES (?, 3, ?, ?, \'\', \'\', 70073, 0)').run('addr-1', now, now);
+    for (const [type, value] of Object.entries(address)) {
+      db.prepare('INSERT INTO address_type_tokens VALUES (\'addr-1\', ?, ?, 4, NULL)').run(Number(type), value);
+    }
+  }
+  const key = crypto.pbkdf2Sync(password, 'saltysalt', 1003, 16, 'sha1');
+  const encrypt = (text) => {
+    const c = crypto.createCipheriv('aes-128-cbc', key, Buffer.alloc(16, 0x20));
+    return Buffer.concat([Buffer.from('v10'), c.update(Buffer.from(text)), c.final()]);
+  };
+  if (card) {
+    db.prepare('INSERT INTO credit_cards VALUES (\'card-1\', ?, ?, ?, ?, ?, 2, ?, \'\', ?, 1)')
+      .run(card.name, card.month, card.year, encrypt(card.number), now, now, card.nickname || '');
+    if (card.cvc) db.prepare('INSERT INTO local_stored_cvc VALUES (\'card-1\', ?, ?)').run(encrypt(card.cvc), now);
+  }
+  for (const e of engines) {
+    db.prepare(`INSERT INTO keywords(short_name, keyword, favicon_url, url, safe_for_autoreplace, date_created, input_encodings,
+      prepopulate_id, last_modified, sync_guid, alternate_urls, is_active) VALUES (?, ?, '', ?, ?, ?, 'UTF-8', ?, ?, ?, '[]', 1)`)
+      .run(e.name, e.keyword, e.url, e.auto ? 1 : 0, chromeTime(Date.now() - 86400000), e.prepopulate || 0,
+        chromeTime(Date.now() - 86400000), crypto.randomUUID());
+  }
+  db.close();
+}
+
+// Arc's "Preferences": a site's notifications allowed, its location blocked, and a one-time
+// camera grant (that stays behind).
+function writeArcPreferences(dir, origin) {
+  fs.mkdirSync(dir, { recursive: true });
+  const entry = (setting, expiration = '0') => ({ setting, expiration, last_modified: '13370000000000000', lifetime: '0' });
+  fs.writeFileSync(path.join(dir, 'Preferences'), JSON.stringify({
+    profile: { content_settings: { exceptions: {
+      notifications: { [`${origin},*`]: entry(1) },
+      geolocation: { [`${origin},*`]: entry(2) },
+      media_stream_camera: { [`${origin},*`]: entry(1, String(Date.now() * 1000 + 11644473600000000 + 3600e6)) },
+      durable_storage: { [`${origin},*`]: entry(1) },
+    } } },
+  }));
+}
+
+// Pages of the test site. /store keeps a localStorage value and an IndexedDB record (to make Arc's
+// site data with a real Chromium); /ls and /idb show them in the title; /search shows its query.
+async function siteWithStorage() {
+  const page = (body) => `<!doctype html><meta charset="utf-8"><body><script>${body}</script>`;
+  const idbRead = `const r = indexedDB.open('arc', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('kv');
+    r.onsuccess = () => { const g = r.result.transaction('kv').objectStore('kv').get('who');
+      g.onsuccess = () => { document.title = 'idb:' + (g.result || ''); }; g.onerror = () => { document.title = 'idb:'; }; };`;
+  const server = http.createServer((req, res) => {
+    const u = new URL(req.url, 'http://x');
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    if (u.pathname === '/store') {
+      res.end(page(`localStorage.setItem('token', 'arc-session');
+        const r = indexedDB.open('arc', 1);
+        r.onupgradeneeded = () => r.result.createObjectStore('kv');
+        r.onsuccess = () => { const t = r.result.transaction('kv', 'readwrite'); t.objectStore('kv').put('arc-user', 'who');
+          t.oncomplete = () => { document.title = 'stored'; }; };`));
+    } else if (u.pathname === '/ls') {
+      res.end(page(`document.title = 'ls:' + (localStorage.getItem('token') || '');`));
+    } else if (u.pathname === '/idb') {
+      res.end(page(idbRead));
+    } else if (u.pathname === '/search') {
+      res.end(`<title>search:${u.searchParams.get('q')}</title>`);
+    } else {
+      res.end(`<title>${decodeURIComponent(u.pathname.slice(1))}</title>`);
+    }
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  return { origin, u: (p) => `${origin}${p.startsWith('/') ? '' : '/'}${p}`, close: () => { server.closeAllConnections(); server.close(); } };
+}
+
+// Arc's own site data, made the way Arc (Chromium) makes it: a browser visits /store, and its
+// "Local Storage" and "IndexedDB" folders become Arc's.
+async function seedArcSiteData(s, arcProfileDir) {
+  // Arc's Chromium keeps localStorage in LevelDB ("Local Storage/leveldb"); this one is moving
+  // to SQLite in a field trial, so without the trials.
+  const b = await launch([s.u('/store')], { args: ['--disable-field-trial-config'] });
+  try {
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'stored')`, 15000);
+    await new Promise((r) => setTimeout(r, 6000));  // localStorage commits after a few seconds
+    await b.quit();
+    if (!fs.existsSync(path.join(b.profile, 'Default', 'Local Storage'))) {
+      throw new Error(`no site data made: ${fs.readdirSync(b.profile)} / ${fs.readdirSync(path.join(b.profile, 'Default'))}`);
+    }
+    for (const sub of ['Local Storage', 'IndexedDB']) {
+      fs.cpSync(path.join(b.profile, 'Default', sub), path.join(arcProfileDir, sub), { recursive: true });
+    }
+  } finally { await b.close(); }
+}
+
+async function pageEval(b, prefix, expression) {
+  const t = (await (await fetch(`${b.base}/json/list`)).json()).find((x) => x.type === 'page' && x.url.startsWith(prefix));
+  if (!t) return undefined;
+  const ws = new WebSocket(t.webSocketDebuggerUrl);
+  await new Promise((r) => (ws.onopen = r));
+  const reply = await new Promise((r) => {
+    ws.onmessage = (m) => r(JSON.parse(m.data));
+    ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression, awaitPromise: true, returnByValue: true } }));
+  });
+  ws.close();
+  return reply.result?.result?.value;
+}
+
+// The list a chrome://settings page shows (addresses or cards), through its own private API.
+async function settingsList(b, page, expression) {
+  await b.eval(`app.$.tabstrip.openUrl('chrome://settings/${page}')`);
+  for (let i = 0; i < 50; i++) {
+    await new Promise((r) => setTimeout(r, 200));
+    const list = await pageEval(b, 'chrome://settings', expression);
+    if (list) {
+      const t = (await (await fetch(`${b.base}/json/list`)).json()).find((x) => x.type === 'page' && x.url.startsWith('chrome://settings'));
+      await fetch(`${b.base}/json/close/${t.id}`);
+      return list;
+    }
+  }
+  return null;
+}
+
+const KEYCODE = {
+  a: 0, s: 1, d: 2, f: 3, h: 4, g: 5, z: 6, x: 7, c: 8, v: 9, b: 11, q: 12, w: 13, e: 14, r: 15, y: 16, t: 17,
+  1: 18, 2: 19, 3: 20, 4: 21, 6: 22, 5: 23, 9: 25, 7: 26, 8: 28, 0: 29, o: 31, u: 32, i: 34, p: 35, l: 37, j: 38,
+  k: 40, n: 45, m: 46, '.': 47, ' ': 49,
+};
+
+test('the rest of Arc comes over from Settings: history, form entries, an address and a card, site permissions, a site search, sites\' data, Air Traffic Control and the archive; again adds nothing', async () => {
+  const s = await siteWithStorage();
+  const arcDir = arcWithTwoProfiles(s.u);
+  const arcDefault = path.join(arcDir, 'User Data', 'Default');
+  const arcWork = path.join(arcDir, 'User Data', 'Profile 2');
+  await seedArcSiteData(s, arcDefault);
+  writeArcHistory(arcDefault, [{ url: s.u('/kiwi-arc-personal'), title: 'kiwi-arc-personal' }]);
+  writeArcHistory(arcWork, [{ url: s.u('/kiwi-arc-work'), title: 'kiwi-arc-work' }]);
+  writeArcWebData(arcDefault, 'test-pass', {
+    forms: [['email', 'alice@example.com'], ['city', 'Batumi']],
+    address: { 7: 'Alice Example', 77: '1 Rustaveli Ave', 33: 'Batumi', 35: '6000', 36: 'GE', 9: 'alice@example.com' },
+    card: { name: 'Alice Example', month: 4, year: 2031, number: '4111111111111111', cvc: '123', nickname: 'Travel' },
+    engines: [
+      { name: 'Kiwi search', keyword: 'kiwi', url: `${s.origin}/search?q={searchTerms}` },
+      { name: 'Arc built-in', keyword: 'arcbuiltin', url: 'https://example.com/?q={searchTerms}', prepopulate: 1 },
+    ],
+  });
+  writeArcPreferences(arcDefault, s.origin);
+  // Arc's archive: a tab of Home, and one of a page that isn't on the web.
+  const apple = (ms) => ms / 1000 - 978307200;
+  fs.writeFileSync(path.join(arcDir, 'StorableArchiveItems.json'), JSON.stringify({ version: 1, items: [
+    'a1', { sidebarItem: { id: 'a1', title: null, childrenIds: [], data: { tab: { savedURL: s.u('/old-arc-tab'), savedTitle: 'Old Arc tab' } } },
+      source: { space: { _0: 's-home' } }, archivedAt: apple(Date.now() - 86400000), reason: 'manual' },
+    'a2', { sidebarItem: { id: 'a2', title: null, childrenIds: [], data: { tab: { savedURL: 'file:///etc/hosts', savedTitle: 'Hosts' } } },
+      source: { space: { _0: 's-work' } }, archivedAt: apple(Date.now() - 7200000), reason: 'auto' },
+  ] }));
+  // Air Traffic Control: zoom links to Home; one rule about the app a link comes from can't be kept.
+  fs.writeFileSync(path.join(arcDir, 'StorableLinkRouting.json'), JSON.stringify({ version: 1,
+    defaultDestination: { space: { _0: { mostRecent: {} } } },
+    rules: [
+      { id: 'r1', destination: { space: { _0: { specific: { _0: 's-home' } } } },
+        sourceComponents: [{ id: 'c1', componentType: { urlMatch: { _0: { contains: {} }, _1: 'zoom.us' } } }] },
+      { id: 'r2', destination: { littleArc: { _0: { mostRecent: {} } } },
+        sourceComponents: [{ id: 'c2', componentType: { sourceApp: { _0: 'com.tinyspeck.slackmacgap' } } }] },
+    ] }));
+
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  const args = [`--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=test-pass', '--meridian-test-keys'];
+  const ST = 'app.$.settings.shadowRoot';
+  let b = await launch(['about:blank'], { profile, args });
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    // Arc's spaces came in earlier, without the rest.
+    assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
+    const press = async (button, note) => {
+      await b.eval(`app.$.tabstrip.runCommand(13, 0)`);  // Meridian > Settings
+      await b.waitFor(`app.$.settings.open && !!${ST}.getElementById('${button}')`);
+      await b.click(`${ST}.getElementById('${button}')`);
+      await b.waitFor(`!/Bringing/.test(${ST}.getElementById('${note}').textContent) && /\\./.test(${ST}.getElementById('${note}').textContent)`, 30000);
+      const text = (await b.eval(`${ST}.getElementById('${note}').textContent`)).replace(/\s+/g, ' ').trim();
+      await b.eval(`${ST}.getElementById('close').click()`);
+      await b.waitFor('!app.$.settings.open');
+      return text;
+    };
+    assert.equal(await press('importArcData', 'arcDataNote'),
+      'Brought over: 2 pages of history, 2 form entries, 1 address, 2 site permissions, 1 site search, ' +
+      'data of 1 site (1 more site when Meridian next opens), 1 Air Traffic Control rule, 1 archived tab.');
+    // The card comes with the passwords (Arc's key opens both).
+    assert.equal(await press('importArcPasswords', 'arcPasswordsNote'), '1 card brought over.');
+
+    const T = 'app.$.tabstrip';
+    const spaces = (await b.eval(`${H}.getState().then(({state}) => state)`)).spaces;
+    const home = spaces.find((x) => x.name === 'Home');
+    const work = spaces.find((x) => x.name === 'Work');
+    await b.eval(`${H}.activateSpace(${JSON.stringify(work.id)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(work.id)}`);
+
+    // The site's localStorage is there at once.
+    await b.eval(`${T}.openUrl(${JSON.stringify(s.u('/ls'))})`);
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title.startsWith('ls:'))`);
+    assert.equal(await b.eval(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title.startsWith('ls:')).tab.title`), 'ls:arc-session');
+    // Its permissions: notifications allowed, location blocked, the one-time camera grant not kept.
+    assert.deepEqual(await pageEval(b, s.u('/ls'), `Promise.all(['notifications', 'geolocation', 'camera'].map((name) =>
+      navigator.permissions.query({ name }).then((p) => p.state)))`), ['granted', 'denied', 'prompt']);
+
+    // ⌘T knows Arc's history: the personal profile's here, the work profile's in Home.
+    const press1 = ([code, ch], mods = 0) => b.eval(`${T}.handler_.testKeyPress(${code}, ${JSON.stringify(ch)}, ${mods})`);
+    const type = async (text) => { for (const ch of text) await press1([KEYCODE[ch], ch]); };
+    const CB = 'app.$.commandBar.shadowRoot';
+    const matches = () => b.eval(`(() => {
+      const dd = ${CB}.getElementById('address').shadowRoot.querySelector('cr-searchbox-dropdown');
+      return dd && !dd.hidden ? [...dd.shadowRoot.querySelectorAll('cr-searchbox-match')].map((m) => m.match?.destinationUrl?.url ?? m.match?.destinationUrl ?? '') : [];
+    })()`);
+    const suggest = async (text) => {
+      await b.click('app.$.contentRegion');
+      await press1([17, 't'], 1 << 20);
+      await b.waitFor('app.$.commandBar.open');
+      await type(text);
+      let seen = '', since = Date.now(), got = [];
+      for (const end = Date.now() + 8000; Date.now() < end; await new Promise((r) => setTimeout(r, 100))) {
+        got = await matches();
+        const now = JSON.stringify(got);
+        if (now !== seen) { seen = now; since = Date.now(); } else if (Date.now() - since > 700 && got.length) break;
+      }
+      return got.join(' | ');
+    };
+    const esc = async () => { await press1([53, '\u001b']); await b.waitFor('!app.$.commandBar.open'); };
+    let got = await suggest('kiwi');
+    assert.match(got, /kiwi-arc-personal/, got);
+    assert.doesNotMatch(got, /kiwi-arc-work/, got);
+    await esc();
+    // Arc's site search: "kiwi pear" + Return searches the site.
+    await suggest('kiwi pear');
+    await press1([36, '\r']);
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'search:pear')`);
+    await b.eval(`${H}.activateSpace(${JSON.stringify(home.id)})`);
+    await b.waitFor(`${T}.state_.profileId === 'Meridian Profile Arc 2'`);
+    got = await suggest('kiwi');
+    assert.match(got, /kiwi-arc-work/, got);
+    assert.doesNotMatch(got, /kiwi-arc-personal/, got);
+    await esc();
+    await b.eval(`${H}.activateSpace(${JSON.stringify(work.id)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(work.id)}`);
+
+    // The address and the card, in Chromium's settings.
+    assert.deepEqual(await settingsList(b, 'addresses', `chrome.autofillPrivate.getAddressList().then((l) => l.map((a) => a.metadata.summaryLabel))`), ['Alice Example']);
+    assert.deepEqual(await settingsList(b, 'payments', `chrome.autofillPrivate.getCreditCardList().then((l) => l.map((c) => [c.nickname, c.cardNumber.slice(-4), Number(c.expirationMonth), Number(c.expirationYear)]))`),
+      [['Travel', '1111', 4, 2031]]);
+
+    // Air Traffic Control: zoom links go to Home; other links to the space you're in.
+    const { settings } = await b.eval(`${H}.getSettings()`);
+    assert.deepEqual(settings.atc.rules.map((r) => [r.pattern, r.target]), [['*zoom.us*', `space:${home.id}`]]);
+    assert.equal(settings.atc.fallback, 'main');
+    // The archive: Arc's tab of Home (the local file stays behind).
+    // (The settings pages closed above are in it too.)
+    const archived = async (q) => (await b.eval(`${H}.searchArchive(${JSON.stringify(q)})`)).tabs.map((t) => [t.title, t.spaceId]);
+    assert.deepEqual(await archived('Old Arc'), [['Old Arc tab', home.id]]);
+    assert.deepEqual(await archived('Hosts'), []);
+
+    // Again: all here already.
+    assert.equal(await press('importArcData', 'arcDataNote'), 'It’s all here already.');
+    assert.equal(await press('importArcPasswords', 'arcPasswordsNote'), 'They’re all here already.');
+    await b.quit();
+
+    // The site's database moved in when Meridian opened again.
+    b = await launch([s.u('/idb')], { profile, args });
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title.startsWith('idb:'))`, 15000);
+    assert.equal(await b.eval(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title.startsWith('idb:')).tab.title`), 'idb:arc-user');
+    assert.equal(fs.existsSync(path.join(profile, 'Default', 'Meridian Arc Staged')), false);
+  } finally {
+    await b.close(); s.close();
+    fs.rmSync(arcDir, { recursive: true, force: true });
+    fs.rmSync(profile, { recursive: true, force: true });
   }
 });

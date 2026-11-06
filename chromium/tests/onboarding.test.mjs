@@ -67,6 +67,11 @@ test('with Arc: Bring everything, after saying macOS will ask; File > Import fro
   const db = new DatabaseSync(path.join(arcDir, 'User Data', 'Default', 'Network', 'Cookies'));
   db.exec("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT); INSERT INTO meta VALUES('version','24'); CREATE TABLE cookies(host_key TEXT, name TEXT, value TEXT, encrypted_value BLOB, path TEXT, expires_utc INTEGER, is_secure INTEGER, is_httponly INTEGER, samesite INTEGER, source_scheme INTEGER)");
   db.close();
+  // And Arc's archive: the rest of Arc comes along without asking.
+  fs.writeFileSync(path.join(arcDir, 'StorableArchiveItems.json'), JSON.stringify({ version: 1, items: [
+    'a1', { sidebarItem: { id: 'a1', data: { tab: { savedURL: 'https://example.com/old', savedTitle: 'Old Arc tab' } } },
+      source: { space: { _0: 's-work' } }, archivedAt: Date.now() / 1000 - 978307200 - 3600, reason: 'manual' },
+  ] }));
   const b = await launch(['about:blank'], { args: ['--meridian-onboarding', `--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=test-pass'] });
   try {
     await b.waitFor(`${step} === 'hello'`);
@@ -80,8 +85,11 @@ test('with Arc: Bring everything, after saying macOS will ask; File > Import fro
     await b.click(`${OB}.getElementById('confirmContinue')`);
     await b.waitFor(`${step} === 'default'`, 15000);
     assert.deepEqual((await b.state()).spaces.map((s) => s.name), ['Work', 'Home']);
+    const work = (await b.state()).spaces.find((s) => s.name === 'Work');
+    assert.deepEqual((await b.eval(`app.$.tabstrip.handler_.searchArchive('Old Arc')`)).tabs.map((t) => [t.title, t.spaceId]), [['Old Arc tab', work.id]]);
     await b.click(`${OB}.getElementById('next')`);
     await b.waitFor(`${step} === 'done'`);
+    assert.match(await b.eval(`[...${OB}.querySelectorAll('.whisper')].map((e) => e.textContent).join(' ')`), /Your history and the rest came too\./);
     await b.click(`${OB}.getElementById('next')`);
     await b.waitFor(`!app.$.onboarding.open`);
     // File > Import from Arc: straight to the Arc step.
