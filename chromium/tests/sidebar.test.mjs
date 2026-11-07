@@ -151,3 +151,44 @@ test('clicking a visible tab, pinned and not loaded or in Today, doesn’t scrol
     }
   } finally { await b.close(); server.closeAllConnections(); server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
+
+// Arc: after a click, ⌘⌥↓ to the next tab still brings it into sight (a tab cut off at the bottom
+// of the list). The list stays put only for the row that was clicked.
+test('click a pinned tab near the bottom, then ⌘⌥↓ at once: the next one, cut off, scrolls into sight', async () => {
+  const http = await import('node:http');
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const server = http.createServer((req, res) => setTimeout(() => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(`<title>${req.url.slice(1)}</title><p>x`); }, 300));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = (p) => `http://127.0.0.1:${server.address().port}/${p}`;
+  const pinned = Array.from({ length: 40 }, (_, i) => ({ id: `p${i}`, title: `P${i}`, url: url(`P${i}`) }));
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-clickdown-'));
+  fs.mkdirSync(path.join(profile, 'Default'));
+  fs.writeFileSync(path.join(profile, 'Default', 'Meridian Sidebar.json'), JSON.stringify({
+    version: 1, activeSpace: 's1', mainProfileName: '', profiles: [], favorites: [],
+    spaces: [{ id: 's1', name: 'Work', color: '#888888', color2: '', icon: '', pinned }],
+  }));
+  const b = await launch([url('today')], { profile, args: ['--meridian-test-keys'] });
+  const CMD = 1 << 20, OPT = 1 << 19;
+  const scroller = `${SB}.getElementById('spacePage')`;
+  const rowOf = (title) => `(() => { const deep = (root) => { for (const it of root?.querySelectorAll('meridian-item') || []) { if (it.item.title === ${JSON.stringify(title)}) return it.shadowRoot.querySelector('.row'); const inner = deep(it.shadowRoot); if (inner) return inner; } return null; }; return deep(${SB}); })()`;
+  const place = (title) => b.eval(`(() => { const v = ${scroller}.getBoundingClientRect(), r = ${rowOf(title)}.getBoundingClientRect(); return { top: r.top - v.top, bottom: r.bottom - v.top, height: v.height }; })()`);
+  const active = `[...app.$.tabstrip.tabs_.values()].find((t) => t.isActive)?.url`;
+  try {
+    await b.waitFor(`app.$.tabstrip.state_?.spaces[0]?.pinned.length === 40 && !!${rowOf('P20')}`);
+    // P20 whole, just above the bottom; P21 half cut off.
+    const p21 = await place('P21');
+    await b.eval(`${scroller}.scrollTop += ${Math.round(p21.top + (p21.bottom - p21.top) / 2 - p21.height)}`);
+    await new Promise((r) => setTimeout(r, 300));
+    const p20 = await place('P20');
+    assert.ok(p20.bottom <= p20.height && (await place('P21')).bottom > p20.height, 'P20 shown whole, P21 cut off');
+    await b.click(rowOf('P20'));
+    await b.waitFor(`${active}?.endsWith('/P20')`);
+    await b.eval(`app.$.tabstrip.handler_.testKeyPress(125, '\\uF701', ${CMD | OPT})`);
+    await b.waitFor(`${active}?.endsWith('/P21')`);
+    await new Promise((r) => setTimeout(r, 800));
+    const after = await place('P21');
+    assert.ok(after.top >= -1 && after.bottom <= after.height + 1, `P21 in sight: ${JSON.stringify(after)}`);
+  } finally { await b.close(); server.closeAllConnections(); server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
