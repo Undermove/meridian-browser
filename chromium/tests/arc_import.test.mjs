@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { execFileSync } from 'node:child_process';
+import zlibModule from 'node:zlib';
 import { launch, SB, APP } from './harness.mjs';
 
 const ARC = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures/arc');
@@ -564,6 +565,69 @@ function writeArcHistory(dir, rows) {
   db.close();
 }
 
+// A square PNG of one colour.
+function solidPng(size, [r, g, b]) {
+  const zlib = zlibModule;
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(zlib.crc32(Buffer.concat([Buffer.from(type), data])));
+    return Buffer.concat([len, Buffer.from(type), data, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(size, 0); ihdr.writeUInt32BE(size, 4); ihdr[8] = 8; ihdr[9] = 2;
+  const row = Buffer.concat([Buffer.from([0]), Buffer.from(Array.from({ length: size }, () => [r, g, b]).flat())]);
+  const raw = Buffer.concat(Array.from({ length: size }, () => row));
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+}
+
+// The colour of a PNG's middle pixel (8-bit RGB or RGBA, not interlaced).
+function pngCentre(png) {
+  let pos = 8, width = 0, height = 0, type = 0;
+  const idat = [];
+  while (pos < png.length) {
+    const len = png.readUInt32BE(pos), kind = png.toString('latin1', pos + 4, pos + 8);
+    const data = png.subarray(pos + 8, pos + 8 + len);
+    if (kind === 'IHDR') { width = data.readUInt32BE(0); height = data.readUInt32BE(4); type = data[9]; }
+    if (kind === 'IDAT') idat.push(data);
+    pos += 12 + len;
+  }
+  const bpp = type === 6 ? 4 : 3, stride = width * bpp;
+  const raw = zlibModule.inflateSync(Buffer.concat(idat));
+  const out = Buffer.alloc(height * stride);
+  for (let y = 0; y < height; y++) {
+    const f = raw[y * (stride + 1)];
+    for (let x = 0; x < stride; x++) {
+      const v = raw[y * (stride + 1) + 1 + x];
+      const a = x >= bpp ? out[y * stride + x - bpp] : 0;
+      const b = y ? out[(y - 1) * stride + x] : 0;
+      const c = x >= bpp && y ? out[(y - 1) * stride + x - bpp] : 0;
+      const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+      const pred = f === 1 ? a : f === 2 ? b : f === 3 ? (a + b) >> 1 : f === 4 ? (pa <= pb && pa <= pc ? a : pb <= pc ? b : c) : 0;
+      out[y * stride + x] = (v + pred) & 255;
+    }
+  }
+  const i = (Math.floor(height / 2) * width + Math.floor(width / 2)) * bpp;
+  return [out[i], out[i + 1], out[i + 2]];
+}
+
+// Arc's "Favicons": site icons ({ icon, png: [[width, png], ...] }) and the pages they are for.
+function writeArcFavicons(dir, icons) {
+  fs.mkdirSync(dir, { recursive: true });
+  const db = new DatabaseSync(path.join(dir, 'Favicons'));
+  db.exec(`CREATE TABLE meta(key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR);
+    INSERT INTO meta VALUES('version', '8');
+    CREATE TABLE icon_mapping(id INTEGER PRIMARY KEY, page_url LONGVARCHAR NOT NULL, icon_id INTEGER, page_url_type INTEGER DEFAULT 0);
+    CREATE TABLE favicons(id INTEGER PRIMARY KEY, url LONGVARCHAR NOT NULL, icon_type INTEGER DEFAULT 1);
+    CREATE TABLE favicon_bitmaps(id INTEGER PRIMARY KEY, icon_id INTEGER NOT NULL, last_updated INTEGER DEFAULT 0,
+      image_data BLOB, width INTEGER DEFAULT 0, height INTEGER DEFAULT 0, last_requested INTEGER DEFAULT 0)`);
+  icons.forEach((icon, i) => {
+    db.prepare('INSERT INTO favicons(id, url, icon_type) VALUES (?, ?, 1)').run(i + 1, icon.icon);
+    for (const [w, png] of icon.png) db.prepare('INSERT INTO favicon_bitmaps(icon_id, image_data, width, height) VALUES (?, ?, ?, ?)').run(i + 1, png, w, w);
+    for (const page of icon.pages) db.prepare('INSERT INTO icon_mapping(page_url, icon_id) VALUES (?, ?)').run(page, i + 1);
+  });
+  db.close();
+}
+
 // Arc's "Web Data": things typed into forms, an address, a card (its number and security code
 // encrypted like the passwords) and site searches (one made by the person, one Arc's own).
 function writeArcWebData(dir, password, { forms = [], address, card, engines = [] }) {
@@ -862,4 +926,67 @@ test('the rest of Arc comes over from Settings: history, form entries, an addres
     fs.rmSync(arcDir, { recursive: true, force: true });
     fs.rmSync(profile, { recursive: true, force: true });
   }
+});
+
+// Arc: the sidebar shows each site's icon before its tab is opened. They come from Arc's own
+// icons (its Favicons), for pinned tabs, open tabs and the pages of the history; a pinned tab Arc
+// had no icon for gets its site's.
+test('the sites\' icons come from Arc: pinned and open tabs show them without loading; history pages have them too', async () => {
+  // Pages without an icon of their own: what shows can only be Arc's.
+  const server = http.createServer((req, res) => {
+    if (req.url === '/favicon.ico') { res.writeHead(404); res.end(); return; }
+    res.writeHead(200, { 'content-type': 'text/html' }); res.end(`<title>${req.url}</title>`);
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const u = (p) => `http://127.0.0.1:${server.address().port}/${p}`;
+  const arcDir = arcWithTwoProfiles(u);
+  const work = path.join(arcDir, 'User Data', 'Profile 2');
+  const RED = [220, 30, 30], BLUE = [30, 60, 220];
+  // Home (Arc's second profile): its pinned tab has the red icon (16, 32 and 64 px), a page of
+  // the history the blue one; Home's open tab, on the same site, has none of its own.
+  writeArcHistory(work, [{ url: u('kiwi-history'), title: 'kiwi-history' }]);
+  writeArcFavicons(work, [
+    { icon: u('red.ico'), png: [[16, solidPng(16, RED)], [32, solidPng(32, RED)], [64, solidPng(64, RED)]], pages: [u('homepin'), u('other-red')] },
+    { icon: u('blue.ico'), png: [[32, solidPng(32, BLUE)]], pages: [u('kiwi-history')] },
+  ]);
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  const args = [`--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=test-pass'];
+  const b = await launch(['about:blank'], { profile, args });
+  // The colour in the middle of the icon at `src` (a chrome://favicon2 address, as the sidebar
+  // shows it): the image the UI page loads, read back through DevTools.
+  const iconColour = async (src) => {
+    await b.cdp.send('Page.enable', {});
+    await b.eval(`(async () => { const img = new Image(); img.src = ${src}; await img.decode().catch(() => {}); return true; })()`);
+    const { frameTree } = await b.cdp.send('Page.getFrameTree', {});
+    const { content, base64Encoded } = await b.cdp.send('Page.getResourceContent', { frameId: frameTree.frame.id, url: JSON.parse(src) });
+    return pngCentre(Buffer.from(content, base64Encoded ? 'base64' : 'binary'));
+  };
+  const near = (got, want) => got.every((v, i) => Math.abs(v - want[i]) < 40);
+  const rowIcon = (title) => `(() => { const all = []; const walk = (root) => { for (const el of root.querySelectorAll('meridian-item')) { all.push(el); walk(el.shadowRoot); } }; walk(${SB}); const it = all.find((el) => el.item.title === ${JSON.stringify(title)}); return it?.shadowRoot.querySelector('img')?.src || ''; })()`;
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
+    const home = (await b.eval(`${H}.getState().then(({state}) => state)`)).spaces.find((x) => x.name === 'Home');
+    await b.eval(`${H}.activateSpace(${JSON.stringify(home.id)})`);
+    await b.waitFor(`app.$.tabstrip.state_.profileId === 'Meridian Profile Arc 2'`);
+    await b.waitFor(`${rowIcon('HomePin')}.startsWith('chrome://favicon2')`);
+    assert.ok(!near(await iconColour(JSON.stringify(await b.eval(rowIcon('HomePin')))), RED), 'no icon before');
+
+    const ST = 'app.$.settings.shadowRoot';
+    await b.eval(`app.$.tabstrip.runCommand(13, 0)`);  // Meridian > Settings
+    await b.waitFor(`app.$.settings.open && !!${ST}.getElementById('importArcData')`);
+    await b.click(`${ST}.getElementById('importArcData')`);
+    await b.waitFor(`!/Bringing/.test(${ST}.getElementById('arcDataNote').textContent) && /\\./.test(${ST}.getElementById('arcDataNote').textContent)`, 30000);
+    await b.eval(`${ST}.getElementById('close').click()`);
+    await b.waitFor('!app.$.settings.open');
+
+    // The pinned tab, not opened: its own icon, at once (the row asks again).
+    const src = await b.waitFor(`(() => { const s = ${rowIcon('HomePin')}; return /&v=/.test(s) && s; })()`);
+    assert.ok(near(await iconColour(JSON.stringify(src)), RED), 'the pinned tab shows Arc\'s icon');
+    assert.equal(await b.eval(`[...app.$.tabstrip.tabs_.values()].some((t) => t.url === ${JSON.stringify(u('homepin'))})`), false, 'without opening it');
+    // A page of the history, and a pinned tab's site for a page Arc had no icon for.
+    const f2 = (page) => JSON.stringify(`chrome://favicon2/?size=16&scaleFactor=2x&allowGoogleServerFallback=0&pageUrl=${encodeURIComponent(page)}&meridianProfile=Meridian%20Profile%20Arc%202&v=9`);
+    assert.ok(near(await iconColour(f2(u('kiwi-history'))), BLUE), 'a history page');
+    assert.ok(near(await iconColour(f2(u('hometoday'))), RED), 'the open tab: its site\'s icon');
+  } finally { await b.close(); server.closeAllConnections(); server.close(); fs.rmSync(profile, { recursive: true, force: true }); fs.rmSync(arcDir, { recursive: true, force: true }); }
 });

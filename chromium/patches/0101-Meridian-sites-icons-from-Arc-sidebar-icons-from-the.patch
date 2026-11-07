@@ -1,0 +1,407 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Sat, 7 Nov 2026 18:26:29 +0400
+Subject: [PATCH 102/102] Meridian: sites' icons from Arc; sidebar icons from
+ the space's profile; clicking a visible row doesn't scroll
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   1 +
+ chrome/browser/meridian/arc_data.cc           | 154 +++++++++++++++++-
+ .../webui_browser/meridian/onboarding.ts      |   1 +
+ .../webui_browser/meridian/settings.ts        |   1 +
+ .../webui_browser/meridian/sidebar.ts         |  37 ++++-
+ chrome/browser/ui/webui/favicon_source.cc     |  17 ++
+ 6 files changed, 209 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index c2b269a874..c9085a0d69 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -286,6 +286,7 @@ source_set("meridian") {
+     "//services/media_session/public/mojom",
+     "//third_party/re2",
+     "//chrome/browser/content_settings",
++    "//chrome/browser/favicon",
+     "//chrome/browser/history",
+     "//chrome/browser/password_manager/factories",
+     "//chrome/browser/translate",
+diff --git a/chrome/browser/meridian/arc_data.cc b/chrome/browser/meridian/arc_data.cc
+index 6d02c59598..2994ae8ccc 100644
+--- a/chrome/browser/meridian/arc_data.cc
++++ b/chrome/browser/meridian/arc_data.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/meridian/arc_data.h"
+ 
+ #include <algorithm>
++#include <functional>
+ #include <map>
+ #include <memory>
+ #include <optional>
+@@ -29,6 +30,7 @@
+ #include "chrome/browser/autofill/personal_data_manager_factory.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
++#include "chrome/browser/favicon/favicon_service_factory.h"
+ #include "chrome/browser/history/history_service_factory.h"
+ #include "chrome/browser/meridian/arc_import.h"
+ #include "chrome/browser/meridian/arc_logins.h"
+@@ -55,6 +57,8 @@
+ #include "components/content_settings/core/browser/website_settings_info.h"
+ #include "components/content_settings/core/browser/website_settings_registry.h"
+ #include "components/content_settings/core/common/content_settings_pattern.h"
++#include "components/favicon/core/favicon_service.h"
++#include "components/favicon_base/favicon_usage_data.h"
+ #include "components/history/core/browser/history_service.h"
+ #include "components/history/core/browser/url_row.h"
+ #include "components/keyed_service/core/service_access_type.h"
+@@ -127,6 +131,11 @@ struct ProfileRead {
+   std::vector<TemplateURLData> engines;
+   std::vector<SiteStorage> storage;
+   int site_databases = 0;
++  // Sites' icons, with the pages they are for (those the history knows).
++  favicon_base::FaviconUsageDataList favicons;
++  // The sidebar's pages that have one: added to the history without a visit
++  // (as Chromium does for bookmarks), so they keep it.
++  std::map<GURL, std::u16string> sidebar_pages;
+ };
+ 
+ struct LinkRule {
+@@ -443,6 +452,135 @@ int StageIndexedDB(const base::FilePath& arc_dir,
+   return n;
+ }
+ 
++// The icon best for the sidebar: 32 px (16 px on a Retina screen), else the
++// nearest bigger one, else the biggest.
++bool BetterIcon(int width, int than) {
++  if (than == 32 || width == than) {
++    return false;
++  }
++  if (width == 32) {
++    return true;
++  }
++  if (width > 32) {
++    return than < 32 || width < than;
++  }
++  return than < 32 && width > than;
++}
++
++// Arc's site icons (its Favicons database), for the pages it showed them on;
++// a sidebar page Arc has none for gets its site's.
++void ReadFavicons(const base::FilePath& file,
++                  const std::map<GURL, std::u16string>& sidebar,
++                  ProfileRead& out) {
++  base::ScopedTempDir tmp;
++  sql::Database db(sql::Database::Tag("Thumbnail"));
++  if (!OpenCopy(file, tmp, db) || !db.DoesTableExist("favicons") ||
++      !db.DoesTableExist("favicon_bitmaps") ||
++      !db.DoesTableExist("icon_mapping")) {
++    return;
++  }
++  struct Icon {
++    GURL url;
++    int width = 0;
++    std::vector<uint8_t> png;
++    std::set<GURL> pages;
++  };
++  std::map<int64_t, Icon> icons;
++  sql::Statement s(db.GetUniqueStatement(
++      "SELECT f.id, f.url, b.image_data, b.width FROM favicons f "
++      "JOIN favicon_bitmaps b ON b.icon_id = f.id WHERE f.icon_type = 1"));
++  while (s.Step()) {
++    Icon& icon = icons[s.ColumnInt64(0)];
++    int width = s.ColumnInt(3);
++    if (!icon.png.empty() && !BetterIcon(width, icon.width)) {
++      continue;
++    }
++    std::vector<uint8_t> png = s.ColumnBlobAsVector(2);
++    if (png.empty()) {
++      continue;
++    }
++    icon.url = GURL(s.ColumnString(1));
++    icon.width = width;
++    icon.png = std::move(png);
++  }
++  std::erase_if(icons, [](const auto& i) {
++    return i.second.png.empty() || !i.second.url.is_valid();
++  });
++  // A site's icon: the one most of its pages have.
++  std::map<std::string, std::map<int64_t, int>> by_host;
++  sql::Statement m(
++      db.GetUniqueStatement("SELECT page_url, icon_id FROM icon_mapping"));
++  while (m.Step()) {
++    auto icon = icons.find(m.ColumnInt64(1));
++    GURL page(m.ColumnString(0));
++    if (icon == icons.end() || !page.is_valid()) {
++      continue;
++    }
++    icon->second.pages.insert(page);
++    ++by_host[page.GetHost()][icon->first];
++  }
++  for (const auto& [page, title] : sidebar) {
++    auto own = std::ranges::find_if(
++        icons, [&](const auto& i) { return i.second.pages.contains(page); });
++    if (own == icons.end()) {
++      auto host = by_host.find(page.GetHost());
++      if (host == by_host.end()) {
++        continue;
++      }
++      int64_t id = std::ranges::max_element(host->second, {},
++                                            [](const auto& c) {
++                                              return c.second;
++                                            })->first;
++      icons[id].pages.insert(page);
++    }
++    out.sidebar_pages.emplace(page, title);
++  }
++  for (auto& [id, icon] : icons) {
++    if (icon.pages.empty()) {
++      continue;
++    }
++    favicon_base::FaviconUsageData data;
++    data.favicon_url = icon.url;
++    data.png_data = std::move(icon.png);
++    data.urls = std::move(icon.pages);
++    out.favicons.push_back(std::move(data));
++  }
++}
++
++// The sidebar's pages in Arc, by Meridian profile id: pinned tabs (in folders
++// too), open tabs and favorites.
++std::map<std::string, std::map<GURL, std::u16string>> SidebarPages(
++    const ArcSidebar& sidebar) {
++  std::map<std::string, std::map<GURL, std::u16string>> out;
++  auto add = [&](const std::string& profile, const GURL& url,
++                 const std::string& title) {
++    if (url.is_valid() && url.SchemeIsHTTPOrHTTPS()) {
++      out[profile].emplace(url, base::UTF8ToUTF16(title));
++    }
++  };
++  std::function<void(const std::string&, const std::vector<Item>&)> add_items =
++      [&](const std::string& profile, const std::vector<Item>& items) {
++        for (const Item& item : items) {
++          add(profile, item.url, item.title);
++          add_items(profile, item.children);
++        }
++      };
++  for (size_t i = 0; i < sidebar.spaces.size(); ++i) {
++    const Space& space = sidebar.spaces[i];
++    add_items(space.profile, space.pinned);
++    if (i < sidebar.today.size()) {
++      for (const ArcSidebar::Tab& tab : sidebar.today[i]) {
++        add(space.profile, tab.url, tab.title);
++      }
++    }
++  }
++  add_items(std::string(), sidebar.favorites);
++  for (const auto& [profile, items] : sidebar.profile_favorites) {
++    add_items(profile, items);
++  }
++  return out;
++}
++
+ void ReadArchive(const base::FilePath& file, ArcDataRead& out) {
+   std::string json;
+   if (!base::ReadFileToString(file, &json)) {
+@@ -582,8 +720,10 @@ ArcDataRead ReadArcData(base::FilePath main_profile, base::FilePath user_data) {
+   if (arc.empty() || !base::DirectoryExists(arc)) {
+     return out;
+   }
++  std::map<std::string, std::map<GURL, std::u16string>> sidebar_pages;
+   if (std::optional<ArcSidebar> sidebar = ReadArcSidebar()) {
+     out.arc_space_names = sidebar->arc_space_names;
++    sidebar_pages = SidebarPages(*sidebar);
+   }
+   ReadArchive(arc.Append("StorableArchiveItems.json"), out);
+   ReadLinkRules(arc.Append("StorableLinkRouting.json"), out);
+@@ -614,9 +754,10 @@ ArcDataRead ReadArcData(base::FilePath main_profile, base::FilePath user_data) {
+     ReadLocalStorage(dir.Append("Local Storage").Append("leveldb"), p.storage);
+     p.site_databases = StageIndexedDB(
+         dir, id.empty() ? main_profile : user_data.Append(id));
++    ReadFavicons(dir.Append("Favicons"), sidebar_pages[id], p);
+     if (p.history.empty() && p.forms.empty() && p.addresses.empty() &&
+         p.permissions.empty() && p.engines.empty() && p.storage.empty() &&
+-        !p.site_databases) {
++        !p.site_databases && p.favicons.empty()) {
+       out.profiles.erase(id);
+       continue;
+     }
+@@ -802,6 +943,17 @@ void WriteProfile(scoped_refptr<Collector> collector,
+                                    history::SOURCE_OS_MIGRATION_IMPORTED);
+     }
+   }
++  // Icons every time (pages that have one here keep it): after the history,
++  // in the same queue.
++  if (favicon::FaviconService* favicons =
++          FaviconServiceFactory::GetForProfile(
++              profile, ServiceAccessType::EXPLICIT_ACCESS);
++      favicons && !data.favicons.empty()) {
++    for (const auto& [page, title] : data.sidebar_pages) {
++      favicons->AddPageNoVisitForBookmark(page, title);
++    }
++    favicons->SetImportedFavicons(data.favicons);
++  }
+   if (!data.forms.empty()) {
+     if (scoped_refptr<autofill::AutofillWebDataService> web_data =
+             WebDataServiceFactory::GetAutofillWebDataForProfile(
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+index b59a615efb..491ce7df94 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+@@ -393,6 +393,7 @@ export class MeridianOnboardingElement extends CrLitElement {
+     // History, permissions, sites' data and the rest: nothing to ask.
+     if (ok && this.arc_?.dataAvailable) {
+       const {result} = await this.handler_.importArcData();
++      window.dispatchEvent(new Event('meridian-icons-changed'));
+       if (!result.error) {
+         this.note_ = [this.note_, 'Your history and the rest came too.']
+                          .filter(x => x)
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 772786faa6..a356d0279c 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -609,6 +609,7 @@ export class MeridianSettingsElement extends CrLitElement {
+   protected async onImportArcDataClick_() {
+     this.arcDataNote_ = 'Bringing it over…';
+     const {result} = await this.handler_.importArcData();
++    window.dispatchEvent(new Event('meridian-icons-changed'));
+     this.arcDataNote_ = result.error ? 'Arc has nothing more to bring.' :
+                                        arcDataSummary(result);
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 2725308cdf..9437af0c0d 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -302,6 +302,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+     // update that came first wins.
+     this.handler_.getUpdateState().then(({state}) => this.update_ ??= state);
+     document.addEventListener('mousedown', this.onDocumentMouseDown_, true);
++    window.addEventListener('meridian-icons-changed', this.onIconsChanged_);
+     this.addEventListener('wheel', this.onSwipeWheel_, {passive: false});
+     // A new track doesn't change the tabs: while something plays, look again.
+     this.nowPlayingPoll_ = setInterval(() => {
+@@ -320,6 +321,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+   override disconnectedCallback() {
+     super.disconnectedCallback();
+     this.removeEventListener('wheel', this.onSwipeWheel_);
++    window.removeEventListener('meridian-icons-changed', this.onIconsChanged_);
+     clearInterval(this.nowPlayingPoll_);
+     clearTimeout(this.nowPlayingTimer_);
+     this.observation_ = undefined;
+@@ -527,10 +529,21 @@ export class MeridianSidebarElement extends CrLitElement implements
+       return tab.favicon.dataUrl;
+     }
+     const url = tab ? tab.url : item ? item.url : '';
++    const again = this.iconsRev_ ? `&v=${this.iconsRev_}` : '';
++    // Kept where the space's profile keeps it.
++    const profile = this.activeSpace()?.profileId;
++    const own = profile ? `&meridianProfile=${encodeURIComponent(profile)}` : '';
+     return `chrome://favicon2/?size=16&scaleFactor=2x&allowGoogleServerFallback=0&pageUrl=${
+-        encodeURIComponent(url)}`;
++        encodeURIComponent(url)}${own}${again}`;
+   }
+ 
++  // Sites' icons came (Arc's, with the rest of its data): the rows ask again.
++  private iconsRev_ = 0;
++  private onIconsChanged_ = () => {
++    this.iconsRev_++;
++    this.rev_++;
++  };
++
+   // -------------------------------------------------------- drag & drop
+ 
+   // What is being dragged: a Today tab or a pinned item / favorite.
+@@ -926,6 +939,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+     if (e.button !== 0 || this.isButton_(e)) {
+       return;
+     }
++    this.notePickedInView_(e);
+     this.tabStripService_.activateTab(tab.id);
+   }
+ 
+@@ -937,9 +951,26 @@ export class MeridianSidebarElement extends CrLitElement implements
+       this.handler_.setFolderOpen(item.id, !item.open);
+       return;
+     }
++    this.notePickedInView_(e);
+     this.handler_.openItem(item.id);
+   }
+ 
++  // Arc: a row clicked where the list shows it whole stays where it is. A
++  // pinned tab that isn't loaded shows in Today while it opens, then comes
++  // back: the list doesn't follow it there and back.
++  private pickedInView_ = 0;
++  private notePickedInView_(e: MouseEvent) {
++    const page = this.shadowRoot.getElementById('spacePage');
++    const row = e.currentTarget as HTMLElement | null;
++    if (!page || !row?.getBoundingClientRect) {
++      return;
++    }
++    const v = page.getBoundingClientRect();
++    const r = row.getBoundingClientRect();
++    this.pickedInView_ =
++        r.top >= v.top - 1 && r.bottom <= v.bottom + 1 ? performance.now() : 0;
++  }
++
+   onCloseClick(e: Event, tab: Tab) {
+     e.stopPropagation();
+     this.tabStripService_.closeNodes([tab.id]);
+@@ -1609,6 +1640,10 @@ export class MeridianSidebarElement extends CrLitElement implements
+         this.sightSpaceId_ = this.shownSpaceId_;
+         return;
+       }
++      if (this.pickedInView_ &&
++          performance.now() - this.pickedInView_ < 2000) {
++        return;
++      }
+       row.scrollIntoView({block: 'nearest'});
+     });
+   }
+diff --git a/chrome/browser/ui/webui/favicon_source.cc b/chrome/browser/ui/webui/favicon_source.cc
+index 758297fcef..cc2a84cf07 100644
+--- a/chrome/browser/ui/webui/favicon_source.cc
++++ b/chrome/browser/ui/webui/favicon_source.cc
+@@ -12,11 +12,13 @@
+ #include "base/notreached.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_number_conversions.h"
++#include "chrome/browser/browser_process.h"
+ #include "chrome/browser/favicon/favicon_service_factory.h"
+ #include "chrome/browser/favicon/favicon_utils.h"
+ #include "chrome/browser/favicon/history_ui_favicon_request_handler_factory.h"
+ #include "chrome/browser/history/top_sites_factory.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_manager.h"
+ #include "chrome/browser/search_engines/template_url_service_factory.h"
+ #include "chrome/common/url_constants.h"
+ #include "chrome/common/webui_url_constants.h"
+@@ -26,6 +28,7 @@
+ #include "components/history/core/browser/top_sites.h"
+ #include "components/search_engines/search_terms_data.h"
+ #include "components/search_engines/template_url_service.h"
++#include "net/base/url_util.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/web_contents.h"
+ #include "third_party/skia/include/core/SkBitmap.h"
+@@ -122,6 +125,20 @@ void FaviconSource::StartDataRequest(
+   CHECK_CURRENTLY_ON(content::BrowserThread::UI, base::NotFatalUntil::M162);
+   const std::string path = content::URLDataSource::URLToRequestPath(url);
+   Profile* profile = GetProfileForRequest(wc_getter);
++  // Meridian: one window shows spaces of several profiles. The sidebar asks
++  // for a page's icon in its space's profile ("meridianProfile=<its folder>"),
++  // where the icon was stored; only a profile open now.
++  if (std::string id;
++      net::GetValueForKeyInQuery(url, "meridianProfile", &id) && !id.empty() &&
++      id.find_first_of("/\\") == std::string::npos && id != "." &&
++      id != ".." && g_browser_process->profile_manager()) {
++    ProfileManager* manager = g_browser_process->profile_manager();
++    if (Profile* own = manager->GetProfileByPath(
++            manager->user_data_dir().AppendASCII(id));
++        own && profile && !profile->IsOffTheRecord()) {
++      profile = own;
++    }
++  }
+   favicon::FaviconService* favicon_service =
+       FaviconServiceFactory::GetForProfile(profile,
+                                            ServiceAccessType::EXPLICIT_ACCESS);

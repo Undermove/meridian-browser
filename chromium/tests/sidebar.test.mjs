@@ -99,3 +99,55 @@ test('hovering a link shows its address at the bottom of the page', async () => 
     ws.close();
   } finally { await b.close(); server.close(); }
 });
+
+// Arc: clicking a tab the sidebar already shows leaves the list where it is. A pinned tab that
+// isn't loaded yet (after the import, after a restart) shows in Today for a moment while it
+// opens; the list used to follow it there and back, leaving the clicked row at the top.
+test('clicking a visible tab, pinned and not loaded or in Today, doesn’t scroll the sidebar', async () => {
+  const http = await import('node:http');
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  // Pages that take a moment, as real ones do.
+  const server = http.createServer((req, res) => setTimeout(() => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(`<title>${req.url.slice(1)}</title><p>x`); }, 300));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = (p) => `http://127.0.0.1:${server.address().port}/${p}`;
+  const pinned = Array.from({ length: 40 }, (_, i) => ({ id: `p${i}`, title: `P${i}`, url: url(`P${i}`) }));
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-noscroll-'));
+  fs.mkdirSync(path.join(profile, 'Default'));
+  fs.writeFileSync(path.join(profile, 'Default', 'Meridian Sidebar.json'), JSON.stringify({
+    version: 1, activeSpace: 's1', mainProfileName: '', profiles: [], favorites: [],
+    spaces: [{ id: 's1', name: 'Work', color: '#888888', color2: '', icon: '', pinned }],
+  }));
+  const b = await launch(Array.from({ length: 25 }, (_, i) => url(`today${i}`)), { profile });
+  const scroller = `${SB}.getElementById('spacePage')`;
+  // The rows the list shows whole, top to bottom: [title, top relative to the list].
+  const shown = () => b.eval(`(() => {
+    const v = ${scroller}.getBoundingClientRect();
+    const rows = [];
+    const deep = (root) => { for (const it of root?.querySelectorAll('meridian-item') || []) { const r = it.shadowRoot.querySelector('.row'); if (r) rows.push([it.item.title, r]); deep(it.shadowRoot); } };
+    deep(${SB});
+    for (const t of ${SB}.querySelectorAll('meridian-tab-row')) rows.push([t.tab.title, t.shadowRoot.querySelector('.row')]);
+    return rows.map(([t, r]) => [t, r.getBoundingClientRect()]).filter(([, r]) => r.top >= v.top && r.bottom <= v.bottom).sort((a, c) => a[1].top - c[1].top).map(([t, r]) => [t, Math.round(r.top - v.top)]);
+  })()`);
+  const settled = async () => { let last = '', same = 0; for (let i = 0; i < 40 && same < 5; i++) { await new Promise((r) => setTimeout(r, 150)); const now = JSON.stringify([await b.eval(`${scroller}.scrollTop`), await b.eval(`[...app.$.tabstrip.tabs_.values()].find((t) => t.isActive)?.title`)]); same = now === last ? same + 1 : 0; last = now; } };
+  const rowOf = (title) => `(() => { const deep = (root) => { for (const it of root?.querySelectorAll('meridian-item') || []) { if (it.item.title === ${JSON.stringify(title)}) return it.shadowRoot.querySelector('.row'); const inner = deep(it.shadowRoot); if (inner) return inner; } return null; }; return deep(${SB}) || [...${SB}.querySelectorAll('meridian-tab-row')].find((t) => t.tab.title === ${JSON.stringify(title)})?.shadowRoot.querySelector('.row'); })()`;
+  try {
+    await b.waitFor(`app.$.tabstrip.state_?.spaces[0]?.pinned.length === 40 && ${SB}.querySelectorAll('meridian-tab-row').length === 25`);
+    await b.waitFor(`[...app.$.tabstrip.tabs_.values()].every((t) => /^today/.test(t.title))`, 15000);
+    for (const [where, scrollTop, pick] of [['pinned', 400, /^P\d+$/], ['pinned again', 700, /^P\d+$/], ['Today', 2000, /^today\d+$/]]) {
+      await b.eval(`${scroller}.scrollTop = ${scrollTop}`);
+      await settled();
+      const before = await shown();
+      // One in the lower half of what is shown, not the active one.
+      const candidates = before.filter(([t]) => pick.test(t));
+      const [title, top] = candidates[Math.floor(candidates.length * 3 / 4)];
+      const scrolled = await b.eval(`${scroller}.scrollTop`);
+      await b.click(rowOf(title));
+      await b.waitFor(`[...app.$.tabstrip.tabs_.values()].find((t) => t.isActive)?.url.endsWith('/${title}')`);
+      await settled();
+      assert.equal(await b.eval(`${scroller}.scrollTop`), scrolled, `${where}: the list stayed (clicked ${title} at ${top})`);
+      assert.deepEqual((await shown()).find(([t]) => t === title), [title, top], `${where}: the clicked row stayed in its place`);
+    }
+  } finally { await b.close(); server.closeAllConnections(); server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
