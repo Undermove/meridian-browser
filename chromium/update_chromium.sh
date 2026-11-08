@@ -25,7 +25,8 @@ say() { printf '\033[1;35m==>\033[0m %s\n' "$*"; }
 OLD_REV="$(cat "$HERE/CHROMIUM_REVISION")"
 OLD_VER="$(cat "$HERE/CHROMIUM_VERSION")"
 [ -n "$BRANCH" ] || BRANCH="$(echo "$OLD_VER" | cut -d. -f3)"
-[ -z "$(git -C "$SRC" status --porcelain --untracked-files=no)" ] || { echo "Chromium's src has uncommitted changes" >&2; exit 1; }
+# (FFmpeg on its own meridian branch, tools/subrepo_patches.sh, isn't a change to src.)
+[ -z "$(git -C "$SRC" status --porcelain --untracked-files=no --ignore-submodules=all)" ] || { echo "Chromium's src has uncommitted changes" >&2; exit 1; }
 [ "$(git -C "$SRC" rev-parse --abbrev-ref HEAD)" = meridian ] || { echo "src isn't on the meridian branch" >&2; exit 1; }
 
 say "Fetching branch $BRANCH…"
@@ -50,8 +51,10 @@ git -C "$SRC" rebase -q --onto "$NEW_REV" "$OLD_REV" meridian
 say "Dependencies (V8, Skia, …)…"
 # Detached, so gclient doesn't try to rebase the meridian branch itself.
 git -C "$SRC" checkout -q --detach meridian
+"$HERE/tools/subrepo_patches.sh" detach
 (cd "$DIR" && gclient sync -D --no-history --nohooks --revision "src@$(git -C "$SRC" rev-parse HEAD)" >/dev/null)
 git -C "$SRC" checkout -q meridian
+"$HERE/tools/subrepo_patches.sh" apply >/dev/null
 (cd "$DIR" && gclient runhooks >/dev/null)
 
 if [ -z "$VERSION" ]; then

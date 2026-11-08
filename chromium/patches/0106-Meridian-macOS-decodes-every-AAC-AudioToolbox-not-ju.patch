@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Mon, 9 Nov 2026 02:06:42 +0400
+Subject: [PATCH 107/108] Meridian: macOS decodes every AAC (AudioToolbox), not
+ just xHE-AAC
+
+Meridian's FFmpeg has no AAC decoder, so AAC LC, HE-AAC and HE-AAC v2
+go to AudioToolbox in the GPU process: the richest layer macOS plays
+(SBR, parametric stereo), the ADTS header MSE's parsers add taken off,
+an AudioSpecificConfig made up for a raw ADTS file.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../mac/audio_toolbox_audio_decoder.cc        | 90 ++++++++++++++++---
+ .../filters/mac/audio_toolbox_audio_decoder.h |  3 +
+ .../services/gpu_mojo_media_client_mac.cc     |  2 +
+ 3 files changed, 83 insertions(+), 12 deletions(-)
+
+diff --git a/media/filters/mac/audio_toolbox_audio_decoder.cc b/media/filters/mac/audio_toolbox_audio_decoder.cc
+index 03c8cf1b0e..ea5597c6ed 100644
+--- a/media/filters/mac/audio_toolbox_audio_decoder.cc
++++ b/media/filters/mac/audio_toolbox_audio_decoder.cc
+@@ -41,12 +41,43 @@ bool CanUseAudioToolbox(const AudioDecoderConfig& config) {
+   }
+ #endif
+   // We use AudioToolbox for decoding xHE-AAC content and that's available on
+-  // macOS 10.15 or higher.
+-  return config.profile() == AudioCodecProfile::kXHE_AAC;
++  // macOS 10.15 or higher. Meridian: and every other AAC, which its FFmpeg
++  // doesn't decode.
++  return config.codec() == AudioCodec::kAAC;
++}
++
++// Meridian: an AudioSpecificConfig for an AAC stream that came without one
++// (an ADTS file, whose headers FFmpeg reads): AAC LC, its rate and channels.
++std::vector<uint8_t> AudioSpecificConfigFor(const AudioDecoderConfig& config) {
++  constexpr int kRates[] = {96000, 88200, 64000, 48000, 44100, 32000, 24000,
++                            22050, 16000, 12000, 11025, 8000,  7350};
++  const auto rate = std::ranges::find(kRates, config.samples_per_second());
++  const int channels = config.channels();
++  if (rate == std::end(kRates) || channels < 1 || channels > 8 ||
++      channels == 7) {
++    return {};
++  }
++  const int index = rate - std::begin(kRates);
++  const int channel_config = channels == 8 ? 7 : channels;
++  constexpr int kAacLc = 2;
++  return {static_cast<uint8_t>(kAacLc << 3 | index >> 1),
++          static_cast<uint8_t>((index & 1) << 7 | channel_config << 3)};
++}
++
++// Meridian: the size of the ADTS header in front of an AAC frame (MSE's MP4 and
++// MPEG-2 TS parsers add one, for FFmpeg), 0 if there is none: AudioToolbox
++// takes raw frames.
++size_t AdtsHeaderSize(base::span<const uint8_t> frame) {
++  if (frame.size() < 7 || frame[0] != 0xFF || (frame[1] & 0xF6) != 0xF0) {
++    return 0;
++  }
++  const size_t size = (frame[1] & 1) ? 7 : 9;  // 9 with a CRC
++  return size < frame.size() ? size : 0;
+ }
+ 
+ struct InputData {
+   raw_ptr<DecoderBuffer> buffer = nullptr;
++  size_t skip = 0;  // Meridian: an ADTS header
+   AudioStreamPacketDescription packet = {};
+ };
+ 
+@@ -67,11 +98,12 @@ OSStatus ProvideInputCallback(AudioConverterRef decoder,
+ 
+   *num_packets = buffer_list->mNumberBuffers = 1;
+   buffer_list->mBuffers[0].mNumberChannels = 0;
+-  buffer_list->mBuffers[0].mDataByteSize = input_data->buffer->size();
++  buffer_list->mBuffers[0].mDataByteSize =
++      input_data->buffer->size() - input_data->skip;
+ 
+   // No const version of this API unfortunately, so we need const_cast().
+-  buffer_list->mBuffers[0].mData =
+-      const_cast<uint8_t*>(base::span(*input_data->buffer).data());
++  buffer_list->mBuffers[0].mData = const_cast<uint8_t*>(
++      base::span(*input_data->buffer).subspan(input_data->skip).data());
+ 
+   if (packets)
+     *packets = &input_data->packet;
+@@ -115,8 +147,7 @@ void AudioToolboxAudioDecoder::Initialize(const AudioDecoderConfig& config,
+                                           const OutputCB& output_cb,
+                                           const WaitingCB& waiting_cb) {
+   if (!CanUseAudioToolbox(config)) {
+-    DLOG(WARNING)
+-        << "Only xHE-AAC/AC3/E-AC3 decoding is supported by this decoder.";
++    DLOG(WARNING) << "Only AAC/AC3/E-AC3 decoding is supported by this decoder.";
+     std::move(init_cb).Run(DecoderStatus::Codes::kUnsupportedCodec);
+     return;
+   }
+@@ -171,7 +202,10 @@ void AudioToolboxAudioDecoder::Decode(scoped_refptr<DecoderBuffer> buffer,
+       return;
+     }
+     last_input_timestamp_ = buffer->timestamp();
+-    input_data.packet.mDataByteSize = buffer->size();
++    if (strip_adts_) {
++      input_data.skip = AdtsHeaderSize(base::span(*buffer));
++    }
++    input_data.packet.mDataByteSize = buffer->size() - input_data.skip;
+   }
+ 
+   // Must be filled in each time in case AudioConverterFillComplexBuffer()
+@@ -269,13 +303,18 @@ bool AudioToolboxAudioDecoder::NeedsBitstreamConversion() const {
+ bool AudioToolboxAudioDecoder::CreateDecoder(const AudioDecoderConfig& config) {
+   AudioStreamBasicDescription input_format = {};
+   std::vector<uint8_t> magic_cookie;
++  strip_adts_ = false;
+ 
+   switch (config.codec()) {
+     case AudioCodec::kAAC: {
+-      // Input is xHE-AAC / USAC.
+-      CHECK_EQ(config.profile(), AudioCodecProfile::kXHE_AAC);
+-      input_format.mFormatID = kAudioFormatMPEGD_USAC;
+-      magic_cookie = mp4::ESDescriptor::CreateEsds(config.extra_data());
++      // Input is xHE-AAC / USAC. Meridian: or AAC (LC, HE, HE v2).
++      const bool xhe = config.profile() == AudioCodecProfile::kXHE_AAC;
++      strip_adts_ = !xhe;
++      input_format.mFormatID =
++          xhe ? kAudioFormatMPEGD_USAC : kAudioFormatMPEG4AAC;
++      magic_cookie = mp4::ESDescriptor::CreateEsds(
++          xhe || !config.extra_data().empty() ? config.extra_data()
++                                              : AudioSpecificConfigFor(config));
+ 
+       // Have macOS fill in the rest of the input_format for us.
+       UInt32 format_size = sizeof(input_format);
+@@ -287,6 +326,31 @@ bool AudioToolboxAudioDecoder::CreateDecoder(const AudioDecoderConfig& config) {
+             << "AudioFormatGetProperty() failed";
+         return false;
+       }
++      if (!xhe) {
++        // Meridian: the richest layer macOS plays (HE v2 over HE over LC), so
++        // SBR and parametric stereo are decoded, not just the AAC LC core.
++        AudioFormatInfo info = {input_format, magic_cookie.data(),
++                                static_cast<UInt32>(magic_cookie.size())};
++        UInt32 list_size = 0;
++        if (AudioFormatGetPropertyInfo(kAudioFormatProperty_FormatList,
++                                       sizeof(info), &info,
++                                       &list_size) == noErr &&
++            list_size >= sizeof(AudioFormatListItem)) {
++          std::vector<AudioFormatListItem> list(list_size /
++                                                sizeof(AudioFormatListItem));
++          UInt32 index = 0, index_size = sizeof(index);
++          if (AudioFormatGetProperty(kAudioFormatProperty_FormatList,
++                                     sizeof(info), &info, &list_size,
++                                     list.data()) == noErr &&
++              AudioFormatGetProperty(
++                  kAudioFormatProperty_FirstPlayableFormatFromList,
++                  list.size() * sizeof(AudioFormatListItem), list.data(),
++                  &index_size, &index) == noErr &&
++              index < list.size()) {
++            input_format = list[index].mASBD;
++          }
++        }
++      }
+       break;
+     }
+ #if BUILDFLAG(ENABLE_PLATFORM_AC3_EAC3_AUDIO)
+@@ -424,7 +488,9 @@ bool AudioToolboxAudioDecoder::CreateDecoder(const AudioDecoderConfig& config) {
+           << "AudioConverterSetProperty() failed";
+       return false;
+     }
++  }
+ 
++  if (config.profile() == AudioCodecProfile::kXHE_AAC) {
+     // macOS doesn't provide a default target loudness. Use the value
+     // recommended by Fraunhofer. AC3/E-AC3 doesn't support set this,
+     // so limit this to xHE-AAC only.
+diff --git a/media/filters/mac/audio_toolbox_audio_decoder.h b/media/filters/mac/audio_toolbox_audio_decoder.h
+index b50c0ca201..4b54fa57e5 100644
+--- a/media/filters/mac/audio_toolbox_audio_decoder.h
++++ b/media/filters/mac/audio_toolbox_audio_decoder.h
+@@ -75,6 +75,9 @@ class MEDIA_EXPORT AudioToolboxAudioDecoder : public AudioDecoder {
+   std::unique_ptr<AudioBus> output_bus_;
+   std::unique_ptr<AudioBufferList, base::FreeDeleter> output_buffer_list_;
+ 
++  // Meridian: AAC frames come with an ADTS header to take off (not xHE-AAC).
++  bool strip_adts_ = false;
++
+   // Keeps track of the last input timestamp to use for output generated during
+   // flush (EOS).
+   base::TimeDelta last_input_timestamp_ = kNoTimestamp;
+diff --git a/media/mojo/services/gpu_mojo_media_client_mac.cc b/media/mojo/services/gpu_mojo_media_client_mac.cc
+index 1d1ec8a5db..16ff4187a2 100644
+--- a/media/mojo/services/gpu_mojo_media_client_mac.cc
++++ b/media/mojo/services/gpu_mojo_media_client_mac.cc
+@@ -33,6 +33,8 @@ class GpuMojoMediaClientMac final : public GpuMojoMediaClient {
+   GetPlatformSupportedAudioDecoderConfigs() final {
+     SupportedAudioDecoderConfigs audio_configs;
+     audio_configs.emplace_back(AudioCodec::kAAC, AudioCodecProfile::kXHE_AAC);
++    // Meridian: every AAC; its FFmpeg has no AAC decoder.
++    audio_configs.emplace_back(AudioCodec::kAAC, AudioCodecProfile::kUnknown);
+ #if BUILDFLAG(ENABLE_PLATFORM_AC3_EAC3_AUDIO)
+     audio_configs.emplace_back(AudioCodec::kAC3, AudioCodecProfile::kUnknown);
+     audio_configs.emplace_back(AudioCodec::kEAC3, AudioCodecProfile::kUnknown);

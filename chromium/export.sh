@@ -9,4 +9,5 @@ git format-patch -q --no-signature --zero-commit -o "$HERE/patches" "$(cat "$HER
 rm -f "$HERE"/patches/*-Meridian-generated-*.patch
 # Keep numbering contiguous.
 i=1; for f in "$HERE"/patches/*.patch; do n=$(printf '%04d' $i); b=$(basename "$f"); [ "${b:0:4}" = "$n" ] || mv "$f" "$HERE/patches/$n-${b:5}"; i=$((i+1)); done
+"$HERE/tools/subrepo_patches.sh" export
 ls "$HERE/patches"
