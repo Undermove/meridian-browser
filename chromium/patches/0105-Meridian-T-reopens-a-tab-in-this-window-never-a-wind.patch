@@ -1,0 +1,282 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Sun, 8 Nov 2026 20:57:44 +0400
+Subject: [PATCH 106/106] =?UTF-8?q?Meridian:=20=E2=87=A7=E2=8C=98T=20reope?=
+ =?UTF-8?q?ns=20a=20tab=20in=20this=20window,=20never=20a=20window,=20as?=
+ =?UTF-8?q?=20in=20Arc;=20a=20closed=20Peek=20comes=20back=20as=20a=20Peek?=
+ =?UTF-8?q?;=20=E2=8C=98Z=20outside=20a=20text=20field=20does=20the=20same?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+After a restart ⇧⌘T opened the window the last quit had closed (the session had already
+brought it back), and a tab closed before the restart came back in a new window (its own
+was gone). A closed Little window came back as a window too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar_handler.cc    | 10 +++++++
+ chrome/browser/meridian/tab_data.cc           | 26 +++++++++++++++++++
+ chrome/browser/meridian/tab_data.h            |  8 ++++++
+ ...me_render_widget_host_view_mac_delegate.mm | 13 ++++++++++
+ chrome/browser/ui/browser_live_tab_context.cc |  4 +++
+ chrome/browser/ui/browser_tab_restorer.cc     | 25 ++++++++++++++++++
+ .../core/tab_restore_service_helper.cc        |  8 ++++--
+ .../render_widget_host_view_cocoa.mm          |  5 ++++
+ .../render_widget_host_view_mac_delegate.h    |  5 ++++
+ 9 files changed, 102 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index af21cea527..fac7616299 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -1968,6 +1968,16 @@ void SidebarHandler::OnTabStripModelChanged(
+       // With this window's session (it may come from another window).
+       TabData::Save(inserted.tab->GetContents());
+       MaybePeek(inserted.tab);
++      // A Peek reopened by ⇧⌘T: a Peek again, over its pinned tab if that is
++      // open (Arc); otherwise an ordinary Today tab.
++      std::string peek_over =
++          TabData::TakeRestoredPeek(inserted.tab->GetContents());
++      if (tabs::TabInterface* over =
++              peek_over.empty() ? nullptr : LiveTabOf(peek_over)) {
++        model()->SetOpenerOfTabAt(model()->GetIndexOfTab(inserted.tab),
++                                  over);
++        TabData::SetPeek(inserted.tab->GetContents(), true);
++      }
+     }
+   }
+   // A closed Today tab goes to the archive (not when the window closes).
+diff --git a/chrome/browser/meridian/tab_data.cc b/chrome/browser/meridian/tab_data.cc
+index 61209caaff..454c2f4935 100644
+--- a/chrome/browser/meridian/tab_data.cc
++++ b/chrome/browser/meridian/tab_data.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/meridian/tab_data.h"
+ 
++#include <utility>
++
+ #include "chrome/browser/meridian/space_profiles.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/sessions/session_service.h"
+@@ -21,6 +23,8 @@ constexpr char kItemKey[] = "meridian.item";
+ // The tab's Meridian profile: it comes back in it (session restore runs
+ // before the sidebar model, which knows the spaces' profiles, has loaded).
+ constexpr char kProfileKey[] = "meridian.profile";
++// A closed Peek's pinned item.
++constexpr char kPeekKey[] = "meridian.peek";
+ }  // namespace
+ 
+ TabData::TabData(content::WebContents* contents)
+@@ -53,6 +57,25 @@ void TabData::SetPeek(content::WebContents* contents, bool peek) {
+   FromWebContents(contents)->peek_ = peek;
+ }
+ 
++// static
++std::map<std::string, std::string> TabData::PeekExtraDataOf(
++    content::WebContents* contents,
++    content::WebContents* opener) {
++  const TabData* data = Get(contents);
++  const TabData* over = opener ? Get(opener) : nullptr;
++  if (!data || !data->peek() || !over || over->item_id().empty()) {
++    return {};
++  }
++  return {{kPeekKey, over->item_id()}};
++}
++
++// static
++std::string TabData::TakeRestoredPeek(content::WebContents* contents) {
++  TabData* data = FromWebContents(contents);
++  return data ? std::exchange(data->restored_peek_, std::string())
++              : std::string();
++}
++
+ // static
+ void TabData::RestoreFromExtraData(
+     content::WebContents* contents,
+@@ -66,6 +89,9 @@ void TabData::RestoreFromExtraData(
+   data->space_id_ = space->second;
+   auto item = extra_data.find(kItemKey);
+   data->item_id_ = item == extra_data.end() ? std::string() : item->second;
++  auto peek = extra_data.find(kPeekKey);
++  data->restored_peek_ =
++      peek == extra_data.end() ? std::string() : peek->second;
+ }
+ 
+ // static
+diff --git a/chrome/browser/meridian/tab_data.h b/chrome/browser/meridian/tab_data.h
+index 1327eade80..4d447508e7 100644
+--- a/chrome/browser/meridian/tab_data.h
++++ b/chrome/browser/meridian/tab_data.h
+@@ -51,6 +51,13 @@ class TabData : public content::WebContentsUserData<TabData> {
+   // restart it is an ordinary Today tab.
+   static void SetPeek(content::WebContents* contents, bool peek);
+   bool peek() const { return peek_; }
++  // A closed Peek remembers the pinned item it was over, so ⇧⌘T reopens it as
++  // a Peek (Arc). Only in the closed tab's data, not in the session.
++  static std::map<std::string, std::string> PeekExtraDataOf(
++      content::WebContents* contents,
++      content::WebContents* opener);
++  // The item a tab reopened by ⇧⌘T was a Peek over ("" if none), once.
++  static std::string TakeRestoredPeek(content::WebContents* contents);
+ 
+  private:
+   friend class content::WebContentsUserData<TabData>;
+@@ -61,6 +68,7 @@ class TabData : public content::WebContentsUserData<TabData> {
+   std::string space_id_;
+   std::string item_id_;
+   bool peek_ = false;
++  std::string restored_peek_;
+ 
+   WEB_CONTENTS_USER_DATA_KEY_DECL();
+ };
+diff --git a/chrome/browser/renderer_host/chrome_render_widget_host_view_mac_delegate.mm b/chrome/browser/renderer_host/chrome_render_widget_host_view_mac_delegate.mm
+index d0b36a4d7f..2754099cef 100644
+--- a/chrome/browser/renderer_host/chrome_render_widget_host_view_mac_delegate.mm
++++ b/chrome/browser/renderer_host/chrome_render_widget_host_view_mac_delegate.mm
+@@ -7,6 +7,7 @@
+ #include <cmath>
+ 
+ #include "base/strings/sys_string_conversions.h"
++#include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/actor/ui/actor_overlay_ui.h"
+ #include "chrome/browser/glic/host/guest_util.h"
+ #include "chrome/browser/glic/public/glic_enabling.h"
+@@ -319,6 +320,18 @@
+   return NO;
+ }
+ 
++- (BOOL)undoWithoutTextInput:(id)sender {
++  // Arc: ⌘Z outside a text field reopens the last closed tab, like ⇧⌘T. Sent
++  // the way the menu sends ⇧⌘T, to this view's browser window.
++  NSWindow* window = self.nsView.window;
++  if (!window) {
++    return NO;
++  }
++  NSMenuItem* item = [[NSMenuItem alloc] init];
++  item.tag = IDC_RESTORE_TAB;
++  return [NSApp sendAction:@selector(commandDispatch:) to:window from:item];
++}
++
+ - (void)rendererHandledGestureScrollEvent:(const blink::WebGestureEvent&)event
+                                  consumed:(BOOL)consumed {
+   [_historySwiper rendererHandledGestureScrollEvent:event consumed:consumed];
+diff --git a/chrome/browser/ui/browser_live_tab_context.cc b/chrome/browser/ui/browser_live_tab_context.cc
+index 0aa96eba82..534973fefc 100644
+--- a/chrome/browser/ui/browser_live_tab_context.cc
++++ b/chrome/browser/ui/browser_live_tab_context.cc
+@@ -206,6 +206,10 @@ std::map<std::string, std::string> BrowserLiveTabContext::GetExtraDataForTab(
+   glic::PopulateGlicExtraData(tab, &extra_data);
+   // Meridian: its space, so ⇧⌘T brings it back there, in its profile.
+   extra_data.merge(meridian::TabData::ExtraDataOf(tab->GetContents()));
++  // ...and, for a Peek, the pinned tab it was over: ⇧⌘T reopens it as one.
++  tabs::TabInterface* const opener = tab_strip_model_->GetOpenerOfTabAt(index);
++  extra_data.merge(meridian::TabData::PeekExtraDataOf(
++      tab->GetContents(), opener ? opener->GetContents() : nullptr));
+   if (auto* contextual_tasks_controller =
+           contextual_tasks::ContextualTasksPanelController::From(
+               &browser_.get())) {
+diff --git a/chrome/browser/ui/browser_tab_restorer.cc b/chrome/browser/ui/browser_tab_restorer.cc
+index bf45669bc5..8672e71179 100644
+--- a/chrome/browser/ui/browser_tab_restorer.cc
++++ b/chrome/browser/ui/browser_tab_restorer.cc
+@@ -6,6 +6,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/metrics/user_metrics.h"
+ #include "base/metrics/user_metrics_action.h"
++#include "base/process/process.h"
+ #include "base/supports_user_data.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/sessions/tab_restore_service_factory.h"
+@@ -15,6 +16,8 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "components/sessions/core/tab_restore_service.h"
+ #include "components/sessions/core/tab_restore_service_observer.h"
++#include "components/sessions/core/tab_restore_types.h"
++#include "ui/base/window_open_disposition.h"
+ 
+ namespace chrome {
+ namespace {
+@@ -112,6 +115,28 @@ void RestoreTab(BrowserWindowInterface* browser) {
+     sessions::LiveTabContext* const live_tab_context =
+         BrowserLiveTabContext::From(browser);
+     CHECK(live_tab_context);
++    // Meridian (Arc): ⇧⌘T reopens a tab, not a window. The windows an earlier
++    // run closed as it quit came back with the session at launch: skip them.
++    // A window closed with a single tab (a Little window) gives back its tab,
++    // here.
++    while (!service->entries().empty()) {
++      const sessions::tab_restore::Entry& entry = *service->entries().front();
++      if (entry.type != sessions::tab_restore::Type::WINDOW) {
++        break;
++      }
++      const auto& window =
++          static_cast<const sessions::tab_restore::Window&>(entry);
++      if (window.timestamp < base::Process::Current().CreationTime()) {
++        service->RemoveEntryById(window.id);
++        continue;
++      }
++      if (window.tabs.size() == 1u) {
++        service->RestoreEntryById(live_tab_context, window.tabs.front()->id,
++                                  WindowOpenDisposition::kUnknown);
++        return;
++      }
++      break;
++    }
+     service->RestoreMostRecentEntry(live_tab_context);
+     return;
+   }
+diff --git a/components/sessions/core/tab_restore_service_helper.cc b/components/sessions/core/tab_restore_service_helper.cc
+index 956beba0a7..e7f1b1524b 100644
+--- a/components/sessions/core/tab_restore_service_helper.cc
++++ b/components/sessions/core/tab_restore_service_helper.cc
+@@ -1557,9 +1557,13 @@ LiveTabContext* TabRestoreServiceHelper::RestoreTab(
+     restored_tab = context->ReplaceRestoredTab(tab);
+   } else {
+     // We only respect the tab's original browser if there's no disposition.
++    // Meridian (Arc): ⇧⌘T never opens a window for a tab. One whose window is
++    // gone (closed, or from before a restart) comes back in `context`.
+     if (disposition == WindowOpenDisposition::kUnknown && tab.browser_id) {
+-      context = client_->FindLiveTabContextWithID(
+-          SessionID::FromSerializedValue(tab.browser_id));
++      if (LiveTabContext* original = client_->FindLiveTabContextWithID(
++              SessionID::FromSerializedValue(tab.browser_id))) {
++        context = original;
++      }
+     }
+ 
+     // Restore a grouped tab into its original group, even if the group has
+diff --git a/content/app_shim_remote_cocoa/render_widget_host_view_cocoa.mm b/content/app_shim_remote_cocoa/render_widget_host_view_cocoa.mm
+index 53bc6fac1a..e9d0adb8e6 100644
+--- a/content/app_shim_remote_cocoa/render_widget_host_view_cocoa.mm
++++ b/content/app_shim_remote_cocoa/render_widget_host_view_cocoa.mm
+@@ -2946,6 +2946,11 @@ extern NSString* NSTextInputReplacementRangeAttributeName;
+ }
+ 
+ - (void)undo:(id)sender {
++  if (_textInputType == ui::TEXT_INPUT_TYPE_NONE &&
++      [_responderDelegate respondsToSelector:@selector(undoWithoutTextInput:)] &&
++      [_responderDelegate undoWithoutTextInput:sender]) {
++    return;
++  }
+   _host->Undo();
+ }
+ 
+diff --git a/content/public/browser/render_widget_host_view_mac_delegate.h b/content/public/browser/render_widget_host_view_mac_delegate.h
+index 80b1083ebd..7907ed36e4 100644
+--- a/content/public/browser/render_widget_host_view_mac_delegate.h
++++ b/content/public/browser/render_widget_host_view_mac_delegate.h
+@@ -73,6 +73,11 @@ enum class AcceptTooltipEvents {
+ - (BOOL)validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item
+                       isValidItem:(BOOL*)valid;
+ 
++// Meridian: Undo (⌘Z) while no text field has focus. Return YES if the
++// delegate handled it (Arc reopens the last closed tab); NO lets the page
++// undo as usual.
++- (BOOL)undoWithoutTextInput:(id)sender;
++
+ // The standard set of responder found on NSResponder. These messages are
+ // forwarded by the RenderWidgetHostViewMac/Cocoa to its delegate.
+ - (void)becomeFirstResponder;
