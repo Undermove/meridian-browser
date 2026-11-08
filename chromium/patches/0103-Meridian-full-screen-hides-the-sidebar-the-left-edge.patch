@@ -1,0 +1,219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Sun, 8 Nov 2026 13:11:42 +0400
+Subject: [PATCH 104/104] Meridian: full screen hides the sidebar (the left
+ edge brings it over the page); a video covers the whole screen, also from
+ full screen
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/resources/webui_browser/app.css   | 35 +++++++++-------
+ chrome/browser/resources/webui_browser/app.ts | 27 +++++++++++++
+ .../ui/webui_browser/webui_browser_window.cc  | 40 ++++++++++++++-----
+ .../ui/webui_browser/webui_browser_window.h   |  9 +++++
+ 4 files changed, 86 insertions(+), 25 deletions(-)
+
+diff --git a/chrome/browser/resources/webui_browser/app.css b/chrome/browser/resources/webui_browser/app.css
+index 381cc77e72..9164b5f149 100644
+--- a/chrome/browser/resources/webui_browser/app.css
++++ b/chrome/browser/resources/webui_browser/app.css
+@@ -68,20 +68,6 @@
+   opacity: 0.85;
+ }
+ 
+-/* Tab fullscreen: only the page. */
+-:host([fullscreen-mode='tab']) #sidebar {
+-  display: none;
+-}
+-
+-:host([fullscreen-mode='tab']) #main {
+-  padding: 0;
+-}
+-
+-:host([fullscreen-mode='tab']) content-region {
+-  border-radius: 0;
+-  box-shadow: none;
+-}
+-
+ .grow {
+   flex: 1;
+ }
+@@ -713,3 +699,24 @@ cr-icon-button[hidden] {
+   background-size: 160px;
+   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 1.6 -0.3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+ }
++
++/* Tab full screen (a video): only the page, whatever the sidebar's place or
++ * state; the left edge doesn't bring the sidebar over it. Last, to win. */
++:host([fullscreen-mode='tab']) #sidebar,
++:host([fullscreen-mode='tab']) #edgeHotzone,
++:host([fullscreen-mode='tab']) #peekShield,
++:host([fullscreen-mode='tab']) #main::before {
++  display: none;
++}
++
++:host([fullscreen-mode='tab']) #main,
++:host([fullscreen-mode='tab'][sidebar-hidden]) #main,
++:host([fullscreen-mode='tab'][sidebar-right]) #main,
++:host([fullscreen-mode='tab'][sidebar-right][sidebar-hidden]) #main {
++  padding: 0;
++}
++
++:host([fullscreen-mode='tab']) content-region {
++  border-radius: 0;
++  box-shadow: none;
++}
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index f9b0fdb529..2444396277 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -524,6 +524,10 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.closeSiteControl_();
+     this.sidebarHidden_ = !this.sidebarHidden_;
+     this.sidebarPeek_ = false;
++    // In full screen it lasts until full screen ends.
++    if (this.sidebarHiddenOutsideFullscreen_ !== null) {
++      return;
++    }
+     try {
+       localStorage.setItem(SIDEBAR_HIDDEN_KEY, this.sidebarHidden_ ? '1' : '');
+     } catch {
+@@ -855,8 +859,31 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.showingSidePanel_ = false;
+   }
+ 
++  // The ⌘S choice of the window, while full screen hides the sidebar.
++  private sidebarHiddenOutsideFullscreen_: boolean|null = null;
++
+   protected onFullscreenModeChanged_(
+       isFullscreen: boolean, context: FullscreenContext|null) {
++    this.updateFullscreenMode_(isFullscreen, context);
++    // Arc: full screen hides the sidebar; it slides over the page from the
++    // left edge, as after ⌘S. Leaving it brings back the window's own choice.
++    if (this.fullscreenMode_ === 'browser' &&
++        this.sidebarHiddenOutsideFullscreen_ === null) {
++      this.sidebarHiddenOutsideFullscreen_ = this.sidebarHidden_;
++      this.closeSiteControl_();
++      this.sidebarHidden_ = true;
++      this.sidebarPeek_ = false;
++    } else if (!this.fullscreenMode_ &&
++               this.sidebarHiddenOutsideFullscreen_ !== null) {
++      this.closeSiteControl_();
++      this.sidebarHidden_ = this.sidebarHiddenOutsideFullscreen_;
++      this.sidebarHiddenOutsideFullscreen_ = null;
++      this.sidebarPeek_ = false;
++    }
++  }
++
++  private updateFullscreenMode_(
++      isFullscreen: boolean, context: FullscreenContext|null) {
+     if (!isFullscreen) {
+       this.fullscreenMode_ = '';
+     } else {
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index 02469630a3..e3c6daade9 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -631,6 +631,9 @@ void WebUIBrowserWindow::OnWidgetBoundsChanged(views::Widget* widget,
+   if (modal_dialog_host_) {
+     modal_dialog_host_->NotifyPositionRequiresUpdate();
+   }
++  // The green button and the menu bar's own Enter Full Screen go around
++  // ProcessFullscreen().
++  SyncFullscreenMode();
+ }
+ 
+ gfx::Rect WebUIBrowserWindow::GetContentsBoundsInScreen() const {
+@@ -643,31 +646,46 @@ gfx::Rect WebUIBrowserWindow::GetContentsBoundsInScreen() const {
+ 
+ void WebUIBrowserWindow::ProcessFullscreen(bool fullscreen) {
+   widget_->SetFullscreen(fullscreen);
++  SyncFullscreenMode();
++}
+ 
++// Tells the WebUI which full screen the window is in. Called when the window
++// enters or leaves it (the menu, the green button) and when the controller's
++// state changes without the window changing: a video going full screen in a
++// window that already is, and back.
++void WebUIBrowserWindow::SyncFullscreenMode() {
+   auto* manager = ExclusiveAccessManager::From(browser_);
+   if (!manager) {
+     return;
+   }
+-
+   auto* controller = manager->fullscreen_controller();
++  if (!fullscreen_changed_subscription_) {
++    fullscreen_changed_subscription_ =
++        controller->RegisterOnFullscreenStateChanged(
++            base::BindRepeating(&WebUIBrowserWindow::SyncFullscreenMode,
++                                base::Unretained(this)));
++  }
+ 
++  const bool fullscreen = widget_->IsFullscreen();
+   std::optional<webui_browser::mojom::FullscreenContext> context;
+   if (fullscreen) {
+-    if (controller->IsTabFullscreen()) {
+-      context = webui_browser::mojom::FullscreenContext::kTab;
+-    } else if (controller->IsFullscreenForBrowser()) {
+-      context = webui_browser::mojom::FullscreenContext::kBrowser;
+-    }
++    context = controller->IsTabFullscreen()
++                  ? webui_browser::mojom::FullscreenContext::kTab
++                  : webui_browser::mojom::FullscreenContext::kBrowser;
+   }
++  const bool window_changed = fullscreen != window_fullscreen_;
++  window_fullscreen_ = fullscreen;
++  if (!window_changed && sent_fullscreen_context_ == context) {
++    return;
++  }
++  sent_fullscreen_context_ = context;
+ 
+-  // Notify the WebUI about the fullscreen mode.
+   if (webui_browser::mojom::Page* page = GetWebUIBrowserUI()->page()) {
+     page->OnFullscreenModeChanged(fullscreen, context);
+   }
+-
+-  ExclusiveAccessManager::From(browser_)
+-      ->fullscreen_controller()
+-      ->WindowFullscreenStateChanged();
++  if (window_changed) {
++    controller->WindowFullscreenStateChanged();
++  }
+ }
+ 
+ void WebUIBrowserWindow::DeleteBrowserWindow() {
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.h b/chrome/browser/ui/webui_browser/webui_browser_window.h
+index e528e26ada..dc5b09657c 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.h
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.h
+@@ -6,6 +6,7 @@
+ #define CHROME_BROWSER_UI_WEBUI_BROWSER_WEBUI_BROWSER_WINDOW_H_
+ 
+ #include <memory>
++#include <optional>
+ 
+ #include "base/callback_list.h"
+ #include "base/memory/raw_ptr.h"
+@@ -17,6 +18,7 @@
+ #include "chrome/browser/ui/side_panel/side_panel_entry_key.h"
+ #include "chrome/browser/ui/unload_controller.h"
+ #include "chrome/browser/ui/webui/webui_toolbar/icon_table.h"
++#include "chrome/browser/ui/webui_browser/browser.mojom.h"
+ #include "content/public/browser/web_contents.h"
+ #include "ui/base/accelerators/accelerator.h"
+ #include "ui/base/interaction/element_tracker.h"
+@@ -323,6 +325,13 @@ class WebUIBrowserWindow : public BrowserWindow,
+ 
+   base::CallbackListSubscription zoom_changed_subscription_;
+ 
++  // Full screen as the WebUI last heard it (see SyncFullscreenMode()).
++  void SyncFullscreenMode();
++  base::CallbackListSubscription fullscreen_changed_subscription_;
++  bool window_fullscreen_ = false;
++  std::optional<webui_browser::mojom::FullscreenContext>
++      sent_fullscreen_context_;
++
+   base::WeakPtrFactory<WebUIBrowserWindow> weak_factory_{this};
+ };
+ 
