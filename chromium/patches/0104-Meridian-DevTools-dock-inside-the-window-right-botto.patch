@@ -1,0 +1,467 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Sun, 8 Nov 2026 14:01:06 +0400
+Subject: [PATCH 105/105] Meridian: DevTools dock inside the window (right,
+ bottom, left) and undock into their own window, as in Arc
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../devtools/devtools_ui_controller.cc        |  6 ++
+ .../browser/devtools/devtools_ui_controller.h |  8 ++
+ chrome/browser/resources/webui_browser/app.ts |  5 ++
+ .../resources/webui_browser/content_region.ts | 16 ++++
+ .../resources/webui_browser/webview.css       | 16 ++++
+ .../resources/webui_browser/webview.ts        | 77 ++++++++++++++++++-
+ .../internal/browser_window_features.cc       |  7 ++
+ chrome/browser/ui/webui_browser/browser.mojom | 18 +++++
+ .../ui/webui_browser/webui_browser_window.cc  | 70 +++++++++++++++++
+ .../ui/webui_browser/webui_browser_window.h   |  9 +++
+ 10 files changed, 231 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/devtools/devtools_ui_controller.cc b/chrome/browser/devtools/devtools_ui_controller.cc
+index f2a3fe25fe..00bde65a7c 100644
+--- a/chrome/browser/devtools/devtools_ui_controller.cc
++++ b/chrome/browser/devtools/devtools_ui_controller.cc
+@@ -43,6 +43,7 @@ void DevtoolsUIController::TearDown() {
+ bool DevtoolsUIController::UpdateDevtools(
+     content::WebContents* web_contents,
+     bool update_devtools_web_contents) {
++  on_update_.Notify(web_contents);
+   auto it = std::ranges::find_if(
+       devtools_web_view_controllers_, [&web_contents](const auto& entry) {
+         return entry.first->contents_view()->web_contents() == web_contents;
+@@ -66,6 +67,11 @@ bool DevtoolsUIController::UpdateDevtools(
+   return requires_layout;
+ }
+ 
++base::CallbackListSubscription DevtoolsUIController::RegisterOnUpdate(
++    base::RepeatingCallback<void(content::WebContents*)> callback) {
++  return on_update_.Add(std::move(callback));
++}
++
+ bool DevtoolsUIController::CanDockDevtools() const {
+   return can_dock_devtools_;
+ }
+diff --git a/chrome/browser/devtools/devtools_ui_controller.h b/chrome/browser/devtools/devtools_ui_controller.h
+index aecb3609bf..1e3d8ad241 100644
+--- a/chrome/browser/devtools/devtools_ui_controller.h
++++ b/chrome/browser/devtools/devtools_ui_controller.h
+@@ -47,6 +47,12 @@ class DevtoolsUIController {
+   // Returns true if the browser window can dock a DevTools panel.
+   bool CanDockDevtools() const;
+ 
++  // Meridian: called on every UpdateDevtools() with the inspected contents. A
++  // window without views containers (the WebUI browser) lays docked DevTools
++  // out itself.
++  base::CallbackListSubscription RegisterOnUpdate(
++      base::RepeatingCallback<void(content::WebContents*)> callback);
++
+   // Updates the visibility of the scrim that covers the devtools area.
+   void SetDevtoolsScrimVisibility(content::WebContents* web_contents,
+                                   bool visible);
+@@ -94,6 +100,8 @@ class DevtoolsUIController {
+ 
+   const bool can_dock_devtools_;
+ 
++  base::RepeatingCallbackList<void(content::WebContents*)> on_update_;
++
+   ui::ScopedUnownedUserData<DevtoolsUIController> scoped_data_holder_;
+ };
+ 
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 2444396277..6a912a75c1 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -37,6 +37,7 @@ import type {PropertyValues} from 'chrome://resources/lit/v3_0/lit.rollup.js';
+ import {getCss} from './app.css.js';
+ import {getHtml} from './app.html.js';
+ import {browserProxyFactory, FullscreenContext, SecurityIcon} from './browser.mojom-webui.js';
++import type {DevtoolsLayout} from './browser.mojom-webui.js';
+ import type {ContentRegionElement} from './content_region.js';
+ import type {SidePanelElement} from './side_panel.js';
+ import type {TabAdded, TabClosed, TabUpdated} from './tab_strip/events.js';
+@@ -235,6 +236,10 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     callbackRouter.onPaintAsActiveChanged.addListener((active: boolean) => {
+       this.inactive_ = !active;
+     });
++    callbackRouter.onDevtoolsChanged.addListener(
++        (tabId: string, layout: DevtoolsLayout|null) => {
++          this.$.contentRegion.setDevtools(tabId, layout);
++        });
+   }
+ 
+   override async connectedCallback() {
+diff --git a/chrome/browser/resources/webui_browser/content_region.ts b/chrome/browser/resources/webui_browser/content_region.ts
+index b2df0c9dfc..c99ee6a523 100644
+--- a/chrome/browser/resources/webui_browser/content_region.ts
++++ b/chrome/browser/resources/webui_browser/content_region.ts
+@@ -7,6 +7,7 @@ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+ import {getCss} from './content_region.css.js';
++import type {DevtoolsLayout} from './browser.mojom-webui.js';
+ import {TabWebviewElement} from './webview.js';
+ 
+ export class ContentRegionElement extends CrLitElement {
+@@ -48,6 +49,19 @@ export class ContentRegionElement extends CrLitElement {
+     webview.setActive(true);
+   }
+ 
++  // Meridian: DevTools docked in a tab (null: none). They wait for the tab's
++  // webview if it isn't there yet.
++  private devtools_: Map<string, DevtoolsLayout> = new Map();
++
++  setDevtools(tabId: string, layout: DevtoolsLayout|null) {
++    if (layout) {
++      this.devtools_.set(tabId, layout);
++    } else {
++      this.devtools_.delete(tabId);
++    }
++    this.webviews.get(tabId)?.setDevtools(layout);
++  }
++
+   hasTab(tabId: string) {
+     return this.webviews.has(tabId);
+   }
+@@ -61,6 +75,7 @@ export class ContentRegionElement extends CrLitElement {
+     webview.addEventListener('focusin', this.onWebviewFocusIn_);
+     this.webviews.set(tabId, webview);
+     this.shadowRoot.appendChild(webview);
++    webview.setDevtools(this.devtools_.get(tabId) ?? null);
+     if (isActive) {
+       this.activateTab(tabId);
+     }
+@@ -196,6 +211,7 @@ export class ContentRegionElement extends CrLitElement {
+       this.activeWebview = undefined;
+     }
+     this.webviews.delete(tabId);
++    this.devtools_.delete(tabId);
+     webview.remove();
+     this.requestUpdate();
+   }
+diff --git a/chrome/browser/resources/webui_browser/webview.css b/chrome/browser/resources/webui_browser/webview.css
+index 29f27d1e33..b84cb00ca3 100644
+--- a/chrome/browser/resources/webui_browser/webview.css
++++ b/chrome/browser/resources/webui_browser/webview.css
+@@ -23,3 +23,19 @@
+   width: 100%;
+   height: 100%;
+ }
++
++/* Meridian: docked DevTools cover the tab; the page lies over them where they
++ * place it (webview.ts placePage_()). */
++:host([devtools]) {
++  position: relative;
++}
++
++:host([devtools]) .devtools {
++  position: absolute;
++  inset: 0;
++}
++
++:host([devtools]) .content {
++  position: absolute;
++  z-index: 1;
++}
+diff --git a/chrome/browser/resources/webui_browser/webview.ts b/chrome/browser/resources/webui_browser/webview.ts
+index a614a5518b..d4935ed078 100644
+--- a/chrome/browser/resources/webui_browser/webview.ts
++++ b/chrome/browser/resources/webui_browser/webview.ts
+@@ -8,7 +8,7 @@ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+ import {browserProxyFactory, GuestHandlerRemote} from './browser.mojom-webui.js';
+-import type {SecurityIcon} from './browser.mojom-webui.js';
++import type {DevtoolsLayout, SecurityIcon} from './browser.mojom-webui.js';
+ import {getCss} from './webview.css.js';
+ import {getHtml} from './webview.html.js';
+ 
+@@ -128,6 +128,8 @@ export class TabWebviewElement extends WebviewElement {
+ 
+   override updated(changedProperties: PropertyValues<this>) {
+     super.updated(changedProperties);
++    // A new page element (the guest attached): where DevTools want it.
++    this.placePage_();
+     // Focus the content element when guestId is set and the tab is active.
+     if (this.classList.contains('active') && changedProperties.has('guestId')) {
+       const content = this.shadowRoot.querySelector<HTMLElement>('.content');
+@@ -137,6 +139,79 @@ export class TabWebviewElement extends WebviewElement {
+     }
+   }
+ 
++  // Meridian: DevTools docked in this tab cover its area, as in Chrome; the
++  // page lies over them where they say (their splitter is their own).
++  private devtools_: WebviewElement|null = null;
++  private devtoolsLayout_: DevtoolsLayout|null = null;
++  private devtoolsResize_: ResizeObserver|null = null;
++
++  setDevtools(layout: DevtoolsLayout|null) {
++    this.devtoolsLayout_ = layout;
++    if (!layout) {
++      this.devtools_?.remove();
++      this.devtools_ = null;
++      this.devtoolsResize_?.disconnect();
++      this.devtoolsResize_ = null;
++      this.toggleAttribute('devtools', false);
++      this.style.removeProperty('--page-rect');
++      this.placePage_();
++      return;
++    }
++    if (!this.devtools_) {
++      this.devtools_ = document.createElement('cr-webview');
++      this.devtools_.classList.add('devtools');
++      this.devtools_.allowPinchZoom = false;
++      this.shadowRoot.prepend(this.devtools_);
++      this.devtoolsResize_ = new ResizeObserver(() => this.placePage_());
++      this.devtoolsResize_.observe(this);
++    }
++    const id = layout.devtoolsId;
++    if (this.devtools_.guestId !== id) {
++      this.devtools_.guestId = id;
++    }
++    this.toggleAttribute('devtools', true);
++    this.placePage_();
++  }
++
++  // DevTools' resizing strategy applied to this tab's size (Chrome:
++  // ApplyDevToolsContentsResizingStrategy).
++  private placePage_() {
++    const layout = this.devtoolsLayout_;
++    const target = this.pageElement_();
++    if (!target) {
++      return;
++    }
++    if (!layout || (!layout.hideInspected && (!layout.width || !layout.height))) {
++      target.style.removeProperty('left');
++      target.style.removeProperty('top');
++      target.style.removeProperty('width');
++      target.style.removeProperty('height');
++      target.style.removeProperty('visibility');
++      return;
++    }
++    const w = this.clientWidth;
++    const h = this.clientHeight;
++    const left = Math.min(layout.x, w);
++    const top = Math.min(layout.y, h);
++    let width = Math.min(layout.width, w);
++    let height = Math.min(layout.height, h);
++    if (layout.dockSide === 'right') {
++      width = Math.min(width, Math.max(0, w - 250));
++    } else if (layout.dockSide === 'bottom') {
++      height = Math.min(height, Math.max(0, h - 72));
++    }
++    target.style.left = `${left}px`;
++    target.style.top = `${top}px`;
++    target.style.width = `${width}px`;
++    target.style.height = `${height}px`;
++    target.style.visibility = layout.hideInspected ? 'hidden' : '';
++  }
++
++  // The tab's own page (the DevTools one is inside their <cr-webview>).
++  private pageElement_(): HTMLElement|null {
++    return this.shadowRoot.querySelector<HTMLElement>('.content');
++  }
++
+   openPageInfoMenu() {
+     this.guestHandler.openPageInfoMenu();
+   }
+diff --git a/chrome/browser/ui/browser_window/internal/browser_window_features.cc b/chrome/browser/ui/browser_window/internal/browser_window_features.cc
+index 728f2fc352..b1d79a066d 100644
+--- a/chrome/browser/ui/browser_window/internal/browser_window_features.cc
++++ b/chrome/browser/ui/browser_window/internal/browser_window_features.cc
+@@ -772,6 +772,13 @@ void BrowserWindowFeatures::InitPostWindowConstruction(
+     devtools_ui_controller_ =
+         GetUserDataFactory().CreateInstance<DevtoolsUIController>(
+             *browser, browser_, browser_view->GetContentsContainerViews());
++  } else if (webui_browser_window) {
++    // Meridian: DevTools dock in the WebUI window too, which lays them out
++    // itself (WebUIBrowserWindow::UpdateDevtoolsForContents()).
++    devtools_ui_controller_ =
++        GetUserDataFactory().CreateInstance<DevtoolsUIController>(
++            *browser, browser_,
++            std::vector<raw_ptr<ContentsContainerView, DanglingUntriaged>>());
+   }
+ 
+   // Must be before exclusive_access_manager_ (whose construction calls
+diff --git a/chrome/browser/ui/webui_browser/browser.mojom b/chrome/browser/ui/webui_browser/browser.mojom
+index 1019073a72..20d9bb5f2d 100644
+--- a/chrome/browser/ui/webui_browser/browser.mojom
++++ b/chrome/browser/ui/webui_browser/browser.mojom
+@@ -27,6 +27,20 @@ enum FullscreenContext {
+ };
+ 
+ // Requests from the browser to WebUI ui for it.
++// Meridian: DevTools docked in a tab. They cover the tab's area; the page
++// lies over them at `x, y, width, height` within it (DevTools' own resizing
++// strategy: empty means the whole area, unless `hide_inspected`).
++struct DevtoolsLayout {
++  mojo_base.mojom.UnguessableToken devtools_id;
++  int32 x;
++  int32 y;
++  int32 width;
++  int32 height;
++  bool hide_inspected;
++  // "right", "bottom", "left" or "".
++  string dock_side;
++};
++
+ interface Page {
+   // Requests the location box be focused. `is_user_initiated` is true if the
+   // user has asked for it explicitly (e.g. by pressing Ctrl-L) rather than this
+@@ -50,6 +64,10 @@ interface Page {
+ 
+   // Notifies the WebUI that the window's paint-as-active state has changed.
+   OnPaintAsActiveChanged(bool active);
++
++  // Meridian: DevTools docked in `tab_id` changed (opened, moved, resized or
++  // closed: null).
++  OnDevtoolsChanged(tabs_api.mojom.NodeId tab_id, DevtoolsLayout? layout);
+ };
+ 
+ // Browser-side handler for requests from WebUI page.
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index e3c6daade9..c569c631d5 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -14,6 +14,9 @@
+ #include "base/task/sequenced_task_runner.h"
+ #include "chrome/browser/app_mode/app_mode_utils.h"
+ #include "chrome/browser/lifetime/browser_shutdown.h"
++#include "chrome/browser/devtools/devtools_contents_resizing_strategy.h"
++#include "chrome/browser/devtools/devtools_ui_controller.h"
++#include "chrome/browser/devtools/devtools_window.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "ui/base/window_open_disposition.h"
+@@ -39,6 +42,7 @@
+ #include "chrome/browser/ui/interaction/browser_elements.h"
+ #include "chrome/browser/ui/side_panel/side_panel_ui_base.h"
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "chrome/browser/ui/unload_controller.h"
+ #include "chrome/browser/ui/views/find_bar_host.h"
+ #include "chrome/browser/ui/views/find_bar_owner.h"
+@@ -58,8 +62,11 @@
+ #include "chrome/common/channel_info.h"
+ #include "chrome/common/chrome_render_frame.mojom.h"
+ #include "chrome/common/webui_url_constants.h"
++#include "components/browser_apis/tab_strip/types/node_id.h"
++#include "content/public/browser/surface_embed_connector.h"
+ #include "components/input/native_web_keyboard_event.h"
+ #include "components/sharing_message/sharing_dialog_data.h"
++#include "components/surface_embed/browser/surface_embed_handle.h"
+ #include "components/version_info/channel.h"
+ #include "components/version_info/version_info.h"
+ #include "components/web_modal/web_contents_modal_dialog_manager.h"
+@@ -294,6 +301,13 @@ WebUIBrowserWindow* WebUIBrowserWindow::FromNativeWindow(
+ // The code about Browser's activation state is copied from
+ // BrowserView::Show().
+ void WebUIBrowserWindow::Show() {
++  if (!devtools_update_subscription_) {
++    if (auto* devtools = DevtoolsUIController::From(browser_.get())) {
++      devtools_update_subscription_ = devtools->RegisterOnUpdate(
++          base::BindRepeating(&WebUIBrowserWindow::UpdateDevtoolsForContents,
++                              base::Unretained(this)));
++    }
++  }
+ #if !BUILDFLAG(IS_WIN) && !BUILDFLAG(IS_CHROMEOS)
+   // The Browser associated with this browser window must become the active
+   // browser at the time Show() is called. This is the natural behavior under
+@@ -688,6 +702,62 @@ void WebUIBrowserWindow::SyncFullscreenMode() {
+   }
+ }
+ 
++void WebUIBrowserWindow::UpdateDevtoolsForContents(
++    content::WebContents* inspected) {
++  tabs::TabInterface* tab =
++      inspected ? tabs::TabInterface::MaybeGetFromContents(inspected) : nullptr;
++  webui_browser::mojom::Page* page = GetWebUIBrowserUI()->page();
++  if (!tab || !page) {
++    return;
++  }
++  DevToolsContentsResizingStrategy strategy;
++  content::WebContents* devtools =
++      DevToolsWindow::GetInTabWebContents(inspected, &strategy);
++  // DevTools leaving the tab (undocked into their own window, or closed) let
++  // go of the embed now: their window takes them right after this, before the
++  // WebUI's own detach arrives, which would leave them hidden there, 0x0.
++  const tabs::TabHandle handle = tab->GetHandle();
++  if (auto it = docked_devtools_.find(handle); it != docked_devtools_.end()) {
++    content::WebContents* before = it->second.get();
++    if (before && before != devtools) {
++      if (auto* connector = before->GetSurfaceEmbedConnector()) {
++        connector->GetDelegate()->DetachedByHost();
++      }
++    }
++    docked_devtools_.erase(it);
++  }
++  if (devtools) {
++    docked_devtools_[handle] = devtools->GetWeakPtr();
++  }
++  webui_browser::mojom::DevtoolsLayoutPtr layout;
++  if (devtools) {
++    surface_embed::SurfaceEmbedHandle::CreateForWebContents(devtools);
++    layout = webui_browser::mojom::DevtoolsLayout::New();
++    layout->devtools_id =
++        surface_embed::SurfaceEmbedHandle::FromWebContents(devtools)->id();
++    layout->x = strategy.bounds().x();
++    layout->y = strategy.bounds().y();
++    layout->width = strategy.bounds().width();
++    layout->height = strategy.bounds().height();
++    layout->hide_inspected = strategy.hide_inspected_contents();
++    switch (strategy.dock_side()) {
++      case devtools::DockSide::kRight:
++        layout->dock_side = "right";
++        break;
++      case devtools::DockSide::kBottom:
++        layout->dock_side = "bottom";
++        break;
++      case devtools::DockSide::kLeft:
++        layout->dock_side = "left";
++        break;
++      default:
++        break;
++    }
++  }
++  page->OnDevtoolsChanged(tabs_api::NodeId::FromTabHandle(tab->GetHandle()),
++                          std::move(layout));
++}
++
+ void WebUIBrowserWindow::DeleteBrowserWindow() {
+   delete this;
+ }
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.h b/chrome/browser/ui/webui_browser/webui_browser_window.h
+index dc5b09657c..6c9bd5f822 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.h
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_UI_WEBUI_BROWSER_WEBUI_BROWSER_WINDOW_H_
+ #define CHROME_BROWSER_UI_WEBUI_BROWSER_WEBUI_BROWSER_WINDOW_H_
+ 
++#include <map>
+ #include <memory>
+ #include <optional>
+ 
+@@ -19,6 +20,7 @@
+ #include "chrome/browser/ui/unload_controller.h"
+ #include "chrome/browser/ui/webui/webui_toolbar/icon_table.h"
+ #include "chrome/browser/ui/webui_browser/browser.mojom.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/web_contents.h"
+ #include "ui/base/accelerators/accelerator.h"
+ #include "ui/base/interaction/element_tracker.h"
+@@ -325,6 +327,13 @@ class WebUIBrowserWindow : public BrowserWindow,
+ 
+   base::CallbackListSubscription zoom_changed_subscription_;
+ 
++  // Meridian: docked DevTools, laid out by the WebUI over the tab's page.
++  void UpdateDevtoolsForContents(content::WebContents* inspected);
++  base::CallbackListSubscription devtools_update_subscription_;
++  // The DevTools contents each tab embeds.
++  std::map<tabs::TabHandle, base::WeakPtr<content::WebContents>>
++      docked_devtools_;
++
+   // Full screen as the WebUI last heard it (see SyncFullscreenMode()).
+   void SyncFullscreenMode();
+   base::CallbackListSubscription fullscreen_changed_subscription_;
