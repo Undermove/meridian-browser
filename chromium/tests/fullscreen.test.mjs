@@ -78,14 +78,21 @@ test('full screen: the exit hint shows, then goes away by itself', async () => {
   } finally { await b.close(); }
 });
 
+// Where the sidebar ends up, not its slide: with the Mac's screen locked a full screen window draws
+// no frames, and a sliding sidebar stays where it started.
+const noSlide = (b) => b.eval(`(() => { const s = document.createElement('style');
+  s.textContent = '#sidebar { transition: none !important; }'; app.shadowRoot.append(s); })()`);
 const sidebarKey = (b) => b.eval(`${T}.handler_.testKeyPress(1, 's', ${CMD})`);  // ⌘S
 
 test('full screen keeps the sidebar where it was: shown stays shown beside the page, ⌘S still hides it', async () => {
   const b = await launch([VIDEO], { args: ARGS });
+  const move = (x, y) => b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
     const windowed = await layout(b);
     assert.ok(windowed.sidebarSeen && windowed.page.x > 200, `windowed: the sidebar beside the page: ${JSON.stringify(windowed)}`);
+    await move(windowed.win / 2, 300);  // the pointer over the page: at the left edge, a hidden sidebar slides out
+    await noSlide(b);
 
     await toggleFullscreen(b);
     await settled(b, () => layout(b), (l) => l.mode === 'browser' && l.win === l.screen && l.sidebarSeen && l.page.x > 200,
@@ -110,6 +117,7 @@ test('a sidebar hidden with ⌘S stays hidden in full screen; the left edge slid
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
     const windowed = await layout(b);
     await move(windowed.win / 2, 300);  // the pointer over the page, not at the edge
+    await noSlide(b);
     await sidebarKey(b);
     await settled(b, () => layout(b), (l) => l.mode === '' && !l.sidebarSeen && l.page.x < 20, '⌘S hides the sidebar');
 
