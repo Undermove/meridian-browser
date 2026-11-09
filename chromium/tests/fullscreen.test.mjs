@@ -1,9 +1,9 @@
 // macOS full screen: the "exit full screen" hint shows at the top and goes away after a few
 // seconds, as in Chrome. It stayed for as long as full screen lasted: the hide timer waited for
 // presentation feedback that the WebUI window's full screen never sends.
-// Arc in full screen: the sidebar hides and slides over the page from the left edge; a video
-// (the page's own full screen) covers the whole screen, also when the window already is full
-// screen.
+// Arc in full screen: the sidebar stays as the person left it (shown, or hidden with ⌘S and sliding
+// over the page from the left edge); a video (the page's own full screen) covers the whole screen,
+// also when the window already is full screen.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { launch, SB } from './harness.mjs';
@@ -78,18 +78,44 @@ test('full screen: the exit hint shows, then goes away by itself', async () => {
   } finally { await b.close(); }
 });
 
-test('full screen hides the sidebar; the left edge slides it over the page; leaving brings it back', async () => {
+const sidebarKey = (b) => b.eval(`${T}.handler_.testKeyPress(1, 's', ${CMD})`);  // ⌘S
+
+test('full screen keeps the sidebar where it was: shown stays shown beside the page, ⌘S still hides it', async () => {
+  const b = await launch([VIDEO], { args: ARGS });
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    const windowed = await layout(b);
+    assert.ok(windowed.sidebarSeen && windowed.page.x > 200, `windowed: the sidebar beside the page: ${JSON.stringify(windowed)}`);
+
+    await toggleFullscreen(b);
+    await settled(b, () => layout(b), (l) => l.mode === 'browser' && l.win === l.screen && l.sidebarSeen && l.page.x > 200,
+        'full screen: the sidebar still beside the page');
+
+    await sidebarKey(b);
+    await settled(b, () => layout(b), (l) => l.mode === 'browser' && !l.sidebarSeen && l.page.x < 20, '⌘S in full screen hides it');
+    await sidebarKey(b);
+    await settled(b, () => layout(b), (l) => l.mode === 'browser' && l.sidebarSeen && l.page.x > 200, 'and ⌘S brings it back');
+
+    await toggleFullscreen(b);
+    const back = await settled(b, () => layout(b), (l) => l.mode === '' && l.sidebarSeen && l.page.x > 200,
+        'out of full screen: the sidebar in its place');
+    assert.equal(back.win, windowed.win);
+  } finally { await b.close(); }
+});
+
+test('a sidebar hidden with ⌘S stays hidden in full screen; the left edge slides it over the page; it stays hidden after', async () => {
   const b = await launch([VIDEO], { args: ARGS });
   const move = (x, y) => b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
     const windowed = await layout(b);
-    assert.ok(windowed.sidebarSeen && windowed.page.x > 200, `windowed: the sidebar beside the page: ${JSON.stringify(windowed)}`);
     await move(windowed.win / 2, 300);  // the pointer over the page, not at the edge
+    await sidebarKey(b);
+    await settled(b, () => layout(b), (l) => l.mode === '' && !l.sidebarSeen && l.page.x < 20, '⌘S hides the sidebar');
 
     await toggleFullscreen(b);
     const full = await settled(b, () => layout(b), (l) => l.mode === 'browser' && l.win === l.screen && !l.sidebarSeen && l.page.x < 20,
-        'full screen: the page from the left edge, no sidebar');
+        'full screen: still hidden, the page from the left edge');
     assert.ok(full.page.w > full.win - 40, `the page across the screen: ${JSON.stringify(full)}`);
 
     await move(2, 300);
@@ -99,10 +125,8 @@ test('full screen hides the sidebar; the left edge slides it over the page; leav
     await settled(b, () => layout(b), (l) => !l.sidebarSeen, 'away from it, it goes');
 
     await toggleFullscreen(b);
-    const back = await settled(b, () => layout(b), (l) => l.mode === '' && l.sidebarSeen && l.page.x > 200,
-        'out of full screen: the sidebar is back in its place');
-    assert.equal(back.win, windowed.win);
-    assert.notEqual(await b.eval(`localStorage.getItem('meridian.sidebarHidden')`), '1', 'full screen is not ⌘S');
+    await settled(b, () => layout(b), (l) => l.mode === '' && !l.sidebarSeen && l.page.x < 20, 'out of full screen: still hidden');
+    assert.equal(await b.eval(`localStorage.getItem('meridian.sidebarHidden')`), '1');
   } finally { await b.close(); }
 });
 
@@ -125,9 +149,9 @@ for (const fromFullscreen of [false, true]) {
       await esc(b);
       await page.waitFor('!document.fullscreenElement');
       if (fromFullscreen) {
-        const l = await settled(b, () => layout(b), (x) => x.mode === 'browser' && x.win === x.screen && !x.sidebarSeen && x.page.x < 20,
-            'Esc: back to full screen, the sidebar still hidden');
-        assert.ok(l.page.w > l.win - 40);
+        const l = await settled(b, () => layout(b), (x) => x.mode === 'browser' && x.win === x.screen && x.sidebarSeen && x.page.x > 200,
+            'Esc: back to full screen, the sidebar beside the page');
+        assert.ok(l.page.x + l.page.w > l.win - 40);
         await toggleFullscreen(b);
       }
       await settled(b, () => layout(b), (l) => l.mode === '' && l.sidebarSeen && l.page.x > 200, 'and to the window with its sidebar');
