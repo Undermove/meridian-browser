@@ -82,6 +82,8 @@ test('full screen: the exit hint shows, then goes away by itself', async () => {
 // no frames, and a sliding sidebar stays where it started.
 const noSlide = (b) => b.eval(`(() => { const s = document.createElement('style');
   s.textContent = '#sidebar { transition: none !important; }'; app.shadowRoot.append(s); })()`);
+// The class of the window the close/minimize/zoom buttons are in; empty while they are hidden.
+const controls = (b) => b.eval(`${T}.handler_.testWindowState().then((s) => s.controls ?? '')`);
 const sidebarKey = (b) => b.eval(`${T}.handler_.testKeyPress(1, 's', ${CMD})`);  // ⌘S
 
 test('full screen keeps the sidebar where it was: shown stays shown beside the page, ⌘S still hides it', async () => {
@@ -120,11 +122,15 @@ test('a sidebar hidden with ⌘S stays hidden in full screen; the left edge slid
     await noSlide(b);
     await sidebarKey(b);
     await settled(b, () => layout(b), (l) => l.mode === '' && !l.sidebarSeen && l.page.x < 20, '⌘S hides the sidebar');
+    assert.equal(await controls(b), '', 'windowed, they hide with the sidebar, as in Arc');
 
     await toggleFullscreen(b);
     const full = await settled(b, () => layout(b), (l) => l.mode === 'browser' && l.win === l.screen && !l.sidebarSeen && l.page.x < 20,
         'full screen: still hidden, the page from the left edge');
     assert.ok(full.page.w > full.win - 40, `the page across the screen: ${JSON.stringify(full)}`);
+    // The window's close, minimize and zoom buttons stay for the bar macOS slides down at the top of
+    // the screen (with the sidebar hidden they went too, and the bar came down empty).
+    assert.ok((await controls(b)).length, `full screen: the window buttons are there for macOS's top bar`);
 
     await move(2, 300);
     const peek = await settled(b, () => layout(b), (l) => l.sidebarSeen, 'the left edge brings the sidebar');
@@ -134,6 +140,7 @@ test('a sidebar hidden with ⌘S stays hidden in full screen; the left edge slid
 
     await toggleFullscreen(b);
     await settled(b, () => layout(b), (l) => l.mode === '' && !l.sidebarSeen && l.page.x < 20, 'out of full screen: still hidden');
+    await settled(b, () => controls(b), (c) => c === '', 'and the window buttons hide again');
     assert.equal(await b.eval(`localStorage.getItem('meridian.sidebarHidden')`), '1');
   } finally { await b.close(); }
 });
