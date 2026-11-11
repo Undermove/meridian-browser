@@ -12,6 +12,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const CMD = 1 << 20;
 const KEY = {
   t: [17, 't'], a: [0, 'a'], l: [37, 'l'], p: [35, 'p'], h: [4, 'h'], x: [7, 'x'],
+  w: [13, 'w'], o: [31, 'o'], r: [15, 'r'], k: [40, 'k'], s: [1, 's'], c: [8, 'c'], e: [14, 'e'],
   down: [125, ''], up: [126, ''], enter: [36, '\r'], esc: [53, '\u001b'],
 };
 const CB = 'app.$.commandBar.shadowRoot';
@@ -244,5 +245,30 @@ test('⌘T and the start of an open tab\'s name: that tab comes first, picked; R
     await press(KEY.enter);
     assert.ok(await until(async () => { const x = await state(); return !x.open && x.active === 'Knowledgebase admin'; }), `switched: ${JSON.stringify(await state())}`);
     assert.equal(await b.eval(`${SB}.querySelectorAll('meridian-tab-row').length`), 3, 'no new tab');
+  } finally { await b.close(); s.close(); }
+});
+
+// Arc's command bar finds the browser's own features too: "workspace" brings up the Workbench under
+// a Meridian heading, picked for Return, above the web suggestions; Return opens it.
+test('⌘T and "workspace": the Workbench, under Meridian, picked; Return opens it', async () => {
+  const { b, s, press, state } = await start(['One', 'Two']);
+  const features = () => b.eval(`[...${CB}.querySelectorAll('#features .tab-row')].map((r) => (r.classList.contains('sel') ? '>' : '') + r.querySelector('.tab-title').textContent)`);
+  try {
+    await press(KEY.t, CMD);
+    await b.waitFor(`app.$.commandBar.open`);
+    for (const ch of 'workspace') await press(KEY[ch]);
+    assert.equal(await until(async () => (await state()).input), 'workspace');
+    const f = await until(async () => { const v = await features(); return v.length ? v : null; });
+    assert.deepEqual(f, ['>Workbench', 'New Space'], 'the features it names, the Workbench picked');
+    assert.equal(await b.eval(`${CB}.querySelector('#features .section').textContent.trim()`), 'Meridian');
+    // ↓ to New Space and back up.
+    await press(KEY.down);
+    assert.deepEqual(await features(), ['Workbench', '>New Space']);
+    await press(KEY.up);
+    assert.deepEqual(await features(), ['>Workbench', 'New Space']);
+    await press(KEY.enter);
+    assert.ok(await until(async () => !(await state()).open), 'the bar closed');
+    assert.ok(await until(() => b.eval(`[...app.$.tabstrip.tabs_.values()].some((t) => t.isActive && t.url.startsWith('chrome://workbench'))`), 10000),
+        'the Workbench is open and shown');
   } finally { await b.close(); s.close(); }
 });

@@ -1,5 +1,6 @@
 // The mini player (Arc's): media playing in another tab shows above the sidebar's bottom bar with
-// its track, play/pause and next; clicking it goes to the tab, where it steps aside.
+// its track, play/pause and next; clicking it goes to the tab, where it steps aside. Its × closes it
+// (the media pauses); playing again in that tab brings it back.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -64,6 +65,49 @@ test('media in another tab shows a mini player: track, play/pause, next; a click
     await b.click(`${P}.querySelector('.player-main')`);
     await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive)?.tab.title === 'Radio'`);
     await b.waitFor(`!${P}`);
+  } finally {
+    await b.close();
+    server.close();
+  }
+});
+
+test('the mini player\'s × closes it and pauses the media; playing again in the tab brings it back', async () => {
+  const wav = toneWav();
+  const server = http.createServer((req, res) => {
+    if (req.url === '/tone.wav') { res.writeHead(200, { 'content-type': 'audio/wav' }); res.end(wav); return; }
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(req.url === '/music' ? MUSIC : '<!doctype html><title>Quiet</title>');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = (p) => `http://127.0.0.1:${server.address().port}${p}`;
+  const b = await launch([url('/music'), url('/quiet')], { args: ['--autoplay-policy=no-user-gesture-required'] });
+  const P = `${SB}.getElementById('player')`;
+  const music = async () => {
+    const t = (await (await fetch(`${b.base}/json/list`)).json()).find((x) => x.url.endsWith('/music'));
+    const ws = new WebSocket(t.webSocketDebuggerUrl);
+    await new Promise((r) => (ws.onopen = r));
+    return (expr) => new Promise((res) => { ws.onmessage = (e) => res(JSON.parse(e.data).result?.result?.value); ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: expr, returnByValue: true } })); });
+  };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 2`);
+    await b.click(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Quiet').shadowRoot.querySelector('.row')`);
+    await b.waitFor(`!!${P}`, 15000);
+    // The pointer over it shows its ×.
+    const box = await b.eval(`(() => { const r = ${P}.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+    await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: box.x, y: box.y, button: 'none' });
+    await b.waitFor(`(() => { const x = ${P}.querySelector('.player-close'); return !!x && getComputedStyle(x).opacity > 0.5; })()`, 3000);
+    await b.click(`${P}.querySelector('.player-close')`);
+    await b.waitFor(`!${P}`, 3000);
+    const page = await music();
+    for (let i = 0; i < 30 && !(await page('document.getElementById("a").paused')); i++) await sleep(100);
+    assert.equal(await page('document.getElementById("a").paused'), true, 'the media paused');
+    // It stays closed (the poll and tab updates don't bring it back).
+    await sleep(3500);
+    assert.equal(await b.eval(`!!${P}`), false, 'still closed');
+    // Playing again in that tab: back.
+    await page('document.getElementById("a").play()');
+    await b.waitFor(`!!${P}`, 15000);
   } finally {
     await b.close();
     server.close();

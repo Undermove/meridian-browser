@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 11 Nov 2026 14:13:40 +0400
+Subject: [PATCH 111/113] =?UTF-8?q?Meridian:=20a=20page=20can't=20keep=20?=
+ =?UTF-8?q?=E2=8C=981-9=20or=20=E2=8C=83Tab,=20also=20in=20full=20screen?=
+ =?UTF-8?q?=20(a=20video=20player's=20keys)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A film site's player in a cross-origin iframe kept every key: the digits
+seek, so ⌘1-9 never reached the browser. ⌘1-9 are reserved now, like
+⌘⌥↑/↓ and ⌃1-9; a key that reaches a page is matched against the menus'
+shortcuts too (⌃Tab, ⌘⌥←/→) by its code. In macOS full screen the sidebar
+is still the toolbar, so the browser keeps its shortcuts there; only a
+page's own full screen (a video) has every key but Esc.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/ui/accelerator_table.cc         | 12 +++++++++++-
+ .../ui/webui_browser/webui_browser_window.cc   |  7 +++++--
+ .../webui_browser/webui_browser_window_mac.mm  | 18 ++++++++++++++++++
+ 3 files changed, 34 insertions(+), 3 deletions(-)
+
+diff --git a/chrome/browser/ui/accelerator_table.cc b/chrome/browser/ui/accelerator_table.cc
+index 71a0f80e26..d7da8fb216 100644
+--- a/chrome/browser/ui/accelerator_table.cc
++++ b/chrome/browser/ui/accelerator_table.cc
+@@ -358,7 +358,17 @@ constexpr int kReservedCommandIds[] = {
+     IDC_CYCLE_TO_PREV_TAB,
+     IDC_EXIT,
+     // Meridian: switching spaces and tabs works whatever the page does with
+-    // the keys, like Arc (pages can't keep ⌘⌥←/→/↑/↓ or ⌃1-9 for themselves).
++    // the keys, like Arc (pages can't keep ⌘⌥←/→/↑/↓, ⌘1-9 or ⌃1-9 for
++    // themselves: a video player seeks with the digits).
++    IDC_SELECT_TAB_0,
++    IDC_SELECT_TAB_1,
++    IDC_SELECT_TAB_2,
++    IDC_SELECT_TAB_3,
++    IDC_SELECT_TAB_4,
++    IDC_SELECT_TAB_5,
++    IDC_SELECT_TAB_6,
++    IDC_SELECT_TAB_7,
++    IDC_SELECT_LAST_TAB,
+     IDC_MERIDIAN_NEXT_SPACE,
+     IDC_MERIDIAN_PREVIOUS_SPACE,
+     IDC_MERIDIAN_NEXT_TAB,
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index c569c631d5..5e4d92e6de 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -1035,8 +1035,11 @@ bool WebUIBrowserWindow::IsToolbarVisible() const {
+ }
+ 
+ bool WebUIBrowserWindow::IsToolbarShowing() const {
+-  NOTIMPLEMENTED_LOG_ONCE();
+-  return false;
++  // Meridian: the sidebar is the toolbar, there (or a hover away) in macOS
++  // full screen too, so the browser keeps its shortcuts there as in a window;
++  // only a page's own full screen (a video) has every key but Esc.
++  auto* manager = ExclusiveAccessManager::From(browser_);
++  return !manager || !manager->fullscreen_controller()->IsTabFullscreen();
+ }
+ 
+ bool WebUIBrowserWindow::IsLocationBarVisible() const {
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm b/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
+index 9cf4ab3632..7f63c43e12 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
++++ b/chrome/browser/ui/webui_browser/webui_browser_window_mac.mm
+@@ -14,12 +14,14 @@
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/global_keyboard_shortcuts_mac.h"
++#import "chrome/browser/ui/cocoa/accelerators_cocoa.h"
+ #import "chrome/browser/ui/cocoa/browser_window_command_handler.h"
+ #import "chrome/browser/ui/cocoa/chrome_command_dispatcher_delegate.h"
+ #include "components/input/native_web_keyboard_event.h"
+ #import "components/remote_cocoa/app_shim/native_widget_ns_window_bridge.h"
+ #include "ui/base/accelerators/global_accelerator_listener/global_accelerator_listener.h"
+ #include "ui/base/window_open_disposition.h"
++#include "ui/events/blink/blink_event_util.h"
+ #include "ui/views/cocoa/native_widget_mac_ns_window_host.h"
+ #include "ui/views/widget/native_widget_mac.h"
+ 
+@@ -85,6 +87,22 @@ int WebUIBrowserWindow::ReservedCommandForKeyEvent(
+       }
+     }
+   }
++  if (command == NO_COMMAND) {
++    // Or a menu item's shortcut (⌃Tab, ⌘⌥←/→), by the key's code and
++    // modifiers, as the menus would match it.
++    const ui::Accelerator key(
++        static_cast<ui::KeyboardCode>(event.windows_key_code),
++        ui::WebEventModifiersToEventFlags(event.GetModifiers()) &
++            (ui::EF_SHIFT_DOWN | ui::EF_CONTROL_DOWN | ui::EF_ALT_DOWN |
++             ui::EF_COMMAND_DOWN));
++    for (const auto& [id, accelerator] : *AcceleratorsCocoa::GetInstance()) {
++      if (accelerator.key_code() == key.key_code() &&
++          accelerator.modifiers() == key.modifiers()) {
++        command = id;
++        break;
++      }
++    }
++  }
+   if (command == NO_COMMAND ||
+       !chrome::BrowserCommandController::From(browser_.get())
+            ->IsReservedCommandOrKey(command, event)) {
