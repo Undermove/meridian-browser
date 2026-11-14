@@ -97,6 +97,10 @@ test('full access: an MCP client lists, opens, reads, clicks, types, screenshots
     // Stop pauses agents until Resume (the bar shows for a few seconds after an action).
     await mcp.call('read_page');
     await b.waitFor(`app.$.agent.working && !!${AG}.getElementById('stop')`);
+    // The tab it works in glows: the page card on screen and its row in the sidebar.
+    await b.waitFor(`app.hasAttribute('agent-on-page')`, 3000)
+        .catch(() => assert.fail('the page card glows while the agent works on it'));
+    assert.equal(await b.eval(`[...${SB}.querySelectorAll('meridian-tab-row')].filter((r) => r.agent).map((r) => r.tab.title).join()`), 'Hello Ada');
     // (A DOM click: real mouse input can lag seconds while the Mac's screen sleeps.)
     await b.eval(`${AG}.getElementById('stop').click()`);
     await b.waitFor(`!!${AG}.getElementById('resume')`);

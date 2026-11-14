@@ -282,6 +282,7 @@ function renderLauncher() {
       : `Start ${AGENT_UI[kind].label} in the project${a?.mcp ? ' — with Meridian browser tools' : ''}`;
     b.addEventListener('click', () => (installed ? launch(kind) : installHint(b, kind)));
     bar.appendChild(b);
+    if (kind === 'claude' && installed) bar.appendChild(resumeButton('launch resume'));
   }
   if (typeof proLauncherExtras === 'function') proLauncherExtras(bar); // Workbench Pro: sandbox + plugin launchers
   iconize(bar);
@@ -815,7 +816,7 @@ function mountTerm(info) {
   return t;
 }
 
-async function launch(kind) {
+async function launch(kind, { resume = false } = {}) {
   if (!S.project) { toast('Open a project first'); return null; }
   if (S.info?.terminals === false) { toast(`Terminals are unavailable: ${S.info.terminalError || ''}`, 5000); return null; }
   // Workbench Pro: a sandbox gets only the vault secrets picked for this session.
@@ -830,7 +831,7 @@ async function launch(kind) {
     // Size the pty right from the start so TUIs (Claude Code, Codex) draw correctly.
     const host = $('#term-host');
     const dims = estimateDims(host);
-    info = await wb.ptyCreate({ kind, cols: dims.cols, rows: dims.rows, secrets });
+    info = await wb.ptyCreate({ kind, cols: dims.cols, rows: dims.rows, secrets, resume });
   } catch (err) {
     toast(err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, ''), 5000);
     if (/not installed/i.test(err.message)) refreshInfo();
@@ -921,6 +922,21 @@ function renderTermStart() {
   b.append(agentMark(kind), document.createTextNode(`Start ${AGENT_UI[kind].label}`));
   b.addEventListener('click', () => launch(kind));
   box.appendChild(b);
+  if (kind === 'claude') box.appendChild(resumeButton('btn big term-resume-btn'));
+}
+
+// Claude Code's list of this project's recent sessions (also ones whose tab was closed), to pick one up.
+function resumeButton(className) {
+  const b = document.createElement('button');
+  b.className = className;
+  const mark = agentMark('claude');
+  mark.textContent = '↻';
+  const label = document.createElement('span');
+  label.textContent = 'Resume a session…';
+  b.append(mark, label);
+  b.title = 'Pick up a recent Claude Code session in this project';
+  b.addEventListener('click', () => launch('claude', { resume: true }));
+  return b;
 }
 
 function layoutTerminals() { renderTermTabs(); fitActive(); }

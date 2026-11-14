@@ -47,6 +47,24 @@ test('Today tabs left alone past the archive time are archived; pinned and activ
   } finally { await b.close(); await site.close(); }
 });
 
+test('the Workbench tab stays past the archive time: its agent sessions run on', async () => {
+  const site = await startServer();
+  const b = await launch([site.url('/p/Active'), site.url('/p/Stale')],
+                         { args: ['--meridian-archive-after-seconds=8'] });
+  try {
+    await b.waitFor(today(2));
+    await b.eval('app.$.tabstrip.runCommand(16, 0)');  // the Workbench, in a Today tab
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.url.startsWith('chrome://workbench'))`);
+    await b.eval(`(() => { const row = [...${SB}.querySelectorAll('meridian-tab-row')]; app.$.tabstrip.tabStripService_.activateTab(row.find((r) => r.tab.title === 'Active').tab.id); })()`);
+    // The other one left alone goes; the Workbench, left alone as long, stays.
+    await b.waitFor(`![...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'Stale')`, 30000);
+    // It was active a little later than Stale: give it the archive time again.
+    const wbGone = `![...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.url.startsWith('chrome://workbench'))`;
+    const gone = await b.waitFor(wbGone, 12000).then(() => true, () => false);
+    assert.equal(gone, false, 'the Workbench is still open');
+  } finally { await b.close(); await site.close(); }
+});
+
 test('Clear Today archives the space\'s Today tabs', async () => {
   const site = await startServer();
   const b = await launch([site.url('/p/A'), site.url('/p/B')]);

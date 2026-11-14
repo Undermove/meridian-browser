@@ -142,6 +142,7 @@
     ptyCreate: (opts) => invoke('ptyCreate', {
       kind: str(opts?.kind || 'shell'), cols: Number(opts?.cols) || 80, rows: Number(opts?.rows) || 24,
       secrets: Array.isArray(opts?.secrets) ? opts.secrets.slice(0, 200).map(String) : undefined,
+      resume: opts?.resume === true,
     }),
     ptyList: () => invoke('ptyList'),
     ptyKill: (id) => invoke('ptyKill', str(id)),

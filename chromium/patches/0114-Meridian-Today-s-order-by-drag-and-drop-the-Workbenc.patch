@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Sat, 14 Nov 2026 20:01:39 +0400
+Subject: [PATCH 115/115] Meridian: Today's order by drag and drop; the
+ Workbench stays overnight and its closed sessions leave Mission Control; the
+ agent's tab glows
+
+- A Today tab dropped on another goes right above or below it, also in the
+  tab strip, so a restart keeps the order (MoveTodayTab).
+- The auto-archive skips the Workbench tab: its agent sessions run on.
+- A Workbench page that goes away (its tab closed) tells Mission Control its
+  sessions stopped, as Stop does; they no longer show as running.
+- Claude Code can be started with --resume (its list of the project's
+  recent sessions).
+- The agent's tab id (a tab handle) is matched to the sidebar's NodeIds
+  ("<handle>:<type>"): the page card and the sidebar row glow again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar.mojom         |  4 ++
+ chrome/browser/meridian/sidebar_handler.cc    | 27 ++++++++++
+ chrome/browser/meridian/sidebar_handler.h     |  3 ++
+ .../meridian/workbench/workbench_handler.cc   | 21 ++++++--
+ .../webui_browser/meridian/sidebar.ts         | 49 +++++++++++++++++--
+ 5 files changed, 98 insertions(+), 6 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index eed0be4cf4..2e37c38ec1 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -517,6 +517,10 @@ interface SidebarHandler {
+   SetSpaceProfile(string space_id, string profile_id);
+   // Moves a live tab (and any item it is linked to stays where it is).
+   MoveTabToSpace(tabs_api.mojom.NodeId tab_id, string space_id);
++  // Today's order (dragging one row onto another): the tab goes right above
++  // or below `target_id`, a tab of the same space.
++  MoveTodayTab(tabs_api.mojom.NodeId tab_id, tabs_api.mojom.NodeId target_id,
++               bool above);
+ 
+   // Pins a live tab: it becomes the live tab of a new item at `position`,
+   // named `title` (empty: the page's title).
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index ddf718f236..62deb6fca4 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -108,6 +108,7 @@
+ #include "components/tabs/public/split_tab_data.h"
+ #include "content/public/browser/navigation_controller.h"
+ #include "content/public/browser/web_contents.h"
++#include "content/public/common/url_constants.h"
+ #include "net/base/registry_controlled_domains/registry_controlled_domain.h"
+ #include "ui/base/base_window.h"
+ #include "ui/views/bubble/bubble_dialog_delegate_view.h"
+@@ -1325,6 +1326,11 @@ void SidebarHandler::ArchiveStaleTabs() {
+       continue;
+     }
+     content::WebContents* contents = tab->GetContents();
++    // The Workbench runs agent sessions: it stays however long they work.
++    const GURL& url = contents->GetLastCommittedURL();
++    if (url.SchemeIs(content::kChromeUIScheme) && url.host() == "workbench") {
++      continue;
++    }
+     if (contents->GetLastActiveTime() < cutoff &&
+         !contents->IsCurrentlyAudible()) {
+       stale.push_back(contents);
+@@ -2234,6 +2240,27 @@ void SidebarHandler::MoveTabToSpace(const tabs_api::NodeId& tab_id,
+   ScheduleNotify();
+ }
+ 
++void SidebarHandler::MoveTodayTab(const tabs_api::NodeId& tab_id,
++                                  const tabs_api::NodeId& target_id,
++                                  bool above) {
++  tabs::TabInterface* tab = TabFor(tab_id);
++  tabs::TabInterface* target = TabFor(target_id);
++  if (!tab || !target || tab == target || tab->GetSplit() ||
++      target->GetSplit()) {
++    return;
++  }
++  // Today lists the newest first: above a tab is after it in the strip, and
++  // the strip's order is what a restart brings back.
++  int from = model()->GetIndexOfTab(tab);
++  int to = model()->GetIndexOfTab(target) + (above ? 1 : 0);
++  if (from < to) {
++    --to;
++  }
++  if (from != to) {
++    model()->MoveWebContentsAt(from, to, /*select_after_move=*/false);
++  }
++}
++
+ void SidebarHandler::GetDownloads(GetDownloadsCallback callback) {
+   std::move(callback).Run(downloads_->List());
+ }
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 4c636b6781..232bd0f206 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -129,6 +129,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+                        const std::string& profile_id) override;
+   void MoveTabToSpace(const tabs_api::NodeId& tab_id,
+                       const std::string& space_id) override;
++  void MoveTodayTab(const tabs_api::NodeId& tab_id,
++                    const tabs_api::NodeId& target_id,
++                    bool above) override;
+   void PinTab(const tabs_api::NodeId& tab_id,
+               mojom::ItemPositionPtr position,
+               const std::string& title) override;
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index d5c4102355..261c47f587 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -251,10 +251,17 @@ WorkbenchHandler::~WorkbenchHandler() {
+     dialog_->ListenerDestroyed();
+   }
+   std::vector<base::FilePath> cleanup;
++  mission::MissionControl* mission =
++      mission::MissionControlFactory::GetForProfile(profile_);
+   for (auto& [id, term] : terms_) {
+     cleanup.insert(cleanup.end(), term.cleanup.begin(), term.cleanup.end());
+     // Live containers go with the page, like its terminals.
+     StopSandbox(term);
++    // Its agent sessions stop with it: Mission Control lets them go, as after
++    // the session's own Stop.
++    if (mission && !term.mission_node.empty()) {
++      mission->TerminalExit(term.mission_token, term.mission_node, 0, true);
++    }
+   }
+   terms_.clear();
+   files_->PostTask(FROM_HERE, base::BindOnce(
+@@ -1738,6 +1745,8 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+   }
+   int cols = opts.FindInt("cols").value_or(80);
+   int rows = opts.FindInt("rows").value_or(24);
++  // Claude Code's own list of this folder's recent sessions, to pick one up.
++  bool resume = kind == "claude" && opts.FindBool("resume").value_or(false);
+   // Host terminals and agents get the project's vault secrets in their
+   // environment (names are shown, values never).
+   std::map<std::string, std::string> secrets =
+@@ -1796,16 +1805,22 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+   files_->PostTaskAndReplyWithResult(
+       FROM_HERE,
+       base::BindOnce(
+-          [](std::string kind, McpBridge bridge)
++          [](std::string kind, McpBridge bridge, bool resume)
+               -> std::pair<base::expected<LaunchSpec, std::string>,
+                            std::map<std::string, std::string>> {
+             std::map<std::string, std::string> env = TerminalEnv();
+             std::string shell = env.contains("SHELL") && !env["SHELL"].empty()
+                                     ? env["SHELL"]
+                                     : "/bin/zsh";
+-            return {MakeLaunchSpec(kind, env["PATH"], shell, bridge), env};
++            base::expected<LaunchSpec, std::string> spec =
++                MakeLaunchSpec(kind, env["PATH"], shell, bridge);
++            if (spec.has_value() && resume && !spec->argv.empty()) {
++              spec->argv.insert(spec->argv.begin() + 1, "--resume");
++              spec->title += " (resumed)";
++            }
++            return {std::move(spec), env};
+           },
+-          kind, std::move(bridge)),
++          kind, std::move(bridge), resume),
+       base::BindOnce(
+           [](base::WeakPtr<WorkbenchHandler> self, std::string kind, int cols,
+              int rows, mission::MissionControl::Registration registration,
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 392ce38a28..bb313cb258 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -609,6 +609,10 @@ export class MeridianSidebarElement extends CrLitElement implements
+         }
+         return {el, pos: y < 0.5 ? 'before' : 'after'};
+       }
++      if (el.dataset['tab'] && el.classList.contains('row')) {
++        const r = el.getBoundingClientRect();
++        return {el, pos: e.clientY < r.top + r.height / 2 ? 'before' : 'after'};
++      }
+       if (el.dataset['space'] && el.classList.contains('space-dot')) {
+         return {el, zone: 'space'};
+       }
+@@ -707,6 +711,15 @@ export class MeridianSidebarElement extends CrLitElement implements
+       }
+       return;
+     }
++    if (t.el.dataset['tab']) {
++      // Onto a Today tab: Today's order; a pinned one comes back to Today.
++      if (drag.tab) {
++        this.moveTodayTab_(drag.tab, t.el.dataset['tab'], t.pos === 'before');
++      } else if (drag.item) {
++        this.handler_.removeItem(drag.item);
++      }
++      return;
++    }
+     if (t.zone === 'space') {
+       const target = t.el.dataset['space']!;
+       if (drag.tab) {
+@@ -746,6 +759,25 @@ export class MeridianSidebarElement extends CrLitElement implements
+     }
+   };
+ 
++  // Shows `tab` right above or below `target` at once; the browser moves it
++  // in the strip too, so a restart keeps the order.
++  private moveTodayTab_(tab: NodeId, target: NodeId, above: boolean) {
++    const today = this.todayTabs();
++    const from = today.findIndex(t => t.id === tab);
++    const at = today.findIndex(t => t.id === target);
++    if (from < 0 || at < 0) {
++      return;
++    }
++    const ids = today.map(t => t.id).filter(id => id !== tab);
++    ids.splice(ids.indexOf(target) + (above ? 0 : 1), 0, tab);
++    // Newest first: the same order numbers, handed out top to bottom.
++    const orders = ids.map(id => this.order_.get(id) ?? 0)
++                       .sort((a, b) => b - a);
++    ids.forEach((id, i) => this.order_.set(id, orders[i]!));
++    this.today_ = this.todayTabs();
++    this.handler_.moveTodayTab(tab, target, above);
++  }
++
+   // ----------------------------------------------------------- commands
+ 
+   // The page's address, without tracking parameters, to the clipboard.
+@@ -1046,13 +1078,24 @@ export class MeridianSidebarElement extends CrLitElement implements
+   }
+ 
+   // The tab an agent is working in (its row glows); '' for none.
++  // `tabId` is the agent's (list_tabs) id: the tab's handle, which is the
++  // first part of its NodeId here ("<handle>:<type>").
+   setAgentTab(tabId: string) {
+-    this.agentTab_ = tabId;
++    this.agentTab_ = this.agentTabNode_(tabId);
+   }
+ 
+   isActiveTab(tabId: string): boolean {
+-    return [...this.tabs_.values()].some(
+-        t => t.isActive && t.id === tabId);
++    const id = this.agentTabNode_(tabId);
++    return [...this.tabs_.values()].some(t => t.isActive && t.id === id);
++  }
++
++  private agentTabNode_(tabId: string): NodeId {
++    if (!tabId) {
++      return '';
++    }
++    return [...this.tabs_.keys()].find(
++               id => id === tabId || id.split(':')[0] === tabId) ??
++        tabId;
+   }
+ 
+   private customTitle_(id: NodeId): string {

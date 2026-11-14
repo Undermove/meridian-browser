@@ -136,3 +136,75 @@ test('Mission Control: a Workbench session with a subagent, a wait, browser tool
     for (const d of [project, bin, profile]) fs.rmSync(d, { recursive: true, force: true });
   }
 });
+
+// A stand-in Claude Code that starts a session, notes how it was started, and works until stopped.
+const IDLE_CLAUDE = (argvFile) => `#!/usr/bin/python3
+import json, os, subprocess, sys
+args = sys.argv
+open(${JSON.stringify(argvFile)}, 'a').write(json.dumps(args[1:]) + '\\n')
+settings = json.load(open(args[args.index('--settings') + 1]))
+for entry in settings['hooks'].get('SessionStart', []):
+    for h in entry['hooks']:
+        subprocess.run(h['command'], shell=True, input=json.dumps(dict(hook_event_name='SessionStart', session_id='s1', cwd=os.getcwd(), model='claude-opus-5-5', source='startup')), text=True)
+print('WORKING', flush=True)
+sys.stdin.readline()
+`;
+
+test('closing the Workbench tab stops its sessions in Mission Control; a closed session can be resumed', async () => {
+  const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-mc-')));
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
+  const argvFile = path.join(bin, 'argv.jsonl');
+  fs.writeFileSync(path.join(bin, 'claude'), IDLE_CLAUDE(argvFile), { mode: 0o755 });
+  const b = await launch(['about:blank'], {
+    args: [`--meridian-test-project=${project}`, `--meridian-agents-path=${bin}`, '--meridian-no-notify'],
+  });
+  const state = () => b.eval('app.$.tabstrip.handler_.getMissionState().then(({snapshotJson}) => JSON.parse(snapshotJson))');
+  const waitState = async (pred, what, ms = 15000) => {
+    const end = Date.now() + ms; let s;
+    while (Date.now() < end) { s = await state(); if (pred(s)) return s; await sleep(200); }
+    throw new Error(`timed out waiting for ${what}: ${JSON.stringify(s?.nodes?.map((n) => [n.label, n.status, n.statusText]))}`);
+  };
+  // Running sessions; `started`: the agent itself is up (its SessionStart hook named the model).
+  const live = (s, started = false) => s.nodes.filter((n) => n.kind === 'session' && !n.endedAt && (!started || n.sublabel === 'claude-opus-5-5'));
+  const openWorkbench = async () => {
+    await b.eval('app.$.tabstrip.runCommand(16, 0)');
+    const wb = await b.page('chrome://workbench');
+    await wb.waitFor(`!document.querySelector('#welcome').hidden || !!S.project`, 15000);
+    if (!await wb.eval('!!S.project')) {
+      await wb.eval(`document.querySelector('#open-folder').click()`);
+      await wb.waitFor('!!S.project');
+    }
+    return wb;
+  };
+  const wbRow = `[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.url.startsWith('chrome://workbench'))`;
+  let wb;
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    wb = await openWorkbench();
+    await wb.eval(`launch('claude').then((t) => !!t)`);
+    await waitState((s) => live(s, true).length === 1, 'the session');
+
+    // The tab is closed with its × in the sidebar: the session is no longer running there.
+    wb.close(); wb = null;
+    await b.click(`${wbRow}.shadowRoot.querySelector('.close')`);
+    await b.waitFor(`!${wbRow}`);
+    await waitState((s) => live(s).length === 0, 'the session to stop', 8000);
+
+    // The Workbench again: Claude Code's own list of this project's sessions picks it up.
+    wb = await openWorkbench();
+    await wb.waitFor(`!!document.querySelector('#term-start .term-resume-btn')`);
+    const r = await wb.eval(`(() => { const r = document.querySelector('#term-start .term-resume-btn').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+    for (const type of ['mousePressed', 'mouseReleased']) {
+      await wb.cdp.send('Input.dispatchMouseEvent', { type, x: r.x, y: r.y, button: 'left', clickCount: 1 });
+    }
+    await waitState((s) => live(s, true).length === 1, 'the resumed session');
+    const runs = fs.readFileSync(argvFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    assert.equal(runs.length, 2);
+    assert.ok(!runs[0].includes('--resume'), 'a new session starts fresh');
+    assert.equal(runs[1][0], '--resume', 'the second one asks Claude Code to resume');
+  } finally {
+    wb?.close();
+    await b.close();
+    for (const d of [project, bin]) fs.rmSync(d, { recursive: true, force: true });
+  }
+});
