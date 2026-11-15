@@ -6,6 +6,7 @@
 #   Meridian-<version>-mac-<arch>.zip   for install.sh and the in-app updater
 #   SHA256SUMS.txt                      checked by both
 #   SHA256SUMS.txt.sig                  the updater trusts no checksum without it (upload it too)
+#   Meridian-mac-<arch>.dmg             the same .dmg for the site's download button
 # Every release must be signed with the same certificate: the updater only takes an app signed like
 # the one running, and the Keychain's "Always Allow" survives updates. (Moving to a Developer ID
 # needs one release first that trusts its Team ID too: see SECURITY.md.)
@@ -140,5 +141,8 @@ if (!built.equals(pub)) {
 const sig = crypto.sign(null, fs.readFileSync(SUMS), key);
 fs.writeFileSync(`${SUMS}.sig`, sig.toString("base64") + "\n");
 '
+# The site's download button links to releases/latest/download/Meridian-mac-<arch>.dmg: the same
+# disk image under a name without the version (upload it too; it isn't in SHA256SUMS.txt).
+cp "$OUT/$NAME.dmg" "$OUT/Meridian-mac-$ARCH.dmg"
 ls -lh "$OUT"
 cat "$OUT/SHA256SUMS.txt"
