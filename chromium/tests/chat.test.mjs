@@ -91,6 +91,6 @@ test('Chat view: a conversation, the chat list, and chats after a restart', asyn
     const file = path.join(profile, 'Default', 'Meridian Chats.json');
     const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
     assert.deepEqual(saved.chats.map((c) => c.messages.length), [6]);
-    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    if (process.platform !== 'win32') assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   } finally { await b.close(); api.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
