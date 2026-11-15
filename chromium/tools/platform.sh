@@ -7,6 +7,7 @@
 #   meridian_binary D      the browser executable of the build in D
 #   keep_awake CMD…        runs CMD, keeping a Mac from sleeping meanwhile
 #   sed_inplace EXPR FILE  sed -i, which BSD and GNU sed spell differently
+#   native_path P          P as a program that isn't part of Git Bash takes it (C:/…) on Windows
 case "$(uname -s)" in
   Darwin) MERIDIAN_OS=mac ;;
   Linux) MERIDIAN_OS=linux ;;
@@ -32,4 +33,8 @@ keep_awake() {
 
 sed_inplace() {
   if [ "$MERIDIAN_OS" = mac ]; then sed -i '' "$1" "$2"; else sed -i "$1" "$2"; fi
+}
+
+native_path() {
+  if [ "$MERIDIAN_OS" = win ]; then cygpath -m "$1"; else echo "$1"; fi
 }
