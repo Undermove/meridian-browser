@@ -1,0 +1,623 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Sun, 15 Nov 2026 22:24:53 +0400
+Subject: [PATCH] Meridian: the Windows installer has a window
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Chromium's installer shows nothing: Google's is run by another program
+that has the window. A person who opened Meridian's saw no sign that it
+had started, for the minute it takes, and none that it had failed.
+
+mini_installer now shows a small window of its own while it works:
+Meridian's icon, "Installing Meridian…" (or "Updating Meridian…" when the
+in-app updater runs it) and a moving bar, then "Opening Meridian…". When
+the installer fails, a message says so, with the error number and where the
+log is; the updater, which tries again by itself, gets no message.
+
+The window is on a thread of its own in meridian_progress.cc: plain Win32
+and no C runtime, like the rest of mini_installer. Chromium's files get two
+calls in the entry point, the sources and two system libraries in
+BUILD.gn, and the installer's icon, which is now Meridian's.
+
+Chromium's installer opens the browser after a first install only. Run by
+a person over a copy they had, it now opens Meridian too.
+
+--meridian-no-ui: no window. --meridian-ui-demo: the window for a few
+seconds and nothing installed (--meridian-ui-demo-failure: the message
+too), for looking at it.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ chrome/installer/mini_installer/BUILD.gn      |  15 +-
+ .../mini_installer/meridian_progress.cc       | 457 ++++++++++++++++++
+ .../mini_installer/meridian_progress.h        |  38 ++
+ .../mini_installer/mini_installer.rc          |   3 +-
+ .../mini_installer/mini_installer_exe_main.cc |   9 +
+ 5 files changed, 519 insertions(+), 3 deletions(-)
+ create mode 100644 chrome/installer/mini_installer/meridian_progress.cc
+ create mode 100644 chrome/installer/mini_installer/meridian_progress.h
+
+diff --git a/chrome/installer/mini_installer/BUILD.gn b/chrome/installer/mini_installer/BUILD.gn
+index df9408bb16..a9588ae38c 100644
+--- a/chrome/installer/mini_installer/BUILD.gn
++++ b/chrome/installer/mini_installer/BUILD.gn
+@@ -258,7 +258,12 @@ action("mini_installer_archive") {
+ }
+ 
+ source_set("mini_installer_sources") {
+-  sources = [ "mini_installer_exe_main.cc" ]
++  sources = [
++    # Meridian: the installer's window.
++    "meridian_progress.cc",
++    "meridian_progress.h",
++    "mini_installer_exe_main.cc",
++  ]
+   deps = [
+     ":lib",
+     "//base:clang_profiling_buildflags",
+@@ -300,7 +305,13 @@ template("generate_mini_installer") {
+       "/NXCOMPAT",
+     ]
+ 
+-    libs = [ "setupapi.lib" ]
++    libs = [
++      "setupapi.lib",
++
++      # Meridian: the installer's window (meridian_progress.cc).
++      "gdi32.lib",
++      "user32.lib",
++    ]
+ 
+     deps = [
+       ":copy_signing",
+diff --git a/chrome/installer/mini_installer/meridian_progress.cc b/chrome/installer/mini_installer/meridian_progress.cc
+new file mode 100644
+index 0000000000..af55383f65
+--- /dev/null
++++ b/chrome/installer/mini_installer/meridian_progress.cc
+@@ -0,0 +1,457 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/installer/mini_installer/meridian_progress.h"
++
++#include "chrome/installer/mini_installer/mini_installer_resource.h"
++
++namespace mini_installer {
++
++namespace {
++
++// In pixels at 100% scaling.
++constexpr int kWidth = 420;
++constexpr int kHeight = 216;
++constexpr int kIcon = 56;
++constexpr int kIconTop = 30;
++constexpr int kTitleTop = 100;
++constexpr int kNoteTop = 132;
++constexpr int kBarTop = 172;
++constexpr int kBarWidth = 240;
++constexpr int kBarHeight = 4;
++constexpr int kBarPiece = 84;
++
++constexpr COLORREF kBackground = RGB(0x17, 0x14, 0x1f);
++constexpr COLORREF kBorder = RGB(0x33, 0x2d, 0x45);
++constexpr COLORREF kTitle = RGB(0xff, 0xff, 0xff);
++constexpr COLORREF kNote = RGB(0xa6, 0xa0, 0xb8);
++constexpr COLORREF kTrack = RGB(0x2a, 0x25, 0x38);
++constexpr COLORREF kAccent = RGB(0x7c, 0x5c, 0xff);
++
++constexpr UINT_PTR kTimer = 1;
++constexpr UINT kFrameMs = 16;
++// One pass of the bar's piece from the left end to the right one.
++constexpr DWORD kPassMs = 1500;
++
++constexpr wchar_t kClass[] = L"MeridianSetupWindow";
++constexpr wchar_t kWindowTitle[] = L"Meridian Setup";
++
++enum class Text { kInstalling, kUpdating, kOpening };
++
++HMODULE g_module = nullptr;
++HANDLE g_thread = nullptr;
++HANDLE g_ready = nullptr;
++HWND g_window = nullptr;
++bool g_updating = false;
++// Meridian was here before this installer ran.
++bool g_was_installed = false;
++Text g_text = Text::kInstalling;
++int g_dpi = 96;
++HICON g_icon = nullptr;
++HFONT g_title_font = nullptr;
++HFONT g_note_font = nullptr;
++DWORD g_started = 0;
++
++int Scaled(int value) {
++  return ::MulDiv(value, g_dpi, 96);
++}
++
++// The two functions below walk NUL-terminated strings and fill a fixed
++// buffer by hand, as there is no C runtime or base/ here.
++// SAFETY: every read stops at its string's NUL; every write is checked
++// against the buffer's size.
++#pragma clang unsafe_buffer_usage begin
++
++// Whether the command line has `flag` (as given, lower case).
++bool HasFlag(const wchar_t* flag) {
++  const wchar_t* line = ::GetCommandLineW();
++  if (!line) {
++    return false;
++  }
++  for (; *line; ++line) {
++    const wchar_t* a = line;
++    const wchar_t* b = flag;
++    while (*b && *a) {
++      wchar_t c = *a;
++      if (c >= L'A' && c <= L'Z') {
++        c = static_cast<wchar_t>(c - L'A' + L'a');
++      }
++      if (c != *b) {
++        break;
++      }
++      ++a;
++      ++b;
++    }
++    if (!*b) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// "Meridian couldn't be installed (error N)…" without the C runtime.
++void TellFailure(DWORD exit_code) {
++  constexpr wchar_t kBefore[] = L"Meridian couldn\x2019t be installed (error ";
++  constexpr wchar_t kAfter[] =
++      L").\n\nIf Meridian is open, close it and run this installer again.\n\n"
++      L"What went wrong is written to chromium_installer.log in your Temp "
++      L"folder (press Win+R and type %TEMP% to open it).";
++  wchar_t text[400];
++  size_t at = 0;
++  for (const wchar_t* p = kBefore; *p && at + 1 < 400; ++p) {
++    text[at++] = *p;
++  }
++  wchar_t digits[12];
++  int count = 0;
++  do {
++    digits[count++] = static_cast<wchar_t>(L'0' + exit_code % 10);
++    exit_code /= 10;
++  } while (exit_code && count < 11);
++  while (count && at + 1 < 400) {
++    text[at++] = digits[--count];
++  }
++  for (const wchar_t* p = kAfter; *p && at + 1 < 400; ++p) {
++    text[at++] = *p;
++  }
++  text[at] = 0;
++  ::MessageBoxW(nullptr, text, kWindowTitle,
++                MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
++}
++
++// Where a person's own copy of Meridian is: the installer's default folder
++// (install_static's, which can't be used here) under %LOCALAPPDATA%.
++// False when there is no such variable or the path is too long.
++bool InstalledBrowserPath(wchar_t* path, DWORD size) {
++  constexpr wchar_t kTail[] = L"\\Meridian Browser\\Application\\chrome.exe";
++  DWORD length = ::GetEnvironmentVariableW(L"LOCALAPPDATA", path, size);
++  if (!length || length + sizeof(kTail) / sizeof(kTail[0]) > size) {
++    return false;
++  }
++  for (const wchar_t* p = kTail; *p; ++p) {
++    path[length++] = *p;
++  }
++  path[length] = 0;
++  return true;
++}
++
++bool BrowserIsInstalled() {
++  wchar_t path[MAX_PATH + 1];
++  if (!InstalledBrowserPath(path, MAX_PATH)) {
++    return false;
++  }
++  DWORD attributes = ::GetFileAttributesW(path);
++  return attributes != INVALID_FILE_ATTRIBUTES &&
++         !(attributes & FILE_ATTRIBUTE_DIRECTORY);
++}
++
++// Chromium's installer opens the browser itself after a first install only.
++// A person who ran the installer over a copy they had expects Meridian to
++// open as well.
++void OpenBrowser() {
++  wchar_t path[MAX_PATH + 1];
++  if (!InstalledBrowserPath(path, MAX_PATH)) {
++    return;
++  }
++  STARTUPINFOW startup;
++  for (size_t i = 0; i < sizeof(startup); ++i) {
++    reinterpret_cast<volatile char*>(&startup)[i] = 0;
++  }
++  startup.cb = sizeof(startup);
++  PROCESS_INFORMATION process;
++  if (::CreateProcessW(path, nullptr, nullptr, nullptr, FALSE, 0, nullptr,
++                       nullptr, &startup, &process)) {
++    ::CloseHandle(process.hThread);
++    ::CloseHandle(process.hProcess);
++  }
++}
++
++#pragma clang unsafe_buffer_usage end
++
++// Sharp text and sizes on a scaled screen. These functions came with later
++// versions of Windows 10, so they are looked up, not linked.
++void UseScreenScale() {
++  HMODULE user32 = ::GetModuleHandleW(L"user32.dll");
++  if (!user32) {
++    return;
++  }
++  using SetContext = BOOL(WINAPI*)(HANDLE);
++  using GetDpi = UINT(WINAPI*)();
++  if (auto set = reinterpret_cast<SetContext>(reinterpret_cast<void*>(
++          ::GetProcAddress(user32, "SetProcessDpiAwarenessContext")))) {
++    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2.
++    set(reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-4)));
++  }
++  if (auto get = reinterpret_cast<GetDpi>(reinterpret_cast<void*>(
++          ::GetProcAddress(user32, "GetDpiForSystem")))) {
++    UINT dpi = get();
++    if (dpi >= 96 && dpi <= 960) {
++      g_dpi = static_cast<int>(dpi);
++    }
++  }
++}
++
++// Rounded corners where Windows draws them itself (Windows 11).
++void RoundCorners(HWND window) {
++  HMODULE dwm = ::LoadLibraryW(L"dwmapi.dll");
++  if (!dwm) {
++    return;
++  }
++  using SetAttribute = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
++  if (auto set = reinterpret_cast<SetAttribute>(reinterpret_cast<void*>(
++          ::GetProcAddress(dwm, "DwmSetWindowAttribute")))) {
++    // DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND.
++    DWORD round = 2;
++    set(window, 33, &round, sizeof(round));
++  }
++}
++
++HFONT MakeFont(int size, int weight) {
++  return ::CreateFontW(-Scaled(size), 0, 0, 0, weight, FALSE, FALSE, FALSE,
++                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
++                       CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
++                       DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
++}
++
++void FillRound(HDC dc, int left, int top, int right, int bottom, COLORREF c) {
++  HBRUSH brush = ::CreateSolidBrush(c);
++  HGDIOBJ old_brush = ::SelectObject(dc, brush);
++  HGDIOBJ old_pen = ::SelectObject(dc, ::GetStockObject(NULL_PEN));
++  int round = bottom - top;
++  ::RoundRect(dc, left, top, right + 1, bottom + 1, round, round);
++  ::SelectObject(dc, old_pen);
++  ::SelectObject(dc, old_brush);
++  ::DeleteObject(brush);
++}
++
++void DrawLine(HDC dc, const wchar_t* text, HFONT font, COLORREF color,
++              int top, int width) {
++  HGDIOBJ old = ::SelectObject(dc, font);
++  ::SetTextColor(dc, color);
++  RECT r = {0, Scaled(top), width, Scaled(top) + Scaled(30)};
++  ::DrawTextW(dc, text, -1, &r, DT_CENTER | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
++  ::SelectObject(dc, old);
++}
++
++void Paint(HWND window, HDC target) {
++  RECT client;
++  ::GetClientRect(window, &client);
++  int width = client.right;
++  int height = client.bottom;
++  HDC dc = ::CreateCompatibleDC(target);
++  HBITMAP bitmap = ::CreateCompatibleBitmap(target, width, height);
++  HGDIOBJ old_bitmap = ::SelectObject(dc, bitmap);
++
++  HBRUSH background = ::CreateSolidBrush(kBackground);
++  ::FillRect(dc, &client, background);
++  ::DeleteObject(background);
++  HBRUSH border = ::CreateSolidBrush(kBorder);
++  ::FrameRect(dc, &client, border);
++  ::DeleteObject(border);
++
++  if (g_icon) {
++    int size = Scaled(kIcon);
++    ::DrawIconEx(dc, (width - size) / 2, Scaled(kIconTop), g_icon, size, size,
++                 0, nullptr, DI_NORMAL);
++  }
++
++  ::SetBkMode(dc, TRANSPARENT);
++  const wchar_t* title = g_text == Text::kOpening    ? L"Opening Meridian\x2026"
++                         : g_text == Text::kUpdating ? L"Updating Meridian\x2026"
++                                                     : L"Installing Meridian\x2026";
++  DrawLine(dc, title, g_title_font, kTitle, kTitleTop, width);
++  DrawLine(dc,
++           g_text == Text::kOpening ? L"All done."
++                                    : L"This takes about a minute.",
++           g_note_font, kNote, kNoteTop, width);
++
++  // The bar: a piece that runs from one end of its track to the other,
++  // slowly at the ends, and again.
++  int track_width = Scaled(kBarWidth);
++  int track_left = (width - track_width) / 2;
++  int track_top = Scaled(kBarTop);
++  int track_bottom = track_top + Scaled(kBarHeight);
++  FillRound(dc, track_left, track_top, track_left + track_width, track_bottom,
++            kTrack);
++  int piece = Scaled(kBarPiece);
++  if (g_text == Text::kOpening) {
++    FillRound(dc, track_left, track_top, track_left + track_width,
++              track_bottom, kAccent);
++  } else {
++    // 0 to 1000 along one pass, eased: 3t² − 2t³.
++    int t = static_cast<int>((::GetTickCount() - g_started) % kPassMs) * 1000 /
++            static_cast<int>(kPassMs);
++    int eased = t * t / 1000 * (3000 - 2 * t) / 1000;
++    // From wholly off the left end to wholly off the right one.
++    int left = track_left - piece + (track_width + piece) * eased / 1000;
++    int right = left + piece;
++    if (left < track_left) {
++      left = track_left;
++    }
++    if (right > track_left + track_width) {
++      right = track_left + track_width;
++    }
++    if (right - left >= Scaled(kBarHeight)) {
++      FillRound(dc, left, track_top, right, track_bottom, kAccent);
++    }
++  }
++
++  ::BitBlt(target, 0, 0, width, height, dc, 0, 0, SRCCOPY);
++  ::SelectObject(dc, old_bitmap);
++  ::DeleteObject(bitmap);
++  ::DeleteDC(dc);
++}
++
++LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
++                            LPARAM lparam) {
++  switch (message) {
++    case WM_TIMER:
++      ::InvalidateRect(window, nullptr, FALSE);
++      return 0;
++    case WM_ERASEBKGND:
++      return 1;
++    case WM_PAINT: {
++      PAINTSTRUCT paint;
++      HDC dc = ::BeginPaint(window, &paint);
++      Paint(window, dc);
++      ::EndPaint(window, &paint);
++      return 0;
++    }
++    case WM_NCHITTEST:
++      // The whole window moves it.
++      return HTCAPTION;
++    case WM_CLOSE:
++      // Only the installer closes it (EndMeridianProgress): it can't be
++      // stopped half way.
++      if (wparam != kTimer) {
++        return 0;
++      }
++      ::DestroyWindow(window);
++      return 0;
++    case WM_DESTROY:
++      ::KillTimer(window, kTimer);
++      ::PostQuitMessage(0);
++      return 0;
++  }
++  return ::DefWindowProcW(window, message, wparam, lparam);
++}
++
++DWORD WINAPI WindowThread(void*) {
++  UseScreenScale();
++  g_icon = static_cast<HICON>(
++      ::LoadImageW(g_module, MAKEINTRESOURCEW(IDI_MINI_INSTALLER), IMAGE_ICON,
++                   Scaled(kIcon), Scaled(kIcon), LR_DEFAULTCOLOR));
++  g_title_font = MakeFont(20, FW_SEMIBOLD);
++  g_note_font = MakeFont(13, FW_NORMAL);
++  g_started = ::GetTickCount();
++
++  WNDCLASSEXW cls;
++  cls.cbSize = sizeof(cls);
++  cls.style = CS_DROPSHADOW;
++  cls.lpfnWndProc = &WindowProc;
++  cls.cbClsExtra = 0;
++  cls.cbWndExtra = 0;
++  cls.hInstance = g_module;
++  cls.hIcon = g_icon;
++  cls.hCursor = ::LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));  // IDC_ARROW
++  cls.hbrBackground = nullptr;
++  cls.lpszMenuName = nullptr;
++  cls.lpszClassName = kClass;
++  cls.hIconSm = g_icon;
++  HWND window = nullptr;
++  if (::RegisterClassExW(&cls)) {
++    int width = Scaled(kWidth);
++    int height = Scaled(kHeight);
++    int left = (::GetSystemMetrics(SM_CXSCREEN) - width) / 2;
++    int top = (::GetSystemMetrics(SM_CYSCREEN) - height) / 2;
++    window = ::CreateWindowExW(WS_EX_APPWINDOW, kClass, kWindowTitle, WS_POPUP,
++                               left, top, width, height, nullptr, nullptr,
++                               g_module, nullptr);
++  }
++  if (window) {
++    RoundCorners(window);
++    ::SetTimer(window, kTimer, kFrameMs, nullptr);
++    ::ShowWindow(window, SW_SHOWNORMAL);
++    ::SetForegroundWindow(window);
++    ::UpdateWindow(window);
++  }
++  g_window = window;
++  ::SetEvent(g_ready);
++  if (!window) {
++    return 0;
++  }
++  MSG message;
++  while (::GetMessageW(&message, nullptr, 0, 0) > 0) {
++    ::TranslateMessage(&message);
++    ::DispatchMessageW(&message);
++  }
++  return 0;
++}
++
++void CloseWindowAndWait() {
++  if (!g_thread) {
++    return;
++  }
++  if (g_window) {
++    // WindowProc closes for this caller only.
++    ::PostMessageW(g_window, WM_CLOSE, kTimer, 0);
++  }
++  ::WaitForSingleObject(g_thread, 3000);
++  ::CloseHandle(g_thread);
++  g_thread = nullptr;
++  g_window = nullptr;
++}
++
++}  // namespace
++
++void ShowMeridianProgress(HMODULE module) {
++  if (g_thread || HasFlag(L"--meridian-no-ui")) {
++    return;
++  }
++  g_module = module;
++  g_updating = HasFlag(L"--do-not-launch-chrome");
++  g_was_installed = BrowserIsInstalled();
++  g_text = g_updating ? Text::kUpdating : Text::kInstalling;
++  g_ready = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
++  if (!g_ready) {
++    return;
++  }
++  g_thread = ::CreateThread(nullptr, 0, &WindowThread, nullptr, 0, nullptr);
++  if (g_thread) {
++    // Up before the work starts, which keeps the disk busy.
++    ::WaitForSingleObject(g_ready, 2000);
++  }
++}
++
++bool ShowMeridianProgressDemo(HMODULE module) {
++  if (!HasFlag(L"--meridian-ui-demo")) {
++    return false;
++  }
++  ShowMeridianProgress(module);
++  ::Sleep(4000);
++  // The failure's message too, with --meridian-ui-demo-failure.
++  EndMeridianProgress(HasFlag(L"--meridian-ui-demo-failure") ? 42 : 0);
++  return true;
++}
++
++void EndMeridianProgress(DWORD exit_code) {
++  if (!g_thread) {
++    return;
++  }
++  if (exit_code == 0 && g_was_installed && !g_updating &&
++      !HasFlag(L"--meridian-ui-demo")) {
++    OpenBrowser();
++  }
++  if (exit_code == 0 && g_window) {
++    // Meridian is starting: the window stays until its own is about to show.
++    g_text = Text::kOpening;
++    ::InvalidateRect(g_window, nullptr, FALSE);
++    ::Sleep(1500);
++  }
++  CloseWindowAndWait();
++  if (exit_code != 0 && !g_updating) {
++    TellFailure(exit_code);
++  }
++}
++
++}  // namespace mini_installer
+diff --git a/chrome/installer/mini_installer/meridian_progress.h b/chrome/installer/mini_installer/meridian_progress.h
+new file mode 100644
+index 0000000000..cc2bb8bcb7
+--- /dev/null
++++ b/chrome/installer/mini_installer/meridian_progress.h
+@@ -0,0 +1,38 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_INSTALLER_MINI_INSTALLER_MERIDIAN_PROGRESS_H_
++#define CHROME_INSTALLER_MINI_INSTALLER_MERIDIAN_PROGRESS_H_
++
++#include <windows.h>
++
++// The installer's only window. Chromium's installer shows nothing at all
++// (Google's own is run by another program that has the window): a person who
++// opens Meridian's sees no sign that it started, for the minute it takes, or
++// that it failed.
++//
++// A small window with Meridian's icon, "Installing Meridian…" and a moving
++// bar, on a thread of its own while the installer works; when the installer
++// fails, a message that says so and where the log is.
++//
++// Like the rest of mini_installer: no C runtime, plain Win32.
++namespace mini_installer {
++
++// Shows the window. Nothing with --meridian-no-ui on the command line.
++void ShowMeridianProgress(HMODULE module);
++
++// With --meridian-ui-demo on the command line: shows the window for a few
++// seconds and installs nothing (for looking at it, and for tests). True if
++// that was asked for.
++bool ShowMeridianProgressDemo(HMODULE module);
++
++// Takes the window away. `exit_code` is the installer's: not zero is a
++// failure, which a person who ran the installer themselves is told about
++// (the in-app updater, which passes --do-not-launch-chrome, tries again by
++// itself and isn't interrupted by a message).
++void EndMeridianProgress(DWORD exit_code);
++
++}  // namespace mini_installer
++
++#endif  // CHROME_INSTALLER_MINI_INSTALLER_MERIDIAN_PROGRESS_H_
+diff --git a/chrome/installer/mini_installer/mini_installer.rc b/chrome/installer/mini_installer/mini_installer.rc
+index fff6a53c69..42b07084cf 100644
+--- a/chrome/installer/mini_installer/mini_installer.rc
++++ b/chrome/installer/mini_installer/mini_installer.rc
+@@ -29,7 +29,8 @@ LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+ 
+ // Icon with lowest ID value placed first to ensure application icon
+ // remains consistent on all systems.
+-IDI_MINI_INSTALLER      ICON                    "mini_installer.ico"
++// Meridian: its own icon, for the file and for the installer's window.
++IDI_MINI_INSTALLER      ICON                    "..\\..\\app\\theme\\chromium\\win\\chromium.ico"
+ 
+ #ifdef APSTUDIO_INVOKED
+ /////////////////////////////////////////////////////////////////////////////
+diff --git a/chrome/installer/mini_installer/mini_installer_exe_main.cc b/chrome/installer/mini_installer/mini_installer_exe_main.cc
+index ba2febbbbb..04c3c97697 100644
+--- a/chrome/installer/mini_installer/mini_installer_exe_main.cc
++++ b/chrome/installer/mini_installer/mini_installer_exe_main.cc
+@@ -7,14 +7,23 @@
+ #include "base/clang_profiling_buildflags.h"
+ #include "base/compiler_specific.h"
+ #include "build/build_config.h"
++#include "chrome/installer/mini_installer/meridian_progress.h"
+ #include "chrome/installer/mini_installer/mini_installer.h"
+ 
+ // http://blogs.msdn.com/oldnewthing/archive/2004/10/25/247180.aspx
+ extern "C" IMAGE_DOS_HEADER __ImageBase;
+ 
+ extern "C" int __stdcall MainEntryPoint() {
++  // Meridian: the installer's window (meridian_progress.h).
++  if (mini_installer::ShowMeridianProgressDemo(
++          reinterpret_cast<HMODULE>(&__ImageBase))) {
++    ::ExitProcess(0);
++  }
++  mini_installer::ShowMeridianProgress(
++      reinterpret_cast<HMODULE>(&__ImageBase));
+   mini_installer::ProcessExitResult result =
+       mini_installer::WMain(reinterpret_cast<HMODULE>(&__ImageBase));
++  mini_installer::EndMeridianProgress(result.exit_code);
+   ::ExitProcess(result.exit_code);
+ }
+ 
