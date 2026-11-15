@@ -57,8 +57,12 @@ in `chrome/browser/meridian/win/` and the `*_win.cc` files.
 
 Not there yet outside macOS:
 
-- the in-app updater (Settings shows the version) and signing. Windows has an installer
-  (`package_win.sh`: Chromium's own, for the current user, unsigned for now); Linux has none;
+- code signing on Windows (SmartScreen warns on the first run of the installer). Windows has an
+  installer and the in-app updater: `package_win.sh` makes `Meridian-<version>-win-<arch>-setup.exe`
+  and `SHA256SUMS-win.txt`, signed with the release key if it is on the computer
+  (`~/.config/meridian/release-ed25519.pem`, copied from the Mac); upload all three to the release.
+  A release only reaches installed Meridians when it is published as a full release, not a
+  pre-release. Linux has neither an installer nor an updater (Settings shows the version);
 - Ask with an agent CLI (Codex, Cursor…): it only runs inside a sandbox that keeps it away from
   credentials, and that sandbox is macOS's `sandbox-exec`;
 - Import from Arc works on Windows (spaces, pins, folders, favorites, Today, sign-ins, passwords,
