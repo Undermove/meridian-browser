@@ -59,7 +59,9 @@ Not there yet outside macOS:
 - the in-app updater (Settings shows the version), installers and signing;
 - Ask with an agent CLI (Codex, Cursor…): it only runs inside a sandbox that keeps it away from
   credentials, and that sandbox is macOS's `sandbox-exec`;
-- Import from Arc looks where Arc keeps its data on macOS;
+- Import from Arc works on Windows (spaces, pins, folders, favorites, Today, sign-ins, passwords,
+  cards, icons; Arc has to be closed for the sign-ins), except Arc's extensions, which don't come
+  over there yet. There is no Arc for Linux;
 - on Linux the build still carries FFmpeg's H.264 and AAC decoders (macOS and Windows decode with
   the system's): to be settled before a Linux release;
 - on Windows, a CLI that npm installed as a `.cmd` wrapper isn't found (only `.exe` programs are
