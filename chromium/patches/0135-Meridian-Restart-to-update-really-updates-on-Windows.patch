@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Mon, 16 Nov 2026 00:10:30 +0400
+Subject: [PATCH] Meridian: "Restart to update" really updates on Windows
+
+It never did: Meridian started its update script (cmd.exe) without saying
+where, so the script ran in the folder Meridian itself runs in, the one of
+its own files (Application\<version>). Every Meridian is the same version
+of Chromium, so the installer replaces exactly that folder, and Windows
+doesn't let go of a folder a process is in: "Failed to delete empty
+directory", five times, and the script opened the old Meridian again.
+
+- The script is started in Windows's system folder.
+- The installer leaves the folder it was started in before anything else,
+  and when that was Meridian's own and it was the update script of 0.6.0 or
+  0.6.1 that started it (cmd.exe, --do-not-launch-chrome), it ends that
+  script and opens Meridian itself when it is done. Without this no
+  installed 0.6.0 could ever update itself.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ chrome/browser/meridian/updater_win.cc        |   4 +
+ .../mini_installer/meridian_progress.cc       | 113 ++++++++++++++++++
+ .../mini_installer/meridian_progress.h        |   8 ++
+ .../mini_installer/mini_installer_exe_main.cc |   1 +
+ 4 files changed, 126 insertions(+)
+
+diff --git a/chrome/browser/meridian/updater_win.cc b/chrome/browser/meridian/updater_win.cc
+index c9db7834f6..b49c23ee5a 100644
+--- a/chrome/browser/meridian/updater_win.cc
++++ b/chrome/browser/meridian/updater_win.cc
+@@ -424,6 +424,10 @@ bool Updater::Install() {
+             base::LaunchOptions options;
+             // No console window; the script outlives Meridian.
+             options.start_hidden = true;
++            // Not in Meridian's own folder (<version>, where the browser
++            // runs): the installer replaces that folder, and Windows doesn't
++            // let go of a folder some process is in.
++            options.current_directory = cmd;
+             return base::LaunchProcess(line, options).IsValid();
+           },
+           dir_, std::move(script)),
+diff --git a/chrome/installer/mini_installer/meridian_progress.cc b/chrome/installer/mini_installer/meridian_progress.cc
+index af55383f65..9aacc72889 100644
+--- a/chrome/installer/mini_installer/meridian_progress.cc
++++ b/chrome/installer/mini_installer/meridian_progress.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/installer/mini_installer/meridian_progress.h"
+ 
++#include <tlhelp32.h>
++
+ #include "chrome/installer/mini_installer/mini_installer_resource.h"
+ 
+ namespace mini_installer {
+@@ -46,6 +48,9 @@ HWND g_window = nullptr;
+ bool g_updating = false;
+ // Meridian was here before this installer ran.
+ bool g_was_installed = false;
++// The update script that started this installer was ended
++// (LeaveBrowserFolder): opening Meridian afterwards is this installer's job.
++bool g_script_ended = false;
+ Text g_text = Text::kInstalling;
+ int g_dpi = 96;
+ HICON g_icon = nullptr;
+@@ -166,6 +171,81 @@ void OpenBrowser() {
+   }
+ }
+ 
++// Whether `text` starts with `prefix`, A-Z and a-z alike.
++bool StartsWithNoCase(const wchar_t* text, const wchar_t* prefix) {
++  for (; *prefix; ++text, ++prefix) {
++    wchar_t a = *text;
++    wchar_t b = *prefix;
++    if (a >= L'A' && a <= L'Z') {
++      a = static_cast<wchar_t>(a - L'A' + L'a');
++    }
++    if (b >= L'A' && b <= L'Z') {
++      b = static_cast<wchar_t>(b - L'A' + L'a');
++    }
++    if (a != b) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// The process that started this one, when it is cmd.exe; otherwise 0.
++DWORD ParentCommandPrompt() {
++  HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
++  if (snapshot == INVALID_HANDLE_VALUE) {
++    return 0;
++  }
++  const DWORD self = ::GetCurrentProcessId();
++  DWORD parent = 0;
++  PROCESSENTRY32W entry;
++  entry.dwSize = sizeof(entry);
++  for (BOOL more = ::Process32FirstW(snapshot, &entry); more;
++       more = ::Process32NextW(snapshot, &entry)) {
++    if (entry.th32ProcessID == self) {
++      parent = entry.th32ParentProcessID;
++      break;
++    }
++  }
++  DWORD result = 0;
++  if (parent) {
++    entry.dwSize = sizeof(entry);
++    for (BOOL more = ::Process32FirstW(snapshot, &entry); more;
++         more = ::Process32NextW(snapshot, &entry)) {
++      if (entry.th32ProcessID == parent) {
++        if (StartsWithNoCase(entry.szExeFile, L"cmd.exe") &&
++            !entry.szExeFile[7]) {
++          result = parent;
++        }
++        break;
++      }
++    }
++  }
++  ::CloseHandle(snapshot);
++  return result;
++}
++
++// Whether this process was started in the folder of an installed Meridian
++// (...\Meridian Browser\Application\ or one inside it).
++bool StartedInBrowserFolder() {
++  constexpr size_t kExe = sizeof(L"chrome.exe") / sizeof(wchar_t) - 1;
++  wchar_t folder[MAX_PATH + 1];
++  DWORD length = ::GetCurrentDirectoryW(MAX_PATH, folder);
++  wchar_t browser[MAX_PATH + 1];
++  if (!length || length >= MAX_PATH ||
++      !InstalledBrowserPath(browser, MAX_PATH)) {
++    return false;
++  }
++  size_t end = 0;
++  while (browser[end]) {
++    ++end;
++  }
++  if (end <= kExe) {
++    return false;
++  }
++  browser[end - kExe] = 0;
++  return StartsWithNoCase(folder, browser);
++}
++
+ #pragma clang unsafe_buffer_usage end
+ 
+ // Sharp text and sizes on a scaled screen. These functions came with later
+@@ -404,6 +484,34 @@ void CloseWindowAndWait() {
+ 
+ }  // namespace
+ 
++void LeaveBrowserFolder() {
++  const bool inside = StartedInBrowserFolder();
++  wchar_t system[MAX_PATH + 1];
++  DWORD length = ::GetSystemDirectoryW(system, MAX_PATH);
++  if (length && length < MAX_PATH) {
++    // The installer's own programs start where this one is.
++    ::SetCurrentDirectoryW(system);
++  }
++  if (!inside || !HasFlag(L"--do-not-launch-chrome")) {
++    return;
++  }
++  // Meridian 0.6.0 or 0.6.1's update script, which is in that folder too.
++  DWORD script = ParentCommandPrompt();
++  if (!script) {
++    return;
++  }
++  HANDLE process =
++      ::OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, script);
++  if (!process) {
++    return;
++  }
++  if (::TerminateProcess(process, 0)) {
++    ::WaitForSingleObject(process, 5000);
++    g_script_ended = true;
++  }
++  ::CloseHandle(process);
++}
++
+ void ShowMeridianProgress(HMODULE module) {
+   if (g_thread || HasFlag(L"--meridian-no-ui")) {
+     return;
+@@ -435,6 +543,11 @@ bool ShowMeridianProgressDemo(HMODULE module) {
+ }
+ 
+ void EndMeridianProgress(DWORD exit_code) {
++  if (g_script_ended) {
++    // What the script would have done next: the new Meridian, or the one
++    // that was there when the installer failed.
++    OpenBrowser();
++  }
+   if (!g_thread) {
+     return;
+   }
+diff --git a/chrome/installer/mini_installer/meridian_progress.h b/chrome/installer/mini_installer/meridian_progress.h
+index cc2bb8bcb7..df19ab7eeb 100644
+--- a/chrome/installer/mini_installer/meridian_progress.h
++++ b/chrome/installer/mini_installer/meridian_progress.h
+@@ -19,6 +19,14 @@
+ // Like the rest of mini_installer: no C runtime, plain Win32.
+ namespace mini_installer {
+ 
++// First of all: this process leaves the folder it was started in. Meridian
++// 0.6.0 and 0.6.1 start their update script (cmd.exe, which starts this
++// installer) in the folder of the browser's own files, and Windows doesn't
++// replace a folder a process is in: every update from them failed. When that
++// is how this installer was started, it ends that script and does the rest
++// of its work itself (opens Meridian when it is done).
++void LeaveBrowserFolder();
++
+ // Shows the window. Nothing with --meridian-no-ui on the command line.
+ void ShowMeridianProgress(HMODULE module);
+ 
+diff --git a/chrome/installer/mini_installer/mini_installer_exe_main.cc b/chrome/installer/mini_installer/mini_installer_exe_main.cc
+index 04c3c97697..0116d70a54 100644
+--- a/chrome/installer/mini_installer/mini_installer_exe_main.cc
++++ b/chrome/installer/mini_installer/mini_installer_exe_main.cc
+@@ -19,6 +19,7 @@ extern "C" int __stdcall MainEntryPoint() {
+           reinterpret_cast<HMODULE>(&__ImageBase))) {
+     ::ExitProcess(0);
+   }
++  mini_installer::LeaveBrowserFolder();
+   mini_installer::ShowMeridianProgress(
+       reinterpret_cast<HMODULE>(&__ImageBase));
+   mini_installer::ProcessExitResult result =
