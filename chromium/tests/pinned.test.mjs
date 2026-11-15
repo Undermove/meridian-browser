@@ -65,7 +65,16 @@ test('Rename… and a double click name a Today tab (kept by the browser); a dou
   const row = (title) => `[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === ${JSON.stringify(title)})`;
   const input = (el) => `${el}.shadowRoot.querySelector('input.rename')`;
   const saved = () => b.eval(`${T}.state_.tabs.map((t) => t.title).filter(Boolean).sort()`);
-  const dblclick = (el) => b.eval(`(${el}.shadowRoot.querySelector('.row').dispatchEvent(new MouseEvent('dblclick', { bubbles: true, composed: true })), true)`);
+  // A real double click: two presses at the row, the second with clickCount 2.
+  const dblclick = async (el) => {
+    const r = await b.point(`${el}.shadowRoot.querySelector('.row')`);
+    await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: r.x, y: r.y, button: 'none' });
+    for (const clickCount of [1, 2]) {
+      for (const type of ['mousePressed', 'mouseReleased']) {
+        await b.cdp.send('Input.dispatchMouseEvent', { type, x: r.x, y: r.y, button: 'left', clickCount });
+      }
+    }
+  };
   try {
     await b.waitFor(`!!${row('A')} && !!${row('B')}`);
 
@@ -88,6 +97,7 @@ test('Rename… and a double click name a Today tab (kept by the browser); a dou
     await b.type('Beta tab');
     await b.key('Enter', 'Enter', 13);
     await b.waitFor(`!!${row('Beta tab')}`);
+    await b.waitFor(`${T}.state_.tabs.some((t) => t.title === 'Beta tab')`);
     assert.deepEqual(await saved(), ['Alpha tab', 'Beta tab']);
 
     // No name gives the page's title back.
@@ -96,6 +106,7 @@ test('Rename… and a double click name a Today tab (kept by the browser); a dou
     await b.eval(`(${input(row('Beta tab'))}.value = '', true)`);
     await b.key('Enter', 'Enter', 13);
     await b.waitFor(`!!${row('B')}`);
+    await b.waitFor(`!${T}.state_.tabs.some((t) => t.title === 'Beta tab')`);
     assert.deepEqual(await saved(), ['Alpha tab']);
 
     // Pinned, it keeps the name; a double click renames the pinned tab too.
