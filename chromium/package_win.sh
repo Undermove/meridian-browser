@@ -2,6 +2,7 @@
 # Release packaging on Windows (Git Bash): the installer, written to chromium/dist/.
 #   Meridian-<version>-win-<arch>-setup.exe   installs for the current user, no administrator
 #   SHA256SUMS-win.txt, SHA256SUMS-win.txt.sig   what the in-app updater checks it against
+#   Meridian-win.exe                          the same installer for the site's download button
 # It is Chromium's own installer (mini_installer) with Meridian's ad blocking rules and Workbench
 # page inside: it puts Meridian in %LOCALAPPDATA%\Meridian Browser\Application, adds the Start menu
 # and desktop shortcuts and the entry in Windows's list of apps, and a newer one installs over an
@@ -26,6 +27,10 @@ DIST="$HERE/dist"
 NAME="Meridian-$VERSION-win-$ARCH-setup.exe"
 mkdir -p "$DIST"
 cp "$OUT/mini_installer.exe" "$DIST/$NAME"
+# The site's download button links to releases/latest/download/Meridian-win.exe: the same installer
+# under that name (x64, what the button promises). Upload it with the rest; it isn't in the
+# checksums, which are the updater's.
+[ "$ARCH" != x64 ] || cp "$DIST/$NAME" "$DIST/Meridian-win.exe"
 # The checksum the in-app updater checks the installer against, in a file of Windows's own (the
 # Mac's SHA256SUMS.txt is made and signed on the Mac), signed with Meridian's release key like the
 # Mac's (package.sh): the updater trusts no checksum without that signature. The key is never
