@@ -128,3 +128,77 @@ test('typed in the other keyboard layout: the command bar offers what was meant;
     await b.waitFor(`!${CB}.getElementById('layoutFix')`);
   } finally { await b.close(); }
 });
+
+// The command bar finds Settings too, like "search everywhere" in an editor: a section, an option in
+// one, a page of Chromium's settings (settings_index.ts).
+test('the command bar finds Settings: "ai" opens Settings at AI, an option comes into sight, a Chromium page opens in a tab', async () => {
+  const site = await startServer();
+  const b = await launch([site.url('/p/Alpha')]);
+  const CB = `${BAR}.shadowRoot`;
+  const ST = `app.$.settings.shadowRoot`;
+  const rows = () => b.eval(`[...${CB}.querySelectorAll('#features .tab-row')].map((r) => (r.classList.contains('sel') ? '>' : '') + r.querySelector('.tab-title').textContent + ' | ' + (r.querySelector('.hint')?.textContent || ''))`);
+  const ask = async (text) => {
+    await b.click(`${SB}.getElementById('newTabButton')`);
+    await b.waitFor(open);
+    await b.waitFor(`${BAR}.$.address.shadowRoot.querySelector('cr-searchbox-input')`);
+    // The field takes the keys a moment after it shows.
+    await b.waitFor(`${BAR}.$.address.matches(':focus-within')`);
+    await b.type(text);
+    await b.key('t', 'KeyT', 84);  // a key press, as in the test above: inserted text alone isn't "typing"
+    await b.waitFor(`${BAR}.query_ === ${JSON.stringify(text)} && ${CB}.querySelectorAll('#features .tab-row').length > 0`);
+  };
+  try {
+    await b.waitFor(today(1));
+    // The section named in full is first and picked, before the features that are about AI.
+    await ask('ai');
+    const found = await rows();
+    assert.equal(found[0], '>AI | Settings', found.join('; '));
+    assert.ok(found.some((r) => r.startsWith('Chat')), found.join('; '));
+    await b.key('Enter', 'Enter', 13);
+    await b.waitFor(`!${open} && app.$.settings.open && !!${ST}.getElementById('ai')`);
+    await b.key('Escape', 'Escape', 27);
+    await b.waitFor(`!app.$.settings.open`);
+
+    // An option: its section opens with the option marked.
+    await ask('api keys');
+    assert.equal((await rows())[0], '>API Keys | Settings \u203a AI');
+    await b.key('Enter', 'Enter', 13);
+    await b.waitFor(`app.$.settings.open && ${ST}.querySelector('.found')?.textContent.trim() === 'API keys'`);
+    await b.key('Escape', 'Escape', 27);
+    await b.waitFor(`!app.$.settings.open`);
+
+    // Named by a word only, a setting is offered but not picked: Return still searches or opens.
+    await ask('priv');
+    const priv = await rows();
+    assert.ok(priv.includes('Privacy and Security | Chromium settings'), priv.join('; '));
+    assert.ok(!priv.some((r) => r.startsWith('>')), priv.join('; '));
+    await b.click(`[...${CB}.querySelectorAll('#features .tab-row')].find((r) => r.querySelector('.tab-title').textContent === 'Privacy and Security')`);
+    await b.waitFor(`!${open} && [...app.$.tabstrip.tabs_.values()].some((t) => t.url.startsWith('chrome://settings/privacy'))`);
+  } finally { await b.close(); await site.close(); }
+});
+
+test('every Settings entry of the command bar leads somewhere: its section has that heading or option', async () => {
+  const b = await launch([]);
+  const ST = `app.$.settings.shadowRoot`;
+  try {
+    await b.waitFor(`typeof app !== 'undefined' && !!app.$.tabstrip?.state_`);
+    const missing = await b.eval(`(async () => {
+      const { SETTINGS_INDEX } = await import('./meridian/settings_index.js');
+      const missing = [];
+      const ids = new Set();
+      for (const e of SETTINGS_INDEX) {
+        if (ids.has(e.id)) missing.push('twice: ' + e.id);
+        ids.add(e.id);
+        if (e.url) continue;
+        await app.$.settings.show(app.$.tabstrip.spaces(), e.section, e.find || '');
+        await app.$.settings.updateComplete;
+        await new Promise((r) => setTimeout(r, 30));
+        if (!${ST}.getElementById(e.section)) missing.push('no section: ' + e.id);
+        else if (e.find && !${ST}.querySelector('.found')) missing.push('not found: ' + e.id + ' (' + e.find + ')');
+        ${ST}.querySelectorAll('.found').forEach((x) => x.classList.remove('found'));
+      }
+      return missing;
+    })()`);
+    assert.deepEqual(missing, []);
+  } finally { await b.close(); }
+});
