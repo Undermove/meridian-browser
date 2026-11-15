@@ -291,7 +291,7 @@ function renderLauncher() {
 function installHint(anchor, kind) {
   const a = S.info?.agents?.[kind] || {};
   popover(anchor, `<h3>${esc(AGENT_UI[kind].label)} isn’t installed</h3>
-    <p>Install it in a terminal, then click the button again.</p>
+    <p>${a.needs ? `This command needs ${esc(a.needs)}, which isn’t on this computer: install that first. ` : ''}Install it in a terminal, then click the button again.</p>
     <div class="cmd">${esc(a.install || '')}</div>
     <div class="row"><button class="btn small" data-a="copy">Copy command</button><button class="btn small accent" data-a="shell" ${S.project ? '' : 'disabled'}>Open a shell</button></div>`, (pop, close) => {
     pop.addEventListener('click', (e) => {
