@@ -63,7 +63,7 @@ test('full access: an MCP client lists, opens, reads, clicks, types, screenshots
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
     for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
-    assert.equal((fs.statSync(path.join(profile, 'Meridian Agent.json')).mode & 0o777), 0o600, 'the token file is private');
+    if (process.platform !== 'win32') assert.equal((fs.statSync(path.join(profile, 'Meridian Agent.json')).mode & 0o777), 0o600, 'the token file is private');
     const init = await mcp.request('initialize', { protocolVersion: '2025-06-18', clientInfo: { name: 'test-client', version: '1' }, capabilities: {} });
     assert.equal(init.result.serverInfo.name, 'meridian');
     const names = (await mcp.request('tools/list')).result.tools.map((t) => t.name);

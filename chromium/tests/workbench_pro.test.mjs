@@ -91,7 +91,7 @@ test('Workbench Pro: vault, .env migration, secrets in terminals, the secret-fil
     await b.quit();
     const vault = fs.readFileSync(path.join(profile, 'Default', 'Meridian Vault.json'), 'utf8');
     assert.ok(!vault.includes(KEY) && !vault.includes('deploy-secret-value-42'));
-    assert.equal(fs.statSync(path.join(profile, 'Default', 'Meridian Vault.json')).mode & 0o777, 0o600);
+    if (process.platform !== 'win32') assert.equal(fs.statSync(path.join(profile, 'Default', 'Meridian Vault.json')).mode & 0o777, 0o600);
 
     // After a restart, Reveal (confirmed) decrypts it again.
     b = await launch(['about:blank'], { profile, args: [...args, '--meridian-test-dialog-answer=Reveal'] });

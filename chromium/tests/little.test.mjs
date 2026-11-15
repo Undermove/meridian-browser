@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { launch, SB } from './harness.mjs';
 import { startServer } from './server.mjs';
 
@@ -19,7 +20,7 @@ async function openFromOtherApp(b, url) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-open-'));
     process.on('exit', () => fs.rmSync(dir, { recursive: true, force: true }));
     opener = path.join(dir, 'open_url');
-    await promisify(execFile)('swiftc', ['-O', path.join(path.dirname(new URL(import.meta.url).pathname), 'tools', 'open_url.swift'), '-o', opener]);
+    await promisify(execFile)('swiftc', ['-O', path.join(path.dirname(fileURLToPath(import.meta.url)), 'tools', 'open_url.swift'), '-o', opener]);
   }
   await promisify(execFile)(opener, [String(b.proc.pid), url]);
 }

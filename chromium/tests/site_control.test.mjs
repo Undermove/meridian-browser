@@ -51,7 +51,11 @@ test('Site Control Center: ads, a permission, zoom and the address; a click outs
     // A click on the page side closes it: the page's own process would get the click, so a layer
     // of the controls lies over it.
     assert.ok(await b.eval(`(() => { const r = app.$.contentRegion.getBoundingClientRect(); return app.shadowRoot.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2) === app.$.siteControl; })()`), 'the page is covered while the controls are open');
-    await b.click(`app.$.contentRegion`);
+    // (A corner of it: on Windows the controls hang from the top bar, over the page's middle.)
+    const corner = await b.eval(`(() => { const r = app.$.contentRegion.getBoundingClientRect(); return { x: r.right - 30, y: r.bottom - 30 }; })()`);
+    for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+      await b.cdp.send('Input.dispatchMouseEvent', { type, x: corner.x, y: corner.y, button: type === 'mouseMoved' ? 'none' : 'left', clickCount: 1 });
+    }
     await b.waitFor(`!app.$.siteControl.open`);
     // A new tab has no site controls.
     await b.eval(`app.$.tabstrip.openUrl('')`);

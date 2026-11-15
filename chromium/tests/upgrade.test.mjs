@@ -39,6 +39,9 @@ async function inWindows(b, expr) {
     await new Promise((r) => (ws.onopen = r));
     const reply = await new Promise((r) => {
       ws.onmessage = (m) => r(JSON.parse(m.data));
+      // A window closing meanwhile (0.5.4's Work window, gathered into the main one) never answers.
+      ws.onclose = () => r({});
+      setTimeout(() => r({}), 3000);
       ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: `(async () => { const app = document.querySelector('webui-browser-app'); return (${expr}); })()`, awaitPromise: true, returnByValue: true } }));
     });
     ws.close();

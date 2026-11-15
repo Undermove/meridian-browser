@@ -129,7 +129,7 @@ test('Mission Control: a Workbench session with a subagent, a wait, browser tool
     for (let i = 0; i < 30 && !fs.existsSync(path.join(profile, 'Default', 'Meridian Mission History.json')); i++) await sleep(200);
     const file = path.join(profile, 'Default', 'Meridian Mission History.json');
     assert.equal(JSON.parse(fs.readFileSync(file, 'utf8'))[0].label, 'Claude Code');
-    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    if (process.platform !== 'win32') assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   } finally {
     wb?.close();
     await b.close();

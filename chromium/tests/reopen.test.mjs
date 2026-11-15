@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { launch, SB, itemEl } from './harness.mjs';
 import { startServer } from './server.mjs';
 
@@ -89,7 +90,7 @@ test('a Little window closed: ⇧⌘T brings its page back as a tab of the main 
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
     // A link clicked in another app: a GetURL Apple event to this browser's pid (never `open -a`).
     const opener = path.join(dir, 'open_url');
-    await promisify(execFile)('swiftc', ['-O', path.join(path.dirname(new URL(import.meta.url).pathname), 'tools', 'open_url.swift'), '-o', opener]);
+    await promisify(execFile)('swiftc', ['-O', path.join(path.dirname(fileURLToPath(import.meta.url)), 'tools', 'open_url.swift'), '-o', opener]);
     await promisify(execFile)(opener, [String(b.proc.pid), site.url('/p/Little')]);
     let little;
     for (let i = 0; i < 100 && !little; i++) {
