@@ -156,6 +156,9 @@ test('the command bar finds Settings: "ai" opens Settings at AI, an option comes
     assert.ok(found.some((r) => r.startsWith('Chat')), found.join('; '));
     await b.key('Enter', 'Enter', 13);
     await b.waitFor(`!${open} && app.$.settings.open && !!${ST}.getElementById('ai')`);
+    // While Settings is open the command bar doesn't: it would open behind Settings and take the keys.
+    await b.eval(`app.showCommandBar_(true, '')`);
+    assert.equal(await b.eval(open), false, 'the command bar opened under Settings');
     await b.key('Escape', 'Escape', 27);
     await b.waitFor(`!app.$.settings.open`);
 
