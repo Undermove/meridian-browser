@@ -20,6 +20,7 @@ way on macOS, Windows and Linux.
 | `apply.sh` | re-apply the patches onto a fresh `meridian` branch in Chromium's `src` |
 | `build.sh` | incremental build, a few minutes; first build ~2.5 h on an M4 |
 | `export.sh` | write the commits on the `meridian` branch back into `patches/` |
+| `package.sh`, `package_win.sh` | release packaging: the signed app on macOS, the installer on Windows |
 
 Chromium lives outside this repo, by default in `~/repos/chromium` (set `CHROMIUM_DIR` to move it).
 Plan for about 60 GB free: about 32 GB of source, about 9 GB of build, and Xcode.
@@ -56,7 +57,8 @@ in `chrome/browser/meridian/win/` and the `*_win.cc` files.
 
 Not there yet outside macOS:
 
-- the in-app updater (Settings shows the version), installers and signing;
+- the in-app updater (Settings shows the version) and signing. Windows has an installer
+  (`package_win.sh`: Chromium's own, for the current user, unsigned for now); Linux has none;
 - Ask with an agent CLI (Codex, Cursor…): it only runs inside a sandbox that keeps it away from
   credentials, and that sandbox is macOS's `sandbox-exec`;
 - Import from Arc works on Windows (spaces, pins, folders, favorites, Today, sign-ins, passwords,

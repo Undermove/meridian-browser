@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Sun, 15 Nov 2026 14:42:48 +0400
+Subject: [PATCH] Meridian: an installer on Windows
+
+Chromium's own installer (mini_installer) installs Meridian for the current
+user. What it needed:
+
+- Meridian's own Active Setup id and notification activator, so that it
+  and a Chromium installed beside it don't take each other's registrations.
+- The ad blocking rules and the Workbench page inside the installer's
+  archive, beside chrome.dll in the version's folder, where an update
+  replaces them together with the code. They are looked up beside the
+  browser's code now (DIR_MODULE), which is the same folder in a build.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../subresource_filter_component_installer.cc |  8 ++++---
+ .../meridian/workbench/workbench_source.cc    | 10 ++++----
+ .../install_static/chromium_install_modes.h   | 15 +++++++-----
+ .../build/win/create_installer_archive.py     | 23 +++++++++++++++++++
+ 4 files changed, 43 insertions(+), 13 deletions(-)
+
+diff --git a/chrome/browser/component_updater/subresource_filter_component_installer.cc b/chrome/browser/component_updater/subresource_filter_component_installer.cc
+index 7a1ada3388..3e25b08e9d 100644
+--- a/chrome/browser/component_updater/subresource_filter_component_installer.cc
++++ b/chrome/browser/component_updater/subresource_filter_component_installer.cc
+@@ -174,9 +174,11 @@ base::FilePath MeridianRulesetPath() {
+   return base::apple::OuterBundlePath().Append(
+       "Contents/Resources/meridian_adblock.dat");
+ #else
+-  base::FilePath exe_dir;
+-  base::PathService::Get(base::DIR_EXE, &exe_dir);
+-  return exe_dir.AppendASCII("meridian_adblock.dat");
++  // Beside the browser's code: next to the executable in a build, in the
++  // version's folder of an installed copy on Windows.
++  base::FilePath module_dir;
++  base::PathService::Get(base::DIR_MODULE, &module_dir);
++  return module_dir.AppendASCII("meridian_adblock.dat");
+ #endif
+ }
+ 
+diff --git a/chrome/browser/meridian/workbench/workbench_source.cc b/chrome/browser/meridian/workbench/workbench_source.cc
+index babdf1f74b..944a10f61c 100644
+--- a/chrome/browser/meridian/workbench/workbench_source.cc
++++ b/chrome/browser/meridian/workbench/workbench_source.cc
+@@ -72,10 +72,12 @@ base::FilePath WorkbenchSource::Folder() {
+ #if BUILDFLAG(IS_MAC)
+   return base::apple::OuterBundlePath().AppendASCII("Contents/Resources/workbench");
+ #else
+-  // Next to the executable, as the ad blocking rules are.
+-  base::FilePath exe_dir;
+-  base::PathService::Get(base::DIR_EXE, &exe_dir);
+-  return exe_dir.AppendASCII("workbench");
++  // Beside the browser's code, as the ad blocking rules are: next to the
++  // executable in a build, in the version's folder of an installed copy on
++  // Windows.
++  base::FilePath module_dir;
++  base::PathService::Get(base::DIR_MODULE, &module_dir);
++  return module_dir.AppendASCII("workbench");
+ #endif
+ }
+ 
+diff --git a/chrome/install_static/chromium_install_modes.h b/chrome/install_static/chromium_install_modes.h
+index a049e6870f..9332813d5a 100644
+--- a/chrome/install_static/chromium_install_modes.h
++++ b/chrome/install_static/chromium_install_modes.h
+@@ -67,14 +67,17 @@ inline constexpr auto kInstallModes = std::to_array<InstallConstants>({
+         .pdf_prog_id_prefix = L"MeridianPDF",  // PDF ProgID prefix.
+         .pdf_prog_id_description =
+             L"Meridian PDF Document",  // PDF ProgID description.
++        // Meridian: its own ids, so that it and a Chromium installed beside
++        // it don't take each other's registrations (Active Setup, the
++        // notifications' activator). They never change again.
+         .active_setup_guid =
+-            L"{7D2B3E1D-D096-4594-9D8F-A6667F12E0AC}",  // Active Setup
++            L"{6F0B8C4E-5D2A-4B7B-9E0D-3C1A5F7E9B21}",  // Active Setup
+                                                         // GUID.
+-        .toast_activator_clsid = {0x635EFA6F,
+-                                  0x08D6,
+-                                  0x4EC9,
+-                                  {0xBD, 0x14, 0x8A, 0x0F, 0xDE, 0x97, 0x51,
+-                                   0x59}},  // Toast Activator CLSID.
++        .toast_activator_clsid = {0x2B9D51C7,
++                                  0x4E3A,
++                                  0x4F68,
++                                  {0xA1, 0x5C, 0x7D, 0x90, 0x2E, 0x6B, 0xC4,
++                                   0x13}},  // Toast Activator CLSID.
+         .elevator_clsid = {0xD133B120,
+                            0x6DB4,
+                            0x4D6B,
+diff --git a/chrome/tools/build/win/create_installer_archive.py b/chrome/tools/build/win/create_installer_archive.py
+index d11825421e..6f97c500fa 100755
+--- a/chrome/tools/build/win/create_installer_archive.py
++++ b/chrome/tools/build/win/create_installer_archive.py
+@@ -740,6 +740,29 @@ def main(options):
+         options.verbose,
+     )
+ 
++    # Meridian: its own data files, made by chromium/build.sh after the build
++    # (ad blocking rules, the Workbench page), go beside chrome.dll. They are
++    # inputs of the archive like the rest, so it is made again when they
++    # change.
++    meridian_version_dir = os.path.join(
++        staging_dir, CHROME_DIR, current_version
++    )
++    meridian_rules = os.path.join(options.build_dir, 'meridian_adblock.dat')
++    if os.path.exists(meridian_rules):
++        shutil.copy(meridian_rules, meridian_version_dir)
++        g_archive_inputs.append(meridian_rules)
++    meridian_workbench = os.path.join(options.build_dir, 'workbench')
++    for root, _, files in os.walk(meridian_workbench):
++        dst = os.path.join(
++            meridian_version_dir,
++            'workbench',
++            os.path.relpath(root, meridian_workbench),
++        )
++        os.makedirs(dst, exist_ok=True)
++        for name in files:
++            shutil.copy(os.path.join(root, name), dst)
++            g_archive_inputs.append(os.path.join(root, name))
++
+     if options.component_build == '1':
+         DoComponentBuildTasks(
+             staging_dir,
