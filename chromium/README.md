@@ -35,6 +35,34 @@ open ~/repos/chromium/src/out/Release/Meridian.app
 Edit files in `~/repos/chromium/src` (the Meridian UI is in `chrome/browser/resources/webui_browser/`),
 commit on the `meridian` branch, run `build.sh`, then `export.sh` and commit `patches/` here.
 
+## On Linux and Windows
+
+The same scripts run in a Linux shell and in Git Bash on Windows (`tools/platform.sh` holds what
+differs). The build is `out/Release/chrome` or `chrome.exe`, with Meridian's own files (ad blocking
+rules, the Workbench page) next to it.
+
+- **Linux** (checked on Ubuntu 24.04): `setup.sh` also installs Chromium's build dependencies and
+  asks for `sudo` once. The E2E tests need Node 22 and a display (`xvfb-run -a chromium/tests/run.sh`).
+- **Windows** (checked on Windows 11): Visual Studio 2026 Build Tools with the C++ workload and the
+  Windows 11 SDK 10.0.28000, Git for Windows, and `depot_tools` on `PATH` with
+  `DEPOT_TOOLS_WIN_TOOLCHAIN=0`. If Visual Studio is under `Program Files (x86)`, point
+  `vs2026_install` at it. Fetching Chromium there was done with `gclient sync` directly; `apply.sh`,
+  `build.sh` and the tools run from Git Bash. Keep `python3` from `depot_tools` ahead of the
+  Microsoft Store's stub.
+
+Meridian's C++ is one code base: where it leans on POSIX (the Workbench's symlink-safe file access,
+unix sockets to the agents' hooks, ptys, process groups), Windows gets the same promises over Win32
+in `chrome/browser/meridian/win/` and the `*_win.cc` files.
+
+Not there yet outside macOS:
+
+- the in-app updater (Settings shows the version), installers and signing;
+- Ask with an agent CLI (Codex, Cursor…): it only runs inside a sandbox that keeps it away from
+  credentials, and that sandbox is macOS's `sandbox-exec`;
+- Import from Arc looks where Arc keeps its data on macOS;
+- on Windows, a CLI that npm installed as a `.cmd` wrapper isn't found (only `.exe` programs are
+  started), and tests that need a symlink to a file skip that part without Developer Mode.
+
 ## Status
 
 - [x] Stock Chromium build; Google sign-in passes
@@ -63,4 +91,4 @@ commit on the `meridian` branch, run `build.sh`, then `export.sh` and commit `pa
 - [x] Mission Control (⇧⌘M): Workbench agent sessions and subagents (hooks via `Meridian --mission-hook`, no Node needed), MCP clients, ⌘J runs; redacted summaries, history, notifications
 - [ ] Workbench Pro (vault, secret guard, sandboxes, customizations, hubs)
 - [ ] Updater, packaging, signing
-- [ ] Windows and Linux builds
+- [x] Windows and Linux builds: build, start, C++ unit tests pass (what is missing: "On Linux and Windows" above)
