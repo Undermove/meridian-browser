@@ -66,6 +66,8 @@ test('after a restart ⇧⌘T reopens the tab closed before it, in this window, 
 
     b = await launch([], { profile, args: ARGS });
     await b.waitFor(`!!${T}?.state_ && ${SB}.querySelectorAll('meridian-tab-row').length === 2`, 15000);
+    // Restored tabs get their titles as they load (a slow Mac shows an address first).
+    await until(async () => (await titles(b)) === 'A,B', 15000);
     assert.deepEqual(await now(b), { windows: 1, tabs: 'A,B' }, 'the session is back');
     await reopen(b);
     assert.deepEqual(await now(b), { windows: 1, tabs: 'A,B,C' }, 'C is back, here');

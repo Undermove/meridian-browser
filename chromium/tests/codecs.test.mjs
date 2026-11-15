@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { launch, APP } from './harness.mjs';
 
@@ -108,8 +109,12 @@ function decoders(page) {
 }
 
 const ARGS = ['--autoplay-policy=no-user-gesture-required'];
+// A Mac in a virtual machine (GitHub's runners): macOS's H.264 decoder doesn't start there
+// (DECODER_ERROR_NOT_SUPPORTED, kUnsupportedConfig), so this one runs on a real Mac only.
+const VM = process.platform === 'darwin' &&
+    execFileSync('sysctl', ['-n', 'kern.hv_vmm_present']).toString().trim() === '1';
 
-test('H.264 with AAC plays, picture and sound, through macOS decoders: a plain MP4 and Media Source', async () => {
+test('H.264 with AAC plays, picture and sound, through macOS decoders: a plain MP4 and Media Source', { skip: VM && 'no H.264 decoder in a macOS virtual machine' }, async () => {
   const site = await serve();
   const b = await launch([site.url], { args: ARGS });
   try {
