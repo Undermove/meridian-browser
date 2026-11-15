@@ -60,6 +60,8 @@ Not there yet outside macOS:
 - Ask with an agent CLI (Codex, Cursor…): it only runs inside a sandbox that keeps it away from
   credentials, and that sandbox is macOS's `sandbox-exec`;
 - Import from Arc looks where Arc keeps its data on macOS;
+- on Linux the build still carries FFmpeg's H.264 and AAC decoders (macOS and Windows decode with
+  the system's): to be settled before a Linux release;
 - on Windows, a CLI that npm installed as a `.cmd` wrapper isn't found (only `.exe` programs are
   started), and tests that need a symlink to a file skip that part without Developer Mode.
 

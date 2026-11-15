@@ -1,6 +1,7 @@
 // H.264 and AAC play, as on most of the web outside YouTube (a film site's player, a news video):
-// the picture and the sound both come through, decoded by macOS (VideoToolbox, AudioToolbox, whose
-// licences Apple holds), as in Firefox. Meridian's own FFmpeg has no H.264 or AAC decoder. It played
+// the picture and the sound both come through, decoded by the system (macOS: VideoToolbox and
+// AudioToolbox; Windows: Direct3D 11 and Media Foundation; their makers hold the licences), as in
+// Firefox. Meridian's own FFmpeg has no H.264 or AAC decoder. It played
 // none of this before: the build had no H.264 or AAC at all.
 //
 // The fixtures (fixtures/codecs) are 3 s of a red picture with a 440 Hz tone:
@@ -13,9 +14,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { launch, APP } from './harness.mjs';
 
-const DIR = path.join(path.dirname(new URL(import.meta.url).pathname), 'fixtures', 'codecs');
+const DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'codecs');
 const TYPES = { '.mp4': 'video/mp4', '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.html': 'text/html' };
 
 // The page: plays a file into an analyser (muted on the way out) and reports what it heard and saw.
@@ -162,10 +164,16 @@ test('Meridian has no H.264 decoder of its own: with macOS\'s video decoding off
 
 test('the app carries no FFmpeg H.264 or AAC decoder', () => {
   // Messages only FFmpeg's H.264 decoder (h264dec.c, h264_direct.c) and AAC decoder (aacdec.c) print.
-  const framework = path.join(path.dirname(path.dirname(APP)), 'Frameworks');
-  const bin = fs.readdirSync(framework).filter((f) => f.endsWith('.framework'))
-    .map((f) => path.join(framework, f, path.basename(f, '.framework'))).find((p) => fs.existsSync(p) && fs.statSync(p).size > 1e8);
-  assert.ok(bin, 'the framework binary');
+  // The file the browser's code is in: the framework on macOS, chrome.dll on Windows.
+  let bin;
+  if (process.platform === 'win32') {
+    bin = path.join(path.dirname(APP), 'chrome.dll');
+  } else {
+    const framework = path.join(path.dirname(path.dirname(APP)), 'Frameworks');
+    bin = fs.readdirSync(framework).filter((f) => f.endsWith('.framework'))
+      .map((f) => path.join(framework, f, path.basename(f, '.framework'))).find((p) => fs.existsSync(p) && fs.statSync(p).size > 1e8);
+  }
+  assert.ok(bin && fs.existsSync(bin), 'the binary');
   const data = fs.readFileSync(bin);
   for (const s of ['decode_slice_header error', 'co located POCs unavailable',
     'Assuming an incorrectly encoded 7.1 channel layout', 'SBR was found before the first channel element']) {
