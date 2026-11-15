@@ -884,9 +884,10 @@ test('the rest of Arc comes over from Settings: history, form entries, an addres
     assert.doesNotMatch(got, /kiwi-arc-work/, got);
     await esc();
     // Arc's site search: "kiwi pear" + Return searches the site.
-    await suggest('kiwi pear');
+    const pear = await suggest('kiwi pear');
     await press1([36, '\r']);
-    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'search:pear')`);
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'search:pear')`)
+        .catch(async (e) => { throw new Error(`${e.message}; the matches: ${pear}; the tabs: ${await b.eval(`[...${SB}.querySelectorAll('meridian-tab-row')].map((r) => r.tab.url + ' ' + r.tab.title).join(' | ')`)}`); });
     await b.eval(`${H}.activateSpace(${JSON.stringify(home.id)})`);
     await b.waitFor(`${T}.state_.profileId === 'Meridian Profile Arc 2'`);
     got = await suggest('kiwi');
