@@ -15,6 +15,9 @@ test('a new tab shows the home page; search opens ⌘T; Make a space; it goes on
     await b.waitFor(`app.$.home.shown`);
     assert.match(await b.eval(`${HM}.querySelector('.greet').textContent`), /^Good (morning|afternoon|evening|night)$/);
     assert.deepEqual(await b.eval(`[...${HM}.querySelectorAll('.card')].map((c) => c.dataset.card)`), ['everyday', 'designer', 'manager', 'developer']);
+    // The cards' shortcuts as key caps: ⌃ and 1–9 for the spaces, not ⌃ 1 – 9.
+    const caps = await b.eval(`[...${HM}.querySelectorAll('.card kbd')].map((k) => k.textContent.trim())`);
+    assert.ok(caps.includes('1–9') && !caps.includes('–'), `the cards' key caps: ${caps.join(' ')}`);
     await b.click(`${HM}.getElementById('search')`);
     await b.waitFor(`app.$.commandBar.open`);
     await b.key('Escape', 'Escape', 27);

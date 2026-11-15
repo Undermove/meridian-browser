@@ -1,0 +1,490 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Sun, 15 Nov 2026 15:14:04 +0400
+Subject: [PATCH] Meridian: on Windows, no title bar and one bar across the
+ top, as Arc has there
+
+The browser window on Windows had Windows's own title bar above the UI
+page. It has none now (webui_browser_frame_view_win.cc: a frame that draws
+nothing, leaves the whole window to the page and answers the hit tests for
+resizing), like the macOS window under its transparent title bar.
+
+In its place the UI page has a bar across the top on Windows: a menu and
+Hide Sidebar on the left, Back, Forward and Reload at the sidebar's edge,
+the URL pill in the middle, and the caption buttons on the right. The bar
+is what the window is dragged by. The controls and the pill are the same
+elements as everywhere else: the page moves them from the sidebar into the
+bar when it starts on Windows, so nothing about them differs on macOS,
+where the bar stays hidden and unused.
+
+The menu holds what the menu bar has on macOS and no button has: New Tab,
+Folder and Space, Ask, Chat, Workbench, Mission Control, Archive, Downloads,
+Import from Arc, Welcome Tour, Settings.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../browser/resources/webui_browser/app.css   | 108 ++++++++++++++++++
+ .../resources/webui_browser/app.html.ts       |  36 ++++++
+ chrome/browser/resources/webui_browser/app.ts |  30 +++++
+ .../resources/webui_browser/meridian/keys.ts  |   3 +
+ .../webui_browser/meridian/sidebar.ts         |  31 +++++
+ chrome/browser/ui/webui_browser/BUILD.gn      |   8 ++
+ .../webui_browser_frame_view_win.cc           |  54 +++++++++
+ .../webui_browser_frame_view_win.h            |  41 +++++++
+ .../ui/webui_browser/webui_browser_window.cc  |  20 ++++
+ 9 files changed, 331 insertions(+)
+ create mode 100644 chrome/browser/ui/webui_browser/webui_browser_frame_view_win.cc
+ create mode 100644 chrome/browser/ui/webui_browser/webui_browser_frame_view_win.h
+
+diff --git a/chrome/browser/resources/webui_browser/app.css b/chrome/browser/resources/webui_browser/app.css
+index 9164b5f149..35d2a488aa 100644
+--- a/chrome/browser/resources/webui_browser/app.css
++++ b/chrome/browser/resources/webui_browser/app.css
+@@ -720,3 +720,111 @@ cr-icon-button[hidden] {
+   border-radius: 0;
+   box-shadow: none;
+ }
++
++/* Windows: one bar across the top of the window (app.html.ts), as Arc has
++ * there. The window has no title bar of Windows's own, so this bar is what
++ * it is dragged by, and the caption buttons are its right end. */
++:host([os-win]) #rootContainer {
++  position: relative;
++  box-sizing: border-box;
++  padding-top: 38px;
++}
++
++#winTopBar {
++  display: none;
++}
++
++:host([os-win]) #winTopBar {
++  position: absolute;
++  top: 0;
++  left: 0;
++  right: 0;
++  z-index: 16;
++  height: 38px;
++  display: flex;
++  align-items: center;
++  app-region: drag;
++  -webkit-app-region: drag;
++}
++
++/* As wide as the sidebar: the menu and Hide Sidebar at its left, Back,
++ * Forward and Reload at its right edge. */
++#winTopLeft {
++  box-sizing: border-box;
++  width: var(--meridian-sidebar-w);
++  flex: none;
++  display: flex;
++  align-items: center;
++  gap: 2px;
++  padding: 0 8px 0 10px;
++}
++
++#winTopBar cr-icon-button {
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
++}
++
++#winTopCenter {
++  flex: 1;
++  min-width: 0;
++  display: flex;
++  justify-content: center;
++}
++
++#winTopBar #urlPill {
++  width: min(440px, 100%);
++  height: 28px;
++  margin-bottom: 0;
++}
++
++#winTopBar .win-caption {
++  flex: none;
++  display: flex;
++  align-self: stretch;
++  margin-left: 8px;
++}
++
++.win-cap {
++  width: 46px;
++  height: 100%;
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  padding: 0;
++  border: 0;
++  background: none;
++  color: var(--meridian-text);
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
++}
++
++.win-cap:hover {
++  background: var(--meridian-row-hover);
++}
++
++.win-cap.win-close:hover {
++  background: #c42b1c;
++  color: #fff;
++}
++
++/* The sidebar's top row, now in the bar: no room kept for macOS's traffic
++ * lights, and the bar is the drag area. */
++:host([os-win]) #sidebarTop {
++  flex: 1;
++  padding-left: 0;
++  margin-bottom: 0;
++}
++
++:host([os-win]) #sidebar {
++  padding-top: 2px;
++}
++
++:host([os-win]) #main {
++  padding-top: 0;
++}
++
++/* A Little Window keeps its own compact layout: only the caption buttons. */
++:host([os-win][little]) #winTopLeft,
++:host([os-win][little]) #winTopCenter {
++  visibility: hidden;
++}
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 9c3288b82f..558f483b62 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -11,6 +11,42 @@ import {keyText} from './meridian/keys.js';
+ export function getHtml(this: WebuiBrowserAppElement) {
+   return html`<!--_html_template_start_-->
+ <div id="rootContainer">
++  <!-- Meridian, Windows only (hidden elsewhere: app.css): one bar across the
++       top of the window, as Arc has there. The menu on the left, the caption
++       buttons on the right. Hide Sidebar, Back, Forward, Reload and the URL
++       pill are moved into it from the sidebar when the page starts (app.ts:
++       they are the same elements on every system). -->
++  <div id="winTopBar">
++    <div id="winTopLeft">
++      <button id="meridianMenuButton" class="top-btn" title="Meridian menu"
++          @click="${this.onMeridianMenuClick_}">
++        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"
++            stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
++          <path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11"/>
++        </svg>
++      </button>
++    </div>
++    <div id="winTopCenter"></div>
++    <div class="win-caption">
++      <button class="win-cap" title="Minimize"
++          @click="${this.onMinimizeClick_}">
++        <svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 5h10"
++            stroke="currentColor" stroke-width="1"/></svg>
++      </button>
++      <button class="win-cap" title="Maximize"
++          @click="${this.onWinMaximizeClick_}">
++        <svg width="10" height="10" viewBox="0 0 10 10"><rect x="0.5" y="0.5"
++            width="9" height="9" fill="none" stroke="currentColor"
++            stroke-width="1"/></svg>
++      </button>
++      <button class="win-cap win-close" title="Close"
++          @click="${this.onCloseClick_}">
++        <svg width="10" height="10" viewBox="0 0 10 10"><path
++            d="M0 0l10 10M10 0L0 10" stroke="currentColor"
++            stroke-width="1"/></svg>
++      </button>
++    </div>
++  </div>
+   <div id="edgeHotzone" @mouseenter="${this.onEdgeHotzoneMouseenter_}"></div>
+   <div id="peekShield" @mouseenter="${this.onPeekShieldMouseenter_}"></div>
+   <div id="sidebar" @mouseenter="${this.onSidebarMouseenter_}"
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index eb60b69f84..67c4466400 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -56,6 +56,7 @@ import type {MeridianSiteControlElement} from './meridian/site_control.js';
+ import type {IconName} from './meridian/icons.js';
+ import {Command} from './sidebar.mojom-webui.js';
+ import type {Space, Split, TidyTab} from './sidebar.mojom-webui.js';
++import {isWindows} from './meridian/keys.js';
+ 
+ const SIDEBAR_HIDDEN_KEY = 'meridian.sidebarHidden';
+ 
+@@ -246,6 +247,17 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     // Important. Properties are not reactive without calling
+     // super.connectedCallback().
+     super.connectedCallback();
++    // Windows: the top bar (app.html.ts, app.css). The controls at the top
++    // of the sidebar and the URL pill move into it, once; they stay the
++    // elements the rest of this class knows.
++    this.toggleAttribute('os-win', isWindows);
++    if (isWindows) {
++      this.updateComplete.then(() => {
++        const find = (id: string) => this.shadowRoot.getElementById(id)!;
++        find('winTopLeft').appendChild(find('sidebarTop'));
++        find('winTopCenter').appendChild(this.$.urlPill);
++      });
++    }
+     this.trackedElementManager_.startTracking(
+         this.$.urlPill, 'kLocationBarElementId');
+     this.trackedElementManager_.startTracking(
+@@ -314,6 +326,24 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     browserProxyFactory.getInstance().handler.maximize();
+   }
+ 
++  // Windows: the caption's middle button maximizes, or puts the window back.
++  protected onWinMaximizeClick_(_: Event) {
++    const handler = browserProxyFactory.getInstance().handler;
++    if (window.outerWidth >= screen.availWidth &&
++        window.outerHeight >= screen.availHeight) {
++      handler.restore();
++    } else {
++      handler.maximize();
++    }
++  }
++
++  // Windows: the menu at the left of the top bar (what the menu bar holds on
++  // macOS).
++  protected onMeridianMenuClick_(e: MouseEvent) {
++    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
++    this.$.tabstrip.openAppMenu(r.left, r.bottom + 4);
++  }
++
+   protected onRestoreClick_(_: Event) {
+     browserProxyFactory.getInstance().handler.restore();
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/keys.ts b/chrome/browser/resources/webui_browser/meridian/keys.ts
+index f5a2dc6982..258d87c855 100644
+--- a/chrome/browser/resources/webui_browser/meridian/keys.ts
++++ b/chrome/browser/resources/webui_browser/meridian/keys.ts
+@@ -8,6 +8,9 @@
+ // accelerator_table.cc (Windows, Linux) and ui/cocoa/accelerators_cocoa.mm.
+ 
+ export const isMac = navigator.userAgent.includes('Mac');
++// Windows has its own window layout: a top bar across the window with the
++// caption buttons on the right (app.html.ts), as Arc has there.
++export const isWindows = navigator.userAgent.includes('Windows');
+ 
+ // Shortcuts that aren't the macOS one with Ctrl for ⌘ and Alt for ⌥.
+ const OTHER: Record<string, string> = {
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 42c58e7877..1bf09bd10b 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -1505,6 +1505,37 @@ export class MeridianSidebarElement extends CrLitElement implements
+     }
+   }
+ 
++  // Windows: the menu at the left of the top bar. What the menu bar holds
++  // on macOS (File, Spaces, Help) that has no button of its own.
++  openAppMenu(x: number, y: number) {
++    if (this.menu_) {
++      this.menu_ = null;
++      return;
++    }
++    const run = (command: Command) => () => this.runCommand(command, 0);
++    this.menu_ = {
++      x,
++      y,
++      sel: -1,
++      sub: null,
++      plus: false,
++      entries: [
++        {label: 'New Tab', icon: 'plus', keys: keyText('⌘T'), action: () => this.onNewTabClick_()},
++        {label: 'New Folder', icon: 'folder', keys: keyText('⌥⇧⌘N'), action: run(Command.kNewFolder)},
++        {label: 'New Space…', icon: 'layers', action: () => this.addSpace()},
++        {label: 'Ask', icon: 'sparkles', keys: keyText('⌘J'), separatorBefore: true, action: run(Command.kAsk)},
++        {label: 'Chat', icon: 'sparkles', keys: keyText('⌥⌘J'), action: run(Command.kChat)},
++        {label: 'Workbench', icon: 'code', keys: keyText('⇧⌘E'), action: run(Command.kWorkbench)},
++        {label: 'Mission Control', icon: 'agents', keys: keyText('⇧⌘M'), action: run(Command.kMission)},
++        {label: 'Archive', icon: 'archive', keys: keyText('⌥⌘A'), separatorBefore: true, action: run(Command.kShowArchive)},
++        {label: 'Downloads', icon: 'download', action: run(Command.kDownloads)},
++        {label: 'Import from Arc…', icon: 'layers', separatorBefore: true, action: run(Command.kImportArc)},
++        {label: 'Welcome Tour', icon: 'sparkles', action: run(Command.kWelcomeTour)},
++        {label: 'Settings', icon: 'settings', keys: keyText('⌘,'), separatorBefore: true, action: run(Command.kShowSettings)},
++      ],
++    };
++  }
++
+   // Arc's +: New Space, New Folder, New Split, New Tab (the + turns into ×).
+   protected onAddSpaceClick_(e: MouseEvent) {
+     if (this.menu_?.plus) {
+diff --git a/chrome/browser/ui/webui_browser/BUILD.gn b/chrome/browser/ui/webui_browser/BUILD.gn
+index d4f9050bb6..b21d35bbf9 100644
+--- a/chrome/browser/ui/webui_browser/BUILD.gn
++++ b/chrome/browser/ui/webui_browser/BUILD.gn
+@@ -84,6 +84,14 @@ source_set("impl") {
+     sources += [ "webui_browser_window_mac.mm" ]
+   }
+ 
++  # Meridian: no title bar on Windows either; the UI page draws the top bar.
++  if (is_win) {
++    sources += [
++      "webui_browser_frame_view_win.cc",
++      "webui_browser_frame_view_win.h",
++    ]
++  }
++
+   deps = [
+     ":browser_mojo_bindings",
+     ":webui_browser",
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_frame_view_win.cc b/chrome/browser/ui/webui_browser/webui_browser_frame_view_win.cc
+new file mode 100644
+index 0000000000..7454a05c04
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/webui_browser_frame_view_win.cc
+@@ -0,0 +1,54 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/webui_browser/webui_browser_frame_view_win.h"
++
++#include "ui/base/hit_test.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/gfx/geometry/point.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/views/widget/widget.h"
++#include "ui/views/widget/widget_delegate.h"
++#include "ui/views/window/client_view.h"
++
++namespace {
++
++// How far in from the window's edge the mouse still resizes it, and how far
++// along an edge a corner reaches.
++constexpr int kResizeBorder = 6;
++constexpr int kResizeCorner = 14;
++
++}  // namespace
++
++WebUIBrowserFrameViewWin::WebUIBrowserFrameViewWin(views::Widget* widget)
++    : widget_(widget) {}
++
++WebUIBrowserFrameViewWin::~WebUIBrowserFrameViewWin() = default;
++
++gfx::Rect WebUIBrowserFrameViewWin::GetBoundsForClientView() const {
++  return bounds();
++}
++
++gfx::Rect WebUIBrowserFrameViewWin::GetWindowBoundsForClientBounds(
++    const gfx::Rect& client_bounds) const {
++  return client_bounds;
++}
++
++int WebUIBrowserFrameViewWin::NonClientHitTest(const gfx::Point& point) {
++  if (!bounds().Contains(point)) {
++    return HTNOWHERE;
++  }
++  // A maximized or full screen window has no edge to pull.
++  const bool can_resize = widget_->widget_delegate() &&
++                          widget_->widget_delegate()->CanResize() &&
++                          !widget_->IsMaximized() && !widget_->IsFullscreen();
++  if (can_resize) {
++    int edge = GetHTComponentForFrame(point, gfx::Insets(kResizeBorder),
++                                      kResizeCorner, kResizeCorner, true);
++    if (edge != HTNOWHERE) {
++      return edge;
++    }
++  }
++  return widget_->client_view()->NonClientHitTest(point);
++}
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_frame_view_win.h b/chrome/browser/ui/webui_browser/webui_browser_frame_view_win.h
+new file mode 100644
+index 0000000000..a876823260
+--- /dev/null
++++ b/chrome/browser/ui/webui_browser/webui_browser_frame_view_win.h
+@@ -0,0 +1,41 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_WEBUI_BROWSER_WEBUI_BROWSER_FRAME_VIEW_WIN_H_
++#define CHROME_BROWSER_UI_WEBUI_BROWSER_WEBUI_BROWSER_FRAME_VIEW_WIN_H_
++
++#include "base/memory/raw_ptr.h"
++#include "ui/views/window/frame_view.h"
++
++namespace views {
++class Widget;
++}
++
++// Meridian, Windows: the browser window without a title bar. The page that is
++// the window's UI (chrome://webui-browser) reaches every edge and draws the
++// top bar itself, the caption buttons included, as the macOS window does
++// under its transparent title bar (webui_browser_window_mac.mm).
++//
++// This frame draws nothing. It leaves the whole window to the client view
++// and answers Windows's hit tests: the edges resize, and the rest is the
++// client view's, which says where the window is dragged by (the page's
++// `app-region: drag` areas).
++class WebUIBrowserFrameViewWin : public views::FrameView {
++ public:
++  explicit WebUIBrowserFrameViewWin(views::Widget* widget);
++  WebUIBrowserFrameViewWin(const WebUIBrowserFrameViewWin&) = delete;
++  WebUIBrowserFrameViewWin& operator=(const WebUIBrowserFrameViewWin&) = delete;
++  ~WebUIBrowserFrameViewWin() override;
++
++  // views::FrameView:
++  gfx::Rect GetBoundsForClientView() const override;
++  gfx::Rect GetWindowBoundsForClientBounds(
++      const gfx::Rect& client_bounds) const override;
++  int NonClientHitTest(const gfx::Point& point) override;
++
++ private:
++  const raw_ptr<views::Widget> widget_;
++};
++
++#endif  // CHROME_BROWSER_UI_WEBUI_BROWSER_WEBUI_BROWSER_FRAME_VIEW_WIN_H_
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index 5e4d92e6de..ae0686c441 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -52,6 +52,9 @@
+ #include "chrome/browser/ui/webui_browser/browser_elements_webui_browser.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser_client_view.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser_exclusive_access_context.h"
++#if BUILDFLAG(IS_WIN)
++#include "chrome/browser/ui/webui_browser/webui_browser_frame_view_win.h"
++#endif
+ #include "chrome/browser/ui/webui_browser/webui_browser_modal_dialog_host.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser_ui.h"
+@@ -139,6 +142,11 @@ class WebUIBrowserWindow::WidgetDelegate : public views::WidgetDelegate {
+       gfx::Rect* bounds,
+       ui::mojom::WindowShowState* show_state) const override;
+   views::ClientView* CreateClientView(views::Widget* widget) override;
++#if BUILDFLAG(IS_WIN)
++  // Meridian: a frame without a title bar (webui_browser_frame_view_win.h).
++  std::unique_ptr<views::FrameView> CreateFrameView(
++      views::Widget* widget) override;
++#endif
+   std::u16string GetWindowTitle() const override;
+   bool ShouldDescendIntoChildForEventHandling(
+       gfx::NativeView child,
+@@ -178,6 +186,11 @@ WebUIBrowserWindow::WebUIBrowserWindow(BrowserWindowInterface* browser)
+   params.native_widget = CreateNativeWidget();
+ #if BUILDFLAG(IS_CHROMEOS)
+   params.remove_standard_frame = true;
++#endif
++#if BUILDFLAG(IS_WIN)
++  // Meridian: Windows's own title bar gives way to the UI page's top bar
++  // (WidgetDelegate::CreateFrameView below).
++  widget_->set_frame_type(views::Widget::FrameType::kForceCustom);
+ #endif
+   widget_->Init(std::move(params));
+   widget_->SetNativeWindowProperty(kWebUIBrowserWindowKey, this);
+@@ -1452,6 +1465,13 @@ views::ClientView* WebUIBrowserWindow::WidgetDelegate::CreateClientView(
+                                     TransferOwnershipOfContentsView());
+ }
+ 
++#if BUILDFLAG(IS_WIN)
++std::unique_ptr<views::FrameView>
++WebUIBrowserWindow::WidgetDelegate::CreateFrameView(views::Widget* widget) {
++  return std::make_unique<WebUIBrowserFrameViewWin>(widget);
++}
++#endif
++
+ std::u16string WebUIBrowserWindow::WidgetDelegate::GetWindowTitle() const {
+   // TODO(webium):  BrowserView::GetWindowTitle() has some magic for media
+   // on Mac.

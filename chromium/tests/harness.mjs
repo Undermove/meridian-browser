@@ -8,8 +8,8 @@ import path from 'node:path';
 
 const DIR = process.env.CHROMIUM_DIR || path.join(os.homedir(), 'repos/chromium');
 // MERIDIAN_APP: another Meridian binary, such as an installed release (CI checks every release).
-export const APP = process.env.MERIDIAN_APP ||
-    path.join(DIR, 'src/out/Release/Meridian.app/Contents/MacOS/Meridian');
+const BINARY = { darwin: 'Meridian.app/Contents/MacOS/Meridian', win32: 'chrome.exe' }[process.platform] || 'chrome';
+export const APP = process.env.MERIDIAN_APP || path.join(DIR, 'src/out/Release', BINARY);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 class Cdp {
@@ -144,7 +144,12 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
     // Keep drawing when the window is covered or the display sleeps (input waits for frames).
     '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
     // No on-device model downloads (≈190 MB each into the temp folder).
-    '--disable-features=OptimizationGuideModelDownloading,OptimizationGuideOnDeviceModel',
+    // MERIDIAN_TEST_DISABLE_FEATURES: more features to turn off, for where the tests run. On
+    // Windows they can run on a desktop nobody sees, out of the person's way; there a window
+    // would count as hidden (CalculateNativeWinOcclusion) and the sandboxed network service
+    // doesn't start (NetworkServiceSandbox), so pages never load.
+    '--disable-features=' + ['OptimizationGuideModelDownloading', 'OptimizationGuideOnDeviceModel',
+      ...(process.env.MERIDIAN_TEST_DISABLE_FEATURES || '').split(',').filter(Boolean)].join(','),
     ...args, ...urls,
     // MERIDIAN_LOG=<file>: the browser's log there (debugging).
   ].concat(process.env.MERIDIAN_LOG ? ['--enable-logging=stderr'] : []),

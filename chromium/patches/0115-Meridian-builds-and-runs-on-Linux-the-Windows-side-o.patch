@@ -1,0 +1,588 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Meridian <meridian@localhost>
+Date: Sun, 15 Nov 2026 09:55:36 +0400
+Subject: [PATCH] Meridian: builds and runs on Linux; the Windows side of the
+ same seams
+
+What only macOS had, behind the same interfaces:
+- Workbench "Move to Trash": gio trash on Linux, the Recycle Bin on Windows.
+- AskNative (the Workbench's and the agent's questions): a browser-modal
+  views dialog, a button per answer, the first one the default.
+- Mission Control's platform part: the last active browser window stands in
+  for NSApp; no Dock badge.
+- Default browser (welcome tour, Settings): Chromium's DefaultBrowserWorker.
+- chrome://workbench finds its files next to the executable, as the ad
+  blocking rules already do.
+- The updater replaces a signed Meridian.app with macOS's tools, so it is
+  built on macOS only; elsewhere a stub reports this build's version.
+Also two includes macOS got by way of other headers, a full traffic
+annotation for the agent's local socket (the short form doesn't exist on
+Windows and Linux), libutil for openpty, and chdir's result in the terminal.
+---
+ .../subresource_filter_component_installer.cc |   1 +
+ chrome/browser/meridian/BUILD.gn              |  30 +++-
+ chrome/browser/meridian/agent/agent_server.cc |  17 ++-
+ .../mission/mission_platform_views.cc         |  43 ++++++
+ chrome/browser/meridian/sidebar_handler.cc    |  30 ++++
+ chrome/browser/meridian/updater_stub.cc       |  54 +++++++
+ .../meridian/workbench/native_dialog_views.cc | 144 ++++++++++++++++++
+ .../meridian/workbench/project_fs_linux.cc    |  30 ++++
+ .../meridian/workbench/project_fs_win.cc      |  28 ++++
+ chrome/browser/meridian/workbench/terminal.cc |   4 +-
+ .../meridian/workbench/workbench_source.cc    |   8 +-
+ 11 files changed, 380 insertions(+), 9 deletions(-)
+ create mode 100644 chrome/browser/meridian/mission/mission_platform_views.cc
+ create mode 100644 chrome/browser/meridian/updater_stub.cc
+ create mode 100644 chrome/browser/meridian/workbench/native_dialog_views.cc
+ create mode 100644 chrome/browser/meridian/workbench/project_fs_linux.cc
+ create mode 100644 chrome/browser/meridian/workbench/project_fs_win.cc
+
+diff --git a/chrome/browser/component_updater/subresource_filter_component_installer.cc b/chrome/browser/component_updater/subresource_filter_component_installer.cc
+index f11a6a61e6..7a1ada3388 100644
+--- a/chrome/browser/component_updater/subresource_filter_component_installer.cc
++++ b/chrome/browser/component_updater/subresource_filter_component_installer.cc
+@@ -30,6 +30,7 @@
+ #include "content/public/browser/browser_task_traits.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "components/component_updater/component_updater_paths.h"
++#include "components/component_updater/component_updater_service.h"
+ #include "components/subresource_filter/content/browser/ruleset_service.h"
+ #include "components/subresource_filter/core/browser/subresource_filter_constants.h"
+ #include "components/subresource_filter/core/browser/subresource_filter_features.h"
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index c9085a0d69..5970648003 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -108,7 +108,6 @@ source_set("workbench_core") {
+     "workbench/hubs_texts.h",
+     "workbench/project_fs.cc",
+     "workbench/project_fs.h",
+-    "workbench/project_fs_mac.mm",
+     "workbench/sandbox.cc",
+     "workbench/sandbox.h",
+     "workbench/secret_files.cc",
+@@ -125,7 +124,18 @@ source_set("workbench_core") {
+     "//third_party/icu",
+     "//third_party/re2",
+   ]
+-  frameworks = [ "Foundation.framework" ]
++  # Moving a file to the Trash is each system's own.
++  if (is_mac) {
++    sources += [ "workbench/project_fs_mac.mm" ]
++    frameworks = [ "Foundation.framework" ]
++  } else if (is_win) {
++    sources += [ "workbench/project_fs_win.cc" ]
++  } else {
++    sources += [ "workbench/project_fs_linux.cc" ]
++
++    # openpty() for the terminals: in libutil before glibc 2.34.
++    libs = [ "util" ]
++  }
+ }
+ 
+ action("agent_embed") {
+@@ -197,11 +207,9 @@ source_set("meridian") {
+     "mission/mission_control_factory.cc",
+     "mission/mission_control_factory.h",
+     "mission/mission_platform.h",
+-    "mission/mission_platform_mac.mm",
+     "workbench/guard_server.cc",
+     "workbench/guard_server.h",
+     "workbench/native_dialog.h",
+-    "workbench/native_dialog_mac.mm",
+     "workbench/vault.cc",
+     "workbench/vault.h",
+     "workbench/workbench_service.cc",
+@@ -244,19 +252,28 @@ source_set("meridian") {
+     "status_bubble.h",
+     "tab_data.cc",
+     "tab_data.h",
+-    "updater.cc",
+     "updater.h",
+   ]
+   if (is_mac) {
+     sources += [
+       "arc_logins_mac.mm",
++      "mission/mission_platform_mac.mm",
+       "sidebar_handler_mac.mm",
++      "updater.cc",
++      "workbench/native_dialog_mac.mm",
+     ]
+     frameworks = [
+       "AppKit.framework",
+       "Carbon.framework",
+       "Security.framework",
+     ]
++  } else {
++    # Windows and Linux: the same things with Chromium's own UI toolkit.
++    sources += [
++      "mission/mission_platform_views.cc",
++      "updater_stub.cc",
++      "workbench/native_dialog_views.cc",
++    ]
+   }
+   public_deps = [
+     ":test_switches",
+@@ -270,6 +287,9 @@ source_set("meridian") {
+   ]
+   deps = [
+     "//chrome/app:command_ids",
++    "//chrome/browser:shell_integration",
++    "//components/constrained_window",
++    "//ui/views",
+     ":agent_embed",
+     ":arc_staged",
+     "//chrome/browser/autofill",
+diff --git a/chrome/browser/meridian/agent/agent_server.cc b/chrome/browser/meridian/agent/agent_server.cc
+index 92a5760f07..2fd8feddfc 100644
+--- a/chrome/browser/meridian/agent/agent_server.cc
++++ b/chrome/browser/meridian/agent/agent_server.cc
+@@ -23,6 +23,7 @@
+ #include "net/base/net_errors.h"
+ #include "net/socket/stream_socket.h"
+ #include "net/socket/unix_domain_server_socket_posix.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
+ 
+ namespace meridian {
+ 
+@@ -281,7 +282,21 @@ class AgentServer::Core {
+     int rv = c.socket->Write(
+         buffer.get(), size,
+         base::BindOnce(&Core::OnWritten, weak_factory_.GetWeakPtr(), id),
+-        TRAFFIC_ANNOTATION_WITHOUT_PROTO("meridian_agent_local_socket"));
++        net::DefineNetworkTrafficAnnotation("meridian_agent_local_socket", R"(
++          semantics {
++            sender: "Meridian agent server"
++            description:
++              "Replies to an MCP client (a coding agent on this computer) "
++              "over a Unix socket in the person's profile folder."
++            trigger: "The MCP client called one of Meridian's browser tools."
++            data: "The tool's result. Nothing leaves this computer."
++            destination: LOCAL
++          }
++          policy {
++            cookies_allowed: NO
++            setting: "Settings, AI: the access MCP clients have (off by default)."
++            policy_exception_justification: "Not implemented."
++          })"));
+     if (rv != net::ERR_IO_PENDING) {
+       OnWritten(id, rv);
+     }
+diff --git a/chrome/browser/meridian/mission/mission_platform_views.cc b/chrome/browser/meridian/mission/mission_platform_views.cc
+new file mode 100644
+index 0000000000..c06557f840
+--- /dev/null
++++ b/chrome/browser/meridian/mission/mission_platform_views.cc
+@@ -0,0 +1,43 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/mission/mission_platform.h"
++
++#include "chrome/browser/meridian/sidebar_handler.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
++#include "ui/base/base_window.h"
++
++// Windows and Linux. (mission_platform_mac.mm is the macOS one.)
++namespace meridian::mission {
++
++namespace {
++
++ui::BaseWindow* LastActiveWindow() {
++  BrowserWindowInterface* browser =
++      GetLastActiveBrowserWindowInterfaceWithAnyProfile();
++  return browser ? browser->GetWindow() : nullptr;
++}
++
++}  // namespace
++
++bool AppIsActive() {
++  ui::BaseWindow* window = LastActiveWindow();
++  return window && window->IsActive();
++}
++
++// The Dock's badge has no counterpart every desktop here shows: the
++// notification and Mission Control's own counter carry it.
++void SetDockBadge(const std::string& text) {}
++
++void RevealMissionControl(Profile* profile,
++                          const std::string& node_id,
++                          std::optional<int> button) {
++  if (ui::BaseWindow* window = LastActiveWindow()) {
++    window->Activate();
++  }
++  SidebarHandler::ShowMissionControl(profile, node_id);
++}
++
++}  // namespace meridian::mission
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 62deb6fca4..ba5a7e6f73 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -56,6 +56,7 @@
+ #include "chrome/browser/meridian/little_window.h"
+ #include "chrome/browser/meridian/now_playing.h"
+ #include "chrome/browser/meridian/test_switches.h"
++#include "chrome/browser/shell_integration.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/common/webui_url_constants.h"
+ #include "ui/base/clipboard/scoped_clipboard_writer.h"
+@@ -2837,6 +2838,35 @@ void SidebarHandler::TestWindowState(TestWindowStateCallback callback) {
+ std::string SystemUserFullName() {
+   return std::string();
+ }
++
++// Synthetic key presses go through AppKit on macOS (sidebar_handler_mac.mm);
++// the tests that need them are macOS ones.
++void SidebarHandler::TestKeyPress(uint16_t key_code,
++                                  const std::string& characters,
++                                  uint32_t modifiers) {}
++
++namespace {
++
++void ReplyIsDefault(base::OnceCallback<void(bool)> callback,
++                    shell_integration::DefaultWebClientState state) {
++  std::move(callback).Run(state == shell_integration::IS_DEFAULT);
++}
++
++}  // namespace
++
++void SidebarHandler::IsDefaultBrowser(IsDefaultBrowserCallback callback) {
++  base::MakeRefCounted<shell_integration::DefaultBrowserWorker>()
++      ->StartCheckIsDefault(
++          base::BindOnce(&ReplyIsDefault, std::move(callback)));
++}
++
++// Windows opens its Default apps settings for the person to choose there;
++// Linux sets it through xdg-settings.
++void SidebarHandler::SetDefaultBrowser(SetDefaultBrowserCallback callback) {
++  base::MakeRefCounted<shell_integration::DefaultBrowserWorker>()
++      ->StartSetAsDefault(
++          base::BindOnce(&ReplyIsDefault, std::move(callback)));
++}
+ #endif
+ 
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/updater_stub.cc b/chrome/browser/meridian/updater_stub.cc
+new file mode 100644
+index 0000000000..bbb15e198c
+--- /dev/null
++++ b/chrome/browser/meridian/updater_stub.cc
+@@ -0,0 +1,54 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/updater.h"
++
++#include <utility>
++
++#include "base/no_destructor.h"
++#include "chrome/browser/meridian/test_switches.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++
++// Windows and Linux: Meridian doesn't replace itself there yet. The updater
++// (updater.cc) swaps a signed Meridian.app with macOS's own tools; these
++// builds are updated by installing a newer release. Settings shows this
++// build's version and nothing to install.
++namespace meridian {
++
++// static
++Updater& Updater::Get() {
++  static base::NoDestructor<Updater> updater;
++  return *updater;
++}
++
++Updater::Updater() = default;
++Updater::~Updater() = default;
++
++void Updater::Start() {}
++
++void Updater::CheckNow() {}
++
++bool Updater::Install() {
++  return false;
++}
++
++mojom::UpdateStatePtr Updater::State() const {
++  auto state = mojom::UpdateState::New();
++  state->status = status_;
++  state->current = HasTestSwitch("meridian-test-version")
++                       ? TestSwitchValue("meridian-test-version")
++                       : std::string(update::kVersion);
++  state->progress = 0;
++  return state;
++}
++
++void Updater::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void Updater::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/workbench/native_dialog_views.cc b/chrome/browser/meridian/workbench/native_dialog_views.cc
+new file mode 100644
+index 0000000000..634241f017
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/native_dialog_views.cc
+@@ -0,0 +1,144 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/workbench/native_dialog.h"
++
++#include <memory>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/memory/ref_counted.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/meridian/test_switches.h"
++#include "components/constrained_window/constrained_window_views.h"
++#include "content/public/browser/web_contents.h"
++#include "ui/base/mojom/dialog_button.mojom.h"
++#include "ui/base/mojom/ui_base_types.mojom.h"
++#include "ui/base/ui_base_types.h"
++#include "ui/gfx/geometry/insets.h"
++#include "ui/gfx/native_ui_types.h"
++#include "ui/views/controls/button/md_text_button.h"
++#include "ui/views/controls/label.h"
++#include "ui/views/layout/box_layout.h"
++#include "ui/views/layout/box_layout_view.h"
++#include "ui/views/layout/layout_provider.h"
++#include "ui/views/widget/widget.h"
++#include "ui/views/window/dialog_delegate.h"
++
++namespace meridian::workbench {
++
++namespace {
++
++// The answer, given once: by a button, or as the first button when the dialog
++// goes away any other way (Escape, the window closing), as the macOS alert
++// does.
++class Answer : public base::RefCounted<Answer> {
++ public:
++  explicit Answer(base::OnceCallback<void(int)> done)
++      : done_(std::move(done)) {}
++
++  // False when it was already given.
++  bool Give(int index) {
++    if (!done_) {
++      return false;
++    }
++    std::move(done_).Run(index);
++    return true;
++  }
++
++ private:
++  friend class base::RefCounted<Answer>;
++  ~Answer() = default;
++
++  base::OnceCallback<void(int)> done_;
++};
++
++}  // namespace
++
++void AskNative(content::WebContents* contents,
++               const std::string& message,
++               const std::string& detail,
++               const std::vector<std::string>& buttons,
++               base::OnceCallback<void(int)> done) {
++  // Only for a profile in the temp folder (test_switches.h).
++  if (HasTestSwitch("meridian-test-dialog-answer")) {
++    std::string answer = TestSwitchValue("meridian-test-dialog-answer");
++    int index = 0;
++    for (size_t i = 0; i < buttons.size(); ++i) {
++      if (buttons[i] == answer) {
++        index = static_cast<int>(i);
++      }
++    }
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(done), index));
++    return;
++  }
++  gfx::NativeWindow parent =
++      contents ? contents->GetTopLevelNativeWindow() : gfx::NativeWindow();
++  if (!parent || buttons.empty()) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(done), 0));
++    return;
++  }
++  // Windows and Linux: the question over the browser window, a button per
++  // answer, the first one the default (as in the macOS alert).
++  auto answer = base::MakeRefCounted<Answer>(std::move(done));
++  auto delegate = std::make_unique<views::DialogDelegate>();
++  views::DialogDelegate* dialog = delegate.get();
++  dialog->SetModalType(ui::mojom::ModalType::kWindow);
++  dialog->SetTitle(base::UTF8ToUTF16(message));
++  dialog->SetShowCloseButton(false);
++  dialog->SetButtons(static_cast<int>(ui::mojom::DialogButton::kNone));
++  dialog->RegisterWindowClosingCallback(base::BindOnce(
++      [](scoped_refptr<Answer> answer) { answer->Give(0); }, answer));
++
++  const views::LayoutProvider* provider = views::LayoutProvider::Get();
++  dialog->set_margins(provider->GetDialogInsetsForContentType(
++      views::DialogContentType::kText, views::DialogContentType::kControl));
++  auto view = std::make_unique<views::BoxLayoutView>();
++  view->SetOrientation(views::BoxLayout::Orientation::kVertical);
++  view->SetCrossAxisAlignment(
++      views::BoxLayout::CrossAxisAlignment::kStretch);
++  view->SetBetweenChildSpacing(provider->GetDistanceMetric(
++      views::DISTANCE_UNRELATED_CONTROL_VERTICAL));
++  if (!detail.empty()) {
++    auto* label = view->AddChildView(
++        std::make_unique<views::Label>(base::UTF8ToUTF16(detail)));
++    label->SetMultiLine(true);
++    label->SetHorizontalAlignment(gfx::ALIGN_LEFT);
++    label->SetMaximumWidth(provider->GetDistanceMetric(
++        views::DISTANCE_MODAL_DIALOG_PREFERRED_WIDTH));
++  }
++  auto* row = view->AddChildView(std::make_unique<views::BoxLayoutView>());
++  row->SetOrientation(views::BoxLayout::Orientation::kHorizontal);
++  row->SetMainAxisAlignment(views::BoxLayout::MainAxisAlignment::kEnd);
++  row->SetBetweenChildSpacing(provider->GetDistanceMetric(
++      views::DISTANCE_RELATED_BUTTON_HORIZONTAL));
++  // The default answer sits last, where a dialog's main button is. The
++  // buttons live inside the dialog's widget, so `dialog` outlives them.
++  for (size_t i = buttons.size(); i-- > 0;) {
++    auto* button = row->AddChildView(std::make_unique<views::MdTextButton>(
++        base::BindRepeating(
++            [](scoped_refptr<Answer> answer, views::DialogDelegate* dialog,
++               int index) {
++              if (answer->Give(index) && dialog->GetWidget()) {
++                dialog->GetWidget()->Close();
++              }
++            },
++            answer, base::Unretained(dialog), static_cast<int>(i)),
++        base::UTF8ToUTF16(buttons[i])));
++    if (i == 0) {
++      button->SetStyle(ui::ButtonStyle::kProminent);
++      button->SetIsDefault(true);
++      dialog->SetInitiallyFocusedView(button);
++    }
++  }
++  dialog->SetContentsView(std::move(view));
++  constrained_window::CreateBrowserModalDialogViews(std::move(delegate), parent)
++      ->Show();
++}
++
++}  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/project_fs_linux.cc b/chrome/browser/meridian/workbench/project_fs_linux.cc
+new file mode 100644
+index 0000000000..c97d5071ab
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/project_fs_linux.cc
+@@ -0,0 +1,30 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/workbench/project_fs.h"
++
++#include <string>
++#include <vector>
++
++#include "base/command_line.h"
++#include "base/process/launch.h"
++
++namespace meridian::workbench {
++
++// The desktop's own trash (the freedesktop.org one: home and per-volume
++// trash folders, restore from the file manager), through GLib's `gio`, which
++// GNOME, KDE and the other desktops Chromium runs on install. Without it
++// nothing is removed, and the caller says so.
++bool MoveToTrash(const base::FilePath& path) {
++  base::CommandLine command(base::FilePath("gio"));
++  command.AppendArg("trash");
++  command.AppendArg("--");
++  command.AppendArgPath(path);
++  std::string output;
++  int exit_code = -1;
++  return base::GetAppOutputWithExitCode(command, &output, &exit_code) &&
++         exit_code == 0;
++}
++
++}  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/project_fs_win.cc b/chrome/browser/meridian/workbench/project_fs_win.cc
+new file mode 100644
+index 0000000000..3aa6ab02c8
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/project_fs_win.cc
+@@ -0,0 +1,28 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/workbench/project_fs.h"
++
++#include <windows.h>
++
++#include <shellapi.h>
++
++#include <string>
++
++namespace meridian::workbench {
++
++// The Recycle Bin, without Explorer's questions or progress window.
++bool MoveToTrash(const base::FilePath& path) {
++  // SHFileOperation takes a list of paths: each ends with a NUL, the list
++  // with one more.
++  std::wstring from = path.value();
++  from.push_back(L'\0');
++  SHFILEOPSTRUCTW op = {};
++  op.wFunc = FO_DELETE;
++  op.pFrom = from.c_str();
++  op.fFlags = FOF_ALLOWUNDO | FOF_NO_UI;
++  return SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
++}
++
++}  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/terminal.cc b/chrome/browser/meridian/workbench/terminal.cc
+index 555e4fad5a..62f22089a9 100644
+--- a/chrome/browser/meridian/workbench/terminal.cc
++++ b/chrome/browser/meridian/workbench/terminal.cc
+@@ -259,8 +259,8 @@ std::unique_ptr<Terminal> Terminal::Start(const Spec& spec,
+     for (int s = 1; s < NSIG; ++s) {
+       sigaction(s, &dfl, nullptr);
+     }
+-    if (!cwd.empty()) {
+-      chdir(cwd.c_str());
++    if (!cwd.empty() && chdir(cwd.c_str()) != 0) {
++      // The folder is gone: the shell starts where Meridian is.
+     }
+     execve(argv[0], argv.data(), envp.data());
+     _exit(127);
+diff --git a/chrome/browser/meridian/workbench/workbench_source.cc b/chrome/browser/meridian/workbench/workbench_source.cc
+index 8a88944fa7..9e4a001493 100644
+--- a/chrome/browser/meridian/workbench/workbench_source.cc
++++ b/chrome/browser/meridian/workbench/workbench_source.cc
+@@ -19,6 +19,9 @@
+ 
+ #if BUILDFLAG(IS_MAC)
+ #include "base/apple/bundle_locations.h"
++#else
++#include "base/base_paths.h"
++#include "base/path_service.h"
+ #endif
+ 
+ namespace meridian::workbench {
+@@ -68,7 +71,10 @@ base::FilePath WorkbenchSource::Folder() {
+ #if BUILDFLAG(IS_MAC)
+   return base::apple::OuterBundlePath().Append("Contents/Resources/workbench");
+ #else
+-  return base::FilePath();
++  // Next to the executable, as the ad blocking rules are.
++  base::FilePath exe_dir;
++  base::PathService::Get(base::DIR_EXE, &exe_dir);
++  return exe_dir.AppendASCII("workbench");
+ #endif
+ }
+ 

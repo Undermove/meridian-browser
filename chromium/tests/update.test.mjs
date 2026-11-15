@@ -88,7 +88,7 @@ async function start(rel, installed, extra = []) {
   return { b, state, waitStatus };
 }
 
-test('Updates: a newer release is checked and unpacked; Restart to update swaps the app', async () => {
+test('Updates: a newer release is checked and unpacked; Restart to update swaps the app', { skip: process.platform !== 'darwin' && 'macOS only (update_win.test.mjs is the Windows one)' }, async () => {
   const rel = await release();
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-apps-')));
   const installed = fakeApp(home, 'old');
@@ -118,7 +118,7 @@ test('Updates: a newer release is checked and unpacked; Restart to update swaps 
   }
 });
 
-test('Updates: a wrong checksum, unsigned checksums or the wrong version are refused; a folder it can’t write to gets the release page; same version is up to date', async () => {
+test('Updates: a wrong checksum, unsigned checksums or the wrong version are refused; a folder it can’t write to gets the release page; same version is up to date', { skip: process.platform !== 'darwin' && 'macOS only (update_win.test.mjs is the Windows one)' }, async () => {
   // Wrong checksum: nothing to install.
   let rel = await release({ badSum: true });
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-apps-')));

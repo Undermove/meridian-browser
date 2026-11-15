@@ -9,7 +9,8 @@ set -Eeuo pipefail
 DIR="${CHROMIUM_DIR:-$HOME/repos/chromium}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
-export PATH="$DIR/depot_tools:$PATH"
+. "$HERE/tools/platform.sh"
+command -v gclient >/dev/null 2>&1 || export PATH="$DIR/depot_tools:$PATH"
 SRC="$DIR/src"
 BRANCH=""; VERSION=""; RELEASE=1
 while [ $# -gt 0 ]; do
@@ -62,12 +63,12 @@ if [ -z "$VERSION" ]; then
   VERSION="$(echo "$CUR" | awk -F. '{print $1"."$2"."$3+1}')"
 fi
 say "Meridian $VERSION"
-sed -i '' "s/inline constexpr char kVersion\[\] = \".*\";/inline constexpr char kVersion[] = \"$VERSION\";/" \
+sed_inplace "s/inline constexpr char kVersion\[\] = \".*\";/inline constexpr char kVersion[] = \"$VERSION\";/" \
   "$SRC/chrome/browser/meridian/update_check.h"
 git -C "$SRC" commit -q -am "Meridian: version $VERSION (Chromium $NEW_VER)"
 
 say "Building (long after a branch change)…"
-caffeinate -i "$HERE/build.sh" >/dev/null
+keep_awake "$HERE/build.sh" >/dev/null
 (cd "$SRC" && autoninja -C out/Release meridian_unittests >/dev/null)
 
 say "Tests…"

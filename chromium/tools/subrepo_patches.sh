@@ -8,7 +8,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 DIR="${CHROMIUM_DIR:-$HOME/repos/chromium}"
-export PATH="$DIR/depot_tools:$PATH"
+command -v gclient >/dev/null 2>&1 || export PATH="$DIR/depot_tools:$PATH"
 cd "$DIR/src"
 SUBREPOS=(third_party/ffmpeg)
 for sub in "${SUBREPOS[@]}"; do
