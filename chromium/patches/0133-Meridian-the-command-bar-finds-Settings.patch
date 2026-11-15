@@ -1,0 +1,363 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Sun, 15 Nov 2026 22:46:56 +0400
+Subject: [PATCH] Meridian: the command bar finds Settings
+
+Like "search everywhere" in an editor: typed in the command bar, the name
+of a section of Settings ("ai"), of an option in one ("api keys", "block
+ads", "search engine") or of a page of Chromium's settings ("privacy",
+"site settings") is offered with where it is. Picking it opens Meridian's
+Settings at that section with the option scrolled into sight and marked for
+a moment, or the Chromium page in a tab.
+
+The entries are a list of their own (settings_index.ts) beside the
+features: up to three features, then up to three settings. A setting named
+in full goes first and is picked for Return ("ai": Settings' AI, before
+Chat); named by a word only it is offered but not picked, so "privacy" and
+Return still searches.
+
+Settings opened this way takes the keys, so Escape closes it (the command
+bar hands them to the page as it closes).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../browser/resources/webui_browser/BUILD.gn  |   1 +
+ chrome/browser/resources/webui_browser/app.ts |  15 ++
+ .../webui_browser/meridian/command_bar.ts     |  35 ++++-
+ .../webui_browser/meridian/settings.css       |  19 +++
+ .../webui_browser/meridian/settings.ts        |  33 ++++-
+ .../webui_browser/meridian/settings_index.ts  | 129 ++++++++++++++++++
+ 6 files changed, 226 insertions(+), 6 deletions(-)
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/settings_index.ts
+
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index edbc2caa39..362d20b7c5 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -62,6 +62,7 @@ build_webui("build") {
+     "meridian/onboarding.ts",
+     "meridian/settings.html.ts",
+     "meridian/settings.ts",
++    "meridian/settings_index.ts",
+     "meridian/sidebar.html.ts",
+     "meridian/sidebar.ts",
+     "meridian/tab_row.html.ts",
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 67c4466400..89f7bae08d 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -14,6 +14,7 @@ import './meridian/archive.js';
+ import './meridian/command_bar.js';
+ import './meridian/onboarding.js';
+ import './meridian/settings.js';
++import {settingsEntry} from './meridian/settings_index.js';
+ import './meridian/theme_editor.js';
+ import './meridian/home.js';
+ import './meridian/agent.js';
+@@ -1032,6 +1033,20 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   // A feature picked in the command bar (its FEATURES id).
+   protected onCommandBarFeature_(e: CustomEvent<string>) {
+     const run = (command: Command) => this.$.tabstrip.runCommand(command, 0);
++    // A place in Settings (settings_index.ts).
++    const setting = settingsEntry(e.detail);
++    if (setting) {
++      if (setting.url) {
++        this.$.tabstrip.openUrl(setting.url);
++      } else {
++        this.closeSiteControl_();
++        this.$.settings
++            .show(this.$.tabstrip.spaces(), setting.section, setting.find)
++            .then(() => this.$.settings.updateComplete)
++            .then(() => this.$.settings.focusSection());
++      }
++      return;
++    }
+     switch (e.detail) {
+       case 'workbench':
+         run(Command.kWorkbench);
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index 4b6cfac81e..62719981fa 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -24,6 +24,7 @@ import type {IconName} from './icons.js';
+ import {fixLayout} from './layout_fix.js';
+ import {renderMarkdown} from './markdown.js';
+ import {isMac, keyText} from './keys.js';
++import {SETTINGS_INDEX} from './settings_index.js';
+ 
+ // An open tab, for "Switch to Tab".
+ export interface CommandBarTab {
+@@ -77,12 +78,28 @@ export const FEATURES: CommandBarFeature[] = [
+    icon: 'restore', words: ['arc', 'move in']},
+ ];
+ 
+-// How well `q` names a feature: 2 a word of its name or a word for it starts
+-// with it, 1 its name or a word for it contains it, 0 not at all.
++// Settings' sections, their options and Chromium's settings pages
++// (settings_index.ts), found the same way and listed after the features.
++export const SETTINGS_FEATURES: CommandBarFeature[] =
++    SETTINGS_INDEX.map(e => ({
++                         id: e.id,
++                         name: e.name,
++                         hint: e.path,
++                         keys: '',
++                         icon: 'settings' as IconName,
++                         words: e.words,
++                       }));
++
++// How well `q` names a feature: 3 it is its name, 2 a word of its name or a
++// word for it starts with it, 1 its name or a word for it contains it, 0 not
++// at all.
+ export function featureMatch(f: CommandBarFeature, q: string): number {
+   if (q.length < 2) {
+     return 0;
+   }
++  if (f.name.toLowerCase() === q) {
++    return 3;
++  }
+   const names = [f.name.toLowerCase(), ...f.words];
+   if (names.some(n => n.split(/[\s-]+/).some(w => w.startsWith(q)) ||
+                       n.startsWith(q))) {
+@@ -290,18 +307,26 @@ export class MeridianCommandBarElement extends CrLitElement {
+             .slice(0, 3) :
+         this.tabs.slice(0, 4);
+     this.tabRows_ = rows;
+-    const features =
+-        FEATURES.map(f => ({f, m: featureMatch(f, q)}))
++    // Up to three features, then up to three places in Settings; a setting
++    // named exactly goes first ("ai": Settings' AI, before Chat).
++    const rank = (list: CommandBarFeature[], setting: boolean) =>
++        list.map(f => ({f, m: featureMatch(f, q), setting}))
+             .filter(x => x.m > 0)
+             .sort((a, b) => b.m - a.m)
+             .slice(0, 3);
++    const found = rank(FEATURES, false).concat(rank(SETTINGS_FEATURES, true));
++    const features = found.filter(x => x.setting && x.m === 3)
++                         .concat(found.filter(x => !(x.setting && x.m === 3)));
+     this.featureRows_ = features.map(x => x.f);
+     const first = q !== '' && !!rows[0] && starts(rows[0]);
+     if (changed.has('query_' as keyof MeridianCommandBarElement)) {
+       this.tabsFirst_ = first;
+       // A feature named by what was typed is picked for Return, before a
+       // tab that starts that way.
+-      this.tabSel_ = features[0]?.m === 2 ? 0 :
++      // (A setting only when it is named in full: "privacy" and Return
++      // still searches.)
++      const top = features[0];
++      this.tabSel_ = top && (top.setting ? top.m === 3 : top.m >= 2) ? 0 :
+           first                          ? this.featureRows_.length :
+                                            -1;
+     }
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.css b/chrome/browser/resources/webui_browser/meridian/settings.css
+index 9dec90c912..019d760f33 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.css
++++ b/chrome/browser/resources/webui_browser/meridian/settings.css
+@@ -611,3 +611,22 @@ select:focus {
+   flex: 1;
+   width: auto;
+ }
++
++/* The option the command bar was asked for: marked for a moment. */
++.found {
++  border-radius: 8px;
++  animation: found 1.8s ease-out;
++}
++
++@keyframes found {
++  0%,
++  35% {
++    box-shadow: 0 0 0 2px var(--meridian-accent, #7c5cff);
++    background: color-mix(in srgb, var(--meridian-accent, #7c5cff) 14%, transparent);
++  }
++
++  100% {
++    box-shadow: 0 0 0 2px transparent;
++    background: transparent;
++  }
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index a5c63c305e..38a544124d 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -248,7 +248,34 @@ export class MeridianSettingsElement extends CrLitElement {
+         (state: UpdateState) => this.update_ = state);
+   }
+ 
+-  async show(spaces: Space[], section: SectionId = 'member') {
++  // The keys go to Settings (Escape closes it): for the command bar, which
++  // hands the keys back to the page as it closes.
++  focusSection() {
++    this.shadowRoot.getElementById('panel')?.focus();
++  }
++
++  // The heading or option label that starts with `text`, in the shown
++  // section: scrolled to the middle and marked for a moment.
++  private reveal_(text: string) {
++    const want = text.toLowerCase();
++    const all = this.shadowRoot.querySelectorAll<HTMLElement>(
++        'section h2, section .row-label');
++    const el = [...all].find(
++        e => (e.textContent || '').trim().replace(/\s+/g, ' ').toLowerCase()
++                 .startsWith(want));
++    if (!el) {
++      return;
++    }
++    const mark = el.closest<HTMLElement>('.row') || el;
++    mark.scrollIntoView({block: 'center'});
++    mark.classList.add('found');
++    setTimeout(() => mark.classList.remove('found'), 1800);
++  }
++
++  // `find`: a heading or an option's label in that section (the command
++  // bar's "Settings" rows, settings_index.ts) to bring into sight and mark
++  // for a moment.
++  async show(spaces: Space[], section: SectionId = 'member', find = '') {
+     this.spaces_ = spaces;
+     this.section_ = section;
+     this.tryResult_ = '';
+@@ -256,6 +283,10 @@ export class MeridianSettingsElement extends CrLitElement {
+     const {settings} = await this.handler_.getSettings();
+     this.settings_ = settings;
+     this.open = true;
++    if (find) {
++      // Once the section is drawn.
++      this.updateComplete.then(() => this.reveal_(find));
++    }
+     this.connectResult_ = '';
+     this.connecting_ = null;
+     this.handler_.getAgentClis().then(({clis}) => this.clis_ = clis);
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings_index.ts b/chrome/browser/resources/webui_browser/meridian/settings_index.ts
+new file mode 100644
+index 0000000000..28a6b433ab
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/settings_index.ts
+@@ -0,0 +1,129 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// What the command bar finds in Settings, like "search everywhere" in an
++// editor: each section of Meridian's Settings, the options in them, and the
++// pages of Chromium's own settings. Picking one opens Settings at that
++// section with the option in sight, or the Chromium page in a tab.
++//
++// `find` is the text of the heading or of the option's label in
++// settings.html.ts (settings.test.mjs checks that every one is there, so a
++// renamed option doesn't leave an entry that leads nowhere).
++
++import type {SectionId} from './settings.js';
++
++export interface SettingsEntry {
++  // 'set:<something>', for the command bar's rows.
++  id: string;
++  name: string;
++  // Where it is, shown beside the name.
++  path: string;
++  // Other words a person may type for it.
++  words: string[];
++  // In Meridian's Settings…
++  section?: SectionId;
++  find?: string;
++  // …or a page of Chromium's.
++  url?: string;
++}
++
++const section =
++    (id: SectionId, name: string, words: string[]): SettingsEntry =>
++        ({id: `set:${id}`, name, path: 'Settings', words, section: id});
++
++const option = (id: string, sectionId: SectionId, where: string, name: string,
++                find: string, words: string[]): SettingsEntry => ({
++  id: `set:${id}`,
++  name,
++  path: `Settings › ${where}`,
++  words,
++  section: sectionId,
++  find,
++});
++
++const chromium = (id: string, name: string, page: string,
++                  words: string[]): SettingsEntry => ({
++  id: `set:chromium-${id}`,
++  name,
++  path: 'Chromium settings',
++  words,
++  url: `chrome://settings/${page}`,
++});
++
++export const SETTINGS_INDEX: SettingsEntry[] = [
++  section('ai', 'AI', ['artificial intelligence', 'llm', 'models']),
++  section('general', 'General', []),
++  section('profiles', 'Profiles', ['accounts', 'work profile', 'personal']),
++  section('links', 'Links', ['air traffic control', 'atc', 'link rules']),
++  section('advanced', 'Advanced', []),
++
++  option('ai-provider', 'ai', 'AI', 'AI Provider', 'Your AI',
++         ['your ai', 'model', 'ollama', 'lm studio', 'openai', 'gemini',
++          'local model']),
++  option('ai-keys', 'ai', 'AI', 'API Keys', 'API keys',
++         ['anthropic key', 'openai key', 'token']),
++  option('ai-tidy', 'ai', 'AI', 'Tidy Today', 'Tidy Today',
++         ['group tabs', 'sort tabs']),
++  option('ai-previews', 'ai', 'AI', 'Link Previews', 'Link previews',
++         ['summaries', 'hover']),
++  option('ai-notify', 'ai', 'AI', 'Agent Notifications',
++         'Notify me when an agent', ['mission control', 'notify']),
++  option('ai-access', 'ai', 'AI', 'What Agents May Do', 'What agents may do',
++         ['agent access', 'mcp', 'permissions', 'read-only', 'full access']),
++  option('ai-js', 'ai', 'AI', 'Run JavaScript in Pages',
++         'Run JavaScript in pages', ['scripts', 'agents']),
++  option('ai-connect', 'ai', 'AI', 'Connect an Agent', 'Connect',
++         ['mcp', 'claude code', 'codex', 'cursor', 'cli']),
++
++  option('theme', 'general', 'General', 'Theme', 'Theme',
++         ['dark', 'light', 'appearance', 'dark mode']),
++  option('sidebar-position', 'general', 'General', 'Sidebar Position',
++         'Sidebar position', ['left', 'right', 'side']),
++  option('space-colours', 'general', 'General', 'Space Colours',
++         'Space colours', ['colors', 'space colors', 'tint']),
++  option('mode', 'general', 'General', 'Mode', 'Mode',
++         ['everyday', 'developer', 'ai for work', 'developer tools']),
++  option('default-browser', 'general', 'General', 'Default Browser',
++         'Default browser', ['make default', 'open links']),
++  option('search-engine', 'general', 'General', 'Search Engine',
++         'Search engine', ['google', 'duckduckgo', 'bing', 'search']),
++  option('archive-after', 'general', 'General', 'Archive Today Tabs After',
++         'Archive Today tabs after', ['auto archive', 'close old tabs']),
++  option('updates', 'general', 'General', 'Updates', 'Updates',
++         ['version', 'check for updates', 'new version']),
++
++  option('link-rules', 'links', 'Links', 'Link Rules', 'Rules',
++         ['routing', 'open links in', 'spaces']),
++  option('other-links', 'links', 'Links', 'Other Links Open In',
++         'Other links open in', ['little window', 'default space']),
++
++  option('adblock', 'advanced', 'Advanced', 'Block Ads and Trackers',
++         'Block ads and trackers', ['adblock', 'ad blocker', 'privacy']),
++  option('clear-archive', 'advanced', 'Advanced', 'Clear the Archive',
++         'Archive', ['delete closed tabs', 'data']),
++  option('about', 'advanced', 'Advanced', 'About Meridian', 'About',
++         ['version', 'licence', 'license']),
++
++  option('welcome-tour', 'member', 'Get started', 'Welcome Tour',
++         'Welcome tour', ['onboarding', 'intro', 'tutorial']),
++
++  chromium('privacy', 'Privacy and Security', 'privacy',
++           ['cookies', 'tracking', 'safe browsing', 'https']),
++  chromium('content', 'Site Settings', 'content',
++           ['site permissions', 'camera', 'microphone', 'location',
++            'notifications', 'pop-ups']),
++  chromium('clear', 'Clear Browsing Data', 'clearBrowserData',
++           ['cache', 'delete history', 'cookies']),
++  chromium('autofill', 'Addresses and Payment Methods', 'autofill',
++           ['autofill', 'cards', 'addresses']),
++  chromium('languages', 'Languages', 'languages',
++           ['spell check', 'translate', 'language']),
++  chromium('downloads', 'Downloads Folder', 'downloads',
++           ['download location', 'ask where to save']),
++  chromium('all', 'All Chromium Settings', '', ['chrome settings']),
++];
++
++export function settingsEntry(id: string): SettingsEntry|undefined {
++  return SETTINGS_INDEX.find(e => e.id === id);
++}
