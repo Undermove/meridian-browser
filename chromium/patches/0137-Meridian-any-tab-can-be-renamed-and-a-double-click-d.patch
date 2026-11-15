@@ -1,0 +1,416 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Mon, 16 Nov 2026 00:33:50 +0400
+Subject: [PATCH] Meridian: any tab can be renamed, and a double click does it
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Rename… was in a pinned tab's menu only. A Today tab has it now, and a
+double click on a tab, a pinned tab or a folder puts its name in a field in
+place (Arc): Return keeps it, Escape doesn't.
+
+A Today tab's name is the tab's own (TabData, saved with the session as tab
+extra data, so it is there after a restart and comes back with a reopened
+tab); the sidebar's page gets it with the tab's space. No name gives the
+page's title back. Pinned, the tab takes the name to its item. The names
+Tidy Today gives are kept the same way: they used to be lost on a restart.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ chrome/browser/meridian/sidebar.mojom         |  5 +++
+ chrome/browser/meridian/sidebar_handler.cc    | 15 +++++++
+ chrome/browser/meridian/sidebar_handler.h     |  2 +
+ chrome/browser/meridian/tab_data.cc           | 23 +++++++++++
+ chrome/browser/meridian/tab_data.h            |  8 ++++
+ .../webui_browser/meridian/item.html.ts       |  2 +
+ .../resources/webui_browser/meridian/item.ts  |  5 +++
+ .../webui_browser/meridian/sidebar.html.ts    |  3 +-
+ .../webui_browser/meridian/sidebar.ts         | 41 +++++++++++++++++--
+ .../webui_browser/meridian/tab_row.html.ts    |  7 +++-
+ .../webui_browser/meridian/tab_row.ts         | 30 ++++++++++++++
+ 11 files changed, 136 insertions(+), 5 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 2e37c38ec1..a922a6a081 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -90,6 +90,8 @@ struct TabInfo {
+   tabs_api.mojom.NodeId tab_id;
+   string space_id;
+   string item_id;
++  // The name a person gave a Today tab ("" for none: the page's title).
++  string title;
+   // A Peek card over `opener_id` (see TabData::peek()).
+   bool peek;
+   tabs_api.mojom.NodeId? opener_id;
+@@ -531,6 +533,9 @@ interface SidebarHandler {
+   // Removing a folder unpins everything in it.
+   RemoveItem(string item_id);
+   RenameItem(string item_id, string title);
++  // A Today tab's own name, kept until the tab is closed (and over a
++  // restart); "" gives the page's title back.
++  RenameTab(tabs_api.mojom.NodeId tab_id, string title);
+   // A pinned tab's or favorite's home address (Edit Pinned Page): http(s).
+   SetItemUrl(string item_id, url.mojom.Url url);
+   SetFolderOpen(string item_id, bool open);
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index f2e2b99700..a15978bd41 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -2098,6 +2098,7 @@ mojom::SidebarStatePtr SidebarHandler::BuildState() {
+     info->tab_id = tabs_api::NodeId::FromTabHandle(tab->GetHandle());
+     info->space_id = data ? data->space_id() : service_->active_space_id();
+     info->item_id = data ? data->item_id() : std::string();
++    info->title = data ? data->title() : std::string();
+     info->peek = data && data->peek();
+     if (tabs::TabInterface* opener = model()->GetOpenerOfTabAt(i)) {
+       info->opener_id = tabs_api::NodeId::FromTabHandle(opener->GetHandle());
+@@ -2602,6 +2603,20 @@ void SidebarHandler::RenameItem(const std::string& item_id,
+   service_->RenameItem(item_id, title);
+ }
+ 
++void SidebarHandler::RenameTab(const tabs_api::NodeId& tab_id,
++                               const std::string& title) {
++  tabs::TabInterface* tab = TabFor(tab_id);
++  if (!tab) {
++    return;
++  }
++  content::WebContents* contents = tab->GetContents();
++  if (!TabData::Get(contents)) {
++    TabData::Set(contents, service_->active_space_id(), std::string());
++  }
++  TabData::SetTitle(contents, title);
++  ScheduleNotify();
++}
++
+ void SidebarHandler::SetItemUrl(const std::string& item_id,
+                                 const GURL& url) {
+   if (url.SchemeIsHTTPOrHTTPS()) {
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index fd60999a56..6b8cdb82e5 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -144,6 +144,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void SetItemUrl(const std::string& item_id, const GURL& url) override;
+   void RenameItem(const std::string& item_id,
+                   const std::string& title) override;
++  void RenameTab(const tabs_api::NodeId& tab_id,
++                 const std::string& title) override;
+   void SetFolderOpen(const std::string& item_id, bool open) override;
+   void OpenItem(const std::string& item_id) override;
+   void ResetItemToHome(const std::string& item_id) override;
+diff --git a/chrome/browser/meridian/tab_data.cc b/chrome/browser/meridian/tab_data.cc
+index 454c2f4935..3f4a83af00 100644
+--- a/chrome/browser/meridian/tab_data.cc
++++ b/chrome/browser/meridian/tab_data.cc
+@@ -23,6 +23,8 @@ constexpr char kItemKey[] = "meridian.item";
+ // The tab's Meridian profile: it comes back in it (session restore runs
+ // before the sidebar model, which knows the spaces' profiles, has loaded).
+ constexpr char kProfileKey[] = "meridian.profile";
++// The name a person gave a Today tab.
++constexpr char kTitleKey[] = "meridian.title";
+ // A closed Peek's pinned item.
+ constexpr char kPeekKey[] = "meridian.peek";
+ }  // namespace
+@@ -48,6 +50,21 @@ void TabData::Set(content::WebContents* contents,
+   }
+   data->space_id_ = space_id;
+   data->item_id_ = item_id;
++  if (!item_id.empty()) {
++    // Pinned: the item has the name from here on.
++    data->title_.clear();
++  }
++  data->Persist();
++}
++
++// static
++void TabData::SetTitle(content::WebContents* contents,
++                       const std::string& title) {
++  TabData* data = FromWebContents(contents);
++  if (!data || data->title_ == title) {
++    return;
++  }
++  data->title_ = title;
+   data->Persist();
+ }
+ 
+@@ -89,6 +106,8 @@ void TabData::RestoreFromExtraData(
+   data->space_id_ = space->second;
+   auto item = extra_data.find(kItemKey);
+   data->item_id_ = item == extra_data.end() ? std::string() : item->second;
++  auto title = extra_data.find(kTitleKey);
++  data->title_ = title == extra_data.end() ? std::string() : title->second;
+   auto peek = extra_data.find(kPeekKey);
+   data->restored_peek_ =
+       peek == extra_data.end() ? std::string() : peek->second;
+@@ -119,6 +138,9 @@ std::map<std::string, std::string> TabData::ExtraDataOf(
+       data->space_id(), meridian::ProfileIdOf(Profile::FromBrowserContext(
+                             contents->GetBrowserContext())));
+   extra[kItemKey] = data->item_id();
++  if (!data->title().empty()) {
++    extra[kTitleKey] = data->title();
++  }
+   return extra;
+ }
+ 
+@@ -150,6 +172,7 @@ void TabData::Persist() {
+   }
+   session->AddTabExtraData(window_id, tab_id, kSpaceKey, space_id_);
+   session->AddTabExtraData(window_id, tab_id, kItemKey, item_id_);
++  session->AddTabExtraData(window_id, tab_id, kTitleKey, title_);
+   session->AddTabExtraData(
+       window_id, tab_id, kProfileKey,
+       meridian::ProfileIdOf(
+diff --git a/chrome/browser/meridian/tab_data.h b/chrome/browser/meridian/tab_data.h
+index 4d447508e7..f8bd6ba57c 100644
+--- a/chrome/browser/meridian/tab_data.h
++++ b/chrome/browser/meridian/tab_data.h
+@@ -46,6 +46,13 @@ class TabData : public content::WebContentsUserData<TabData> {
+   const std::string& space_id() const { return space_id_; }
+   const std::string& item_id() const { return item_id_; }
+ 
++  // The name a person gave a Today tab (Rename…, or a double click on it),
++  // shown in place of the page's title; "" for none. Saved with the session.
++  // A pinned tab's name is its item's.
++  static void SetTitle(content::WebContents* contents,
++                       const std::string& title);
++  const std::string& title() const { return title_; }
++
+   // Peek: a page opened from a pinned tab or favorite into another site,
+   // shown as a card over its opener rather than in Today. Not saved: after a
+   // restart it is an ordinary Today tab.
+@@ -67,6 +74,7 @@ class TabData : public content::WebContentsUserData<TabData> {
+ 
+   std::string space_id_;
+   std::string item_id_;
++  std::string title_;
+   bool peek_ = false;
+   std::string restored_peek_;
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.html.ts b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+index 888d14f712..2067dcbf57 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+@@ -14,6 +14,7 @@ ${this.item?.isFolder ? html`
+     <div class="row folder" style="--depth:${this.depth}" draggable="true"
+         data-item="${this.item.id}" data-parent="${this.parentId}"
+         @mousedown="${this.onRowMousedown_}"
++        @dblclick="${this.onRowDblclick_}"
+         @contextmenu="${this.onRowContextmenu_}">
+       <span class="folder-ic">
+         ${icon(this.item.open ? 'folderOpen' : 'folder')}
+@@ -40,6 +41,7 @@ ${this.item && !this.item.isFolder ? html`
+       draggable="true" data-item="${this.item.id}"
+       data-parent="${this.parentId}" title="${this.title_}"
+       @mousedown="${this.onRowMousedown_}"
++      @dblclick="${this.onRowDblclick_}"
+       @contextmenu="${this.onRowContextmenu_}">
+     ${this.away_ ? html`
+       <button class="row-btn reset" title="Back to the pinned page"
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.ts b/chrome/browser/resources/webui_browser/meridian/item.ts
+index 0b21bc741b..e32739f211 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.ts
+@@ -122,6 +122,11 @@ export class MeridianItemElement extends CrLitElement {
+     this.host?.onItemContextMenu(e, this.item!, this.container);
+   }
+ 
++  protected onRowDblclick_(e: MouseEvent) {
++    e.stopPropagation();
++    this.host?.onItemDblclick(e, this.item!);
++  }
++
+   protected onCloseClick_(e: Event) {
+     const tab = this.tab_;
+     if (tab) {
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+index 9c6d65205b..1a9d15d45e 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+@@ -53,7 +53,8 @@ export function getHtml(this: MeridianSidebarElement) {
+     <div id="today">
+       ${repeat(this.today_, t => t.id, t => html`
+         <meridian-tab-row .tab="${t}" .host="${this}"
+-            .agentTab="${this.agentTab_}"></meridian-tab-row>`)}
++            .agentTab="${this.agentTab_}" .renaming="${this.renaming_}">
++        </meridian-tab-row>`)}
+     </div>
+   ` : ''}
+ </div>
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 1bf09bd10b..f0086f99ce 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -496,7 +496,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+       if (info.spaceId === space.id && !info.itemId && !info.peek) {
+         const tab = this.tabs_.get(info.tabId);
+         if (tab) {
+-          const title = this.customTitles_.get(tab.id);
++          const title = this.customTitles_.get(tab.id) ?? info.title;
+           result.push(title ? {...tab, title} : tab);
+         }
+       }
+@@ -969,7 +969,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+ 
+   onTabMouseDown(e: MouseEvent, tab: Tab) {
+     // No preventDefault(): it would stop the row from being dragged.
+-    if (e.button !== 0 || this.isButton_(e)) {
++    if (e.button !== 0 || this.isButton_(e) ||
++        this.renaming_ === 'tab:' + tab.id) {
+       return;
+     }
+     this.notePickedInView_(e, {tab: tab.id});
+@@ -1099,8 +1100,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+         tabId;
+   }
+ 
++  // The name a Today tab was given: just now here (until the browser's next
++  // state has it), or before.
+   private customTitle_(id: NodeId): string {
+-    return this.customTitles_.get(id) || '';
++    return this.customTitles_.get(id) ??
++        this.state_?.tabs.find(t => t.tabId === id)?.title ?? '';
+   }
+ 
+   // Tidy Today: Claude's proposal for the active space's Today tabs.
+@@ -1122,6 +1126,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+     for (const [id, title] of titles) {
+       if (!grouped.has(id)) {
+         this.customTitles_.set(id, title);
++        this.handler_.renameTab(id, title);
+       }
+     }
+     for (const [index, folder] of folders.entries()) {
+@@ -1218,6 +1223,20 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.renaming_ = id;
+   }
+ 
++  // Arc: a double click on a tab, a pinned tab or a folder renames it in
++  // place.
++  onTabDblclick(e: MouseEvent, tab: Tab) {
++    if (!this.isButton_(e)) {
++      this.renaming_ = 'tab:' + tab.id;
++    }
++  }
++
++  onItemDblclick(e: MouseEvent, item: Item) {
++    if (!this.isButton_(e)) {
++      this.renaming_ = item.id;
++    }
++  }
++
+   private spaceFromEvent_(e: Event): Space|null {
+     const id = (e.currentTarget as HTMLElement).dataset['space'];
+     return this.state_?.spaces.find(s => s.id === id) || null;
+@@ -1636,6 +1655,17 @@ export class MeridianSidebarElement extends CrLitElement implements
+       }
+       return;
+     }
++    // A Today tab's own name; none gives the page's title back.
++    if (id.startsWith('tab:')) {
++      const tabId = id.slice(4);
++      const shown = this.today_.find(t => t.id === tabId)?.title;
++      if (value !== shown) {
++        this.customTitles_.set(tabId, value);
++        this.handler_.renameTab(tabId, value);
++        this.today_ = this.todayTabs();
++      }
++      return;
++    }
+     if (isSpace) {
+       this.openNamedSpace_();
+     }
+@@ -1849,6 +1879,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+             tab.id, {container: space.id, parentId: '', index: -1},
+             this.customTitle_(tab.id)),
+       },
++      {
++        label: 'Rename…',
++        icon: 'pencil',
++        action: () => this.renaming_ = 'tab:' + tab.id,
++      },
+       {label: 'Move to Space', icon: 'moveTo', enabled: move.length > 0, submenu: move},
+       {
+         label: 'Close Tab',
+diff --git a/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts b/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
+index 1406f5a797..2f43ca1dd0 100644
+--- a/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
+@@ -14,11 +14,16 @@ ${this.tab ? html`
+       this.loading_ ? 'loading' : ''}" draggable="true"
+       data-tab="${this.tab.id}" title="${this.tab.title}"
+       @mousedown="${this.onRowMousedown_}"
++      @dblclick="${this.onRowDblclick_}"
+       @contextmenu="${this.onRowContextmenu_}">
+     <span class="favicon">
+       <img src="${this.favicon_}" width="16" height="16" alt="">
+     </span>
+-    <span class="title">${this.tab.title || this.tab.url}</span>
++    ${this.renaming_() ? html`
++      <input class="rename" .value="${this.tab.title || this.tab.url}"
++          spellcheck="false" @keydown="${this.onRenameKeydown_}"
++          @blur="${this.onRenameBlur_}">
++    ` : html`<span class="title">${this.tab.title || this.tab.url}</span>`}
+     ${this.audio_ ? html`
+       <button class="row-btn audio" title="${this.audioTitle_}"
+           @mousedown="${this.onAudioMousedown_}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/tab_row.ts b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+index af6b6448b7..eb85c952a0 100644
+--- a/chrome/browser/resources/webui_browser/meridian/tab_row.ts
++++ b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+@@ -35,6 +35,8 @@ export class MeridianTabRowElement extends CrLitElement {
+       // The tab an agent works in (this row glows when it's this one).
+       agentTab: {type: String},
+       agent: {type: Boolean, reflect: true},
++      // What the sidebar is renaming in place ('tab:<id>' when it's this).
++      renaming: {type: String},
+       favicon_: {state: true, type: String},
+       loading_: {state: true, type: Boolean},
+       audio_: {state: true, type: String},
+@@ -46,6 +48,7 @@ export class MeridianTabRowElement extends CrLitElement {
+   accessor tab: Tab|null = null;
+   accessor agentTab: string = '';
+   accessor agent: boolean = false;
++  accessor renaming: string = '';
+   accessor host: MeridianSidebarElement|null = null;
+   protected accessor favicon_: string = '';
+   protected accessor loading_: boolean = false;
+@@ -71,10 +74,37 @@ export class MeridianTabRowElement extends CrLitElement {
+     this.audioIcon_ = this.audio_ === 'muted' ? 'mute' : 'speaker';
+   }
+ 
++  override updated(changed: PropertyValues<this>) {
++    super.updated(changed);
++    const input =
++        this.shadowRoot.querySelector<HTMLInputElement>('input.rename');
++    if (input && input.dataset['focused'] !== '1') {
++      input.dataset['focused'] = '1';
++      input.focus();
++      input.select();
++    }
++  }
++
++  protected renaming_(): boolean {
++    return !!this.tab && this.renaming === 'tab:' + this.tab.id;
++  }
++
+   protected onRowMousedown_(e: MouseEvent) {
+     this.host?.onTabMouseDown(e, this.tab!);
+   }
+ 
++  protected onRowDblclick_(e: MouseEvent) {
++    this.host?.onTabDblclick(e, this.tab!);
++  }
++
++  protected onRenameKeydown_(e: KeyboardEvent) {
++    this.host?.onRenameKeydown(e);
++  }
++
++  protected onRenameBlur_(e: Event) {
++    this.host?.onRenameBlur(e, 'tab:' + this.tab!.id, false);
++  }
++
+   protected onRowContextmenu_(e: MouseEvent) {
+     this.host?.onTabContextMenu(e, this.tab!);
+   }
