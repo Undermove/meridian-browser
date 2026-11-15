@@ -4,6 +4,8 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DIR="${CHROMIUM_DIR:-$HOME/repos/chromium}"
+. "$HERE/../tools/platform.sh"
+OUT="$DIR/src/out/Release"
 fail=0
 # Some tests copy links, and searching on a page writes the system's find
 # pasteboard (⌘E/⌘G in every app): both come back afterwards.
@@ -11,8 +13,8 @@ clip="$(mktemp)"; pbpaste > "$clip" 2>/dev/null || true
 find_clip="$(mktemp)"; pbpaste -pboard find > "$find_clip" 2>/dev/null || true
 trap 'pbcopy < "$clip" 2>/dev/null; pbcopy -pboard find < "$find_clip" 2>/dev/null; rm -f "$clip" "$find_clip"' EXIT
 # The Workbench page (chrome://workbench) from the current UI sources.
-"$HERE/../tools/workbench_assets.sh" "$DIR/src/out/Release/Meridian.app/Contents/Resources/workbench" >/dev/null || fail=1
-"$DIR/src/out/Release/meridian_unittests" --gtest_brief=1 2>&1 | tail -2 || fail=1
+"$HERE/../tools/workbench_assets.sh" "$(meridian_resources "$OUT")/workbench" >/dev/null || fail=1
+"$OUT/meridian_unittests" --gtest_brief=1 2>&1 | tail -2 || fail=1
 cd "$HERE"
 args=(--test --test-force-exit --test-concurrency=1 --test-timeout=90000)
 [ $# -gt 0 ] && args+=(--test-name-pattern="$1")

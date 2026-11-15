@@ -6,6 +6,10 @@
 # a few thousand of them filled 70 GB. A copy made around the launch of a running browser is kept.
 set -uo pipefail
 dry=0; [ "${1:-}" = "-n" ] && dry=1
+. "$(dirname "$0")/platform.sh"
+drop() { if [ $dry = 1 ]; then echo "would remove $1"; else rm -rf "$1"; fi; }
+n=0
+if [ "$MERIDIAN_OS" = mac ]; then
 T="${TMPDIR:-$(getconf DARWIN_USER_TEMP_DIR)}"; T="${T%/}"
 X="$(dirname "$T")/X"
 
@@ -16,9 +20,6 @@ while read -r pid; do
   [ -n "$s" ] && starts+=("$(date -j -f "%a %b %d %T %Y" "$s" +%s)")
 done < <(pgrep -f '/Contents/MacOS/(Meridian|Chromium)( --|$)')
 
-drop() { if [ $dry = 1 ]; then echo "would remove $1"; else rm -rf "$1"; fi; }
-
-n=0
 for d in "$X/dev.meridian.browser.code_sign_clone" "$X/org.chromium.Chromium.code_sign_clone"; do
   [ -d "$d" ] || continue
   for c in "$d"/code_sign_clone.*; do
@@ -30,6 +31,10 @@ for d in "$X/dev.meridian.browser.code_sign_clone" "$X/org.chromium.Chromium.cod
     [ $keep = 0 ] && { drop "$c"; n=$((n + 1)); }
   done
 done
+else
+  # No code-sign clones off macOS: only the temp files below.
+  T="${TMPDIR:-${TEMP:-/tmp}}"; T="${T%/}"
+fi
 
 # Build logs older than 3 days; libraries OpenCode unpacks on every run and temp dirs of killed
 # test browsers, older than a day.

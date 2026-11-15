@@ -2,7 +2,8 @@
 # Assembles the Workbench page (chrome://workbench) into a folder: the page and
 # its scripts from the Meridian UI (src/renderer/dev), the bridge to the C++
 # handler, and Monaco + xterm. Usage: workbench_assets.sh <dest>
-# (Meridian.app/Contents/Resources/workbench in a build.)
+# (Meridian.app/Contents/Resources/workbench in a macOS build, workbench/ next to the
+# executable elsewhere.)
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 repo="$(cd "$here/.." && pwd)"
@@ -30,10 +31,11 @@ cp "$repo/src/agents/hooks/mission-hook.js" "$dest.tmp/hooks/mission-hook.js"
 # The bridge goes first: it is what gives the page `window.workbench`.
 perl -0pi -e 's|(<script src="/vendor/xterm/lib/xterm.js"></script>)|<script src="bridge.js"></script>\n  $1|' "$dest.tmp/workbench.html"
 grep -q 'src="bridge.js"' "$dest.tmp/workbench.html"
-rsync -a --exclude '*.map' "$cache/node_modules/monaco-editor/min/" "$dest.tmp/vendor/monaco/"
+cp -R "$cache/node_modules/monaco-editor/min" "$dest.tmp/vendor/monaco"
 mkdir -p "$dest.tmp/vendor/xterm" "$dest.tmp/vendor/xterm-fit"
-rsync -a --exclude '*.map' "$cache/node_modules/@xterm/xterm/css" "$cache/node_modules/@xterm/xterm/lib" "$dest.tmp/vendor/xterm/"
-rsync -a --exclude '*.map' "$cache/node_modules/@xterm/addon-fit/lib" "$dest.tmp/vendor/xterm-fit/"
+cp -R "$cache/node_modules/@xterm/xterm/css" "$cache/node_modules/@xterm/xterm/lib" "$dest.tmp/vendor/xterm/"
+cp -R "$cache/node_modules/@xterm/addon-fit/lib" "$dest.tmp/vendor/xterm-fit/"
+find "$dest.tmp/vendor" -name '*.map' -delete
 rm -rf "$dest"
 mv "$dest.tmp" "$dest"
 echo "workbench assets: $dest"
