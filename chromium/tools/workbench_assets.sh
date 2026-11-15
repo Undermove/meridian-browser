@@ -13,7 +13,8 @@ monaco=0.57.0; xterm=6.0.0; fit=0.11.0
 
 if [ ! -d "$cache/node_modules/monaco-editor/min" ] || [ ! -d "$cache/node_modules/@xterm/xterm/lib" ]; then
   mkdir -p "$cache"
-  (cd "$cache" && npm install --no-save --no-package-lock --ignore-scripts --silent \
+  # --prefix: otherwise npm installs into the nearest folder above with a package.json (this repo).
+  (cd "$cache" && npm install --prefix "$cache" --no-save --no-package-lock --ignore-scripts --silent \
     "monaco-editor@$monaco" "@xterm/xterm@$xterm" "@xterm/addon-fit@$fit")
 fi
 
