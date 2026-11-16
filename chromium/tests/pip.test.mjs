@@ -60,6 +60,10 @@ for (const own of [false, true]) {
       if (process.platform === 'darwin') assert.match(w || '', /allSpaces=1 fullScreenSpaces=1/, `on every space: ${w}`);
       else assert.match(w || '', /onTop=1/, `over the other windows: ${w}`);
       assert.match(w || '', / page=2/, `the page's draggable header moves the window: ${w}`);
+      // Arc's bar: the middle (the site's name) moves the window; "Back to Tab" at the left and
+      // "Close" at the right are buttons (1 is HTCLIENT).
+      assert.match(w || '', / top=2 /, `the bar's middle moves the window: ${w}`);
+      assert.match(w || '', / back=1 close=1$/, `Back to Tab and Close are buttons: ${w}`);
       // A link in it (a call's chat) opens as a tab of this window and space, as in Arc, not in a
       // new window.
       const pipTarget = (await (await fetch(`${b.base}/json/list`)).json()).find((t) => t.type === 'page' && t.url === 'about:blank');
