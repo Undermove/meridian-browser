@@ -142,10 +142,13 @@ test('⇧⌥⌘C copies the page as a Markdown link; ⌥⌘N opens a Little Wind
       text = execFileSync('pbpaste').toString();
     }
     assert.equal(text, '[A b c](data:text/html,<title>A [b] c</title>)');
-    // Both say so at the bottom of the window, like Arc.
+    // Both say so at the top right of the window, like Arc, and go after a moment.
     await b.waitFor(`app.shadowRoot.querySelector('#missionToast .mt-title')?.textContent.trim() === 'Copied as Markdown'`);
     await b.eval(`app.$.tabstrip.handler_.testCommand(${IDC.copyUrl})`);
     await b.waitFor(`app.shadowRoot.querySelector('#missionToast .mt-title')?.textContent.trim() === 'Copied link'`);
+    const r = await b.eval(`(() => { const r = app.shadowRoot.getElementById('missionToast').getBoundingClientRect(); return { top: r.top, right: innerWidth - r.right }; })()`);
+    assert.ok(r.top < 40 && r.right < 40, `at the top right: ${JSON.stringify(r)}`);
+    await b.waitFor(`!app.shadowRoot.getElementById('missionToast')`, 3000);
     await b.eval(`app.$.tabstrip.handler_.testCommand(${IDC.littleWindow})`);
     let little = false;
     for (let i = 0; i < 40 && !little; i++) {

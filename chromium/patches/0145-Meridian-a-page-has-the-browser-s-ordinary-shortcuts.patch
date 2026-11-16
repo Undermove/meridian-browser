@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Mon, 16 Nov 2026 13:03:10 +0400
+Subject: [PATCH] Meridian: a page has the browser's ordinary shortcuts first
+ on Windows
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On Windows and Linux the window took every browser shortcut before the
+page: an editor's own Ctrl+F (Google Docs) opened the browser's find bar
+instead, and a page could never keep Ctrl+P or Ctrl+D. As BrowserView
+does, only a reserved shortcut (Ctrl+T, Ctrl+W, Meridian's Ctrl+Shift+C,
+Ctrl+S…) is the browser's before the page now; the others go to the page,
+and back to the browser when the page leaves them (HandleKeyboardEvent,
+which did nothing off the Mac).
+
+Also, for tests: TestFloatingWindows() off the Mac lists the document
+picture-in-picture windows ("PictureInPicture onTop=… top=… page=…"), so
+pip.test.mjs checks the page's draggable header on Windows too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/meridian/sidebar_handler.cc    | 36 ++++++++++++++++++-
+ .../ui/webui_browser/webui_browser_window.cc  | 28 ++++++++++++++-
+ 2 files changed, 62 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index e888d60c0f..b67fbc80db 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -119,6 +119,7 @@
+ #include "ui/views/bubble/bubble_dialog_delegate_view.h"
+ #include "ui/views/view_utils.h"
+ #include "ui/views/widget/widget.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "ui/views/widget/widget_delegate.h"
+ #include "ui/views/window/client_view.h"
+ #include "ui/views/window/dialog_delegate.h"
+@@ -2924,9 +2925,42 @@ void SidebarHandler::TestWindowState(TestWindowStateCallback callback) {
+   std::move(callback).Run(false, false, -1, std::string());
+ }
+ 
++// Windows and Linux: the document picture-in-picture windows (a video's is
++// not a browser window), each "PictureInPicture onTop=0|1 top=<hit test 12px
++// under the top edge, mid-width> page=<hit test 40% down>". Spaces of the
++// Mac's kind don't exist here: always on top is what puts it over the rest.
+ void SidebarHandler::TestFloatingWindows(
+     TestFloatingWindowsCallback callback) {
+-  std::move(callback).Run({});
++  std::vector<std::string> out;
++  if (!HasTestSwitch("meridian-test-keys")) {
++    std::move(callback).Run(std::move(out));
++    return;
++  }
++  ForEachCurrentBrowserWindowInterfaceOrderedByActivation(
++      [&](BrowserWindowInterface* b) {
++        if (b->GetType() !=
++                BrowserWindowInterface::Type::TYPE_FLOATING ||
++            !b->GetWindow()) {
++          return true;
++        }
++        views::Widget* widget = views::Widget::GetWidgetForNativeWindow(
++            b->GetWindow()->GetNativeWindow());
++        if (!widget || !widget->IsVisible()) {
++          return true;
++        }
++        const gfx::Size size = widget->GetClientAreaBoundsInScreen().size();
++        std::string line = "PictureInPicture onTop=";
++        line += widget->GetZOrderLevel() == ui::ZOrderLevel::kNormal ? "0"
++                                                                     : "1";
++        line += " top=" + base::NumberToString(widget->GetNonClientComponent(
++                              gfx::Point(size.width() / 2, 12)));
++        line += " page=" +
++                base::NumberToString(widget->GetNonClientComponent(gfx::Point(
++                    size.width() / 2, size.height() * 2 / 5)));
++        out.push_back(std::move(line));
++        return true;
++      });
++  std::move(callback).Run(std::move(out));
+ }
+ 
+ std::string SystemUserFullName() {
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index 9064097017..bb9281a891 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -29,6 +29,7 @@
+ #include "chrome/browser/themes/theme_service_factory.h"
+ #include "chrome/browser/ui/accelerator_table.h"
+ #include "chrome/browser/ui/browser_active_state_manager/browser_active_state_manager.h"
++#include "chrome/browser/ui/browser_command_controller.h"
+ #include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/browser_init_state.h"
+@@ -1222,6 +1223,21 @@ WebUIBrowserWindow::PreHandleKeyboardEvent(
+     return content::KeyboardEventProcessingResult::NOT_HANDLED;
+   }
+ 
++#if !BUILDFLAG(IS_MAC)
++  // Meridian: as BrowserView, only a reserved shortcut (Ctrl+T, Ctrl+W,
++  // Meridian's own: Ctrl+Shift+C, Ctrl+S…) is the browser's before the page.
++  // The others (Ctrl+F, Ctrl+P…) go to the page first, and to the browser
++  // when the page leaves them (HandleKeyboardEvent): an editor's own find
++  // (Google Docs) works, as in Chrome and Arc. Before, every one was taken
++  // here and the page never saw it.
++  if (!chrome::BrowserCommandController::From(browser_.get())
++           ->IsReservedCommandOrKey(command_id, event)) {
++    return event.GetType() == blink::WebInputEvent::Type::kRawKeyDown
++               ? content::KeyboardEventProcessingResult::NOT_HANDLED_IS_SHORTCUT
++               : content::KeyboardEventProcessingResult::NOT_HANDLED;
++  }
++#endif
++
+   // TODO(webium): Handle shortcuts that are registered in the FocusManager.
+   // We handle only browser window shortcuts here. Secondary UIs can
+   // registered their own shortcuts (e.g. Ctrl+Enter closes the Find Bar) via
+@@ -1242,9 +1258,19 @@ WebUIBrowserWindow::PreHandleKeyboardEvent(
+ 
+ // These functions have Mac implementations in webui_browser_window_mac.mm.
+ #if !BUILDFLAG(IS_MAC)
++// Meridian: a browser shortcut the page left (didn't preventDefault): the
++// browser's after all (PreHandleKeyboardEvent let the page have it first).
+ bool WebUIBrowserWindow::HandleKeyboardEvent(
+     const input::NativeWebKeyboardEvent& event) {
+-  return false;
++  if (event.GetType() != blink::WebInputEvent::Type::kRawKeyDown ||
++      event.skip_if_unhandled) {
++    return false;
++  }
++  ui::Accelerator accelerator =
++      ui::GetAcceleratorFromNativeWebKeyboardEvent(event);
++  int command_id;
++  return FindCommandIdForAccelerator(accelerator, &command_id) &&
++         accelerator_manager_.Process(accelerator);
+ }
+ 
+ views::NativeWidget* WebUIBrowserWindow::CreateNativeWidget() {

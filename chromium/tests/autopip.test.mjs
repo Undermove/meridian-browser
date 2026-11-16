@@ -1,5 +1,6 @@
 // Arc's automatic picture-in-picture: a video playing with sound floats when its tab is left, and
-// comes back into the page when the tab is shown again. No prompt (allowed by default).
+// comes back into the page when the tab is shown again. No prompt (allowed by default). It shows
+// on every space, full screen ones too.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -15,7 +16,7 @@ test('a playing video goes picture-in-picture when its tab is left, and back whe
   fs.copyFileSync(path.join(here, 'fixtures', 'tone.webm'), path.join(dir, 'tone.webm'));
   fs.writeFileSync(path.join(dir, 'video.html'), '<!doctype html><title>Video</title><video id="v" src="tone.webm" autoplay loop width="320"></video>');
   const videoUrl = `file://${dir}/video.html`;
-  const b = await launch([videoUrl, 'data:text/html,<title>Quiet</title>'], { args: ['--autoplay-policy=no-user-gesture-required'] });
+  const b = await launch([videoUrl, 'data:text/html,<title>Quiet</title>'], { args: ['--autoplay-policy=no-user-gesture-required', '--meridian-test-keys'] });
   const row = (title) => `[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === ${JSON.stringify(title)})?.shadowRoot.querySelector('.row')`;
   const page = async () => {
     const t = (await (await fetch(`${b.base}/json/list`)).json()).find((x) => x.url === videoUrl);
@@ -32,6 +33,10 @@ test('a playing video goes picture-in-picture when its tab is left, and back whe
     assert.ok(await until(() => v('!document.getElementById("v").paused && document.getElementById("v").currentTime > 1')), 'the video plays');
     await b.click(row('Quiet'));
     assert.ok(await until(() => v('!!document.pictureInPictureElement')), 'picture-in-picture when the tab is left');
+    // On every space, the full screen ones (another app's) too, as in Arc.
+    let floating = [];
+    await until(async () => (floating = (await b.eval(`app.$.tabstrip.handler_.testFloatingWindows()`)).windows).length > 0);
+    assert.match(floating[0] || '', /allSpaces=1 fullScreenSpaces=1/, `on every space: ${floating}`);
     await b.click(row('Video'));
     assert.ok(await until(() => v('!document.pictureInPictureElement')), 'back in the page');
   } finally {
