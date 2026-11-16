@@ -1,0 +1,301 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Mon, 16 Nov 2026 12:46:19 +0400
+Subject: [PATCH 145/145] Meridian: picture in picture as in Arc: every space,
+ its links, its header
+
+- Both kinds of picture-in-picture window show on full screen spaces too
+  (another app's, a full screen window).
+- A link in one opens as a tab of the opener's window. It opened a new
+  window: WebUIBrowserWindow::IsOnCurrentWorkspace() said false, so the
+  navigator never reused a window.
+- A document picture-in-picture page's "app-region: drag" (Kontur
+  Talk's header) moves the window.
+- Test hook: TestFloatingWindows().
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar.mojom         |  4 +++
+ chrome/browser/meridian/sidebar_handler.cc    |  5 +++
+ chrome/browser/meridian/sidebar_handler.h     |  1 +
+ .../browser/meridian/sidebar_handler_mac.mm   | 32 +++++++++++++++++++
+ .../picture_in_picture_window_manager.cc      |  3 ++
+ .../browser_web_contents_delegate.cc          |  9 ++++++
+ .../browser/ui/navigator/browser_navigator.cc | 14 ++++++++
+ chrome/browser/ui/views/frame/browser_view.cc |  9 ++++++
+ chrome/browser/ui/views/frame/browser_view.h  | 10 ++++++
+ .../browser/ui/views/frame/browser_widget.cc  |  6 ++++
+ .../overlay/video_overlay_window_views.cc     |  3 ++
+ .../ui/webui_browser/webui_browser_window.cc  |  9 +++---
+ 12 files changed, 101 insertions(+), 4 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index a922a6a081..09ffa7a64b 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -581,6 +581,10 @@ interface SidebarHandler {
+   // in, empty while they are hidden.
+   TestWindowState() => (bool visible, bool on_active_space, int32 order,
+                         string controls);
++  // Tests (--meridian-test-keys): the app's floating windows (picture in
++  // picture), each "Class allSpaces=0|1 fullScreenSpaces=0|1 top=<hit test
++  // 12px under the top edge, mid-width> page=<hit test 40% down>".
++  TestFloatingWindows() => (array<string> windows);
+ 
+   // Split view: the active tab and `other` side by side (⌃⇧=), back to one
+   // (⌃⇧-), and the divider position.
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index a15978bd41..e888d60c0f 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -2924,6 +2924,11 @@ void SidebarHandler::TestWindowState(TestWindowStateCallback callback) {
+   std::move(callback).Run(false, false, -1, std::string());
+ }
+ 
++void SidebarHandler::TestFloatingWindows(
++    TestFloatingWindowsCallback callback) {
++  std::move(callback).Run({});
++}
++
+ std::string SystemUserFullName() {
+   return std::string();
+ }
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 6b8cdb82e5..6eff0e37a4 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -162,6 +162,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void SetWindowControlsVisible(bool visible) override;
+   void TestCommand(int32_t command_id) override;
+   void TestWindowState(TestWindowStateCallback callback) override;
++  void TestFloatingWindows(TestFloatingWindowsCallback callback) override;
+   void SwitchKeyboardLayout(const std::string& language) override;
+   void CopyLink() override;
+   void TestKeyPress(uint16_t key_code,
+diff --git a/chrome/browser/meridian/sidebar_handler_mac.mm b/chrome/browser/meridian/sidebar_handler_mac.mm
+index 532ec20165..f20e3ef1e6 100644
+--- a/chrome/browser/meridian/sidebar_handler_mac.mm
++++ b/chrome/browser/meridian/sidebar_handler_mac.mm
+@@ -20,6 +20,8 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "ui/base/base_window.h"
+ #include "ui/gfx/native_ui_types.h"
++#include "ui/views/widget/widget.h"
++#include "base/strings/string_number_conversions.h"
+ 
+ namespace meridian {
+ 
+@@ -49,6 +51,36 @@ void SidebarHandler::TestWindowState(TestWindowStateCallback callback) {
+           : std::string());
+ }
+ 
++void SidebarHandler::TestFloatingWindows(
++    TestFloatingWindowsCallback callback) {
++  std::vector<std::string> out;
++  if (!HasTestSwitch("meridian-test-keys")) {
++    std::move(callback).Run(std::move(out));
++    return;
++  }
++  for (NSWindow* window in NSApp.windows) {
++    views::Widget* widget =
++        views::Widget::GetWidgetForNativeWindow(gfx::NativeWindow(window));
++    if (!widget || !window.isVisible || window.level < NSFloatingWindowLevel) {
++      continue;
++    }
++    const NSWindowCollectionBehavior behavior = window.collectionBehavior;
++    std::string line = base::SysNSStringToUTF8(NSStringFromClass([window class]));
++    line += " allSpaces=";
++    line += (behavior & NSWindowCollectionBehaviorCanJoinAllSpaces) ? "1" : "0";
++    line += " fullScreenSpaces=";
++    line +=
++        (behavior & NSWindowCollectionBehaviorFullScreenAuxiliary) ? "1" : "0";
++    const gfx::Size size = widget->GetClientAreaBoundsInScreen().size();
++    line += " top=" + base::NumberToString(widget->GetNonClientComponent(
++                          gfx::Point(size.width() / 2, 12)));
++    line += " page=" + base::NumberToString(widget->GetNonClientComponent(
++                           gfx::Point(size.width() / 2, size.height() * 2 / 5)));
++    out.push_back(std::move(line));
++  }
++  std::move(callback).Run(std::move(out));
++}
++
+ void SidebarHandler::SwitchKeyboardLayout(const std::string& language) {
+   // Test browsers leave the person's keyboard alone.
+   if (base::CommandLine::ForCurrentProcess()->HasSwitch(
+diff --git a/chrome/browser/picture_in_picture/picture_in_picture_window_manager.cc b/chrome/browser/picture_in_picture/picture_in_picture_window_manager.cc
+index 811bac8db0..fadc9b747f 100644
+--- a/chrome/browser/picture_in_picture/picture_in_picture_window_manager.cc
++++ b/chrome/browser/picture_in_picture/picture_in_picture_window_manager.cc
+@@ -182,6 +182,9 @@ void PictureInPictureWindowManager::EnterDocumentPictureInPicture(
+       GetOrCreateDocumentPictureInPictureController(parent_web_contents);
+ 
+   controller->SetChildWebContents(child_web_contents);
++  // Meridian: the page's own header ("app-region: drag", Kontur Talk's say)
++  // moves the window, as in Arc.
++  child_web_contents->SetSupportsDraggableRegions(true);
+ 
+   // Show the new window. As a side effect, this also first closes any
+   // pre-existing PictureInPictureWindowController's window (if any).
+diff --git a/chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.cc b/chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.cc
+index 82f99670ad..598bd381b7 100644
+--- a/chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.cc
++++ b/chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.cc
+@@ -55,6 +55,8 @@
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/contents_web_view.h"
+ #include "chrome/browser/ui/views/status_bubble_views.h"
++#include "third_party/blink/public/mojom/page/draggable_region.mojom.h"
++#include "ui/gfx/draggable_region.h"
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/browser/web_applications/web_app_provider.h"
+ #include "chrome/browser/web_applications/web_app_registrar.h"
+@@ -1013,6 +1015,13 @@ void BrowserWebContentsDelegate::DraggableRegionsChanged(
+   if (app_browser_controller_) {
+     app_browser_controller_->DraggableRegionsChanged(regions, contents);
+   }
++  // Meridian: a document picture-in-picture page's header moves its window.
++  if (browser_->GetType() == BrowserWindowInterface::Type::TYPE_FLOATING) {
++    if (auto* browser_view = BrowserView::GetBrowserViewForBrowser(&*browser_)) {
++      browser_view->SetPictureInPictureDraggableRegion(
++          gfx::DraggableRegionsToSkRegion(regions));
++    }
++  }
+ }
+ 
+ std::vector<blink::mojom::RelatedApplicationPtr>
+diff --git a/chrome/browser/ui/navigator/browser_navigator.cc b/chrome/browser/ui/navigator/browser_navigator.cc
+index b67b03ac0a..42044f283b 100644
+--- a/chrome/browser/ui/navigator/browser_navigator.cc
++++ b/chrome/browser/ui/navigator/browser_navigator.cc
+@@ -358,6 +358,20 @@ std::tuple<BrowserWindowInterface*, int> GetBrowserAndTabForDisposition(
+       if (WindowCanOpenTabs(params)) {
+         return {params.browser, -1};
+       }
++      // Meridian: a link in a picture-in-picture window opens in the window
++      // of the tab that opened it (whatever its space's profile), as in Arc.
++      if (params.browser && params.browser->GetType() ==
++                                BrowserWindowInterface::Type::TYPE_FLOATING) {
++        if (content::WebContents* opener =
++                PictureInPictureWindowManager::GetInstance()->GetWebContents()) {
++          if (auto* tab = tabs::TabInterface::MaybeGetFromContents(opener)) {
++            if (BrowserWindowInterface* window =
++                    tab->GetBrowserWindowInterface()) {
++              return {window, -1};
++            }
++          }
++        }
++      }
+ 
+       // Find a compatible window and re-execute this command in it. Otherwise
+       // re-run with NEW_WINDOW.
+diff --git a/chrome/browser/ui/views/frame/browser_view.cc b/chrome/browser/ui/views/frame/browser_view.cc
+index 764e295293..dbbbf29f89 100644
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -4807,6 +4807,15 @@ int BrowserView::NonClientHitTest(const gfx::Point& point) {
+     }
+   }
+ 
++  // Meridian: a document picture-in-picture page's "app-region: drag".
++  if (pip_draggable_region_ && GetIsPictureInPictureType()) {
++    gfx::Point in_contents(point_in_browser_view_coords);
++    views::View::ConvertPointToTarget(this, GetContentsView(), &in_contents);
++    if (pip_draggable_region_->contains(in_contents.x(), in_contents.y())) {
++      return HTCAPTION;
++    }
++  }
++
+   // For apps with window-controls-overlay or unframed display mode, see if
+   // we're in an app defined draggable region so we can return `HTCAPTION`.
+   web_app::AppBrowserController* controller =
+diff --git a/chrome/browser/ui/views/frame/browser_view.h b/chrome/browser/ui/views/frame/browser_view.h
+index 750e46c97b..fa7fbcc4ab 100644
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -61,6 +61,7 @@
+ #include "ui/gfx/native_ui_types.h"
+ #include "ui/views/controls/button/button.h"
+ #include "ui/views/controls/webview/unhandled_keyboard_event_handler.h"
++#include "third_party/skia/include/core/SkRegion.h"
+ #include "ui/views/interaction/view_subregion_anchor.h"
+ #include "ui/views/widget/widget_delegate.h"
+ #include "ui/views/widget/widget_observer.h"
+@@ -464,6 +465,12 @@ class BrowserView : public BrowserWindow,
+   // Returns whether any of the features enabling draggable regions is enabled.
+   bool AreDraggableRegionsEnabled() const;
+ 
++  // Meridian: a document picture-in-picture page's "app-region: drag" parts,
++  // which move the window.
++  void SetPictureInPictureDraggableRegion(std::optional<SkRegion> region) {
++    pip_draggable_region_ = std::move(region);
++  }
++
+   // Returns true when the window controls overlay should be displayed instead
+   // of a full titlebar. This is only supported for desktop web apps.
+   bool IsWindowControlsOverlayEnabled() const;
+@@ -1411,6 +1418,9 @@ class BrowserView : public BrowserWindow,
+   base::EnumSet<TabStripAndWebAppViewsReparentedState>
+       tab_strip_web_apps_reparented_state_;
+ 
++  // Meridian: see SetPictureInPictureDraggableRegion().
++  std::optional<SkRegion> pip_draggable_region_;
++
+   mutable base::WeakPtrFactory<BrowserView> weak_ptr_factory_{this};
+ };
+ 
+diff --git a/chrome/browser/ui/views/frame/browser_widget.cc b/chrome/browser/ui/views/frame/browser_widget.cc
+index df70a8b38c..ef914bf35c 100644
+--- a/chrome/browser/ui/views/frame/browser_widget.cc
++++ b/chrome/browser/ui/views/frame/browser_widget.cc
+@@ -218,6 +218,12 @@ void BrowserWidget::InitBrowserWidget() {
+ 
+   Init(std::move(params));
+ 
++  // Meridian: a picture-in-picture window follows to every space, the full
++  // screen ones (another app's, a full screen window) too, as in Arc.
++  if (browser->GetType() == BrowserWindowInterface::Type::TYPE_FLOATING) {
++    SetCanAppearInExistingFullscreenSpaces(true);
++  }
++
+ #if BUILDFLAG(IS_LINUX)
+   SelectNativeTheme();
+ #else
+diff --git a/chrome/browser/ui/views/overlay/video_overlay_window_views.cc b/chrome/browser/ui/views/overlay/video_overlay_window_views.cc
+index a20b96209b..6da4169d7d 100644
+--- a/chrome/browser/ui/views/overlay/video_overlay_window_views.cc
++++ b/chrome/browser/ui/views/overlay/video_overlay_window_views.cc
+@@ -1744,6 +1744,9 @@ void VideoOverlayWindowViews::ShowInactive() {
+ #endif
+ 
+   views::Widget::SetVisibleOnAllWorkspaces(true);
++  // Meridian: the full screen spaces too (another app's, a full screen
++  // window), as in Arc.
++  views::Widget::SetCanAppearInExistingFullscreenSpaces(true);
+ #if BUILDFLAG(IS_CHROMEOS)
+   non_client_view()->frame_view()->UpdateWindowRoundedCorners();
+ #endif
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index a60a1aaada..9064097017 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -462,14 +462,15 @@ gfx::NativeWindow WebUIBrowserWindow::GetNativeWindow() const {
+ #endif
+ }
+ 
++// Meridian: as BrowserView's on macOS. False sent every link opened outside a
++// tab (from a picture-in-picture window, say) into a new window: the
++// navigator only reuses a window on the current workspace.
+ bool WebUIBrowserWindow::IsOnCurrentWorkspace() const {
+-  NOTIMPLEMENTED_LOG_ONCE();
+-  return false;
++  return true;
+ }
+ 
+ bool WebUIBrowserWindow::IsVisibleOnScreen() const {
+-  NOTIMPLEMENTED_LOG_ONCE();
+-  return false;
++  return widget_ && widget_->IsVisibleOnScreen();
+ }
+ 
+ void WebUIBrowserWindow::SetTopControlsShownRatio(
