@@ -100,8 +100,14 @@ test('a page that leaves ⌘F to the browser gets the find bar', async () => {
     await b.waitFor(`app.$.contentRegion.activeWebview?.shadowRoot.activeElement?.classList.contains('content')`);
     const findBar = async () => (await b.eval(`${T}.handler_.testBubbles('bounds')`)).bubbles.some((x) => /^View /.test(x));
     assert.equal(await findBar(), false);
-    await page.cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...KEYS.find });
-    await page.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...KEYS.find });
+    if (process.platform === 'darwin') {
+      // A real NSEvent: on the Mac a key the page leaves goes back through AppKit's menus, which a
+      // CDP key event (no NSEvent behind it) can't reach.
+      await b.eval(`${T}.handler_.testKeyPress(3, 'f', ${1 << 20})`);
+    } else {
+      await page.cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...KEYS.find });
+      await page.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...KEYS.find });
+    }
     let shown = false;
     for (let i = 0; i < 30 && !shown; i++) { await sleep(100); shown = await findBar(); }
     assert.ok(shown, 'the find bar is shown');
