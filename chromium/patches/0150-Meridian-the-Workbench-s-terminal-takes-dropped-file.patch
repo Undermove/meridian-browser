@@ -1,0 +1,260 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Mon, 16 Nov 2026 19:37:59 +0400
+Subject: [PATCH 151/151] Meridian: the Workbench's terminal takes dropped
+ files as their paths; links in it work; terminal.scrollSpeed
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |  1 +
+ .../meridian/workbench/customizations_texts.h |  8 +-
+ .../meridian/workbench/workbench_handler.cc   | 84 +++++++++++++++++++
+ .../chrome_web_contents_view_handle_drop.cc   | 21 +++++
+ .../chrome_web_contents_view_handle_drop.h    | 16 ++++
+ 5 files changed, 128 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 99d15c1fa8..8671038120 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -357,6 +357,7 @@ source_set("meridian") {
+     "//third_party/leveldatabase",
+     ":ai_providers",
+     ":workbench_core",
++    "//chrome/browser/ui/tab_contents",
+     "//ui/base/clipboard",
+     "//services/media_session/public/cpp",
+     "//services/media_session/public/mojom",
+diff --git a/chrome/browser/meridian/workbench/customizations_texts.h b/chrome/browser/meridian/workbench/customizations_texts.h
+index 5f90478c58..91266145b1 100644
+--- a/chrome/browser/meridian/workbench/customizations_texts.h
++++ b/chrome/browser/meridian/workbench/customizations_texts.h
+@@ -82,7 +82,8 @@ with data you didn't write.
+   "terminal": {
+     "fontSize": 12.5,
+     "fontFamily": "",
+-    "lineHeight": 1.15
++    "lineHeight": 1.15,
++    "scrollSpeed": 1
+   },
+   "layout": {
+     "treeWidth": 240,
+@@ -97,6 +98,8 @@ with data you didn't write.
+ ```
+ 
+ - `editor.theme`: `"auto"` (follows the system), `"light"`, `"dark"`, `"hc-black"`, `"hc-light"`.
++- `terminal.scrollSpeed`: how far the terminal scrolls for a move of the fingers or the wheel
++  (`0.5` half as far, `2` twice; ⌥ scrolls five times faster).
+ - `layout.terminalHeight`: CSS length (`"40%"`, `"320px"`). `layout.showTree`: hide the file tree.
+ - `ui.accent`: hex colour to override the space colour (`"#d97757"`), empty = follow the space.
+ 
+@@ -164,7 +167,8 @@ inline constexpr char kDefaultSettings[] = R"meridian({
+   "terminal": {
+     "fontSize": 12.5,
+     "fontFamily": "",
+-    "lineHeight": 1.15
++    "lineHeight": 1.15,
++    "scrollSpeed": 1
+   },
+   "layout": {
+     "treeWidth": 240,
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index c00cc34401..933a996743 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <utility>
+ 
++#include "base/base64.h"
+ #include "base/command_line.h"
+ #include "base/files/file_util.h"
+ #include "base/json/json_reader.h"
+@@ -17,6 +18,7 @@
+ #include "base/strings/stringprintf.h"
+ #include "base/task/bind_post_task.h"
+ #include "base/task/thread_pool.h"
++#include "base/uuid.h"
+ #include "chrome/browser/meridian/ai/process_runner.h"
+ #include "chrome/browser/meridian/ai/tidy.h"
+ #include "chrome/browser/meridian/mission/mission_control_factory.h"
+@@ -38,6 +40,7 @@
+ #include "chrome/browser/meridian/workbench/workbench_service.h"
+ #include "chrome/browser/meridian/workbench/workbench_service_factory.h"
+ #include "chrome/browser/meridian/workbench/terminal.h"
++#include "chrome/browser/ui/tab_contents/chrome_web_contents_view_handle_drop.h"
+ #include "chrome/browser/platform_util.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+@@ -201,6 +204,9 @@ std::map<std::string, std::string> TerminalEnv() {
+   env["TERM"] = "xterm-256color";
+   env["COLORTERM"] = "truecolor";
+   env["TERM_PROGRAM"] = "Meridian";
++  // Links as links (OSC 8): programs don't know Meridian's terminal, which
++  // opens them (Claude Code's file and web links).
++  env["FORCE_HYPERLINK"] = "1";
+   if (!env.contains("LANG")) {
+     env["LANG"] = "en_US.UTF-8";
+   }
+@@ -457,6 +463,84 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+                          a),
+                      std::move(reply));
+   }
++  if (method == "droppedPaths") {
++    // The paths of the files just dropped on the page, which it names (and
++    // sizes): what a terminal types for them. None unless all of them match.
++    std::vector<std::pair<std::string, int64_t>> files;
++    if (!params.empty() && params[0].is_list()) {
++      for (const base::Value& f : params[0].GetList()) {
++        const std::string* name = f.is_dict() ? f.GetDict().FindString("name")
++                                              : nullptr;
++        std::optional<double> size =
++            f.is_dict() ? f.GetDict().FindDouble("size") : std::nullopt;
++        if (name && size) {
++          files.emplace_back(*name, static_cast<int64_t>(*size));
++        }
++      }
++    }
++    const DroppedFiles& last = LastDroppedFiles();
++    if (files.empty() ||
++        base::TimeTicks::Now() - last.when > base::Seconds(10)) {
++      return std::move(reply).Run(base::Value(base::ListValue()));
++    }
++    files_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(
++            [](std::vector<std::pair<std::string, int64_t>> files,
++               std::vector<base::FilePath> paths) -> Result {
++              base::ListValue out;
++              std::vector<bool> used(paths.size());
++              for (const auto& [name, size] : files) {
++                bool found = false;
++                for (size_t i = 0; i < paths.size() && !found; ++i) {
++                  std::optional<int64_t> real = base::GetFileSize(paths[i]);
++                  bool dir = base::DirectoryExists(paths[i]);
++                  if (!used[i] && paths[i].BaseName().AsUTF8Unsafe() == name &&
++                      (dir || real == size)) {
++                    used[i] = found = true;
++                    out.Append(paths[i].AsUTF8Unsafe());
++                  }
++                }
++                if (!found) {
++                  return base::Value(base::ListValue());
++                }
++              }
++              return base::Value(std::move(out));
++            },
++            std::move(files), last.paths),
++        std::move(reply));
++    return;
++  }
++  if (method == "saveDrop") {
++    // A dropped or pasted file that has no path (an image from a page, a
++    // screenshot on the clipboard): saved where the terminal's program can
++    // read it.
++    std::string name = base::FilePath::FromUTF8Unsafe(a).BaseName().AsUTF8Unsafe();
++    if (name.empty() || name == "." || name == ".." || b.size() > 70000000) {
++      return std::move(reply).Run(base::unexpected("Can't save this file"));
++    }
++    files_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(
++            [](std::string name, std::string data) -> Result {
++              std::optional<std::vector<uint8_t>> bytes =
++                  base::Base64Decode(data);
++              base::FilePath dir;
++              if (!bytes || !base::GetTempDir(&dir)) {
++                return base::unexpected("Can't save this file");
++              }
++              dir = dir.Append("Meridian Drops")
++                        .Append(base::Uuid::GenerateRandomV4().AsLowercaseString());
++              base::FilePath file = dir.Append(base::FilePath::FromUTF8Unsafe(name));
++              if (!base::CreateDirectory(dir) || !base::WriteFile(file, *bytes)) {
++                return base::unexpected("Can't save this file");
++              }
++              return base::Value(file.AsUTF8Unsafe());
++            },
++            name, b),
++        std::move(reply));
++    return;
++  }
+   if (method == "stat") {
+     return OnProject(base::BindOnce(
+                          [](std::string rel, const ProjectFs& p) -> Result {
+diff --git a/chrome/browser/ui/tab_contents/chrome_web_contents_view_handle_drop.cc b/chrome/browser/ui/tab_contents/chrome_web_contents_view_handle_drop.cc
+index 2e3ed6f9f1..6f0b227dea 100644
+--- a/chrome/browser/ui/tab_contents/chrome_web_contents_view_handle_drop.cc
++++ b/chrome/browser/ui/tab_contents/chrome_web_contents_view_handle_drop.cc
+@@ -10,6 +10,7 @@
+ #include "base/containers/flat_map.h"
+ #include "base/files/file_enumerator.h"
+ #include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/thread_pool.h"
+ #include "build/chromeos_buildflags.h"
+@@ -235,11 +236,31 @@ class HandleDropScanData : public content::WebContentsObserver {
+ #endif  // BUILDFLAG(ENTERPRISE_CLOUD_CONTENT_ANALYSIS) &&
+         // BUILDFLAG(SAFE_BROWSING_AVAILABLE)
+ 
++DroppedFiles::DroppedFiles() = default;
++DroppedFiles::DroppedFiles(const DroppedFiles&) = default;
++DroppedFiles::~DroppedFiles() = default;
++
++namespace {
++DroppedFiles& LastDrop() {
++  static base::NoDestructor<DroppedFiles> last;
++  return *last;
++}
++}  // namespace
++
++const DroppedFiles& LastDroppedFiles() {
++  return LastDrop();
++}
++
+ void HandleOnPerformingDrop(
+     content::WebContents* web_contents,
+     content::DropData drop_data,
+     content::WebContentsViewDelegate::DropCompletionCallback callback) {
+   CHECK(callback);
++  LastDrop().paths.clear();
++  for (const ui::FileInfo& file : drop_data.filenames) {
++    LastDrop().paths.push_back(file.path);
++  }
++  LastDrop().when = base::TimeTicks::Now();
+ 
+   content::WebContents* scan_target =
+       glic::GetGlicGuestWebContents(web_contents);
+diff --git a/chrome/browser/ui/tab_contents/chrome_web_contents_view_handle_drop.h b/chrome/browser/ui/tab_contents/chrome_web_contents_view_handle_drop.h
+index 0b065d3821..51309651b6 100644
+--- a/chrome/browser/ui/tab_contents/chrome_web_contents_view_handle_drop.h
++++ b/chrome/browser/ui/tab_contents/chrome_web_contents_view_handle_drop.h
+@@ -5,6 +5,10 @@
+ #ifndef CHROME_BROWSER_UI_TAB_CONTENTS_CHROME_WEB_CONTENTS_VIEW_HANDLE_DROP_H_
+ #define CHROME_BROWSER_UI_TAB_CONTENTS_CHROME_WEB_CONTENTS_VIEW_HANDLE_DROP_H_
+ 
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/time/time.h"
+ #include "content/public/browser/web_contents_view_delegate.h"
+ 
+ namespace content {
+@@ -19,4 +23,16 @@ void HandleOnPerformingDrop(
+     content::DropData drop_data,
+     content::WebContentsViewDelegate::DropCompletionCallback callback);
+ 
++// Meridian: the files of the last drop on a page, and when it came. A chrome://
++// page sees only the names and contents of files dropped on it; the
++// Workbench's terminal types their paths, as a terminal does.
++struct DroppedFiles {
++  DroppedFiles();
++  DroppedFiles(const DroppedFiles&);
++  ~DroppedFiles();
++  std::vector<base::FilePath> paths;
++  base::TimeTicks when;
++};
++const DroppedFiles& LastDroppedFiles();
++
+ #endif  // CHROME_BROWSER_UI_TAB_CONTENTS_CHROME_WEB_CONTENTS_VIEW_HANDLE_DROP_H_

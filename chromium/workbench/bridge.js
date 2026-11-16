@@ -137,6 +137,11 @@
     rename: (from, to) => invoke('rename', str(from), str(to)),
     remove: (rel) => invoke('remove', str(rel)),
     reveal: (rel) => invoke('reveal', str(rel)),
+    // Files dropped on the page: their paths (none unless the page names all of them), or a copy
+    // of one saved where programs can read it.
+    droppedPaths: (files) => invoke('droppedPaths', (Array.isArray(files) ? files : []).slice(0, 100)
+      .map((f) => ({ name: str(f?.name), size: Number(f?.size) || 0 }))),
+    saveDrop: (name, base64) => invoke('saveDrop', str(name), str(base64)),
     onFsChange: listen('wb:fs-change'),
 
     ptyCreate: (opts) => invoke('ptyCreate', {
