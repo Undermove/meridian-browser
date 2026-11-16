@@ -915,7 +915,9 @@ async function openFileAt(rel, line, col) {
 // Files dropped on a terminal, or an image pasted with ⌘V: their paths are typed into it, as
 // Warp and iTerm do; Claude Code attaches an image from its path. A file with no path (an image
 // from a page, a screenshot copied to the clipboard) is saved first.
-const shellQuote = (p) => (IS_MAC || !/\s/.test(p) ? p.replace(/([^\w@%+=:,./-])/g, '\\$1') : `"${p}"`);
+// A path as the shell takes it: a backslash before each special on the Mac and Linux; on Windows
+// (PowerShell, cmd) in double quotes when it has a space or a special, its backslashes kept.
+const shellQuote = (p) => (wb.platform !== 'win32' ? p.replace(/([^\w@%+=:,./-])/g, '\\$1') : /[^\w@%+=:,./\\-]/.test(p) ? `"${p}"` : p);
 async function pathsOf(t, files, dropped) {
   let paths = dropped ? await wb.droppedPaths(files.map((f) => ({ name: f.name, size: f.size }))).catch(() => []) : [];
   if (paths.length !== files.length) {

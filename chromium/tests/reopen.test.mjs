@@ -23,7 +23,7 @@ const ARGS = ['--meridian-test-keys'];
 const titles = (b) => b.eval(`[...${SB}.querySelectorAll('meridian-tab-row')].map((r) => r.tab.title).sort().join()`);
 const windows = async (b) => (await (await fetch(`${b.base}/json/list`)).json())
     .filter((t) => t.url.startsWith('chrome://webui-browser')).length;
-const closeTab = (b) => b.eval(`${T}.handler_.testKeyPress(13, 'w', ${CMD})`);  // ⌘W
+const closeTab = (b) => b.shortcut(13, 'w', CMD);  // ⌘W
 // ⇧⌘T goes to the page first and comes back through the main menu, which AppKit only does for
 // the key window (a test window in the background isn't): the command it runs.
 const reopen = (b) => b.eval(`${T}.handler_.testCommand(34028)`);  // IDC_RESTORE_TAB

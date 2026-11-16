@@ -120,7 +120,8 @@
 
   const str = (v) => String(v ?? '');
   window.workbench = {
-    platform: 'darwin',
+    // The system the page runs on, as Node names it: Ctrl or ⌘, Finder or a folder, how paths are quoted.
+    platform: /^Win/.test(navigator.platform) ? 'win32' : /^Mac/.test(navigator.platform) ? 'darwin' : 'linux',
     info: () => invoke('info'),
 
     pickProject: () => invoke('pickProject'),

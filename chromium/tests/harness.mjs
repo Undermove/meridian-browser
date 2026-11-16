@@ -307,6 +307,20 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
       await b.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: keyCode });
       b.afterAction?.(`the ${key} key`);
     },
+    // A shortcut as a person presses it (macCode: the Mac key code; mods: 1 << 20 for ⌘, Ctrl off
+    // the Mac, 1 << 17 for ⇧): a real NSEvent on the Mac, where a CDP key has none; elsewhere a key
+    // into the shown tab's page, which leaves a browser shortcut to the browser.
+    async shortcut(macCode, ch, mods = 1 << 20) {
+      if (process.platform === 'darwin') return b.eval(`app.$.tabstrip.handler_.testKeyPress(${macCode}, ${JSON.stringify(ch)}, ${mods})`);
+      const url = await b.eval(`[...app.$.tabstrip.tabs_.values()].find((t) => t.isActive)?.url`);
+      const page = await b.page(url);
+      const vk = ch.toUpperCase().charCodeAt(0);
+      const k = { key: ch, code: 'Key' + ch.toUpperCase(), windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers: (mods & (1 << 20) ? 2 : 0) | (mods & (1 << 17) ? 8 : 0) };
+      // The page may close on it (Ctrl+W): its target goes away under the key.
+      await page.cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...k }).catch(() => {});
+      await page.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...k }).catch(() => {});
+      try { page.close(); } catch {}
+    },
     // A real mouse click at the centre of an element found by a JS expression in the UI page.
     // The centre of an element once it has stopped moving (menus place themselves after opening).
     async point(elExpr) {

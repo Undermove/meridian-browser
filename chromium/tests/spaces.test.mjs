@@ -312,7 +312,7 @@ test('⌘W in a space shows the next tab of that space, never another space\'s',
     await open(b, 'w3');
     for (const closing of ['w3', 'w2']) {
       assert.equal(await active(b), closing);
-      await b.eval(`${T}.handler_.testKeyPress(13, 'w', ${CMD})`);  // ⌘W
+      await b.shortcut(13, 'w', CMD);  // ⌘W
       await b.waitFor(`![...${T}.tabs_.values()].some((t) => t.title === ${JSON.stringify(closing)})`);
       await new Promise((r) => setTimeout(r, 500));
       assert.equal(await b.eval(`${T}.state_.activeSpaceId`), work, `still in Work after closing ${closing}`);
@@ -324,7 +324,7 @@ test('⌘W in a space shows the next tab of that space, never another space\'s',
     const workTabs = () => b.eval(`${T}.state_.tabs.filter((t) => t.spaceId === ${JSON.stringify(work)}).length`);
     for (let left = await workTabs(); left > 0; left--) {
       const closing = await b.eval(`[...${T}.tabs_.values()].find((t) => t.isActive)?.id`);
-      await b.eval(`${T}.handler_.testKeyPress(13, 'w', ${CMD})`);  // ⌘W
+      await b.shortcut(13, 'w', CMD);  // ⌘W
       await b.waitFor(`![...${T}.tabs_.values()].some((t) => t.id === ${JSON.stringify(closing)})`);
     }
     await b.waitFor(`${T}.state_.tabs.find((t) => t.tabId === [...${T}.tabs_.values()].find((x) => x.isActive)?.id)?.spaceId === ${JSON.stringify(work)}`);

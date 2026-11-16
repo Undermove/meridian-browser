@@ -11,6 +11,10 @@ import path from 'node:path';
 import { launch } from './harness.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// On Windows the Workbench's shell is PowerShell: node runs with its call operator, and the Unix
+// tools used here (cat -v, printf) are a small node script or echo there.
+const WIN = process.platform === 'win32';
+const NODE = WIN ? `& ${JSON.stringify(process.execPath)}` : JSON.stringify(process.execPath);
 const T = 'app.$.tabstrip';
 const TEXT = `(() => { const b = S.activeTerm.xterm.buffer.active; return Array.from({ length: b.length }, (_, i) => { const l = b.getLine(i); return (l?.isWrapped ? '' : '\\n') + (l?.translateToString(true) || ''); }).join(''); })()`;
 
@@ -63,7 +67,18 @@ test('Workbench terminal: ⇧↩ is a new line for the program, ↩ is Enter', a
   const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-wbt-')));
   const { b, wb } = await workbench(project);
   try {
-    await run(wb, 'cat -v');
+    if (WIN) {
+      // cat -v: ESC as ^[, Enter as a new line.
+      fs.writeFileSync(path.join(project, 'catv.js'), String.raw`process.stdin.setRawMode(true);
+process.stdin.on('data', (d) => { for (const c of d.toString()) process.stdout.write(c === '\x1b' ? '^[' : c === '\r' ? '\r\n' : c); });
+process.stdout.write('READY\r\n');
+`);
+      await run(wb, `${NODE} catv.js`);
+      // node starts slower than cat: the keys are its once it says so, not PowerShell's.
+      await wb.waitFor(`${TEXT}.includes('\\nREADY')`, 10000);
+    } else {
+      await run(wb, 'cat -v');
+    }
     await sleep(500);
     const key = (type, modifiers) => wb.cdp.send('Input.dispatchKeyEvent', { type, modifiers, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, ...(type === 'keyDown' ? { text: '\r' } : {}) });
     for (const ch of 'ab') await wb.cdp.send('Input.insertText', { text: ch });
@@ -73,7 +88,7 @@ test('Workbench terminal: ⇧↩ is a new line for the program, ↩ is Enter', a
     await wb.waitFor(`${TEXT}.includes('ab^[')`, 5000, TEXT);
     const text = await wb.eval(TEXT);
     // "ab" ESC, then a new line (⇧↩); "c", then Enter.
-    assert.match(text, /\nab\^\[\nc\n/, '⇧↩ sent ESC ↩, ↩ a plain Enter');
+    assert.match(text, /\nab\^\[\nc\n/, `⇧↩ sent ESC ↩, ↩ a plain Enter: ${JSON.stringify(text.slice(-300))}`);
   } finally { wb.close(); await b.close(); fs.rmSync(project, { recursive: true, force: true }); }
 });
 
@@ -86,7 +101,7 @@ test('Workbench terminal: a web address opens in a tab; a project file at its li
   const url = `http://127.0.0.1:${s.address().port}/docs?a=1`;
   const { b, wb } = await workbench(project);
   try {
-    await run(wb, `clear; printf 'see ${url}. and src/app.ts:3 too\\n'`);
+    await run(wb, WIN ? `clear; echo 'see ${url}. and src/app.ts:3 too'` : `clear; printf 'see ${url}. and src/app.ts:3 too\\n'`);
     await wb.waitFor(`${TEXT}.includes('src/app.ts:3 too')`, 5000);
     await click(wb, await cell(wb, 'http://127.0.0.1'));
     await b.waitFor(`[...${T}.tabs_.values()].some((t) => t.title === 'Docs page')`, 8000);
@@ -113,15 +128,18 @@ test('Workbench terminal: a file dropped on it is typed as its path, quoted for 
     for (const type of ['dragEnter', 'dragOver', 'drop']) await wb.cdp.send('Input.dispatchDragEvent', { type, x: at.x, y: at.y, data });
     await wb.waitFor(`${TEXT}.includes('shot.png')`, 8000, TEXT);
     const typed = (await wb.eval(TEXT)).split('\n').reverse().find((l) => l.includes('shot.png'));
-    const m = /(\/\S*(?:\\ \S*)*shot\.png)/.exec(typed);
+    // Quoted for the shell: a backslash before a space on the Mac, double quotes on Windows.
+    const m = WIN ? /"([^"]*shot\.png)"/.exec(typed) : /(\/\S*(?:\\ \S*)*shot\.png)/.exec(typed);
     assert.ok(m, `a path was typed: ${typed}`);
-    const p = m[1].replace(/\\(.)/g, '$1');
+    const p = WIN ? m[1] : m[1].replace(/\\(.)/g, '$1');
     assert.equal(path.basename(p), 'my shot.png');
     assert.deepEqual(fs.readFileSync(p), fs.readFileSync(file), 'the path is the file (or its copy)');
   } finally { wb.close(); await b.close(); fs.rmSync(project, { recursive: true, force: true }); fs.rmSync(pics, { recursive: true, force: true }); }
 });
 
-test('Workbench terminal: a program that takes the mouse scrolls as far for small trackpad moves as for one big one', async () => {
+// Not on Windows: there the console (ConPTY) keeps a program's mouse mode (\e[?1000h) to itself
+// unless the program reads VT input, which node's raw mode doesn't; the terminal never sees it.
+test('Workbench terminal: a program that takes the mouse scrolls as far for small trackpad moves as for one big one', { skip: WIN && 'ConPTY keeps node\'s mouse mode' }, async () => {
   const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-wbt-')));
   // A full-screen program with the mouse on (SGR), counting the wheel's lines.
   fs.writeFileSync(path.join(project, 'wheel.js'), `
@@ -137,8 +155,8 @@ process.stdin.on('data', (d) => {
   const { b, wb } = await workbench(project);
   try {
     const count = async (moves) => {
-      await run(wb, `${JSON.stringify(process.execPath)} wheel.js`);
-      await wb.waitFor(`S.activeTerm.xterm.modes.mouseTrackingMode !== 'none'`, 8000);
+      await run(wb, `${NODE} wheel.js`);
+      await wb.waitFor(`S.activeTerm.xterm.modes.mouseTrackingMode !== 'none'`, 8000, TEXT);
       const at = await wb.eval(`(() => { const r = S.activeTerm.el.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`);
       for (const deltaY of moves) {
         await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: at.x, y: at.y, deltaX: 0, deltaY });
