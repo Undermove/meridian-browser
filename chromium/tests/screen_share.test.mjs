@@ -11,6 +11,7 @@ import { launch, SB } from './harness.mjs';
 const T = 'app.$.tabstrip';
 const CALL = `<!doctype html><title>Call</title><button id=b style="width:200px;height:80px">Share</button><script>
 document.getElementById('b').onclick = async () => {
+  window.clicked = true;
   try {
     const s = await navigator.mediaDevices.getDisplayMedia({ video: true });
     window.shared = s.getVideoTracks()[0].getSettings().displaySurface;
@@ -43,9 +44,13 @@ for (const own of [false, true]) {
       await b.waitFor(`[...${T}.tabs_.values()].find((t) => t.isActive)?.title === 'Call'`);
       const page = await b.page(`${base}/call`);
       await page.waitFor(`document.readyState === 'complete' && !!document.getElementById('b')`);
-      // A click on Share, as a person's (getDisplayMedia needs the gesture).
-      for (const type of ['mousePressed', 'mouseReleased']) {
-        await page.cdp.send('Input.dispatchMouseEvent', { type, x: 100, y: 40, button: 'left', clickCount: 1 });
+      // A click on Share, as a person's (getDisplayMedia needs the gesture). A tab that just came
+      // to the front can still lose the first click (Windows): click until the page has it.
+      for (let i = 0; i < 10 && !(await page.eval('!!window.clicked')); i++) {
+        for (const type of ['mousePressed', 'mouseReleased']) {
+          await page.cdp.send('Input.dispatchMouseEvent', { type, x: 100, y: 40, button: 'left', clickCount: 1 });
+        }
+        await new Promise((res) => setTimeout(res, 300));
       }
       const shared = await page.waitFor(`window.shared`, 10000).catch(() => page.eval(`window.shared || 'nothing yet'`));
       assert.equal(shared, 'browser', 'the Slides tab is shared');

@@ -10,6 +10,7 @@ import { launch } from './harness.mjs';
 const T = 'app.$.tabstrip';
 const PAGE = `<!doctype html><title>Player</title><button id=b>PiP</button><script>
 document.getElementById('b').onclick = async () => {
+  window.clicked = true;
   const w = await documentPictureInPicture.requestWindow({ width: 320, height: 180 });
   // Kontur Talk's way: the page's own header moves the window.
   w.document.head.innerHTML = '<style>html, body { height: 100%; margin: 0; app-region: drag; }</style>';
@@ -39,8 +40,13 @@ for (const own of [false, true]) {
       await page.waitFor(`!!document.getElementById('b')`);
       // A click on the button, as a person's.
       const r = await page.eval(`(() => { const r = document.getElementById('b').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
-      for (const type of ['mousePressed', 'mouseReleased']) {
-        await page.cdp.send('Input.dispatchMouseEvent', { type, x: r.x, y: r.y, button: 'left', clickCount: 1 }).catch(() => {});
+      // A tab of another profile's space can still be getting ready for input when it shows (on
+      // Windows the first click was lost): click until the page has it.
+      for (let i = 0; i < 10 && !(await page.eval('!!window.clicked')); i++) {
+        for (const type of ['mousePressed', 'mouseReleased']) {
+          await page.cdp.send('Input.dispatchMouseEvent', { type, x: r.x, y: r.y, button: 'left', clickCount: 1 }).catch(() => {});
+        }
+        await new Promise((res) => setTimeout(res, 300));
       }
       await page.waitFor(`window.pipOpen === true && documentPictureInPicture.window?.document.body.textContent.startsWith('mini player')`, 8000)
           .catch((e) => { throw new Error(b.proc.exitCode !== null || b.proc.signalCode ? 'the browser crashed' : e.message); });
@@ -51,7 +57,8 @@ for (const own of [false, true]) {
       const floating = async () => (await b.eval(`${T}.handler_.testFloatingWindows()`)).windows;
       await b.waitFor(`${T}.handler_.testFloatingWindows().then((r) => r.windows.some((w) => / page=2/.test(w)))`, 5000).catch(() => {});
       const [w] = await floating();
-      assert.match(w || '', /allSpaces=1 fullScreenSpaces=1/, `on every space: ${w}`);
+      if (process.platform === 'darwin') assert.match(w || '', /allSpaces=1 fullScreenSpaces=1/, `on every space: ${w}`);
+      else assert.match(w || '', /onTop=1/, `over the other windows: ${w}`);
       assert.match(w || '', / page=2/, `the page's draggable header moves the window: ${w}`);
       // A link in it (a call's chat) opens as a tab of this window and space, as in Arc, not in a
       // new window.
