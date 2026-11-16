@@ -82,6 +82,42 @@ test('after a restart ⇧⌘T reopens the tab closed before it, in this window, 
   }
 });
 
+// A crash (or a force quit) is a restart too: Arc's tabs are all there when it opens again, and
+// ⇧⌘T after it is the tab closed before it, not the crashed window as a second window.
+test('after a crash the tabs are back as after a quit, and ⇧⌘T opens no window', async () => {
+  const site = await startServer();
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  let b = await launch([site.url('/p/A'), site.url('/p/B'), site.url('/p/C')], { profile, args: ARGS });
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 3`);
+    await pick(b, 'C');
+    await closeTab(b);
+    await until(async () => (await titles(b)) === 'A,B');
+    await sleep(4000);  // the session is saved (every 2.5 s)
+    // The browser has marked its session as running, so the next launch sees it crashed.
+    const prefs = path.join(profile, 'Default', 'Preferences');
+    const exitType = () => { try { return JSON.parse(fs.readFileSync(prefs, 'utf8')).profile?.exit_type; } catch { return ''; } };
+    await until(async () => exitType() === 'Crashed', 30000);
+    assert.equal(exitType(), 'Crashed');
+    b.proc.kill('SIGKILL');
+    await new Promise((r) => (b.proc.exitCode !== null || b.proc.signalCode !== null ? r() : b.proc.once('exit', r)));
+    await b.close();
+
+    b = await launch([], { profile, args: ARGS });
+    await b.waitFor(`!!${T}?.state_`, 15000);
+    await until(async () => (await titles(b)) === 'A,B', 15000);
+    assert.deepEqual(await now(b), { windows: 1, tabs: 'A,B' }, 'the tabs are back');
+    await reopen(b);
+    assert.deepEqual(await now(b), { windows: 1, tabs: 'A,B,C' }, 'C is back, here');
+    await reopen(b);
+    assert.deepEqual(await now(b), { windows: 1, tabs: 'A,B,C' }, 'no second window');
+  } finally {
+    await b.close();
+    await site.close();
+    fs.rmSync(profile, { recursive: true, force: true });
+  }
+});
+
 test('a Little window closed: ⇧⌘T brings its page back as a tab of the main window', async () => {
   const site = await startServer();
   const b = await launch([site.url('/p/Main')], { args: ARGS });
