@@ -1,0 +1,2656 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 17 Nov 2026 21:59:14 +0400
+Subject: [PATCH 158/158] Meridian: Boost editor, Zap and colour pad as Arc's
+
+The editor is a card at the right of the page: a colour pad with a rim of
+hues and two knobs (the colour, and the page's dark in it), dark or light,
+brightness/contrast/saturation, a font grid (Mac or Windows fonts), size,
+case, Zap, code, Improve with AI. The site's boosts are listed in the site
+controls. Zap offers Zap This or all related elements, and an Undo per zap
+that shows what it brings back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/meridian/agent/agent_service.cc   |   3 +-
+ .../browser/meridian/agent/agent_tools.json   |  20 +
+ .../browser/meridian/boosts/boost_service.cc  |  96 +++-
+ .../browser/meridian/boosts/boost_service.h   |  19 +-
+ .../meridian/boosts/boost_service_unittest.cc |  32 ++
+ .../meridian/boosts/boost_tab_helper.cc       | 266 +++++++--
+ .../meridian/boosts/boost_tab_helper.h        |  11 +-
+ chrome/browser/meridian/sidebar.mojom         |  20 +-
+ chrome/browser/meridian/sidebar_handler.cc    |  28 +-
+ chrome/browser/meridian/sidebar_handler.h     |   5 +-
+ .../browser/resources/webui_browser/BUILD.gn  |   3 +
+ .../resources/webui_browser/app.html.ts       |   2 +
+ chrome/browser/resources/webui_browser/app.ts |   8 +
+ .../webui_browser/meridian/boost_editor.css   | 429 +++++++++++++++
+ .../meridian/boost_editor.html.ts             | 132 +++++
+ .../webui_browser/meridian/boost_editor.ts    | 511 ++++++++++++++++++
+ .../resources/webui_browser/meridian/icons.ts |   5 +-
+ .../webui_browser/meridian/site_control.css   | 216 +-------
+ .../meridian/site_control.html.ts             | 126 ++---
+ .../webui_browser/meridian/site_control.ts    | 173 +-----
+ 20 files changed, 1603 insertions(+), 502 deletions(-)
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/boost_editor.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/boost_editor.ts
+
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index f79cf60331..8d9976c549 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -1738,7 +1738,8 @@ void AgentService::SetBoost(std::unique_ptr<Call> call) {
+                          : base::DictValue().Set("host", host).Set("name",
+                                                                    host);
+             for (const char* key :
+-                 {"css", "js", "zaps", "name", "enabled", "hue", "font"}) {
++                 {"css", "js", "zaps", "name", "enabled", "hue", "font", "tint",
++                  "tint_strength", "dark", "size", "text_case"}) {
+               if (const base::Value* v = call->input.Find(key)) {
+                 value.Set(key, v->Clone());
+               }
+diff --git a/chrome/browser/meridian/agent/agent_tools.json b/chrome/browser/meridian/agent/agent_tools.json
+index fb9ceb5e58..a80844c151 100644
+--- a/chrome/browser/meridian/agent/agent_tools.json
++++ b/chrome/browser/meridian/agent/agent_tools.json
+@@ -633,6 +633,26 @@
+      "type": "string",
+      "description": "A font family for the site's text (\"\": the site's own)."
+     },
++    "tint": {
++     "type": "integer",
++     "description": "A colour over the page: its hue, 0-359 (-1: none)."
++    },
++    "tint_strength": {
++     "type": "integer",
++     "description": "How much of the tint, 0-100."
++    },
++    "dark": {
++     "type": "boolean",
++     "description": "Light pages dark and dark ones light (pictures stay)."
++    },
++    "size": {
++     "type": "integer",
++     "description": "The page's size in percent (100: as it is)."
++    },
++    "text_case": {
++     "type": "string",
++     "description": "\"lower\", \"upper\" or \"\" (the site's)."
++    },
+     "remove": {
+      "type": "boolean",
+      "description": "Delete the site's boost."
+diff --git a/chrome/browser/meridian/boosts/boost_service.cc b/chrome/browser/meridian/boosts/boost_service.cc
+index 1c5927ae5b..27e84b9a3a 100644
+--- a/chrome/browser/meridian/boosts/boost_service.cc
++++ b/chrome/browser/meridian/boosts/boost_service.cc
+@@ -109,7 +109,15 @@ base::DictValue Boost::ToValue() const {
+       .Set("js", js)
+       .Set("zaps", std::move(zap_list))
+       .Set("hue", hue)
+-      .Set("font", font);
++      .Set("font", font)
++      .Set("tint", tint)
++      .Set("tint_strength", tint_strength)
++      .Set("dark", dark)
++      .Set("brightness", brightness)
++      .Set("contrast", contrast)
++      .Set("saturation", saturation)
++      .Set("size", size)
++      .Set("text_case", text_case);
+ }
+ 
+ // static
+@@ -138,6 +146,20 @@ std::optional<Boost> Boost::FromValue(const base::DictValue& value) {
+   }
+   boost.hue = std::clamp(value.FindInt("hue").value_or(0), 0, 359);
+   boost.font = FontName(str("font"));
++  boost.tint = std::clamp(value.FindInt("tint").value_or(-1), -1, 359);
++  boost.tint_strength =
++      std::clamp(value.FindInt("tint_strength").value_or(60), 0, 100);
++  boost.dark = value.FindBool("dark").value_or(false);
++  auto percent = [&](const char* key, int lo, int hi) {
++    return std::clamp(value.FindInt(key).value_or(100), lo, hi);
++  };
++  boost.brightness = percent("brightness", 50, 150);
++  boost.contrast = percent("contrast", 50, 150);
++  boost.saturation = percent("saturation", 0, 200);
++  boost.size = percent("size", 50, 200);
++  std::string text_case = str("text_case");
++  boost.text_case =
++      text_case == "lower" || text_case == "upper" ? text_case : "";
+   return boost;
+ }
+ 
+@@ -147,20 +169,67 @@ std::string Boost::PageCss() const {
+     // A selector that isn't one would drop the rest: each zap on its own.
+     out += "\n" + zap + " { display: none !important; }";
+   }
++  // The page's filter; pictures and video get the dark and the turn undone,
++  // so only the site's own colours change.
++  std::string page_filter, media_filter;
++  if (dark) {
++    page_filter += " invert(1) hue-rotate(180deg)";
++    media_filter += " hue-rotate(180deg) invert(1)";
++  }
+   if (hue) {
+-    // Pictures and video turn back, so only the site's colours change.
+     std::string turn = base::NumberToString(hue);
+-    out += "\nhtml { filter: hue-rotate(" + turn + "deg) !important; }" +
+-           "\nimg, video, picture, canvas, iframe, svg image, "
+-           "[style*=\"background-image\"] { filter: hue-rotate(-" +
+-           turn + "deg) !important; }";
++    page_filter += " hue-rotate(" + turn + "deg)";
++    media_filter = " hue-rotate(-" + turn + "deg)" + media_filter;
++  }
++  auto adjust = [&](const char* name, int percent) {
++    if (percent != 100) {
++      page_filter += std::string(" ") + name + "(" +
++                     base::NumberToString(percent) + "%)";
++    }
++  };
++  adjust("brightness", brightness);
++  adjust("contrast", contrast);
++  adjust("saturate", saturation);
++  if (!page_filter.empty()) {
++    out += "\nhtml { filter:" + page_filter + " !important; }";
++  }
++  if (!media_filter.empty()) {
++    out += "\nimg, video, picture, canvas, iframe, svg image, "
++           "[style*=\"background-image\"] { filter:" +
++           media_filter + " !important; }";
++  }
++  if (tint >= 0 && tint_strength > 0) {
++    // The colour over everything, keeping each part's lightness.
++    out += "\nhtml::after { content: \"\"; position: fixed; inset: 0; "
++           "pointer-events: none; z-index: 2147483647; background: hsl(" +
++           base::NumberToString(tint) +
++           " 85% 50%); mix-blend-mode: color; opacity: " +
++           base::NumberToString(tint_strength / 100.0) + " !important; }";
++    // A little of it on white too, as Arc's tint has.
++    out += "\nhtml::before { content: \"\"; position: fixed; inset: 0; "
++           "pointer-events: none; z-index: 2147483647; background: hsl(" +
++           base::NumberToString(tint) +
++           " 70% 55%); mix-blend-mode: multiply; opacity: " +
++           base::NumberToString(tint_strength / 100.0 * 0.14) +
++           " !important; }";
++  }
++  if (size != 100) {
++    out += "\nbody { zoom: " + base::NumberToString(size) +
++           "% !important; }";
++  }
++  if (!text_case.empty()) {
++    out += "\nbody, body *:not(pre):not(code):not(kbd):not(samp):not("
++           "textarea):not(input) { text-transform: " +
++           std::string(text_case == "lower" ? "lowercase" : "uppercase") +
++           " !important; }";
+   }
+   if (!font.empty()) {
+     // Not code, and not icon fonts (their names are their glyphs).
+     out += "\nbody, body *:not(pre):not(code):not(kbd):not(samp):not(i):not("
+            "[class*=\"icon\"]):not([class*=\"material\"]):not([class*=\"fa-\"]"
+-           ") { font-family: \"" +
+-           font + "\", system-ui, sans-serif !important; }";
++           ") { font-family: " +
++           (font == "system-ui" ? font : "\"" + font + "\"") +
++           ", system-ui, sans-serif !important; }";
+   }
+   return out;
+ }
+@@ -251,6 +320,17 @@ const Boost* BoostService::ForHost(const std::string& host) const {
+   return nullptr;
+ }
+ 
++std::vector<const Boost*> BoostService::AllForHost(
++    const std::string& host) const {
++  std::vector<const Boost*> out;
++  for (const Boost& boost : boosts_) {
++    if (boost.host == host) {
++      out.push_back(&boost);
++    }
++  }
++  return out;
++}
++
+ std::vector<const Boost*> BoostService::ForUrl(const GURL& url) const {
+   std::string host = BoostHostFor(url);
+   std::vector<const Boost*> out;
+diff --git a/chrome/browser/meridian/boosts/boost_service.h b/chrome/browser/meridian/boosts/boost_service.h
+index 6a3759c6c1..a20d94e690 100644
+--- a/chrome/browser/meridian/boosts/boost_service.h
++++ b/chrome/browser/meridian/boosts/boost_service.h
+@@ -42,10 +42,25 @@ struct Boost {
+   std::string js;
+   // CSS selectors of the zapped elements.
+   std::vector<std::string> zaps;
+-  // Degrees the page's colours turn (0: as they are).
++  // Degrees the page's colours turn (0: as they are). Agents and older
++  // boosts; the editor tints instead.
+   int hue = 0;
+   // A font for the page's text ("": the site's).
+   std::string font;
++  // A colour over the page, as Arc's: its hue (-1: none) and how much of it
++  // (0-100).
++  int tint = -1;
++  int tint_strength = 60;
++  // Light pages dark and dark ones light (pictures stay as they are).
++  bool dark = false;
++  // Percent, 100: as the site has them.
++  int brightness = 100;
++  int contrast = 100;
++  int saturation = 100;
++  // The page's size, percent.
++  int size = 100;
++  // The text's case: "", "lower" or "upper".
++  std::string text_case;
+ 
+   base::DictValue ToValue() const;
+   static std::optional<Boost> FromValue(const base::DictValue& value);
+@@ -80,6 +95,8 @@ class BoostService : public KeyedService {
+   const std::vector<Boost>& boosts() const { return boosts_; }
+   // The site's own boost (not the every-site ones), if it has one.
+   const Boost* ForHost(const std::string& host) const;
++  // All of the site's own boosts, on or off.
++  std::vector<const Boost*> AllForHost(const std::string& host) const;
+   // The enabled boosts that apply on `url`, every-site ones first.
+   std::vector<const Boost*> ForUrl(const GURL& url) const;
+   // Adds it, or replaces the one with its id. A new one gets an id. Returns
+diff --git a/chrome/browser/meridian/boosts/boost_service_unittest.cc b/chrome/browser/meridian/boosts/boost_service_unittest.cc
+index 1c9c30cbe2..c0c3733536 100644
+--- a/chrome/browser/meridian/boosts/boost_service_unittest.cc
++++ b/chrome/browser/meridian/boosts/boost_service_unittest.cc
+@@ -68,6 +68,38 @@ TEST(BoostServiceTest, PageCssHasZapsHueAndFont) {
+   EXPECT_EQ(round->font.find_first_of("\";{}"), std::string::npos);
+ }
+ 
++TEST(BoostServiceTest, PageCssHasTintDarkSizeAndCase) {
++  Boost b = Make("example.com", "");
++  b.tint = 30;
++  b.tint_strength = 50;
++  b.dark = true;
++  b.size = 110;
++  b.text_case = "lower";
++  b.contrast = 120;
++  std::string css = b.PageCss();
++  EXPECT_NE(css.find("hsl(30 85% 50%)"), std::string::npos);
++  EXPECT_NE(css.find("opacity: 0.5"), std::string::npos);
++  EXPECT_NE(css.find("invert(1) hue-rotate(180deg) contrast(120%)"),
++            std::string::npos);
++  // Pictures undo the dark.
++  EXPECT_NE(css.find("img, video"), std::string::npos);
++  EXPECT_NE(css.find("zoom: 110%"), std::string::npos);
++  EXPECT_NE(css.find("text-transform: lowercase"), std::string::npos);
++  // Read back as it was; nonsense comes back as the site's.
++  std::optional<Boost> round = Boost::FromValue(b.ToValue());
++  ASSERT_TRUE(round);
++  EXPECT_EQ(round->tint, 30);
++  EXPECT_TRUE(round->dark);
++  base::DictValue odd = b.ToValue();
++  odd.Set("text_case", "sideways");
++  odd.Set("size", 5000);
++  round = Boost::FromValue(odd);
++  EXPECT_EQ(round->text_case, "");
++  EXPECT_EQ(round->size, 200);
++  // Nothing set: no look at all.
++  EXPECT_EQ(Make("example.com", "").PageCss(), "");
++}
++
+ TEST(BoostServiceTest, ImportSkipsSitesWithABoost) {
+   base::test::TaskEnvironment env;
+   BoostService service{base::FilePath()};
+diff --git a/chrome/browser/meridian/boosts/boost_tab_helper.cc b/chrome/browser/meridian/boosts/boost_tab_helper.cc
+index ed0caf93b1..0991ff4d58 100644
+--- a/chrome/browser/meridian/boosts/boost_tab_helper.cc
++++ b/chrome/browser/meridian/boosts/boost_tab_helper.cc
+@@ -44,33 +44,68 @@ constexpr char kApplyCss[] = R"((css) => {
+ // selector for it (in __meridianZap.picked, taken by the browser); Esc ends.
+ constexpr char kZapStart[] = R"((() => {
+   if (window.__meridianZap && !window.__meridianZap.done) return true;
+-  const z = window.__meridianZap = { picked: [], done: false };
+-  const box = document.createElement('div');
+-  box.id = 'meridian-zap-box';
+-  box.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;' +
+-      'border:2px solid #ff3b30;background:rgba(255,59,48,.15);border-radius:4px;' +
+-      'transition:all .06s;display:none';
+-  const hint = document.createElement('div');
+-  hint.id = 'meridian-zap-hint';
+-  hint.textContent = 'Click what to zap · Esc when done';
+-  hint.style.cssText = 'position:fixed;z-index:2147483647;left:50%;top:12px;' +
+-      'transform:translateX(-50%);pointer-events:none;padding:6px 12px;' +
+-      'border-radius:8px;background:#1c1c1e;color:#fff;font:600 13px system-ui';
+-  document.documentElement.append(box, hint);
+-  const ours = (el) => el === box || el === hint;
++  // The boost's zaps so far (set just before this runs), then this time's.
++  const zaps = [...(window.__meridianZapZaps || [])];
++  const z = window.__meridianZap = { picked: [], removed: [], done: false };
++  const host = document.createElement('div');
++  host.id = 'meridian-zap';
++  host.style.cssText = 'all:initial;position:fixed;inset:0;z-index:2147483647;pointer-events:none';
++  const root = host.attachShadow({ mode: 'open' });
++  root.innerHTML = `<style>
++    * { box-sizing: border-box; font: 500 13px system-ui, sans-serif; }
++    .box { position: fixed; pointer-events: none; border: 2px solid #ff3b30;
++      background: rgba(255,59,48,.14); border-radius: 4px; display: none; }
++    .bar { position: fixed; bottom: 16px; display: flex; gap: 6px; align-items: center;
++      pointer-events: auto; padding: 6px; border-radius: 14px; background: #1c1c1e;
++      color: #fff; box-shadow: 0 8px 30px rgba(0,0,0,.3); }
++    .left { left: 16px; max-width: calc(100vw - 160px); overflow-x: auto; }
++    .right { right: 16px; }
++    .tip { padding: 0 8px; opacity: .8; white-space: nowrap; }
++    button { all: unset; cursor: pointer; }
++    .undo { width: 30px; height: 30px; flex: none; display: grid; place-items: center;
++      border-radius: 9px; background: rgba(255,255,255,.12); font: 700 15px system-ui; }
++    .undo:hover { background: #ff3b30; }
++    .done { padding: 7px 14px; border-radius: 9px; background: #fff; color: #1c1c1e; font-weight: 650; }
++    .pick { position: fixed; pointer-events: auto; width: 230px; padding: 8px; border-radius: 14px;
++      background: #1c1c1e; color: #fff; box-shadow: 0 10px 34px rgba(0,0,0,.35);
++      display: none; flex-direction: column; gap: 8px; }
++    .pick .row { display: flex; align-items: center; gap: 8px; }
++    .zap-this, .zap-related { padding: 7px 10px; border-radius: 9px; background: #ff3b30;
++      font-weight: 650; text-align: center; }
++    .zap-related { background: rgba(255,59,48,.85); }
++    .pick label { font-size: 12px; opacity: .8; }
++    .related { width: 100%; accent-color: #ff3b30; }
++    .marks { position: fixed; inset: 0; pointer-events: none; }
++    .mark { position: fixed; border: 2px dashed #ff3b30; background: rgba(255,59,48,.18); border-radius: 3px; }
++  </style>
++  <div class="marks"></div><div class="box"></div>
++  <div class="bar left"><span class="tip">Click what to zap</span></div>
++  <div class="bar right"><button class="done">Done</button></div>
++  <div class="pick">
++    <button class="zap-this">Zap This</button>
++    <label>Zap all related elements</label>
++    <input class="related" type="range" min="0" value="0">
++    <button class="zap-related"></button>
++  </div>`;
++  document.documentElement.append(host);
++  const $ = (s) => root.querySelector(s);
++  const box = $('.box'), marks = $('.marks'), left = $('.left'), tip = $('.tip'), pick = $('.pick');
++  const related = $('.related');
++  const preview = document.createElement('style');
++  preview.id = 'meridian-zap-preview';
++  const ours = (e) => e.composedPath().includes(host);
+   const at = (e) => {
+     const el = document.elementFromPoint(e.clientX, e.clientY);
+-    return el && !ours(el) && el !== document.documentElement &&
+-        el !== document.body ? el : null;
++    return el && el !== host && el !== document.documentElement && el !== document.body ? el : null;
+   };
+   const esc = (s) => CSS.escape(s);
+-  const unique = (sel) => { try { return document.querySelectorAll(sel).length === 1; } catch { return false; } };
++  const count = (sel) => { try { return document.querySelectorAll(sel).length; } catch { return 0; } };
+   // Generated class names (hashes) change with the site's next build.
+   const stable = (c) => c && !/\d{3}|[_-][a-zA-Z0-9]{5,}$|^css-|^sc-|^jsx-/.test(c);
+   const selectorOf = (el) => {
+     const parts = [];
+     for (let n = el; n && n !== document.documentElement; n = n.parentElement) {
+-      if (n.id && stable(n.id) && unique('#' + esc(n.id))) {
++      if (n.id && stable(n.id) && count('#' + esc(n.id)) === 1) {
+         parts.unshift('#' + esc(n.id));
+         break;
+       }
+@@ -79,36 +114,162 @@ constexpr char kZapStart[] = R"((() => {
+       if (classes.length) part += classes.map((c) => '.' + esc(c)).join('');
+       const same = n.parentElement ?
+           [...n.parentElement.children].filter((c) => c.localName === n.localName) : [];
+-      if (same.length > 1 && !classes.length) {
++      // Siblings that look the same: which one.
++      const twins = same.filter((c) => [...n.classList].filter(stable).slice(0, 2)
++          .every((k) => c.classList.contains(k)));
++      if (twins.length > 1) {
+         part += ':nth-of-type(' + (same.indexOf(n) + 1) + ')';
+       }
+       parts.unshift(part);
+-      if (unique(parts.join(' > '))) break;
++      if (count(parts.join(' > ')) === 1) break;
+     }
+     return parts.join(' > ');
+   };
++  // Wider and wider: the element's kind with its classes, with one, its
++  // siblings of the kind, and their cousins; each counted, fewest first.
++  const relatedOf = (el) => {
++    const out = [];
++    const classes = [...el.classList].filter(stable).map((c) => '.' + esc(c));
++    const tries = [];
++    if (classes.length > 1) tries.push(el.localName + classes.slice(0, 2).join(''));
++    for (const c of classes.slice(0, 2)) tries.push(el.localName + c);
++    const parent = el.parentElement;
++    if (parent && parent !== document.body) {
++      const ps = selectorOf(parent);
++      tries.push(ps + ' > ' + el.localName + (classes[0] || ''));
++      if (parent.parentElement && parent.parentElement !== document.body) {
++        tries.push(selectorOf(parent.parentElement) + ' > ' + parent.localName + ' > ' + el.localName);
++      }
++    }
++    const seen = new Set([1]);
++    for (const sel of tries) {
++      const n = count(sel);
++      if (n > 1 && n < 400 && !seen.has(n)) { seen.add(n); out.push({ sel, n }); }
++    }
++    return out.sort((a, b) => a.n - b.n);
++  };
++  const markAll = (sel) => {
++    marks.replaceChildren();
++    if (!sel) return;
++    let shown = 0;
++    for (const el of document.querySelectorAll(sel)) {
++      const r = el.getBoundingClientRect();
++      if (!r.width || shown++ > 200) continue;
++      const m = document.createElement('div');
++      m.className = 'mark';
++      Object.assign(m.style, { left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px' });
++      marks.append(m);
++    }
++  };
++  // Hidden at once (the boost's style follows): what was hidden here comes
++  // back on Undo.
++  const hidden = new Map();
++  const hide = (sel) => {
++    const els = [...document.querySelectorAll(sel)];
++    for (const el of els) el.style.setProperty('display', 'none', 'important');
++    hidden.set(sel, els);
++  };
++  const unhide = (sel) => {
++    for (const el of hidden.get(sel) || []) el.style.removeProperty('display');
++    hidden.delete(sel);
++  };
++  // A zap's elements shown for a moment, marked, while the pointer is on its
++  // Undo.
++  const peek = (sel) => {
++    if (!sel) { preview.remove(); for (const [s, els] of hidden) for (const el of els) el.style.setProperty('display', 'none', 'important'); return; }
++    for (const el of hidden.get(sel) || []) el.style.removeProperty('display');
++    preview.textContent = 'html ' + sel + ' { display: revert !important; outline: 2px dashed #ff3b30 !important; outline-offset: -2px; background-color: rgba(255,59,48,.15) !important; }';
++    document.documentElement.append(preview);
++  };
++  const drawUndo = () => {
++    left.querySelectorAll('.undo').forEach((b) => b.remove());
++    tip.textContent = zaps.length ? '' : 'Click what to zap';
++    tip.style.display = zaps.length ? 'none' : '';
++    zaps.forEach((sel, i) => {
++      const b = document.createElement('button');
++      b.className = 'undo';
++      b.textContent = '\\';
++      b.title = 'Show again: ' + sel;
++      b.dataset.index = i;
++      b.addEventListener('mouseenter', () => peek(sel));
++      b.addEventListener('mouseleave', () => peek(null));
++      b.addEventListener('click', () => {
++        peek(null);
++        unhide(sel);
++        zaps.splice(zaps.indexOf(sel), 1);
++        const p = z.picked.indexOf(sel);
++        if (p >= 0) z.picked.splice(p, 1); else z.removed.push(sel);
++        drawUndo();
++      });
++      left.append(b);
++    });
++  };
++  drawUndo();
++  let target = null, options = [];
++  const closePick = () => { pick.style.display = 'none'; target = null; markAll(null); };
++  const zap = (sel) => {
++    if (!sel || zaps.includes(sel)) { closePick(); return; }
++    hide(sel);
++    zaps.push(sel);
++    z.picked.push(sel);
++    closePick();
++    drawUndo();
++  };
++  const showRelated = () => {
++    const o = options[Number(related.value)];
++    $('.zap-related').textContent = o ? 'Zap ' + o.n + ' elements' : '';
++    markAll(o ? o.sel : null);
++  };
++  related.addEventListener('input', showRelated);
++  // The one picked is marked; the related ones while the slider or their
++  // button is under the pointer.
++  const markThis = () => markAll(target && selectorOf(target));
++  related.addEventListener('change', markThis);
++  $('.zap-related').addEventListener('mouseenter', showRelated);
++  $('.zap-related').addEventListener('mouseleave', markThis);
++  $('.zap-this').addEventListener('click', () => zap(target && selectorOf(target)));
++  $('.zap-related').addEventListener('click', () => { const o = options[Number(related.value)]; zap(o && o.sel); });
++  $('.done').addEventListener('click', () => end());
+   const move = (e) => {
++    if (ours(e) || target) return;
+     const el = at(e);
+     if (!el) { box.style.display = 'none'; return; }
+     const r = el.getBoundingClientRect();
+     Object.assign(box.style, { display: 'block', left: r.left + 'px', top: r.top + 'px',
+         width: r.width + 'px', height: r.height + 'px' });
+   };
+-  const stop = (e) => { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); };
++  const stop = (e) => { if (ours(e)) return; e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); };
+   const click = (e) => {
++    if (ours(e)) return;
+     stop(e);
++    if (target) { closePick(); return; }
+     const el = at(e);
+     if (!el) return;
+-    const sel = selectorOf(el);
+-    el.style.setProperty('display', 'none', 'important');
++    target = el;
+     box.style.display = 'none';
+-    if (sel) z.picked.push(sel);
++    markAll(selectorOf(el));
++    options = relatedOf(el);
++    related.max = Math.max(0, options.length - 1);
++    related.value = 0;
++    related.parentElement.querySelectorAll('label, .related, .zap-related').forEach((n) => n.style.display = options.length ? '' : 'none');
++    showRelated();
++    markAll(selectorOf(el));
++    pick.style.display = 'flex';
++    // Left of the click near the right edge, clear of the Boost editor.
++    const x = e.clientX + 258 > innerWidth - 290 ? Math.max(8, e.clientX - 246) : e.clientX + 12;
++    const y = Math.min(innerHeight - pick.offsetHeight - 70, Math.max(8, e.clientY + 12));
++    Object.assign(pick.style, { left: x + 'px', top: y + 'px' });
++  };
++  const key = (e) => {
++    if (e.key !== 'Escape') return;
++    stop(e);
++    if (target) closePick(); else end();
+   };
+-  const key = (e) => { if (e.key === 'Escape') { stop(e); end(); } };
+   const opts = { capture: true };
+   const end = () => {
+     z.done = true;
+-    box.remove(); hint.remove();
++    peek(null);
++    host.remove();
+     removeEventListener('mousemove', move, opts);
+     removeEventListener('click', click, opts);
+     for (const t of ['mousedown', 'mouseup', 'pointerdown', 'pointerup']) removeEventListener(t, stop, opts);
+@@ -123,8 +284,8 @@ constexpr char kZapStart[] = R"((() => {
+ 
+ constexpr char kZapPoll[] = R"((() => {
+   const z = window.__meridianZap;
+-  if (!z) return { done: true, picked: [] };
+-  return { done: z.done, picked: z.picked.splice(0) };
++  if (!z) return { done: true, picked: [], removed: [] };
++  return { done: z.done, picked: z.picked.splice(0), removed: z.removed.splice(0) };
+ })())";
+ 
+ // The page as an AI can restyle it: its elements (tag#id.classes, role,
+@@ -287,11 +448,36 @@ void BoostTabHelper::OnBoostServiceShutdown() {
+   observation_.Reset();
+ }
+ 
+-void BoostTabHelper::StartZap() {
++const Boost* BoostTabHelper::Target(BoostService* s,
++                                    const std::string& host) const {
++  for (const Boost* boost : s->AllForHost(host)) {
++    if (boost->id == target_id_) {
++      return boost;
++    }
++  }
++  return s->ForHost(host);
++}
++
++void BoostTabHelper::StartZap(const std::string& boost_id) {
++  target_id_ = boost_id;
+   content::RenderFrameHost* frame = web_contents()->GetPrimaryMainFrame();
+   if (BoostHostFor(frame->GetLastCommittedURL()).empty()) {
+     return;
+   }
++  // The boost's zaps so far, each with its Undo.
++  base::ListValue zaps;
++  BoostService* s = service();
++  if (const Boost* boost =
++          s ? Target(s, BoostHostFor(frame->GetLastCommittedURL()))
++            : nullptr) {
++    for (const std::string& zap : boost->zaps) {
++      zaps.Append(zap);
++    }
++  }
++  RunInFrame(frame,
++             "window.__meridianZapZaps = " +
++                 base::WriteJson(zaps).value_or("[]") + ";",
++             base::NullCallback());
+   RunInFrame(frame, kZapStart, base::NullCallback());
+   zap_timer_.Start(FROM_HERE, base::Milliseconds(250), this,
+                    &BoostTabHelper::PollZap);
+@@ -308,11 +494,22 @@ void BoostTabHelper::OnZapPicked(base::Value result) {
+     return;
+   }
+   const base::ListValue* picked = result.GetDict().FindList("picked");
++  const base::ListValue* removed = result.GetDict().FindList("removed");
+   BoostService* s = service();
+   std::string host =
+       BoostHostFor(web_contents()->GetPrimaryMainFrame()->GetLastCommittedURL());
++  // Undone in the page: out of the boost.
++  if (removed && !removed->empty() && s && !host.empty()) {
++    if (const Boost* existing = Target(s, host)) {
++      Boost boost = *existing;
++      std::erase_if(boost.zaps, [&](const std::string& zap) {
++        return std::ranges::contains(*removed, base::Value(zap));
++      });
++      s->Set(std::move(boost));
++    }
++  }
+   if (picked && !picked->empty() && s && !host.empty()) {
+-    const Boost* existing = s->ForHost(host);
++    const Boost* existing = Target(s, host);
+     Boost boost = existing ? *existing : Boost();
+     if (!existing) {
+       boost.host = host;
+@@ -332,8 +529,10 @@ void BoostTabHelper::OnZapPicked(base::Value result) {
+ }
+ 
+ void BoostTabHelper::Improve(
++    const std::string& boost_id,
+     const std::string& wish,
+     base::OnceCallback<void(std::string, std::string)> done) {
++  target_id_ = boost_id;
+   content::RenderFrameHost* frame = web_contents()->GetPrimaryMainFrame();
+   if (BoostHostFor(frame->GetLastCommittedURL()).empty()) {
+     std::move(done).Run("Only websites can be boosted.", std::string());
+@@ -364,7 +563,7 @@ void BoostTabHelper::OnOutline(
+   }
+   GURL url = web_contents()->GetPrimaryMainFrame()->GetLastCommittedURL();
+   std::string host = BoostHostFor(url);
+-  const Boost* existing = s->ForHost(host);
++  const Boost* existing = Target(s, host);
+   std::string text =
+       "<site host=\"" + host + "\" url=\"" + url.spec().substr(0, 300) +
+       "\">\n" + base::UTF16ToUTF8(web_contents()->GetTitle()).substr(0, 200) +
+@@ -439,13 +638,14 @@ void BoostTabHelper::OnOutline(
+               return;
+             }
+             BoostService* s = self->service();
+-            const Boost* existing = s->ForHost(host);
++            const Boost* existing = self->Target(s, host);
+             Boost boost = existing ? *existing : Boost();
+             boost.host = host;
+             boost.enabled = true;
+             boost.css = *css;
+             const std::string* name = json->FindString("name");
+-            if (boost.name.empty() || boost.name == host) {
++            if (boost.name.empty() || boost.name == host ||
++                boost.name == "My Boost") {
+               boost.name = name && !name->empty() ? name->substr(0, 60) : host;
+             }
+             s->Set(std::move(boost));
+diff --git a/chrome/browser/meridian/boosts/boost_tab_helper.h b/chrome/browser/meridian/boosts/boost_tab_helper.h
+index 80b4d1d020..3f02c97b3e 100644
+--- a/chrome/browser/meridian/boosts/boost_tab_helper.h
++++ b/chrome/browser/meridian/boosts/boost_tab_helper.h
+@@ -33,13 +33,16 @@ class BoostTabHelper : public content::WebContentsObserver,
+   // Zap: the person clicks the things to hide (the one under the pointer is
+   // outlined), Esc or the page's next load ends it. Each one clicked goes
+   // into the site's boost (one is made if the site has none).
+-  void StartZap();
++  // `boost_id`: the boost the zaps go into ("" or gone: the site's first,
++  // or a new one).
++  void StartZap(const std::string& boost_id = std::string());
+   bool zapping() const { return zap_timer_.IsRunning(); }
+ 
+   // Improve with AI: the page's outline goes to the AI picked in Settings >
+   // AI with `wish` (or "a calmer page"); its CSS becomes the site's boost.
+   // `done`: an error, or what changed in a sentence.
+-  void Improve(const std::string& wish,
++  void Improve(const std::string& boost_id,
++               const std::string& wish,
+                base::OnceCallback<void(std::string error, std::string summary)>
+                    done);
+ 
+@@ -57,6 +60,9 @@ class BoostTabHelper : public content::WebContentsObserver,
+   void OnBoostServiceShutdown() override;
+ 
+   BoostService* service();
++  // The boost Zap and Improve change: the one asked for, else the site's
++  // first (nullptr: none yet).
++  const Boost* Target(BoostService* s, const std::string& host) const;
+   void ApplyCss();
+   void PollZap();
+   void OnZapPicked(base::Value result);
+@@ -67,6 +73,7 @@ class BoostTabHelper : public content::WebContentsObserver,
+   base::ScopedObservation<BoostService, BoostService::Observer> observation_{
+       this};
+   base::RepeatingTimer zap_timer_;
++  std::string target_id_;
+   base::WeakPtrFactory<BoostTabHelper> weak_factory_{this};
+ 
+   WEB_CONTENTS_USER_DATA_KEY_DECL();
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 5deab2e444..323cccbdad 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -291,13 +291,28 @@ struct Boost {
+   // Degrees the site's colours turn (0: none).
+   int32 hue;
+   string font;
++  // A colour over the page (its hue, -1: none) and how much (0-100).
++  int32 tint;
++  int32 tint_strength;
++  // Light pages dark, dark ones light.
++  bool dark;
++  // Percent; 100: the site's.
++  int32 brightness;
++  int32 contrast;
++  int32 saturation;
++  int32 size;
++  // "", "lower" or "upper".
++  string text_case;
+ };
+ 
+ // The active tab's site as the Boost panel shows it.
+ struct BoostState {
+   // "" when the page can't be boosted (not a website).
+   string host;
++  // The site's first boost (the one agents and Improve work on).
+   Boost? boost;
++  // All of the site's boosts, on and off.
++  array<Boost> boosts;
+   // Who Improve asks ("Claude", "Codex"…; "" when no AI is set up).
+   string ai_label;
+   // Zap is on in the tab (the person is picking things to hide).
+@@ -606,8 +621,9 @@ interface SidebarHandler {
+   GetBoosts() => (array<Boost> boosts);
+   SetBoost(Boost boost) => (string id);
+   DeleteBoost(string id);
+-  StartZap();
+-  ImproveBoost(string wish) => (string error, string summary);
++  StartZap(string boost_id);
++  ImproveBoost(string boost_id, string wish) =>
++      (string error, string summary);
+ 
+   // macOS: hides the window's traffic lights while the sidebar is hidden (they
+   // come back with it), like Arc.
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 1b64130240..0f06b8bfd2 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -2954,6 +2954,14 @@ mojom::BoostPtr ToMojom(const Boost& b) {
+   m->zaps = b.zaps;
+   m->hue = b.hue;
+   m->font = b.font;
++  m->tint = b.tint;
++  m->tint_strength = b.tint_strength;
++  m->dark = b.dark;
++  m->brightness = b.brightness;
++  m->contrast = b.contrast;
++  m->saturation = b.saturation;
++  m->size = b.size;
++  m->text_case = b.text_case;
+   return m;
+ }
+ 
+@@ -2970,6 +2978,9 @@ void SidebarHandler::GetBoost(GetBoostCallback callback) {
+     if (const Boost* b = service->ForHost(state->host)) {
+       state->boost = ToMojom(*b);
+     }
++    for (const Boost* b : service->AllForHost(state->host)) {
++      state->boosts.push_back(ToMojom(*b));
++    }
+     if (BoostTabHelper* helper = BoostTabHelper::FromWebContents(contents)) {
+       state->zapping = helper->zapping();
+     }
+@@ -3010,6 +3021,14 @@ void SidebarHandler::SetBoost(mojom::BoostPtr boost,
+   value.Set("zaps", std::move(zaps));
+   value.Set("hue", boost->hue);
+   value.Set("font", boost->font);
++  value.Set("tint", boost->tint);
++  value.Set("tint_strength", boost->tint_strength);
++  value.Set("dark", boost->dark);
++  value.Set("brightness", boost->brightness);
++  value.Set("contrast", boost->contrast);
++  value.Set("saturation", boost->saturation);
++  value.Set("size", boost->size);
++  value.Set("text_case", boost->text_case);
+   std::optional<Boost> b = Boost::FromValue(value);
+   if (!service || !b) {
+     std::move(callback).Run(std::string());
+@@ -3025,16 +3044,17 @@ void SidebarHandler::DeleteBoost(const std::string& id) {
+   }
+ }
+ 
+-void SidebarHandler::StartZap() {
++void SidebarHandler::StartZap(const std::string& boost_id) {
+   if (content::WebContents* contents = model()->GetActiveWebContents()) {
+     if (BoostTabHelper* helper = BoostTabHelper::FromWebContents(contents)) {
+       contents->Focus();
+-      helper->StartZap();
++      helper->StartZap(boost_id);
+     }
+   }
+ }
+ 
+-void SidebarHandler::ImproveBoost(const std::string& wish,
++void SidebarHandler::ImproveBoost(const std::string& boost_id,
++                                  const std::string& wish,
+                                   ImproveBoostCallback callback) {
+   content::WebContents* contents = model()->GetActiveWebContents();
+   BoostTabHelper* helper =
+@@ -3044,7 +3064,7 @@ void SidebarHandler::ImproveBoost(const std::string& wish,
+     return;
+   }
+   helper->Improve(
+-      wish.substr(0, 2000),
++      boost_id, wish.substr(0, 2000),
+       base::BindOnce(
+           [](ImproveBoostCallback callback, std::string error,
+              std::string summary) { std::move(callback).Run(error, summary); },
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index fa86b7b70d..70ea7d7b7d 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -163,8 +163,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void GetBoosts(GetBoostsCallback callback) override;
+   void SetBoost(mojom::BoostPtr boost, SetBoostCallback callback) override;
+   void DeleteBoost(const std::string& id) override;
+-  void StartZap() override;
+-  void ImproveBoost(const std::string& wish,
++  void StartZap(const std::string& boost_id) override;
++  void ImproveBoost(const std::string& boost_id,
++                    const std::string& wish,
+                     ImproveBoostCallback callback) override;
+   void SetWindowControlsVisible(bool visible) override;
+   void TestCommand(int32_t command_id) override;
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index 362d20b7c5..eea197b1e9 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -41,6 +41,8 @@ build_webui("build") {
+     "meridian/member_card.ts",
+     "meridian/site_control.html.ts",
+     "meridian/site_control.ts",
++    "meridian/boost_editor.html.ts",
++    "meridian/boost_editor.ts",
+     "meridian/chat.html.ts",
+     "meridian/chat.ts",
+     "meridian/mission.html.ts",
+@@ -103,6 +105,7 @@ build_webui("build") {
+     "meridian/menu.css",
+     "meridian/member_card.css",
+     "meridian/site_control.css",
++    "meridian/boost_editor.css",
+     "meridian/chat.css",
+     "meridian/mission.css",
+     "meridian/command_bar.css",
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index ae1d3f3f58..485da425f9 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -110,6 +110,8 @@ export function getHtml(this: WebuiBrowserAppElement) {
+       <webui-browser-extensions-bar id="extensionsBar" slot="extensions">
+       </webui-browser-extensions-bar>
+     </meridian-site-control>
++    <meridian-boost-editor id="boostEditor" .url="${this.url_}">
++    </meridian-boost-editor>
+     <meridian-sidebar id="tabstrip" ?private="${this.private_}"
+         @tab-added="${this.onTabAdded_}"
+         @tab-closed="${this.onTabClosed_}" @tab-updated="${this.onTabUpdated_}"
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 5d240235a2..e40cac77b3 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -23,6 +23,7 @@ import './meridian/tidy.js';
+ import './meridian/chat.js';
+ import './meridian/mission.js';
+ import './meridian/site_control.js';
++import './meridian/boost_editor.js';
+ import 'chrome://resources/cr_elements/cr_button/cr_button.js';
+ import 'chrome://resources/cr_elements/cr_icon_button/cr_icon_button.js';
+ import 'chrome://resources/cr_elements/cr_icon/cr_icon.js';
+@@ -53,6 +54,7 @@ import type {MeridianSettingsElement} from './meridian/settings.js';
+ import type {SectionId} from './meridian/settings.js';
+ import type {MeridianThemeEditorElement} from './meridian/theme_editor.js';
+ import type {MeridianSidebarElement} from './meridian/sidebar.js';
++import type {MeridianBoostEditorElement} from './meridian/boost_editor.js';
+ import type {MeridianSiteControlElement} from './meridian/site_control.js';
+ import type {IconName} from './meridian/icons.js';
+ import {Command} from './sidebar.mojom-webui.js';
+@@ -136,6 +138,7 @@ export interface WebuiBrowserAppElement {
+     forwardButton: HTMLElement,
+     locationIconButton: HTMLElement,
+     siteControl: MeridianSiteControlElement,
++    boostEditor: MeridianBoostEditorElement,
+     contentRegion: ContentRegionElement,
+     sidePanel: SidePanelElement,
+     tabstrip: MeridianSidebarElement,
+@@ -1082,6 +1085,11 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       case 'arc-extensions':
+         this.$.settings.show(this.$.tabstrip.spaces(), 'member');
+         break;
++      default:
++        // "boost:<id>": that boost in the editor ("boost:": a new one).
++        if (e.detail.startsWith('boost:')) {
++          this.$.boostEditor.show(e.detail.slice('boost:'.length));
++        }
+     }
+   }
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/boost_editor.css b/chrome/browser/resources/webui_browser/meridian/boost_editor.css
+new file mode 100644
+index 0000000000..5ac25d03d4
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/boost_editor.css
+@@ -0,0 +1,429 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #scheme=relative
++ * #css_wrapper_metadata_end */
++
++:host {
++  position: fixed;
++  top: 18px;
++  right: 18px;
++  z-index: 94;
++  display: none;
++  color: var(--meridian-text);
++  font-size: 13px;
++}
++
++:host([open]) {
++  display: block;
++}
++
++button {
++  border: 0;
++  background: none;
++  font: inherit;
++  color: inherit;
++  padding: 0;
++  cursor: pointer;
++  text-align: left;
++}
++
++button:disabled {
++  cursor: default;
++  opacity: 0.55;
++}
++
++svg {
++  display: block;
++}
++
++#card {
++  width: 252px;
++  max-height: calc(100vh - 36px);
++  overflow-y: auto;
++  padding: 10px;
++  box-sizing: border-box;
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++  border-radius: 16px;
++  background: color-mix(in srgb, var(--meridian-surface) 97%, var(--meridian-space));
++  backdrop-filter: blur(24px) saturate(1.6);
++  box-shadow: 0 0 0 0.5px var(--meridian-border),
++      0 16px 48px rgba(0, 0, 0, 0.22), 0 2px 8px rgba(0, 0, 0, 0.08);
++  animation: slide 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
++  user-select: none;
++}
++
++@keyframes slide {
++  from {
++    opacity: 0;
++    transform: translateX(12px);
++  }
++}
++
++.head {
++  display: flex;
++  align-items: center;
++  gap: 4px;
++}
++
++.ic {
++  width: 26px;
++  height: 26px;
++  flex: none;
++  display: grid;
++  place-items: center;
++  border-radius: 8px;
++  color: var(--meridian-text-muted);
++}
++
++.ic:hover {
++  background: color-mix(in srgb, var(--meridian-text) 8%, transparent);
++  color: var(--meridian-text);
++}
++
++.name {
++  flex: 1;
++  min-width: 0;
++  border: 0;
++  border-radius: 7px;
++  padding: 4px 6px;
++  background: none;
++  color: inherit;
++  font: inherit;
++  font-weight: 650;
++  text-align: center;
++  outline: none;
++}
++
++.name:hover,
++.name:focus {
++  background: color-mix(in srgb, var(--meridian-text) 7%, transparent);
++}
++
++.bswitch {
++  display: flex;
++  flex: none;
++  padding: 4px;
++}
++
++.switch {
++  position: relative;
++  width: 30px;
++  height: 18px;
++  border-radius: 9px;
++  background: color-mix(in srgb, var(--meridian-text) 18%, transparent);
++  transition: background 0.15s;
++}
++
++.switch i {
++  position: absolute;
++  top: 2px;
++  left: 2px;
++  width: 14px;
++  height: 14px;
++  border-radius: 50%;
++  background: white;
++  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
++  transition: transform 0.15s;
++}
++
++.bswitch.on .switch {
++  background: var(--meridian-space);
++}
++
++.bswitch.on .switch i {
++  transform: translateX(12px);
++}
++
++/* As Arc's: a rim of the hues (red at the top, clockwise) around a dotted
++ * field, tinted where the knob is. */
++.pad {
++  position: relative;
++  aspect-ratio: 1 / 0.92;
++  padding: 6px;
++  box-sizing: border-box;
++  border-radius: 20px;
++  background: conic-gradient(hsl(0 90% 62%), hsl(45 95% 58%),
++      hsl(90 80% 52%), hsl(150 75% 50%), hsl(195 85% 55%),
++      hsl(240 85% 64%), hsl(285 80% 62%), hsl(330 85% 62%), hsl(360 90% 62%));
++  cursor: pointer;
++  touch-action: none;
++}
++
++.field {
++  position: relative;
++  height: 100%;
++  border-radius: 14px;
++  background:
++      radial-gradient(circle,
++          color-mix(in srgb, var(--meridian-text) 16%, transparent) 0.9px,
++          transparent 1.3px) 0 0 / 11px 11px,
++      var(--wash, none),
++      var(--meridian-surface);
++  box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.08);
++}
++
++.knob {
++  position: absolute;
++  width: 32px;
++  height: 32px;
++  margin: -16px 0 0 -16px;
++  border-radius: 50%;
++  border: 3px solid white;
++  box-sizing: border-box;
++  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 0.5px rgba(0, 0, 0, 0.12);
++  pointer-events: none;
++  transition: left 0.45s cubic-bezier(0.3, 1.35, 0.5, 1),
++      top 0.45s cubic-bezier(0.3, 1.35, 0.5, 1),
++      background 0.3s, opacity 0.3s, transform 0.15s;
++}
++
++.knob.shade {
++  width: 18px;
++  height: 18px;
++  margin: -9px 0 0 -9px;
++  border-width: 2px;
++  transition-duration: 0.6s, 0.6s, 0.3s, 0.3s, 0.15s;
++}
++
++.pad.drag .knob {
++  transition: background 0.1s, transform 0.15s;
++}
++
++.pad.drag #knob {
++  transform: scale(1.12);
++}
++
++.tiles {
++  display: grid;
++  grid-template-columns: repeat(3, 1fr);
++  gap: 6px;
++}
++
++.tile {
++  height: 40px;
++  display: grid;
++  place-items: center;
++  border-radius: 10px;
++  background: color-mix(in srgb, var(--meridian-text) 7%, transparent);
++}
++
++.tile:hover {
++  background: color-mix(in srgb, var(--meridian-text) 11%, transparent);
++}
++
++.tile.on {
++  background: var(--meridian-space);
++  color: white;
++}
++
++.adjust {
++  display: flex;
++  flex-direction: column;
++  gap: 4px;
++  padding: 2px 4px;
++  font-size: 12px;
++  color: var(--meridian-text-muted);
++}
++
++.adjust label {
++  display: grid;
++  grid-template-columns: 74px 1fr;
++  align-items: center;
++}
++
++.adjust input {
++  width: 100%;
++  accent-color: var(--meridian-space);
++}
++
++.fonts {
++  display: grid;
++  grid-template-columns: repeat(5, 1fr);
++  gap: 2px;
++  padding: 6px;
++  border-radius: 12px;
++  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--meridian-text) 9%, transparent);
++}
++
++.font {
++  height: 32px;
++  border-radius: 8px;
++  text-align: center;
++  font-size: 15px;
++  color: var(--meridian-text-muted);
++}
++
++.font:hover {
++  background: color-mix(in srgb, var(--meridian-text) 7%, transparent);
++  color: var(--meridian-text);
++}
++
++.font.on {
++  background: color-mix(in srgb, var(--meridian-space) 22%, transparent);
++  color: var(--meridian-text);
++}
++
++.pair {
++  display: grid;
++  grid-template-columns: 1fr 1fr;
++  gap: 6px;
++}
++
++.tile.wide {
++  display: flex;
++  justify-content: center;
++  gap: 6px;
++  font-weight: 600;
++}
++
++.val {
++  font-weight: 500;
++  opacity: 0.75;
++}
++
++.line {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  height: 40px;
++  padding: 0 12px;
++  border-radius: 10px;
++  background: color-mix(in srgb, var(--meridian-text) 7%, transparent);
++  font-weight: 600;
++}
++
++.line:hover {
++  background: color-mix(in srgb, var(--meridian-text) 11%, transparent);
++}
++
++.line.on {
++  box-shadow: inset 0 0 0 1.5px var(--meridian-space);
++}
++
++.grow {
++  flex: 1;
++}
++
++.count {
++  font-weight: 500;
++  color: var(--meridian-text-muted);
++}
++
++.zap {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  margin-top: -4px;
++  padding: 2px 4px 2px 12px;
++  font: 11px ui-monospace, Menlo, monospace;
++  color: var(--meridian-text-muted);
++}
++
++.zap span {
++  flex: 1;
++  min-width: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.zap-x {
++  width: 20px;
++  height: 20px;
++  display: grid;
++  place-items: center;
++  border-radius: 6px;
++}
++
++.zap-x:hover {
++  background: color-mix(in srgb, var(--meridian-text) 10%, transparent);
++}
++
++.code,
++.improve {
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++}
++
++.code-label {
++  font-size: 11px;
++  font-weight: 600;
++  color: var(--meridian-text-muted);
++}
++
++.code-label span {
++  font-weight: 400;
++}
++
++textarea {
++  box-sizing: border-box;
++  width: 100%;
++  resize: vertical;
++  border: 0;
++  border-radius: 9px;
++  padding: 7px 9px;
++  background: color-mix(in srgb, var(--meridian-text) 6%, transparent);
++  color: inherit;
++  font: inherit;
++  outline: none;
++  user-select: text;
++}
++
++textarea:focus {
++  box-shadow: inset 0 0 0 1.5px var(--meridian-space);
++}
++
++#css,
++#js {
++  min-height: 80px;
++  font: 11.5px ui-monospace, Menlo, monospace;
++}
++
++.primary {
++  height: 32px;
++  border-radius: 9px;
++  text-align: center;
++  background: var(--meridian-space);
++  color: white;
++  font-weight: 600;
++}
++
++.note {
++  display: flex;
++  align-items: baseline;
++  gap: 8px;
++  font-size: 12px;
++  color: var(--meridian-text-muted);
++}
++
++.note.err {
++  color: #e5484d;
++}
++
++.note span {
++  flex: 1;
++}
++
++.link {
++  color: var(--meridian-space);
++  font-weight: 600;
++}
++
++.line.danger {
++  background: none;
++  color: var(--meridian-text-muted);
++  font-weight: 500;
++}
++
++.line.danger:hover,
++.line.danger.confirm {
++  background: color-mix(in srgb, #e5484d 12%, transparent);
++  color: #e5484d;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts b/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts
+new file mode 100644
+index 0000000000..4ccd22f2db
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts
+@@ -0,0 +1,132 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {MeridianBoostEditorElement} from './boost_editor.js';
++import {icon} from './icons.js';
++
++export function getHtml(this: MeridianBoostEditorElement) {
++  return html`<!--_html_template_start_-->
++${this.boost_ ? html`
++<div id="card" role="dialog" aria-label="Boost" @keydown="${this.onCardKeydown_}">
++  <div class="head">
++    <button id="close" class="ic" title="Close" @click="${this.onCloseClick_}">
++      ${icon('x', 14)}</button>
++    <input id="name" class="name" .value="${this.nameValue_()}"
++        spellcheck="false" maxlength="40" aria-label="Boost name"
++        @change="${this.onNameChange_}">
++    <button id="enabled" class="bswitch ${this.boost_.enabled ? 'on' : ''}"
++        title="${this.enabledTitle_()}" @click="${this.onEnabledClick_}">
++      <span class="switch"><i></i></span>
++    </button>
++    <button id="reset" class="ic" title="Back to the site’s look"
++        @click="${this.onResetClick_}">${icon('history', 15)}</button>
++  </div>
++
++  <div id="pad" class="pad ${this.dragging_ ? 'drag' : ''}" title="Colour"
++      @pointerdown="${this.onPadPointerdown_}">
++    <div class="field" style="${this.washStyle_()}">
++      <div id="shade" class="knob shade" style="${this.shadeStyle_()}"></div>
++      <div id="knob" class="knob" style="${this.knobStyle_()}"></div>
++    </div>
++  </div>
++  <div class="tiles">
++    <button id="dark" class="tile ${this.boost_.dark ? 'on' : ''}"
++        title="Dark or light" @click="${this.onDarkClick_}">
++      ${icon('moon', 17)}</button>
++    <button id="adjust" class="tile ${this.adjustOpen_ ? 'on' : ''}"
++        title="Brightness, contrast, saturation"
++        @click="${this.onAdjustClick_}">${icon('sliders', 17)}</button>
++    <button id="noColour" class="tile" title="No colour"
++        @click="${this.onNoColourClick_}">${icon('ban', 17)}</button>
++  </div>
++  ${this.adjustOpen_ ? html`
++    <div class="adjust">
++      <label>Brightness<input id="brightness" type="range" min="50"
++          max="150" data-key="brightness"
++          .value="${this.adjustValue_('brightness')}"
++          @input="${this.onAdjustInput_}"></label>
++      <label>Contrast<input id="contrast" type="range" min="50" max="150"
++          data-key="contrast" .value="${this.adjustValue_('contrast')}"
++          @input="${this.onAdjustInput_}"></label>
++      <label>Saturation<input id="saturation" type="range" min="0"
++          max="200" data-key="saturation"
++          .value="${this.adjustValue_('saturation')}"
++          @input="${this.onAdjustInput_}"></label>
++    </div>` : ''}
++
++  <div class="fonts">
++    ${this.fonts_.map(f => html`
++      <button class="font ${f.on ? 'on' : ''}" data-font="${f.name}"
++          title="${f.name}" style="font-family:'${f.name}'"
++          @click="${this.onFontClick_}">Aa</button>`)}
++  </div>
++
++  <div class="pair">
++    <button id="size" class="tile wide ${this.boost_.size !== 100 ? 'on' : ''}"
++        title="Size" @click="${this.onSizeClick_}">
++      <span>Size</span><span class="val">${this.sizeLabel_()}</span>
++    </button>
++    <button id="case" class="tile wide ${this.boost_.textCase ? 'on' : ''}"
++        title="${this.caseTitle_()}" @click="${this.onCaseClick_}">
++      ${this.caseLabel_()}</button>
++  </div>
++
++  <button id="zap" class="line ${this.zapping_ ? 'on' : ''}"
++      @click="${this.onZapClick_}">
++    ${icon('bolt', 15)}<span class="grow">${this.zapLabel_()}</span>
++    <span class="count">${this.zapCount_()}</span>
++  </button>
++  ${this.boost_.zaps.map((z, i) => html`
++    <div class="zap">
++      <span title="${z}">${z}</span>
++      <button class="zap-x" data-index="${i}" title="Show it again"
++          @click="${this.onZapRemoveClick_}">${icon('x', 12)}</button>
++    </div>`)}
++
++  <button id="code" class="line ${this.codeOpen_ ? 'on' : ''}"
++      @click="${this.onCodeClick_}">
++    ${icon('code', 15)}<span class="grow">Code</span>
++    <span class="count">{ }</span>
++  </button>
++  ${this.codeOpen_ ? html`
++    <div class="code">
++      <div class="code-label">CSS</div>
++      <textarea id="css" spellcheck="false"
++          .value="${this.boost_.css}"></textarea>
++      <div class="code-label">JavaScript
++        <span>runs from the next load</span></div>
++      <textarea id="js" spellcheck="false" .value="${this.boost_.js}"></textarea>
++      <button id="codeSave" class="primary" @click="${this.onCodeSaveClick_}">
++        Save</button>
++    </div>` : ''}
++
++  <button id="improveToggle" class="line ${this.improveOpen_ ? 'on' : ''}"
++      @click="${this.onImproveToggleClick_}">
++    ${icon('sparkles', 15)}<span class="grow">Improve with AI</span>
++  </button>
++  ${this.improveOpen_ ? html`
++    <div class="improve">
++      <textarea id="wish" rows="2"
++          placeholder="What to change? Empty: less clutter"></textarea>
++      <button id="improve" class="primary"
++          ?disabled="${this.improving_ || !this.aiLabel_}"
++          @click="${this.onImproveClick_}">${this.improveLabel_()}</button>
++      ${this.note_ ? html`
++        <div id="note" class="note ${this.noteError_ ? 'err' : ''}">
++          <span>${this.note_}</span>
++          ${this.canUndo_ ? html`
++            <button id="undo" class="link" @click="${this.onUndoClick_}">
++              Undo</button>` : ''}
++        </div>` : ''}
++    </div>` : ''}
++
++  <button id="delete" class="line danger ${this.confirmDelete_ ? 'confirm' : ''}"
++      @click="${this.onDeleteClick_}">
++    ${icon('trash', 15)}<span class="grow">${this.deleteLabel_()}</span>
++  </button>
++</div>` : ''}
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/boost_editor.ts b/chrome/browser/resources/webui_browser/meridian/boost_editor.ts
+new file mode 100644
+index 0000000000..fe71a690f4
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/boost_editor.ts
+@@ -0,0 +1,511 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The Boost editor, as Arc's: a card at the right of the page for one of the
++// site's boosts. A colour over the page (picked on a pad), dark or light,
++// brightness and contrast, a font, the text's size and case, Zap, its own
++// code, and Improve with the AI from Settings > AI. Every change shows on the
++// page at once.
++
++import {isWindows} from '//resources/js/platform.js';
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {browserProxyFactory} from '../sidebar.mojom-webui.js';
++import type {Boost, SidebarHandlerInterface} from '../sidebar.mojom-webui.js';
++
++import {getCss} from './boost_editor.css.js';
++import {getHtml} from './boost_editor.html.js';
++
++// A font as the grid shows it.
++export interface BoostFont {
++  name: string;
++  on: boolean;
++}
++
++// Fonts every Mac (or Windows) has ("system-ui": the system's own).
++const MAC_FONTS = [
++  'system-ui',        'Helvetica Neue', 'Avenir Next',     'Futura',
++  'Gill Sans',        'Optima',         'Georgia',         'Palatino',
++  'Baskerville',      'Didot',          'Iowan Old Style', 'Charter',
++  'Hoefler Text',     'Rockwell',       'American Typewriter',
++  'Courier New',      'Menlo',          'Marker Felt',     'Chalkboard SE',
++  'Snell Roundhand',
++];
++const WINDOWS_FONTS = [
++  'system-ui',         'Segoe UI',      'Arial',           'Calibri',
++  'Candara',           'Corbel',        'Georgia',         'Palatino Linotype',
++  'Book Antiqua',      'Cambria',       'Constantia',      'Times New Roman',
++  'Bahnschrift',       'Franklin Gothic Medium',           'Trebuchet MS',
++  'Verdana',           'Consolas',      'Courier New',     'Comic Sans MS',
++  'Segoe Print',
++];
++const FONTS = isWindows ? WINDOWS_FONTS : MAC_FONTS;
++
++// Size goes round these (percent).
++const SIZES = [100, 110, 125, 90];
++const CASES = ['', 'lower', 'upper'];
++
++export class MeridianBoostEditorElement extends CrLitElement {
++  static get is() {
++    return 'meridian-boost-editor';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      open: {type: Boolean, reflect: true},
++      url: {type: String},
++      boost_: {state: true, type: Object},
++      fonts_: {state: true, type: Array},
++      aiLabel_: {state: true, type: String},
++      adjustOpen_: {state: true, type: Boolean},
++      codeOpen_: {state: true, type: Boolean},
++      improveOpen_: {state: true, type: Boolean},
++      improving_: {state: true, type: Boolean},
++      zapping_: {state: true, type: Boolean},
++      note_: {state: true, type: String},
++      noteError_: {state: true, type: Boolean},
++      canUndo_: {state: true, type: Boolean},
++      confirmDelete_: {state: true, type: Boolean},
++      dragging_: {state: true, type: Boolean},
++    };
++  }
++
++  accessor open: boolean = false;
++  // The active tab's address: another site closes the editor.
++  accessor url: string = '';
++  protected accessor boost_: Boost|null = null;
++  protected accessor fonts_: BoostFont[] = [];
++  // Who Improve asks ("" when no AI is set up).
++  protected accessor aiLabel_: string = '';
++  protected accessor adjustOpen_: boolean = false;
++  protected accessor codeOpen_: boolean = false;
++  protected accessor improveOpen_: boolean = false;
++  protected accessor improving_: boolean = false;
++  protected accessor zapping_: boolean = false;
++  // What Improve did, or why it couldn't.
++  protected accessor note_: string = '';
++  protected accessor noteError_: boolean = false;
++  protected accessor canUndo_: boolean = false;
++  protected accessor confirmDelete_: boolean = false;
++  // The colour knob is held: it follows the pointer without easing.
++  protected accessor dragging_: boolean = false;
++
++  private handler_: SidebarHandlerInterface =
++      browserProxyFactory.getInstance().handler;
++  private host_: string = '';
++  // The boost before Improve, for Undo.
++  private before_: Boost|null = null;
++  // Changes made while one is being saved go in the next save.
++  private dirty_: boolean = false;
++  private saving_: boolean = false;
++  private zapTimer_: number = 0;
++
++  override disconnectedCallback() {
++    super.disconnectedCallback();
++    clearInterval(this.zapTimer_);
++  }
++
++  override willUpdate(changed: PropertyValues<this>) {
++    super.willUpdate(changed);
++    if (changed.has('url') && this.open) {
++      this.checkSite_();
++    }
++    const changedPrivate = changed as Map<PropertyKey, unknown>;
++    if (changedPrivate.has('boost_')) {
++      this.fonts_ = FONTS.map(
++          name => ({name, on: (this.boost_?.font || '') === name}));
++    }
++  }
++
++  // Opens on the boost `id` of the active tab's site; "" makes a new one.
++  async show(id: string) {
++    const {state} = await this.handler_.getBoost();
++    if (!state.host) {
++      return;
++    }
++    this.host_ = state.host;
++    this.aiLabel_ = state.aiLabel;
++    let boost = state.boosts.find(b => b.id === id) || null;
++    if (!boost) {
++      boost = {
++        id: '',
++        host: state.host,
++        name: state.boosts.length ? `Boost ${state.boosts.length + 1}` :
++                                    'My Boost',
++        enabled: true,
++        css: '',
++        js: '',
++        zaps: [],
++        hue: 0,
++        font: '',
++        tint: -1,
++        tintStrength: 60,
++        dark: false,
++        brightness: 100,
++        contrast: 100,
++        saturation: 100,
++        size: 100,
++        textCase: '',
++      };
++      const {id: made} = await this.handler_.setBoost(boost);
++      boost = {...boost, id: made};
++    }
++    this.boost_ = boost;
++    this.adjustOpen_ = false;
++    this.codeOpen_ = !!(boost.css || boost.js);
++    this.improveOpen_ = false;
++    this.note_ = '';
++    this.canUndo_ = false;
++    this.confirmDelete_ = false;
++    this.open = true;
++  }
++
++  close() {
++    this.open = false;
++    this.stopZapWatch_();
++    this.fire('boost-editor-closed');
++  }
++
++  private async checkSite_() {
++    const {state} = await this.handler_.getBoost();
++    if (state.host !== this.host_) {
++      this.close();
++    }
++  }
++
++  // ------------------------------------------------------------ Saving
++
++  private change_(change: Partial<Boost>) {
++    if (!this.boost_) {
++      return;
++    }
++    this.boost_ = {...this.boost_, ...change};
++    this.dirty_ = true;
++    this.flush_();
++  }
++
++  // One save at a time, each with everything changed so far: a drag on the
++  // pad is many changes and one boost.
++  private async flush_() {
++    if (this.saving_) {
++      return;
++    }
++    this.saving_ = true;
++    while (this.dirty_ && this.boost_) {
++      this.dirty_ = false;
++      await this.handler_.setBoost(this.boost_);
++    }
++    this.saving_ = false;
++  }
++
++  private async reload_() {
++    const {state} = await this.handler_.getBoost();
++    const fresh = state.boosts.find(b => b.id === this.boost_?.id);
++    if (fresh && !this.dirty_) {
++      this.boost_ = fresh;
++    }
++    this.aiLabel_ = state.aiLabel;
++    return state;
++  }
++
++  // ------------------------------------------------------------ Template
++
++  protected nameValue_(): string {
++    return this.boost_?.name || '';
++  }
++
++  protected enabledTitle_(): string {
++    return this.boost_?.enabled ? 'Turn off' : 'Turn on';
++  }
++
++  // The pad, as Arc's: the hues around its rim, the colour's knob at the
++  // hue's angle from the middle, further out for more colour; a small knob
++  // opposite it shows the dark of the page in that colour.
++  protected knobStyle_(): string {
++    const b = this.boost_;
++    if (!b || b.tint < 0) {
++      return 'left:50%;top:50%;background:var(--meridian-surface)';
++    }
++    const [x, y] = this.knobAt_(b);
++    return `left:${x}%;top:${y}%;background:hsl(${b.tint} 85% 62%)`;
++  }
++
++  protected shadeStyle_(): string {
++    const b = this.boost_;
++    if (!b || b.tint < 0) {
++      return 'left:50%;top:50%;opacity:0';
++    }
++    const [x, y] = this.knobAt_(b);
++    return `left:${100 - x}%;top:${100 - y}%;` +
++        `background:hsl(${b.tint} ${Math.round(b.tintStrength * 0.5)}% 16%)`;
++  }
++
++  protected washStyle_(): string {
++    const b = this.boost_;
++    if (!b || b.tint < 0) {
++      return '';
++    }
++    const [x, y] = this.knobAt_(b);
++    return `--wash:radial-gradient(circle at ${x}% ${y}%, ` +
++        `hsl(${b.tint} 90% 65% / ${0.12 + b.tintStrength / 300}), ` +
++        `transparent 75%)`;
++  }
++
++  // Where the knob is, in percent of the pad's field: the edge of the square
++  // is full colour.
++  private knobAt_(b: Boost): [number, number] {
++    const a = b.tint * Math.PI / 180;
++    const vx = Math.sin(a);
++    const vy = -Math.cos(a);
++    const r = b.tintStrength / 2 / Math.max(Math.abs(vx), Math.abs(vy));
++    return [50 + vx * r, 50 + vy * r];
++  }
++
++  protected adjustValue_(key: 'brightness'|'contrast'|'saturation'): string {
++    return String(this.boost_?.[key] ?? 100);
++  }
++
++  protected sizeLabel_(): string {
++    return `${this.boost_?.size || 100}%`;
++  }
++
++  protected caseLabel_(): string {
++    const c = this.boost_?.textCase || '';
++    return c === 'lower' ? 'aa' : c === 'upper' ? 'AA' : 'Aa';
++  }
++
++  protected caseTitle_(): string {
++    const c = this.boost_?.textCase || '';
++    return c === 'lower' ? 'Lower case' :
++        c === 'upper'    ? 'Upper case' :
++                           'Text as the site has it';
++  }
++
++  protected zapCount_(): string {
++    return String(this.boost_?.zaps.length || 0);
++  }
++
++  protected zapLabel_(): string {
++    return this.zapping_ ? 'Zapping… Esc to stop' : 'Zap';
++  }
++
++  protected improveLabel_(): string {
++    if (this.improving_) {
++      return 'Improving…';
++    }
++    return this.aiLabel_ ? `Improve with ${this.aiLabel_}` :
++                           'Set up an AI in Settings';
++  }
++
++  protected deleteLabel_(): string {
++    return this.confirmDelete_ ? 'Click again to delete' : 'Delete boost';
++  }
++
++  // ------------------------------------------------------------ Events
++
++  protected onCloseClick_() {
++    this.close();
++  }
++
++  protected onCardKeydown_(e: KeyboardEvent) {
++    if (e.key === 'Escape') {
++      this.close();
++    }
++  }
++
++  protected onNameChange_(e: Event) {
++    const name = (e.target as HTMLInputElement).value.trim();
++    this.change_({name: name || 'My Boost'});
++  }
++
++  protected onEnabledClick_() {
++    this.change_({enabled: !this.boost_?.enabled});
++  }
++
++  // Back to the site's look; zaps and code stay.
++  protected onResetClick_() {
++    this.change_({
++      hue: 0,
++      font: '',
++      tint: -1,
++      dark: false,
++      brightness: 100,
++      contrast: 100,
++      saturation: 100,
++      size: 100,
++      textCase: '',
++    });
++  }
++
++  protected onPadPointerdown_(e: PointerEvent) {
++    const pad = e.currentTarget as HTMLElement;
++    const field = pad.querySelector<HTMLElement>('.field')!;
++    pad.setPointerCapture(e.pointerId);
++    this.pickColour_(field, e);
++    // A click glides the knob over; a drag holds it under the pointer.
++    const move = (ev: PointerEvent) => {
++      this.dragging_ = true;
++      this.pickColour_(field, ev);
++    };
++    const up = () => {
++      this.dragging_ = false;
++      pad.removeEventListener('pointermove', move);
++      pad.removeEventListener('pointerup', up);
++      pad.removeEventListener('pointercancel', up);
++    };
++    pad.addEventListener('pointermove', move);
++    pad.addEventListener('pointerup', up);
++    pad.addEventListener('pointercancel', up);
++  }
++
++  // The hue is the angle from the middle (red at the top, clockwise, as the
++  // rim), the amount of colour how far out.
++  private pickColour_(field: HTMLElement, e: PointerEvent) {
++    const r = field.getBoundingClientRect();
++    const dx = Math.min(0.5, Math.max(-0.5, (e.clientX - r.left) / r.width - 0.5));
++    const dy = Math.min(0.5, Math.max(-0.5, (e.clientY - r.top) / r.height - 0.5));
++    const hue = (Math.atan2(dx, -dy) * 180 / Math.PI + 360) % 360;
++    this.change_({
++      tint: Math.round(hue) % 360,
++      tintStrength: Math.round(Math.max(Math.abs(dx), Math.abs(dy)) * 200),
++    });
++  }
++
++  protected onDarkClick_() {
++    this.change_({dark: !this.boost_?.dark});
++  }
++
++  protected onAdjustClick_() {
++    this.adjustOpen_ = !this.adjustOpen_;
++  }
++
++  protected onNoColourClick_() {
++    this.change_({tint: -1, hue: 0});
++  }
++
++  protected onAdjustInput_(e: Event) {
++    const input = e.target as HTMLInputElement;
++    const key = input.dataset['key'] as 'brightness' | 'contrast' |
++        'saturation';
++    this.change_({[key]: Number(input.value)});
++  }
++
++  protected onFontClick_(e: Event) {
++    const font = (e.currentTarget as HTMLElement).dataset['font'] || '';
++    this.change_({font: this.boost_?.font === font ? '' : font});
++  }
++
++  protected onSizeClick_() {
++    const at = SIZES.indexOf(this.boost_?.size || 100);
++    this.change_({size: SIZES[(at + 1) % SIZES.length]});
++  }
++
++  protected onCaseClick_() {
++    const at = CASES.indexOf(this.boost_?.textCase || '');
++    this.change_({textCase: CASES[(at + 1) % CASES.length]});
++  }
++
++  // Zap: the page takes clicks on what to hide; the count follows.
++  protected onZapClick_() {
++    if (!this.boost_) {
++      return;
++    }
++    this.handler_.startZap(this.boost_.id);
++    this.zapping_ = true;
++    clearInterval(this.zapTimer_);
++    this.zapTimer_ = window.setInterval(async () => {
++      const state = await this.reload_();
++      if (!state.zapping) {
++        this.stopZapWatch_();
++      }
++    }, 400);
++  }
++
++  private stopZapWatch_() {
++    clearInterval(this.zapTimer_);
++    this.zapTimer_ = 0;
++    this.zapping_ = false;
++  }
++
++  protected onZapRemoveClick_(e: Event) {
++    const index = Number((e.currentTarget as HTMLElement).dataset['index']);
++    const zaps = [...(this.boost_?.zaps || [])];
++    zaps.splice(index, 1);
++    this.change_({zaps});
++  }
++
++  protected onCodeClick_() {
++    this.codeOpen_ = !this.codeOpen_;
++  }
++
++  protected onCodeSaveClick_() {
++    const css = this.shadowRoot.querySelector<HTMLTextAreaElement>('#css');
++    const js = this.shadowRoot.querySelector<HTMLTextAreaElement>('#js');
++    this.change_({css: css?.value || '', js: js?.value || ''});
++  }
++
++  protected async onImproveToggleClick_() {
++    this.improveOpen_ = !this.improveOpen_;
++    // An AI set up since the editor opened.
++    await this.reload_();
++  }
++
++  protected async onImproveClick_() {
++    if (!this.boost_) {
++      return;
++    }
++    const wish = this.shadowRoot.querySelector<HTMLTextAreaElement>('#wish');
++    this.before_ = {...this.boost_};
++    this.improving_ = true;
++    this.note_ = '';
++    this.canUndo_ = false;
++    const {error, summary} = await this.handler_.improveBoost(
++        this.boost_.id, wish?.value.trim() || '');
++    this.improving_ = false;
++    this.noteError_ = !!error;
++    this.note_ = error || summary;
++    this.canUndo_ = !error;
++    await this.reload_();
++  }
++
++  protected async onUndoClick_() {
++    if (this.before_) {
++      this.boost_ = this.before_;
++      await this.handler_.setBoost(this.before_);
++    }
++    this.canUndo_ = false;
++    this.note_ = 'Undone.';
++    this.noteError_ = false;
++  }
++
++  protected async onDeleteClick_() {
++    if (!this.confirmDelete_) {
++      this.confirmDelete_ = true;
++      return;
++    }
++    if (this.boost_) {
++      await this.handler_.deleteBoost(this.boost_.id);
++    }
++    this.boost_ = null;
++    this.close();
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-boost-editor': MeridianBoostEditorElement;
++  }
++}
++
++customElements.define(
++    MeridianBoostEditorElement.is, MeridianBoostEditorElement);
+diff --git a/chrome/browser/resources/webui_browser/meridian/icons.ts b/chrome/browser/resources/webui_browser/meridian/icons.ts
+index d296f2ff9e..da44c9873e 100644
+--- a/chrome/browser/resources/webui_browser/meridian/icons.ts
++++ b/chrome/browser/resources/webui_browser/meridian/icons.ts
+@@ -90,7 +90,8 @@ export type IconName =
+     'playFilled'|
+     'next'|
+     'previous'|
+-    'pip';
++    'pip'|
++    'ban';
+ 
+ export function icon(name: IconName, size = 16): TemplateResult {
+   switch (name) {
+@@ -252,6 +253,8 @@ export function icon(name: IconName, size = 16): TemplateResult {
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5.5 6l8 6-8 6z" fill="currentColor" stroke-linejoin="round"/><path d="M18 6v12"/></svg>`;
+     case 'previous':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18.5 6l-8 6 8 6z" fill="currentColor" stroke-linejoin="round"/><path d="M6 6v12"/></svg>`;
++    case 'ban':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg>`;
+     case 'pip':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2"/><rect x="11.5" y="11.5" width="6.5" height="5" rx="1" fill="currentColor" stroke="none"/></svg>`;
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_control.css b/chrome/browser/resources/webui_browser/meridian/site_control.css
+index fe5b256970..94459df879 100644
+--- a/chrome/browser/resources/webui_browser/meridian/site_control.css
++++ b/chrome/browser/resources/webui_browser/meridian/site_control.css
+@@ -356,222 +356,34 @@ button.row:hover {
+   color: var(--meridian-space);
+ }
+ 
+-/* Boost: the site's own look (Arc's Boosts). */
+-.bhead {
++/* Arc's Boosts section: a row per boost (a click turns it on or off), its
++   editor behind the chevron. */
++.boost-row {
+   display: flex;
+   align-items: center;
+-  gap: 8px;
+-  margin-bottom: 10px;
+ }
+ 
+-.bback {
+-  display: inline-flex;
+-  align-items: center;
+-  justify-content: center;
+-  width: 28px;
+-  height: 28px;
+-  border-radius: 8px;
+-}
+-
+-.bback:hover {
+-  background: color-mix(in srgb, var(--meridian-text) 7%, transparent);
+-}
+-
+-.btitle {
+-  display: flex;
+-  flex-direction: column;
++.boost-row .row {
+   flex: 1;
+   min-width: 0;
+-  font-weight: 650;
+-}
+-
+-.bhost {
+-  font-size: 12px;
+-  font-weight: 500;
+-  color: var(--meridian-text-muted);
+-  white-space: nowrap;
+-  overflow: hidden;
+-  text-overflow: ellipsis;
+-}
+-
+-.bswitch {
+-  display: flex;
+-  flex: none;
+-  padding: 4px;
+-  cursor: pointer;
+-}
+-
+-.bswitch.on .switch {
+-  background: var(--meridian-space);
+-}
+-
+-.bswitch.on .switch i {
+-  transform: translateX(12px);
+-}
+-
+-.improve {
+-  display: flex;
+-  flex-direction: column;
+-  gap: 6px;
+-  padding: 8px;
+-  border-radius: 12px;
+-  background: color-mix(in srgb, var(--meridian-space) 9%, transparent);
+-}
+-
+-textarea {
+-  width: 100%;
+-  box-sizing: border-box;
+-  resize: vertical;
+-  border: 0;
+-  border-radius: 8px;
+-  padding: 6px 8px;
+-  font: inherit;
+-  color: inherit;
+-  background: var(--meridian-surface);
+-  box-shadow: 0 0 0 0.5px var(--meridian-border);
+-  outline: none;
+-  user-select: text;
+ }
+ 
+-textarea:focus {
+-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--meridian-space) 50%, transparent);
+-}
+-
+-.primary {
+-  display: inline-flex;
+-  align-items: center;
+-  justify-content: center;
+-  gap: 6px;
+-  height: 30px;
+-  border-radius: 9px;
++.boost-row.on .boost-ic {
+   background: var(--meridian-space);
+   color: white;
+-  font-weight: 600;
+-}
+-
+-.primary:disabled {
+-  opacity: 0.55;
+-}
+-
+-.bnote {
+-  display: flex;
+-  align-items: baseline;
+-  gap: 6px;
+-  font-size: 12px;
+-  color: var(--meridian-text-muted);
+-  user-select: text;
+-}
+-
+-.bnote.err {
+-  color: #e5484d;
+-}
+-
+-.link {
+-  font-weight: 600;
+-  color: var(--meridian-space);
+ }
+ 
+-.tools {
++.boost-edit {
++  width: 28px;
++  height: 28px;
++  flex: none;
+   display: grid;
+-  grid-template-columns: auto 1fr auto;
+-  gap: 6px;
+-  margin-top: 8px;
+-}
+-
+-.tool {
+-  display: inline-flex;
+-  align-items: center;
+-  gap: 6px;
+-  height: 32px;
+-  padding: 0 10px;
+-  border-radius: 9px;
+-  background: color-mix(in srgb, var(--meridian-text) 6%, transparent);
+-  font-weight: 600;
+-}
+-
+-button.tool:hover {
+-  background: color-mix(in srgb, var(--meridian-text) 11%, transparent);
+-}
+-
+-.hue input {
+-  flex: 1;
+-  min-width: 0;
+-  accent-color: var(--meridian-space);
+-}
+-
+-.font {
+-  border: 0;
+-  font: inherit;
+-  font-weight: 600;
+-  color: inherit;
+-  max-width: 96px;
+-}
+-
+-.zap {
+-  display: flex;
+-  align-items: center;
+-  gap: 6px;
+-  padding: 3px 6px;
+-  font-family: ui-monospace, Menlo, monospace;
+-  font-size: 11px;
+-  color: var(--meridian-text-muted);
+-}
+-
+-.zap span {
+-  flex: 1;
+-  min-width: 0;
+-  white-space: nowrap;
+-  overflow: hidden;
+-  text-overflow: ellipsis;
+-}
+-
+-.zap-x {
+-  display: inline-flex;
+-  padding: 3px;
+-  border-radius: 5px;
+-}
+-
+-.zap-x:hover {
+-  background: color-mix(in srgb, var(--meridian-text) 9%, transparent);
+-}
+-
+-details {
+-  margin-top: 10px;
+-}
+-
+-summary {
+-  display: flex;
+-  align-items: center;
+-  gap: 6px;
+-  padding: 4px;
+-  font-weight: 600;
+-  cursor: pointer;
+-  list-style: none;
+-}
+-
+-.code-label {
+-  margin: 8px 4px 4px;
+-  font-size: 12px;
+-  font-weight: 600;
+-}
+-
+-.code-label span {
+-  font-weight: 400;
++  place-items: center;
++  border-radius: 8px;
+   color: var(--meridian-text-muted);
+ }
+ 
+-textarea.code {
+-  min-height: 90px;
+-  font-family: ui-monospace, Menlo, monospace;
+-  font-size: 11.5px;
+-  white-space: pre;
+-}
+-
+-details .primary {
+-  width: 100%;
+-  margin-top: 8px;
+-}
+-
+-#boostDelete {
+-  margin-top: 8px;
++.boost-edit:hover {
++  background: color-mix(in srgb, var(--meridian-text) 8%, transparent);
++  color: var(--meridian-text);
+ }
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_control.html.ts b/chrome/browser/resources/webui_browser/meridian/site_control.html.ts
+index 8e9709719a..5a4622b9c2 100644
+--- a/chrome/browser/resources/webui_browser/meridian/site_control.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/site_control.html.ts
+@@ -11,88 +11,6 @@ export function getHtml(this: MeridianSiteControlElement) {
+   return html`<!--_html_template_start_-->
+ <div id="shield" @mousedown="${this.onShieldMousedown_}"></div>
+ <div id="card" role="dialog" aria-label="Site controls">
+-  ${this.view_ === 'boost' ? html`
+-  <div class="bhead">
+-    <button id="boostBack" class="bback" title="Back"
+-        @click="${this.onBoostBackClick_}">${icon('back', 16)}</button>
+-    <div class="btitle">
+-      <span>Boost</span><span class="bhost">${this.boostHost_}</span>
+-    </div>
+-    ${this.boost_ ? html`
+-      <button id="boostEnabled" class="bswitch ${this.boost_.enabled ? 'on' : ''}"
+-          title="${this.boost_.enabled ? 'Turn off' : 'Turn on'}"
+-          @click="${this.onBoostEnabledClick_}">
+-        <span class="switch"><i></i></span>
+-      </button>` : ''}
+-  </div>
+-
+-  <div class="improve">
+-    <textarea id="boostWish" rows="2"
+-        placeholder="What to change? Empty: less clutter"></textarea>
+-    <button id="boostImprove" class="primary"
+-        ?disabled="${this.improving_ || !this.aiLabel_}"
+-        @click="${this.onBoostImproveClick_}">
+-      ${icon('sparkles', 14)}<span>${this.improveLabel_()}</span>
+-    </button>
+-    ${this.boostNote_ ? html`
+-      <div id="boostNote" class="bnote ${this.boostError_ ? 'err' : ''}">
+-        <span>${this.boostNote_}</span>
+-        ${this.canUndo_ ? html`
+-          <button id="boostUndo" class="link"
+-              @click="${this.onBoostUndoClick_}">Undo</button>` : ''}
+-      </div>` : ''}
+-  </div>
+-
+-  <div class="tools">
+-    <button id="boostZap" class="tool" @click="${this.onBoostZapClick_}">
+-      ${icon('bolt', 16)}<span>Zap</span>
+-    </button>
+-    <label class="tool hue" title="Colors">
+-      ${icon('palette', 16)}
+-      <input id="boostHue" type="range" min="0" max="359" step="1"
+-          .value="${String(this.boost_?.hue || 0)}"
+-          @change="${this.onBoostHueChange_}">
+-    </label>
+-    <select id="boostFont" class="tool font" title="Font"
+-        @change="${this.onBoostFontChange_}">
+-      ${this.fonts_.map(f => html`
+-        <option value="${f.value}" ?selected="${(this.boost_?.font || '') === f.value}">
+-          ${f.label}</option>`)}
+-    </select>
+-  </div>
+-
+-  ${this.boost_?.zaps.length ? html`
+-    <div class="sec">Zapped</div>
+-    ${this.boost_.zaps.map((z, i) => html`
+-      <div class="zap">
+-        <span title="${z}">${z}</span>
+-        <button class="zap-x" data-index="${i}" title="Show it again"
+-            @click="${this.onBoostZapRemoveClick_}">${icon('x', 12)}</button>
+-      </div>`)}` : ''}
+-
+-  <details id="boostCode" ?open="${!!(this.boost_?.css || this.boost_?.js)}">
+-    <summary>${icon('code', 14)}<span>Code</span></summary>
+-    <div class="code-label">CSS</div>
+-    <textarea id="boostCss" class="code" spellcheck="false"
+-        .value="${this.boost_?.css || ''}"></textarea>
+-    <div class="code-label">JavaScript <span>runs from the next load</span></div>
+-    <textarea id="boostJs" class="code" spellcheck="false"
+-        .value="${this.boost_?.js || ''}"></textarea>
+-    <button id="boostSave" class="primary" @click="${this.onBoostSaveClick_}">
+-      Save
+-    </button>
+-  </details>
+-
+-  ${this.boost_ ? html`
+-    <button id="boostDelete" class="row ${this.confirmDelete_ ? 'confirm' : ''}"
+-        @click="${this.onBoostDeleteClick_}">
+-      <span class="row-ic">${icon('trash', 16)}</span>
+-      <span class="row-text">
+-        <span class="row-label">${this.confirmDelete_ ?
+-            'Click again to delete' : 'Delete boost'}</span>
+-      </span>
+-    </button>` : ''}
+-` : html`
+   <div class="quick">
+     <button class="q" data-action="copy" @click="${this.onQuickClick_}">
+       ${icon(this.copyIcon_(), 18)}<span>${this.copyLabel_()}</span>
+@@ -131,6 +49,39 @@ export function getHtml(this: MeridianSiteControlElement) {
+       <span class="arc-add">Add…</span>
+     </button>` : ''}
+ 
++  ${this.boostHost_ ? html`
++    <div class="sec-row">
++      <div class="sec">Boosts</div>
++      ${this.boosts_.length ? html`
++        <button id="newBoost" class="manage" @click="${this.onNewBoostClick_}">
++          New Boost</button>` : ''}
++    </div>
++    ${this.boosts_.map(b => html`
++      <div class="boost-row ${b.enabled ? 'on' : ''}">
++        <button class="row boost-toggle" data-id="${b.id}"
++            title="${b.enabled ? 'Turn off' : 'Turn on'}"
++            @click="${this.onBoostToggleClick_}">
++          <span class="row-ic boost-ic">${icon('wand', 15)}</span>
++          <span class="row-text">
++            <span class="row-label">${b.name}</span>
++            <span class="row-sub">${b.enabled ? 'Enabled' : 'Disabled'}</span>
++          </span>
++        </button>
++        <button class="boost-edit" data-id="${b.id}" title="Edit"
++            @click="${this.onBoostEditClick_}">
++          ${icon('chevronRight', 14)}</button>
++      </div>`)}
++    ${!this.boosts_.length ? html`
++      <button id="boostRow" class="row" @click="${this.onNewBoostClick_}">
++        <span class="row-ic">${icon('wand', 16)}</span>
++        <span class="row-text">
++          <span class="row-label">Boost this site</span>
++          <span class="row-sub">Colours, fonts, zap, AI</span>
++        </span>
++        ${icon('plus', 14)}
++      </button>` : ''}
++  ` : ''}
++
+   ${this.info_?.origin ? html`
+     <div class="sec">${this.info_.host}</div>
+     <button id="adsRow" class="row ${this.info_.adblock ? 'on' : ''}"
+@@ -142,15 +93,6 @@ export function getHtml(this: MeridianSiteControlElement) {
+       </span>
+       <span class="switch"><i></i></span>
+     </button>
+-    <button id="boostRow" class="row ${this.boost_?.enabled ? 'on' : ''}"
+-        @click="${this.onBoostRowClick_}">
+-      <span class="row-ic">${icon('wand', 16)}</span>
+-      <span class="row-text">
+-        <span class="row-label">${this.boostLabel_()}</span>
+-        <span class="row-sub">${this.boostSub_()}</span>
+-      </span>
+-      ${icon('chevronRight', 14)}
+-    </button>
+     ${this.rows_.map(r => html`
+       <button class="row permission ${r.allowed ? 'on' : ''}"
+           data-type="${r.type}" @click="${this.onPermissionClick_}">
+@@ -203,7 +145,7 @@ export function getHtml(this: MeridianSiteControlElement) {
+     ${this.info_?.origin ? html`
+       <button id="more" class="more" title="All site settings"
+           @click="${this.onMoreClick_}">${icon('more', 16)}</button>` : ''}
+-  </div>`}
++  </div>
+ </div>
+ <!--_html_template_end_-->`;
+ }
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_control.ts b/chrome/browser/resources/webui_browser/meridian/site_control.ts
+index c637913477..6017e2727f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/site_control.ts
++++ b/chrome/browser/resources/webui_browser/meridian/site_control.ts
+@@ -67,15 +67,8 @@ export class MeridianSiteControlElement extends CrLitElement {
+       confirmClear_: {state: true, type: Boolean},
+       arcLeft_: {state: true, type: Number},
+       extensions_: {state: true, type: Array},
+-      view_: {state: true, type: String},
+-      boost_: {state: true, type: Object},
++      boosts_: {state: true, type: Array},
+       boostHost_: {state: true, type: String},
+-      aiLabel_: {state: true, type: String},
+-      improving_: {state: true, type: Boolean},
+-      boostNote_: {state: true, type: String},
+-      boostError_: {state: true, type: Boolean},
+-      canUndo_: {state: true, type: Boolean},
+-      confirmDelete_: {state: true, type: Boolean},
+     };
+   }
+ 
+@@ -92,33 +85,10 @@ export class MeridianSiteControlElement extends CrLitElement {
+   protected accessor arcLeft_: number = 0;
+   // The shown space's extensions (Arc's row: all of them, not just pinned).
+   protected accessor extensions_: SpaceExtension[] = [];
+-  // A boost's font choices ("": the site's own).
+-  protected fonts_ = [
+-    {value: '', label: 'Site’s font'},
+-    {value: 'system-ui', label: 'System'},
+-    {value: 'Inter', label: 'Inter'},
+-    {value: 'Georgia', label: 'Georgia'},
+-    {value: 'Iowan Old Style', label: 'Iowan'},
+-    {value: 'Avenir Next', label: 'Avenir'},
+-    {value: 'Menlo', label: 'Menlo'},
+-  ];
+-
+-  // "main", or "boost": the site's Boost.
+-  protected accessor view_: string = 'main';
+-  protected accessor boost_: Boost|null = null;
++  // The site's boosts (Arc's "Boosts" section).
++  protected accessor boosts_: Boost[] = [];
+   // The site a boost is for ("" when the page isn't a website).
+   protected accessor boostHost_: string = '';
+-  // Who Improve asks ("" when no AI is set up).
+-  protected accessor aiLabel_: string = '';
+-  protected accessor improving_: boolean = false;
+-  // What Improve did, or why it couldn't.
+-  protected accessor boostNote_: string = '';
+-  protected accessor boostError_: boolean = false;
+-  protected accessor canUndo_: boolean = false;
+-  protected accessor confirmDelete_: boolean = false;
+-  // The boost before Improve (null: there was none), for Undo.
+-  private before_: Boost|null = null;
+-  private saving_: Promise<void> = Promise.resolve();
+ 
+   private handler_: SidebarHandlerInterface =
+       browserProxyFactory.getInstance().handler;
+@@ -128,11 +98,10 @@ export class MeridianSiteControlElement extends CrLitElement {
+     if (changed.has('open') && this.open) {
+       this.copied_ = false;
+       this.confirmClear_ = false;
+-      this.view_ = 'main';
+-      this.boostNote_ = '';
+-      this.canUndo_ = false;
+-      this.confirmDelete_ = false;
+       this.refresh_();
++      // Hidden until this page's boosts are in (not the last page's).
++      this.boostHost_ = '';
++      this.boosts_ = [];
+       this.loadBoost_();
+       this.countArcExtensions_();
+       this.loadExtensions_();
+@@ -342,133 +311,29 @@ export class MeridianSiteControlElement extends CrLitElement {
+ 
+   private async loadBoost_() {
+     const {state} = await this.handler_.getBoost();
+-    this.boost_ = state.boost;
++    this.boosts_ = state.boosts;
+     this.boostHost_ = state.host;
+-    this.aiLabel_ = state.aiLabel;
+   }
+ 
+-  protected boostLabel_(): string {
+-    return this.boost_ ? (this.boost_.name || 'Boost') : 'Boost this site';
+-  }
+-
+-  protected boostSub_(): string {
+-    if (!this.boost_) {
+-      return 'Colors, fonts, zap, AI';
+-    }
+-    return this.boost_.enabled ? 'On' : 'Off';
+-  }
+-
+-  protected improveLabel_(): string {
+-    if (this.improving_) {
+-      return 'Improving…';
+-    }
+-    return this.aiLabel_ ? `Improve with ${this.aiLabel_}` :
+-                           'Set up an AI in Settings';
+-  }
+-
+-  // Fresh: an AI set up since the controls opened shows.
+-  protected onBoostRowClick_() {
+-    this.view_ = 'boost';
+-    this.loadBoost_();
+-  }
+-
+-  protected onBoostBackClick_() {
+-    this.view_ = 'main';
+-  }
+-
+-  // The site's boost with `change`s (a new one if it has none). One at a
+-  // time, each on the one before: quick changes (a font, then colours) make
+-  // one boost, not two.
+-  private saveBoost_(change: Partial<Boost>): Promise<void> {
+-    this.saving_ = this.saving_.then(() => this.writeBoost_(change));
+-    return this.saving_;
+-  }
+-
+-  private async writeBoost_(change: Partial<Boost>) {
+-    const base: Boost = this.boost_ || {
+-      id: '',
+-      host: this.boostHost_,
+-      name: this.boostHost_,
+-      enabled: true,
+-      css: '',
+-      js: '',
+-      zaps: [],
+-      hue: 0,
+-      font: '',
+-    };
+-    await this.handler_.setBoost({...base, ...change});
+-    await this.loadBoost_();
+-  }
+-
+-  protected onBoostEnabledClick_() {
+-    this.saveBoost_({enabled: !this.boost_?.enabled});
+-  }
+-
+-  protected onBoostHueChange_(e: Event) {
+-    this.saveBoost_({hue: Number((e.target as HTMLInputElement).value)});
+-  }
+-
+-  protected onBoostFontChange_(e: Event) {
+-    this.saveBoost_({font: (e.target as HTMLSelectElement).value});
+-  }
+-
+-  protected onBoostZapRemoveClick_(e: Event) {
+-    const index = Number((e.currentTarget as HTMLElement).dataset['index']);
+-    const zaps = [...(this.boost_?.zaps || [])];
+-    zaps.splice(index, 1);
+-    this.saveBoost_({zaps});
+-  }
+-
+-  protected onBoostSaveClick_() {
+-    const css = this.shadowRoot.querySelector<HTMLTextAreaElement>('#boostCss');
+-    const js = this.shadowRoot.querySelector<HTMLTextAreaElement>('#boostJs');
+-    this.saveBoost_({css: css?.value || '', js: js?.value || ''});
+-  }
+-
+-  // Zap: the controls close and the person clicks what to hide.
+-  protected onBoostZapClick_() {
+-    this.fire('site-control-action', 'close');
+-    this.handler_.startZap();
+-  }
+-
+-  protected async onBoostDeleteClick_() {
+-    if (!this.confirmDelete_) {
+-      this.confirmDelete_ = true;
++  // A boost on or off from the list; the page changes at once.
++  protected async onBoostToggleClick_(e: Event) {
++    const id = (e.currentTarget as HTMLElement).dataset['id'];
++    const boost = this.boosts_.find(b => b.id === id);
++    if (!boost) {
+       return;
+     }
+-    this.confirmDelete_ = false;
+-    if (this.boost_) {
+-      await this.handler_.deleteBoost(this.boost_.id);
+-    }
++    await this.handler_.setBoost({...boost, enabled: !boost.enabled});
+     await this.loadBoost_();
+   }
+ 
+-  protected async onBoostImproveClick_() {
+-    const wish =
+-        this.shadowRoot.querySelector<HTMLTextAreaElement>('#boostWish');
+-    this.before_ = this.boost_ ? {...this.boost_} : null;
+-    this.improving_ = true;
+-    this.boostNote_ = '';
+-    this.canUndo_ = false;
+-    const {error, summary} =
+-        await this.handler_.improveBoost(wish?.value.trim() || '');
+-    this.improving_ = false;
+-    this.boostError_ = !!error;
+-    this.boostNote_ = error || summary;
+-    this.canUndo_ = !error;
+-    await this.loadBoost_();
++  // The editor opens at the right of the page; the controls close.
++  protected onBoostEditClick_(e: Event) {
++    const id = (e.currentTarget as HTMLElement).dataset['id'];
++    this.fire('site-control-action', `boost:${id}`);
+   }
+ 
+-  protected async onBoostUndoClick_() {
+-    if (this.before_) {
+-      await this.handler_.setBoost(this.before_);
+-    } else if (this.boost_) {
+-      await this.handler_.deleteBoost(this.boost_.id);
+-    }
+-    this.canUndo_ = false;
+-    this.boostNote_ = 'Undone.';
+-    this.boostError_ = false;
+-    await this.loadBoost_();
++  protected onNewBoostClick_() {
++    this.fire('site-control-action', 'boost:');
+   }
+ }
+ 

@@ -143,6 +143,9 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
     ...(firstRun ? [] : ['--no-first-run']), '--no-default-browser-check', '--window-size=1280,860',
     // Keep drawing when the window is covered or the display sleeps (input waits for frames).
     '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
+    // Frames on a timer, not the display's: with the screen locked macOS stops the display link, and
+    // without frames every click waited ~5 s and animations stood still.
+    '--disable-gpu-vsync', '--disable-frame-rate-limit',
     // No on-device model downloads (≈190 MB each into the temp folder).
     // MERIDIAN_TEST_DISABLE_FEATURES: more features to turn off, for where the tests run. On
     // Windows they can run on a desktop nobody sees, out of the person's way; there a window
