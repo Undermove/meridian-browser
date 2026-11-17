@@ -26,8 +26,9 @@ test('Search Image with Google on a picture: no crash, the search opens in a new
     for (const [type, button] of [['mouseMoved', 'none'], ['mousePressed', 'right'], ['mouseReleased', 'right']]) {
       await page.cdp.send('Input.dispatchMouseEvent', { type, x: 100, y: 100, button, clickCount: 1 });
     }
-    // The search, in a tab of its own; the article stays.
-    await b.waitFor(`[...app.$.tabstrip.tabs_.values()].some((t) => /^https:\\/\\/(lens|www)\\.google\\./.test(t.url))`, 15000,
+    // The search, in a tab of its own (the picture goes to Google first: slow on a cold network); the
+    // article stays.
+    await b.waitFor(`[...app.$.tabstrip.tabs_.values()].some((t) => /^https:\\/\\/(lens|www)\\.google\\./.test(t.url))`, 30000,
       `[...app.$.tabstrip.tabs_.values()].map((t) => t.url)`);
     assert.ok((await b.eval(`[...app.$.tabstrip.tabs_.values()].map((t) => t.url)`)).includes(url));
     // Still alive.
