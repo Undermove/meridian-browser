@@ -85,7 +85,8 @@ process.stdout.write('READY\r\n');
     await key('keyDown', 8); await key('keyUp', 8);  // ⇧↩
     await wb.cdp.send('Input.insertText', { text: 'c' });
     await key('keyDown', 0); await key('keyUp', 0);  // ↩
-    await wb.waitFor(`${TEXT}.includes('ab^[')`, 5000, TEXT);
+    // The whole line, not just its start: on Windows "c" and Enter can still be on their way.
+    await wb.waitFor(`/\\nab\\^\\[\\nc\\n/.test(${TEXT})`, 5000, TEXT).catch(() => {});
     const text = await wb.eval(TEXT);
     // "ab" ESC, then a new line (⇧↩); "c", then Enter.
     assert.match(text, /\nab\^\[\nc\n/, `⇧↩ sent ESC ↩, ↩ a plain Enter: ${JSON.stringify(text.slice(-300))}`);
