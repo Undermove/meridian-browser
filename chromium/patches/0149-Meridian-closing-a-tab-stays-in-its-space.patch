@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Mon, 16 Nov 2026 19:27:30 +0400
+Subject: [PATCH 150/151] Meridian: closing a tab stays in its space
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar_handler.cc | 40 +++++++++++++++++++++-
+ chrome/browser/meridian/sidebar_handler.h  |  6 ++++
+ chrome/browser/ui/tabs/tab_strip_model.cc  | 35 ++++++++++++++++---
+ chrome/browser/ui/tabs/tab_strip_model.h   |  7 ++++
+ 4 files changed, 83 insertions(+), 5 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index b67fbc80db..7e8cb3c438 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -271,6 +271,7 @@ SidebarHandler::SidebarHandler(
+                                  base::Unretained(this)));
+   model()->AddObserver(this);
+   Handlers()[browser_] = this;
++  TabStripModel::SetSelectableAfterClose(&SidebarHandler::SelectableAfterClose);
+   Updater::Get().AddObserver(this);
+   Updater::Get().Start();
+   downloads_ = std::make_unique<DownloadsTracker>(
+@@ -784,6 +785,25 @@ bool SidebarHandler::HandleCommand(BrowserWindowInterface* browser,
+   return true;
+ }
+ 
++bool SidebarHandler::InActiveSpace(tabs::TabInterface* tab) {
++  const TabData* data = TabData::Get(tab->GetContents());
++  if (!data) {
++    return true;
++  }
++  if (!data->item_id().empty() &&
++      IsFavorites(service_->ContainerOf(data->item_id()))) {
++    return true;
++  }
++  return data->space_id() == service_->active_space_id();
++}
++
++// static
++bool SidebarHandler::SelectableAfterClose(tabs::TabInterface* closing,
++                                          tabs::TabInterface* candidate) {
++  SidebarHandler* handler = For(closing->GetBrowserWindowInterface());
++  return !handler || handler->InActiveSpace(candidate);
++}
++
+ void SidebarHandler::OnActiveTabChanged(tabs::TabInterface* tab) {
+   if (!tab) {
+     return;
+@@ -2060,7 +2080,25 @@ void SidebarHandler::OnTabStripModelChanged(
+     }
+   }
+   if (selection.active_tab_changed()) {
+-    OnActiveTabChanged(selection.new_tab);
++    // The space's last tab closed: the space stays, with a new tab, as when it
++    // is opened empty (Arc never moves to another space by itself).
++    bool closed_last = false;
++    if (change.type() == TabStripModelChange::kRemoved &&
++        !tab_strip_model->closing_all() && selection.new_tab &&
++        !InActiveSpace(selection.new_tab)) {
++      for (const auto& removed : change.GetRemove()->contents) {
++        closed_last |= removed.contents == selection.old_contents &&
++                       removed.remove_reason == TabRemovedReason::kDeleted;
++      }
++    }
++    if (closed_last) {
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce(&SidebarHandler::ActivateSpaceHere,
++                                    weak_factory_.GetWeakPtr(),
++                                    service_->active_space_id()));
++    } else {
++      OnActiveTabChanged(selection.new_tab);
++    }
+   }
+   ScheduleNotify();
+ }
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 6eff0e37a4..4510cdf6fe 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -322,6 +322,12 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void ActivateSpaceHere(const std::string& space_id);
+   void MaybePeek(tabs::TabInterface* tab);
+   void OnActiveTabChanged(tabs::TabInterface* tab);
++  // Whether `tab` is shown in the active space: its own tab, or a favorite.
++  bool InActiveSpace(tabs::TabInterface* tab);
++  // TabStripModel::SelectableAfterClose: a closed tab hands the window to a
++  // tab of its space.
++  static bool SelectableAfterClose(tabs::TabInterface* closing,
++                                   tabs::TabInterface* candidate);
+   // Closes (and so archives) Today tabs not visited for ArchiveAfter().
+   void ArchiveStaleTabs();
+   bool IsTodayTab(tabs::TabInterface* tab);
+diff --git a/chrome/browser/ui/tabs/tab_strip_model.cc b/chrome/browser/ui/tabs/tab_strip_model.cc
+index 4a85ea7e9e..6bf470e65c 100644
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -5912,6 +5912,15 @@ void TabStripModel::GroupCloseStopped(const tab_groups::TabGroupId& group) {
+   RemoveFromGroup(tabs_in_group.ToIntVector());
+ }
+ 
++namespace {
++TabStripModel::SelectableAfterClose g_selectable_after_close = nullptr;
++}  // namespace
++
++// static
++void TabStripModel::SetSelectableAfterClose(SelectableAfterClose selectable) {
++  g_selectable_after_close = selectable;
++}
++
+ std::optional<int> TabStripModel::DetermineNewSelectedIndex(
+     std::variant<tabs::DanglingUntriagedTabInterface,
+                  tabs::DanglingUntriagedTabCollection> tab_or_collection)
+@@ -5945,21 +5954,31 @@ std::optional<int> TabStripModel::DetermineNewSelectedIndex(
+   const gfx::Range block_tabs =
+       gfx::Range(start_index, start_index + block_size);
+ 
++  // Meridian: first only the tabs that closing this block may show (its
++  // space's).
++  tabs::TabInterface* const closing = GetTabAtIndex(start_index);
++  bool same_space = false;
++
+   // Applies the ranked preferences in order, considering only the tabs that the
+   // caller deems selectable. `focused_group` restricts the candidates to the
+   // tabs the user is allowed to activate while that group is focused; when it
+   // is nullopt every tab outside the block is a candidate.
+   auto find_candidate =
+-      [this, &block_tabs, start_index, block_size,
+-       &tab_or_collection](std::optional<tab_groups::TabGroupId> focused_group)
++      [this, &block_tabs, start_index, block_size, &tab_or_collection, closing,
++       &same_space](std::optional<tab_groups::TabGroupId> focused_group)
+       -> std::optional<int> {
+     // Focus mode is the only restriction that applies to a tab which is
+     // otherwise a legitimate selection, so it is kept separate from the
+     // visibility check below.
+-    auto is_valid_for_focus = [this, &focused_group](int index) {
++    auto is_valid_for_focus = [this, &focused_group, closing,
++                               &same_space](int index) {
+       if (!ContainsIndex(index)) {
+         return false;
+       }
++      if (same_space &&
++          !g_selectable_after_close(closing, GetTabAtIndex(index))) {
++        return false;
++      }
+       return !focused_group.has_value() ||
+              tabs::TabStripModelSelectionState::IsTabValidInFocusedGroup(
+                  GetTabAtIndex(index), focused_group);
+@@ -6050,7 +6069,15 @@ std::optional<int> TabStripModel::DetermineNewSelectedIndex(
+   // focused group is closing and there are no pinned tabs), focus mode is
+   // ending so retry across all tabs.
+   const std::optional<tab_groups::TabGroupId> focused_group = GetFocusedGroup();
+-  std::optional<int> new_selected_index = find_candidate(focused_group);
++  std::optional<int> new_selected_index;
++  if (g_selectable_after_close) {
++    same_space = true;
++    new_selected_index = find_candidate(focused_group);
++    same_space = false;
++  }
++  if (!new_selected_index.has_value()) {
++    new_selected_index = find_candidate(focused_group);
++  }
+   if (!new_selected_index.has_value() && focused_group.has_value()) {
+     new_selected_index = find_candidate(std::nullopt);
+   }
+diff --git a/chrome/browser/ui/tabs/tab_strip_model.h b/chrome/browser/ui/tabs/tab_strip_model.h
+index 8fae54e33d..57a1116f8f 100644
+--- a/chrome/browser/ui/tabs/tab_strip_model.h
++++ b/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -207,6 +207,13 @@ class TabStripModel {
+ 
+   static constexpr int kNoTab = tab_list::kNoTabIndex;
+ 
++  // Meridian: which tabs closing the active tab may show next (the tabs of its
++  // space: the window's one strip holds every space's tabs). The others only
++  // when none of those is left.
++  using SelectableAfterClose = bool (*)(tabs::TabInterface* closing,
++                                        tabs::TabInterface* candidate);
++  static void SetSelectableAfterClose(SelectableAfterClose selectable);
++
+   TabStripModel() = delete;
+ 
+   // Construct a TabStripModel with a delegate to help it do certain things

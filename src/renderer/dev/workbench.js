@@ -797,6 +797,172 @@ function newXterm() {
   return { xterm, fit };
 }
 
+// Scrolling as in a Mac app: the lines follow the fingers at a steady rate. xterm hands a program
+// that takes the mouse (a full-screen agent) slow trackpad moves at a third of their size and quick
+// ones whole, so the scroll crawled, then jumped. `terminal.scrollSpeed` in settings.json sets the
+// rate; ⌥ scrolls five times faster.
+const synthetic = new WeakSet();
+function scrollSpeed() {
+  // eslint-disable-next-line no-undef
+  const v = typeof proTerminalOptions === 'function' ? proTerminalOptions().scrollSpeed : undefined;
+  return v > 0 ? v : 1;
+}
+function termWheel(t, e) {
+  if (synthetic.has(e) || e.deltaMode !== WheelEvent.DOM_DELTA_PIXEL || !e.deltaY) return true;
+  const ownMouse = t.xterm.modes.mouseTrackingMode !== 'none' || t.xterm.buffer.active.type === 'alternate';
+  if (!ownMouse) {
+    t.xterm.options.scrollSensitivity = scrollSpeed();
+    return true;
+  }
+  const lineHeight = t.el.querySelector('.xterm-screen')?.getBoundingClientRect().height / t.xterm.rows || 16;
+  t.wheelRest = (t.wheelRest || 0) + (e.deltaY / lineHeight) * scrollSpeed() * (e.altKey ? 5 : 1);
+  const lines = Math.trunc(t.wheelRest);
+  t.wheelRest -= lines;
+  // The same wheel a line at a time: xterm tells the program one line for each wheel event.
+  for (let i = 0; i < Math.min(Math.abs(lines), 300); i++) {
+    const ev = new WheelEvent('wheel', { deltaY: Math.sign(lines), deltaMode: WheelEvent.DOM_DELTA_LINE, clientX: e.clientX, clientY: e.clientY, bubbles: true, cancelable: true });
+    synthetic.add(ev);
+    e.target.dispatchEvent(ev);
+  }
+  e.preventDefault();
+  return false;
+}
+
+// Links in what programs print: web addresses open in a tab next to this one; a project file
+// (src/app.ts, src/app.ts:42, ./README.md:3:7) opens in the editor at its line.
+const URL_RE = /\bhttps?:\/\/[^\s<>"'`]+/g;
+const FILE_RE = /(?:^|[\s('"`[])((?:\.{1,2}\/|\/)?[\w@.-]+(?:\/[\w@.-]+)*\.[A-Za-z0-9]{1,8})(?::(\d+))?(?::(\d+))?/g;
+function termLinks(t) {
+  return {
+    provideLinks(y, done) {
+      const buf = t.xterm.buffer.active;
+      // The whole logical line: a long address wraps over several rows.
+      let first = y - 1;
+      while (first > 0 && buf.getLine(first)?.isWrapped) first--;
+      let last = y - 1;
+      while (buf.getLine(last + 1)?.isWrapped) last++;
+      const cols = t.xterm.cols;
+      let text = '';
+      for (let i = first; i <= last; i++) text += (buf.getLine(i)?.translateToString(i === last) || '').padEnd(i === last ? 0 : cols);
+      const at = (offset) => ({ x: (offset % cols) + 1, y: first + Math.floor(offset / cols) + 1 });
+      const range = (start, length) => ({ start: at(start), end: at(start + length - 1) });
+      const onRow = (r) => r.start.y <= y && r.end.y >= y;
+      const links = [];
+      for (const m of text.matchAll(URL_RE)) {
+        // Not the sentence's full stop or closing bracket (a bracket the address opened stays).
+        let url = m[0].replace(/[.,;:!?'"]+$/, '');
+        while (/[)\]}>]$/.test(url) && (url.match(/[([{<]/g) || []).length < (url.match(/[)\]}>]/g) || []).length) url = url.slice(0, -1).replace(/[.,;:!?'"]+$/, '');
+        const r = range(m.index, url.length);
+        if (onRow(r)) links.push({ range: r, text: url, open: () => wb.toHost({ type: 'link', url }), activate: () => {} });
+      }
+      const files = [];
+      for (const m of text.matchAll(FILE_RE)) {
+        if (/^https?:/.test(text.slice(Math.max(0, m.index - 8), m.index + 1)) || m[1].includes('//')) continue;
+        const start = m.index + m[0].indexOf(m[1]);
+        const length = m[0].length - (start - m.index);
+        const r = range(start, length);
+        if (onRow(r) && !links.some((l) => l.range.start.y === r.start.y && l.range.start.x <= r.start.x && l.range.end.x >= r.end.x)) files.push({ r, path: m[1], line: +m[2] || 0, col: +m[3] || 0 });
+      }
+      if (!files.length || !S.project) return done(links.length ? links : undefined);
+      // Only paths that are files of the project.
+      const root = S.project.root.replace(/\/$/, '') + '/';
+      Promise.all(files.map(async (f) => {
+        let rel = f.path.startsWith(root) ? f.path.slice(root.length) : f.path.replace(/^\.\//, '');
+        if (rel.startsWith('/') || rel.startsWith('../')) return null;
+        const st = await wb.stat(rel).catch(() => null);
+        return st?.exists && !st.dir ? { range: f.r, text: f.path, open: () => openFileAt(rel, f.line, f.col), activate: () => {} } : null;
+      })).then((found) => {
+        const all = links.concat(found.filter(Boolean));
+        done(all.length ? all : undefined);
+      });
+    },
+  };
+}
+// A click opens the link under it. Not xterm's own activation: a click that focuses the terminal
+// (back from another tab) redraws it, and xterm forgets the link it was over.
+function termLinkClicks(t, provider) {
+  let down = null;
+  t.el.addEventListener('mousedown', (e) => { down = e.button === 0 ? { x: e.clientX, y: e.clientY } : null; }, true);
+  t.el.addEventListener('mouseup', (e) => {
+    if (!down || e.button !== 0 || Math.hypot(e.clientX - down.x, e.clientY - down.y) > 4 || t.xterm.hasSelection()) return;
+    // A program that takes the mouse gets plain clicks; ⌘-click still opens.
+    if (t.xterm.modes.mouseTrackingMode !== 'none' && !e.metaKey) return;
+    const screen = t.el.querySelector('.xterm-screen')?.getBoundingClientRect();
+    const cell = t.xterm._core._renderService?.dimensions?.css?.cell;
+    if (!screen || !cell?.width) return;
+    const x = Math.floor((e.clientX - screen.left) / cell.width) + 1;
+    const row = Math.floor((e.clientY - screen.top) / cell.height);
+    if (x < 1 || row < 0 || row >= t.xterm.rows) return;
+    const y = t.xterm.buffer.active.viewportY + row + 1;
+    provider.provideLinks(y, (links) => {
+      const hit = (links || []).find((l) => {
+        const { start: a, end: b } = l.range;
+        return (y > a.y || (y === a.y && x >= a.x)) && (y < b.y || (y === b.y && x <= b.x));
+      });
+      hit?.open();
+    });
+  }, true);
+}
+async function openFileAt(rel, line, col) {
+  const tab = await openFile(rel, { focus: true });
+  if (tab?.model && S.editor && line) {
+    const pos = { lineNumber: line, column: col || 1 };
+    S.editor.setPosition(pos);
+    S.editor.revealPositionInCenter(pos);
+  }
+}
+
+// Files dropped on a terminal, or an image pasted with ⌘V: their paths are typed into it, as
+// Warp and iTerm do; Claude Code attaches an image from its path. A file with no path (an image
+// from a page, a screenshot copied to the clipboard) is saved first.
+// A path as the shell takes it: a backslash before each special on the Mac and Linux; on Windows
+// (PowerShell, cmd) in double quotes when it has a space or a special, its backslashes kept.
+const shellQuote = (p) => (wb.platform !== 'win32' ? p.replace(/([^\w@%+=:,./-])/g, '\\$1') : /[^\w@%+=:,./\\-]/.test(p) ? `"${p}"` : p);
+async function pathsOf(t, files, dropped) {
+  let paths = dropped ? await wb.droppedPaths(files.map((f) => ({ name: f.name, size: f.size }))).catch(() => []) : [];
+  if (paths.length !== files.length) {
+    paths = [];
+    for (const f of files) {
+      if (!f.size || f.size > 50 * 1024 * 1024) continue;
+      const bytes = new Uint8Array(await f.arrayBuffer());
+      let bin = '';
+      for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      const name = f.name && f.name !== 'image.png' ? f.name : `pasted-${Date.now()}.${(f.type.split('/')[1] || 'png').replace('jpeg', 'jpg')}`;
+      const saved = await wb.saveDrop(name, btoa(bin)).catch(() => null);
+      if (saved) paths.push(saved);
+    }
+  }
+  if (paths.length && !t.exited) t.xterm.paste(paths.map(shellQuote).join(' ') + ' ');
+  t.xterm.focus();
+}
+function termDrops(t) {
+  const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
+  t.el.addEventListener('dragover', (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    t.el.classList.add('drop-target');
+  });
+  t.el.addEventListener('dragleave', () => t.el.classList.remove('drop-target'));
+  t.el.addEventListener('drop', (e) => {
+    t.el.classList.remove('drop-target');
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    pathsOf(t, [...e.dataTransfer.files], true);
+  });
+  // ⌘V with only an image on the clipboard (a screenshot): its saved path. Text pastes as before.
+  t.el.addEventListener('paste', (e) => {
+    const cd = e.clipboardData;
+    if (!cd || cd.getData('text/plain')) return;
+    const images = [...cd.files].filter((f) => f.type.startsWith('image/'));
+    if (!images.length) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    pathsOf(t, images, false);
+  }, true);
+}
+
 function mountTerm(info) {
   const el = document.createElement('div');
   el.className = 'term hidden';
@@ -809,8 +975,18 @@ function mountTerm(info) {
   xterm.onData((data) => { if (!t.exited) wb.ptyWrite(t.id, data); else if (data === '\r') restartTerm(t); });
   xterm.attachCustomKeyEventHandler((e) => {
     if (e.type === 'keydown' && (IS_MAC ? e.metaKey : e.ctrlKey && e.shiftKey) && e.key.toLowerCase() === 'k') { xterm.clear(); return false; }
+    // ⇧↩ is a new line in the prompt, not Enter (Claude Code, Codex): ESC ↩, as Warp and iTerm send.
+    if (e.key === 'Enter' && e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      if (e.type === 'keydown' && !t.exited) wb.ptyWrite(t.id, '\x1b\r');
+      return false;
+    }
     return true;
   });
+  xterm.attachCustomWheelEventHandler((e) => termWheel(t, e));
+  const links = termLinks(t);
+  xterm.registerLinkProvider(links);
+  termLinkClicks(t, links);
+  termDrops(t);
   xterm.onResize(({ cols, rows }) => { if (!t.exited) wb.ptyResize(t.id, cols, rows); });
   S.terms.push(t);
   return t;

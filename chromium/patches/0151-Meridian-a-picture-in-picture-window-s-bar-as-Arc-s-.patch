@@ -1,0 +1,447 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Mon, 16 Nov 2026 20:12:23 +0400
+Subject: [PATCH 152/152] Meridian: a picture-in-picture window's bar as Arc's:
+ Back to Tab, the site's name in the middle, Close
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   2 +
+ chrome/browser/meridian/sidebar.mojom         |   3 +
+ chrome/browser/meridian/sidebar_handler.cc    |  55 +++++++
+ chrome/browser/meridian/sidebar_handler.h     |   1 +
+ .../browser/meridian/sidebar_handler_mac.mm   |   5 +
+ .../picture_in_picture_browser_frame_view.cc  | 155 ++++++++++++------
+ .../picture_in_picture_browser_frame_view.h   |   3 +-
+ components/vector_icons/BUILD.gn              |   1 +
+ components/vector_icons/north_west_arrow.icon |  16 ++
+ 9 files changed, 193 insertions(+), 48 deletions(-)
+ create mode 100644 components/vector_icons/north_west_arrow.icon
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 8671038120..5a8e4f69f4 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -358,6 +358,8 @@ source_set("meridian") {
+     ":ai_providers",
+     ":workbench_core",
+     "//chrome/browser/ui/tab_contents",
++    "//ui/compositor",
++    "//ui/gfx/codec",
+     "//ui/base/clipboard",
+     "//services/media_session/public/cpp",
+     "//services/media_session/public/mojom",
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 09ffa7a64b..31721ccbe8 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -585,6 +585,9 @@ interface SidebarHandler {
+   // picture), each "Class allSpaces=0|1 fullScreenSpaces=0|1 top=<hit test
+   // 12px under the top edge, mid-width> page=<hit test 40% down>".
+   TestFloatingWindows() => (array<string> windows);
++  // Tests (--meridian-test-keys): a picture of the first document
++  // picture-in-picture window, frame and page (PNG, base64; empty if none).
++  TestFloatingWindowShot() => (string png_base64);
+ 
+   // Split view: the active tab and `other` side by side (⌃⇧=), back to one
+   // (⌃⇧-), and the divider position.
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 7e8cb3c438..6f54e2b83a 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -119,6 +119,12 @@
+ #include "ui/views/bubble/bubble_dialog_delegate_view.h"
+ #include "ui/views/view_utils.h"
+ #include "ui/views/widget/widget.h"
++#include "ui/gfx/codec/png_codec.h"
++#include "ui/compositor/compositor.h"
++#include "ui/compositor/layer.h"
++#include "components/viz/common/frame_sinks/copy_output_result.h"
++#include "components/viz/common/frame_sinks/copy_output_request.h"
++#include "base/base64.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "ui/views/widget/widget_delegate.h"
+ #include "ui/views/window/client_view.h"
+@@ -2995,6 +3001,11 @@ void SidebarHandler::TestFloatingWindows(
+         line += " page=" +
+                 base::NumberToString(widget->GetNonClientComponent(gfx::Point(
+                     size.width() / 2, size.height() * 2 / 5)));
++        // The bar's buttons (Back to Tab at the left, Close at the right).
++        line += " back=" + base::NumberToString(widget->GetNonClientComponent(
++                               gfx::Point(24, 22)));
++        line += " close=" + base::NumberToString(widget->GetNonClientComponent(
++                                gfx::Point(size.width() - 24, 22)));
+         out.push_back(std::move(line));
+         return true;
+       });
+@@ -3035,4 +3046,48 @@ void SidebarHandler::SetDefaultBrowser(SetDefaultBrowserCallback callback) {
+ }
+ #endif
+ 
++void SidebarHandler::TestFloatingWindowShot(
++    TestFloatingWindowShotCallback callback) {
++  views::Widget* widget = nullptr;
++  if (HasTestSwitch("meridian-test-keys")) {
++    ForEachCurrentBrowserWindowInterfaceOrderedByActivation(
++        [&](BrowserWindowInterface* b) {
++          if (b->GetType() == BrowserWindowInterface::Type::TYPE_FLOATING &&
++              b->GetWindow()) {
++            widget = views::Widget::GetWidgetForNativeWindow(
++                b->GetWindow()->GetNativeWindow());
++          }
++          return !widget;
++        });
++  }
++  if (!widget || !widget->GetLayer()) {
++    std::move(callback).Run(std::string());
++    return;
++  }
++  // The compositor's own picture of the window: no screen capture involved.
++  widget->GetLayer()->RequestCopyOfOutput(std::make_unique<
++                                          viz::CopyOutputRequest>(
++      viz::CopyOutputRequest::ResultFormat::RGBA,
++      viz::CopyOutputRequest::ResultDestination::kSystemMemory,
++      base::BindOnce(
++          [](TestFloatingWindowShotCallback callback,
++             std::unique_ptr<viz::CopyOutputResult> result) {
++            if (result->IsEmpty()) {
++              std::move(callback).Run(std::string());
++              return;
++            }
++            auto access = result->ScopedAccessSkBitmap();
++            std::optional<std::vector<uint8_t>> png =
++                gfx::PNGCodec::EncodeBGRASkBitmap(access.GetOutScopedBitmap(),
++                                                  /*discard_transparency=*/true);
++            std::move(callback).Run(png ? base::Base64Encode(*png)
++                                        : std::string());
++          },
++          std::move(callback))));
++  // A frame to copy, though nothing in the window changed.
++  if (ui::Compositor* compositor = widget->GetCompositor()) {
++    compositor->ScheduleFullRedraw();
++  }
++}
++
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 4510cdf6fe..4b8b864176 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -163,6 +163,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void TestCommand(int32_t command_id) override;
+   void TestWindowState(TestWindowStateCallback callback) override;
+   void TestFloatingWindows(TestFloatingWindowsCallback callback) override;
++  void TestFloatingWindowShot(TestFloatingWindowShotCallback callback) override;
+   void SwitchKeyboardLayout(const std::string& language) override;
+   void CopyLink() override;
+   void TestKeyPress(uint16_t key_code,
+diff --git a/chrome/browser/meridian/sidebar_handler_mac.mm b/chrome/browser/meridian/sidebar_handler_mac.mm
+index f20e3ef1e6..486044a915 100644
+--- a/chrome/browser/meridian/sidebar_handler_mac.mm
++++ b/chrome/browser/meridian/sidebar_handler_mac.mm
+@@ -76,6 +76,11 @@ void SidebarHandler::TestFloatingWindows(
+                           gfx::Point(size.width() / 2, 12)));
+     line += " page=" + base::NumberToString(widget->GetNonClientComponent(
+                            gfx::Point(size.width() / 2, size.height() * 2 / 5)));
++    // The bar's buttons (Back to Tab at the left, Close at the right).
++    line += " back=" + base::NumberToString(
++                           widget->GetNonClientComponent(gfx::Point(24, 22)));
++    line += " close=" + base::NumberToString(widget->GetNonClientComponent(
++                            gfx::Point(size.width() - 24, 22)));
+     out.push_back(std::move(line));
+   }
+   std::move(callback).Run(std::move(out));
+diff --git a/chrome/browser/ui/views/frame/picture_in_picture_browser_frame_view.cc b/chrome/browser/ui/views/frame/picture_in_picture_browser_frame_view.cc
+index 454bc05a5d..b7ad8a05ee 100644
+--- a/chrome/browser/ui/views/frame/picture_in_picture_browser_frame_view.cc
++++ b/chrome/browser/ui/views/frame/picture_in_picture_browser_frame_view.cc
+@@ -50,7 +50,11 @@
+ #include "ui/gfx/geometry/insets.h"
+ #include "ui/gfx/text_constants.h"
+ #include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/background.h"
++#include "ui/views/border.h"
+ #include "ui/views/bubble/bubble_dialog_delegate_view.h"
++#include "ui/views/controls/button/label_button.h"
++#include "ui/views/controls/highlight_path_generator.h"
+ #include "ui/views/event_monitor.h"
+ #include "ui/views/layout/animating_layout_manager.h"
+ #include "ui/views/layout/flex_layout_view.h"
+@@ -80,37 +84,66 @@ constexpr int kWindowIconImageSize = 16;
+ constexpr int kBackToTabImageSize = 16;
+ constexpr int kContentSettingIconSize = 16;
+ 
+-// The height of the controls bar at the top of the window.
+-constexpr int kTopControlsHeight = 34;
++// The height of the controls bar at the top of the window. Meridian: Arc's,
++// taller, for its buttons with words.
++constexpr int kTopControlsHeight = 44;
++// Meridian: narrower than this, "Back to Tab" is only its arrow, and narrower
++// still, "Close" only its cross (as in Arc).
++constexpr int kBackWordMinWidth = 380;
++constexpr int kCloseWordMinWidth = 240;
+ // The vertical margin for IconLabelBubbleView to have 24px height.
+ constexpr int KIconViewVerticalMargin = 5;
+ 
+ constexpr int kResizeBorder = 10;
+ constexpr int kResizeAreaCornerSize = 16;
+ 
+-class BackToTabButton : public OverlayWindowImageButton {
+-  METADATA_HEADER(BackToTabButton, OverlayWindowImageButton)
++// Meridian: the bar's buttons as Arc's: an icon and a word on a soft pill
++// ("Back to Tab", "Close"); a narrow window shows only the icon.
++class PillButton : public views::LabelButton {
++  METADATA_HEADER(PillButton, views::LabelButton)
+ 
+  public:
+-  explicit BackToTabButton(PressedCallback callback)
+-      : OverlayWindowImageButton(std::move(callback)) {
+-    auto* icon = &(features::IsRoundedIconsEnabled()
+-                       ? vector_icons::kBackToTabIcon
+-                       : vector_icons::kBackToTabChromeRefreshOldIcon);
++  PillButton(PressedCallback callback,
++             const gfx::VectorIcon& icon,
++             std::u16string text)
++      : views::LabelButton(std::move(callback), text), text_(std::move(text)) {
+     SetImageModel(views::Button::STATE_NORMAL,
+                   ui::ImageModel::FromVectorIcon(
+-                      *icon, kColorPipWindowForeground, kBackToTabImageSize));
++                      icon, kColorPipWindowForeground, kBackToTabImageSize));
++    SetEnabledTextColors(kColorPipWindowForeground);
++    SetImageLabelSpacing(6);
++    SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(6, 10)));
++    label()->SetFontList(
++        label()->font_list().DeriveWithWeight(gfx::Font::Weight::SEMIBOLD));
++    SetTooltipText(text_);
++    GetViewAccessibility().SetName(text_);
++    views::InstallRoundRectHighlightPathGenerator(this, gfx::Insets(), 7);
++  }
++  PillButton(const PillButton&) = delete;
++  PillButton& operator=(const PillButton&) = delete;
++  ~PillButton() override = default;
++
++  void SetShowsWord(bool shows) {
++    if (shows == !GetText().empty()) {
++      return;
++    }
++    SetText(shows ? text_ : std::u16string());
++    SetImageLabelSpacing(shows ? 6 : 0);
++    SetBorder(views::CreateEmptyBorder(gfx::Insets::VH(6, shows ? 10 : 7)));
++  }
+ 
+-    const std::u16string back_to_tab_button_label = l10n_util::GetStringUTF16(
+-        IDS_PICTURE_IN_PICTURE_BACK_TO_TAB_CONTROL_TEXT);
+-    SetTooltipText(back_to_tab_button_label);
++  void OnThemeChanged() override {
++    views::LabelButton::OnThemeChanged();
++    const SkColor fg =
++        GetColorProvider()->GetColor(kColorPipWindowForeground);
++    SetBackground(views::CreateRoundedRectBackground(SkColorSetA(fg, 0x24), 7));
+   }
+-  BackToTabButton(const BackToTabButton&) = delete;
+-  BackToTabButton& operator=(const BackToTabButton&) = delete;
+-  ~BackToTabButton() override = default;
++
++ private:
++  const std::u16string text_;
+ };
+ 
+-BEGIN_METADATA(BackToTabButton)
++BEGIN_METADATA(PillButton)
+ END_METADATA
+ 
+ // Helper class for observing mouse and key events from native window.
+@@ -225,6 +258,8 @@ PictureInPictureBrowserFrameView::PictureInPictureBrowserFrameView(
+   location_icon_view_->SetProperty(
+       views::kMarginsKey, gfx::Insets::TLBR(KIconViewVerticalMargin, 8,
+                                             KIconViewVerticalMargin, 4));
++  // Meridian: Arc's bar has no page info button, only the site's name.
++  location_icon_view_->SetVisible(false);
+ 
+   // For file URLs, we want to elide the tail, since the file name and/or query
+   // part of the file URL can be made to look like an origin for spoofing. For
+@@ -254,7 +289,7 @@ PictureInPictureBrowserFrameView::PictureInPictureBrowserFrameView(
+               views::style::CONTEXT_LABEL, views::style::STYLE_PRIMARY,
+               gfx::DirectionalityMode::DIRECTIONALITY_AS_URL))
+           .CopyAddressTo(&window_title_)
+-          .SetHorizontalAlignment(gfx::ALIGN_LEFT)
++          .SetHorizontalAlignment(gfx::ALIGN_CENTER)
+           .SetElideBehavior(elide_behavior)
+           .SetProperty(
+               views::kFlexBehaviorKey,
+@@ -263,6 +298,9 @@ PictureInPictureBrowserFrameView::PictureInPictureBrowserFrameView(
+                                        views::MaximumFlexSizeRule::kUnbounded))
+           .Build());
+ 
++  window_title_->SetFontList(window_title_->font_list().DeriveWithWeight(
++      gfx::Font::Weight::SEMIBOLD));
++  window_title_->SetProperty(views::kMarginsKey, gfx::Insets::VH(0, 8));
+   window_title_->SetBackgroundColor(kColorPipWindowTopBarBackground);
+   window_title_->SetEnabledColor(kColorPipWindowForeground);
+ 
+@@ -308,26 +346,37 @@ PictureInPictureBrowserFrameView::PictureInPictureBrowserFrameView(
+     const std::optional<blink::mojom::PictureInPictureWindowOptions>
+         pip_options = browser_view->GetDocumentPictureInPictureOptions();
+     if (!pip_options.has_value() || !pip_options->disallow_return_to_opener) {
+-      back_to_tab_button_ = button_container_view_->AddChildView(
+-          std::make_unique<BackToTabButton>(base::BindRepeating(
+-              [](PictureInPictureBrowserFrameView* frame_view) {
+-                DefinitelyExitPictureInPicture(
+-                    *frame_view, PictureInPictureWindowManager::UiBehavior::
+-                                     kCloseWindowAndFocusOpener);
+-              },
+-              base::Unretained(this))));
++      // Meridian: on the left, as in Arc.
++      back_to_tab_button_ = top_bar_container_view_->AddChildViewAt(
++          std::make_unique<PillButton>(
++              base::BindRepeating(
++                  [](PictureInPictureBrowserFrameView* frame_view) {
++                    DefinitelyExitPictureInPicture(
++                        *frame_view, PictureInPictureWindowManager::UiBehavior::
++                                         kCloseWindowAndFocusOpener);
++                  },
++                  base::Unretained(this)),
++              vector_icons::kNorthWestArrowIcon, u"Back to Tab"),
++          0);
++      back_to_tab_button_->SetProperty(views::kMarginsKey,
++                                       gfx::Insets::TLBR(0, 8, 0, 0));
+     }
+   }
+ 
+   // Creates the close button.
+   close_image_button_ = button_container_view_->AddChildView(
+-      std::make_unique<CloseImageButton>(base::BindRepeating(
+-          [](PictureInPictureBrowserFrameView* frame_view) {
+-            DefinitelyExitPictureInPicture(
+-                *frame_view,
+-                PictureInPictureWindowManager::UiBehavior::kCloseWindowOnly);
+-          },
+-          base::Unretained(this))));
++      std::make_unique<PillButton>(
++          base::BindRepeating(
++              [](PictureInPictureBrowserFrameView* frame_view) {
++                DefinitelyExitPictureInPicture(
++                    *frame_view, PictureInPictureWindowManager::UiBehavior::
++                                     kCloseWindowOnly);
++              },
++              base::Unretained(this)),
++          features::IsRoundedIconsEnabled()
++              ? vector_icons::kCloseIcon
++              : vector_icons::kCloseChromeRefreshOldIcon,
++          u"Close"));
+ 
+   // Creates the controller that owns and drives the top-bar hover animations,
+   // now that the buttons and content-setting views it references exist. It
+@@ -539,6 +588,28 @@ void PictureInPictureBrowserFrameView::Layout(PassKey) {
+   content_area.Inset(FrameBorderInsets());
+   gfx::Rect top_bar = content_area;
+   top_bar.set_height(kTopControlsHeight);
++  // Meridian: the buttons' words when there's room; the site's name in the
++  // middle of the window, not of the space between the buttons.
++  if (back_to_tab_button_) {
++    static_cast<PillButton*>(back_to_tab_button_.get())
++        ->SetShowsWord(top_bar.width() >= kBackWordMinWidth);
++  }
++  static_cast<PillButton*>(close_image_button_.get())
++      ->SetShowsWord(top_bar.width() >= kCloseWordMinWidth);
++  const int left = back_to_tab_button_
++                       ? back_to_tab_button_->GetPreferredSize().width() + 8
++                       : 0;
++  const gfx::Insets* right_margins =
++      button_container_view_->GetProperty(views::kMarginsKey);
++  const int right = button_container_view_->GetPreferredSize().width() +
++                    (right_margins ? right_margins->width() : 0);
++  const gfx::Insets title_margins =
++      gfx::Insets::TLBR(0, 8 + std::max(0, right - left), 0,
++                        8 + std::max(0, left - right));
++  const gfx::Insets* current = window_title_->GetProperty(views::kMarginsKey);
++  if (!current || *current != title_margins) {
++    window_title_->SetProperty(views::kMarginsKey, title_margins);
++  }
+   top_bar_container_view_->SetBoundsRect(top_bar);
+ #if !BUILDFLAG(IS_ANDROID)
+   if (auto_pip_setting_overlay_) {
+@@ -981,7 +1052,7 @@ gfx::Rect PictureInPictureBrowserFrameView::GetBackToTabControlsBounds() const {
+     return gfx::Rect();
+   }
+   return ConvertTopBarControlViewBounds(back_to_tab_button_,
+-                                        button_container_view_);
++                                        top_bar_container_view_);
+ }
+ 
+ gfx::Rect PictureInPictureBrowserFrameView::GetCloseControlsBounds() const {
+@@ -995,22 +1066,12 @@ LocationIconView* PictureInPictureBrowserFrameView::GetLocationIconView() {
+ }
+ 
+ void PictureInPictureBrowserFrameView::UpdateContentSettingsIcons() {
+-  const auto kButtonContainerViewWithCameraButtonInsets = gfx::Insets::TLBR(
+-      0, 0, 0, GetLayoutConstant(LayoutConstant::kTabAfterTitlePadding));
+-  const auto kButtonContainerViewInsets = gfx::Insets::VH(
+-      0, GetLayoutConstant(LayoutConstant::kTabAfterTitlePadding));
+-
+   for (ContentSettingImageView* view : content_setting_views_) {
+     view->Update();
+ 
+-    // Currently the only content setting view we have is for camera and
+-    // microphone settings, and we add margin insets based on its visibility to
+-    // the button container view to be consistent with the normal browser
+-    // window.
+-    button_container_view_->SetProperty(
+-        views::kMarginsKey,
+-        (view->GetVisible() ? kButtonContainerViewWithCameraButtonInsets
+-                            : kButtonContainerViewInsets));
++    // Meridian: Arc's 8px from the edge, the camera icon or not.
++    button_container_view_->SetProperty(views::kMarginsKey,
++                                        gfx::Insets::TLBR(0, 0, 0, 8));
+   }
+ }
+ 
+diff --git a/chrome/browser/ui/views/frame/picture_in_picture_browser_frame_view.h b/chrome/browser/ui/views/frame/picture_in_picture_browser_frame_view.h
+index 6f9d288af3..ff1f2189ff 100644
+--- a/chrome/browser/ui/views/frame/picture_in_picture_browser_frame_view.h
++++ b/chrome/browser/ui/views/frame/picture_in_picture_browser_frame_view.h
+@@ -269,7 +269,8 @@ class PictureInPictureBrowserFrameView
+   std::vector<raw_ptr<ContentSettingImageView, VectorExperimental>>
+       content_setting_views_;
+ 
+-  raw_ptr<CloseImageButton> close_image_button_ = nullptr;
++  // Meridian: Arc's "Close" (a PillButton).
++  raw_ptr<views::View> close_image_button_ = nullptr;
+   raw_ptr<views::View> back_to_tab_button_ = nullptr;
+ 
+   base::ScopedObservation<views::Widget, views::WidgetObserver>
+diff --git a/components/vector_icons/BUILD.gn b/components/vector_icons/BUILD.gn
+index 23cdbe1d87..aa1d3abc78 100644
+--- a/components/vector_icons/BUILD.gn
++++ b/components/vector_icons/BUILD.gn
+@@ -317,6 +317,7 @@ if (current_toolchain == default_toolchain) {
+       "notifications_off.icon",
+       "notifications_off_chrome_refresh_old.icon",
+       "notifications_old.icon",
++      "north_west_arrow.icon",
+       "open_in_new_flippable.icon",
+       "open_in_new_off.icon",
+       "page_info_content_paste_old.icon",
+diff --git a/components/vector_icons/north_west_arrow.icon b/components/vector_icons/north_west_arrow.icon
+new file mode 100644
+index 0000000000..1782e9ebfc
+--- /dev/null
++++ b/components/vector_icons/north_west_arrow.icon
+@@ -0,0 +1,16 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Meridian: "Back to Tab" in a picture-in-picture window, as Arc's (↖).
++CANVAS_DIMENSIONS, 960,
++MOVE_TO, 760, 760,
++LINE_TO, 296, 296,
++V_LINE_TO, 560,
++H_LINE_TO, 216,
++V_LINE_TO, 160,
++H_LINE_TO, 616,
++V_LINE_TO, 240,
++H_LINE_TO, 352,
++LINE_TO, 816, 704,
++CLOSE

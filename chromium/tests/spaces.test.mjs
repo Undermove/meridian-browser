@@ -279,3 +279,58 @@ test('starting on a space whose tab isn\'t shown: its tab comes up; its pinned t
     } finally { await b.close(); }
   } finally { server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
+
+// Closing a tab never leaves its space (Arc): the next tab is one of this space's, though the
+// window's one tab strip holds every space's tabs and the neighbour there is another space's.
+test('⌘W in a space shows the next tab of that space, never another space\'s', async () => {
+  const http = await import('node:http');
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(`<title>${req.url.slice(1)}</title>`); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const u = (p) => `http://127.0.0.1:${server.address().port}/${p}`;
+  const T = 'app.$.tabstrip';
+  const CMD = 1 << 20;
+  const active = (b) => b.eval(`[...${T}.tabs_.values()].find((t) => t.isActive)?.title`);
+  const open = async (b, p) => {
+    await b.eval(`${T}.openUrl(${JSON.stringify(u(p))})`);
+    await b.waitFor(`[...${T}.tabs_.values()].find((t) => t.isActive)?.title === ${JSON.stringify(p)}`);
+  };
+  const b = await launch([u('home')], { args: ['--meridian-test-keys'] });
+  try {
+    await b.waitFor(todayCount(1));
+    const personal = await b.eval(`${T}.state_.spaces[0].id`);
+    const { spaceId: work } = await b.eval(`${T}.handler_.createSpace('Work', '', '', '')`);
+    await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(work)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(work)}`);
+    await open(b, 'w1');
+    await open(b, 'w2');
+    // A Personal tab after them in the strip, then one more Work tab after it.
+    await b.click(`${SB}.querySelectorAll('.space-dot')[0]`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(personal)}`);
+    await open(b, 'p2');
+    await b.click(`${SB}.querySelectorAll('.space-dot')[1]`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(work)}`);
+    await open(b, 'w3');
+    for (const closing of ['w3', 'w2']) {
+      assert.equal(await active(b), closing);
+      await b.shortcut(13, 'w', CMD);  // ⌘W
+      await b.waitFor(`![...${T}.tabs_.values()].some((t) => t.title === ${JSON.stringify(closing)})`);
+      await new Promise((r) => setTimeout(r, 500));
+      assert.equal(await b.eval(`${T}.state_.activeSpaceId`), work, `still in Work after closing ${closing}`);
+      const shown = await active(b);
+      const space = await b.eval(`${T}.state_.tabs.find((t) => t.tabId === [...${T}.tabs_.values()].find((x) => x.isActive)?.id)?.spaceId`);
+      assert.equal(space, work, `the tab shown after closing ${closing} (${shown}) is Work's`);
+    }
+    // Work's last tabs close too: Work stays, with a new tab, and Personal keeps its own.
+    const workTabs = () => b.eval(`${T}.state_.tabs.filter((t) => t.spaceId === ${JSON.stringify(work)}).length`);
+    for (let left = await workTabs(); left > 0; left--) {
+      const closing = await b.eval(`[...${T}.tabs_.values()].find((t) => t.isActive)?.id`);
+      await b.shortcut(13, 'w', CMD);  // ⌘W
+      await b.waitFor(`![...${T}.tabs_.values()].some((t) => t.id === ${JSON.stringify(closing)})`);
+    }
+    await b.waitFor(`${T}.state_.tabs.find((t) => t.tabId === [...${T}.tabs_.values()].find((x) => x.isActive)?.id)?.spaceId === ${JSON.stringify(work)}`);
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(await b.eval(`${T}.state_.activeSpaceId`), work, 'still in Work after its last tab');
+    assert.equal(await workTabs(), 1, 'a new tab in Work');
+    assert.equal(await b.eval(`${T}.state_.tabs.filter((t) => t.spaceId === ${JSON.stringify(personal)}).length`), 2, 'Personal keeps home and p2');
+  } finally { await b.close(); server.close(); }
+});
