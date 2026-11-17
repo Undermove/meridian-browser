@@ -1,6 +1,7 @@
-// Boosts, as in Arc: a site the person's way (colours, a font, zapped elements, their own CSS and
-// JavaScript), from the site controls with real clicks; "Improve with Claude" asking the AI for the
-// site's CSS; agents making one over MCP; and Arc's boosts brought over with the rest of its data.
+// Boosts, as in Arc: a site the person's way (a colour, dark, a font, size and case, zapped elements,
+// their own CSS and JavaScript), in the editor at the right of the page with real clicks; "Improve
+// with Claude" asking the AI for the site's CSS; agents making one over MCP; and Arc's boosts brought
+// over with the rest of its data.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -21,7 +22,8 @@ const KEY = 'sk-ant-test-000000000000000000000000';
 const PAGE = `<!doctype html><title>News</title><body style="margin:0;font-family:Arial">
 <header id=top style="height:40px;background:rgb(200,0,0)">Top</header>
 <div id=promo class="promo-banner" style="height:120px;background:rgb(0,0,200)">Subscribe now!</div>
-<main id=story><h1>Story</h1><p>Text of the story.</p></main>
+<main id=story><h1>Story</h1><p>Text of the story.</p>
+<div class=card>Ad one</div><div class=card>Ad two</div><div class=card>Ad three</div></main>
 <script>window.loads = (window.loads || 0) + 1;</script>`;
 
 function site() {
@@ -42,7 +44,16 @@ const shown = (page, sel) => page.eval(`(() => { const el = document.querySelect
 async function openControls(b) {
   await b.waitFor(`app.shadowRoot.querySelector('#urlPill .host')?.textContent === '127.0.0.1'`);
   await b.click(`app.$.locationIconButton`);
-  await b.waitFor(`app.$.siteControl.open && !!${SC}.getElementById('boostRow')`);
+  await b.waitFor(`app.$.siteControl.open && !!${SC}.querySelector('#boostRow, .boost-row')`);
+}
+
+const BE = 'app.$.boostEditor.shadowRoot';
+
+// The site controls' "Boost this site" (or a boost's chevron): the editor at the right of the page.
+async function openEditor(b, which = '#boostRow') {
+  await openControls(b);
+  await b.click(`${SC}.querySelector('${which}')`);
+  await b.waitFor(`app.$.boostEditor.open && !!${BE}.getElementById('pad') && !app.$.siteControl.open`);
 }
 
 // A real click in the page, at the middle of `sel`.
@@ -53,7 +64,26 @@ async function clickIn(page, sel) {
   }
 }
 
-test('Boost from the site controls: colours, font, code; on every page of the site, off, deleted', async () => {
+// A real click on the editor's colour pad (its dotted field, inside the rim of hues), at a fraction of
+// its width and height.
+async function clickPad(b, fx, fy) {
+  const at = await b.eval(`(() => { const r = ${BE}.querySelector('#pad .field').getBoundingClientRect(); return { x: r.x + r.width * ${fx}, y: r.y + r.height * ${fy} }; })()`);
+  for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+    await b.cdp.send('Input.dispatchMouseEvent', { type, x: at.x, y: at.y, button: type === 'mouseMoved' ? 'none' : 'left', clickCount: 1 });
+  }
+}
+
+// The card scrolled to its end with the wheel, as a person would to reach Delete (the code shows
+// open when the boost has some, and the card is taller than the window).
+async function scrollEditor(b) {
+  const at = await b.point(`${BE}.getElementById('card')`);
+  await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: at.x, y: at.y, deltaX: 0, deltaY: 2000 });
+  await b.waitFor(`(() => { const c = ${BE}.getElementById('card'), d = ${BE}.getElementById('delete').getBoundingClientRect(), r = c.getBoundingClientRect(); return d.bottom <= r.bottom + 1 && d.top >= r.top; })()`, 3000);
+}
+
+const style = (page) => page.eval(`document.getElementById('meridian-boost-style')?.textContent || ''`);
+
+test('Boost editor, as Arc’s: a colour on the pad, a font, size, case, dark, code; every page of the site; on and off from the list; a second boost; deleted', async () => {
   const s = await site();
   const b = await launch([s.url]);
   try {
@@ -62,31 +92,38 @@ test('Boost from the site controls: colours, font, code; on every page of the si
     await openControls(b);
     assert.match(await b.eval(`${SC}.getElementById('boostRow').textContent`), /Boost this site/);
     await b.click(`${SC}.getElementById('boostRow')`);
-    await b.waitFor(`!!${SC}.getElementById('boostZap')`);
-    assert.match(await b.eval(`${SC}.querySelector('.bhost').textContent`), /127\.0\.0\.1/);
+    await b.waitFor(`app.$.boostEditor.open && !!${BE}.getElementById('pad')`);
+    assert.equal(await b.eval(`${BE}.getElementById('name').value`), 'My Boost');
 
-    // A font: the page's text takes it at once.
-    await b.eval(`(() => { const f = ${SC}.getElementById('boostFont'); f.value = 'Georgia'; f.dispatchEvent(new Event('change')); })()`);
-    await page.waitFor(`getComputedStyle(document.querySelector('p')).fontFamily.startsWith('Georgia')`, 5000);
-    // Colours: the header's red turns.
-    await b.eval(`(() => { const h = ${SC}.getElementById('boostHue'); h.value = '180'; h.dispatchEvent(new Event('change')); })()`);
-    await page.waitFor(`getComputedStyle(document.documentElement).filter.includes('hue-rotate(180deg)')`, 5000);
-
-    // Code: CSS hides the promo at once; JavaScript runs from the next load.
-    await b.click(`${SC}.querySelector('#boostCode summary')`);
-    await b.eval(`(() => { ${SC}.getElementById('boostCss').value = '#promo { display: none !important; }'; ${SC}.getElementById('boostJs').value = "document.body.dataset.boosted = 'yes';"; })()`);
-    await b.click(`${SC}.getElementById('boostSave')`);
-    await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
-    assert.equal(await page.eval(`document.body.dataset.boosted || ''`), '');
+    // A colour on the pad, as Arc's: the hue is the angle from the middle (red at the top, clockwise),
+    // the amount how far out. Right of the middle, 3/5 of the way out: a yellow-green, over the whole
+    // page as a colour layer; the knob glides there, the small dark one opposite.
+    await clickPad(b, 0.8, 0.5);
+    await page.waitFor(`getComputedStyle(document.documentElement, '::after').mixBlendMode === 'color'`, 5000);
     const { state } = await b.eval(`${H}.getBoost()`);
-    assert.equal(state.boost.host, '127.0.0.1');
-    assert.equal(state.boost.font, 'Georgia');
-    assert.equal(state.boost.hue, 180);
+    assert.ok(state.boost.tint >= 85 && state.boost.tint <= 95, `tint ${state.boost.tint}`);
+    assert.ok(state.boost.tintStrength >= 55 && state.boost.tintStrength <= 65, `strength ${state.boost.tintStrength}`);
+    await b.waitFor(`(() => { const f = ${BE}.querySelector('#pad .field').getBoundingClientRect(); const at = (id) => { const r = ${BE}.getElementById(id).getBoundingClientRect(); return [(r.x + r.width / 2 - f.x) / f.width, (r.y + r.height / 2 - f.y) / f.height]; }; const [kx, ky] = at('knob'), [sx, sy] = at('shade'); return Math.abs(kx - 0.8) < 0.03 && Math.abs(ky - 0.5) < 0.03 && Math.abs(sx - 0.2) < 0.03 && Math.abs(sy - 0.5) < 0.03; })()`, 3000);
+    // A font from the grid, the size up, lower case, dark.
+    await b.click(`${BE}.querySelector('.font[data-font="Georgia"]')`);
+    await page.waitFor(`getComputedStyle(document.querySelector('p')).fontFamily.startsWith('Georgia')`, 5000);
+    await b.click(`${BE}.getElementById('size')`);
+    await page.waitFor(`getComputedStyle(document.body).zoom === '1.1'`, 5000);
+    await b.click(`${BE}.getElementById('case')`);
+    await page.waitFor(`getComputedStyle(document.querySelector('p')).textTransform === 'lowercase'`, 5000);
+    await b.click(`${BE}.getElementById('dark')`);
+    await page.waitFor(`getComputedStyle(document.documentElement).filter.includes('invert(1)')`, 5000);
     // Quick changes, one boost.
     assert.equal((await b.eval(`${H}.getBoosts()`)).boosts.length, 1);
 
-    // Another page of the site, opened fresh: all of it, the JavaScript too, and the style after the
-    // site's own.
+    // Code: CSS hides the promo at once; JavaScript runs from the next load.
+    await b.click(`${BE}.getElementById('code')`);
+    await b.eval(`(() => { ${BE}.getElementById('css').value = '#promo { display: none !important; }'; ${BE}.getElementById('js').value = "document.body.dataset.boosted = 'yes';"; })()`);
+    await b.click(`${BE}.getElementById('codeSave')`);
+    await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
+    assert.equal(await page.eval(`document.body.dataset.boosted || ''`), '');
+
+    // Another page of the site, opened fresh: all of it, the JavaScript too, the style after the site's.
     const other = s.url.replace('/news', '/other');
     await b.eval(`app.$.tabstrip.openUrl(${JSON.stringify(other)})`);
     const p2 = await b.page(other);
@@ -95,50 +132,112 @@ test('Boost from the site controls: colours, font, code; on every page of the si
     assert.equal(await p2.eval(`document.documentElement.lastElementChild.id`), 'meridian-boost-style');
     p2.close();
 
-    // Off: the page is the site's again; on; then deleted (two clicks).
+    // Back on the first tab, the list in the site controls: off and on with a click.
     await b.click(`[...app.$.tabstrip.shadowRoot.querySelectorAll('meridian-tab-row')].find((r) => r.tab.url === ${JSON.stringify(s.url)}).shadowRoot.querySelector('.row')`);
     await openControls(b);
-    assert.match(await b.eval(`${SC}.getElementById('boostRow').textContent`), /On/);
-    await b.click(`${SC}.getElementById('boostRow')`);
-    await b.click(`${SC}.getElementById('boostEnabled')`);
+    assert.match(await b.eval(`${SC}.querySelector('.boost-row').textContent`), /My Boost[\s\S]*Enabled/);
+    await b.click(`${SC}.querySelector('.boost-toggle')`);
     await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'block'`, 5000);
-    await b.click(`${SC}.getElementById('boostEnabled')`);
+    await b.waitFor(`/Disabled/.test(${SC}.querySelector('.boost-row').textContent)`);
+    await b.click(`${SC}.querySelector('.boost-toggle')`);
     await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
-    await b.eval(`${SC}.getElementById('boostDelete').scrollIntoView()`);
-    await b.click(`${SC}.getElementById('boostDelete')`);
-    await b.click(`${SC}.getElementById('boostDelete')`);
+
+    // A second boost for the site.
+    await b.click(`${SC}.getElementById('newBoost')`);
+    await b.waitFor(`app.$.boostEditor.open && ${BE}.getElementById('name').value === 'Boost 2'`);
+    assert.equal((await b.eval(`${H}.getBoost()`)).state.boosts.length, 2);
+    await b.click(`${BE}.getElementById('delete')`);
+    await b.click(`${BE}.getElementById('delete')`);
+    await b.waitFor(`!app.$.boostEditor.open`);
+
+    // The first one, from its chevron, deleted (two clicks): the site's own look again.
+    await openEditor(b, '.boost-edit');
+    assert.equal(await b.eval(`${BE}.getElementById('name').value`), 'My Boost');
+    await scrollEditor(b);
+    await b.click(`${BE}.getElementById('delete')`);
+    await b.click(`${BE}.getElementById('delete')`);
     await page.waitFor(`!document.getElementById('meridian-boost-style')`, 5000);
     assert.equal((await b.eval(`${H}.getBoost()`)).state.boost, null);
     page.close();
   } finally { await b.close(); s.server.close(); }
 });
 
-test('Zap: click what to hide on the page, Esc to stop; it stays hidden after a reload', async () => {
+// A real click on Zap's own controls in the page (the bar, the chooser).
+async function clickZapUi(page, sel) {
+  const at = await page.eval(`(() => { const r = document.getElementById('meridian-zap').shadowRoot.querySelector(${JSON.stringify(sel)}).getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+  for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+    await page.cdp.send('Input.dispatchMouseEvent', { type, x: at.x, y: at.y, button: type === 'mouseMoved' ? 'none' : 'left', clickCount: 1 });
+  }
+}
+
+const zapUi = (page, js) => page.eval(`(() => { const r = document.getElementById('meridian-zap')?.shadowRoot; return r ? ${js} : null; })()`);
+
+test('Zap, as Arc’s: Zap This or all related elements; an Undo per zap shows what it brings back; Done; still hidden after a restart', async () => {
   const s = await site();
   const profile = profileWith();
   let b = await launch([s.url], { profile });
   try {
     let page = await b.page(s.url);
     await page.waitFor(`document.readyState === 'complete'`);
-    await openControls(b);
-    await b.click(`${SC}.getElementById('boostRow')`);
-    await b.click(`${SC}.getElementById('boostZap')`);
-    await b.waitFor(`!app.$.siteControl.open`);
-    await page.waitFor(`!!document.getElementById('meridian-zap-hint')`, 5000);
+    await openEditor(b);
+    await b.click(`${BE}.getElementById('zap')`);
+    await page.waitFor(`!!document.getElementById('meridian-zap')`, 5000);
+    await b.waitFor(`/Zapping/.test(${BE}.getElementById('zap').textContent)`);
+
+    // A click on the promo: the page doesn't get it; the chooser does. Zap This.
+    await page.eval(`document.getElementById('promo').onclick = () => { window.promoClicked = true; }`);
     await clickIn(page, '#promo');
-    // The page didn't get the click (the hint is still there), and the browser kept the zap.
-    await b.waitFor(`${H}.getBoost().then((r) => r.state.boost?.zaps.length === 1)`, 5000);
+    await page.waitFor(`document.getElementById('meridian-zap').shadowRoot.querySelector('.pick').style.display === 'flex'`, 3000);
+    await clickZapUi(page, '.zap-this');
+    await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 3000);
+    assert.equal(await page.eval('window.promoClicked || false'), false);
+    await b.waitFor(`${BE}.querySelector('#zap .count').textContent.trim() === '1'`, 5000);
+
+    // One card, then all of its kind with the slider: "Zap 3 elements".
+    await clickIn(page, '.card');
+    await page.waitFor(`document.getElementById('meridian-zap').shadowRoot.querySelector('.pick').style.display === 'flex'`, 3000);
+    assert.equal(await zapUi(page, `r.querySelector('.zap-related').textContent`), 'Zap 3 elements');
+    assert.equal(await zapUi(page, `r.querySelectorAll('.mark').length`), 1, 'the one clicked is marked');
+    // The pointer on "Zap 3 elements": the three are marked.
+    const relatedAt = await page.eval(`(() => { const r = document.getElementById('meridian-zap').shadowRoot.querySelector('.zap-related').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+    await page.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: relatedAt.x, y: relatedAt.y, button: 'none' });
+    await page.waitFor(`document.getElementById('meridian-zap').shadowRoot.querySelectorAll('.mark').length === 3`, 3000);
+    await clickZapUi(page, '.zap-related');
+    await page.waitFor(`[...document.querySelectorAll('.card')].every((c) => getComputedStyle(c).display === 'none')`, 3000);
+    await b.waitFor(`${BE}.querySelector('#zap .count').textContent.trim() === '2'`, 5000);
+    assert.equal(await zapUi(page, `r.querySelectorAll('.undo').length`), 2);
+
+    // Undo: the pointer on it shows the cards, marked; away, hidden again; a click brings them back.
+    const undoAt = await page.eval(`(() => { const r = document.getElementById('meridian-zap').shadowRoot.querySelectorAll('.undo')[1].getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+    await page.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: undoAt.x, y: undoAt.y, button: 'none' });
+    await page.waitFor(`getComputedStyle(document.querySelector('.card')).display !== 'none'`, 3000);
+    await page.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 400, y: 30, button: 'none' });
+    await page.waitFor(`getComputedStyle(document.querySelector('.card')).display === 'none'`, 3000);
+    await clickZapUi(page, '.undo[data-index="1"]');
+    await page.waitFor(`[...document.querySelectorAll('.card')].every((c) => getComputedStyle(c).display === 'block')`, 3000);
+    await b.waitFor(`${BE}.querySelector('#zap .count').textContent.trim() === '1'`, 5000);
     assert.equal(await shown(page, '#promo'), 'none');
-    assert.match((await b.eval(`${H}.getBoost()`)).state.boost.zaps[0], /promo/);
-    await page.cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
-    await page.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
-    await page.waitFor(`!document.getElementById('meridian-zap-hint')`, 5000);
-    // Zap is over: a click is the page's again.
+
+    // Zap This on the second card: only that one.
+    await clickIn(page, '.card:nth-of-type(2)');
+    await page.waitFor(`document.getElementById('meridian-zap').shadowRoot.querySelector('.pick').style.display === 'flex'`, 3000);
+    await clickZapUi(page, '.zap-this');
+    const cards = `[...document.querySelectorAll('.card')].map((c) => getComputedStyle(c).display).join()`;
+    for (let i = 0; i < 30 && await page.eval(cards) !== 'block,none,block'; i++) await sleep(100);
+    assert.equal(await page.eval(cards), 'block,none,block', JSON.stringify(await page.eval(`({ inline: [...document.querySelectorAll('.card')].map((c) => c.style.display), style: document.getElementById('meridian-boost-style')?.textContent, undo: [...document.getElementById('meridian-zap').shadowRoot.querySelectorAll('.undo')].map((u) => u.title) })`)));
+    await b.waitFor(`${BE}.querySelector('#zap .count').textContent.trim() === '2'`, 5000);
+    await clickZapUi(page, '.undo[data-index="1"]');
+    await b.waitFor(`${BE}.querySelector('#zap .count').textContent.trim() === '1'`, 5000);
+
+    // Done: zap is over, a click is the page's again.
+    await clickZapUi(page, '.done');
+    await page.waitFor(`!document.getElementById('meridian-zap')`, 5000);
+    await b.waitFor(`!/Zapping/.test(${BE}.getElementById('zap').textContent)`, 5000);
     await page.eval(`document.getElementById('top').onclick = () => { window.topClicked = true; }`);
     await clickIn(page, '#top');
     await page.waitFor('window.topClicked === true', 3000);
 
-    // After a restart and a reload: still hidden.
+    // After a restart and a reload: still hidden; the editor's × shows it again.
     page.close();
     await b.quit();
     b = await launch([s.url], { profile });
@@ -146,10 +245,15 @@ test('Zap: click what to hide on the page, Esc to stop; it stays hidden after a 
     await page.waitFor(`document.readyState === 'complete'`);
     await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 8000);
     assert.equal(await shown(page, '#story'), 'block');
-    // The zap is listed and comes back with its ×.
-    await openControls(b);
-    await b.click(`${SC}.getElementById('boostRow')`);
-    await b.click(`${SC}.querySelector('.zap-x')`);
+    await openEditor(b, '.boost-edit');
+    // Zap again: the earlier zap has its Undo (Esc ends it too).
+    await b.click(`${BE}.getElementById('zap')`);
+    await page.waitFor(`!!document.getElementById('meridian-zap')`, 5000);
+    assert.equal(await zapUi(page, `r.querySelectorAll('.undo').length`), 1);
+    await page.cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+    await page.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+    await page.waitFor(`!document.getElementById('meridian-zap')`, 5000);
+    await b.click(`${BE}.querySelector('.zap-x')`);
     await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'block'`, 5000);
     page.close();
   } finally { await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
@@ -187,19 +291,21 @@ test('Improve with Claude: the page outline goes to Claude, its CSS becomes the 
   try {
     const page = await b.page(s.url);
     await page.waitFor(`document.readyState === 'complete'`);
-    await openControls(b);
-    await b.click(`${SC}.getElementById('boostRow')`);
+    await openEditor(b);
+    await b.click(`${BE}.getElementById('improveToggle')`);
     // No AI yet: the button says where to set one up.
-    await b.waitFor(`${SC}.getElementById('boostImprove').disabled && /Settings/.test(${SC}.getElementById('boostImprove').textContent)`);
+    await b.waitFor(`${BE}.getElementById('improve').disabled && /Settings/.test(${BE}.getElementById('improve').textContent)`);
     assert.equal((await b.eval(`${H}.setAiKey(${JSON.stringify(KEY)})`)).ok, true);
-    await b.click(`${SC}.getElementById('boostBack')`);
-    await b.click(`${SC}.getElementById('boostRow')`);
-    await b.waitFor(`/Improve with Claude/.test(${SC}.getElementById('boostImprove').textContent)`);
+    // Folded and opened again: the AI set up meanwhile.
+    await b.click(`${BE}.getElementById('improveToggle')`);
+    await b.click(`${BE}.getElementById('improveToggle')`);
+    await b.waitFor(`/Improve with Claude/.test(${BE}.getElementById('improve').textContent)`);
 
-    await b.eval(`${SC}.getElementById('boostWish').value = 'hide the banner'`);
-    await b.click(`${SC}.getElementById('boostImprove')`);
-    await b.waitFor(`${SC}.getElementById('boostNote')?.textContent.includes('Hid the subscription banner.')`, 15000, `${SC}.getElementById('boostNote')?.textContent`);
+    await b.eval(`${BE}.getElementById('wish').value = 'hide the banner'`);
+    await b.click(`${BE}.getElementById('improve')`);
+    await b.waitFor(`${BE}.getElementById('note')?.textContent.includes('Hid the subscription banner.')`, 15000, `${BE}.getElementById('note')?.textContent`);
     await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
+    // A boost still called "My Boost" takes the AI's name.
     assert.equal((await b.eval(`${H}.getBoost()`)).state.boost.name, 'Calm News');
 
     // What Claude got: the boost instructions, the outline with the page's elements, the wish.
@@ -211,10 +317,12 @@ test('Improve with Claude: the page outline goes to Claude, its CSS becomes the 
     assert.match(text, /Subscribe now!/);
     assert.match(text, /hide the banner/);
 
-    // Undo: the site had no boost, so it has none again.
-    await b.click(`${SC}.getElementById('boostUndo')`);
+    // Undo: the boost as it was before.
+    await b.click(`${BE}.getElementById('undo')`);
     await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'block'`, 5000);
-    assert.equal((await b.eval(`${H}.getBoost()`)).state.boost, null);
+    const after = (await b.eval(`${H}.getBoost()`)).state.boost;
+    assert.equal(after.css, '');
+    assert.equal(after.name, 'My Boost');
     page.close();
   } finally { await b.close(); s.server.close(); api.server.close(); }
 });
@@ -256,7 +364,11 @@ test('an agent makes a boost over MCP: get_boost, set_boost; JavaScript only if 
     const names = (await mcp.request('tools/list')).result.tools.map((t) => t.name);
     assert.ok(names.includes('get_boost') && names.includes('set_boost'));
 
-    assert.deepEqual((await mcp.call('get_boost')).value, { host: '127.0.0.1', boost: null });
+    // get_boost without a tab: the active one (the site's, once the window has made it active).
+    await b.waitFor(`[...app.$.tabstrip.tabs_.values()].some((t) => t.isActive && t.url === ${JSON.stringify(s.url)})`, 10000,
+      `[...app.$.tabstrip.tabs_.values()].map((t) => [t.url, t.isActive])`);
+    const first = await mcp.call('get_boost');
+    assert.deepEqual(first.value, { host: '127.0.0.1', boost: null }, first.error);
     const set = await mcp.call('set_boost', { css: '#promo { display: none !important; }', zaps: ['#top'], name: 'Agent boost' });
     assert.equal(set.error, null, set.error);
     await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none' && getComputedStyle(document.getElementById('top')).display === 'none'`, 5000);
