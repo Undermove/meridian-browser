@@ -55,6 +55,36 @@ function site() {
   return new Promise((r) => server.listen(0, '127.0.0.1', () => r({ server, url: (p) => `http://127.0.0.1:${server.address().port}${p}` })));
 }
 
+// run_javascript answers for the code it was given. One shared result slot let a call that didn't
+// compile (or one still running) hand back the previous call's result, and an IIFE ("return" inside)
+// was wrapped as a function body and came back null (a report from a user, 18.11.2026, on
+// developer.apple.com).
+test('run_javascript: an IIFE, a body, a bad one and the next one each give their own answer', async () => {
+  const s = await site();
+  const profile = profileWith({ agent_access: 'full', agent_allow_js: true });
+  const b = await launch([s.url('/form')], { profile });
+  const mcp = bridge(profile);
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { protocolVersion: '2025-06-18', clientInfo: { name: 'test-client', version: '1' }, capabilities: {} });
+    const js = (code) => mcp.call('run_javascript', { code });
+    assert.equal((await js(`(() => { return 'from an IIFE'; })()`)).value, 'from an IIFE');
+    assert.equal((await js('document.title')).value, 'Form');
+    assert.equal((await js(`const el = document.getElementById('name'); el.value = 'Ada'; return el.value`)).value, 'Ada');
+    // A syntax error is said as one: not the last answer again.
+    const bad = await js('return (;');
+    assert.match(bad.error || '', /SyntaxError/);
+    assert.notEqual(bad.value, 'Ada');
+    // The next call is its own: it runs, and its answer is its own.
+    assert.equal((await js(`document.getElementById('name').value = 'Grace'; return document.getElementById('name').value`)).value, 'Grace');
+    assert.equal((await js(`[1, 2, 3].map((n) => { return n * 2; })`)).value.join(','), '2,4,6');
+    // Two at once: each gets its own.
+    const [a, c] = await Promise.all([js(`new Promise((r) => setTimeout(() => r('slow'), 400))`), js(`'fast'`)]);
+    assert.deepEqual([a.value, c.value], ['slow', 'fast']);
+  } finally { mcp.close(); await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
 test('full access: an MCP client lists, opens, reads, clicks, types, screenshots and runs JS', async () => {
   const s = await site();
   const profile = profileWith({ agent_access: 'full', agent_allow_js: true });
