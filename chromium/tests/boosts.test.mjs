@@ -73,12 +73,17 @@ async function clickPad(b, fx, fy) {
   }
 }
 
-// The card scrolled to its end with the wheel, as a person would to reach Delete (the code shows
-// open when the boost has some, and the card is taller than the window).
-async function scrollEditor(b) {
-  const at = await b.point(`${BE}.getElementById('card')`);
-  await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: at.x, y: at.y, deltaX: 0, deltaY: 2000 });
-  await b.waitFor(`(() => { const c = ${BE}.getElementById('card'), d = ${BE}.getElementById('delete').getBoundingClientRect(), r = c.getBoundingClientRect(); return d.bottom <= r.bottom + 1 && d.top >= r.top; })()`, 3000);
+// A real click on something in the editor card: first the wheel over the card until it's in view,
+// as a person would (on a small screen the card is taller than the window, the code open even more).
+async function clickEditor(b, elExpr) {
+  for (let i = 0; i < 20; i++) {
+    const where = await b.eval(`(() => { const c = ${BE}.getElementById('card').getBoundingClientRect(), r = (${elExpr}).getBoundingClientRect(); return r.top < c.top ? -1 : r.bottom > c.bottom ? 1 : 0; })()`);
+    if (!where) break;
+    const at = await b.point(`${BE}.getElementById('card')`);
+    await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: at.x, y: at.y, deltaX: 0, deltaY: where * 120 });
+    await sleep(60);
+  }
+  await b.click(elExpr);
 }
 
 const style = (page) => page.eval(`document.getElementById('meridian-boost-style')?.textContent || ''`);
@@ -105,21 +110,21 @@ test('Boost editor, as Arc’s: a colour on the pad, a font, size, case, dark, c
     assert.ok(state.boost.tintStrength >= 55 && state.boost.tintStrength <= 65, `strength ${state.boost.tintStrength}`);
     await b.waitFor(`(() => { const f = ${BE}.querySelector('#pad .field').getBoundingClientRect(); const at = (id) => { const r = ${BE}.getElementById(id).getBoundingClientRect(); return [(r.x + r.width / 2 - f.x) / f.width, (r.y + r.height / 2 - f.y) / f.height]; }; const [kx, ky] = at('knob'), [sx, sy] = at('shade'); return Math.abs(kx - 0.8) < 0.03 && Math.abs(ky - 0.5) < 0.03 && Math.abs(sx - 0.2) < 0.03 && Math.abs(sy - 0.5) < 0.03; })()`, 3000);
     // A font from the grid, the size up, lower case, dark.
-    await b.click(`${BE}.querySelector('.font[data-font="Georgia"]')`);
+    await clickEditor(b, `${BE}.querySelector('.font[data-font="Georgia"]')`);
     await page.waitFor(`getComputedStyle(document.querySelector('p')).fontFamily.startsWith('Georgia')`, 5000);
-    await b.click(`${BE}.getElementById('size')`);
+    await clickEditor(b, `${BE}.getElementById('size')`);
     await page.waitFor(`getComputedStyle(document.body).zoom === '1.1'`, 5000);
-    await b.click(`${BE}.getElementById('case')`);
+    await clickEditor(b, `${BE}.getElementById('case')`);
     await page.waitFor(`getComputedStyle(document.querySelector('p')).textTransform === 'lowercase'`, 5000);
-    await b.click(`${BE}.getElementById('dark')`);
+    await clickEditor(b, `${BE}.getElementById('dark')`);
     await page.waitFor(`getComputedStyle(document.documentElement).filter.includes('invert(1)')`, 5000);
     // Quick changes, one boost.
     assert.equal((await b.eval(`${H}.getBoosts()`)).boosts.length, 1);
 
     // Code: CSS hides the promo at once; JavaScript runs from the next load.
-    await b.click(`${BE}.getElementById('code')`);
+    await clickEditor(b, `${BE}.getElementById('code')`);
     await b.eval(`(() => { ${BE}.getElementById('css').value = '#promo { display: none !important; }'; ${BE}.getElementById('js').value = "document.body.dataset.boosted = 'yes';"; })()`);
-    await b.click(`${BE}.getElementById('codeSave')`);
+    await clickEditor(b, `${BE}.getElementById('codeSave')`);
     await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
     assert.equal(await page.eval(`document.body.dataset.boosted || ''`), '');
 
@@ -146,16 +151,15 @@ test('Boost editor, as Arc’s: a colour on the pad, a font, size, case, dark, c
     await b.click(`${SC}.getElementById('newBoost')`);
     await b.waitFor(`app.$.boostEditor.open && ${BE}.getElementById('name').value === 'Boost 2'`);
     assert.equal((await b.eval(`${H}.getBoost()`)).state.boosts.length, 2);
-    await b.click(`${BE}.getElementById('delete')`);
-    await b.click(`${BE}.getElementById('delete')`);
+    await clickEditor(b, `${BE}.getElementById('delete')`);
+    await clickEditor(b, `${BE}.getElementById('delete')`);
     await b.waitFor(`!app.$.boostEditor.open`);
 
     // The first one, from its chevron, deleted (two clicks): the site's own look again.
     await openEditor(b, '.boost-edit');
     assert.equal(await b.eval(`${BE}.getElementById('name').value`), 'My Boost');
-    await scrollEditor(b);
-    await b.click(`${BE}.getElementById('delete')`);
-    await b.click(`${BE}.getElementById('delete')`);
+    await clickEditor(b, `${BE}.getElementById('delete')`);
+    await clickEditor(b, `${BE}.getElementById('delete')`);
     await page.waitFor(`!document.getElementById('meridian-boost-style')`, 5000);
     assert.equal((await b.eval(`${H}.getBoost()`)).state.boost, null);
     page.close();
@@ -180,7 +184,7 @@ test('Zap, as Arc’s: Zap This or all related elements; an Undo per zap shows w
     let page = await b.page(s.url);
     await page.waitFor(`document.readyState === 'complete'`);
     await openEditor(b);
-    await b.click(`${BE}.getElementById('zap')`);
+    await clickEditor(b, `${BE}.getElementById('zap')`);
     await page.waitFor(`!!document.getElementById('meridian-zap')`, 5000);
     await b.waitFor(`/Zapping/.test(${BE}.getElementById('zap').textContent)`);
 
@@ -247,13 +251,13 @@ test('Zap, as Arc’s: Zap This or all related elements; an Undo per zap shows w
     assert.equal(await shown(page, '#story'), 'block');
     await openEditor(b, '.boost-edit');
     // Zap again: the earlier zap has its Undo (Esc ends it too).
-    await b.click(`${BE}.getElementById('zap')`);
+    await clickEditor(b, `${BE}.getElementById('zap')`);
     await page.waitFor(`!!document.getElementById('meridian-zap')`, 5000);
     assert.equal(await zapUi(page, `r.querySelectorAll('.undo').length`), 1);
     await page.cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
     await page.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
     await page.waitFor(`!document.getElementById('meridian-zap')`, 5000);
-    await b.click(`${BE}.querySelector('.zap-x')`);
+    await clickEditor(b, `${BE}.querySelector('.zap-x')`);
     await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'block'`, 5000);
     page.close();
   } finally { await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
@@ -292,17 +296,17 @@ test('Improve with Claude: the page outline goes to Claude, its CSS becomes the 
     const page = await b.page(s.url);
     await page.waitFor(`document.readyState === 'complete'`);
     await openEditor(b);
-    await b.click(`${BE}.getElementById('improveToggle')`);
+    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
     // No AI yet: the button says where to set one up.
     await b.waitFor(`${BE}.getElementById('improve').disabled && /Settings/.test(${BE}.getElementById('improve').textContent)`);
     assert.equal((await b.eval(`${H}.setAiKey(${JSON.stringify(KEY)})`)).ok, true);
     // Folded and opened again: the AI set up meanwhile.
-    await b.click(`${BE}.getElementById('improveToggle')`);
-    await b.click(`${BE}.getElementById('improveToggle')`);
+    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
+    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
     await b.waitFor(`/Improve with Claude/.test(${BE}.getElementById('improve').textContent)`);
 
     await b.eval(`${BE}.getElementById('wish').value = 'hide the banner'`);
-    await b.click(`${BE}.getElementById('improve')`);
+    await clickEditor(b, `${BE}.getElementById('improve')`);
     await b.waitFor(`${BE}.getElementById('note')?.textContent.includes('Hid the subscription banner.')`, 15000, `${BE}.getElementById('note')?.textContent`);
     await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
     // A boost still called "My Boost" takes the AI's name.
@@ -318,7 +322,7 @@ test('Improve with Claude: the page outline goes to Claude, its CSS becomes the 
     assert.match(text, /hide the banner/);
 
     // Undo: the boost as it was before.
-    await b.click(`${BE}.getElementById('undo')`);
+    await clickEditor(b, `${BE}.getElementById('undo')`);
     await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'block'`, 5000);
     const after = (await b.eval(`${H}.getBoost()`)).state.boost;
     assert.equal(after.css, '');
