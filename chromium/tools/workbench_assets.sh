@@ -20,7 +20,7 @@ fi
 
 rm -rf "$dest.tmp"
 mkdir -p "$dest.tmp/vendor"
-for f in workbench.html workbench.js workbench-pro.js workbench.css secret-detect.js mission-chip.js; do
+for f in workbench.html workbench.js workbench-pro.js workbench.css secret-detect.js mission-chip.js context-insights.js; do
   cp "$repo/src/renderer/dev/$f" "$dest.tmp/$f"
 done
 cp "$repo/src/renderer/icons.js" "$dest.tmp/icons.js"

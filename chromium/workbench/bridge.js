@@ -151,6 +151,8 @@
       resume: opts?.resume === true,
     }),
     ptyList: () => invoke('ptyList'),
+    // Context Insights for the Claude Code session in a terminal.
+    contextInsights: (id, opts) => invoke('contextInsights', str(id), { contextSize: Number(opts?.contextSize) || undefined }),
     ptyKill: (id) => invoke('ptyKill', str(id)),
     ptyWrite: (id, data) => send('ptyWrite', str(id), str(data)),
     ptyResize: (id, cols, rows) => send('ptyResize', str(id), Math.round(Number(cols)) || 80, Math.round(Number(rows)) || 24),
