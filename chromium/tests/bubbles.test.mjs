@@ -184,3 +184,50 @@ test('Bubbles in a space of another profile: a permission prompt, and a password
     await b.close(); s.closeAllConnections(); s.close();
   }
 });
+
+// A form with an address, typed and submitted like a person: Chromium offers "Save address?". The
+// window had no autofill bubble handler, and the offer crashed the whole browser (a report from a
+// user, 18.11.2026: an enrolment form on developer.apple.com). Save stores the address.
+test('Bubbles: a submitted address is offered for saving (the browser lives), and Save stores it', async () => {
+  const s = http.createServer((req, res) => {
+    if (req.method === 'POST') req.resume();
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(req.url === '/done' ? '<title>Thanks</title><h1>Saved</h1>' :
+      '<title>Address</title><form action="/done" method="post">' +
+      [['given', 'given-name'], ['family', 'family-name'], ['tel', 'tel'], ['street', 'address-line1'], ['apt', 'address-line2'],
+        ['city', 'address-level2'], ['state', 'address-level1'], ['zip', 'postal-code']].map(([id, ac]) => `<input id="${id}" name="${id}" autocomplete="${ac}">`).join('') +
+      '<select id="country" name="country" autocomplete="country"><option value="">-</option><option value="US">United States</option><option value="GE">Georgia</option></select>' +
+      '<button id="go">Continue</button></form>');
+  });
+  await new Promise((r) => s.listen(0, '127.0.0.1', r));
+  const url = `http://localhost:${s.address().port}/`;
+  const b = await launch([url], { args: ['--meridian-test-bubbles'] });
+  try {
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'Address')`);
+    const page = await b.page(url);
+    const bubbles = (action = '') => b.eval(`app.$.tabstrip.handler_.testBubbles(${JSON.stringify(action)}).then((r) => r.bubbles)`);
+    for (const [id, text] of [['given', 'Ada'], ['family', 'Lovelace'], ['tel', '+1 650 253 0000'], ['street', '1600 Amphitheatre Pkwy'],
+      ['apt', 'Suite 12'], ['city', 'Mountain View'], ['state', 'CA'], ['zip', '94043']]) {
+      await page.eval(`(document.getElementById('${id}').focus(), true)`);
+      await page.cdp.send('Input.insertText', { text });
+    }
+    await page.eval(`(() => { const c = document.getElementById('country'); c.value = 'US'; c.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+    // A click on the button, as a person submits it.
+    const at = await page.eval(`(() => { const r = document.getElementById('go').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+    for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+      await page.cdp.send('Input.dispatchMouseEvent', { type, x: at.x, y: at.y, button: type === 'mouseMoved' ? 'none' : 'left', clickCount: 1 });
+    }
+    let list = [];
+    for (let i = 0; i < 100 && !list.includes('SaveAddressProfileView'); i++) { await sleep(100); list = await bubbles(); }
+    assert.ok(list.includes('SaveAddressProfileView'), `"Save address?" shows: ${JSON.stringify(list)}`);
+    assert.equal(await b.eval('1 + 1'), 2, 'the browser lives');
+    await bubbles('accept');
+    for (let i = 0; i < 30 && (await bubbles()).length; i++) await sleep(100);
+    page.close();
+    // Saved: Settings › Addresses has it.
+    await b.eval(`app.$.tabstrip.openUrl('chrome://settings/addresses')`);
+    const st = await b.page('chrome://settings');
+    await st.waitFor(`(() => { const deep = (root) => [root, ...[...root.querySelectorAll('*')].filter((e) => e.shadowRoot).flatMap((e) => deep(e.shadowRoot))]; return deep(document).some((r) => r.textContent?.includes('1600 Amphitheatre')); })()`, 15000);
+    st.close();
+  } finally { await b.close(); s.closeAllConnections(); s.close(); }
+});

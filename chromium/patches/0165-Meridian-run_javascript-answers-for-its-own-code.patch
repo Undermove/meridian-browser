@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 18 Nov 2026 19:49:33 +0400
+Subject: [PATCH 166/166] Meridian: run_javascript answers for its own code
+
+Each call has its own result slot (code that didn't compile, or a call still
+running, handed back the previous call's result); the code runs as an
+expression first, else as a function body (an IIFE was wrapped as a body
+and returned null); neither compiling is a SyntaxError.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/meridian/agent/agent_service.cc   | 94 +++++++++++++++----
+ 1 file changed, 74 insertions(+), 20 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index 8d9976c549..7e7c2390f3 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -2252,36 +2252,57 @@ void AgentService::RunJavaScript(std::unique_ptr<Call> call) {
+               return call->Fail("the tab is gone");
+             }
+             self->Activity(*call, tab);
+-            // A function body (with return) or an expression; the result,
+-            // awaited, lands in window.__meridianJs for polling.
+-            bool body = code.find("return") != std::string::npos;
+-            std::string js =
+-                "(window.__meridianJs = {done: false}, Promise.resolve().then("
+-                "async () => " +
+-                (body ? "{\n" + code + "\n}" : "(" + code + ")") +
+-                ").then(v => { let out; try { out = JSON.parse(JSON.stringify("
+-                "v === undefined ? null : v)); } catch { out = String(v); } "
+-                "window.__meridianJs = {done: true, value: out}; }, e => { "
+-                "window.__meridianJs = {done: true, error: String(e && "
+-                "e.message || e)}; }), true)";
++            // Each call gets its own slot for its result: with one shared
++            // slot, code that didn't compile (or a call still running) left
++            // the previous call's result there, and it came back as this
++            // one's. The code runs as an expression first (an IIFE has
++            // "return" inside and is one), else as a function body; neither
++            // compiling is a syntax error, said as such. No eval: pages with
++            // a strict CSP forbid it.
++            static int counter = 0;
++            std::string slot = "window.__meridianJs['" +
++                               base::NumberToString(++counter) + "']";
++            auto wrap = [&slot](const std::string& run) {
++              return "((window.__meridianJs = window.__meridianJs || {}), (" +
++                     slot +
++                     " = {done: false}), Promise.resolve().then(async () => " +
++                     run +
++                     ").then(v => { let out; try { out = JSON.parse("
++                     "JSON.stringify(v === undefined ? null : v)); } catch { "
++                     "out = String(v); } " +
++                     slot + " = {done: true, value: out}; }, e => { " + slot +
++                     " = {done: true, error: String(e && e.message || e)}; "
++                     "}), true)";
++            };
++            std::string as_expression = wrap("(" + code + "\n)");
++            std::string as_body = wrap("{\n" + code + "\n}");
+             content::WebContents* contents = tab->GetContents();
+             base::TimeTicks deadline =
+                 base::TimeTicks::Now() + base::Seconds(30);
+             struct Poll {
+               static void Step(base::WeakPtr<AgentService> self,
+                                base::WeakPtr<content::WebContents> contents,
++                               std::string slot,
+                                base::TimeTicks deadline,
+                                std::unique_ptr<Call> call) {
+                 if (!self || !contents) {
+                   return call->Fail("the tab is gone");
+                 }
+                 self->RunInPage(
+-                    contents.get(), "window.__meridianJs",
++                    contents.get(),
++                    "(() => { const s = window.__meridianJs && " + slot +
++                        "; if (s && s.done) { delete " + slot +
++                        "; } return s || 'gone'; })()",
+                     base::BindOnce(
+                         [](base::WeakPtr<AgentService> self,
+                            base::WeakPtr<content::WebContents> contents,
+-                           base::TimeTicks deadline,
++                           std::string slot, base::TimeTicks deadline,
+                            std::unique_ptr<Call> call, base::Value state) {
++                          if (state.is_string()) {
++                            return call->Fail(
++                                "the page changed (it navigated or reloaded) "
++                                "before the code finished");
++                          }
+                           const base::DictValue* s = state.GetIfDict();
+                           if (s && s->FindBool("done").value_or(false)) {
+                             if (const std::string* e = s->FindString("error")) {
+@@ -2297,22 +2318,55 @@ void AgentService::RunJavaScript(std::unique_ptr<Call> call) {
+                               ->PostDelayedTask(
+                                   FROM_HERE,
+                                   base::BindOnce(&Poll::Step, self, contents,
+-                                                 deadline, std::move(call)),
++                                                 slot, deadline,
++                                                 std::move(call)),
+                                   base::Milliseconds(100));
+                         },
+-                        self, contents, deadline, std::move(call)));
++                        self, contents, slot, deadline, std::move(call)));
+               }
+             };
++            // Started: true. Not compiled: no value.
++            auto started = [](const base::Value& v) {
++              return v.is_bool() && v.GetBool();
++            };
+             self->RunInPage(
+-                contents, js,
++                contents, as_expression,
+                 base::BindOnce(
+                     [](base::WeakPtr<AgentService> self,
+                        base::WeakPtr<content::WebContents> contents,
++                       std::string slot, std::string as_body,
+                        base::TimeTicks deadline, std::unique_ptr<Call> call,
+-                       base::Value) {
+-                      Poll::Step(self, contents, deadline, std::move(call));
++                       decltype(started) started, base::Value result) {
++                      if (started(result)) {
++                        return Poll::Step(self, contents, slot, deadline,
++                                          std::move(call));
++                      }
++                      if (!self || !contents) {
++                        return call->Fail("the tab is gone");
++                      }
++                      self->RunInPage(
++                          contents.get(), as_body,
++                          base::BindOnce(
++                              [](base::WeakPtr<AgentService> self,
++                                 base::WeakPtr<content::WebContents> contents,
++                                 std::string slot, base::TimeTicks deadline,
++                                 std::unique_ptr<Call> call,
++                                 decltype(started) started,
++                                 base::Value result) {
++                                if (!started(result)) {
++                                  return call->Fail(
++                                      "SyntaxError: the code compiles neither "
++                                      "as an expression nor as a function "
++                                      "body");
++                                }
++                                Poll::Step(self, contents, slot, deadline,
++                                           std::move(call));
++                              },
++                              self, contents, slot, deadline, std::move(call),
++                              started));
+                     },
+-                    self, contents->GetWeakPtr(), deadline, std::move(call)));
++                    self, contents->GetWeakPtr(), slot, as_body, deadline,
++                    std::move(call), started));
+           },
+           weak_factory_.GetWeakPtr(), handle, code));
+ }
