@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 19 Nov 2026 00:47:28 +0400
+Subject: [PATCH 169/169] Meridian: a resumed Workbench Claude session gets its
+ permission mode back
+
+The hooks' permission_mode reaches Mission Control and the Workbench; it is
+kept with the session and a restored tab starts with --permission-mode
+(not plan).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/mission/mission_control.cc       | 12 +++++++
+ .../meridian/mission/mission_control.h        |  6 ++++
+ .../browser/meridian/mission/mission_hook.cc  |  3 ++
+ .../meridian/workbench/workbench_handler.cc   | 33 ++++++++++++++++---
+ 4 files changed, 49 insertions(+), 5 deletions(-)
+
+diff --git a/chrome/browser/meridian/mission/mission_control.cc b/chrome/browser/meridian/mission/mission_control.cc
+index 499a80fdd1..cc304bd867 100644
+--- a/chrome/browser/meridian/mission/mission_control.cc
++++ b/chrome/browser/meridian/mission/mission_control.cc
+@@ -135,6 +135,11 @@ base::Value OptString(const std::string& s) {
+ 
+ }  // namespace
+ 
++bool IsResumablePermissionMode(std::string_view mode) {
++  return mode == "default" || mode == "acceptEdits" || mode == "auto" ||
++         mode == "dontAsk" || mode == "bypassPermissions";
++}
++
+ bool IsSessionId(std::string_view id) {
+   if (id.empty() || id.size() > 80) {
+     return false;
+@@ -464,6 +469,12 @@ void MissionControl::OnHookEvent(const std::string& node_id,
+   bool background = raw.FindBool("background").value_or(false);
+   std::string cwd_name = s("cwd_name", 60);
+   const std::string* kind = raw.FindString("kind");
++  if (const std::string* mode = raw.FindString("permission_mode");
++      mode && agent_id.empty() && IsResumablePermissionMode(*mode) &&
++      *mode != root->permission_mode) {
++    root->permission_mode = *mode;
++    Changed();
++  }
+   if (kind && *kind == "codex") {
+     if (event == "TurnComplete") {
+       root->tool_calls++;
+@@ -1091,6 +1102,7 @@ base::DictValue MissionControl::Snapshot() const {
+             .Set("usage", n.usage.dict.empty()
+                               ? base::Value()
+                               : base::Value(n.usage.dict.Clone()))
++            .Set("permissionMode", OptString(n.permission_mode))
+             .Set("log", std::move(log)));
+   }
+   return base::DictValue()
+diff --git a/chrome/browser/meridian/mission/mission_control.h b/chrome/browser/meridian/mission/mission_control.h
+index f76451870b..8602dce67e 100644
+--- a/chrome/browser/meridian/mission/mission_control.h
++++ b/chrome/browser/meridian/mission/mission_control.h
+@@ -34,6 +34,10 @@ namespace meridian::mission {
+ // '-' and '_', at most 80 (a UUID in practice).
+ bool IsSessionId(std::string_view id);
+ 
++// A permission mode `claude --permission-mode` takes back on a resume: one
++// the session was in, other than plan (a step, not a way of working).
++bool IsResumablePermissionMode(std::string_view mode);
++
+ class EventChannel;
+ struct NamedSecret;
+ 
+@@ -209,6 +213,8 @@ class MissionControl : public KeyedService,
+     } usage;
+     std::string transcript;
+     int compactions = 0;
++    // The main session's permission mode, as its hooks last reported it.
++    std::string permission_mode;
+   };
+ 
+   Node* AddNode(Node node);
+diff --git a/chrome/browser/meridian/mission/mission_hook.cc b/chrome/browser/meridian/mission/mission_hook.cc
+index 95ae4b8068..dff15347d9 100644
+--- a/chrome/browser/meridian/mission/mission_hook.cc
++++ b/chrome/browser/meridian/mission/mission_hook.cc
+@@ -429,6 +429,9 @@ base::DictValue FromClaudeEvent(const base::DictValue& ev) {
+   SetIf(out, "session_id", Str(ev.Find("session_id"), 80));
+   SetIf(out, "agent_id", Str(ev.Find("agent_id"), 80));
+   SetIf(out, "agent_type", Str(ev.Find("agent_type"), 60));
++  // The session's permission mode (default, acceptEdits, plan, auto,
++  // bypassPermissions…), so a resumed session gets it back.
++  SetIf(out, "permission_mode", Str(ev.Find("permission_mode"), 30));
+   SetIf(out, "tool", tool);
+   SetIf(out, "tool_use_id", Str(ev.Find("tool_use_id"), 80));
+   if (tool) {
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 6034c5fbe5..a9ddfdfdfe 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -680,12 +680,19 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+         if (!id || !mission::IsSessionId(*id) || list.size() >= 20) {
+           continue;
+         }
++        const std::string* mode = v.GetDict().FindString("mode");
+         const std::string* name = v.GetDict().FindString("name");
+         std::string short_name;
+         if (name) {
+           base::TruncateUTF8ToByteSize(*name, 240, &short_name);
+         }
+-        list.Append(base::DictValue().Set("id", *id).Set("name", short_name));
++        base::DictValue entry;
++        entry.Set("id", *id);
++        entry.Set("name", short_name);
++        if (mode && mission::IsResumablePermissionMode(*mode)) {
++          entry.Set("mode", *mode);
++        }
++        list.Append(std::move(entry));
+       }
+     }
+     {
+@@ -1934,6 +1941,12 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+       kind == "claude" && sid && mission::IsSessionId(*sid)) {
+     resume_id = *sid;
+   }
++  std::string resume_mode;
++  if (const std::string* mode = opts.FindString("resumeMode");
++      !resume_id.empty() && mode &&
++      mission::IsResumablePermissionMode(*mode) && *mode != "default") {
++    resume_mode = *mode;
++  }
+   // Host terminals and agents get the project's vault secrets in their
+   // environment (names are shown, values never).
+   std::map<std::string, std::string> secrets =
+@@ -1993,7 +2006,7 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+       FROM_HERE,
+       base::BindOnce(
+           [](std::string kind, McpBridge bridge, bool resume,
+-             std::string resume_id)
++             std::string resume_id, std::string resume_mode)
+               -> std::pair<base::expected<LaunchSpec, std::string>,
+                            std::map<std::string, std::string>> {
+             std::map<std::string, std::string> env = TerminalEnv();
+@@ -2023,13 +2036,18 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+                 !spec->argv.empty()) {
+               spec->argv.insert(spec->argv.begin() + 1, resume_id);
+               spec->argv.insert(spec->argv.begin() + 1, "--resume");
++              if (!resume_mode.empty()) {
++                spec->argv.insert(spec->argv.begin() + 1, resume_mode);
++                spec->argv.insert(spec->argv.begin() + 1, "--permission-mode");
++              }
+             } else if (spec.has_value() && resume && !spec->argv.empty()) {
+               spec->argv.insert(spec->argv.begin() + 1, "--resume");
+               spec->title += " (resumed)";
+             }
+             return {std::move(spec), env};
+           },
+-          kind, std::move(bridge), resume, std::move(resume_id)),
++          kind, std::move(bridge), resume, std::move(resume_id),
++          std::move(resume_mode)),
+       base::BindOnce(
+           [](base::WeakPtr<WorkbenchHandler> self, std::string kind, int cols,
+              int rows, mission::MissionControl::Registration registration,
+@@ -2579,8 +2597,13 @@ void WorkbenchHandler::OnMissionChanged(const base::DictValue& snapshot) {
+     for (const base::Value& n : *nodes) {
+       const std::string* term = n.GetDict().FindString("termId");
+       const base::DictValue* u = n.GetDict().FindDict("usage");
+-      if (term && u && terms_.contains(*term)) {
+-        usage.Set(*term, u->Clone());
++      const std::string* mode = n.GetDict().FindString("permissionMode");
++      if (term && (u || mode) && terms_.contains(*term)) {
++        base::DictValue entry = u ? u->Clone() : base::DictValue();
++        if (mode) {
++          entry.Set("permission_mode", *mode);
++        }
++        usage.Set(*term, std::move(entry));
+       }
+     }
+   }
