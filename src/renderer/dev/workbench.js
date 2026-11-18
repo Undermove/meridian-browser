@@ -972,6 +972,15 @@ function mountTerm(info) {
   const t = { id: info.id, kind: info.kind, title: info.title, xterm, fit, el, exited: info.exited, browserTools: info.browserTools,
     secrets: info.secrets || [], guard: !!info.guard, sandbox: !!info.sandbox, then: info.then || null };
   if (typeof proGuardPaste === 'function') proGuardPaste(t); // Workbench Pro: secret paste guard
+  t.custom = savedTermNames()[t.id] || '';
+  // The title the program sets (OSC 0/2): Claude Code names it after the session, with a spinner or
+  // ✳ in front; a shell, after the folder or the command running.
+  xterm.onTitleChange((title) => {
+    const clean = String(title).replace(/^[^\p{L}\p{N}~/.]+/u, '').trim().slice(0, 80);
+    if (clean === t.auto) return;
+    t.auto = clean;
+    renderTermTabs();
+  });
   xterm.onData((data) => { if (!t.exited) wb.ptyWrite(t.id, data); else if (data === '\r') restartTerm(t); });
   xterm.attachCustomKeyEventHandler((e) => {
     if (e.type === 'keydown' && (IS_MAC ? e.metaKey : e.ctrlKey && e.shiftKey) && e.key.toLowerCase() === 'k') { xterm.clear(); return false; }
@@ -1035,7 +1044,7 @@ async function restartTerm(t) {
 
 async function killTerm(t, { quiet = false } = {}) {
   if (!quiet && !t.exited && t.kind !== 'shell') {
-    if (!(await confirmBox(`Stop ${t.title}?`, 'The agent session in this terminal will end.', 'Stop', true))) return;
+    if (!(await confirmBox(`Stop ${termName(t)}?`, 'The agent session in this terminal will end.', 'Stop', true))) return;
   }
   try { await wb.ptyKill(t.id); } catch {}
   t.xterm.dispose();
@@ -1059,7 +1068,56 @@ function fitActive() {
   try { t.fit.fit(); } catch {}
 }
 
+// Names given by hand (double click on a tab), by terminal, for as long as the terminals live.
+function savedTermNames() {
+  try { return JSON.parse(sessionStorage.getItem('termNames') || '{}'); } catch { return {}; }
+}
+
+function saveTermName(t, name) {
+  t.custom = name;
+  const all = savedTermNames();
+  if (name) all[t.id] = name; else delete all[t.id];
+  try { sessionStorage.setItem('termNames', JSON.stringify(all)); } catch {}
+}
+
+// A name given by hand, else the session's name (Claude Code's status line), else the terminal's title.
+function termName(t) {
+  return t.custom || (typeof termSessionName === 'function' && termSessionName(t)) || t.auto || t.title;
+}
+
+function renameTerm(t) {
+  const nameEl = [...document.querySelectorAll('#term-tab-list .ttab')][S.terms.indexOf(t)]?.querySelector('.name');
+  if (!nameEl) return;
+  S.renamingTerm = t;
+  const input = document.createElement('input');
+  input.className = 'rename';
+  input.value = termName(t);
+  input.spellcheck = false;
+  nameEl.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = (keep) => {
+    if (done) return;
+    done = true;
+    S.renamingTerm = null;
+    // Empty: back to the name the program gives.
+    if (keep) saveTermName(t, input.value.trim().slice(0, 80));
+    renderTermTabs();
+    t.xterm.focus();
+  };
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') finish(true);
+    else if (e.key === 'Escape') finish(false);
+  });
+  input.addEventListener('blur', () => finish(true));
+  input.addEventListener('click', (e) => e.stopPropagation());
+}
+
 function renderTermTabs() {
+  // Not under the name being typed (a status update would drop it).
+  if (S.renamingTerm) return;
   const list = $('#term-tab-list');
   list.replaceChildren(...S.terms.map((t) => {
     const el = document.createElement('div');
@@ -1068,8 +1126,11 @@ function renderTermTabs() {
     el.appendChild(agentMark(AGENT_UI[t.kind] ? t.kind : 'shell'));
     const name = document.createElement('span');
     name.className = 'name';
-    name.textContent = t.title + (t.exited ? ' (exited)' : '');
+    name.textContent = termName(t) + (t.exited ? ' (exited)' : '');
+    el.title = `${termName(t)}\nDouble-click to rename`;
     el.appendChild(name);
+    const badge = typeof termUsageBadge === 'function' ? termUsageBadge(t) : null;
+    if (badge) el.appendChild(badge);
     if (t.browserTools) { const p = document.createElement('span'); p.className = 'plug'; p.title = 'Meridian browser tools connected'; p.innerHTML = icon('globe', 11); el.appendChild(p); }
     // Workbench Pro: sandbox and vault indicators (secret NAMES only)
     if (t.sandbox) { const p = document.createElement('span'); p.className = 'plug sbx'; p.title = 'Runs in a Docker sandbox: only this project is visible'; p.innerHTML = icon('shield', 11); el.appendChild(p); }
@@ -1077,7 +1138,12 @@ function renderTermTabs() {
     const x = document.createElement('button');
     x.className = 'tab-close'; x.title = t.exited ? 'Close' : 'Stop and close'; x.innerHTML = icon('x', 12);
     el.appendChild(x);
-    el.addEventListener('click', (e) => { if (e.target.closest('.tab-close')) killTerm(t); else activateTerm(t); });
+    // A double click renames: told by the click count, since the first click redraws the tabs.
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('.tab-close')) killTerm(t);
+      else if (e.detail === 2 && !e.target.closest('.ctx-badge')) renameTerm(t);
+      else if (e.detail < 2) activateTerm(t);
+    });
     el.addEventListener('mousedown', (e) => { if (e.button === 1) { e.preventDefault(); killTerm(t); } });
     return el;
   }));
@@ -1214,6 +1280,7 @@ function onHostCommand(msg) {
   // Mission Control: "Open terminal" on an agent node, and the live counts for the topbar chip.
   if (msg.type === 'focus-term') { const t = S.terms.find((x) => x.id === String(msg.id)); if (t) { $('#term-area').classList.remove('collapsed'); activateTerm(t); } }
   if (msg.type === 'mission' && typeof missionChip === 'function') missionChip(msg);
+  if (msg.type === 'mission' && typeof insightsUsage === 'function') insightsUsage(msg.usage);
   if (typeof proHostCommand === 'function') proHostCommand(msg); // Workbench Pro: new-hub, customize, safe-mode
 }
 
