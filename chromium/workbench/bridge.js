@@ -149,8 +149,12 @@
       kind: str(opts?.kind || 'shell'), cols: Number(opts?.cols) || 80, rows: Number(opts?.rows) || 24,
       secrets: Array.isArray(opts?.secrets) ? opts.secrets.slice(0, 200).map(String) : undefined,
       resume: opts?.resume === true,
+      resumeId: typeof opts?.resumeId === 'string' ? opts.resumeId.slice(0, 80) : undefined,
     }),
     ptyList: () => invoke('ptyList'),
+    // The open project's Claude Code sessions, reopened after a restart.
+    claudeSessions: () => invoke('claudeSessions'),
+    saveClaudeSessions: (list) => invoke('saveClaudeSessions', Array.isArray(list) ? list.slice(0, 20).map((s) => ({ id: str(s?.id), name: str(s?.name) })) : []),
     // Context Insights for the Claude Code session in a terminal.
     contextInsights: (id, opts) => invoke('contextInsights', str(id), { contextSize: Number(opts?.contextSize) || undefined }),
     ptyKill: (id) => invoke('ptyKill', str(id)),

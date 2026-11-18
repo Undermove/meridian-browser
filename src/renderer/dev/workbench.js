@@ -162,6 +162,7 @@ async function setProject(p, { reattach = false } = {}) {
     for (const t of [...S.tabs]) closeTab(t, { force: true });
   }
   S.project = p;
+  S.savedSessions = null;
   S.tree.clear();
   S.selected = null;
   document.title = p.name;
@@ -171,9 +172,12 @@ async function setProject(p, { reattach = false } = {}) {
   $('#welcome').hidden = true;
   $('#main').hidden = false;
   wb.toHost({ type: 'project', root: p.root, name: p.name });
+  // The tab's address names the project, so the tab reopens it after a restart (as a pinned hub does).
+  try { const u = new URL(location.href); if (u.searchParams.get('project') !== p.root) { u.searchParams.set('project', p.root); history.replaceState(history.state, '', u.href); } } catch {}
   await loadDir('', true);
   renderTree();
-  if (reattach) await reattachTerminals();
+  const alive = reattach ? await reattachTerminals() : S.terms.length;
+  if (!alive) await restoreClaudeSessions(p.root);
   layoutTerminals();
   emit('project', p);
 }
@@ -970,7 +974,7 @@ function mountTerm(info) {
   const { xterm, fit } = newXterm();
   xterm.open(el);
   const t = { id: info.id, kind: info.kind, title: info.title, xterm, fit, el, exited: info.exited, browserTools: info.browserTools,
-    secrets: info.secrets || [], guard: !!info.guard, sandbox: !!info.sandbox, then: info.then || null };
+    secrets: info.secrets || [], guard: !!info.guard, sandbox: !!info.sandbox, then: info.then || null, root: S.project?.root || '' };
   if (typeof proGuardPaste === 'function') proGuardPaste(t); // Workbench Pro: secret paste guard
   t.custom = savedTermNames()[t.id] || '';
   // The title the program sets (OSC 0/2): Claude Code names it after the session, with a spinner or
@@ -1001,7 +1005,7 @@ function mountTerm(info) {
   return t;
 }
 
-async function launch(kind, { resume = false } = {}) {
+async function launch(kind, { resume = false, resumeId, name } = {}) {
   if (!S.project) { toast('Open a project first'); return null; }
   if (S.info?.terminals === false) { toast(`Terminals are unavailable: ${S.info.terminalError || ''}`, 5000); return null; }
   // Workbench Pro: a sandbox gets only the vault secrets picked for this session.
@@ -1016,13 +1020,14 @@ async function launch(kind, { resume = false } = {}) {
     // Size the pty right from the start so TUIs (Claude Code, Codex) draw correctly.
     const host = $('#term-host');
     const dims = estimateDims(host);
-    info = await wb.ptyCreate({ kind, cols: dims.cols, rows: dims.rows, secrets, resume });
+    info = await wb.ptyCreate({ kind, cols: dims.cols, rows: dims.rows, secrets, resume, resumeId });
   } catch (err) {
     toast(err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, ''), 5000);
     if (/not installed/i.test(err.message)) refreshInfo();
     return null;
   }
   const t = mountTerm(info);
+  if (resumeId) { t.sessionId = resumeId; if (name) saveTermName(t, name); }
   for (const n of info.notes || []) t.xterm.writeln(`\x1b[2m${n}\x1b[0m`);
   if (t.secrets.length && !t.sandbox) t.xterm.writeln(`\x1b[2mVault: ${t.secrets.join(', ')} ${t.secrets.length === 1 ? 'is' : 'are'} set in this session’s environment (values hidden).\x1b[0m`);
   if (t.guard) t.xterm.writeln('\x1b[2mSecret-file guard: Meridian asks before Claude Code reads .env, keys or credentials (file tools by path; shell commands only by a name match, so it is a safety net, not a wall).\x1b[0m');
@@ -1047,12 +1052,14 @@ async function killTerm(t, { quiet = false } = {}) {
     if (!(await confirmBox(`Stop ${termName(t)}?`, 'The agent session in this terminal will end.', 'Stop', true))) return;
   }
   try { await wb.ptyKill(t.id); } catch {}
+  t.closed = true;
   t.xterm.dispose();
   t.el.remove();
   const i = S.terms.indexOf(t);
   S.terms.splice(i, 1);
   if (S.activeTerm === t) S.activeTerm = S.terms[Math.min(i, S.terms.length - 1)] || null;
   if (S.activeTerm) activateTerm(S.activeTerm); else renderTermTabs();
+  if (t.kind === 'claude') saveClaudeSessions();
 }
 
 function activateTerm(t) {
@@ -1078,6 +1085,7 @@ function saveTermName(t, name) {
   const all = savedTermNames();
   if (name) all[t.id] = name; else delete all[t.id];
   try { sessionStorage.setItem('termNames', JSON.stringify(all)); } catch {}
+  if (t.kind === 'claude') saveClaudeSessions();
 }
 
 // A name given by hand, else the session's name (Claude Code's status line), else the terminal's title.
@@ -1185,7 +1193,7 @@ function layoutTerminals() { renderTermTabs(); fitActive(); }
 
 async function reattachTerminals() {
   let list = [];
-  try { list = await wb.ptyList(); } catch { return; }
+  try { list = await wb.ptyList(); } catch { return 0; }
   for (const info of list) {
     if (S.terms.some((t) => t.id === info.id)) continue;
     const t = mountTerm(info);
@@ -1193,6 +1201,48 @@ async function reattachTerminals() {
     if (info.exited) t.xterm.writeln(`\r\n\x1b[2m[process exited — press Enter to restart]\x1b[0m`);
   }
   if (S.terms.length) activateTerm(S.terms[S.terms.length - 1]);
+  return list.length;
+}
+
+// Claude Code tabs come back after the browser restarts (an update, say): each project remembers
+// its Claude sessions (the id Claude Code's status line gives, and a name given by hand), and when
+// the Workbench opens the project with no terminals running, they open again with `claude --resume`,
+// in the same order. A tab closed by hand is forgotten.
+function saveClaudeSessions() {
+  const root = S.project?.root;
+  if (!root || S.restoringSessions || typeof wb.saveClaudeSessions !== 'function') return;
+  const list = S.terms.filter((t) => t.kind === 'claude' && t.root === root && t.sessionId && !t.closed)
+    .map((t) => ({ id: t.sessionId, name: t.custom || '' }));
+  const key = JSON.stringify(list);
+  if (S.savedSessions === key) return;
+  S.savedSessions = key;
+  wb.saveClaudeSessions(list).catch(() => { S.savedSessions = null; });
+}
+
+// The status line told us a terminal's session id (it changes on /clear, so keep following it).
+function noteClaudeSessions(usage) {
+  let changed = false;
+  for (const t of S.terms) {
+    const id = usage?.[t.id]?.session_id;
+    if (t.kind === 'claude' && typeof id === 'string' && id && id !== t.sessionId) { t.sessionId = id; changed = true; }
+  }
+  if (changed) saveClaudeSessions();
+}
+
+async function restoreClaudeSessions(root) {
+  let list = [];
+  try { list = (await wb.claudeSessions()) || []; } catch { return; }
+  list = list.filter((s) => s && /^[\w-]{1,80}$/.test(String(s.id)));
+  S.savedSessions = JSON.stringify(list);
+  if (!list.length || S.info?.agents?.claude?.installed === false) return;
+  S.restoringSessions = true;
+  try {
+    for (const s of list) {
+      if (S.project?.root !== root) break;
+      await launch('claude', { resumeId: String(s.id), name: typeof s.name === 'string' ? s.name.slice(0, 80) : '' });
+    }
+  } finally { S.restoringSessions = false; }
+  saveClaudeSessions();
 }
 
 function initTerminals() {
@@ -1281,6 +1331,7 @@ function onHostCommand(msg) {
   if (msg.type === 'focus-term') { const t = S.terms.find((x) => x.id === String(msg.id)); if (t) { $('#term-area').classList.remove('collapsed'); activateTerm(t); } }
   if (msg.type === 'mission' && typeof missionChip === 'function') missionChip(msg);
   if (msg.type === 'mission' && typeof insightsUsage === 'function') insightsUsage(msg.usage);
+  if (msg.type === 'mission') noteClaudeSessions(msg.usage);
   if (typeof proHostCommand === 'function') proHostCommand(msg); // Workbench Pro: new-hub, customize, safe-mode
 }
 
