@@ -92,12 +92,14 @@ test('after a restart the Workbench opens its Claude Code tabs again, resumed, i
     await wb.waitFor(`!!document.querySelector('#modal-overlay [data-a="ok"]')`);
     await click(wb, `document.querySelector('#modal-overlay [data-a="ok"]')`);
     await wb.waitFor(`${tabNames}.length === 2`);
-    await sleep(300);
+    // The tab's address names the project, so the restored tab opens it again.
+    assert.ok((await wb.eval('location.href')).includes('project='), 'the Workbench address names its project');
+    await sleep(1500);  // the session is saved
 
     // The browser quits (as for an update) and starts again.
     wb.close();
-    await b.close();
-    b = await launch(['about:blank'], { profile, args });
+    await b.quit();
+    b = await launch([], { profile, args });
     wb = await openWorkbench(b);
     await wb.waitFor('!!S.project', 15000);
     await wb.waitFor(`${tabNames}.length === 2`, 20000);
