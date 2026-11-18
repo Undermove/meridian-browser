@@ -1,0 +1,819 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 18 Nov 2026 16:36:20 +0400
+Subject: [PATCH 160/160] Meridian: Little window in a space with a picker;
+ splits as one sidebar row, made by dropping a tab on another
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/little_window.cc      | 75 +++++++++++++++---
+ chrome/browser/meridian/little_window.h       | 17 +++-
+ chrome/browser/meridian/sidebar.mojom         |  9 +++
+ chrome/browser/meridian/sidebar_handler.cc    | 66 +++++++++++++++-
+ chrome/browser/meridian/sidebar_handler.h     |  4 +
+ chrome/browser/meridian/space_profiles.cc     | 13 ++-
+ .../browser/resources/webui_browser/app.css   | 79 +++++++++++++++++++
+ .../resources/webui_browser/app.html.ts       | 24 ++++++
+ chrome/browser/resources/webui_browser/app.ts | 41 ++++++++++
+ .../resources/webui_browser/meridian/rows.css | 17 ++++
+ .../webui_browser/meridian/sidebar.css        | 26 ++++++
+ .../webui_browser/meridian/sidebar.html.ts    | 15 +++-
+ .../webui_browser/meridian/sidebar.ts         | 68 ++++++++++++++--
+ .../webui_browser/meridian/tab_row.ts         |  3 +
+ 14 files changed, 433 insertions(+), 24 deletions(-)
+
+diff --git a/chrome/browser/meridian/little_window.cc b/chrome/browser/meridian/little_window.cc
+index 9a001bd3ea..8daa39c844 100644
+--- a/chrome/browser/meridian/little_window.cc
++++ b/chrome/browser/meridian/little_window.cc
+@@ -22,6 +22,9 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "chrome/browser/ui/browser_window/public/create_browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
+ #include "components/prefs/pref_service.h"
+ #include "ui/base/base_window.h"
+ #include "ui/base/page_transition_types.h"
+@@ -36,18 +39,38 @@ namespace {
+ constexpr int kWidth = 980;
+ constexpr int kHeight = 720;
+ 
++struct Little {
++  base::CallbackListSubscription closed;
++  std::string space_id;
++};
++
+ // Open Little windows, until they close.
+-std::map<const BrowserWindowInterface*, base::CallbackListSubscription>&
+-LittleWindows() {
+-  static base::NoDestructor<
+-      std::map<const BrowserWindowInterface*, base::CallbackListSubscription>>
++std::map<const BrowserWindowInterface*, Little>& LittleWindows() {
++  static base::NoDestructor<std::map<const BrowserWindowInterface*, Little>>
+       windows;
+   return *windows;
+ }
+ 
++// `space_id` if the profile has it, else the active space.
++std::string SpaceOrActive(Profile* profile, const std::string& space_id) {
++  SidebarService* service = SidebarServiceFactory::GetForProfile(profile);
++  if (!service) {
++    return std::string();
++  }
++  if (!space_id.empty() && service->FindSpace(space_id)) {
++    return space_id;
++  }
++  return service->active_space_id();
++}
++
+ }  // namespace
+ 
+-BrowserWindowInterface* OpenLittleWindow(Profile* profile, const GURL& url) {
++BrowserWindowInterface* OpenLittleWindow(Profile* profile,
++                                         const GURL& url,
++                                         const std::string& space_id) {
++  // The window is the main profile's (its bar is Meridian's WebUI); the page
++  // is in the space's profile.
++  profile = MainProfileFor(profile);
+   BrowserWindowCreateParams params(*profile, /*from_user_gesture=*/true);
+   gfx::Rect work_area =
+       display::Screen::Get()->GetDisplayForNewWindows().work_area();
+@@ -61,14 +84,20 @@ BrowserWindowInterface* OpenLittleWindow(Profile* profile, const GURL& url) {
+   if (!browser) {
+     return nullptr;
+   }
+-  LittleWindows()[browser] = browser->RegisterBrowserDidClose(
++  Little& little = LittleWindows()[browser];
++  little.closed = browser->RegisterBrowserDidClose(
+       base::BindRepeating([](BrowserWindowInterface* closed) {
+         LittleWindows().erase(closed);
+       }));
++  little.space_id = SpaceOrActive(profile, space_id);
+ 
+-  NavigateParams nav(browser, url, ui::PAGE_TRANSITION_LINK);
+-  nav.disposition = WindowOpenDisposition::kNewForegroundTab;
+-  Navigate(&nav);
++  if (little.space_id.empty()) {
++    NavigateParams nav(browser, url, ui::PAGE_TRANSITION_LINK);
++    nav.disposition = WindowOpenDisposition::kNewForegroundTab;
++    Navigate(&nav);
++  } else {
++    OpenInSpace(browser, little.space_id, url, /*active=*/true);
++  }
+   browser->GetWindow()->Show();
+   return browser;
+ }
+@@ -77,6 +106,34 @@ bool IsLittleWindow(const BrowserWindowInterface* browser) {
+   return LittleWindows().contains(browser);
+ }
+ 
++std::string LittleSpaceOf(const BrowserWindowInterface* browser) {
++  auto it = LittleWindows().find(browser);
++  return it == LittleWindows().end() ? std::string() : it->second.space_id;
++}
++
++void SetLittleSpace(BrowserWindowInterface* browser,
++                    const std::string& space_id) {
++  auto it = LittleWindows().find(browser);
++  SidebarService* service =
++      SidebarServiceFactory::GetForProfile(browser->GetProfile());
++  TabStripModel* model = browser->GetTabStripModel();
++  tabs::TabInterface* old = model->GetActiveTab();
++  if (it == LittleWindows().end() || !service ||
++      !service->FindSpace(space_id) || it->second.space_id == space_id ||
++      !old) {
++    return;
++  }
++  content::WebContents* contents = old->GetContents();
++  GURL url = contents->GetLastCommittedURL().is_empty()
++                 ? contents->GetVisibleURL()
++                 : contents->GetLastCommittedURL();
++  it->second.space_id = space_id;
++  // The new page first: the window closes with its last tab.
++  OpenInSpace(browser, space_id, url, /*active=*/true);
++  model->CloseWebContentsAt(model->GetIndexOfTab(old),
++                            TabCloseTypes::CLOSE_NONE);
++}
++
+ BrowserWindowInterface* FindOrCreateMainWindow(
+     Profile* profile,
+     const BrowserWindowInterface* except) {
+diff --git a/chrome/browser/meridian/little_window.h b/chrome/browser/meridian/little_window.h
+index 48d44bccda..cbad409442 100644
+--- a/chrome/browser/meridian/little_window.h
++++ b/chrome/browser/meridian/little_window.h
+@@ -5,6 +5,8 @@
+ #ifndef CHROME_BROWSER_MERIDIAN_LITTLE_WINDOW_H_
+ #define CHROME_BROWSER_MERIDIAN_LITTLE_WINDOW_H_
+ 
++#include <string>
++
+ class BrowserWindowInterface;
+ class GURL;
+ class Profile;
+@@ -13,11 +15,22 @@ namespace meridian {
+ 
+ // Arc's Little window: a link opened from another app shows in a small window
+ // without the sidebar, with "Open in Meridian" to move it into the main
+-// window. It is not saved with the session.
+-BrowserWindowInterface* OpenLittleWindow(Profile* profile, const GURL& url);
++// window. It is not saved with the session. As in Arc, the page opens in a
++// space (by default the one last active) with that space's profile, so its
++// logins; the bar can move it to another space (SetLittleSpace).
++BrowserWindowInterface* OpenLittleWindow(Profile* profile,
++                                         const GURL& url,
++                                         const std::string& space_id = "");
+ 
+ bool IsLittleWindow(const BrowserWindowInterface* browser);
+ 
++// The space a Little window's page is in ("" for any other window).
++std::string LittleSpaceOf(const BrowserWindowInterface* browser);
++// Opens the Little window's page again in `space_id` (its profile), in place
++// of the one there.
++void SetLittleSpace(BrowserWindowInterface* browser,
++                    const std::string& space_id);
++
+ // The most recently used normal window that isn't a Little window (other than
+ // `except`), or a new one.
+ BrowserWindowInterface* FindOrCreateMainWindow(
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 323cccbdad..f688b2de47 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -135,6 +135,8 @@ struct SidebarState {
+   // A Little window (a link from another app): no sidebar, a bar with
+   // "Open in Meridian".
+   bool little;
++  // A Little window's space: the profile its page is in, picked in its bar.
++  string little_space_id;
+ };
+ 
+ // What an Arc import would bring, shown before anything is imported.
+@@ -653,6 +655,11 @@ interface SidebarHandler {
+   // (⌃⇧-), and the divider position.
+   SplitWith(tabs_api.mojom.NodeId other);
+   Unsplit();
++  // Arc: a tab dropped onto another in the sidebar. `dropped` joins `onto`
++  // in a split, on its right, and becomes the active tab.
++  SplitTabs(tabs_api.mojom.NodeId onto, tabs_api.mojom.NodeId dropped);
++  // Separates the split `tab` is in (the sidebar's Separate Split).
++  UnsplitTab(tabs_api.mojom.NodeId tab);
+   SetSplitRatio(string split_id, double ratio);
+ 
+   // The archive, newest first, filtered by `query` (title or URL).
+@@ -667,6 +674,8 @@ interface SidebarHandler {
+   // Little window: moves its tab into the main window (opening one if
+   // needed); the Little window closes.
+   OpenInMeridian();
++  // Little window: its page again in `space_id` (Arc's space picker).
++  SetLittleSpace(string space_id);
+ 
+   // Arc's sidebar on this computer (null if there is none).
+   GetArcPreview() => (ArcPreview? preview);
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 0f06b8bfd2..4bc07ccd31 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -1477,6 +1477,11 @@ void SidebarHandler::OpenInMeridian() {
+   if (!target) {
+     return;
+   }
++  // Into its space, which the main window shows.
++  std::string space_id = LittleSpaceOf(browser_);
++  if (!space_id.empty() && service_->FindSpace(space_id)) {
++    service_->SetActiveSpace(space_id);
++  }
+   // The last tab leaving closes this window (and this handler), so nothing
+   // touches `this` after the detach.
+   std::unique_ptr<tabs::TabModel> detached =
+@@ -1487,6 +1492,11 @@ void SidebarHandler::OpenInMeridian() {
+   target->GetWindow()->Show();
+ }
+ 
++void SidebarHandler::SetLittleSpace(const std::string& space_id) {
++  meridian::SetLittleSpace(browser_, space_id);
++  ScheduleNotify();
++}
++
+ namespace {
+ struct ArcRead {
+   std::optional<ArcSidebar> sidebar;
+@@ -2189,6 +2199,7 @@ mojom::SidebarStatePtr SidebarHandler::BuildState() {
+     }
+   }
+   state->little = IsLittleWindow(browser_);
++  state->little_space_id = LittleSpaceOf(browser_);
+   state->sidebar_right =
+       browser_->GetProfile()->GetPrefs()->GetBoolean(prefs::kSidebarRight);
+   state->off_the_record = browser_->GetProfile()->IsOffTheRecord();
+@@ -2370,14 +2381,29 @@ void SidebarHandler::MoveTodayTab(const tabs_api::NodeId& tab_id,
+                                   bool above) {
+   tabs::TabInterface* tab = TabFor(tab_id);
+   tabs::TabInterface* target = TabFor(target_id);
+-  if (!tab || !target || tab == target || tab->GetSplit() ||
+-      target->GetSplit()) {
++  if (!tab || !target || tab == target) {
+     return;
+   }
++  // A half of a split dragged out of it: the split comes apart (Arc).
++  if (tab->GetSplit()) {
++    if (tab->GetSplit() == target->GetSplit()) {
++      return;
++    }
++    model()->RemoveSplit(*tab->GetSplit());
++  }
+   // Today lists the newest first: above a tab is after it in the strip, and
+-  // the strip's order is what a restart brings back.
++  // the strip's order is what a restart brings back. Next to a split is next
++  // to both of its tabs.
++  int target_index = model()->GetIndexOfTab(target);
++  if (std::optional<split_tabs::SplitTabId> split = target->GetSplit()) {
++    for (tabs::TabInterface* t : model()->GetSplitData(*split)->ListTabs()) {
++      int i = model()->GetIndexOfTab(t);
++      target_index = above ? std::max(target_index, i)
++                           : std::min(target_index, i);
++    }
++  }
+   int from = model()->GetIndexOfTab(tab);
+-  int to = model()->GetIndexOfTab(target) + (above ? 1 : 0);
++  int to = target_index + (above ? 1 : 0);
+   if (from < to) {
+     --to;
+   }
+@@ -3091,6 +3117,38 @@ void SidebarHandler::Unsplit() {
+   }
+ }
+ 
++void SidebarHandler::SplitTabs(const tabs_api::NodeId& onto,
++                               const tabs_api::NodeId& dropped) {
++  tabs::TabInterface* left = TabFor(onto);
++  tabs::TabInterface* right = TabFor(dropped);
++  if (!left || !right || left == right || left->GetSplit() ||
++      right->GetSplit()) {
++    return;
++  }
++  // The dropped tab right after the one it joins: the split keeps the strip's
++  // order, so it shows on the right.
++  int from = model()->GetIndexOfTab(right);
++  int to = model()->GetIndexOfTab(left) + 1;
++  if (from < to) {
++    --to;
++  }
++  if (from != to) {
++    model()->MoveWebContentsAt(from, to, /*select_after_move=*/false);
++  }
++  model()->ActivateTabAt(model()->GetIndexOfTab(right));
++  model()->AddToNewSplit(
++      {model()->GetIndexOfTab(left)},
++      split_tabs::SplitTabVisualData(split_tabs::SplitTabLayout::kSideBySide),
++      split_tabs::SplitTabCreatedSource::kDragAndDropTab);
++}
++
++void SidebarHandler::UnsplitTab(const tabs_api::NodeId& tab_id) {
++  tabs::TabInterface* tab = TabFor(tab_id);
++  if (tab && tab->GetSplit()) {
++    model()->RemoveSplit(*tab->GetSplit());
++  }
++}
++
+ void SidebarHandler::SetSplitRatio(const std::string& split_id, double ratio) {
+   for (int i = 0; i < model()->count(); ++i) {
+     std::optional<split_tabs::SplitTabId> id =
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 70ea7d7b7d..85798d165f 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -179,6 +179,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+                     uint32_t modifiers) override;
+   void SplitWith(const tabs_api::NodeId& other) override;
+   void Unsplit() override;
++  void SplitTabs(const tabs_api::NodeId& onto,
++                 const tabs_api::NodeId& dropped) override;
++  void UnsplitTab(const tabs_api::NodeId& tab) override;
+   void SetSplitRatio(const std::string& split_id, double ratio) override;
+   void SearchArchive(const std::string& query,
+                      SearchArchiveCallback callback) override;
+@@ -186,6 +189,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void DeleteArchived(const std::string& id) override;
+   void ClearToday() override;
+   void OpenInMeridian() override;
++  void SetLittleSpace(const std::string& space_id) override;
+   void GetArcPreview(GetArcPreviewCallback callback) override;
+   void ImportArc(ImportArcCallback callback) override;
+   void ImportArcLogins(ImportArcLoginsCallback callback) override;
+diff --git a/chrome/browser/meridian/space_profiles.cc b/chrome/browser/meridian/space_profiles.cc
+index e29947f06b..8a154c34d0 100644
+--- a/chrome/browser/meridian/space_profiles.cc
++++ b/chrome/browser/meridian/space_profiles.cc
+@@ -165,6 +165,17 @@ bool LinkOpensInPeek(content::WebContents* source) {
+ 
+ Profile* ProfileForNewTab(BrowserWindowInterface* browser, Profile* source) {
+   Profile* own = browser->GetProfile();
++  // A Little window: the profile of its page's space.
++  if (IsLittleWindow(browser) && !own->IsOffTheRecord()) {
++    if (source && !source->IsOffTheRecord()) {
++      return source;
++    }
++    SidebarService* service = SidebarServiceFactory::GetForProfile(own);
++    const Space* space =
++        service ? service->FindSpace(LittleSpaceOf(browser)) : nullptr;
++    Profile* profile = space ? LoadSpaceProfile(own, space->profile) : nullptr;
++    return profile ? profile : own;
++  }
+   if (!HoldsSpaceTabs(browser)) {
+     return own;
+   }
+@@ -188,7 +199,7 @@ content::WebContents* OpenInSpace(BrowserWindowInterface* browser,
+   Profile* profile = browser->GetProfile();
+   SidebarService* service = SidebarServiceFactory::GetForProfile(profile);
+   const Space* space = service ? service->FindSpace(space_id) : nullptr;
+-  if (space && HoldsSpaceTabs(browser)) {
++  if (space && (HoldsSpaceTabs(browser) || IsLittleWindow(browser))) {
+     if (Profile* own = LoadSpaceProfile(profile, space->profile)) {
+       profile = own;
+     }
+diff --git a/chrome/browser/resources/webui_browser/app.css b/chrome/browser/resources/webui_browser/app.css
+index 2779547c5c..21ff0ccb9b 100644
+--- a/chrome/browser/resources/webui_browser/app.css
++++ b/chrome/browser/resources/webui_browser/app.css
+@@ -512,6 +512,7 @@ cr-icon-button[hidden] {
+ /* Little window (a link from another app): no sidebar; a bar on top with the
+  * site and "Open in Meridian", next to the traffic lights. */
+ #littleBar {
++  position: relative;
+   display: flex;
+   align-items: center;
+   gap: 8px;
+@@ -541,6 +542,84 @@ cr-icon-button[hidden] {
+   color: var(--meridian-text-muted);
+ }
+ 
++#littleSpace {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  max-width: 40%;
++  font: inherit;
++  font-size: 12px;
++  font-weight: 550;
++  color: var(--meridian-text);
++  padding: 4px 8px;
++  border: 0;
++  border-radius: 7px;
++  background: none;
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
++}
++
++#littleSpace:hover,
++#littleSpace.open {
++  background: color-mix(in srgb, var(--meridian-text) 9%, transparent);
++}
++
++#littleSpace .name,
++.little-space .name {
++  min-width: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++#littleSpace .dot,
++.little-space .dot {
++  width: 9px;
++  height: 9px;
++  flex: none;
++  border-radius: 50%;
++}
++
++#littleSpaces {
++  position: absolute;
++  top: 34px;
++  left: 78px;
++  z-index: 40;
++  min-width: 180px;
++  padding: 5px;
++  display: flex;
++  flex-direction: column;
++  border-radius: 10px;
++  background: var(--meridian-surface);
++  box-shadow: 0 0 0 0.5px var(--meridian-border),
++      0 10px 32px rgba(0, 0, 0, 0.2);
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
++}
++
++.little-space {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  height: 30px;
++  padding: 0 10px;
++  border: 0;
++  border-radius: 6px;
++  background: none;
++  font: inherit;
++  font-size: 13px;
++  color: var(--meridian-text);
++  text-align: left;
++}
++
++.little-space .name {
++  flex: 1;
++}
++
++.little-space:hover {
++  background: color-mix(in srgb, var(--meridian-space) 24%, transparent);
++}
++
+ #openInMeridian {
+   font: inherit;
+   font-size: 12px;
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 485da425f9..50635d73c9 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -123,6 +123,7 @@ export function getHtml(this: WebuiBrowserAppElement) {
+         @meridian-peeks-changed="${this.onMeridianPeeksChanged_}"
+         @meridian-status="${this.onMeridianStatus_}"
+         @meridian-little-changed="${this.onMeridianLittleChanged_}"
++        @meridian-little-space="${this.onMeridianLittleSpace_}"
+         @meridian-onboarding="${this.onMeridianOnboarding_}"
+         @meridian-show-settings="${this.onMeridianShowSettings_}"
+         @meridian-sidebar-side="${this.onMeridianSidebarSide_}"
+@@ -184,9 +185,32 @@ export function getHtml(this: WebuiBrowserAppElement) {
+   <meridian-tidy id="tidy"
+       @meridian-tidy-apply="${this.onMeridianTidyApply_}"></meridian-tidy>
+   <div id="littleBar" ?hidden="${!this.little_}">
++    ${this.littleSpace_() ? html`
++      <button id="littleSpace" class="${this.littleMenu_ ? 'open' : ''}"
++          title="The space this page opens in"
++          @click="${this.onLittleSpaceClick_}">
++        ${this.littleSpace_()!.icon ? html`
++          <span class="emoji">${this.littleSpace_()!.icon}</span>` : html`
++          <span class="dot" style="background:${this.littleSpace_()!.color}">
++          </span>`}
++        <span class="name">${this.littleSpace_()!.name}</span>
++        ${icon('chevronDown', 12)}
++      </button>` : ''}
+     <span class="host"><bdi dir="ltr">${this.urlHost_}</bdi></span>
+     <button id="openInMeridian" title="Open in Meridian"
+         @click="${this.onOpenInMeridianClick_}">Open in Meridian</button>
++    ${this.littleMenu_ ? html`
++      <div id="littleSpaces" role="menu">
++        ${this.littleSpaces_.map(s => html`
++          <button class="little-space" role="menuitemradio"
++              aria-checked="${s.id === this.littleSpaceId_}" data-space="${s.id}"
++              @click="${this.onLittleSpacePickClick_}">
++            ${s.icon ? html`<span class="emoji">${s.icon}</span>` : html`
++              <span class="dot" style="background:${s.color}"></span>`}
++            <span class="name">${s.name}</span>
++            ${s.id === this.littleSpaceId_ ? icon('check', 13) : ''}
++          </button>`)}
++      </div>` : ''}
+   </div>
+   <div id="main">
+     <content-region id="contentRegion"
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index e40cac77b3..cdf6c6709c 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -182,6 +182,9 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       missionToast_: {state: true, type: Object},
+       sidebarHidden_: {type: Boolean, reflect: true, attribute: 'sidebar-hidden'},
+       little_: {type: Boolean, reflect: true, attribute: 'little'},
++      littleSpaces_: {state: true, type: Array},
++      littleSpaceId_: {state: true, type: String},
++      littleMenu_: {state: true, type: Boolean},
+       sidebarRight_: {type: Boolean, reflect: true, attribute: 'sidebar-right'},
+       private_: {type: Boolean, reflect: true, attribute: 'private'},
+       showHome_: {state: true, type: Boolean},
+@@ -235,6 +238,10 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   // A Little window: a link from another app, without the sidebar.
+   protected accessor little_: boolean = false;
+   private littleAsked_ = false;
++  // Its page's space and the spaces it can move to (Arc's picker in the bar).
++  protected accessor littleSpaces_: Space[] = [];
++  protected accessor littleSpaceId_: string = '';
++  protected accessor littleMenu_: boolean = false;
+   protected accessor sidebarRight_: boolean = false;
+   protected accessor private_: boolean = false;
+   // The active tab is a new tab: the home page shows instead.
+@@ -939,6 +946,40 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.little_ = e.detail;
+   }
+ 
++  protected onMeridianLittleSpace_(
++      e: CustomEvent<{spaces: Space[], id: string}>) {
++    this.littleSpaces_ = e.detail.spaces;
++    this.littleSpaceId_ = e.detail.id;
++  }
++
++  protected littleSpace_(): Space|undefined {
++    return this.littleSpaces_.find(s => s.id === this.littleSpaceId_);
++  }
++
++  protected onLittleSpaceClick_(e: Event) {
++    e.stopPropagation();
++    this.littleMenu_ = !this.littleMenu_;
++    if (this.littleMenu_) {
++      // Any other click closes it.
++      window.addEventListener('pointerdown', (ev: Event) => {
++        if (!ev.composedPath().some(
++                el => el instanceof HTMLElement &&
++                    (el.id === 'littleSpaces' || el.id === 'littleSpace'))) {
++          this.littleMenu_ = false;
++        }
++      }, {once: true, capture: true});
++    }
++  }
++
++  protected onLittleSpacePickClick_(e: Event) {
++    const id = (e.currentTarget as HTMLElement).dataset['space']!;
++    this.littleMenu_ = false;
++    if (id !== this.littleSpaceId_) {
++      this.littleSpaceId_ = id;
++      this.$.tabstrip.setLittleSpace(id);
++    }
++  }
++
+   protected onOpenInMeridianClick_() {
+     this.$.tabstrip.openInMeridian();
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/rows.css b/chrome/browser/resources/webui_browser/meridian/rows.css
+index 102d08d8a4..1919b6346f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/rows.css
++++ b/chrome/browser/resources/webui_browser/meridian/rows.css
+@@ -48,6 +48,23 @@ button {
+   box-shadow: var(--meridian-row-shadow);
+ }
+ 
++/* A half of a split's row (sidebar.css .split-row): the row around both
++ * shows the selection; the focused half only a little. */
++:host([half]) {
++  flex: 1;
++  min-width: 0;
++}
++
++:host([half]) .row {
++  gap: 8px;
++  padding: 0 4px 0 10px;
++}
++
++:host([half]) .row.active {
++  background: color-mix(in srgb, var(--meridian-text) 7%, transparent);
++  box-shadow: none;
++}
++
+ .row .title {
+   flex: 1;
+   white-space: nowrap;
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.css b/chrome/browser/resources/webui_browser/meridian/sidebar.css
+index b3e1e65a5b..806e8bdf85 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.css
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.css
+@@ -545,6 +545,32 @@ button {
+   color: var(--meridian-text-muted);
+ }
+ 
++/* Arc's split: one row, the two tabs side by side. */
++.split-row {
++  display: flex;
++  gap: 2px;
++  padding: 0;
++  border-radius: 8px;
++  position: relative;
++}
++
++.split-row.active {
++  background: var(--meridian-row-active);
++  box-shadow: var(--meridian-row-shadow);
++}
++
++/* Between the halves (both flex: 1). */
++.split-row::after {
++  content: '';
++  position: absolute;
++  top: 10px;
++  bottom: 10px;
++  left: 50%;
++  width: 1px;
++  margin-left: -0.5px;
++  background: color-mix(in srgb, var(--meridian-text) 14%, transparent);
++}
++
+ #today {
+   min-height: 34px;
+ }
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+index 1a9d15d45e..e385fc269b 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+@@ -51,10 +51,19 @@ export function getHtml(this: MeridianSidebarElement) {
+       <span class="title">New Tab</span>
+     </button>
+     <div id="today">
+-      ${repeat(this.today_, t => t.id, t => html`
+-        <meridian-tab-row .tab="${t}" .host="${this}"
++      ${repeat(this.todayRows_(), r => r.key, r => html`${r.end ? html`
++        <div class="split-row ${this.splitRowActive_(r) ? 'active' : ''}"
++            data-split="${r.key}">
++          <meridian-tab-row half .tab="${r.start}" .host="${this}"
++              .agentTab="${this.agentTab_}" .renaming="${this.renaming_}">
++          </meridian-tab-row>
++          <meridian-tab-row half .tab="${r.end}" .host="${this}"
++              .agentTab="${this.agentTab_}" .renaming="${this.renaming_}">
++          </meridian-tab-row>
++        </div>` : html`
++        <meridian-tab-row .tab="${r.start}" .host="${this}"
+             .agentTab="${this.agentTab_}" .renaming="${this.renaming_}">
+-        </meridian-tab-row>`)}
++        </meridian-tab-row>`}`)}
+     </div>
+   ` : ''}
+ </div>
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index f0086f99ce..d45ff3df95 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -24,7 +24,7 @@ import type {TabStripObserver} from '/tab_strip_api/tab_strip_observer.js';
+ 
+ import {browserProxyFactory as sidebarProxyFactory, Command, UpdateStatus} from '../sidebar.mojom-webui.js';
+ import {TabAlertState} from '../tabs.mojom-webui.js';
+-import type {Download, Item, NowPlaying, SidebarHandlerInterface, UpdateState, SidebarState, Space, TidyFolder, TidyRename} from '../sidebar.mojom-webui.js';
++import type {Download, Item, NowPlaying, SidebarHandlerInterface, UpdateState, SidebarState, Space, Split, TidyFolder, TidyRename} from '../sidebar.mojom-webui.js';
+ import type {TabAdded, TabClosed, TabUpdated} from '../tab_strip/events.js';
+ 
+ import './fav.js';
+@@ -444,6 +444,10 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.rev_++;
+     this.fire('meridian-splits-changed', state.splits);
+     this.fire('meridian-little-changed', state.little);
++    if (state.little) {
++      this.fire('meridian-little-space',
++                {spaces: state.spaces, id: state.littleSpaceId});
++    }
+     this.fire('meridian-sidebar-side', state.sidebarRight);
+     this.fire('meridian-private', state.offTheRecord);
+     // First start of this profile: the welcome tour, once per window.
+@@ -612,7 +616,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+       }
+       if (el.dataset['tab'] && el.classList.contains('row')) {
+         const r = el.getBoundingClientRect();
+-        return {el, pos: e.clientY < r.top + r.height / 2 ? 'before' : 'after'};
++        const y = (e.clientY - r.top) / r.height;
++        if (y > 0.25 && y < 0.75 && this.canSplitOnto_(el.dataset['tab'])) {
++          return {el, pos: 'into'};
++        }
++        return {el, pos: y < 0.5 ? 'before' : 'after'};
+       }
+       if (el.dataset['space'] && el.classList.contains('space-dot')) {
+         return {el, zone: 'space'};
+@@ -713,8 +721,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+       return;
+     }
+     if (t.el.dataset['tab']) {
+-      // Onto a Today tab: Today's order; a pinned one comes back to Today.
+-      if (drag.tab) {
++      // Onto a Today tab: its middle makes a split (Arc), its edges Today's
++      // order; a pinned one comes back to Today.
++      if (drag.tab && t.pos === 'into') {
++        this.handler_.splitTabs(t.el.dataset['tab'], drag.tab);
++      } else if (drag.tab) {
+         this.moveTodayTab_(drag.tab, t.el.dataset['tab'], t.pos === 'before');
+       } else if (drag.item) {
+         this.handler_.removeItem(drag.item);
+@@ -760,6 +771,45 @@ export class MeridianSidebarElement extends CrLitElement implements
+     }
+   };
+ 
++  // Today as rows: a split's two tabs make one row (Arc), where the first of
++  // them is.
++  protected todayRows_(): Array<{key: string, start: Tab, end?: Tab}> {
++    const rows: Array<{key: string, start: Tab, end?: Tab}> = [];
++    const shown = new Set<string>();
++    for (const t of this.today_) {
++      if (shown.has(t.id)) {
++        continue;
++      }
++      const split = this.splitOf_(t.id);
++      const start = split && this.today_.find(x => x.id === split.start);
++      const end = split && this.today_.find(x => x.id === split.end);
++      if (split && start && end) {
++        shown.add(start.id);
++        shown.add(end.id);
++        rows.push({key: 'split:' + split.id, start, end});
++      } else {
++        rows.push({key: t.id, start: t});
++      }
++    }
++    return rows;
++  }
++
++  protected splitRowActive_(row: {start: Tab, end?: Tab}): boolean {
++    return row.start.isActive || !!row.end?.isActive;
++  }
++
++  private splitOf_(tabId: NodeId): Split|undefined {
++    return this.state_?.splits.find(s => s.start === tabId || s.end === tabId);
++  }
++
++  // A tab dragged onto the middle of another joins it in a split; neither
++  // may be in one already.
++  private canSplitOnto_(target: NodeId): boolean {
++    const dragged = this.drag_?.tab;
++    return !!dragged && dragged !== target && !this.splitOf_(dragged) &&
++        !this.splitOf_(target);
++  }
++
+   // Shows `tab` right above or below `target` at once; the browser moves it
+   // in the strip too, so a restart keeps the order.
+   private moveTodayTab_(tab: NodeId, target: NodeId, above: boolean) {
+@@ -1219,6 +1269,10 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.handler_.openInMeridian();
+   }
+ 
++  setLittleSpace(spaceId: string) {
++    this.handler_.setLittleSpace(spaceId);
++  }
++
+   startRenaming(id: string) {
+     this.renaming_ = id;
+   }
+@@ -1856,7 +1910,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+         action: () => navigator.clipboard.writeText(tab.url),
+       },
+       {label: 'Duplicate', icon: 'duplicate', action: () => this.openUrl(tab.url)},
+-      {
++      this.splitOf_(tab.id) ? {
++        label: 'Separate Split',
++        icon: 'split',
++        action: () => this.handler_.unsplitTab(tab.id),
++      } : {
+         label: 'Open in Split View',
+         icon: 'split',
+         enabled: !tab.isActive,
+diff --git a/chrome/browser/resources/webui_browser/meridian/tab_row.ts b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+index eb85c952a0..7ba314385e 100644
+--- a/chrome/browser/resources/webui_browser/meridian/tab_row.ts
++++ b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+@@ -35,6 +35,8 @@ export class MeridianTabRowElement extends CrLitElement {
+       // The tab an agent works in (this row glows when it's this one).
+       agentTab: {type: String},
+       agent: {type: Boolean, reflect: true},
++      // One of a split's two halves, in the split's row.
++      half: {type: Boolean, reflect: true},
+       // What the sidebar is renaming in place ('tab:<id>' when it's this).
+       renaming: {type: String},
+       favicon_: {state: true, type: String},
+@@ -48,6 +50,7 @@ export class MeridianTabRowElement extends CrLitElement {
+   accessor tab: Tab|null = null;
+   accessor agentTab: string = '';
+   accessor agent: boolean = false;
++  accessor half: boolean = false;
+   accessor renaming: string = '';
+   accessor host: MeridianSidebarElement|null = null;
+   protected accessor favicon_: string = '';

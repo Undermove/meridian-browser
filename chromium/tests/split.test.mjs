@@ -36,3 +36,42 @@ test('Open in Split View shows both tabs side by side; the divider resizes; âŒƒâ
     assert.equal((await b.tabs()).length, 2, 'both tabs stay open');
   } finally { await b.close(); }
 });
+
+// Arc: a tab dragged onto the middle of another in the sidebar makes a split, shown there as one
+// row with both tabs; a click on either half shows the split; dragging a half out separates it.
+test('a tab dropped onto another in the sidebar splits them into one row; dragged out, they separate', async () => {
+  const b = await launch([page('Left', '%23fde'), page('Right', '%23def'), page('Third', '%23efd')]);
+  const half = (t) => `[...${SB}.querySelectorAll('.split-row meridian-tab-row')].find((r) => r.tab.title === ${JSON.stringify(t)})?.shadowRoot.querySelector('.row')`;
+  const row = (t) => `[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === ${JSON.stringify(t)})?.shadowRoot.querySelector('.row')`;
+  const active = `[...app.$.tabstrip.tabs_.values()].find((t) => t.isActive)?.title`;
+  try {
+    await b.waitFor(today(3));
+    await b.drag(row('Right'), row('Left'), { fy: 0.5 });
+    await b.waitFor(`${SB}.querySelectorAll('.split-row').length === 1`);
+    assert.deepEqual(await b.eval(`[...${SB}.querySelectorAll('.split-row meridian-tab-row')].map((r) => r.tab.title)`), ['Left', 'Right'], 'one row, the dropped tab on the right');
+    assert.equal(await b.eval(`${SB}.querySelectorAll('#today > meridian-tab-row').length`), 1, 'Third stays a row of its own');
+    await b.waitFor(`${CR}.hasAttribute('split')`);
+    assert.equal(await b.eval(active), 'Right', 'the dropped tab is the active one');
+    const r = await b.eval(`(() => { const a = ${half('Left')}.getBoundingClientRect(), c = ${half('Right')}.getBoundingClientRect(); return { top: Math.abs(a.top - c.top), side: c.left > a.right - 1 }; })()`);
+    assert.ok(r.top < 2 && r.side, 'the halves side by side in the row');
+
+    // Away to Third, then a click on the split's left half: the split again, Left focused.
+    await b.click(row('Third'));
+    await b.waitFor(`!${CR}.hasAttribute('split')`);
+    await b.click(half('Left'));
+    await b.waitFor(`${CR}.hasAttribute('split') && ${active} === 'Left'`);
+    assert.ok(await b.eval(`${SB}.querySelector('.split-row').classList.contains('active')`));
+
+    // The right half dragged out above Third: no split, three rows.
+    await b.drag(half('Right'), row('Third'), { fy: 0.1 });
+    await b.waitFor(`${SB}.querySelectorAll('.split-row').length === 0 && ${today(3)}`);
+    await b.waitFor(`app.$.tabstrip.state_.splits.length === 0`);
+    assert.equal((await b.tabs()).length, 3, 'every tab stays open');
+
+    // Again, then the menu's Separate Split.
+    await b.drag(row('Third'), row('Left'), { fy: 0.5 });
+    await b.waitFor(`${SB}.querySelectorAll('.split-row').length === 1`);
+    await b.menu(half('Left'), 'Separate Split');
+    await b.waitFor(`${SB}.querySelectorAll('.split-row').length === 0 && app.$.tabstrip.state_.splits.length === 0`);
+  } finally { await b.close(); }
+});
