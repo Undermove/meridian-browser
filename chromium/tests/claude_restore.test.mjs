@@ -1,6 +1,6 @@
 // The Workbench's Claude Code tabs come back after the browser restarts (an update, say): each one
-// opens again with `claude --resume <its session>`, in the same order, with a name given by hand;
-// a tab closed by hand stays closed.
+// opens again with `claude --resume <its session>`, in the permission mode it was in (bypass stays
+// bypass), in the same order, with a name given by hand; a tab closed by hand stays closed.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -27,6 +27,17 @@ else:
   open(counter, 'w').write(str(n))
   sid = 's%d' % n
   print('NEW ' + sid, flush=True)
+# The mode it runs in: the one it was started with, else the one the person switched to (⇧⇥):
+# s1 bypass, s2 accept edits, s3 auto. Its hooks report it.
+modes = {'s1': 'bypassPermissions', 's2': 'acceptEdits', 's3': 'auto'}
+if '--permission-mode' in args:
+  mode = args[args.index('--permission-mode') + 1]
+  print('MODE ' + mode, flush=True)
+else:
+  mode = modes.get(sid, 'default')
+for entry in settings.get('hooks', {}).get('UserPromptSubmit', []):
+  for h in entry['hooks']:
+    subprocess.run(h['command'], shell=True, input=json.dumps({'hook_event_name': 'UserPromptSubmit', 'session_id': sid, 'cwd': cwd, 'permission_mode': mode, 'prompt': 'hi'}), text=True)
 status = {'session_id': sid, 'session_name': 'Session ' + sid, 'model': {'display_name': 'Opus 5.5'},
           'workspace': {'project_dir': cwd, 'current_dir': cwd}, 'context_window': {'context_window_size': 200000, 'used_percentage': 10}}
 env = dict(os.environ, HOME=os.path.join(cwd, 'home'))
@@ -58,7 +69,7 @@ async function openWorkbench(b) {
   return wb;
 }
 
-test('after a restart the Workbench opens its Claude Code tabs again, resumed, in order, with their names; one closed by hand stays closed', async () => {
+test('after a restart the Workbench opens its Claude Code tabs again, resumed in their permission mode, in order, with their names; one closed by hand stays closed', async () => {
   const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-cr-')));
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
@@ -106,6 +117,9 @@ test('after a restart the Workbench opens its Claude Code tabs again, resumed, i
     await wb.waitFor(`JSON.stringify(${tabNames}) === JSON.stringify(['Session s1', 'Login bug'])`, 15000);
     await wb.waitFor(`${termText(0)}.includes('RESUMED s1')`, 10000);
     await wb.waitFor(`${termText(1)}.includes('RESUMED s2')`, 10000);
+    // In the permission mode each was in.
+    assert.ok((await wb.eval(termText(0))).includes('MODE bypassPermissions'), 'the first is in bypass again');
+    assert.ok((await wb.eval(termText(1))).includes('MODE acceptEdits'), 'the second accepts edits again');
     assert.equal(fs.readFileSync(path.join(project, '.sessions'), 'utf8'), '3', 'no new session was started');
   } finally {
     try { wb?.close(); } catch {}

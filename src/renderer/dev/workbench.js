@@ -1005,7 +1005,7 @@ function mountTerm(info) {
   return t;
 }
 
-async function launch(kind, { resume = false, resumeId, name } = {}) {
+async function launch(kind, { resume = false, resumeId, resumeMode, name } = {}) {
   if (!S.project) { toast('Open a project first'); return null; }
   if (S.info?.terminals === false) { toast(`Terminals are unavailable: ${S.info.terminalError || ''}`, 5000); return null; }
   // Workbench Pro: a sandbox gets only the vault secrets picked for this session.
@@ -1020,14 +1020,14 @@ async function launch(kind, { resume = false, resumeId, name } = {}) {
     // Size the pty right from the start so TUIs (Claude Code, Codex) draw correctly.
     const host = $('#term-host');
     const dims = estimateDims(host);
-    info = await wb.ptyCreate({ kind, cols: dims.cols, rows: dims.rows, secrets, resume, resumeId });
+    info = await wb.ptyCreate({ kind, cols: dims.cols, rows: dims.rows, secrets, resume, resumeId, resumeMode });
   } catch (err) {
     toast(err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, ''), 5000);
     if (/not installed/i.test(err.message)) refreshInfo();
     return null;
   }
   const t = mountTerm(info);
-  if (resumeId) { t.sessionId = resumeId; if (name) saveTermName(t, name); }
+  if (resumeId) { t.sessionId = resumeId; t.permissionMode = resumeMode || ''; if (name) saveTermName(t, name); }
   for (const n of info.notes || []) t.xterm.writeln(`\x1b[2m${n}\x1b[0m`);
   if (t.secrets.length && !t.sandbox) t.xterm.writeln(`\x1b[2mVault: ${t.secrets.join(', ')} ${t.secrets.length === 1 ? 'is' : 'are'} set in this session’s environment (values hidden).\x1b[0m`);
   if (t.guard) t.xterm.writeln('\x1b[2mSecret-file guard: Meridian asks before Claude Code reads .env, keys or credentials (file tools by path; shell commands only by a name match, so it is a safety net, not a wall).\x1b[0m');
@@ -1205,14 +1205,15 @@ async function reattachTerminals() {
 }
 
 // Claude Code tabs come back after the browser restarts (an update, say): each project remembers
-// its Claude sessions (the id Claude Code's status line gives, and a name given by hand), and when
+// its Claude sessions (the id Claude Code's status line gives, the permission mode its hooks report,
+// and a name given by hand), and when
 // the Workbench opens the project with no terminals running, they open again with `claude --resume`,
 // in the same order. A tab closed by hand is forgotten.
 function saveClaudeSessions() {
   const root = S.project?.root;
   if (!root || S.restoringSessions || typeof wb.saveClaudeSessions !== 'function') return;
   const list = S.terms.filter((t) => t.kind === 'claude' && t.root === root && t.sessionId && !t.closed)
-    .map((t) => ({ id: t.sessionId, name: t.custom || '' }));
+    .map((t) => ({ id: t.sessionId, name: t.custom || '', mode: t.permissionMode || '' }));
   const key = JSON.stringify(list);
   if (S.savedSessions === key) return;
   S.savedSessions = key;
@@ -1225,6 +1226,9 @@ function noteClaudeSessions(usage) {
   for (const t of S.terms) {
     const id = usage?.[t.id]?.session_id;
     if (t.kind === 'claude' && typeof id === 'string' && id && id !== t.sessionId) { t.sessionId = id; changed = true; }
+    // The permission mode it's in (bypass, auto, accept edits…), to resume it in the same one.
+    const mode = usage?.[t.id]?.permission_mode;
+    if (t.kind === 'claude' && typeof mode === 'string' && mode && mode !== t.permissionMode) { t.permissionMode = mode; changed = true; }
   }
   if (changed) saveClaudeSessions();
 }
@@ -1239,7 +1243,7 @@ async function restoreClaudeSessions(root) {
   try {
     for (const s of list) {
       if (S.project?.root !== root) break;
-      await launch('claude', { resumeId: String(s.id), name: typeof s.name === 'string' ? s.name.slice(0, 80) : '' });
+      await launch('claude', { resumeId: String(s.id), resumeMode: typeof s.mode === 'string' ? s.mode : '', name: typeof s.name === 'string' ? s.name.slice(0, 80) : '' });
     }
   } finally { S.restoringSessions = false; }
   saveClaudeSessions();
