@@ -159,7 +159,7 @@ test('Chrome’s extensions, saved passwords and history come over too', async (
   fs.writeFileSync(path.join(extDir, 'manifest.json'), JSON.stringify({ manifest_version: 3, name: 'Mark Chromy', version: '1.0' }));
   writePasswords(path.join(chrome, 'Default'), 'test-pass', [{ url: 'https://accounts.example.com/login', username: 'ada', password: 'hunter2' }]);
   writeHistory(path.join(chrome, 'Default'), [{ url: 'https://example.com/read-later', title: 'Read later' }]);
-  const b = await launch(['about:blank'], { args: [`--meridian-chrome-dir=${chrome}`, '--meridian-chrome-safe-storage=test-pass', `--apps-gallery-update-url=${web.url}`, '--meridian-test-unsigned-store'] });
+  const b = await launch(['about:blank'], { args: [`--meridian-chrome-dir=${chrome}`, '--meridian-chrome-safe-storage=test-pass', `--apps-gallery-update-url=${web.url}`, '--meridian-test-unsigned-store', '--meridian-test-no-external-extensions'] });
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
     assert.equal((await b.eval(`${H}.importArc('chrome')`)).ok, true);
