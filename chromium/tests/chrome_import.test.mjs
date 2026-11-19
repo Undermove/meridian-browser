@@ -12,6 +12,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { launch, SB } from './harness.mjs';
+import { packExtension, store, writeHistory, writePasswords } from './chromium_profile.mjs';
 
 const H = 'app.$.tabstrip.handler_';
 const OB = 'app.$.onboarding.shadowRoot';
@@ -33,7 +34,7 @@ function writeCookies(dir, password, rows) {
   for (const r of rows) {
     const c = crypto.createCipheriv('aes-128-cbc', key, Buffer.alloc(16, 0x20));
     const plain = Buffer.concat([crypto.createHash('sha256').update(r.host).digest(), Buffer.from(r.value)]);
-    insert.run(toChrome(Date.now() - 1000), r.host, r.name, Buffer.concat([Buffer.from('v10'), c.update(plain), c.final()]), toChrome(Date.now() + 86400000), toChrome(Date.now()), r.port);
+    insert.run(toChrome(Date.now() - 1000), r.host, r.name, Buffer.concat([Buffer.from(r.prefix || 'v10'), c.update(plain), c.final()]), toChrome(Date.now() + 86400000), toChrome(Date.now()), r.port);
   }
   db.close();
 }
@@ -142,4 +143,60 @@ test('the welcome tour moves in from Chrome when there is no Arc', async () => {
     await b.click(`${OB}.getElementById('next')`);
     await b.waitFor(`app.$.tabstrip.state_.spaces.map((s) => s.name).join() === 'Personal,Work'`, 15000);
   } finally { await b.close(); server.close(); fs.rmSync(chrome, { recursive: true, force: true }); fs.rmSync(empty, { recursive: true, force: true }); }
+});
+
+test('Chrome’s extensions, saved passwords and history come over too', async () => {
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(`<title>page ${req.url}</title>`); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = (p) => `http://127.0.0.1:${server.address().port}${p}`;
+  const chrome = await fakeChrome(url);
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-ext-'));
+  const ext = packExtension(tmp, 'Chromy');
+  const web = await store([ext]);
+  // As Chrome keeps it: Extensions/<id>/<version>/manifest.json.
+  const extDir = path.join(chrome, 'Default', 'Extensions', ext.id, '1.0_0');
+  fs.mkdirSync(extDir, { recursive: true });
+  fs.writeFileSync(path.join(extDir, 'manifest.json'), JSON.stringify({ manifest_version: 3, name: 'Mark Chromy', version: '1.0' }));
+  writePasswords(path.join(chrome, 'Default'), 'test-pass', [{ url: 'https://accounts.example.com/login', username: 'ada', password: 'hunter2' }]);
+  writeHistory(path.join(chrome, 'Default'), [{ url: 'https://example.com/read-later', title: 'Read later' }]);
+  const b = await launch(['about:blank'], { args: [`--meridian-chrome-dir=${chrome}`, '--meridian-chrome-safe-storage=test-pass', `--apps-gallery-update-url=${web.url}`, '--meridian-test-unsigned-store'] });
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    assert.equal((await b.eval(`${H}.importArc('chrome')`)).ok, true);
+    // The extension, from the (test) Web Store: it runs on pages.
+    await b.eval(`app.$.tabstrip.openUrl(${JSON.stringify(url('/marked'))})`);
+    let marked = false;
+    for (let i = 0; i < 60 && !marked; i++) {
+      await sleep(500);
+      try {
+        const page = await b.page(url('/marked'), 1000);
+        marked = await page.eval(`document.documentElement.dataset.markChromy === '1'`);
+        if (!marked) await page.eval('location.reload(), true');
+      } catch {}
+    }
+    assert.ok(marked, `Chrome's extension runs: asked ${JSON.stringify(web.asked)}`);
+    // Passwords, then history.
+    const pw = await b.eval(`${H}.importArcPasswords('chrome')`);
+    assert.equal(pw.error, '');
+    assert.equal(pw.imported, 1);
+    const { result } = await b.eval(`${H}.importArcData('chrome')`);
+    assert.equal(result.error, '');
+    assert.ok(result.history >= 1, `history: ${JSON.stringify(result)}`);
+  } finally { await b.close(); server.close(); web.close(); fs.rmSync(chrome, { recursive: true, force: true }); fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+// Chrome on Windows locks its cookies to itself (App-Bound Encryption, "v20"): Meridian says the
+// sign-ins can't come, and brings the passwords all the same.
+test('sign-ins Chrome locked to itself: said so; its passwords come all the same', async () => {
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(`<title>page ${req.url}</title>`); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+  const chrome = await fakeChrome((p) => `http://127.0.0.1:${port}${p}`);
+  writeCookies(path.join(chrome, 'Default'), 'test-pass', [{ host: '127.0.0.1', name: 'sid', value: 'locked', port, prefix: 'v20' }]);
+  writePasswords(path.join(chrome, 'Default'), 'test-pass', [{ url: 'https://accounts.example.com/login', username: 'ada', password: 'hunter2' }]);
+  const b = await launch(['about:blank'], { args: [`--meridian-chrome-dir=${chrome}`, '--meridian-chrome-safe-storage=test-pass'] });
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    assert.deepEqual(await b.eval(`${H}.importArcLogins('chrome')`), { imported: 0, passwords: 1, cards: 0, error: 'app-bound' });
+  } finally { await b.close(); server.close(); fs.rmSync(chrome, { recursive: true, force: true }); }
 });
