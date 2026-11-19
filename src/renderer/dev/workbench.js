@@ -1113,8 +1113,9 @@ async function launch(kind, { resume = false, resumeId, resumeMode, name } = {})
   if (resumeId) { t.sessionId = resumeId; t.permissionMode = resumeMode || ''; if (name) saveTermName(t, name); }
   for (const n of info.notes || []) t.xterm.writeln(`\x1b[2m${n}\x1b[0m`);
   if (t.secrets.length && !t.sandbox) t.xterm.writeln(`\x1b[2mVault: ${t.secrets.join(', ')} ${t.secrets.length === 1 ? 'is' : 'are'} set in this session’s environment (values hidden).\x1b[0m`);
-  if (t.guard) t.xterm.writeln('\x1b[2mSecret-file guard: Meridian asks before Claude Code reads .env, keys or credentials (file tools by path; shell commands only by a name match, so it is a safety net, not a wall).\x1b[0m');
-  if (info.browserTools) t.xterm.writeln(`\x1b[2mMeridian browser tools are connected for this session (access: ${ACCESS_LABEL[S.info?.agentAccess] || 'off'} — change it in Settings → AI).\x1b[0m`);
+  // (A shell tab gets them too, for Claude Code started there: no notes in a plain shell.)
+  if (t.guard && kind !== 'shell') t.xterm.writeln('\x1b[2mSecret-file guard: Meridian asks before Claude Code reads .env, keys or credentials (file tools by path; shell commands only by a name match, so it is a safety net, not a wall).\x1b[0m');
+  if (info.browserTools && kind !== 'shell') t.xterm.writeln(`\x1b[2mMeridian browser tools are connected for this session (access: ${ACCESS_LABEL[S.info?.agentAccess] || 'off'} — change it in Settings → AI).\x1b[0m`);
   activateTerm(t);
   return t;
 }
@@ -1251,7 +1252,8 @@ function renderTermTabs() {
     const el = document.createElement('div');
     el.className = `ttab${t === S.activeTerm ? ' active' : ''}${t.exited ? ' exited' : ''}`;
     el.setAttribute('role', 'tab');
-    el.appendChild(agentMark(AGENT_UI[t.kind] ? t.kind : 'shell'));
+    // A shell tab with Claude Code running in it looks like a Claude Code tab.
+    el.appendChild(agentMark(t.kind === 'shell' && t.sessionId ? 'claude' : AGENT_UI[t.kind] ? t.kind : 'shell'));
     const name = document.createElement('span');
     name.className = 'name';
     name.textContent = termName(t) + (t.exited ? ' (exited)' : '');
@@ -1347,7 +1349,8 @@ async function reattachTerminals() {
 function saveClaudeSessions() {
   const root = S.project?.root;
   if (!root || S.restoringSessions || typeof wb.saveClaudeSessions !== 'function') return;
-  const list = S.terms.filter((t) => t.kind === 'claude' && t.root === root && t.sessionId && !t.closed)
+  // (Claude Code started by hand in a shell tab too, while it runs there.)
+  const list = S.terms.filter((t) => (t.kind === 'claude' || t.kind === 'shell') && t.root === root && t.sessionId && !t.closed)
     .map((t) => ({ id: t.sessionId, name: t.custom || '', mode: t.permissionMode || '' }));
   const key = JSON.stringify(list);
   if (S.savedSessions === key) return;
@@ -1359,11 +1362,14 @@ function saveClaudeSessions() {
 function noteClaudeSessions(usage) {
   let changed = false;
   for (const t of S.terms) {
+    const claude = t.kind === 'claude' || t.kind === 'shell';
     const id = usage?.[t.id]?.session_id;
-    if (t.kind === 'claude' && typeof id === 'string' && id && id !== t.sessionId) { t.sessionId = id; changed = true; }
+    if (claude && typeof id === 'string' && id && id !== t.sessionId) { t.sessionId = id; changed = true; }
     // The permission mode it's in (bypass, auto, accept edits…), to resume it in the same one.
     const mode = usage?.[t.id]?.permission_mode;
-    if (t.kind === 'claude' && typeof mode === 'string' && mode && mode !== t.permissionMode) { t.permissionMode = mode; changed = true; }
+    if (claude && typeof mode === 'string' && mode && mode !== t.permissionMode) { t.permissionMode = mode; changed = true; }
+    // Claude Code quit in a shell tab: the shell stays, nothing to bring back.
+    if (t.kind === 'shell' && t.sessionId && !usage?.[t.id]) { t.sessionId = ''; t.permissionMode = ''; changed = true; }
   }
   if (changed) saveClaudeSessions();
 }
