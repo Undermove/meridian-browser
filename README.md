@@ -115,3 +115,5 @@ No account, no server, no telemetry. AI features talk only to the AI you connect
 ## License
 
 MIT. Third-party components: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Meridian is an independent project, not affiliated with or endorsed by The Browser Company. "Arc" is a trademark of its owner and is used here only to describe compatibility.
+
+[![As seen on Open Source Alternatives](https://www.opensourcealternatives.to/badge-osa.svg)](https://www.opensourcealternatives.to/)
