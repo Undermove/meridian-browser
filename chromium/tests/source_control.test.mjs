@@ -12,6 +12,14 @@ import { launch, SB } from './harness.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+// The PATH Meridian searches in a test: the stand-ins' folder; on Windows, also git's own (the test
+// PATH there is that folder and System32 only): Git for Windows' cmd\git.exe, which sets up the rest
+// of Git (push to a folder needs it; mingw64\bin\git.exe alone doesn't).
+function testPath(bin) {
+  if (process.platform !== 'win32') return bin;
+  const found = execFileSync('where', ['git'], { encoding: 'utf8' }).split(/\r?\n/).map((p) => p.trim()).filter(Boolean);
+  return [bin, path.dirname(found.find((p) => /\\cmd\\git\.exe$/i.test(p)) || found[0])].join(';');
+}
 
 async function mouse(wb, expr, { hoverFirst } = {}) {
   if (hoverFirst) {
@@ -35,6 +43,8 @@ test('Source Control: changes, a diff, stage, commit, discard, push, pull reques
   git(project, 'config', 'user.name', 'Test');
   git(project, 'config', 'user.email', 'test@example.com');
   git(project, 'config', 'commit.gpgsign', 'false');
+  // Git for Windows turns LF into CRLF on checkout by default; the test compares the files byte by byte.
+  git(project, 'config', 'core.autocrlf', 'false');
   fs.writeFileSync(path.join(project, 'app.txt'), 'one\ntwo\nthree\n');
   git(project, 'add', '-A');
   git(project, 'commit', '-q', '-m', 'First');
@@ -44,7 +54,7 @@ test('Source Control: changes, a diff, stage, commit, discard, push, pull reques
   fs.writeFileSync(path.join(project, 'notes.md'), '# Notes\n');
   // A stand-in GitHub CLI: one open pull request.
   fs.writeFileSync(path.join(bin, 'gh'), `#!/bin/sh\nif [ "$1 $2" = "pr list" ]; then echo '[{"number":7,"title":"Fix the login","headRefName":"fix-login","url":"https://github.com/example/app/pull/7","state":"OPEN"}]'; fi\n`, { mode: 0o755 });
-  const b = await launch(['about:blank'], { args: [`--meridian-test-project=${project}`, `--meridian-agents-path=${bin}`, '--meridian-no-notify'] });
+  const b = await launch(['about:blank'], { args: [`--meridian-test-project=${project}`, `--meridian-agents-path=${testPath(bin)}`, '--meridian-no-notify'] });
   let wb;
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
