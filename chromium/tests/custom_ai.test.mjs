@@ -49,6 +49,8 @@ test('your own OpenAI-compatible server: address and key checked, a model picked
   };
   const connect = async (base, key) => {
     await b.eval(`(() => { ${ST}.getElementById('customBase').value = ${JSON.stringify(base)}; ${ST}.getElementById('customKey').value = ${JSON.stringify(key)}; return true; })()`);
+    // (At the bottom of a small window: in sight first.)
+    await b.eval(`${ST}.getElementById('saveCustom').scrollIntoView({ block: 'center' }), true`);
     await b.click(`${ST}.getElementById('saveCustom')`);
   };
   const message = `${ST}.getElementById('keyMessage').textContent`;

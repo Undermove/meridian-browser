@@ -1,0 +1,376 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 19 Nov 2026 21:02:03 +0400
+Subject: [PATCH 182/185] Meridian: Claude Code started by hand in a Workbench
+ shell tab reports too
+
+A shell tab's zsh gets Meridian's startup files (ZDOTDIR): the person's own
+run first, then `claude` typed there (their alias or function included)
+gets Meridian's --settings and browser tools. Mission Control keeps a hidden
+session for the tab that shows once Claude Code starts and hides again when
+it ends; the guard and permission card work there too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/mission/mission_control.cc       | 42 +++++++-
+ .../meridian/mission/mission_control.h        |  8 +-
+ chrome/browser/meridian/workbench/agents.cc   | 97 +++++++++++++++++++
+ .../meridian/workbench/workbench_handler.cc   | 42 ++++++--
+ 4 files changed, 175 insertions(+), 14 deletions(-)
+
+diff --git a/chrome/browser/meridian/mission/mission_control.cc b/chrome/browser/meridian/mission/mission_control.cc
+index aca4af82a9..9b459ccc4b 100644
+--- a/chrome/browser/meridian/mission/mission_control.cc
++++ b/chrome/browser/meridian/mission/mission_control.cc
+@@ -293,7 +293,8 @@ MissionControl::Registration MissionControl::RegisterTerminal(
+     const std::string& kind_id,
+     const std::string& project,
+     int owner_tab,
+-    bool sandbox) {
++    bool sandbox,
++    bool in_shell) {
+   std::string kind = kind_id;
+   if (kind.starts_with("sandbox-")) {
+     kind = kind.substr(8);
+@@ -318,6 +319,8 @@ MissionControl::Registration MissionControl::RegisterTerminal(
+   }
+   node.project = Clean(project, 60);
+   node.status = "starting";
++  node.in_shell = in_shell;
++  node.dormant = in_shell;
+   // Only Claude Code and Codex report what they do.
+   if (kind != "claude" && kind != "codex") {
+     node.status_text = "Running · no live status";
+@@ -327,7 +330,7 @@ MissionControl::Registration MissionControl::RegisterTerminal(
+   // The first agent session: macOS will ask once about notifications (they
+   // come when an agent waits), so say so before its prompt appears.
+   PrefService* prefs = profile_->GetPrefs();
+-  if (!prefs->GetBoolean(prefs::kMissionNotifyIntro) &&
++  if (!in_shell && !prefs->GetBoolean(prefs::kMissionNotifyIntro) &&
+       prefs->GetBoolean(prefs::kMissionNotify)) {
+     prefs->SetBoolean(prefs::kMissionNotifyIntro, true);
+     for (Observer& o : observers_) {
+@@ -501,6 +504,12 @@ void MissionControl::TerminalExit(const std::string& token,
+   if (!node || node->ended_at) {
+     return;
+   }
++  // A shell where Claude Code isn't running: nothing to keep.
++  if (node->dormant) {
++    nodes_.erase(node_id);
++    Changed();
++    return;
++  }
+   bool ok = killed || code == 0;
+   Finish(*node, ok ? "done" : "error",
+          ok ? (killed ? "Stopped" : "Exited")
+@@ -515,6 +524,14 @@ void MissionControl::OnHookEvent(const std::string& node_id,
+   if (!root || root->ended_at) {
+     return;
+   }
++  // Claude Code started in a shell tab: the session shows from now on.
++  if (root->dormant) {
++    root->dormant = false;
++    root->started_at = Now();
++    root->status = "starting";
++    root->status_text.clear();
++    Changed();
++  }
+   std::vector<NamedSecret> sv = SecretValues();
+   auto s = [&](const char* key, size_t n) {
+     const std::string* v = raw.FindString(key);
+@@ -743,6 +760,22 @@ void MissionControl::OnHookEvent(const std::string& node_id,
+     root->tool.reset();
+     if (reason == "clear" || reason == "resume") {
+       SetStatus(*root, "idle", "Ready");
++    } else if (root->in_shell) {
++      // Back to the shell: hidden until Claude Code starts there again.
++      SetStatus(*root, "starting");
++      CloseAsks(root_id);
++      root->dormant = true;
++      root->usage.dict.clear();
++      root->display_name.clear();
++      root->permission_mode.clear();
++      root->tool_calls = 0;
++      root->turns = 0;
++      root->errors = 0;
++      root->background = 0;
++      root->log.clear();
++      for (Node* c : Descendants(root_id)) {
++        nodes_.erase(c->id);
++      }
+     } else {
+       SetStatus(*root, "done", "Session ended");
+     }
+@@ -1202,7 +1235,7 @@ void MissionControl::ClearHistory() {
+ base::DictValue MissionControl::Counts() const {
+   int working = 0, waiting = 0, live = 0;
+   for (const auto& [id, n] : nodes_) {
+-    if (n.ended_at) {
++    if (n.ended_at || n.dormant) {
+       continue;
+     }
+     live += n.parent_id.empty();
+@@ -1218,6 +1251,9 @@ base::DictValue MissionControl::Counts() const {
+ base::DictValue MissionControl::Snapshot() const {
+   base::ListValue nodes;
+   for (const auto& [id, n] : nodes_) {
++    if (n.dormant) {
++      continue;
++    }
+     base::ListValue log;
+     for (const LogEntry& e : n.log) {
+       log.Append(base::DictValue()
+diff --git a/chrome/browser/meridian/mission/mission_control.h b/chrome/browser/meridian/mission/mission_control.h
+index bd14729938..bfe2792693 100644
+--- a/chrome/browser/meridian/mission/mission_control.h
++++ b/chrome/browser/meridian/mission/mission_control.h
+@@ -86,10 +86,13 @@ class MissionControl : public KeyedService,
+   // `term_id`, from its status line ("" until known).
+   std::string TranscriptOf(int owner_tab, const std::string& term_id) const;
+   // `owner_tab`: the Workbench tab's handle id (to open its terminal).
++  // `in_shell`: a shell tab where Claude Code may be started by hand: hidden
++  // until it starts, hidden again when it ends.
+   Registration RegisterTerminal(const std::string& kind,
+                                 const std::string& project,
+                                 int owner_tab,
+-                                bool sandbox = false);
++                                bool sandbox = false,
++                                bool in_shell = false);
+   // A Docker sandbox session: a private dir mounted at /meridian with the
+   // hook script (run by node in the container), Claude Code's settings and
+   // the events file the browser follows. Blocking (writes files);
+@@ -198,6 +201,9 @@ class MissionControl : public KeyedService,
+     std::string parent_id;
+     std::string root_id;
+     std::string kind;    // session, subagent, client, assistant
++    // A shell tab's Claude Code: `dormant` while none runs there.
++    bool in_shell = false;
++    bool dormant = false;
+     std::string source;  // claude, codex, gemini, mcp, assistant
+     std::string where;   // local, sandbox, mcp, assistant
+     std::string label;
+diff --git a/chrome/browser/meridian/workbench/agents.cc b/chrome/browser/meridian/workbench/agents.cc
+index 82d727776b..5b2c4e54a8 100644
+--- a/chrome/browser/meridian/workbench/agents.cc
++++ b/chrome/browser/meridian/workbench/agents.cc
+@@ -76,6 +76,99 @@ std::string Toml(const std::string& s) {
+   return base::WriteJson(base::Value(s)).value_or("\"\"");
+ }
+ 
++#if !BUILDFLAG(IS_WIN)
++// zsh's startup files for a shell tab (ZDOTDIR): the person's own run as
++// always, then `claude` typed there gets what a Claude Code tab gets (the
++// hooks and status line in --settings, the browser tools). An alias or a
++// function of their own named claude keeps working, with these added.
++constexpr char kZshEnv[] = R"(# Meridian Workbench: your startup files, then Claude Code reports to Meridian.
++_meridian_zdotdir=$ZDOTDIR
++ZDOTDIR=${MERIDIAN_USER_ZDOTDIR:-$HOME}
++[[ -r $ZDOTDIR/.zshenv ]] && builtin source $ZDOTDIR/.zshenv
++MERIDIAN_USER_ZDOTDIR=$ZDOTDIR
++ZDOTDIR=$_meridian_zdotdir
++)";
++constexpr char kZshProfile[] = R"(ZDOTDIR=$MERIDIAN_USER_ZDOTDIR
++[[ -r $ZDOTDIR/.zprofile ]] && builtin source $ZDOTDIR/.zprofile
++MERIDIAN_USER_ZDOTDIR=$ZDOTDIR
++ZDOTDIR=$_meridian_zdotdir
++)";
++constexpr char kZshRc[] = R"(ZDOTDIR=$MERIDIAN_USER_ZDOTDIR
++[[ -r $ZDOTDIR/.zshrc ]] && builtin source $ZDOTDIR/.zshrc
++MERIDIAN_USER_ZDOTDIR=$ZDOTDIR
++ZDOTDIR=$_meridian_zdotdir
++if (( ${+aliases[claude]} )); then
++  _meridian_claude=${aliases[claude]}
++  unalias claude
++elif (( ${+functions[claude]} )); then
++  functions[_meridian_own_claude]=$functions[claude]
++  _meridian_claude=_meridian_own_claude
++else
++  _meridian_claude='command claude'
++fi
++claude() {
++  # Their alias or function calling claude again: the real one this time.
++  if [[ -n $_meridian_in_claude ]]; then
++    command claude "$@"
++    return
++  fi
++  local _meridian_in_claude=1
++  case "$1" in
++    mcp|config|doctor|update|upgrade|install|setup-token|plugin|plugins|migrate-installer|auth|login|logout|agents|-v|--version|-h|--help)
++      eval "$_meridian_claude" '"$@"' ;;
++    *)
++      eval "$_meridian_claude" '"$@"' --settings '"$MERIDIAN_CLAUDE_SETTINGS"' --mcp-config '"$MERIDIAN_CLAUDE_MCP"' ;;
++  esac
++}
++)";
++constexpr char kZshLogin[] = R"(ZDOTDIR=$MERIDIAN_USER_ZDOTDIR
++[[ -r $ZDOTDIR/.zlogin ]] && builtin source $ZDOTDIR/.zlogin
++unset _meridian_zdotdir
++)";
++
++void AddShellClaude(LaunchSpec& spec, const McpBridge& bridge) {
++  base::FilePath dir;
++  if (!base::CreateNewTempDirectory(FILE_PATH_LITERAL("meridian-zsh-"), &dir)) {
++    return;
++  }
++  MakePrivate(dir, 0700);
++  spec.cleanup.push_back(dir);
++  auto write = [&](const std::string& name, std::string_view content) {
++    base::FilePath file = dir.AppendUTF8(name);
++    if (!base::WriteFile(file, content)) {
++      return base::FilePath();
++    }
++    MakePrivate(file, 0600);
++    return file;
++  };
++  base::ListValue bridge_args;
++  for (const std::string& a : bridge.args) {
++    bridge_args.Append(a);
++  }
++  base::FilePath settings = write(
++      "settings.json", base::WriteJson(*bridge.claude_settings).value_or("{}"));
++  base::FilePath mcp = write(
++      "mcp.json",
++      base::WriteJson(
++          base::DictValue().Set(
++              "mcpServers",
++              base::DictValue().Set("meridian",
++                                    base::DictValue()
++                                        .Set("command", bridge.command)
++                                        .Set("args", std::move(bridge_args)))))
++          .value_or("{}"));
++  if (settings.empty() || mcp.empty() || write(".zshenv", kZshEnv).empty() ||
++      write(".zprofile", kZshProfile).empty() ||
++      write(".zshrc", kZshRc).empty() || write(".zlogin", kZshLogin).empty()) {
++    return;
++  }
++  spec.env["ZDOTDIR"] = dir.AsUTF8Unsafe();
++  spec.env["MERIDIAN_CLAUDE_SETTINGS"] = settings.AsUTF8Unsafe();
++  spec.env["MERIDIAN_CLAUDE_MCP"] = mcp.AsUTF8Unsafe();
++  spec.browser_tools = true;
++}
++#endif
++
+ }  // namespace
+ 
+ std::string FindExecutable(const std::string& name,
+@@ -119,6 +212,10 @@ base::expected<LaunchSpec, std::string> MakeLaunchSpec(
+     spec.argv = {shell};
+ #else
+     spec.argv = {shell, "-l"};
++    if (bridge.claude_settings &&
++        base::FilePath::FromUTF8Unsafe(shell).BaseName().value() == "zsh") {
++      AddShellClaude(spec, bridge);
++    }
+ #endif
+     return spec;
+   }
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 5cc90a209e..5428d1a17e 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -1950,6 +1950,15 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+   }
+   const std::string* kind_param = opts.FindString("kind");
+   std::string kind = kind_param ? *kind_param : "shell";
++#if BUILDFLAG(IS_WIN)
++  const bool shell_claude = false;
++#else
++  // A shell tab: `claude` typed there gets what a Claude Code tab gets (the
++  // hooks, the status line, the browser tools), through the shell's startup
++  // files; Mission Control shows it once it starts.
++  const bool shell_claude = kind == "shell";
++#endif
++  const bool claude_hooks = kind == "claude" || shell_claude;
+   if (FindSandboxKind(kind)) {
+     return CreateSandbox(kind, std::move(opts), /*vault_ready=*/false,
+                          std::move(reply));
+@@ -1976,7 +1985,7 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+   // Agent sessions report to Mission Control: its channel must listen first.
+   mission::MissionControl* listening =
+       mission::MissionControlFactory::GetForProfile(profile_);
+-  if (listening && (kind == "claude" || kind == "codex") &&
++  if (listening && (claude_hooks || kind == "codex") &&
+       !steps.channel_ready) {
+     steps.channel_ready = true;
+     listening->WhenChannelReady(base::BindOnce(
+@@ -1995,7 +2004,7 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+     return;
+   }
+   // Claude Code never runs without the guard (its hook would fail open).
+-  if (kind == "claude" && !steps.guard_ready) {
++  if (claude_hooks && !steps.guard_ready) {
+     steps.guard_ready = true;
+     workbench->guard().Start(base::BindOnce(
+         [](base::WeakPtr<WorkbenchHandler> self, base::DictValue opts,
+@@ -2003,7 +2012,9 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+           if (!self) {
+             return;
+           }
+-          if (socket.empty()) {
++          // (A shell starts anyway, without the Claude Code extras.)
++          const std::string* k = opts.FindString("kind");
++          if (socket.empty() && !(k && *k == "shell")) {
+             return std::move(reply).Run(base::unexpected(kNoGuard));
+           }
+           self->ContinueTerminal(std::move(opts), steps, std::move(reply));
+@@ -2040,14 +2051,16 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+     secret_names.push_back(name);
+   }
+   std::string guard_token;
+-  if (kind == "claude") {
++  const bool with_guard =
++      claude_hooks && !workbench->guard().socket_path().empty();
++  if (with_guard) {
+     // The token, once known: a permission question finds its terminal by it.
+     auto token = std::make_shared<std::string>();
+     guard_token = workbench->RegisterGuard(base::BindRepeating(
+         &WorkbenchHandler::GuardDecision, weak_factory_.GetWeakPtr(), token,
+         project_->root().AsUTF8Unsafe(), std::make_shared<std::set<std::string>>()));
+     *token = guard_token;
+-    if (guard_token.empty()) {
++    if (guard_token.empty() && kind == "claude") {
+       workbench->UnregisterGuard(guard_token);
+       return std::move(reply).Run(base::unexpected(kNoGuard));
+     }
+@@ -2064,19 +2077,22 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+   mission::MissionControl::Registration registration;
+   mission::MissionControl* mission =
+       mission::MissionControlFactory::GetForProfile(profile_);
+-  if (kind == "claude") {
++  if (claude_hooks && !guard_token.empty()) {
+     // Merged, never replaced: the guard's blocking hook first, then Mission
+     // Control's observers.
+     bridge.claude_settings = GuardHookSettings();
+   }
+   // Every agent shows in Mission Control (OpenCode, Copilot and the others
+-  // without live status); a shell doesn't.
+-  if (mission && kind != "shell" && !kind.ends_with("-shell")) {
++  // without live status); a shell only once Claude Code runs in it.
++  if (mission && (shell_claude ? !guard_token.empty()
++                               : kind != "shell" && !kind.ends_with("-shell"))) {
+     tabs::TabInterface* tab =
+         tabs::TabInterface::MaybeGetFromContents(web_ui()->GetWebContents());
+     registration = mission->RegisterTerminal(
+-        kind, project_->name(), tab ? tab->GetHandle().raw_value() : 0);
+-    if (kind == "claude" && !registration.token.empty()) {
++        shell_claude ? "claude" : kind, project_->name(),
++        tab ? tab->GetHandle().raw_value() : 0, /*sandbox=*/false,
++        /*in_shell=*/shell_claude);
++    if (claude_hooks && !registration.token.empty()) {
+       base::DictValue observers = mission->ClaudeHookSettings();
+       bridge.claude_settings = bridge.claude_settings
+                                    ? MergeClaudeSettings(
+@@ -2121,6 +2137,12 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+ #endif
+             base::expected<LaunchSpec, std::string> spec =
+                 MakeLaunchSpec(kind, env["PATH"], shell, bridge);
++            // A shell tab's zsh runs the person's own startup files first:
++            // from where they keep them.
++            if (spec.has_value() && spec->env.contains("ZDOTDIR") &&
++                env.contains("ZDOTDIR") && !env["ZDOTDIR"].empty()) {
++              spec->env["MERIDIAN_USER_ZDOTDIR"] = env["ZDOTDIR"];
++            }
+             if (spec.has_value() && !resume_id.empty() &&
+                 !spec->argv.empty()) {
+               spec->argv.insert(spec->argv.begin() + 1, resume_id);

@@ -1113,8 +1113,9 @@ async function launch(kind, { resume = false, resumeId, resumeMode, name } = {})
   if (resumeId) { t.sessionId = resumeId; t.permissionMode = resumeMode || ''; if (name) saveTermName(t, name); }
   for (const n of info.notes || []) t.xterm.writeln(`\x1b[2m${n}\x1b[0m`);
   if (t.secrets.length && !t.sandbox) t.xterm.writeln(`\x1b[2mVault: ${t.secrets.join(', ')} ${t.secrets.length === 1 ? 'is' : 'are'} set in this session’s environment (values hidden).\x1b[0m`);
-  if (t.guard) t.xterm.writeln('\x1b[2mSecret-file guard: Meridian asks before Claude Code reads .env, keys or credentials (file tools by path; shell commands only by a name match, so it is a safety net, not a wall).\x1b[0m');
-  if (info.browserTools) t.xterm.writeln(`\x1b[2mMeridian browser tools are connected for this session (access: ${ACCESS_LABEL[S.info?.agentAccess] || 'off'} — change it in Settings → AI).\x1b[0m`);
+  // (A shell tab gets them too, for Claude Code started there: no notes in a plain shell.)
+  if (t.guard && kind !== 'shell') t.xterm.writeln('\x1b[2mSecret-file guard: Meridian asks before Claude Code reads .env, keys or credentials (file tools by path; shell commands only by a name match, so it is a safety net, not a wall).\x1b[0m');
+  if (info.browserTools && kind !== 'shell') t.xterm.writeln(`\x1b[2mMeridian browser tools are connected for this session (access: ${ACCESS_LABEL[S.info?.agentAccess] || 'off'} — change it in Settings → AI).\x1b[0m`);
   activateTerm(t);
   return t;
 }
@@ -1206,15 +1207,53 @@ function renameTerm(t) {
   input.addEventListener('click', (e) => e.stopPropagation());
 }
 
+// Drag a terminal's tab along the strip to put it elsewhere (pointer events, so a mouse and a
+// trackpad both do). The order is kept: Claude Code tabs come back in it after a restart.
+function dragTermTab(el, t, e) {
+  if (e.button !== 0 || e.target.closest('.tab-close, .ctx-badge, .rename')) return;
+  const list = $('#term-tab-list');
+  const startX = e.clientX;
+  let dragging = false;
+  const others = () => [...list.children].filter((x) => x !== el);
+  const move = (ev) => {
+    if (!dragging && Math.abs(ev.clientX - startX) < 5) return;
+    if (!dragging) {
+      dragging = true;
+      S.draggingTerm = t;
+      el.classList.add('dragging');
+    }
+    el.style.transform = `translateX(${ev.clientX - startX}px)`;
+  };
+  const up = (ev) => {
+    window.removeEventListener('pointermove', move, true);
+    window.removeEventListener('pointerup', up, true);
+    if (!dragging) return;
+    S.draggingTerm = null;
+    S.termDraggedAt = Date.now();
+    // Its new place: after every other tab whose middle the pointer passed.
+    const tabs = others();
+    const index = tabs.filter((x) => { const r = x.getBoundingClientRect(); return r.left + r.width / 2 < ev.clientX; }).length;
+    const order = S.terms.filter((x) => x !== t);
+    const before = tabs[index] ? S.terms[[...list.children].indexOf(tabs[index])] : null;
+    order.splice(before ? order.indexOf(before) : order.length, 0, t);
+    S.terms = order;
+    renderTermTabs();
+    saveClaudeSessions();
+  };
+  window.addEventListener('pointermove', move, true);
+  window.addEventListener('pointerup', up, true);
+}
+
 function renderTermTabs() {
-  // Not under the name being typed (a status update would drop it).
-  if (S.renamingTerm) return;
+  // Not under the name being typed (a status update would drop it), nor under a tab being dragged.
+  if (S.renamingTerm || S.draggingTerm) return;
   const list = $('#term-tab-list');
   list.replaceChildren(...S.terms.map((t) => {
     const el = document.createElement('div');
     el.className = `ttab${t === S.activeTerm ? ' active' : ''}${t.exited ? ' exited' : ''}`;
     el.setAttribute('role', 'tab');
-    el.appendChild(agentMark(AGENT_UI[t.kind] ? t.kind : 'shell'));
+    // A shell tab with Claude Code running in it looks like a Claude Code tab.
+    el.appendChild(agentMark(t.kind === 'shell' && t.sessionId ? 'claude' : AGENT_UI[t.kind] ? t.kind : 'shell'));
     const name = document.createElement('span');
     name.className = 'name';
     name.textContent = termName(t) + (t.exited ? ' (exited)' : '');
@@ -1230,7 +1269,10 @@ function renderTermTabs() {
     x.className = 'tab-close'; x.title = t.exited ? 'Close' : 'Stop and close'; x.innerHTML = icon('x', 12);
     el.appendChild(x);
     // A double click renames: told by the click count, since the first click redraws the tabs.
+    el.addEventListener('pointerdown', (e) => dragTermTab(el, t, e));
     el.addEventListener('click', (e) => {
+      // The click that ends a drag isn't one.
+      if (Date.now() - (S.termDraggedAt || 0) < 300) return;
       if (e.target.closest('.tab-close')) killTerm(t);
       else if (e.detail === 2 && !e.target.closest('.ctx-badge')) renameTerm(t);
       else if (e.detail < 2) activateTerm(t);
@@ -1307,7 +1349,8 @@ async function reattachTerminals() {
 function saveClaudeSessions() {
   const root = S.project?.root;
   if (!root || S.restoringSessions || typeof wb.saveClaudeSessions !== 'function') return;
-  const list = S.terms.filter((t) => t.kind === 'claude' && t.root === root && t.sessionId && !t.closed)
+  // (Claude Code started by hand in a shell tab too, while it runs there.)
+  const list = S.terms.filter((t) => (t.kind === 'claude' || t.kind === 'shell') && t.root === root && t.sessionId && !t.closed)
     .map((t) => ({ id: t.sessionId, name: t.custom || '', mode: t.permissionMode || '' }));
   const key = JSON.stringify(list);
   if (S.savedSessions === key) return;
@@ -1319,11 +1362,14 @@ function saveClaudeSessions() {
 function noteClaudeSessions(usage) {
   let changed = false;
   for (const t of S.terms) {
+    const claude = t.kind === 'claude' || t.kind === 'shell';
     const id = usage?.[t.id]?.session_id;
-    if (t.kind === 'claude' && typeof id === 'string' && id && id !== t.sessionId) { t.sessionId = id; changed = true; }
+    if (claude && typeof id === 'string' && id && id !== t.sessionId) { t.sessionId = id; changed = true; }
     // The permission mode it's in (bypass, auto, accept edits…), to resume it in the same one.
     const mode = usage?.[t.id]?.permission_mode;
-    if (t.kind === 'claude' && typeof mode === 'string' && mode && mode !== t.permissionMode) { t.permissionMode = mode; changed = true; }
+    if (claude && typeof mode === 'string' && mode && mode !== t.permissionMode) { t.permissionMode = mode; changed = true; }
+    // Claude Code quit in a shell tab: the shell stays, nothing to bring back.
+    if (t.kind === 'shell' && t.sessionId && !usage?.[t.id]) { t.sessionId = ''; t.permissionMode = ''; changed = true; }
   }
   if (changed) saveClaudeSessions();
 }
