@@ -1,7 +1,7 @@
 // The Workbench's terminal as in Warp or iTerm, for an agent like Claude Code: ⇧↩ is a new line,
 // web addresses and project files printed in it open on a click, files dropped on it are typed as
 // their paths, and a trackpad scrolls a program that takes the mouse at a steady rate (it crawled,
-// then jumped).
+// then jumped). Its tabs move with a drag, like a browser's.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -176,4 +176,47 @@ process.stdin.on('data', (d) => {
     assert.ok(Math.abs(slow - 10) <= 1, `small moves: ${slow} lines for 10 lines' worth`);
     assert.ok(Math.abs(fast - 10) <= 1, `one big move: ${fast} lines for 10 lines' worth`);
   } finally { wb.close(); await b.close(); fs.rmSync(project, { recursive: true, force: true }); }
+});
+
+test('Workbench terminal tabs: dragged along the strip, a tab takes its new place; a click still switches', async () => {
+  const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-tt-')));
+  const { b, wb } = await workbench(project);
+  try {
+    await wb.eval(`launch('shell').then(() => launch('shell')).then(() => true)`);
+    await wb.waitFor('S.terms.length === 3');
+    // Names to tell them apart.
+    await wb.eval(`(() => { S.terms.forEach((t, i) => saveTermName(t, 'tab ' + 'ABC'[i])); renderTermTabs(); return true; })()`);
+    const names = () => wb.eval(`[...document.querySelectorAll('#term-tab-list .ttab .name')].map((e) => e.textContent)`);
+    assert.deepEqual(await names(), ['tab A', 'tab B', 'tab C']);
+    const box = (i) => wb.eval(`(() => { const r = document.querySelectorAll('#term-tab-list .ttab')[${i}].getBoundingClientRect(); return { x: r.left, y: r.top + r.height / 2, w: r.width }; })()`);
+    const drag = async (from, toX) => {
+      const a = await box(from);
+      const x0 = a.x + 20;
+      await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: x0, y: a.y });
+      await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: x0, y: a.y, button: 'left', clickCount: 1 });
+      for (let k = 1; k <= 8; k++) {
+        await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: x0 + (toX - x0) * k / 8, y: a.y, button: 'left', buttons: 1 });
+        await sleep(20);
+      }
+      await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: toX, y: a.y, button: 'left', clickCount: 1 });
+    };
+    // A past the end.
+    const c = await box(2);
+    await drag(0, c.x + c.w - 4);
+    await wb.waitFor(`[...document.querySelectorAll('#term-tab-list .ttab .name')].map((e) => e.textContent).join() === 'tab B,tab C,tab A'`);
+    assert.deepEqual(await wb.eval(`S.terms.map((t) => t.custom)`), ['tab B', 'tab C', 'tab A'], 'the order itself, not only the picture');
+    // C to the front.
+    const first = await box(0);
+    await drag(1, first.x + 4);
+    await wb.waitFor(`[...document.querySelectorAll('#term-tab-list .ttab .name')].map((e) => e.textContent).join() === 'tab C,tab B,tab A'`);
+    // A plain click still switches tabs.
+    await sleep(400);
+    const bTab = await box(1);
+    for (const type of ['mousePressed', 'mouseReleased']) await wb.cdp.send('Input.dispatchMouseEvent', { type, x: bTab.x + 20, y: bTab.y, button: 'left', clickCount: 1 });
+    await wb.waitFor(`S.activeTerm?.custom === 'tab B'`);
+  } finally {
+    wb.close();
+    await b.close();
+    fs.rmSync(project, { recursive: true, force: true });
+  }
 });

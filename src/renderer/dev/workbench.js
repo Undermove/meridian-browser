@@ -1206,9 +1206,46 @@ function renameTerm(t) {
   input.addEventListener('click', (e) => e.stopPropagation());
 }
 
+// Drag a terminal's tab along the strip to put it elsewhere (pointer events, so a mouse and a
+// trackpad both do). The order is kept: Claude Code tabs come back in it after a restart.
+function dragTermTab(el, t, e) {
+  if (e.button !== 0 || e.target.closest('.tab-close, .ctx-badge, .rename')) return;
+  const list = $('#term-tab-list');
+  const startX = e.clientX;
+  let dragging = false;
+  const others = () => [...list.children].filter((x) => x !== el);
+  const move = (ev) => {
+    if (!dragging && Math.abs(ev.clientX - startX) < 5) return;
+    if (!dragging) {
+      dragging = true;
+      S.draggingTerm = t;
+      el.classList.add('dragging');
+    }
+    el.style.transform = `translateX(${ev.clientX - startX}px)`;
+  };
+  const up = (ev) => {
+    window.removeEventListener('pointermove', move, true);
+    window.removeEventListener('pointerup', up, true);
+    if (!dragging) return;
+    S.draggingTerm = null;
+    S.termDraggedAt = Date.now();
+    // Its new place: after every other tab whose middle the pointer passed.
+    const tabs = others();
+    const index = tabs.filter((x) => { const r = x.getBoundingClientRect(); return r.left + r.width / 2 < ev.clientX; }).length;
+    const order = S.terms.filter((x) => x !== t);
+    const before = tabs[index] ? S.terms[[...list.children].indexOf(tabs[index])] : null;
+    order.splice(before ? order.indexOf(before) : order.length, 0, t);
+    S.terms = order;
+    renderTermTabs();
+    saveClaudeSessions();
+  };
+  window.addEventListener('pointermove', move, true);
+  window.addEventListener('pointerup', up, true);
+}
+
 function renderTermTabs() {
-  // Not under the name being typed (a status update would drop it).
-  if (S.renamingTerm) return;
+  // Not under the name being typed (a status update would drop it), nor under a tab being dragged.
+  if (S.renamingTerm || S.draggingTerm) return;
   const list = $('#term-tab-list');
   list.replaceChildren(...S.terms.map((t) => {
     const el = document.createElement('div');
@@ -1230,7 +1267,10 @@ function renderTermTabs() {
     x.className = 'tab-close'; x.title = t.exited ? 'Close' : 'Stop and close'; x.innerHTML = icon('x', 12);
     el.appendChild(x);
     // A double click renames: told by the click count, since the first click redraws the tabs.
+    el.addEventListener('pointerdown', (e) => dragTermTab(el, t, e));
     el.addEventListener('click', (e) => {
+      // The click that ends a drag isn't one.
+      if (Date.now() - (S.termDraggedAt || 0) < 300) return;
       if (e.target.closest('.tab-close')) killTerm(t);
       else if (e.detail === 2 && !e.target.closest('.ctx-badge')) renameTerm(t);
       else if (e.detail < 2) activateTerm(t);
