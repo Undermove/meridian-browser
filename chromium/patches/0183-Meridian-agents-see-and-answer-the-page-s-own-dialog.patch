@@ -1,0 +1,451 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 19 Nov 2026 21:21:32 +0400
+Subject: [PATCH 184/185] Meridian: agents see and answer the page's own
+ dialogs (handle_dialog)
+
+list_tabs shows pending_dialog {type, message, buttons} for a tab whose page
+shows (or, in the background, waits to show) an alert, confirm, prompt or
+"Leave site?"; any page call into such a tab is an error at once saying so
+(it hung before); handle_dialog accepts or dismisses it (prompt with its
+text), with the person's OK in ask mode and not in read-only.
+TabModalDialogManager tells what it shows (GetOpenDialog) and no longer
+reads input from a dialog view that isn't there yet (a pending dialog).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   1 +
+ .../browser/meridian/agent/agent_service.cc   | 221 +++++++++++++++++-
+ chrome/browser/meridian/agent/agent_service.h |   1 +
+ .../browser/meridian/agent/agent_tools.json   |  30 ++-
+ .../tab_modal_dialog_manager.cc               |  15 +-
+ .../tab_modal_dialog_manager.h                |  14 ++
+ 6 files changed, 272 insertions(+), 10 deletions(-)
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 7e241cbc07..10a5d5598b 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -353,6 +353,7 @@ source_set("meridian") {
+     "//chrome/app:command_ids",
+     "//chrome/browser:shell_integration",
+     "//components/constrained_window",
++    "//components/javascript_dialogs",
+     "//ui/views",
+     ":agent_embed",
+     ":arc_staged",
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index 3fd7e63c73..1f46c35d56 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -67,6 +67,11 @@
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/render_widget_host.h"
+ #include "content/public/browser/render_widget_host_view.h"
++#include "components/javascript_dialogs/app_modal_dialog_controller.h"
++#include "components/javascript_dialogs/app_modal_dialog_manager.h"
++#include "components/javascript_dialogs/app_modal_dialog_queue.h"
++#include "components/javascript_dialogs/tab_modal_dialog_manager.h"
++#include "base/timer/timer.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_observer.h"
+ #include "third_party/blink/public/common/input/web_mouse_event.h"
+@@ -399,6 +404,97 @@ class FileInputSetter : public content::DevToolsAgentHostClient {
+   std::string search_;
+ };
+ 
++// The page's own dialog (alert, confirm, prompt, or "Leave site?") that the
++// tab shows or waits to show: the renderer stands still until it's answered.
++// Permission prompts, file pickers and sign-in dialogs aren't these.
++struct PageDialog {
++  std::string type;  // alert, confirm, prompt, beforeunload
++  std::string message;
++  std::string default_prompt;
++};
++
++std::optional<PageDialog> PageDialogOf(content::WebContents* contents) {
++  if (!contents) {
++    return std::nullopt;
++  }
++  if (auto* manager =
++          javascript_dialogs::TabModalDialogManager::FromWebContents(contents)) {
++    if (auto open = manager->GetOpenDialog()) {
++      PageDialog d;
++      d.type = open->type == content::JAVASCRIPT_DIALOG_TYPE_CONFIRM ? "confirm"
++               : open->type == content::JAVASCRIPT_DIALOG_TYPE_PROMPT
++                   ? "prompt"
++                   : "alert";
++      d.message = base::UTF16ToUTF8(open->message);
++      d.default_prompt = base::UTF16ToUTF8(open->default_prompt);
++      return d;
++    }
++  }
++  // "Leave site?" and others the app-modal queue shows for this tab.
++  javascript_dialogs::AppModalDialogQueue* queue =
++      javascript_dialogs::AppModalDialogQueue::GetInstance();
++  std::vector<javascript_dialogs::AppModalDialogController*> dialogs;
++  if (queue->active_dialog()) {
++    dialogs.push_back(queue->active_dialog());
++  }
++  for (auto& d : *queue) {
++    dialogs.push_back(d.get());
++  }
++  for (auto* d : dialogs) {
++    if (d->web_contents() != contents) {
++      continue;
++    }
++    PageDialog out;
++    out.type = d->is_before_unload_dialog() ? "beforeunload"
++               : d->javascript_dialog_type() ==
++                       content::JAVASCRIPT_DIALOG_TYPE_CONFIRM
++                   ? "confirm"
++               : d->javascript_dialog_type() ==
++                       content::JAVASCRIPT_DIALOG_TYPE_PROMPT
++                   ? "prompt"
++                   : "alert";
++    out.message = d->is_before_unload_dialog()
++                      ? std::string("Leave site? Changes you made may not be saved.")
++                      : base::UTF16ToUTF8(d->message_text());
++    out.default_prompt = base::UTF16ToUTF8(d->default_prompt_text());
++    return out;
++  }
++  return std::nullopt;
++}
++
++base::ListValue DialogButtons(const PageDialog& d) {
++  base::ListValue b;
++  if (d.type == "beforeunload") {
++    b.Append("Leave (accept)");
++    b.Append("Cancel (dismiss)");
++  } else if (d.type == "alert") {
++    b.Append("OK (accept)");
++  } else {
++    b.Append("OK (accept)");
++    b.Append("Cancel (dismiss)");
++  }
++  return b;
++}
++
++base::DictValue DialogValue(const PageDialog& d) {
++  base::DictValue v;
++  v.Set("type", d.type);
++  v.Set("message", d.message);
++  v.Set("buttons", DialogButtons(d));
++  if (d.type == "prompt") {
++    v.Set("default_text", d.default_prompt);
++  }
++  return v;
++}
++
++std::string DialogError(const PageDialog& d) {
++  std::string message = d.message.size() > 200 ? d.message.substr(0, 200) + "…"
++                                                : d.message;
++  return "The tab has an open " + d.type + " dialog: \"" + message +
++         "\". The page waits for it: answer it with handle_dialog (accept or "
++         "dismiss).";
++}
++
+ }  // namespace
+ 
+ // One tool call in flight.
+@@ -593,6 +689,7 @@ void AgentService::Run(std::unique_ptr<Call> call) {
+       {"create_space", &AgentService::CreateSpace},
+       {"run_javascript", &AgentService::RunJavaScript},
+       {"get_boost", &AgentService::GetBoost},
++      {"handle_dialog", &AgentService::HandleDialog},
+       {"set_boost", &AgentService::SetBoost},
+   });
+   auto it = methods->find(call->tool);
+@@ -743,8 +840,41 @@ void AgentService::RunInPage(content::WebContents* contents,
+         }
+       },
+       once);
++  // The page waits for its own dialog: say so at once (and if one opens
++  // while the script runs, e.g. a click that alerts).
++  if (std::optional<PageDialog> dialog = PageDialogOf(contents)) {
++    finish.Run(base::Value(base::DictValue()
++                               .Set("page_timeout", true)
++                               .Set("error", DialogError(*dialog))));
++    return;
++  }
+   contents->GetPrimaryMainFrame()->ExecuteJavaScriptInIsolatedWorld(
+       script, base::BindOnce(finish), ISOLATED_WORLD_ID_CHROME_INTERNAL);
++  auto watch = std::make_shared<base::RepeatingTimer>();
++  watch->Start(
++      FROM_HERE, base::Milliseconds(250),
++      base::BindRepeating(
++          [](base::WeakPtr<content::WebContents> contents,
++             std::shared_ptr<base::OnceCallback<void(base::Value)>> once,
++             base::RepeatingCallback<void(base::Value)> finish,
++             base::RepeatingTimer* timer) {
++            if (!*once || !contents) {
++              timer->Stop();
++              return;
++            }
++            if (std::optional<PageDialog> dialog =
++                    PageDialogOf(contents.get())) {
++              timer->Stop();
++              finish.Run(base::Value(base::DictValue()
++                                         .Set("page_timeout", true)
++                                         .Set("error", DialogError(*dialog))));
++            }
++          },
++          contents->GetWeakPtr(), once, finish, base::Unretained(watch.get())));
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce([](std::shared_ptr<base::RepeatingTimer>) {}, watch),
++      timeout + base::Seconds(1));
+   base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
+       FROM_HERE,
+       base::BindOnce(
+@@ -852,6 +982,11 @@ void AgentService::ListTabs(std::unique_ptr<Call> call) {
+           }
+           e.Set("loaded", !!tab);
+           e.Set("active", tab && tab == active);
++          if (tab) {
++            if (auto dialog = PageDialogOf(tab->GetContents())) {
++              e.Set("pending_dialog", DialogValue(*dialog));
++            }
++          }
+           out.Append(std::move(e));
+         }
+       };
+@@ -869,14 +1004,18 @@ void AgentService::ListTabs(std::unique_ptr<Call> call) {
+         continue;
+       }
+       tabs::TabInterface* tab = model->GetTabAtIndex(i);
+-      out.Append(base::DictValue()
+-                     .Set("id", TabId(tab))
+-                     .Set("title", base::UTF16ToUTF8(contents->GetTitle()))
+-                     .Set("url", contents->GetLastCommittedURL().spec())
+-                     .Set("zone", "today")
+-                     .Set("space_id", space.id)
+-                     .Set("loaded", true)
+-                     .Set("active", tab == active));
++      base::DictValue e = base::DictValue()
++                              .Set("id", TabId(tab))
++                              .Set("title", base::UTF16ToUTF8(contents->GetTitle()))
++                              .Set("url", contents->GetLastCommittedURL().spec())
++                              .Set("zone", "today")
++                              .Set("space_id", space.id)
++                              .Set("loaded", true)
++                              .Set("active", tab == active);
++      if (auto dialog = PageDialogOf(contents)) {
++        e.Set("pending_dialog", DialogValue(*dialog));
++      }
++      out.Append(std::move(e));
+     }
+   }
+   call->Ok(base::Value(std::move(out)));
+@@ -1749,6 +1888,72 @@ void AgentService::WaitFor(std::unique_ptr<Call> call) {
+              deadline, std::move(call));
+ }
+ 
++// ------------------------------------------------------------------ dialogs
++
++void AgentService::HandleDialog(std::unique_ptr<Call> call) {
++  tabs::TabInterface* tab = TabFor(*call);
++  if (!tab) {
++    return call->Fail(kNoTab);
++  }
++  Activity(*call, tab);
++  std::optional<PageDialog> dialog = PageDialogOf(tab->GetContents());
++  if (!dialog) {
++    return call->Fail("The tab has no open dialog.");
++  }
++  const std::string action = call->StrOr("action", "");
++  if (action != "accept" && action != "dismiss") {
++    return call->Fail("action is \"accept\" or \"dismiss\".");
++  }
++  const bool accept = action == "accept";
++  std::string what =
++      dialog->type == "beforeunload"
++          ? (accept ? "leave the page (unsaved changes there are lost)"
++                    : "stay on the page")
++          : (accept ? "answer OK to the page's " + dialog->type
++                    : "answer Cancel to the page's " + dialog->type);
++  Confirm(std::move(call), what + ": \"" + dialog->message.substr(0, 160) + "\"",
++          base::BindOnce(
++              [](base::WeakPtr<AgentService> self, tabs::TabHandle handle,
++                 bool accept, std::unique_ptr<Call> call) {
++                tabs::TabInterface* tab = handle.Get();
++                if (!self || !tab) {
++                  return call->Fail("the tab is gone");
++                }
++                content::WebContents* contents = tab->GetContents();
++                std::optional<PageDialog> dialog = PageDialogOf(contents);
++                if (!dialog) {
++                  return call->Fail("The dialog was already closed.");
++                }
++                std::u16string text = base::UTF8ToUTF16(
++                    call->StrOr("prompt_text", dialog->default_prompt));
++                auto* manager =
++                    javascript_dialogs::TabModalDialogManager::FromWebContents(
++                        contents);
++                bool handled = false;
++                if (manager) {
++                  handled =
++                      manager->HandleJavaScriptDialog(contents, accept, &text);
++                } else {
++                  handled = javascript_dialogs::AppModalDialogManager::
++                                GetInstance()
++                                    ->HandleJavaScriptDialog(contents, accept,
++                                                             &text);
++                }
++                if (!handled) {
++                  return call->Fail("Meridian couldn't answer that dialog.");
++                }
++                base::DictValue out;
++                out.Set("handled", true);
++                out.Set("type", dialog->type);
++                out.Set("accepted", accept);
++                if (dialog->type == "prompt" && accept) {
++                  out.Set("text", base::UTF16ToUTF8(text));
++                }
++                call->Ok(base::Value(std::move(out)));
++              },
++              weak_factory_.GetWeakPtr(), tab->GetHandle(), accept));
++}
++
+ // ------------------------------------------------------------------ boosts
+ 
+ void AgentService::GetBoost(std::unique_ptr<Call> call) {
+diff --git a/chrome/browser/meridian/agent/agent_service.h b/chrome/browser/meridian/agent/agent_service.h
+index 17fb1746be..0286a39fb2 100644
+--- a/chrome/browser/meridian/agent/agent_service.h
++++ b/chrome/browser/meridian/agent/agent_service.h
+@@ -129,6 +129,7 @@ class AgentService : public KeyedService {
+   void CreateSpace(std::unique_ptr<Call> call);
+   void RunJavaScript(std::unique_ptr<Call> call);
+   void GetBoost(std::unique_ptr<Call> call);
++  void HandleDialog(std::unique_ptr<Call> call);
+   void SetBoost(std::unique_ptr<Call> call);
+ 
+   raw_ptr<Profile> profile_;
+diff --git a/chrome/browser/meridian/agent/agent_tools.json b/chrome/browser/meridian/agent/agent_tools.json
+index a80844c151..f9ff1a4f18 100644
+--- a/chrome/browser/meridian/agent/agent_tools.json
++++ b/chrome/browser/meridian/agent/agent_tools.json
+@@ -11,7 +11,7 @@
+  {
+   "name": "list_tabs",
+   "access": "read",
+-  "description": "List tabs: favorites, pinned tabs (with folder path) and Today tabs. Returns id, title, url, zone, loaded, active.",
++  "description": "List tabs: favorites, pinned tabs (with folder path) and Today tabs. Returns id, title, url, zone, loaded, active. A tab whose page shows its own dialog (alert, confirm, prompt, \"Leave site?\") has pending_dialog {type, message, buttons}: the page waits until it is answered with handle_dialog.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+@@ -362,6 +362,34 @@
+    }
+   }
+  },
++ {
++  "name": "handle_dialog",
++  "access": "write",
++  "description": "Answer the page's own dialog in a tab (alert, confirm, prompt, or beforeunload \"Leave site?\"): accept (OK / Leave) or dismiss (Cancel / Stay). While such a dialog is open the page is paused and other tools on that tab return an error saying so. For a prompt, prompt_text is what is typed. Permission prompts, file pickers and sign-in dialogs are left to the person.",
++  "input_schema": {
++   "type": "object",
++   "properties": {
++    "tab_id": {
++     "type": "string"
++    },
++    "action": {
++     "type": "string",
++     "enum": [
++      "accept",
++      "dismiss"
++     ]
++    },
++    "prompt_text": {
++     "type": "string",
++     "description": "For a prompt dialog: the text to answer with (default: its default text)."
++    }
++   },
++   "required": [
++    "tab_id",
++    "action"
++   ]
++  }
++ },
+  {
+   "name": "translate_page",
+   "access": "read",
+diff --git a/components/javascript_dialogs/tab_modal_dialog_manager.cc b/components/javascript_dialogs/tab_modal_dialog_manager.cc
+index bffeb732ae..d76f09e57e 100644
+--- a/components/javascript_dialogs/tab_modal_dialog_manager.cc
++++ b/components/javascript_dialogs/tab_modal_dialog_manager.cc
+@@ -173,6 +173,8 @@ void TabModalDialogManager::RunJavaScriptDialog(
+   dialog_title_ = title;
+   dialog_callback_ = std::move(callback);
+   dialog_type_ = dialog_type;
++  dialog_message_ = truncated_message_text;
++  dialog_default_prompt_ = truncated_default_prompt_text;
+   if (make_pending) {
+     DCHECK(!dialog_);
+     pending_dialog_ = base::BindOnce(
+@@ -229,13 +231,24 @@ void TabModalDialogManager::RunBeforeUnloadDialog(
+       std::move(callback));
+ }
+ 
++std::optional<TabModalDialogManager::OpenDialog>
++TabModalDialogManager::GetOpenDialog() const {
++  if (!dialog_ && !pending_dialog_) {
++    return std::nullopt;
++  }
++  return OpenDialog{dialog_type_, dialog_message_, dialog_default_prompt_};
++}
++
+ bool TabModalDialogManager::HandleJavaScriptDialog(
+     content::WebContents* web_contents,
+     bool accept,
+     const std::u16string* prompt_override) {
+   if (dialog_ || pending_dialog_) {
++    // (A pending dialog has no view yet to read the input from.)
+     CloseDialog(DismissalCause::kHandleDialogCalled, accept,
+-                prompt_override ? *prompt_override : dialog_->GetUserInput());
++                prompt_override ? *prompt_override
++                : dialog_       ? dialog_->GetUserInput()
++                                : dialog_default_prompt_);
+     return true;
+   }
+ 
+diff --git a/components/javascript_dialogs/tab_modal_dialog_manager.h b/components/javascript_dialogs/tab_modal_dialog_manager.h
+index 0931c0c66f..eccc322ca5 100644
+--- a/components/javascript_dialogs/tab_modal_dialog_manager.h
++++ b/components/javascript_dialogs/tab_modal_dialog_manager.h
+@@ -6,6 +6,8 @@
+ #define COMPONENTS_JAVASCRIPT_DIALOGS_TAB_MODAL_DIALOG_MANAGER_H_
+ 
+ #include <memory>
++#include <optional>
++#include <string>
+ 
+ #include "base/functional/callback_forward.h"
+ #include "base/memory/sanitized_object.h"
+@@ -104,6 +106,15 @@ class TabModalDialogManager
+   void BrowserActiveStateChanged();
+   void CloseDialogWithReason(DismissalCause reason);
+ 
++  // Meridian: the dialog this tab shows or waits to show (an agent answers
++  // it with HandleJavaScriptDialog), if any.
++  struct OpenDialog {
++    content::JavaScriptDialogType type;
++    std::u16string message;
++    std::u16string default_prompt;
++  };
++  std::optional<OpenDialog> GetOpenDialog() const;
++
+   void SetDialogShownCallbackForTesting(base::OnceClosure callback);
+   bool IsShowingDialogForTesting() const;
+   const std::u16string& GetDialogTitleForTesting() const {
+@@ -194,6 +205,9 @@ class TabModalDialogManager
+   // |pending_dialog_| is non-null.
+   content::JavaScriptDialogType dialog_type_ =
+       content::JavaScriptDialogType::JAVASCRIPT_DIALOG_TYPE_ALERT;
++  // Meridian: its text, for GetOpenDialog().
++  std::u16string dialog_message_;
++  std::u16string dialog_default_prompt_;
+ 
+   // A closure to be fired when a dialog is shown. For testing only.
+   base::OnceClosure dialog_shown_;
