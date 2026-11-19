@@ -450,7 +450,7 @@ function renderSideTabs() {
     b.addEventListener('click', () => openPanel(id));
     return b;
   }));
-  for (const [id, btn] of [['hub', '#btn-hub'], ['secrets', '#btn-secrets'], ['customize', '#btn-customize'], ['insights', '#limits-chip']]) $(btn)?.classList.toggle('on', PRO.activePanel === id);
+  for (const [id, btn] of [['hub', '#btn-hub'], ['secrets', '#btn-secrets'], ['customize', '#btn-customize'], ['insights', '#limits-chip'], ['scm', '#scm-chip']]) $(btn)?.classList.toggle('on', PRO.activePanel === id);
   if (PRO.activePanel && !panelById(PRO.activePanel) && !PRO.reloading) closePanel();
 }
 

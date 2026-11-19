@@ -198,6 +198,10 @@
     hubPickParent: () => invoke('hubPickParent'),
     hubCreate: (opts) => invoke('hubCreate', { name: str(opts?.name), template: str(opts?.template), git: opts?.git !== false, skills: opts?.skills !== false }),
     hubInfo: () => invoke('hubInfo'),
+    // Source Control: git and gh in the project (only the commands the panel uses).
+    git: (args, opts) => invoke('git', (Array.isArray(args) ? args : []).slice(0, 200).map(str), { stdin: opts?.stdin === undefined ? undefined : str(opts.stdin) }),
+    gh: (args, opts) => invoke('gh', (Array.isArray(args) ? args : []).slice(0, 200).map(str), { stdin: opts?.stdin === undefined ? undefined : str(opts.stdin) }),
+    gitInfo: () => invoke('gitInfo'),
 
     toHost: (msg) => send('toHost', JSON.parse(JSON.stringify(msg || {}))),
     onHostCommand: listen('wb:command'),
