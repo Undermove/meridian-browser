@@ -282,3 +282,46 @@ test('translate: the site controls translate a Georgian page to English and back
     fs.rmSync(profile, { recursive: true, force: true });
   }
 });
+
+// A background tab Chromium froze (as it does to save power) answered an agent only once the person
+// looked at it, and meanwhile every other tool waited too: wait_for, then search_tabs, hung for 15
+// minutes (a report from the promotion session, 19.11.2026, on x.com). Now the agent's tab is woken
+// and kept awake, a page that doesn't answer is an error after 20 s, and calls don't wait in line.
+test('a frozen background tab answers the agent; a page that never answers is an error; other tools don’t wait', async () => {
+  const s = await site();
+  // Another site (another renderer) whose page locks up its main thread.
+  const busy = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<title>Busy</title><p id=x>x</p><script>setTimeout(() => { for (;;) {} }, 300)</script>'); });
+  await new Promise((r) => busy.listen(0, '127.0.0.1', r));
+  const profile = profileWith({ agent_access: 'full' });
+  const b = await launch([s.url('/')], { profile });
+  const mcp = bridge(profile);
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { protocolVersion: '2025-06-18', clientInfo: { name: 'test-client', version: '1' }, capabilities: {} });
+    // A tab in the background, then frozen the way Chromium freezes one.
+    const { tab_id } = (await mcp.call('open_tab', { url: s.url('/form') })).value;
+    const page = await b.page(s.url('/form'));
+    await page.waitFor(`!!document.getElementById('name')`);
+    await page.cdp.send('Page.setWebLifecycleState', { state: 'frozen' });
+    await sleep(300);
+    const t0 = Date.now();
+    const found = await mcp.call('wait_for', { tab_id, selector: '#name', timeout_ms: 10000 });
+    assert.deepEqual(found.value, { found: true }, `the frozen tab answered: ${JSON.stringify(found)}`);
+    assert.ok(Date.now() - t0 < 8000, `in ${Date.now() - t0} ms`);
+
+    // A page that never answers: an error after 20 s, and meanwhile other tools answer at once.
+    const stuck = (await mcp.call('open_tab', { url: `http://localhost:${busy.address().port}/` })).value;
+    await sleep(1500);
+    const t1 = Date.now();
+    const reading = mcp.call('read_page', { tab_id: stuck.tab_id });
+    await sleep(300);
+    const t2 = Date.now();
+    const list = await mcp.call('search_tabs', { query: 'Form' });
+    assert.ok(!list.error, list.error);
+    assert.ok(Date.now() - t2 < 3000, `search_tabs didn't wait for read_page: ${Date.now() - t2} ms`);
+    const read = await reading;
+    assert.match(read.error || '', /didn't answer within 20 seconds/, JSON.stringify(read).slice(0, 300));
+    assert.ok(Date.now() - t1 < 30000, `read_page gave up in ${Date.now() - t1} ms`);
+  } finally { mcp.close(); await b.close(); s.server.close(); busy.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
