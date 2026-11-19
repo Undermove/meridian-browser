@@ -331,7 +331,7 @@ for (const imported of ['now', 'by 0.5.13']) {
     arcExtension(arcDir, 'Default', personal.id, 'Mark Personal');
     arcExtension(arcDir, 'Profile 2', office.id, 'Mark Office');
     const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-arc-'));
-    const args = [`--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=test-pass', `--apps-gallery-update-url=${web.url}`, '--meridian-test-unsigned-store'];
+    const args = [`--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=test-pass', `--apps-gallery-update-url=${web.url}`, '--meridian-test-unsigned-store', '--meridian-test-no-external-extensions'];
     try {
       if (imported !== 'now') {
         const old = await launch(['about:blank'], { profile, args, app: OLD });
@@ -387,7 +387,7 @@ test('the site controls show the shown space\'s extensions; a click opens its po
   const arcDir = arcWithTwoProfiles(s.u);
   arcExtension(arcDir, 'Default', personal.id, 'Mark Personal');
   arcExtension(arcDir, 'Profile 2', office.id, 'Mark Office');
-  const args = [`--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=test-pass', `--apps-gallery-update-url=${web.url}`, '--meridian-test-unsigned-store'];
+  const args = [`--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=test-pass', `--apps-gallery-update-url=${web.url}`, '--meridian-test-unsigned-store', '--meridian-test-no-external-extensions'];
   const b = await launch(['about:blank'], { args });
   const SC = 'app.$.siteControl.shadowRoot';
   const tiles = () => b.eval(`[...${SC}.querySelectorAll('.ext-btn')].map((t) => t.title)`);
