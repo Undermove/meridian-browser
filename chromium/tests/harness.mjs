@@ -140,6 +140,10 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
   const proc = spawn(app, [
     `--user-data-dir=${profile}`, `--remote-debugging-port=${port}`, '--use-mock-keychain',
     '--meridian-keep-keyboard-layout',
+    // In the background, beside the person working on this Mac: never the active app, no windows
+    // on screen, no Dock icon (input goes over the DevTools protocol). MERIDIAN_FOREGROUND=1 shows
+    // them (the few tests that need a real window ask for it themselves).
+    ...(process.platform === 'darwin' && !process.env.MERIDIAN_FOREGROUND && !args.includes('--meridian-test-foreground') ? ['--meridian-test-background'] : []),
     ...(firstRun ? [] : ['--no-first-run']), '--no-default-browser-check', '--window-size=1280,860',
     // Keep drawing when the window is covered or the display sleeps (input waits for frames).
     '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
@@ -385,6 +389,11 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
 
 // The sidebar's shadow root, and its rows.
 export const SB = `app.$.tabstrip.shadowRoot`;
+// Tests run in the background on macOS (no windows on screen, no focus). macOS full screen and
+// picture-in-picture windows show on screen whatever the app is, so tests of those run only with
+// MERIDIAN_FOREGROUND=1 (when nobody is working at the Mac): `{ skip: NEEDS_SCREEN }`.
+export const FOREGROUND = process.platform !== 'darwin' || !!process.env.MERIDIAN_FOREGROUND;
+export const NEEDS_SCREEN = !FOREGROUND && 'needs a window on screen: run with MERIDIAN_FOREGROUND=1';
 export const tabEl = (i) => `${SB}.querySelectorAll('meridian-tab-row')[${i}]`;
 export const itemEl = (title) => `(() => { const all = []; const walk = (root) => { for (const el of root.querySelectorAll('meridian-item')) { all.push(el); walk(el.shadowRoot); } }; walk(${SB}); return all.find((el) => el.item.title === ${JSON.stringify(title)}); })()`;
 export const favEl = (i) => `${SB}.querySelectorAll('meridian-fav')[${i}]`;

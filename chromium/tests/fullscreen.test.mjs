@@ -6,7 +6,7 @@
 // also when the window already is full screen.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { launch, SB } from './harness.mjs';
+import { launch, SB, NEEDS_SCREEN } from './harness.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const T = 'app.$.tabstrip';
@@ -60,7 +60,7 @@ async function settled(b, fn, ok, what, ms = 8000) {
   assert.fail(`${what}: ${JSON.stringify(last)}`);
 }
 
-test('full screen: the exit hint shows, then goes away by itself', async () => {
+test('full screen: the exit hint shows, then goes away by itself', { skip: NEEDS_SCREEN }, async () => {
   const b = await launch(['data:text/html,<title>P</title>page'], { args: ['--meridian-test-keys', '--meridian-test-bubbles'] });
   const hint = async () => (await b.eval(`${T}.handler_.testBubbles('').then((r) => r.bubbles)`))
       .includes('SubtleNotificationView');
@@ -86,7 +86,7 @@ const noSlide = (b) => b.eval(`(() => { const s = document.createElement('style'
 const controls = (b) => b.eval(`${T}.handler_.testWindowState().then((s) => s.controls ?? '')`);
 const sidebarKey = (b) => b.eval(`${T}.handler_.testKeyPress(1, 's', ${CMD})`);  // ⌘S
 
-test('full screen keeps the sidebar where it was: shown stays shown beside the page, ⌘S still hides it', async () => {
+test('full screen keeps the sidebar where it was: shown stays shown beside the page, ⌘S still hides it', { skip: NEEDS_SCREEN }, async () => {
   const b = await launch([VIDEO], { args: ARGS });
   const move = (x, y) => b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
   try {
@@ -112,7 +112,7 @@ test('full screen keeps the sidebar where it was: shown stays shown beside the p
   } finally { await b.close(); }
 });
 
-test('a sidebar hidden with ⌘S stays hidden in full screen; the left edge slides it over the page; it stays hidden after', async () => {
+test('a sidebar hidden with ⌘S stays hidden in full screen; the left edge slides it over the page; it stays hidden after', { skip: NEEDS_SCREEN }, async () => {
   const b = await launch([VIDEO], { args: ARGS });
   const move = (x, y) => b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' });
   try {
@@ -146,7 +146,7 @@ test('a sidebar hidden with ⌘S stays hidden in full screen; the left edge slid
 });
 
 for (const fromFullscreen of [false, true]) {
-  test(`a video full screen covers the whole screen${fromFullscreen ? ' from macOS full screen too' : ''}; Esc goes back`, async () => {
+  test(`a video full screen covers the whole screen${fromFullscreen ? ' from macOS full screen too' : ''}; Esc goes back`, { skip: NEEDS_SCREEN }, async () => {
     const b = await launch([VIDEO], { args: ARGS });
     try {
       await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);

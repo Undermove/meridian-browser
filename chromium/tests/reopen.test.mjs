@@ -12,7 +12,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { launch, SB, itemEl } from './harness.mjs';
+import { launch, SB, itemEl, NEEDS_SCREEN } from './harness.mjs';
 import { startServer } from './server.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -191,7 +191,7 @@ test('a closed Peek: ⇧⌘T opens it again as a Peek over its pinned tab', asyn
   } finally { await b.close(); site.close(); }
 });
 
-test('⌘Z outside a text field reopens the last closed tab; in one it undoes the typing', async () => {
+test('⌘Z outside a text field reopens the last closed tab; in one it undoes the typing', { skip: NEEDS_SCREEN }, async () => {
   const FORM = 'data:text/html,' + encodeURIComponent('<title>Form</title><input id=q style="position:fixed;left:40px;top:40px;width:300px;height:40px"><p style="margin-top:200px">text');
   const b = await launch([FORM, 'data:text/html,<title>Gone</title>gone'], { args: ARGS });
   try {

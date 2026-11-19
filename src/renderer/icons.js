@@ -39,6 +39,7 @@ const ICON_PATHS = {
   pin: '<path d="M9 4.5h6M10 4.5v5.2l-3 3.3v1.5h10V13l-3-3.3V4.5M12 14.5v5"/>',
   unpin: '<path d="M9 4.5h6M10 4.5v5.2l-3 3.3v1.5h10V13l-3-3.3V4.5M12 14.5v5"/><path d="M4.5 4.5l15 15"/>',
   code: '<path d="M15.5 17.5L21 12l-5.5-5.5M8.5 6.5L3 12l5.5 5.5"/>',
+  branch: '<circle cx="6" cy="5.5" r="2.2"/><circle cx="6" cy="18.5" r="2.2"/><circle cx="18" cy="7.5" r="2.2"/><path d="M6 7.7v8.6M18 9.7c0 4-4 4.5-9.6 7.1"/>',
   terminal: '<path d="M5 16.5l5-4.5-5-4.5M12.5 18h7"/>',
   file: '<path d="M13.5 3.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z"/><path d="M13.5 3.5V9H19"/>',
   play: '<path d="M7.5 5l11 7-11 7z"/>',

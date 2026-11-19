@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { launch, SB } from './harness.mjs';
+import { launch, SB, NEEDS_SCREEN } from './harness.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ST = 'app.$.settings.shadowRoot';
@@ -225,7 +225,7 @@ async function switchAcrossProfiles(fullscreen) {
 
 test('Profiles: ⌃1–3 across profiles stay in the one window', () => switchAcrossProfiles(false));
 
-test('Profiles: the same in macOS full screen', () => switchAcrossProfiles(true));
+test('Profiles: the same in macOS full screen', { skip: NEEDS_SCREEN }, () => switchAcrossProfiles(true));
 
 test('Profiles: Peek, Open as Tab and Split in a Work space keep the Work profile', async () => {
   // /work sets Work's cookie on 127.0.0.1; /app links out to localhost (another site: Peek).
