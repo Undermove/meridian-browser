@@ -13,7 +13,7 @@
   <a href="https://undermove.github.io/meridian-browser/">Website</a>
 </p>
 
-<p align="center"><b>Importing from Arc: one click.</b> Spaces, pinned tabs, folders, favorites, and on macOS your logins too.<br>Arc stops working on December 22, 2026.</p>
+<p align="center"><b>Importing from Arc or Chrome: one click.</b> Spaces, pinned tabs, folders, favorites, bookmarks, open tabs, passwords, and on macOS your logins too.<br>Arc stops working on December 22, 2026.</p>
 
 Meridian is a free, open-source browser built on Chromium, so sites, Google sign-in, passkeys and extensions work like in Chrome. On top of it: the Arc sidebar you know, and a home for coding agents (Claude Code, Codex and others) right next to the page they work on.
 
@@ -28,6 +28,7 @@ Meridian is a free, open-source browser built on Chromium, so sites, Google sign
 - **Little window**: links from other apps open in a small window; "Open in Meridian" moves them in.
 - **Air Traffic Control** (Settings › Links): send links from other apps to the right space by domain or pattern.
 - **Import from Arc** in one click: spaces, colours, icons, pinned tabs, folders, favorites and Today. On macOS your **logins** come over too (Arc's cookies are copied into the matching profiles after you allow the keychain prompt). Nothing leaves your computer and Arc isn't changed.
+- **Import from Google Chrome** (File › Import from Chrome…): a space per Chrome profile, its bookmarks as pinned tabs and folders, the tabs you had open, sign-ins, passwords, history and extensions.
 - Also: private windows, a theme editor per space, built-in ad and tracker blocking, Chrome extensions, a hideable sidebar on either side, every shortcut configurable.
 
 ## For AI agents
