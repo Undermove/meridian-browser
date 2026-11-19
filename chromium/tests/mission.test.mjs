@@ -80,7 +80,8 @@ test('Mission Control: a Workbench session with a subagent, a wait, browser tool
     const s = await waitState((x) => x.nodes.some((n) => n.status === 'waiting'), 'the wait');
     const root = s.nodes.find((n) => n.kind === 'session');
     assert.equal(root.label, 'Claude Code');
-    assert.equal(root.sublabel, 'claude-opus-5-5');
+    // The model, after the agent once the Workbench has named the session.
+    assert.match(root.sublabel, /^(Claude Code · )?claude-opus-5-5$/);
     assert.equal(root.project, path.basename(project));
     assert.match(root.statusText, /Needs permission: Bash/);
     const sub = s.nodes.find((n) => n.kind === 'subagent');
@@ -165,7 +166,7 @@ test('closing the Workbench tab stops its sessions in Mission Control; a closed 
     throw new Error(`timed out waiting for ${what}: ${JSON.stringify(s?.nodes?.map((n) => [n.label, n.status, n.statusText]))}`);
   };
   // Running sessions; `started`: the agent itself is up (its SessionStart hook named the model).
-  const live = (s, started = false) => s.nodes.filter((n) => n.kind === 'session' && !n.endedAt && (!started || n.sublabel === 'claude-opus-5-5'));
+  const live = (s, started = false) => s.nodes.filter((n) => n.kind === 'session' && !n.endedAt && (!started || /claude-opus-5-5$/.test(n.sublabel || '')));
   const openWorkbench = async () => {
     await b.eval('app.$.tabstrip.runCommand(16, 0)');
     const wb = await b.page('chrome://workbench');

@@ -284,12 +284,59 @@ function renderLauncher() {
     b.title = !installed ? `${AGENT_UI[kind].label} is not installed`
       : kind === 'shell' ? 'Open a shell in the project'
       : `Start ${AGENT_UI[kind].label} in the project${a?.mcp ? ' — with Meridian browser tools' : ''}`;
-    b.addEventListener('click', () => (installed ? launch(kind) : installHint(b, kind)));
+    // `anchor`: where a hint shows (the More button when this one is in its menu).
+    b._run = (anchor) => (installed ? launch(kind) : installHint(anchor, kind));
+    b.addEventListener('click', () => b._run(b));
     bar.appendChild(b);
     if (kind === 'claude' && installed) bar.appendChild(resumeButton('launch resume'));
   }
   if (typeof proLauncherExtras === 'function') proLauncherExtras(bar); // Workbench Pro: sandbox + plugin launchers
   iconize(bar);
+  fitLauncher();
+}
+
+// The launchers that don't fit the top bar go into a "More" menu at its end (the last ones first),
+// so every agent stays one click away on a small screen.
+function fitLauncher() {
+  const bar = $('#launcher');
+  if (!bar) return;
+  bar.querySelector('#launcher-more')?.remove();
+  bar.classList.remove('compact');
+  const items = [...bar.children];
+  for (const el of items) el.hidden = false;
+  if (bar.scrollWidth <= bar.clientWidth + 1) return;
+  const more = document.createElement('button');
+  more.id = 'launcher-more';
+  more.className = 'launch more';
+  more.title = 'More agents';
+  more.setAttribute('aria-haspopup', 'menu');
+  bar.appendChild(more);
+  const hidden = [];
+  // Claude Code stays; everything after it can go.
+  for (let i = items.length - 1; i > 0 && bar.scrollWidth > bar.clientWidth + 1; i--) {
+    items[i].hidden = true;
+    hidden.unshift(items[i]);
+    more.innerHTML = `<span class="ic-slot" data-icon="more" data-size="14"></span><span class="more-n">${hidden.length}</span>`;
+    more.title = `More agents: ${hidden.map((e) => e.textContent.trim()).join(', ')}`;
+    iconize(more);
+  }
+  if (!hidden.length) { more.remove(); return; }
+  // Still too narrow: Claude Code's button shows only its mark.
+  if (bar.scrollWidth > bar.clientWidth + 1) bar.classList.add('compact');
+  more.addEventListener('click', () => {
+    popover(more, '<div class="launch-menu" role="menu"></div>', (pop, close) => {
+      const list = $('.launch-menu', pop);
+      for (const el of hidden) {
+        const row = el.cloneNode(true);
+        row.hidden = false;
+        row.removeAttribute('id');
+        row.classList.add('menu-row');
+        row.setAttribute('role', 'menuitem');
+        row.addEventListener('click', () => { close(); el._run ? el._run(more) : el.click(); });
+        list.appendChild(row);
+      }
+    });
+  });
 }
 
 function installHint(anchor, kind) {
@@ -1157,6 +1204,18 @@ function renderTermTabs() {
   }));
   $('#term-empty').hidden = S.terms.length > 0;
   renderTermStart();
+  sendMissionNames();
+}
+
+// Mission Control shows each session under the name on its tab (only when one changes).
+let lastMissionNames = '';
+function sendMissionNames() {
+  if (typeof wb.missionNames !== 'function') return;
+  const names = Object.fromEntries(S.terms.filter((t) => t.id && !t.exited).map((t) => [t.id, termName(t) || '']));
+  const key = JSON.stringify(names);
+  if (key === lastMissionNames) return;
+  lastMissionNames = key;
+  wb.missionNames(names).catch(() => {});
 }
 
 // A project with no terminal yet: one big button for the agent that's installed (the first of Claude Code,
@@ -1268,6 +1327,15 @@ function initTerminals() {
     fitActive();
   });
   new ResizeObserver(() => fitActive()).observe($('#term-host'));
+  // The launchers fit again whenever the bar or what shares it (the project's name, the buttons on
+  // the right) changes size.
+  {
+    let queued = false;
+    const refit = () => { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; fitLauncher(); }); };
+    const ro = new ResizeObserver(refit);
+    for (const el of $('#topbar')?.children || []) if (el.id !== 'launcher') ro.observe(el);
+    if ($('#topbar')) ro.observe($('#topbar'));
+  }
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { for (const t of S.terms) t.xterm.options.theme = termTheme(); });
 }
 
@@ -1332,7 +1400,15 @@ function onHostCommand(msg) {
   }
   if (msg.type === 'pick-project') pickProject();
   // Mission Control: "Open terminal" on an agent node, and the live counts for the topbar chip.
-  if (msg.type === 'focus-term') { const t = S.terms.find((x) => x.id === String(msg.id)); if (t) { $('#term-area').classList.remove('collapsed'); activateTerm(t); } }
+  if (msg.type === 'focus-term') {
+    const t = S.terms.find((x) => x.id === String(msg.id));
+    if (t) {
+      $('#term-area').classList.remove('collapsed');
+      activateTerm(t);
+      // From Mission Control's "Context Insights".
+      if (msg.panel === 'insights' && typeof openPanel === 'function') { CI.termId = t.id; openPanel('insights'); }
+    }
+  }
   if (msg.type === 'mission' && typeof missionChip === 'function') missionChip(msg);
   if (msg.type === 'mission' && typeof insightsUsage === 'function') insightsUsage(msg.usage);
   if (msg.type === 'mission') noteClaudeSessions(msg.usage);
