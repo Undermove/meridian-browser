@@ -1,0 +1,967 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 19 Nov 2026 19:51:08 +0400
+Subject: [PATCH 177/177] Meridian: ask before anything goes to an online AI
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A sheet says where the request goes (Send, Always, Use another AI, Turn AI
+features off, Cancel); Settings › AI has Ask / Don't ask / AI off. The
+Workbench counts commands its agents run in the background.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/ai/ai_service.cc      | 141 ++++++++++++++++++
+ chrome/browser/meridian/ai/ai_service.h       |  26 ++++
+ chrome/browser/meridian/prefs.cc              |   1 +
+ chrome/browser/meridian/prefs.h               |   3 +
+ chrome/browser/meridian/sidebar.mojom         |   7 +
+ chrome/browser/meridian/sidebar_handler.cc    |  43 ++++++
+ chrome/browser/meridian/sidebar_handler.h     |   4 +
+ .../meridian/workbench/workbench_handler.cc   | 116 ++++++++++++++
+ .../meridian/workbench/workbench_handler.h    |   3 +
+ .../browser/resources/webui_browser/BUILD.gn  |   3 +
+ .../resources/webui_browser/app.html.ts       |   3 +
+ chrome/browser/resources/webui_browser/app.ts |   1 +
+ .../webui_browser/meridian/ai_consent.css     | 110 ++++++++++++++
+ .../webui_browser/meridian/ai_consent.html.ts |  38 +++++
+ .../webui_browser/meridian/ai_consent.ts      | 122 +++++++++++++++
+ .../webui_browser/meridian/settings.html.ts   |  29 ++++
+ .../webui_browser/meridian/settings.ts        |   2 +
+ tools/gritsettings/resource_ids.spec          |   2 +-
+ 18 files changed, 653 insertions(+), 1 deletion(-)
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/ai_consent.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/ai_consent.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/ai_consent.ts
+
+diff --git a/chrome/browser/meridian/ai/ai_service.cc b/chrome/browser/meridian/ai/ai_service.cc
+index 9ddf598703..cc5e0196a2 100644
+--- a/chrome/browser/meridian/ai/ai_service.cc
++++ b/chrome/browser/meridian/ai/ai_service.cc
+@@ -522,6 +522,21 @@ std::string NeutralizePage(std::string text) {
+ 
+ void AiService::PreviewLink(const GURL& url,
+                             base::OnceCallback<void(Preview)> done) {
++  // It goes to Claude's API: nothing leaves before the person allowed it.
++  if (!ConsentGiven("api")) {
++    WhenAllowed(
++        "api",
++        base::BindOnce(&AiService::PreviewLink, weak_factory_.GetWeakPtr(),
++                       url, std::move(done)),
++        base::BindOnce(
++            [](base::OnceCallback<void(Preview)> done, GURL url,
++               const std::string& why) {
++              std::move(done).Run(
++                  {.host = std::string(url.host()), .error = why});
++            },
++            std::move(done), url));
++    return;
++  }
+   auto hit = previews_.find(url);
+   if (hit != previews_.end() &&
+       base::TimeTicks::Now() - hit->second.first < kPreviewCacheAge) {
+@@ -666,6 +681,32 @@ void AiService::FinishPreview(const GURL& url, Preview preview) {
+ void AiService::Tidy(
+     std::vector<ai::TidyTab> tabs,
+     base::OnceCallback<void(std::optional<ai::TidyPlan>, std::string)> done) {
++  // It goes to Claude's API: nothing leaves before the person allowed it.
++  if (!ConsentGiven("api")) {
++    // Split one callback across the two outcomes.
++    auto shared = std::make_shared<decltype(done)>(std::move(done));
++    WhenAllowed(
++        "api",
++        base::BindOnce(
++            [](base::WeakPtr<AiService> self, std::vector<ai::TidyTab> tabs,
++               std::shared_ptr<base::OnceCallback<void(
++                   std::optional<ai::TidyPlan>, std::string)>> done) {
++              if (self && *done) {
++                self->Tidy(std::move(tabs), std::move(*done));
++              }
++            },
++            weak_factory_.GetWeakPtr(), std::move(tabs), shared),
++        base::BindOnce(
++            [](std::shared_ptr<base::OnceCallback<void(
++                   std::optional<ai::TidyPlan>, std::string)>> done,
++               const std::string& why) {
++              if (*done) {
++                std::move(*done).Run(std::nullopt, why);
++              }
++            },
++            shared));
++    return;
++  }
+   if (tabs.size() < 2) {
+     std::move(done).Run(std::nullopt, "Tidy needs at least two Today tabs.");
+     return;
+@@ -789,7 +830,107 @@ std::string AiService::CurrentLabel() const {
+   return p ? p->label : std::string();
+ }
+ 
++namespace {
++
++AiService::ConsentAsker& Asker() {
++  static base::NoDestructor<AiService::ConsentAsker> asker;
++  return *asker;
++}
++
++}  // namespace
++
++// static
++void AiService::SetConsentAsker(ConsentAsker asker) {
++  Asker() = std::move(asker);
++}
++
++// static
++std::string AiService::DestinationOf(const std::string& provider) {
++  if (provider == "api" || provider == "claude") {
++    return "Anthropic (Claude)";
++  }
++  const ai::Provider* p = ai::FindProvider(provider);
++  if (!p || p->kind == ai::Kind::kOllama || p->kind == ai::Kind::kOpenAiLocal) {
++    return std::string();
++  }
++  return p->vendor.empty() || p->vendor == p->label
++             ? p->label
++             : p->vendor + " (" + p->label + ")";
++}
++
++bool AiService::ConsentGiven(const std::string& provider) const {
++  const std::string consent =
++      profile_->GetPrefs()->GetString(prefs::kAiConsent);
++  if (consent == "off") {
++    return false;
++  }
++  // On this computer, said yes already, or a test that doesn't ask about it.
++  return DestinationOf(provider).empty() || consent == "always" ||
++         consent_this_run_ ||
++         (TestSwitchesAllowed() && !HasTestSwitch("meridian-test-ai-consent")) ||
++         Asker().is_null();
++}
++
++void AiService::WhenAllowed(
++    const std::string& provider,
++    base::OnceClosure go,
++    base::OnceCallback<void(const std::string&)> refuse) {
++  if (profile_->GetPrefs()->GetString(prefs::kAiConsent) == "off") {
++    return std::move(refuse).Run(
++        "AI features are off. Turn them on in Settings › AI.");
++  }
++  if (ConsentGiven(provider)) {
++    return std::move(go).Run();
++  }
++  const std::string to = DestinationOf(provider);
++  consent_waiting_.emplace_back(std::move(go), std::move(refuse));
++  if (consent_waiting_.size() > 1) {
++    return;  // one question for all of them
++  }
++  Asker().Run(profile_, to,
++              base::BindOnce(&AiService::OnConsent,
++                             weak_factory_.GetWeakPtr()));
++}
++
++void AiService::OnConsent(const std::string& choice) {
++  if (choice == "always") {
++    profile_->GetPrefs()->SetString(prefs::kAiConsent, "always");
++  } else if (choice == "off") {
++    profile_->GetPrefs()->SetString(prefs::kAiConsent, "off");
++  }
++  const bool yes = choice == "send" || choice == "always";
++  if (yes) {
++    consent_this_run_ = true;
++  }
++  const std::string why =
++      choice == "off"     ? "AI features are off. Turn them on in Settings › AI."
++      : choice == "other" ? "Pick the AI to use in Settings › AI."
++                          : "Not sent: you didn’t allow it.";
++  auto waiting = std::move(consent_waiting_);
++  consent_waiting_.clear();
++  for (auto& [go, refuse] : waiting) {
++    if (yes) {
++      std::move(go).Run();
++    } else {
++      std::move(refuse).Run(why);
++    }
++  }
++}
++
+ void AiService::Chat(Request request, EventCallback events) {
++  // Nothing leaves before the person allowed it.
++  if (std::string provider = CurrentProvider(); !ConsentGiven(provider)) {
++    WhenAllowed(
++        provider,
++        base::BindOnce(&AiService::Chat, weak_factory_.GetWeakPtr(),
++                       std::move(request), events),
++        base::BindOnce(
++            [](EventCallback events, const std::string& why) {
++              events.Run("error", why);
++            },
++            events));
++    return;
++  }
+   auto& session = sessions_[request.session_id];
+   if (!session) {
+     session = std::make_unique<Session>();
+diff --git a/chrome/browser/meridian/ai/ai_service.h b/chrome/browser/meridian/ai/ai_service.h
+index ec762576fd..8cc50292fb 100644
+--- a/chrome/browser/meridian/ai/ai_service.h
++++ b/chrome/browser/meridian/ai/ai_service.h
+@@ -85,6 +85,25 @@ class AiService : public KeyedService {
+   // up.
+   std::string CurrentLabel() const;
+ 
++  // Consent before anything goes to an AI service on the internet (not one
++  // on this computer): the person said yes once this run, or always; or AI
++  // is off. `provider` is where the request goes ("api" is Claude's API).
++  // `go` runs once allowed; `refuse` gets the reason otherwise.
++  using ConsentAnswer = base::OnceCallback<void(const std::string& choice)>;
++  using ConsentAsker =
++      base::RepeatingCallback<void(Profile* profile,
++                                   const std::string& to,
++                                   ConsentAnswer answer)>;
++  // The window that asks (SidebarHandler); choices: "send", "always",
++  // "other" (pick another AI), "off", "cancel".
++  static void SetConsentAsker(ConsentAsker asker);
++  void WhenAllowed(const std::string& provider,
++                   base::OnceClosure go,
++                   base::OnceCallback<void(const std::string&)> refuse);
++  // Where a request to `provider` goes, as the question says it: "Anthropic
++  // (Claude)", "OpenAI (ChatGPT)"; empty for a model on this computer.
++  static std::string DestinationOf(const std::string& provider);
++
+   ai::LocalAgents& local() { return *local_; }
+   // Chat view conversations.
+   ai::ChatStore& chats() { return *chats_; }
+@@ -141,6 +160,13 @@ class AiService : public KeyedService {
+   void FinishPreview(const GURL& url, Preview preview);
+ 
+   raw_ptr<Profile> profile_;
++  // Consent: given for this run; the requests waiting for an answer.
++  bool consent_this_run_ = false;
++  std::vector<std::pair<base::OnceClosure,
++                        base::OnceCallback<void(const std::string&)>>>
++      consent_waiting_;
++  void OnConsent(const std::string& choice);
++  bool ConsentGiven(const std::string& provider) const;
+   // Link previews: url -> (when, preview); what's being fetched; recent
+   // uncached starts (a page can move links under a still cursor).
+   std::map<GURL, std::pair<base::TimeTicks, Preview>> previews_;
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index 3a29b11568..c5de57ba2e 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -27,6 +27,7 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterListPref(kAgentUploadSites);
+   registry->RegisterStringPref(kAiKey, std::string());
+   registry->RegisterStringPref(kAiProvider, std::string());
++  registry->RegisterStringPref(kAiConsent, std::string());
+   registry->RegisterDictionaryPref(kAiCloudKeys);
+   registry->RegisterDictionaryPref(kAiModels);
+   registry->RegisterBooleanPref(kAiOtherAgents, false);
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index 604a57b404..24dc774ea4 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -48,6 +48,9 @@ inline constexpr char kAiKey[] = "meridian.ai_key";
+ // Who answers Ask and the ⌘J panel: "" (automatic), "api" (Claude on the key
+ // above) or a provider id (ai/providers.h).
+ inline constexpr char kAiProvider[] = "meridian.ai_provider";
++// Before the AI features send anything to an AI service on the internet:
++// "" asks (once per run), "always" doesn't, "off" turns them off.
++inline constexpr char kAiConsent[] = "meridian.ai_consent";
+ // Other providers' API keys: provider id -> key encrypted with OSCrypt
+ // (base64).
+ inline constexpr char kAiCloudKeys[] = "meridian.ai_cloud_keys";
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 39fcfe1b55..1f2fb3c66e 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -350,6 +350,9 @@ struct Settings {
+   // AI agents (MCP): "off", "read", "ask" or "full"; JavaScript in pages.
+   string agent_access;
+   bool agent_allow_js;
++  // Before the AI features send anything to an AI service on the internet:
++  // "" (ask), "always" or "off".
++  string ai_consent;
+   // Files agents upload: "ask", "always" or "never"; the sites allowed for
+   // good (no question there).
+   string agent_uploads;
+@@ -515,6 +518,10 @@ interface SidebarPage {
+   OnAgentActivity(AgentActivity activity);
+   // Access level "ask": the person allows or denies one action.
+   AskAgent(string client, string summary) => (bool allowed);
++  // Before an AI feature sends something to an AI service on the internet
++  // (`to`: "Anthropic (Claude)"): "send", "always", "other", "off" or
++  // "cancel".
++  AskAiConsent(string to) => (string choice);
+   // The built-in AI streams: "text" (a delta), "tool", "done" or "error".
+   OnAiEvent(string session_id, string type, string text);
+   // Mission Control (mission_control.h): its snapshot as JSON on every
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index c5e7b74638..fb9a50d562 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -251,6 +251,10 @@ mojom::ItemPtr ToMojo(const Item& item) {
+   return m;
+ }
+ 
++void AskAiConsentIn(Profile* profile,
++                    const std::string& to,
++                    AiService::ConsentAnswer answer);
++
+ }  // namespace
+ 
+ SidebarHandler::SidebarHandler(
+@@ -281,6 +285,7 @@ SidebarHandler::SidebarHandler(
+                                  base::Unretained(this)));
+   model()->AddObserver(this);
+   Handlers()[browser_] = this;
++  AiService::SetConsentAsker(base::BindRepeating(&AskAiConsentIn));
+   TabStripModel::SetSelectableAfterClose(&SidebarHandler::SelectableAfterClose);
+   Updater::Get().AddObserver(this);
+   Updater::Get().Start();
+@@ -939,6 +944,39 @@ void SidebarHandler::AskAgent(BrowserWindowInterface* browser,
+       mojo::WrapCallbackWithDefaultInvokeIfNotRun(std::move(done), false));
+ }
+ 
++namespace {
++
++// The AI features' question goes to the frontmost Meridian window of the
++// profile (its spaces' too): "cancel" when there is none, or it closes first.
++void AskAiConsentIn(Profile* profile,
++                    const std::string& to,
++                    AiService::ConsentAnswer answer) {
++  SidebarHandler* best = nullptr;
++  Profile* main = MainProfileFor(profile);
++  for (auto& [browser, handler] : Handlers()) {
++    if (MainProfileFor(browser->GetProfile()) != main ||
++        !handler->page_connected()) {
++      continue;
++    }
++    if (!best || browser->IsActive()) {
++      best = handler;
++    }
++  }
++  if (!best) {
++    std::move(answer).Run("cancel");
++    return;
++  }
++  best->AskAiConsent(to, std::move(answer));
++}
++
++}  // namespace
++
++void SidebarHandler::AskAiConsent(const std::string& to,
++                                  AiService::ConsentAnswer answer) {
++  page_->AskAiConsent(to, mojo::WrapCallbackWithDefaultInvokeIfNotRun(
++                              std::move(answer), std::string("cancel")));
++}
++
+ void SidebarHandler::SetAgentsPaused(bool paused) {
+   if (AgentService* agents =
+           AgentServiceFactory::GetForProfile(browser_->GetProfile())) {
+@@ -1772,6 +1810,7 @@ void SidebarHandler::GetSettings(GetSettingsCallback callback) {
+   settings->archive_after_hours = prefs->GetInteger(prefs::kArchiveAfterHours);
+   settings->atc = AtcToMojo(prefs->GetDict(prefs::kAtc));
+   settings->agent_access = prefs->GetString(prefs::kAgentAccess);
++  settings->ai_consent = prefs->GetString(prefs::kAiConsent);
+   settings->agent_allow_js = prefs->GetBoolean(prefs::kAgentAllowJs);
+   settings->agent_uploads = prefs->GetString(prefs::kAgentUploads);
+   for (const base::Value& site : prefs->GetList(prefs::kAgentUploadSites)) {
+@@ -1835,6 +1874,10 @@ void SidebarHandler::SetSettings(mojom::SettingsPtr settings) {
+     prefs->SetString(prefs::kAgentAccess, access);
+   }
+   prefs->SetBoolean(prefs::kAgentAllowJs, settings->agent_allow_js);
++  const std::string& consent = settings->ai_consent;
++  if (consent.empty() || consent == "always" || consent == "off") {
++    prefs->SetString(prefs::kAiConsent, consent);
++  }
+   const std::string& uploads = settings->agent_uploads;
+   if (uploads == "ask" || uploads == "always" || uploads == "never") {
+     prefs->SetString(prefs::kAgentUploads, uploads);
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index a4a127d924..214ef4f391 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -14,6 +14,7 @@
+ #include "base/scoped_observation.h"
+ #include "base/timer/timer.h"
+ #include "components/prefs/pref_change_registrar.h"
++#include "chrome/browser/meridian/ai/ai_service.h"
+ #include "chrome/browser/meridian/archive_service.h"
+ #include "chrome/browser/meridian/arc_import.h"
+ #include "chrome/browser/meridian/downloads_tracker.h"
+@@ -275,6 +276,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+                             const std::string& tab_id,
+                             const std::string& host,
+                             bool paused);
++  // The AI features' consent question, in this window.
++  void AskAiConsent(const std::string& to, AiService::ConsentAnswer answer);
++  bool page_connected() const { return page_.is_connected(); }
+   static void AskAgent(BrowserWindowInterface* browser,
+                        const std::string& client,
+                        const std::string& summary,
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 51e9075619..39f34683af 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <utility>
+ 
++#include "base/process/process_iterator.h"
+ #include "base/base64.h"
+ #include "base/command_line.h"
+ #include "base/files/file_util.h"
+@@ -259,6 +260,8 @@ void WorkbenchHandler::FocusTerminal(content::WebContents* contents,
+ 
+ void WorkbenchHandler::OnJavascriptAllowed() {
+   Handlers()[web_ui()->GetWebContents()] = this;
++  background_timer_.Start(FROM_HERE, base::Seconds(4), this,
++                          &WorkbenchHandler::CountBackgroundTasks);
+ }
+ 
+ WorkbenchHandler::~WorkbenchHandler() {
+@@ -733,6 +736,22 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+     }
+     return std::move(reply).Run(base::Value(true));
+   }
++  // Before an agent that works with an AI service on the internet starts:
++  // the person's answer for the AI features ("", "always" or "off"; tests
++  // don't ask unless --meridian-test-ai-consent).
++  if (method == "aiConsent") {
++    std::string consent = profile_->GetPrefs()->GetString(prefs::kAiConsent);
++    if (TestSwitchesAllowed() && !HasTestSwitch("meridian-test-ai-consent")) {
++      consent = "always";
++    }
++    return std::move(reply).Run(base::Value(consent));
++  }
++  if (method == "setAiConsent") {
++    if (a == "always") {
++      profile_->GetPrefs()->SetString(prefs::kAiConsent, "always");
++    }
++    return std::move(reply).Run(base::Value(true));
++  }
+   if (method == "ptyList") {
+     base::ListValue list;
+     for (const auto& [id, term] : terms_) {
+@@ -2615,6 +2634,103 @@ void WorkbenchHandler::CreateSandbox(std::string kind,
+           cols, rows, std::move(registration), std::move(reply)));
+ }
+ 
++namespace {
++
++// The background commands an agent left running: shells (`sh -c …`, how
++// Claude Code runs a Bash command) below the agent's own process, under the
++// terminal's process `root`. While the agent waits for its next prompt they
++// are its background tasks.
++int BackgroundShells(int root,
++                     const std::map<int, std::vector<int>>& children,
++                     const std::map<int, std::vector<std::string>>& args) {
++  int count = 0;
++  std::vector<std::pair<int, int>> stack = {{root, 0}};
++  while (!stack.empty()) {
++    auto [pid, depth] = stack.back();
++    stack.pop_back();
++    auto a = args.find(pid);
++    // The terminal runs the agent itself: any shell under it with -c is a
++    // command it started (Meridian's own hooks and status line aside).
++    if (depth >= 1 && a != args.end() && !a->second.empty()) {
++      std::string exe = base::FilePath(a->second[0]).BaseName().value();
++      if (exe.starts_with("-")) {
++        exe = exe.substr(1);
++      }
++      bool shell = exe == "sh" || exe == "bash" || exe == "zsh" ||
++                   exe == "dash" || exe == "fish";
++      bool dash_c = std::ranges::find(a->second, "-c") != a->second.end() ||
++                    std::ranges::find(a->second, "-lc") != a->second.end();
++      std::string line = base::JoinString(a->second, " ");
++      if (shell && dash_c && line.find("claude") == std::string::npos &&
++          line.find("codex") == std::string::npos &&
++          line.find("--mission-hook") == std::string::npos &&
++          line.find("--secret-guard") == std::string::npos &&
++          line.find("--permission-hook") == std::string::npos) {
++        ++count;
++        continue;  // its own children are part of the same task
++      }
++    }
++    auto c = children.find(pid);
++    if (c != children.end() && depth < 12) {
++      for (int child : c->second) {
++        stack.emplace_back(child, depth + 1);
++      }
++    }
++  }
++  return count;
++}
++
++}  // namespace
++
++void WorkbenchHandler::CountBackgroundTasks() {
++  std::map<std::string, int> roots;
++  for (const auto& [id, term] : terms_) {
++    if (!term.mission_node.empty() && term.container.empty() &&
++        term.terminal && term.exited.is_none()) {
++      roots[id] = term.terminal->pid();
++    }
++  }
++  if (roots.empty()) {
++    return;
++  }
++  tabs::TabInterface* tab =
++      tabs::TabInterface::MaybeGetFromContents(web_ui()->GetWebContents());
++  const int owner = tab ? tab->GetHandle().raw_value() : 0;
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::BEST_EFFORT},
++      base::BindOnce(
++          [](std::map<std::string, int> roots) {
++            std::map<std::string, int> counts;
++#if !BUILDFLAG(IS_WIN)
++            std::map<int, std::vector<int>> children;
++            std::map<int, std::vector<std::string>> args;
++            base::ProcessIterator it(nullptr);
++            while (const base::ProcessEntry* e = it.NextProcessEntry()) {
++              children[e->parent_pid()].push_back(e->pid());
++              args[e->pid()] = e->cmd_line_args();
++            }
++            for (const auto& [id, pid] : roots) {
++              counts[id] = BackgroundShells(pid, children, args);
++            }
++#endif
++            return counts;
++          },
++          std::move(roots)),
++      base::BindOnce(
++          [](base::WeakPtr<WorkbenchHandler> self, int owner,
++             std::map<std::string, int> counts) {
++            if (!self) {
++              return;
++            }
++            if (mission::MissionControl* mission =
++                    mission::MissionControlFactory::GetForProfile(
++                        self->profile_)) {
++              mission->SetBackgroundTasks(owner, counts);
++            }
++          },
++          weak_factory_.GetWeakPtr(), owner));
++}
++
+ void WorkbenchHandler::OnMissionChanged(const base::DictValue& snapshot) {
+   // The counts for the topbar chip.
+   base::DictValue counts = snapshot.FindDict("counts")->Clone();
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.h b/chrome/browser/meridian/workbench/workbench_handler.h
+index 71de36e2dc..24bf98cecd 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.h
++++ b/chrome/browser/meridian/workbench/workbench_handler.h
+@@ -177,6 +177,9 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+   base::SequenceBound<base::FilePathWatcher> watcher_;
+   std::set<std::string> changed_;
+   base::OneShotTimer flush_;
++  // Counts the agents' background commands for Mission Control.
++  base::RepeatingTimer background_timer_;
++  void CountBackgroundTasks();
+   std::map<std::string, Term> terms_;
+   // Context Insights, by transcript: each read on where the last one stopped.
+   std::map<std::string, std::unique_ptr<ContextInsights>> insights_;
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index e417335161..d93526f398 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -47,6 +47,8 @@ build_webui("build") {
+     "meridian/chat.ts",
+     "meridian/mission.html.ts",
+     "meridian/mission.ts",
++    "meridian/ai_consent.html.ts",
++    "meridian/ai_consent.ts",
+     "meridian/update_sheet.html.ts",
+     "meridian/update_sheet.ts",
+     "meridian/archive.ts",
+@@ -110,6 +112,7 @@ build_webui("build") {
+     "meridian/boost_editor.css",
+     "meridian/chat.css",
+     "meridian/mission.css",
++    "meridian/ai_consent.css",
+     "meridian/update_sheet.css",
+     "meridian/command_bar.css",
+     "meridian/home.css",
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index f8ccf7af1d..a2b3a4c3b4 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -171,6 +171,9 @@ export function getHtml(this: WebuiBrowserAppElement) {
+       @meridian-update-confirm="${this.onMeridianUpdateConfirm_}"
+       @meridian-open-url="${this.onMeridianOpenUrl_}">
+   </meridian-settings>
++  <meridian-ai-consent id="aiConsent"
++      @meridian-show-settings="${this.onMeridianShowSettings_}">
++  </meridian-ai-consent>
+   <meridian-update-sheet id="updateSheet"
+       @meridian-open-url="${this.onMeridianOpenUrl_}">
+   </meridian-update-sheet>
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 3b809070ca..c4de721bea 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -22,6 +22,7 @@ import './meridian/ask.js';
+ import './meridian/tidy.js';
+ import './meridian/chat.js';
+ import './meridian/mission.js';
++import './meridian/ai_consent.js';
+ import './meridian/update_sheet.js';
+ import './meridian/site_control.js';
+ import './meridian/boost_editor.js';
+diff --git a/chrome/browser/resources/webui_browser/meridian/ai_consent.css b/chrome/browser/resources/webui_browser/meridian/ai_consent.css
+new file mode 100644
+index 0000000000..6048b57c59
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/ai_consent.css
+@@ -0,0 +1,110 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #scheme=relative
++ * #css_wrapper_metadata_end */
++
++:host {
++  position: fixed;
++  inset: 0;
++  z-index: 70;
++  display: none;
++  color: var(--meridian-text);
++  font-size: 13px;
++}
++
++:host([open]) {
++  display: block;
++}
++
++#overlay {
++  position: absolute;
++  inset: 0;
++  display: flex;
++  justify-content: center;
++  align-items: center;
++  background: var(--meridian-overlay);
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
++}
++
++#card {
++  width: min(520px, 92vw);
++  max-height: min(420px, 84vh);
++  display: flex;
++  flex-direction: column;
++  border-radius: 14px;
++  background: var(--meridian-surface);
++  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35),
++    0 0 0 0.5px var(--meridian-border);
++  overflow: hidden;
++  outline: none;
++}
++
++header {
++  display: flex;
++  gap: 12px;
++  align-items: center;
++  padding: 18px 20px 6px;
++}
++
++.badge {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  width: 36px;
++  height: 36px;
++  flex: none;
++  border-radius: 10px;
++  color: var(--meridian-space);
++  background: color-mix(in srgb, var(--meridian-space) 14%, transparent);
++}
++
++#title {
++  font-size: 15px;
++  font-weight: 600;
++}
++
++p {
++  margin: 6px 20px;
++  line-height: 1.5;
++}
++
++.muted {
++  color: var(--meridian-text-muted);
++  font-size: 12px;
++}
++
++.choices {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 8px;
++  padding: 14px 20px 18px;
++}
++
++.btn {
++  height: 28px;
++  padding: 0 14px;
++  border: 0;
++  border-radius: 8px;
++  font: inherit;
++  font-weight: 550;
++  color: var(--meridian-text);
++  background: color-mix(in srgb, var(--meridian-text) 8%, transparent);
++  cursor: pointer;
++}
++
++.btn.primary {
++  color: white;
++  background: var(--meridian-space);
++}
++
++.btn.quiet {
++  margin-left: auto;
++  background: none;
++  color: var(--meridian-text-muted);
++}
++
+diff --git a/chrome/browser/resources/webui_browser/meridian/ai_consent.html.ts b/chrome/browser/resources/webui_browser/meridian/ai_consent.html.ts
+new file mode 100644
+index 0000000000..c96f2f4f94
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/ai_consent.html.ts
+@@ -0,0 +1,38 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {MeridianAiConsentElement} from './ai_consent.js';
++import {icon} from './icons.js';
++
++export function getHtml(this: MeridianAiConsentElement) {
++  return html`<!--_html_template_start_-->
++<div id="overlay" @keydown="${this.onKeydown_}">
++  <div id="card" role="alertdialog" aria-labelledby="title" tabindex="-1">
++    <header>
++      <span class="badge">${icon('sparkles', 18)}</span>
++      <div id="title">This goes to <b id="to">${this.to_}</b></div>
++    </header>
++    <p>Meridian's AI features send what you ask, and the page or tabs they
++      work with, to this service on the internet. Nothing has been sent yet.
++    </p>
++    <p class="muted">Choose once: Meridian remembers it. You can change it in
++      Settings › AI.</p>
++    <div class="choices">
++      <button id="send" class="btn primary" @click="${this.onSendClick_}">
++        Send</button>
++      <button id="always" class="btn" @click="${this.onAlwaysClick_}">
++        Always send, don't ask</button>
++      <button id="other" class="btn" @click="${this.onOtherClick_}">
++        Use another AI…</button>
++      <button id="off" class="btn" @click="${this.onOffClick_}">
++        Turn AI features off</button>
++      <button id="cancel" class="btn quiet" @click="${this.onCancelClick_}">
++        Cancel</button>
++    </div>
++  </div>
++</div>
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/ai_consent.ts b/chrome/browser/resources/webui_browser/meridian/ai_consent.ts
+new file mode 100644
+index 0000000000..f4c71ca129
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/ai_consent.ts
+@@ -0,0 +1,122 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Before an AI feature (⌘J, Tidy, Improve with AI, link previews…) sends
++// anything to an AI service on the internet, Meridian says where it goes and
++// the person decides: send (and don't ask again this run), always send, pick
++// another AI, or turn the AI features off. Nothing leaves before an answer.
++
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {browserProxyFactory} from '../sidebar.mojom-webui.js';
++
++import {getCss} from './ai_consent.css.js';
++import {getHtml} from './ai_consent.html.js';
++
++interface Question {
++  to: string;
++  answer: (choice: string) => void;
++}
++
++export class MeridianAiConsentElement extends CrLitElement {
++  static get is() {
++    return 'meridian-ai-consent';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      open: {type: Boolean, reflect: true},
++      to_: {state: true, type: String},
++    };
++  }
++
++  accessor open: boolean = false;
++  protected accessor to_: string = '';
++
++  private question_: Question|null = null;
++  private listener_: number|null = null;
++
++  override connectedCallback() {
++    super.connectedCallback();
++    const router = browserProxyFactory.getInstance().callbackRouter;
++    this.listener_ = router.askAiConsent.addListener(
++        (to: string) => new Promise<{choice: string}>(resolve => {
++          // A question still open: the new one gets the same answer.
++          if (this.question_) {
++            const earlier = this.question_.answer;
++            this.question_.answer = (choice: string) => {
++              earlier(choice);
++              resolve({choice});
++            };
++            return;
++          }
++          this.question_ = {to, answer: (choice) => resolve({choice})};
++          this.to_ = to;
++          this.open = true;
++          this.updateComplete.then(
++              () => this.shadowRoot.querySelector<HTMLElement>('#cancel')
++                        ?.focus());
++        }));
++  }
++
++  override disconnectedCallback() {
++    super.disconnectedCallback();
++    if (this.listener_ !== null) {
++      browserProxyFactory.getInstance().callbackRouter.removeListener(
++          this.listener_);
++      this.listener_ = null;
++    }
++  }
++
++  private answer_(choice: string) {
++    const q = this.question_;
++    this.question_ = null;
++    this.open = false;
++    q?.answer(choice);
++  }
++
++  protected onSendClick_() {
++    this.answer_('send');
++  }
++
++  protected onAlwaysClick_() {
++    this.answer_('always');
++  }
++
++  protected onOtherClick_() {
++    this.answer_('other');
++    this.fire('meridian-show-settings', 'ai');
++  }
++
++  protected onOffClick_() {
++    this.answer_('off');
++  }
++
++  protected onCancelClick_() {
++    this.answer_('cancel');
++  }
++
++  protected onKeydown_(e: KeyboardEvent) {
++    if (e.key === 'Escape') {
++      e.preventDefault();
++      this.answer_('cancel');
++    }
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-ai-consent': MeridianAiConsentElement;
++  }
++}
++
++customElements.define(MeridianAiConsentElement.is, MeridianAiConsentElement);
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index 6403010087..ee0aadbf81 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -558,6 +558,35 @@ export function getHtml(this: MeridianSettingsElement) {
+               </div>
+             </div>
+           </div>
++          <div class="group">
++            <h2>Online AI</h2>
++            <div class="card">
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Before sending to an online AI</div>
++                  <div class="row-desc">⌘J, Tidy, Improve with AI and link
++                    previews send what you ask, and the page or tabs, to the
++                    AI service picked above. Ask: Meridian says where it goes
++                    first (once per launch). Models on this computer are never
++                    asked about.</div>
++                </div>
++                <div class="segmented">
++                  <button id="aiConsentAsk"
++                      class="seg ${!this.settings_.aiConsent ? 'on' : ''}"
++                      data-name="aiConsent" data-value=""
++                      @click="${this.onSegmentClick_}">Ask</button>
++                  <button id="aiConsentAlways"
++                      class="seg ${this.settings_.aiConsent === 'always' ? 'on' : ''}"
++                      data-name="aiConsent" data-value="always"
++                      @click="${this.onSegmentClick_}">Don't ask</button>
++                  <button id="aiConsentOff"
++                      class="seg ${this.settings_.aiConsent === 'off' ? 'on' : ''}"
++                      data-name="aiConsent" data-value="off"
++                      @click="${this.onSegmentClick_}">AI off</button>
++                </div>
++              </div>
++            </div>
++          </div>
+           <div class="group">
+             <h2>Agents</h2>
+             <div class="card">
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index c95050532f..363eb627b7 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -709,6 +709,8 @@ export class MeridianSettingsElement extends CrLitElement {
+       this.save_({agentAccess: value});
+     } else if (name === 'uploads') {
+       this.save_({agentUploads: value});
++    } else if (name === 'aiConsent') {
++      this.save_({aiConsent: value});
+     }
+   }
+ 
+diff --git a/tools/gritsettings/resource_ids.spec b/tools/gritsettings/resource_ids.spec
+index 263476b76d..515ba4f64b 100644
+--- a/tools/gritsettings/resource_ids.spec
++++ b/tools/gritsettings/resource_ids.spec
+@@ -904,7 +904,7 @@
+     "includes": [5230],
+   },
+   "<(SHARED_INTERMEDIATE_DIR)/chrome/browser/resources/webui_browser/resources.grd": {
+-    "META": {"sizes": {"includes": [120]}},
++    "META": {"sizes": {"includes": [160]}},
+     "includes": [5250],
+   },
+   "<(SHARED_INTERMEDIATE_DIR)/chrome/browser/resources/webui_browser/internal/resources.grd": {

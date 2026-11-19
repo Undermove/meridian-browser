@@ -104,6 +104,12 @@ test('Mission Control: every space’s agents, grouped by space, named by their 
     assert.deepEqual(groups, [home.name, 'Work']);
     const rows = await b.eval(`[...${MC}.querySelectorAll('#tree .row')].map((r) => [r.querySelector('.label').textContent, r.querySelector('.ctx')?.textContent.trim()])`);
     assert.deepEqual(rows, [['Fix the login bug', '50%'], ['Write the release notes', '70%']]);
+    // MERIDIAN_SHOTS=<folder>: a picture for the changelog.
+    if (process.env.MERIDIAN_SHOTS) {
+      await b.click(`${MC}.querySelectorAll('#tree .row')[0]`);
+      await sleep(400);
+      await b.screenshot(path.join(process.env.MERIDIAN_SHOTS, 'mission-spaces.png'));
+    }
 
     // Work's chip, clicked: only Work's session; the others are a click away.
     await b.click(`[...${MC}.querySelectorAll('#spaces .space')].find((c) => c.textContent.includes('Work'))`);

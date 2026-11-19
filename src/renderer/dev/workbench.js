@@ -100,6 +100,40 @@ function askText(title, value = '', hint = '') {
   });
 }
 
+// Where each agent sends your prompts and the project's files. Before the first start (once per
+// Workbench, or never again after "Always start"), the person decides.
+const AGENT_DESTINATION = {
+  claude: 'Anthropic (Claude)', codex: 'OpenAI (Codex)', gemini: 'Google (Gemini)', copilot: 'GitHub (Copilot)',
+  cursor: 'Anysphere (Cursor)', qwen: 'Alibaba (Qwen)', amp: 'Sourcegraph (Amp)', droid: 'Factory (Droid)',
+  goose: 'the AI service Goose is set up with', opencode: 'the AI service OpenCode is set up with',
+};
+const agentConsentGiven = new Set();
+async function agentConsent(kind) {
+  const base = String(kind).replace(/^sandbox-/, '');
+  const to = AGENT_DESTINATION[base];
+  if (!to || agentConsentGiven.has(base)) return true;
+  let state = '';
+  try { state = typeof wb.aiConsent === 'function' ? await wb.aiConsent() : 'always'; } catch {}
+  if (state === 'always') return true;
+  const label = AGENT_UI[kind]?.label || base;
+  return new Promise((resolve) => {
+    modal(`<h3>${esc(label)} sends what you type and the project's files to ${esc(to)}</h3>
+      <p>Nothing has been sent yet. Choose once: Meridian remembers it (Settings › AI).</p>
+      <div class="modal-actions"><button class="btn" data-a="cancel">Cancel</button><button class="btn" data-a="always">Always start, don't ask</button><button class="btn accent" data-a="ok">Start</button></div>`, (m, close) => {
+      setTimeout(() => $('[data-a="cancel"]', m).focus(), 0);
+      const done = (a) => {
+        close();
+        if (a === 'ok' || a === 'always') agentConsentGiven.add(base);
+        if (a === 'always') wb.setAiConsent?.('always').catch(() => {});
+        resolve(a === 'ok' || a === 'always');
+      };
+      m.addEventListener('click', (e) => { const a = e.target.closest('[data-a]')?.dataset.a; if (a) done(a); });
+      m.addEventListener('keydown', (e) => { if (e.key === 'Escape') done('cancel'); });
+      $('#modal-overlay').addEventListener('dismiss', () => resolve(false), { once: true });
+    });
+  });
+}
+
 function confirmBox(title, detail, okLabel = 'OK', danger = false) {
   return new Promise((resolve) => {
     modal(`<h3>${esc(title)}</h3>${detail ? `<p>${esc(detail)}</p>` : ''}
@@ -1055,6 +1089,8 @@ function mountTerm(info) {
 async function launch(kind, { resume = false, resumeId, resumeMode, name } = {}) {
   if (!S.project) { toast('Open a project first'); return null; }
   if (S.info?.terminals === false) { toast(`Terminals are unavailable: ${S.info.terminalError || ''}`, 5000); return null; }
+  // Where it sends what you type, said first (not for a session reopened after a restart).
+  if (!resumeId && !(await agentConsent(kind))) return null;
   // Workbench Pro: a sandbox gets only the vault secrets picked for this session.
   let secrets;
   if (String(kind).startsWith('sandbox-') && typeof proPickSandboxSecrets === 'function') {
@@ -1241,7 +1277,7 @@ function resumeButton(className) {
   const mark = agentMark('claude');
   mark.textContent = '↻';
   const label = document.createElement('span');
-  label.textContent = 'Resume a session…';
+  label.textContent = 'Resume Claude Code…';
   b.append(mark, label);
   b.title = 'Pick up a recent Claude Code session in this project';
   b.addEventListener('click', () => launch('claude', { resume: true }));

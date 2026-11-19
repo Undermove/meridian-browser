@@ -163,6 +163,16 @@ test('ask: every action is put to the person; read-only refuses changes; off has
     await b.click(`${AG}.getElementById('allow')`);
     assert.equal((await allowed).value.title, 'Form');
     assert.match((await mcp.call('run_javascript', { code: '1' })).error, /JavaScript is off/);
+    // Always allow: this one is allowed, and the next ones aren't asked (full control, as in Settings).
+    const always = mcp.call('open_tab', { url: s.url('/') });
+    await b.waitFor(`!!${AG}.getElementById('ask')`);
+    await sleep(700);
+    await b.click(`${AG}.getElementById('always')`);
+    assert.equal((await always).error, null);
+    await b.waitFor(`app.$.tabstrip.handler_.getSettings().then((r) => r.settings.agentAccess === 'full')`);
+    const quiet = mcp.call('open_tab', { url: s.url('/form') });
+    assert.equal((await quiet).error, null);
+    assert.equal(await b.eval(`!!${AG}.getElementById('ask')`), false, 'not asked again');
   } finally { mcp.close(); await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 
   const off = profileWith({ agent_access: 'off' });
