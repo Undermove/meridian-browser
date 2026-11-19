@@ -96,6 +96,9 @@ test('Updates on Windows: a newer release’s installer is downloaded and checke
     await b.waitFor(`${SB}.getElementById('updateBanner')?.textContent.includes('Restart to update to 9.9.9')`);
     assert.equal(fs.existsSync(target), false, 'nothing is handed over before the restart');
     await b.click(`${SB}.getElementById('updateBanner')`);
+    // It asks first (what's new): Restart now.
+    await b.waitFor(`app.$.updateSheet.open`);
+    await b.click(`app.$.updateSheet.shadowRoot.getElementById('restart')`);
     for (let i = 0; i < 100 && b.proc.exitCode === null && b.proc.signalCode === null; i++) await sleep(150);
     assert.ok(b.proc.exitCode !== null || b.proc.signalCode !== null, 'Meridian quit');
     for (let i = 0; i < 100 && !fs.existsSync(target); i++) await sleep(100);
