@@ -1,0 +1,200 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 19 Nov 2026 22:06:14 +0400
+Subject: [PATCH 188/189] Meridian: Chrome's extensions come over; sign-ins
+ Chrome locked to itself are said so
+
+The Web Store extensions of each Chrome profile are added to its Meridian
+profile on import, as Arc's are. Chrome on Windows keeps its cookies under
+App-Bound Encryption (v20), which no other program can read: the import says
+so ("app-bound") and brings the saved passwords and cards all the same.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/arc_import.cc         | 17 ++++++++++---
+ chrome/browser/meridian/arc_import.h          |  3 +++
+ chrome/browser/meridian/arc_logins.cc         | 25 ++++++++++++++++---
+ chrome/browser/meridian/sidebar_handler.cc    | 10 ++++----
+ chrome/browser/meridian/sidebar_handler.h     |  3 ++-
+ .../webui_browser/meridian/onboarding.ts      |  2 ++
+ 6 files changed, 47 insertions(+), 13 deletions(-)
+
+diff --git a/chrome/browser/meridian/arc_import.cc b/chrome/browser/meridian/arc_import.cc
+index 763ed972ba..e1dd71fb3b 100644
+--- a/chrome/browser/meridian/arc_import.cc
++++ b/chrome/browser/meridian/arc_import.cc
+@@ -421,21 +421,30 @@ std::vector<ArcExtension> ReadArcExtensions() {
+ }
+ 
+ std::vector<ArcExtension> ReadArcExtensionsIn(const base::FilePath& arc_dir) {
++  ImportSource source = ArcSource();
++  source.user_data = arc_dir.AppendASCII("User Data");
++  return ReadExtensionsOf(source);
++}
++
++std::vector<ArcExtension> ReadExtensionsOf(const ImportSource& source) {
+   std::vector<ArcExtension> out;
+-  base::FilePath user_data = arc_dir.AppendASCII("User Data");
+-  base::FileEnumerator profiles(user_data, false,
++  if (source.user_data.empty()) {
++    return out;
++  }
++  base::FileEnumerator profiles(source.user_data, false,
+                                 base::FileEnumerator::DIRECTORIES);
+   std::vector<base::FilePath> dirs;
+   for (base::FilePath dir = profiles.Next(); !dir.empty();
+        dir = profiles.Next()) {
+     const std::string name = dir.BaseName().AsUTF8Unsafe();
+-    if (name == "Default" || name.starts_with("Profile ")) {
++    if (IsProfileDir(name)) {
+       dirs.push_back(dir);
+     }
+   }
+   std::ranges::sort(dirs);
+   for (const base::FilePath& profile : dirs) {
+-    const std::string profile_id = ProfileIdForArcDir(profile.BaseName().AsUTF8Unsafe());
++    const std::string profile_id =
++        ProfileIdFor(source, profile.BaseName().AsUTF8Unsafe());
+     std::set<std::string> seen;
+     base::FileEnumerator ids(profile.AppendASCII("Extensions"), false,
+                              base::FileEnumerator::DIRECTORIES);
+diff --git a/chrome/browser/meridian/arc_import.h b/chrome/browser/meridian/arc_import.h
+index ad33823d7a..f5e989fc03 100644
+--- a/chrome/browser/meridian/arc_import.h
++++ b/chrome/browser/meridian/arc_import.h
+@@ -73,6 +73,9 @@ struct ArcExtension {
+ // per profile, by name; themes and Arc's own are left out. Blocking (file
+ // IO).
+ std::vector<ArcExtension> ReadArcExtensions();
++struct ImportSource;
++// Another Chromium browser's (Google Chrome's) Web Store extensions.
++std::vector<ArcExtension> ReadExtensionsOf(const ImportSource& source);
+ // The same in another Arc data folder.
+ std::vector<ArcExtension> ReadArcExtensionsIn(const base::FilePath& arc_dir);
+ 
+diff --git a/chrome/browser/meridian/arc_logins.cc b/chrome/browser/meridian/arc_logins.cc
+index f9f9eaccaf..9cb08ecfd5 100644
+--- a/chrome/browser/meridian/arc_logins.cc
++++ b/chrome/browser/meridian/arc_logins.cc
+@@ -259,7 +259,8 @@ bool ReadProfile(const base::FilePath& db_file,
+                  std::set<std::tuple<std::string, std::string, std::string>>&
+                      seen,
+                  std::vector<net::CanonicalCookie>& cookies,
+-                 int& failed) {
++                 int& failed,
++                 int& app_bound) {
+   base::ScopedTempDir tmp;
+   sql::Database db(sql::Database::Tag("Cookie"));
+   if (!OpenCopy(db_file, tmp, db) || !db.DoesTableExist("cookies")) {
+@@ -313,6 +314,11 @@ bool ReadProfile(const base::FilePath& db_file,
+           Decrypt(enc, key, r.host_key, version);
+       if (!value) {
+         ++failed;
++        // Chrome on Windows locks its cookies to itself (App-Bound
++        // Encryption): no other program can read them.
++        if (enc.size() > 3 && enc[0] == 'v' && enc[1] == '2' && enc[2] == '0') {
++          ++app_bound;
++        }
+         continue;
+       }
+       r.value = std::move(*value);
+@@ -557,11 +563,13 @@ ReadResult ReadArc(ImportSource source, bool with_cookies) {
+   std::map<std::string, std::set<std::u16string>> seen_cards;
+   bool any = false;
+   [[maybe_unused]] bool cookies_unread = false;
++  int app_bound = 0;
+   for (const ArcProfile& p : profiles) {
+     std::string target = ProfileIdFor(source, p.dir);
+     if (with_cookies && !p.cookies.empty()) {
+       bool read = ReadProfile(p.cookies, key, seen[target],
+-                              out.cookies[target], out.result.failed);
++                              out.cookies[target], out.result.failed,
++                              app_bound);
+       any |= read;
+       cookies_unread |= !read;
+     }
+@@ -595,6 +603,15 @@ ReadResult ReadArc(ImportSource source, bool with_cookies) {
+     out.result.error = "busy";
+   }
+ #endif
++  // Every sign-in was locked to the browser (Chrome on Windows): say so; its
++  // passwords and cards came over all the same.
++  size_t cookies = 0;
++  for (const auto& [id, list] : out.cookies) {
++    cookies += list.size();
++  }
++  if (app_bound > 0 && cookies == 0) {
++    out.result.error = "app-bound";
++  }
+   return out;
+ }
+ 
+@@ -820,7 +837,9 @@ void WriteTo(scoped_refptr<Writer> writer,
+ void Write(base::WeakPtr<Profile> profile,
+            base::OnceCallback<void(ArcLoginsResult)> done,
+            ReadResult read) {
+-  if (!profile || !read.result.error.empty() ||
++  // (Sign-ins locked to the browser: its passwords and cards still come.)
++  if (!profile ||
++      (!read.result.error.empty() && read.result.error != "app-bound") ||
+       (read.cookies.empty() && read.passwords.empty() && read.cards.empty())) {
+     if (read.result.error.empty()) {
+       read.result.error = "no-data";
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 0c2058f2a5..5beda24d6d 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -2068,9 +2068,7 @@ void SidebarHandler::OnArcRead(std::string kind,
+       ->SetBoolean(kind == "chrome" ? prefs::kChromeImported
+                                     : prefs::kArcImported,
+                    true);
+-  if (kind != "chrome") {
+-    AddArcExtensions(/*again=*/true);
+-  }
++  AddArcExtensions(/*again=*/true, kind);
+   ActivateSpace(service_->active_space_id());
+   ScheduleNotify();
+   std::move(callback).Run(true);
+@@ -3013,10 +3011,12 @@ Profile* SidebarHandler::ActiveSpaceProfile() {
+   return space ? LoadSpaceProfile(main, space->profile) : main;
+ }
+ 
+-void SidebarHandler::AddArcExtensions(bool again) {
++void SidebarHandler::AddArcExtensions(bool again, const std::string& kind) {
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+-      base::BindOnce(&ReadArcExtensions),
++      kind == "chrome"
++          ? base::BindOnce([] { return ReadExtensionsOf(ChromeSource()); })
++          : base::BindOnce(&ReadArcExtensions),
+       base::BindOnce(&SidebarHandler::OnArcExtensionsRead,
+                      weak_factory_.GetWeakPtr(), again));
+ }
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index cf2ac26288..b652b2e0c1 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -326,7 +326,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+   // `again`: the person asked for the import themselves, so the extensions
+   // of Arc profiles that were already gone through are added too (ones
+   // installed in Arc since, or that didn't arrive the first time).
+-  void AddArcExtensions(bool again);
++  // `kind`: the browser to bring them from ("arc", "chrome").
++  void AddArcExtensions(bool again, const std::string& kind = "arc");
+   void OnArcExtensionsRead(bool again, std::vector<ArcExtension> found);
+   // The profile of the space shown.
+   Profile* ActiveSpaceProfile();
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+index 1fdb75bc30..3f2926ce98 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+@@ -400,6 +400,8 @@ export class MeridianOnboardingElement extends CrLitElement {
+       const name = this.sourceName_;
+       this.note_ = error === 'denied' ?
+           `Sign-ins weren’t brought over. You can try again from File > Import from ${name}.` :
++          error === 'app-bound' ?
++          `${name} keeps its sign-ins locked to itself on Windows, so sign in to your sites once more${more.length ? ` (${more.join(', ')} came over)` : ''}.` :
+           error === 'busy' ?
+           `Sign-ins weren’t brought over: ${name} is open. Quit ${name}, then try again from File > Import from ${name}.` :
+           error ? `${name}’s sign-ins couldn’t be read.` :
