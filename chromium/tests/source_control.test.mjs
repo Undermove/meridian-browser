@@ -69,6 +69,12 @@ test('Source Control: changes, a diff, stage, commit, discard, push, pull reques
     await wb.waitFor(`!document.getElementById('diff-pane')?.hidden && !!S.diffEditor?.getModel()`);
     assert.deepEqual(await wb.eval(`[S.diffEditor.getModel().original.getValue(), S.diffEditor.getModel().modified.getValue()]`), ['one\ntwo\nthree\n', 'one\nTWO\nthree\n']);
     await wb.waitFor(`S.diffEditor.getLineChanges()?.length === 1`, 5000);
+    // MERIDIAN_SHOTS=<folder>: a picture for the changelog.
+    if (process.env.MERIDIAN_SHOTS) {
+      await sleep(600);
+      const { data } = await wb.cdp.send('Page.captureScreenshot', { format: 'png' });
+      fs.writeFileSync(path.join(process.env.MERIDIAN_SHOTS, 'source-control.png'), Buffer.from(data, 'base64'));
+    }
 
     // Stage app.txt (its + on hover), then commit it with a message: notes.md stays a change.
     await mouse(wb, `${row('app.txt')}.querySelector('.stage')`, { hoverFirst: row('app.txt') });
