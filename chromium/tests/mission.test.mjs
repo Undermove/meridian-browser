@@ -22,7 +22,13 @@ cwd = os.getcwd()
 def hook(event, **fields):
     for entry in settings['hooks'].get(event, []):
         for h in entry['hooks']:
-            subprocess.run(h['command'], shell=True, input=json.dumps(dict(hook_event_name=event, session_id='s1', cwd=cwd, **fields)), text=True)
+            data = json.dumps(dict(hook_event_name=event, session_id='s1', cwd=cwd, **fields))
+            # Claude Code asks in the terminal while its PermissionRequest hooks run: it doesn't wait for them.
+            if event == 'PermissionRequest':
+                p = subprocess.Popen(h['command'], shell=True, stdin=subprocess.PIPE, text=True, stdout=subprocess.DEVNULL)
+                p.stdin.write(data); p.stdin.close()
+            else:
+                subprocess.run(h['command'], shell=True, input=data, text=True)
 hook('SessionStart', model='claude-opus-5-5', source='startup')
 hook('UserPromptSubmit')
 hook('PreToolUse', tool_name='Bash', tool_use_id='t1', tool_input={'command': 'ANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123 npm test'})
