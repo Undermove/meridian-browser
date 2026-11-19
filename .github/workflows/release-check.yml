@@ -1,8 +1,11 @@
 name: Release check
 
 # Every published release, on a clean Mac: install it the way people do (install.sh), check the
-# checksum and the signature, and run the whole E2E suite against the installed app. If anything
-# fails, the release goes back to pre-release (so 0.4.x users aren't offered it) and an issue opens.
+# checksum and the signature and that the in-app updater takes it; if any of that fails, the release
+# goes back to pre-release (so nobody is offered a release that can't install) and an issue opens.
+# Then the E2E suite against the installed app: it reports (an issue) but doesn't change the release,
+# since a shared CI Mac can't run all of it (no display, no keychain, network) and it failed there on
+# every release, putting good releases back to pre-release.
 
 on:
   release:
@@ -55,14 +58,21 @@ jobs:
           mkdir -p "$RUNNER_TEMP/rel"
           gh release download "$TAG" -R "${{ github.repository }}" -D "$RUNNER_TEMP/rel" -p 'SHA256SUMS.txt*' -p 'Meridian-*-mac-arm64.zip'
           node chromium/tools/verify_release.mjs "$RUNNER_TEMP/rel/SHA256SUMS.txt" "$RUNNER_TEMP/rel/SHA256SUMS.txt.sig" "$RUNNER_TEMP"/rel/Meridian-*-mac-arm64.zip
-      - name: E2E tests against the installed app
-        run: |
-          cd chromium/tests
-          MERIDIAN_APP="$RUNNER_TEMP/apps/Meridian.app/Contents/MacOS/Meridian" \
-            node --test --test-force-exit --test-concurrency=1 --test-timeout=120000 ${{ inputs.tests || '*.test.mjs' }}
       - name: Take the release back to pre-release
         if: failure()
         run: |
           gh release edit "$TAG" --prerelease
           gh issue create --title "Release check failed for $TAG" \
-            --body "The release was set back to pre-release. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            --body "It doesn't install, isn't signed, or the updater won't take it: the release was set back to pre-release. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      - name: E2E tests against the installed app
+        id: e2e
+        continue-on-error: true
+        run: |
+          cd chromium/tests
+          MERIDIAN_APP="$RUNNER_TEMP/apps/Meridian.app/Contents/MacOS/Meridian" \
+            node --test --test-force-exit --test-concurrency=1 --test-timeout=120000 ${{ inputs.tests || '*.test.mjs' }}
+      - name: Report E2E failures (the release stays as it is)
+        if: steps.e2e.outcome == 'failure'
+        run: |
+          gh issue create --title "E2E on CI failed for $TAG" \
+            --body "The release itself installs and updates (it stays published). Some E2E tests failed on the CI Mac: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
