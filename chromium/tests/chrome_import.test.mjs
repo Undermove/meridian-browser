@@ -163,6 +163,13 @@ test('Chrome’s extensions, saved passwords and history come over too', async (
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
     assert.equal((await b.eval(`${H}.importArc('chrome')`)).ok, true);
+    // Passwords, then history.
+    const pw = await b.eval(`${H}.importArcPasswords('chrome')`);
+    assert.equal(pw.error, '');
+    assert.equal(pw.imported, 1);
+    const { result } = await b.eval(`${H}.importArcData('chrome')`);
+    assert.equal(result.error, '');
+    assert.ok(result.history >= 1, `history: ${JSON.stringify(result)}`);
     // The extension, from the (test) Web Store: it runs on pages.
     await b.eval(`app.$.tabstrip.openUrl(${JSON.stringify(url('/marked'))})`);
     let marked = false;
@@ -175,13 +182,6 @@ test('Chrome’s extensions, saved passwords and history come over too', async (
       } catch {}
     }
     assert.ok(marked, `Chrome's extension runs: asked ${JSON.stringify(web.asked)}`);
-    // Passwords, then history.
-    const pw = await b.eval(`${H}.importArcPasswords('chrome')`);
-    assert.equal(pw.error, '');
-    assert.equal(pw.imported, 1);
-    const { result } = await b.eval(`${H}.importArcData('chrome')`);
-    assert.equal(result.error, '');
-    assert.ok(result.history >= 1, `history: ${JSON.stringify(result)}`);
   } finally { await b.close(); server.close(); web.close(); fs.rmSync(chrome, { recursive: true, force: true }); fs.rmSync(tmp, { recursive: true, force: true }); }
 });
 

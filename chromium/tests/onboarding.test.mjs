@@ -16,7 +16,8 @@ const C = { welcomeTour: 11, importArc: 12 };
 test('without Arc: hello → a setup from the apps → preview → links → done, once', async () => {
   const noArc = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-noarc-'));
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
-  const args = ['--meridian-onboarding', `--meridian-arc-dir=${noArc}`, '--lang=en-US'];
+  // (No Chrome either: the tour would offer to move in from it.)
+  const args = ['--meridian-onboarding', `--meridian-arc-dir=${noArc}`, `--meridian-chrome-dir=${noArc}`, '--lang=en-US'];
   let b = await launch(['about:blank'], { profile, args });
   try {
     await b.waitFor(`${step} === 'hello'`);
