@@ -7,7 +7,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
-import { launch, APP, SB } from './harness.mjs';
+import { launch, APP, SB, FOREGROUND } from './harness.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const AG = 'app.$.agent.shadowRoot';
@@ -324,6 +324,39 @@ test('a frozen background tab answers the agent; a page that never answers is an
     assert.match(read.error || '', /didn't answer within 20 seconds/, JSON.stringify(read).slice(0, 300));
     assert.ok(Date.now() - t1 < 30000, `read_page gave up in ${Date.now() - t1} ms`);
   } finally { mcp.close(); await b.close(); s.server.close(); busy.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
+// A covered or minimized window: the tab the agent works in is drawn and "visible" to its page
+// (screenshots, lists that draw on scroll, date pickers); some time after its last call, hidden again.
+test('the agent\'s tab in a minimized window is visible and drawn while the agent works in it', async () => {
+  const s = await site();
+  const profile = profileWith({ agent_access: 'full', agent_allow_js: true });
+  const b = await launch([s.url('/')], { profile, args: ['--meridian-test-agent-awake-seconds=6'] });
+  const mcp = bridge(profile);
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { protocolVersion: '2025-06-18', clientInfo: { name: 'test-client', version: '1' }, capabilities: {} });
+    const { tab_id } = (await mcp.call('open_tab', { url: s.url('/form') })).value;
+    const page = await b.page(s.url('/form'));
+    await page.waitFor(`!!document.getElementById('name')`);
+    // The window minimized.
+    const { windowId } = await page.cdp.send('Browser.getWindowForTarget');
+    await page.cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } });
+    await sleep(1500);
+    const js = async (code) => { const r = await mcp.call('run_javascript', { tab_id, code }); assert.ok(!r.error, r.error); return r.value; };
+    assert.equal(await js('document.visibilityState'), 'visible');
+    const frames = await js('return await new Promise((r) => { let n = 0; const f = () => (++n < 5 ? requestAnimationFrame(f) : r(n)); requestAnimationFrame(f); setTimeout(() => r(n), 3000); })');
+    assert.equal(frames, 5, 'requestAnimationFrame ticks');
+    // A screenshot of it: one frame of a video capture (as Chrome's tab previews). Only with a real
+    // screen: in background mode (windows see-through) nothing draws a tab that isn't shown.
+    if (FOREGROUND) {
+      const shot = await mcp.call('screenshot', { tab_id });
+      assert.ok(!shot.error, `the screenshot: ${shot.error}`);
+    }
+    // After the agent stops: hidden again.
+    await page.waitFor(`document.visibilityState === 'hidden'`, 20000);
+  } finally { mcp.close(); await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
 
 // The page's own dialogs: an agent sees them (list_tabs pending_dialog), gets an error at once from
