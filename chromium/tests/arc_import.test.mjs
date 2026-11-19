@@ -27,13 +27,13 @@ test('Arc import: preview, then spaces, pins, folders, favorites and Today', asy
   const b = await launch(['about:blank'], { args: [`--meridian-arc-dir=${arcDir}`] });
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-    const { preview } = await b.eval(`${H}.getArcPreview()`);
+    const { preview } = await b.eval(`${H}.getArcPreview('arc')`);
     assert.deepEqual(
       { s: preview.spaceCount, p: preview.pinnedCount, t: preview.todayCount, f: preview.favoriteCount },
       { s: 2, p: 3, t: 2, f: 3 });
     assert.deepEqual(preview.spaces.map((s) => [s.name, s.icon, s.color]), [['Work', '💼', '#ff8000'], ['Home', '', '']]);
 
-    assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
+    assert.equal((await b.eval(`${H}.importArc('arc')`)).ok, true);
     await b.waitFor(`app.$.tabstrip.state_.spaces.map((s) => s.name).join() === 'Work,Home'`);
     // The untouched first space made way for Arc's; Work is shown.
     await b.waitFor(`${SB}.querySelector('.space-name')?.textContent === 'Work'`);
@@ -92,18 +92,18 @@ test('Arc logins: cookies come over, so sites stay signed in; Deny imports nothi
     let b = await launch(['about:blank'], { args: [`--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=__deny__'] });
     try {
       await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-      assert.equal((await b.eval(`${H}.getArcPreview()`)).preview.loginsAvailable, true);
-      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 0, passwords: 0, cards: 0, error: 'denied' });
+      assert.equal((await b.eval(`${H}.getArcPreview('arc')`)).preview.loginsAvailable, true);
+      assert.deepEqual(await b.eval(`${H}.importArcLogins('arc')`), { imported: 0, passwords: 0, cards: 0, error: 'denied' });
     } finally { await b.close(); }
 
     b = await launch(['about:blank'], { args: [`--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=test-pass'] });
     try {
       await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 2, passwords: 0, cards: 0, error: '' });
+      assert.deepEqual(await b.eval(`${H}.importArcLogins('arc')`), { imported: 2, passwords: 0, cards: 0, error: '' });
       await b.eval(`app.$.tabstrip.tabStripService_.createTabAt(null, 'http://127.0.0.1:${port}/')`);
       await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'cookie:sid=signed-in')`);
       // The sidebar after the sign-ins: Home (Arc's Profile 2) has that profile's cookie.
-      assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
+      assert.equal((await b.eval(`${H}.importArc('arc')`)).ok, true);
       const home = (await b.eval(`${H}.getState().then(({state}) => state)`)).spaces.find((s) => s.name === 'Home');
       await b.eval(`${H}.activateSpace(${JSON.stringify(home.id)})`);
       // In this window, its tabs in Arc's Profile 2's Meridian profile.
@@ -198,8 +198,8 @@ test('a space of another Arc profile is signed in as that profile: its pinned, o
     let b = await launch(['about:blank'], { profile, args });
     try {
       await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-      assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
-      assert.deepEqual(await b.eval(`${H}.importArcLogins()`), { imported: 2, passwords: 0, cards: 0, error: '' });
+      assert.equal((await b.eval(`${H}.importArc('arc')`)).ok, true);
+      assert.deepEqual(await b.eval(`${H}.importArcLogins('arc')`), { imported: 2, passwords: 0, cards: 0, error: '' });
       assert.deepEqual(await homeCookies(b, s.u), WORK);
       await b.quit();
     } finally { await b.close(); }
@@ -224,8 +224,8 @@ test('tabs 0.5.13 put in the main profile move to their space\'s profile, unarch
     b.invariants = false;
     try {
       await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-      assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
-      await b.eval(`${H}.importArcLogins()`);
+      assert.equal((await b.eval(`${H}.importArc('arc')`)).ok, true);
+      await b.eval(`${H}.importArcLogins('arc')`);
       const before = await homeCookies(b, s.u);
       assert.equal(before.pinned, 'sid=personal', '0.5.13 made the mistake');
       await new Promise((r) => setTimeout(r, 2000));
@@ -337,7 +337,7 @@ for (const imported of ['now', 'by 0.5.13']) {
         const old = await launch(['about:blank'], { profile, args, app: OLD });
         try {
           await old.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-          assert.equal((await old.eval(`${H}.importArc()`)).ok, true);
+          assert.equal((await old.eval(`${H}.importArc('arc')`)).ok, true);
           await old.quit();
         } finally { await old.close(); }
       }
@@ -346,7 +346,7 @@ for (const imported of ['now', 'by 0.5.13']) {
         await b.waitFor(`app.$.tabstrip.state_?.spaces.length >= 1`);
         if (imported === 'now') {
           await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-          assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
+          assert.equal((await b.eval(`${H}.importArc('arc')`)).ok, true);
         }
         const spaces = (await b.eval(`${H}.getState().then(({state}) => state)`)).spaces;
         const inSpace = async (name, page) => {
@@ -395,7 +395,7 @@ test('the site controls show the shown space\'s extensions; a click opens its po
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-    assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
+    assert.equal((await b.eval(`${H}.importArc('arc')`)).ok, true);
     const spaces = (await b.eval(`${H}.getState().then(({state}) => state)`)).spaces;
     const main = spaces.find((x) => !x.profileId);
     const home = spaces.find((x) => x.name === 'Home');
@@ -520,7 +520,7 @@ test('Arc\'s saved passwords come over from Settings, each into its space\'s pro
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
     // Arc's spaces came in earlier (without its sign-ins).
-    assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
+    assert.equal((await b.eval(`${H}.importArc('arc')`)).ok, true);
     const press = async () => {
       await b.eval(`app.$.tabstrip.runCommand(13, 0)`);  // Meridian > Settings
       await b.waitFor(`app.$.settings.open && !!${ST}.getElementById('importArcPasswords')`);
@@ -825,7 +825,7 @@ test('the rest of Arc comes over from Settings: history, form entries, an addres
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
     // Arc's spaces came in earlier, without the rest.
-    assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
+    assert.equal((await b.eval(`${H}.importArc('arc')`)).ok, true);
     const press = async (button, note) => {
       await b.eval(`app.$.tabstrip.runCommand(13, 0)`);  // Meridian > Settings
       await b.waitFor(`app.$.settings.open && !!${ST}.getElementById('${button}')`);
@@ -966,7 +966,7 @@ test('the sites\' icons come from Arc: pinned and open tabs show them without lo
   const rowIcon = (title) => `(() => { const all = []; const walk = (root) => { for (const el of root.querySelectorAll('meridian-item')) { all.push(el); walk(el.shadowRoot); } }; walk(${SB}); const it = all.find((el) => el.item.title === ${JSON.stringify(title)}); return it?.shadowRoot.querySelector('img')?.src || ''; })()`;
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-    assert.equal((await b.eval(`${H}.importArc()`)).ok, true);
+    assert.equal((await b.eval(`${H}.importArc('arc')`)).ok, true);
     const home = (await b.eval(`${H}.getState().then(({state}) => state)`)).spaces.find((x) => x.name === 'Home');
     await b.eval(`${H}.activateSpace(${JSON.stringify(home.id)})`);
     await b.waitFor(`app.$.tabstrip.state_.profileId === 'Meridian Profile Arc 2'`);
