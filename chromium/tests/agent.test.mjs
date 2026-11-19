@@ -325,3 +325,90 @@ test('a frozen background tab answers the agent; a page that never answers is an
     assert.ok(Date.now() - t1 < 30000, `read_page gave up in ${Date.now() - t1} ms`);
   } finally { mcp.close(); await b.close(); s.server.close(); busy.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
+
+// The page's own dialogs: an agent sees them (list_tabs pending_dialog), gets an error at once from
+// a tab whose page waits for one (it used to hang), and answers them with handle_dialog: alert,
+// confirm (OK / Cancel), prompt (with its text), "Leave site?" (stay / leave), and one in a tab in
+// the background (a report from the promotion session, 19.11.2026).
+test('page dialogs: pending_dialog in list_tabs, an error instead of a hang, handle_dialog answers each', async () => {
+  const pages = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    if (req.url === '/dialogs') res.end('<title>Dialogs</title><textarea id=t></textarea><script>addEventListener("beforeunload", (e) => { if (document.getElementById("t").value) { e.preventDefault(); e.returnValue = ""; } });</script>');
+    else res.end('<title>Elsewhere</title><p>Elsewhere</p>');
+  });
+  await new Promise((r) => pages.listen(0, '127.0.0.1', r));
+  const url = (p) => `http://127.0.0.1:${pages.address().port}${p}`;
+  const profile = profileWith({ agent_access: 'full' });
+  const b = await launch([url('/dialogs')], { profile });
+  const mcp = bridge(profile);
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { protocolVersion: '2025-06-18', clientInfo: { name: 'test-client', version: '1' }, capabilities: {} });
+    const page = await b.page(url('/dialogs'));
+    const tabs = async () => (await mcp.call('list_tabs')).value;
+    const tabId = (await tabs()).find((t) => t.url === url('/dialogs')).id;
+    const dialogOf = async () => (await tabs()).find((t) => t.id === tabId)?.pending_dialog;
+    const waitDialog = async (type) => { for (let i = 0; i < 40; i++) { const d = await dialogOf(); if (d?.type === type) return d; await sleep(150); } throw new Error(`no ${type} dialog`); };
+    // The page opens one (from a timer, as pages do).
+    const open = (js) => page.cdp.send('Runtime.evaluate', { expression: `setTimeout(() => { ${js} }, 0); 1` });
+    const title = () => page.eval('document.title');
+
+    // alert: seen, and the tab answers nothing else meanwhile: an error at once, not a hang.
+    await open(`alert('Saved!'); document.title = 'after alert'`);
+    const alert = await waitDialog('alert');
+    assert.equal(alert.message, 'Saved!');
+    assert.deepEqual(alert.buttons, ['OK (accept)']);
+    const t0 = Date.now();
+    const blocked = await mcp.call('read_page', { tab_id: tabId });
+    assert.match(blocked.error || '', /open alert dialog: "Saved!".*handle_dialog/);
+    assert.ok(Date.now() - t0 < 3000, `at once: ${Date.now() - t0} ms`);
+    assert.deepEqual((await mcp.call('handle_dialog', { tab_id: tabId, action: 'accept' })).value, { handled: true, type: 'alert', accepted: true });
+    await page.waitFor(`document.title === 'after alert'`);
+    assert.equal(await dialogOf(), undefined);
+
+    // confirm: Cancel, then OK.
+    await open(`document.title = 'confirm:' + confirm('Delete it?')`);
+    assert.equal((await waitDialog('confirm')).message, 'Delete it?');
+    await mcp.call('handle_dialog', { tab_id: tabId, action: 'dismiss' });
+    await page.waitFor(`document.title === 'confirm:false'`);
+    await open(`document.title = 'confirm:' + confirm('Delete it?')`);
+    await waitDialog('confirm');
+    await mcp.call('handle_dialog', { tab_id: tabId, action: 'accept' });
+    await page.waitFor(`document.title === 'confirm:true'`);
+
+    // prompt: with the agent's text.
+    await open(`document.title = 'prompt:' + prompt('Your name?', 'Anon')`);
+    const p = await waitDialog('prompt');
+    assert.equal(p.default_text, 'Anon');
+    assert.equal((await mcp.call('handle_dialog', { tab_id: tabId, action: 'accept', prompt_text: 'Ada' })).value.text, 'Ada');
+    await page.waitFor(`document.title === 'prompt:Ada'`);
+
+    // "Leave site?": unsaved text (typed by a person, so the page may ask), then the agent navigates.
+    await page.eval(`document.getElementById('t').focus(), true`);
+    await page.cdp.send('Input.insertText', { text: 'a draft' });
+    const going = mcp.call('navigate', { tab_id: tabId, url: url('/elsewhere') });
+    const leave = await waitDialog('beforeunload');
+    assert.deepEqual(leave.buttons, ['Leave (accept)', 'Cancel (dismiss)']);
+    await mcp.call('handle_dialog', { tab_id: tabId, action: 'dismiss' });
+    await going;
+    await sleep(500);
+    assert.equal((await tabs()).find((t) => t.id === tabId).url, url('/dialogs'), 'stayed');
+    const again = mcp.call('navigate', { tab_id: tabId, url: url('/elsewhere') });
+    await waitDialog('beforeunload');
+    await mcp.call('handle_dialog', { tab_id: tabId, action: 'accept' });
+    await again;
+    for (let i = 0; i < 40 && (await tabs()).find((t) => t.id === tabId).url !== url('/elsewhere'); i++) await sleep(150);
+    assert.equal((await tabs()).find((t) => t.id === tabId).url, url('/elsewhere'), 'left');
+
+    // In a tab in the background: the dialog waits there; the agent answers it all the same.
+    const front = (await mcp.call('open_tab', { url: url('/front'), activate: true })).value;
+    assert.ok(front.tab_id);
+    await page.cdp.send('Runtime.evaluate', { expression: `setTimeout(() => { document.title = 'bg:' + prompt('Code?', '1234') }, 0); 1` });
+    await waitDialog('prompt');
+    assert.equal((await mcp.call('handle_dialog', { tab_id: tabId, action: 'accept' })).value.text, '1234');
+    await page.waitFor(`document.title === 'bg:1234'`);
+    // No dialog: said so.
+    assert.match((await mcp.call('handle_dialog', { tab_id: tabId, action: 'accept' })).error || '', /no open dialog/);
+  } finally { mcp.close(); await b.close(); pages.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
