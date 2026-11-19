@@ -7,11 +7,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { launch, SB } from './harness.mjs';
+import { launch, SB, NEEDS_SCREEN } from './harness.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
-test('a playing video goes picture-in-picture when its tab is left, and back when it is shown', async () => {
+test('a playing video goes picture-in-picture when its tab is left, and back when it is shown', { skip: NEEDS_SCREEN }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-autopip-'));
   fs.copyFileSync(path.join(here, 'fixtures', 'tone.webm'), path.join(dir, 'tone.webm'));
   fs.writeFileSync(path.join(dir, 'video.html'), '<!doctype html><title>Video</title><video id="v" src="tone.webm" autoplay loop width="320"></video>');

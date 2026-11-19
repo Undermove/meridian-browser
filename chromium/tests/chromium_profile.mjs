@@ -27,7 +27,7 @@ export function packExtension(dir, name, { popup = false } = {}) {
   const id = [...hash].map((c) => String.fromCharCode(97 + parseInt(c, 16))).join('');
   const udd = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-pack-'));
   try {
-    execFileSync(APP, [`--user-data-dir=${udd}`, `--pack-extension=${src}`, `--pack-extension-key=${pem}`, '--no-message-box'], { stdio: 'ignore', timeout: 60000 });
+    execFileSync(APP, [`--user-data-dir=${udd}`, `--pack-extension=${src}`, `--pack-extension-key=${pem}`, '--no-message-box', ...(process.platform === 'darwin' ? ['--meridian-test-background'] : [])], { stdio: 'ignore', timeout: 60000 });
   } finally { fs.rmSync(udd, { recursive: true, force: true }); }
   return { id, crx: fs.readFileSync(`${src}.crx`) };
 }

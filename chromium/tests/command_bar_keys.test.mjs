@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { launch, SB } from './harness.mjs';
+import { launch, SB, NEEDS_SCREEN } from './harness.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const CMD = 1 << 20;
@@ -201,7 +201,7 @@ test('a space of another profile: ⌘T suggests from that profile\'s history onl
   } finally { await b.close(); s.close(); }
 });
 
-test('macOS full screen: ⌘T, the arrows, Return and Esc work the same', async () => {
+test('macOS full screen: ⌘T, the arrows, Return and Esc work the same', { skip: NEEDS_SCREEN }, async () => {
   const { b, s, press, state } = await start(['One', 'Two', 'Three']);
   try {
     await b.eval(`app.$.tabstrip.handler_.testCommand(34030)`);  // IDC_FULLSCREEN

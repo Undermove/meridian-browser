@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { launch, SB } from './harness.mjs';
+import { launch, SB, NEEDS_SCREEN } from './harness.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const T = 'app.$.tabstrip';
@@ -55,7 +55,7 @@ const KEYS = {
 };
 
 for (const fullscreen of [false, true]) {
-  test(`a player that keeps every key doesn't keep the tab and space shortcuts${fullscreen ? ', in macOS full screen' : ''}`, async () => {
+  test(`a player that keeps every key doesn't keep the tab and space shortcuts${fullscreen ? ', in macOS full screen' : ''}`, { skip: fullscreen && NEEDS_SCREEN }, async () => {
     const s = await sites();
     // Full screen needs the window treated as focused (a test window behind another app isn't).
     const b = await launch([s.url('A'), s.url('B'), s.url('C')], {

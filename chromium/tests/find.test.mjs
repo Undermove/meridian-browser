@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { launch, SB } from './harness.mjs';
+import { launch, SB, FOREGROUND } from './harness.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const CMD = 1 << 20;
@@ -98,10 +98,12 @@ test('⌘F finds on the page, over the page, in any profile and with the sidebar
     await b.waitFor(`app.$.contentRegion.getBoundingClientRect().left < 40`);
     await findNeedle(b, press, '/work');
 
-    // macOS full screen (its own Space).
-    await press(KEY.s, CMD);
-    await b.eval(`${T}.handler_.testCommand(34030)`);  // IDC_FULLSCREEN
-    await sleep(2500);
-    await findNeedle(b, press, '/work');
+    // macOS full screen (its own Space): only with a window on screen.
+    if (FOREGROUND) {
+      await press(KEY.s, CMD);
+      await b.eval(`${T}.handler_.testCommand(34030)`);  // IDC_FULLSCREEN
+      await sleep(2500);
+      await findNeedle(b, press, '/work');
+    }
   } finally { await b.close(); s.close(); }
 });

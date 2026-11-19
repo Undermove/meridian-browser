@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { launch } from './harness.mjs';
+import { launch, NEEDS_SCREEN } from './harness.mjs';
 
 const T = 'app.$.tabstrip';
 const PAGE = `<!doctype html><title>Player</title><button id=b>PiP</button><script>
@@ -20,7 +20,7 @@ document.getElementById('b').onclick = async () => {
 </script>`;
 
 for (const own of [false, true]) {
-  test(`a page opens a document picture-in-picture window${own ? ' from a space of another profile' : ''}`, async () => {
+  test(`a page opens a document picture-in-picture window${own ? ' from a space of another profile' : ''}`, { skip: NEEDS_SCREEN }, async () => {
     const s = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(PAGE); });
     await new Promise((r) => s.listen(0, '127.0.0.1', r));
     const url = `http://127.0.0.1:${s.address().port}/player`;
