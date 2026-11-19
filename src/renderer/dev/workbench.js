@@ -1061,7 +1061,9 @@ function mountTerm(info) {
   // The title the program sets (OSC 0/2): Claude Code names it after the session, with a spinner or
   // ✳ in front; a shell, after the folder or the command running.
   xterm.onTitleChange((title) => {
-    const clean = String(title).replace(/^[^\p{L}\p{N}~/.]+/u, '').trim().slice(0, 80);
+    let clean = String(title).replace(/^[^\p{L}\p{N}~/.]+/u, '').trim().slice(0, 80);
+    // On Windows a program that sets no title has its own path as one (ConPTY): that's no name.
+    if (/^([a-z]:\\|\\\\)[^\n]*\.exe$/i.test(clean)) clean = '';
     if (clean === t.auto) return;
     t.auto = clean;
     renderTermTabs();
