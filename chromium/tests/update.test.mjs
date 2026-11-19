@@ -15,6 +15,9 @@ import path from 'node:path';
 import { launch, SB } from './harness.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// The release's notes on GitHub (Markdown), shown before restarting.
+const NOTES = '# Meridian 9.9.9\n\n## New\n- **Mission Control** shows every space\n- Context Insights\n\n## Fixed\n- A crash on Lens';
+const US = 'app.$.updateSheet.shadowRoot';
 const S = { upToDate: 2, available: 3, ready: 5, failed: 6 };
 const ZIP = 'Meridian-9.9.9-mac-arm64.zip';
 // The stand-in release key; Meridian gets its public half (raw, base64).
@@ -49,7 +52,7 @@ async function release({ tag = 'v9.9.9', badSum = false, badSig = false, appVers
     const base = `http://127.0.0.1:${s.address().port}`;
     if (req.url === '/feed') {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ tag_name: tag, html_url: `${base}/page`, assets: [
+      res.end(JSON.stringify({ tag_name: tag, html_url: `${base}/page`, body: NOTES, assets: [
         { name: ZIP.replace('.zip', '.dmg'), browser_download_url: `${base}/dmg` },
         { name: ZIP, browser_download_url: `${base}/zip` },
         { name: 'SHA256SUMS.txt', browser_download_url: `${base}/sums` },
@@ -103,13 +106,29 @@ test('Updates: a newer release is checked and unpacked; Restart to update swaps 
     await b.waitFor(`app.$.settings.shadowRoot.getElementById('updateText')?.textContent.includes('Meridian 9.9.9 is ready')`);
     assert.ok(await b.eval(`!!app.$.settings.shadowRoot.getElementById('restartUpdate')`));
     await b.eval('app.$.settings.open = false');
-    // The sidebar's pill: Meridian quits and the app is swapped.
+    // The sidebar's pill asks first: what's new, Restart now or Later.
     await b.waitFor(`${SB}.getElementById('updateBanner')?.textContent.includes('Restart to update to 9.9.9')`);
     await b.click(`${SB}.getElementById('updateBanner')`);
+    await b.waitFor(`app.$.updateSheet.open`);
+    assert.match(await b.eval(`${US}.getElementById('title').textContent`), /Meridian 9\.9\.9 is ready/);
+    assert.deepEqual(await b.eval(`[...${US}.querySelectorAll('#notes li')].map((e) => e.textContent.trim())`),
+      ['Mission Control shows every space', 'Context Insights', 'A crash on Lens']);
+    assert.equal(await b.eval(`${US}.querySelectorAll('#notes strong, #notes b').length`), 1, 'Markdown, rendered');
+    // Later: nothing happens.
+    await b.click(`${US}.getElementById('later')`);
+    await b.waitFor(`!app.$.updateSheet.open`);
+    await sleep(500);
+    assert.ok(b.proc.exitCode === null && b.proc.signalCode === null, 'Meridian still runs');
+    // Again, Restart now: Meridian quits and the app is swapped.
+    await b.click(`${SB}.getElementById('updateBanner')`);
+    await b.waitFor(`app.$.updateSheet.open`);
+    await b.click(`${US}.getElementById('restart')`);
     for (let i = 0; i < 100 && b.proc.exitCode === null && b.proc.signalCode === null; i++) await sleep(150);
     assert.ok(b.proc.exitCode !== null || b.proc.signalCode !== null, 'Meridian quit');
     for (let i = 0; i < 50 && fs.readFileSync(path.join(installed, 'Contents', 'version'), 'utf8') !== 'new'; i++) await sleep(100);
     assert.equal(fs.readFileSync(path.join(installed, 'Contents', 'version'), 'utf8'), 'new');
+    // The old copy goes a moment after the new one is in place.
+    for (let i = 0; i < 50 && fs.existsSync(installed + '.previous'); i++) await sleep(100);
     assert.equal(fs.existsSync(installed + '.previous'), false);
     assert.match(fs.readFileSync(path.join(b.profile, 'Meridian Update', 'swap.log'), 'utf8'), /updated/);
   } finally {

@@ -772,7 +772,8 @@ function proLauncherExtras(bar) {
 
 async function sandboxMenu(anchor) {
   const st = await refreshSandbox(true);
-  anchor = $('#sandbox-btn') || anchor;
+  // The button itself, unless it's in the top bar's More menu.
+  anchor = ($('#sandbox-btn')?.offsetParent && $('#sandbox-btn')) || anchor;
   if (!st || !st.installed) {
     popover(anchor, `<h3>Run agents in a sandbox</h3>
       <p>Install OrbStack or Docker Desktop to run Claude Code, Codex or a shell in a container that only sees this project — no home folder, no SSH keys, no Docker socket.</p>

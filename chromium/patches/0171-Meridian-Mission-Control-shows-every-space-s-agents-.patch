@@ -1,0 +1,1049 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 19 Nov 2026 13:56:29 +0400
+Subject: [PATCH 172/173] Meridian: Mission Control shows every space's agents,
+ by space, under their sessions' names
+
+One Mission Control for the main profile and its spaces' profiles (a
+Workbench in a space with its own profile reported to a Mission Control no
+window showed). Each session shows under the name on its Workbench tab (the
+session's name, or one given by hand) with the agent and model below, its
+space and its context used; chips filter by space (remembered), all spaces
+are grouped by space. Context Insights opens from a session's details. Every
+agent in the Workbench shows (OpenCode and the others without live status).
+A Workbench only takes its own terminals' numbers (terminal ids repeat across
+Workbench tabs).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/mission/mission_control.cc       |  96 +++++++--
+ .../meridian/mission/mission_control.h        |  11 +-
+ .../mission/mission_control_factory.cc        |   6 +-
+ .../mission/mission_control_factory.h         |   3 +-
+ chrome/browser/meridian/sidebar.mojom         |   3 +-
+ chrome/browser/meridian/sidebar_handler.cc    |  42 +++-
+ chrome/browser/meridian/sidebar_handler.h     |   4 +
+ .../meridian/workbench/workbench_handler.cc   |  49 ++++-
+ .../meridian/workbench/workbench_handler.h    |   3 +-
+ chrome/browser/resources/webui_browser/app.ts |   9 +-
+ .../webui_browser/meridian/mission.css        | 115 +++++++++++
+ .../webui_browser/meridian/mission.html.ts    |  41 +++-
+ .../webui_browser/meridian/mission.ts         | 192 +++++++++++++++++-
+ .../webui_browser/meridian/sidebar.ts         |   4 +-
+ 14 files changed, 534 insertions(+), 44 deletions(-)
+
+diff --git a/chrome/browser/meridian/mission/mission_control.cc b/chrome/browser/meridian/mission/mission_control.cc
+index cc304bd867..72ef8a67ca 100644
+--- a/chrome/browser/meridian/mission/mission_control.cc
++++ b/chrome/browser/meridian/mission/mission_control.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/meridian/mission/mission_control.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <utility>
+ 
+ #include "base/command_line.h"
+@@ -18,11 +19,13 @@
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/thread_pool.h"
++#include "chrome/browser/browser_process.h"
+ #include "chrome/browser/meridian/mission/event_channel.h"
+ #include "chrome/browser/meridian/mission/mission_platform.h"
+ #include "chrome/browser/meridian/mission/secrets.h"
+ #include "chrome/browser/meridian/prefs.h"
+ #include "chrome/browser/meridian/private_file.h"
++#include "chrome/browser/meridian/space_profiles.h"
+ #include "chrome/browser/meridian/workbench/sandbox.h"
+ #include "chrome/browser/meridian/workbench/vault.h"
+ #include "chrome/browser/meridian/workbench/workbench_source.h"
+@@ -31,6 +34,7 @@
+ #include "chrome/browser/notifications/notification_display_service.h"
+ #include "chrome/browser/notifications/notification_display_service_factory.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_manager.h"
+ #include "components/prefs/pref_service.h"
+ #include "crypto/hash.h"
+ #include "third_party/re2/src/re2/re2.h"
+@@ -296,13 +300,21 @@ MissionControl::Registration MissionControl::RegisterTerminal(
+   node.kind = "session";
+   node.source = kind;
+   node.where = sandbox ? "sandbox" : "local";
+-  node.label = kind == "claude"  ? "Claude Code"
+-               : kind == "codex" ? "Codex"
+-               : kind == "gemini" ? "Gemini"
+-                                  : kind;
++  static constexpr auto kNames = std::to_array<std::pair<const char*, const char*>>({
++      {"claude", "Claude Code"}, {"codex", "Codex"}, {"gemini", "Gemini"},
++      {"opencode", "OpenCode"}, {"copilot", "Copilot"}, {"cursor", "Cursor"},
++      {"qwen", "Qwen Code"}, {"amp", "Amp"}, {"goose", "Goose"},
++      {"droid", "Droid"}});
++  node.label = kind;
++  for (const auto& [id, name] : kNames) {
++    if (kind == id) {
++      node.label = name;
++    }
++  }
+   node.project = Clean(project, 60);
+   node.status = "starting";
+-  if (kind == "gemini") {
++  // Only Claude Code and Codex report what they do.
++  if (kind != "claude" && kind != "codex") {
+     node.status_text = "Running · no live status";
+   }
+   out.node_id = node.id;
+@@ -378,9 +390,11 @@ std::string MissionControl::CodexNotifyArg() const {
+   return "notify=[" + json(exe) + ", \"--mission-hook\", \"--codex\"]";
+ }
+ 
+-std::string MissionControl::TranscriptOf(const std::string& term_id) const {
++std::string MissionControl::TranscriptOf(int owner_tab,
++                                         const std::string& term_id) const {
+   for (const auto& [id, n] : nodes_) {
+-    if (n.term_id == term_id && n.kind == "session" && !n.transcript.empty()) {
++    if (n.owner_tab == owner_tab && n.term_id == term_id &&
++        n.kind == "session" && !n.transcript.empty()) {
+       return n.transcript;
+     }
+   }
+@@ -400,6 +414,37 @@ void MissionControl::AttachTerminal(const std::string& node_id,
+   Changed();
+ }
+ 
++// Under a session's own name: the agent and its model ("Claude Code ·
++// claude-opus-5-5").
++std::string MissionControl::AgentLine(const Node& n) {
++  return n.sublabel.empty() || n.sublabel == n.label
++             ? n.label
++             : n.label + " · " + n.sublabel;
++}
++
++void MissionControl::SetTerminalNames(
++    int owner_tab,
++    const std::map<std::string, std::string>& names) {
++  bool changed = false;
++  for (auto& [id, node] : nodes_) {
++    if (node.owner_tab != owner_tab || node.term_id.empty()) {
++      continue;
++    }
++    auto it = names.find(node.term_id);
++    if (it == names.end()) {
++      continue;
++    }
++    std::string name = Clean(it->second, 80);
++    if (name != node.display_name) {
++      node.display_name = std::move(name);
++      changed = true;
++    }
++  }
++  if (changed) {
++    Changed();
++  }
++}
++
+ void MissionControl::TerminalInput(const std::string& node_id,
+                                    const std::string& data) {
+   Node* node = Get(node_id);
+@@ -974,8 +1019,13 @@ void MissionControl::Archive(const std::string& root_id) {
+   base::ListValue next;
+   next.Append(base::DictValue()
+                   .Set("id", copy.id)
+-                  .Set("label", copy.label)
+-                  .Set("sublabel", OptString(copy.sublabel))
++                  .Set("label", copy.display_name.empty()
++                                    ? copy.label
++                                    : copy.display_name)
++                  // The agent (Claude Code, Codex…) under a session's name.
++                  .Set("sublabel", copy.display_name.empty()
++                                       ? OptString(copy.sublabel)
++                                       : base::Value(AgentLine(copy)))
+                   .Set("source", copy.source)
+                   .Set("where", copy.where)
+                   .Set("project", OptString(copy.project))
+@@ -1079,8 +1129,11 @@ base::DictValue MissionControl::Snapshot() const {
+             .Set("kind", n.kind)
+             .Set("source", n.source)
+             .Set("where", n.where)
+-            .Set("label", n.label)
+-            .Set("sublabel", OptString(n.sublabel))
++            .Set("label", n.display_name.empty() ? n.label : n.display_name)
++            .Set("sublabel", n.display_name.empty()
++                                 ? OptString(n.sublabel)
++                                 : base::Value(AgentLine(n)))
++            .Set("ownerTab", n.owner_tab)
+             .Set("project", OptString(n.project))
+             .Set("status", n.status)
+             .Set("statusText", OptString(n.status_text))
+@@ -1188,11 +1241,24 @@ void MissionControl::NotifyWaiting(Node& node) {
+ 
+ std::vector<NamedSecret> MissionControl::SecretValues() const {
+   // Exact vault values become their names in summaries.
++  // The vaults of the main profile and of its spaces' (one Mission Control
++  // serves them all).
+   std::vector<NamedSecret> out;
+-  if (workbench::WorkbenchService* workbench =
+-          workbench::WorkbenchServiceFactory::GetForProfile(profile_)) {
+-    for (auto& [name, value] : workbench->vault().AllValues()) {
+-      out.push_back({name, value});
++  std::vector<Profile*> profiles = {profile_.get()};
++  if (g_browser_process && g_browser_process->profile_manager()) {
++    for (Profile* p :
++         g_browser_process->profile_manager()->GetLoadedProfiles()) {
++      if (p != profile_ && !p->IsOffTheRecord() && IsSpaceProfile(p)) {
++        profiles.push_back(p);
++      }
++    }
++  }
++  for (Profile* p : profiles) {
++    if (workbench::WorkbenchService* workbench =
++            workbench::WorkbenchServiceFactory::GetForProfile(p)) {
++      for (auto& [name, value] : workbench->vault().AllValues()) {
++        out.push_back({name, value});
++      }
+     }
+   }
+   return out;
+diff --git a/chrome/browser/meridian/mission/mission_control.h b/chrome/browser/meridian/mission/mission_control.h
+index 8602dce67e..8285d7e5b2 100644
+--- a/chrome/browser/meridian/mission/mission_control.h
++++ b/chrome/browser/meridian/mission/mission_control.h
+@@ -84,7 +84,7 @@ class MissionControl : public KeyedService,
+   void WhenChannelReady(base::OnceClosure ready);
+   // The transcript of the Claude Code session in Workbench terminal
+   // `term_id`, from its status line ("" until known).
+-  std::string TranscriptOf(const std::string& term_id) const;
++  std::string TranscriptOf(int owner_tab, const std::string& term_id) const;
+   // `owner_tab`: the Workbench tab's handle id (to open its terminal).
+   Registration RegisterTerminal(const std::string& kind,
+                                 const std::string& project,
+@@ -111,6 +111,10 @@ class MissionControl : public KeyedService,
+   // Codex's `-c notify=[…]` value.
+   std::string CodexNotifyArg() const;
+   void AttachTerminal(const std::string& node_id, const std::string& term_id);
++  // The names the Workbench in tab `owner_tab` shows on its terminals' tabs
++  // (terminal id -> name).
++  void SetTerminalNames(int owner_tab,
++                        const std::map<std::string, std::string>& names);
+   // Enter in an agent's terminal (Codex has no per-tool hooks).
+   void TerminalInput(const std::string& node_id, const std::string& data);
+   void TerminalExit(const std::string& token,
+@@ -192,6 +196,9 @@ class MissionControl : public KeyedService,
+     double waiting_since = 0;
+     std::vector<LogEntry> log;
+     std::string term_id;
++    // The name the Workbench shows on the terminal's tab (the session's name,
++    // or one given by hand); the label when set.
++    std::string display_name;
+     int owner_tab = 0;
+     std::string tab_id;
+     std::string agent_id;
+@@ -216,6 +223,8 @@ class MissionControl : public KeyedService,
+     // The main session's permission mode, as its hooks last reported it.
+     std::string permission_mode;
+   };
++  // Under a session's own name: the agent and its model.
++  static std::string AgentLine(const Node& n);
+ 
+   Node* AddNode(Node node);
+   Node* Get(const std::string& id);
+diff --git a/chrome/browser/meridian/mission/mission_control_factory.cc b/chrome/browser/meridian/mission/mission_control_factory.cc
+index 609620d8d1..f9dfff5e86 100644
+--- a/chrome/browser/meridian/mission/mission_control_factory.cc
++++ b/chrome/browser/meridian/mission/mission_control_factory.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/meridian/mission/mission_control_factory.h"
+ 
+ #include "chrome/browser/meridian/mission/mission_control.h"
++#include "chrome/browser/meridian/space_profiles.h"
+ #include "chrome/browser/meridian/workbench/workbench_service_factory.h"
+ #include "chrome/browser/notifications/notification_display_service_factory.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -13,7 +14,10 @@ namespace meridian::mission {
+ 
+ MissionControl* MissionControlFactory::GetForProfile(Profile* profile) {
+   return static_cast<MissionControl*>(
+-      GetInstance()->GetServiceForBrowserContext(profile, /*create=*/true));
++      // One for the main profile and its spaces' profiles: a Workbench in any
++      // space reports to the Mission Control every window shows.
++      GetInstance()->GetServiceForBrowserContext(MainProfileFor(profile),
++                                                 /*create=*/true));
+ }
+ 
+ MissionControlFactory* MissionControlFactory::GetInstance() {
+diff --git a/chrome/browser/meridian/mission/mission_control_factory.h b/chrome/browser/meridian/mission/mission_control_factory.h
+index bab53b8e30..42602f488d 100644
+--- a/chrome/browser/meridian/mission/mission_control_factory.h
++++ b/chrome/browser/meridian/mission/mission_control_factory.h
+@@ -14,7 +14,8 @@ namespace meridian::mission {
+ 
+ class MissionControl;
+ 
+-// One Mission Control per regular profile (none in private windows).
++// One Mission Control for the main profile and its spaces' profiles (none in
++// private windows).
+ class MissionControlFactory : public ProfileKeyedServiceFactory {
+  public:
+   static MissionControl* GetForProfile(Profile* profile);
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index f688b2de47..af99a132a5 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -752,7 +752,8 @@ interface SidebarHandler {
+   // session, clearing the history.
+   GetMissionState() => (string snapshot_json);
+   // Opens where a session works: its Workbench tab, on its terminal.
+-  RevealMissionNode(string id) => (bool found);
++  // `panel`: "insights" opens the session's Context Insights there.
++  RevealMissionNode(string id, string panel) => (bool found);
+   DismissMission(string id);
+   ClearMissionHistory();
+   // Claude proposes folders and shorter titles for these Today tabs; nothing
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 4bc07ccd31..7350873236 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -579,9 +579,38 @@ bool SidebarHandler::PinTabContents(content::WebContents* contents,
+   return true;
+ }
+ 
++std::string SidebarHandler::MissionJson(base::DictValue snapshot) {
++  // The space each session's Workbench tab is in, and the spaces, so Mission
++  // Control can show where every agent runs and filter by space.
++  if (base::ListValue* nodes = snapshot.FindList("nodes")) {
++    for (base::Value& v : *nodes) {
++      base::DictValue& n = v.GetDict();
++      std::optional<int> owner = n.FindInt("ownerTab");
++      tabs::TabInterface* tab =
++          owner && *owner ? tabs::TabHandle(*owner).Get() : nullptr;
++      const TabData* data =
++          tab && tab->GetContents() ? TabData::Get(tab->GetContents()) : nullptr;
++      if (data && !data->space_id().empty()) {
++        n.Set("spaceId", data->space_id());
++      }
++    }
++  }
++  base::ListValue spaces;
++  for (const Space& s : service_->spaces()) {
++    spaces.Append(base::DictValue()
++                      .Set("id", s.id)
++                      .Set("name", s.name)
++                      .Set("icon", s.icon)
++                      .Set("color", s.color));
++  }
++  snapshot.Set("spaces", std::move(spaces));
++  snapshot.Set("activeSpace", service_->active_space_id());
++  return base::WriteJson(snapshot).value_or("{}");
++}
++
+ void SidebarHandler::OnMissionChanged(const base::DictValue& snapshot) {
+   if (page_.is_connected()) {
+-    page_->OnMissionState(base::WriteJson(snapshot).value_or("{}"));
++    page_->OnMissionState(MissionJson(snapshot.Clone()));
+   }
+ }
+ 
+@@ -598,11 +627,15 @@ void SidebarHandler::OnMissionToast(const std::string& node_id,
+ void SidebarHandler::GetMissionState(GetMissionStateCallback callback) {
+   mission::MissionControl* mission =
+       mission::MissionControlFactory::GetForProfile(browser_->GetProfile());
+-  std::move(callback).Run(
+-      mission ? base::WriteJson(mission->Snapshot()).value_or("{}") : "{}");
++  if (!mission) {
++    std::move(callback).Run("{}");
++    return;
++  }
++  std::move(callback).Run(MissionJson(mission->Snapshot()));
+ }
+ 
+ void SidebarHandler::RevealMissionNode(const std::string& id,
++                                       const std::string& panel,
+                                        RevealMissionNodeCallback callback) {
+   mission::MissionControl* mission =
+       mission::MissionControlFactory::GetForProfile(browser_->GetProfile());
+@@ -619,7 +652,8 @@ void SidebarHandler::RevealMissionNode(const std::string& id,
+     service_->SetActiveSpace(data->space_id());
+   }
+   model()->ActivateTabAt(model()->GetIndexOfTab(tab));
+-  workbench::WorkbenchHandler::FocusTerminal(tab->GetContents(), where->second);
++  workbench::WorkbenchHandler::FocusTerminal(tab->GetContents(), where->second,
++                                             panel);
+   std::move(callback).Run(true);
+ }
+ 
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 85798d165f..17eb395adc 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -238,6 +238,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void GetMissionState(GetMissionStateCallback callback) override;
+   void DismissMission(const std::string& id) override;
+   void RevealMissionNode(const std::string& id,
++                         const std::string& panel,
+                          RevealMissionNodeCallback callback) override;
+   void ClearMissionHistory() override;
+   void TidyToday(std::vector<mojom::TidyTabPtr> tabs,
+@@ -311,6 +312,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void OnArcExtensionsRead(bool again, std::vector<ArcExtension> found);
+   // The profile of the space shown.
+   Profile* ActiveSpaceProfile();
++  // Mission Control's snapshot with each session's space and the spaces, as
++  // JSON for the page.
++  std::string MissionJson(base::DictValue snapshot);
+   // Coalesces notifications into one OnStateChanged per task.
+   void ScheduleNotify();
+   void Notify();
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index a9ddfdfdfe..51e9075619 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -243,12 +243,17 @@ WorkbenchHandler::WorkbenchHandler(Profile* profile)
+ 
+ // static
+ void WorkbenchHandler::FocusTerminal(content::WebContents* contents,
+-                                     const std::string& term_id) {
++                                     const std::string& term_id,
++                                     const std::string& panel) {
+   auto it = Handlers().find(contents);
+   if (it != Handlers().end()) {
+-    it->second->Emit("wb:command", base::Value(base::DictValue()
+-                                                   .Set("type", "focus-term")
+-                                                   .Set("id", term_id)));
++    it->second->Emit("wb:command",
++                     base::Value(base::DictValue()
++                                     .Set("type", "focus-term")
++                                     .Set("id", term_id)
++                                     .Set("panel", panel == "insights"
++                                                       ? panel
++                                                       : std::string())));
+   }
+ }
+ 
+@@ -620,7 +625,9 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+     std::string path;
+     if (mission::MissionControl* mission =
+             mission::MissionControlFactory::GetForProfile(profile_)) {
+-      path = mission->TranscriptOf(a);
++      tabs::TabInterface* tab =
++          tabs::TabInterface::MaybeGetFromContents(web_ui()->GetWebContents());
++      path = mission->TranscriptOf(tab ? tab->GetHandle().raw_value() : 0, a);
+     }
+     if (path.empty()) {
+       return std::move(reply).Run(base::unexpected(
+@@ -706,6 +713,26 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+     prefs->CommitPendingWrite();
+     return std::move(reply).Run(base::Value(true));
+   }
++  // The names on the terminals' tabs (terminal id -> name), for Mission
++  // Control.
++  if (method == "missionNames") {
++    std::map<std::string, std::string> names;
++    if (params.size() > 0 && params[0].is_dict()) {
++      for (auto [id, name] : params[0].GetDict()) {
++        if (name.is_string() && names.size() < 50 && terms_.count(id)) {
++          names[id] = name.GetString();
++        }
++      }
++    }
++    tabs::TabInterface* tab =
++        tabs::TabInterface::MaybeGetFromContents(web_ui()->GetWebContents());
++    if (mission::MissionControl* mission =
++            mission::MissionControlFactory::GetForProfile(profile_);
++        mission && tab) {
++      mission->SetTerminalNames(tab->GetHandle().raw_value(), names);
++    }
++    return std::move(reply).Run(base::Value(true));
++  }
+   if (method == "ptyList") {
+     base::ListValue list;
+     for (const auto& [id, term] : terms_) {
+@@ -1982,7 +2009,9 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+     // Control's observers.
+     bridge.claude_settings = GuardHookSettings();
+   }
+-  if (mission && (kind == "claude" || kind == "codex" || kind == "gemini")) {
++  // Every agent shows in Mission Control (OpenCode, Copilot and the others
++  // without live status); a shell doesn't.
++  if (mission && kind != "shell" && !kind.ends_with("-shell")) {
+     tabs::TabInterface* tab =
+         tabs::TabInterface::MaybeGetFromContents(web_ui()->GetWebContents());
+     registration = mission->RegisterTerminal(
+@@ -2592,9 +2621,17 @@ void WorkbenchHandler::OnMissionChanged(const base::DictValue& snapshot) {
+   counts.Set("type", "mission");
+   // Each Claude Code terminal's status line numbers (context, usage limits,
+   // prompt cache, the session's name), by terminal.
++  // Only this Workbench's terminals: every Workbench (in every space) reports
++  // to the one Mission Control, and terminal ids repeat across them.
++  tabs::TabInterface* tab =
++      tabs::TabInterface::MaybeGetFromContents(web_ui()->GetWebContents());
++  const int self = tab ? tab->GetHandle().raw_value() : 0;
+   base::DictValue usage;
+   if (const base::ListValue* nodes = snapshot.FindList("nodes")) {
+     for (const base::Value& n : *nodes) {
++      if (n.GetDict().FindInt("ownerTab").value_or(0) != self) {
++        continue;
++      }
+       const std::string* term = n.GetDict().FindString("termId");
+       const base::DictValue* u = n.GetDict().FindDict("usage");
+       const std::string* mode = n.GetDict().FindString("permissionMode");
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.h b/chrome/browser/meridian/workbench/workbench_handler.h
+index fed0a033a5..71de36e2dc 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.h
++++ b/chrome/browser/meridian/workbench/workbench_handler.h
+@@ -50,7 +50,8 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+   // Shows terminal `term_id` in the Workbench in `contents` (Mission
+   // Control's "Open terminal").
+   static void FocusTerminal(content::WebContents* contents,
+-                            const std::string& term_id);
++                            const std::string& term_id,
++                            const std::string& panel = std::string());
+ 
+   // content::WebUIMessageHandler:
+   void RegisterMessages() override;
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index cdf6c6709c..f2699583a4 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -840,18 +840,19 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   }
+ 
+   protected onMeridianMissionReveal_(
+-      e: CustomEvent<{id: string, assistant: boolean}>) {
+-    this.revealMission_(e.detail.id, e.detail.assistant);
++      e: CustomEvent<{id: string, assistant: boolean, panel?: string}>) {
++    this.revealMission_(e.detail.id, e.detail.assistant, e.detail.panel || '');
+   }
+ 
+-  private async revealMission_(id: string, assistant: boolean) {
++  private async revealMission_(
++      id: string, assistant: boolean, panel: string = '') {
+     if (assistant) {
+       if (!this.$.ask.open) {
+         this.$.ask.toggle();
+       }
+       return;
+     }
+-    const {found} = await this.$.tabstrip.revealMissionNode(id);
++    const {found} = await this.$.tabstrip.revealMissionNode(id, panel);
+     if (!found) {
+       this.$.mission.show(id);
+     }
+diff --git a/chrome/browser/resources/webui_browser/meridian/mission.css b/chrome/browser/resources/webui_browser/meridian/mission.css
+index e9d7dd7358..dc949267ef 100644
+--- a/chrome/browser/resources/webui_browser/meridian/mission.css
++++ b/chrome/browser/resources/webui_browser/meridian/mission.css
+@@ -509,3 +509,118 @@ button:disabled {
+   padding-top: 40px;
+   text-align: center;
+ }
++
++/* Spaces: a chip each (and All spaces) to show only that space's agents. */
++.spaces {
++  display: flex;
++  gap: 6px;
++  padding: 8px 14px 8px 18px;
++  border-bottom: 1px solid var(--meridian-border);
++  overflow-x: auto;
++  scrollbar-width: none;
++  flex: none;
++}
++
++.space {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  flex: none;
++  max-width: 220px;
++  padding: 3px 10px;
++  border-radius: 8px;
++  font-size: 12px;
++  color: var(--meridian-text-muted);
++}
++
++.space:hover {
++  background: color-mix(in srgb, var(--meridian-text) 6%, transparent);
++}
++
++.space.on {
++  color: var(--meridian-text);
++  background: color-mix(in srgb, var(--meridian-space) 16%, transparent);
++  font-weight: 600;
++}
++
++.s-name {
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.s-n {
++  font-size: 11px;
++  font-variant-numeric: tabular-nums;
++  opacity: 0.7;
++}
++
++/* All spaces: a heading above each space's agents. */
++.group {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  padding: 12px 12px 4px;
++  font-size: 11px;
++  font-weight: 650;
++  letter-spacing: 0.02em;
++  color: var(--meridian-text-muted);
++}
++
++.group:first-child {
++  padding-top: 4px;
++}
++
++.g-n {
++  font-weight: 400;
++  opacity: 0.8;
++}
++
++/* Context used, as on the Workbench's terminal tabs. */
++.ctx {
++  --c: var(--done);
++  flex: none;
++  padding: 0 6px;
++  border-radius: 6px;
++  font-size: 10.5px;
++  font-variant-numeric: tabular-nums;
++  color: var(--c);
++  background: linear-gradient(90deg,
++      color-mix(in srgb, var(--c) 22%, transparent) var(--p),
++      color-mix(in srgb, var(--c) 8%, transparent) var(--p));
++}
++
++.ctx.warn,
++.ctx-bar.warn {
++  --c: var(--waiting);
++}
++
++.ctx.bad,
++.ctx-bar.bad {
++  --c: var(--error);
++}
++
++.ctx-bar {
++  --c: var(--done);
++  display: inline-block;
++  width: 64px;
++  height: 5px;
++  margin-right: 6px;
++  vertical-align: middle;
++  border-radius: 3px;
++  overflow: hidden;
++  background: color-mix(in srgb, var(--meridian-text) 10%, transparent);
++}
++
++.ctx-bar i {
++  display: block;
++  width: var(--p);
++  height: 100%;
++  background: var(--c);
++}
++
++.other-spaces {
++  display: block;
++  margin: 10px 12px;
++  font-size: 12px;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/mission.html.ts b/chrome/browser/resources/webui_browser/meridian/mission.html.ts
+index dc24e0ec32..f84e8bcf92 100644
+--- a/chrome/browser/resources/webui_browser/meridian/mission.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/mission.html.ts
+@@ -29,10 +29,27 @@ export function getHtml(this: MeridianMissionElement) {
+       <button id="close" class="icon-btn" title="Close (Esc)"
+           @click="${this.onCloseClick_}">${icon('x', 14)}</button>
+     </header>
++    ${this.spaceChips_.length ? html`
++      <nav id="spaces" class="spaces" aria-label="Spaces">
++        ${this.spaceChips_.map(c => html`
++          <button class="space ${c.on ? 'on' : ''}" data-id="${c.id}"
++              aria-pressed="${c.on}" @click="${this.onSpaceClick_}">
++            ${c.icon ? html`<span class="s-icon">${c.icon}</span>` : ''}
++            <span class="s-name">${c.label}</span>
++            <span class="s-n">${c.count}</span>
++          </button>`)}
++      </nav>` : ''}
+     <div class="body">
+       <section class="tree-wrap">
+         <div id="tree">
+           ${this.rows_.map(r => html`
++            ${r.group ? html`
++              <div class="group" data-space="${r.group.id}">
++                ${r.group.icon ? html`
++                  <span class="g-icon">${r.group.icon}</span>` : ''}
++                <span class="g-name">${r.group.label}</span>
++                <span class="g-n">${r.group.count}</span>
++              </div>` : ''}
+             <div class="row ${r.selected ? 'sel' : ''} ${r.live ? 'live' : ''}
+                 ${r.ended ? 'ended' : ''}" data-id="${r.id}"
+                 data-status="${r.status}" style="--depth:${r.depth}"
+@@ -45,6 +62,11 @@ export function getHtml(this: MeridianMissionElement) {
+                   <span class="sub">${r.sublabel}</span>
+                   <span class="where">${r.where}</span>
+                   <span class="proj">${r.project}</span>
++                  ${r.context ? html`
++                    <span class="ctx ${r.context.level}"
++                        style="--p:${Math.min(100, r.context.pct)}%"
++                        title="${r.context.title}">${r.context.pct}%</span>` :
++                    ''}
+                 </div>
+                 <div class="line2">
+                   <span class="pill" data-status="${r.status}"><i></i>
+@@ -59,7 +81,12 @@ export function getHtml(this: MeridianMissionElement) {
+               </div>
+             </div>`)}
+         </div>
+-        ${this.empty_ ? html`
++        ${this.filteredOut_ ? html`
++          <button id="otherSpaces" class="link-btn other-spaces"
++              @click="${this.onShowAllClick_}">
++            ${this.filteredOut_} more at work in other spaces · Show all
++          </button>` : ''}
++        ${this.empty_ && !this.filteredOut_ ? html`
+           <div id="empty" class="empty">
+             <span class="orbit">${icon('agents', 26)}</span>
+             <div class="empty-title">No agents at work</div>
+@@ -99,7 +126,14 @@ export function getHtml(this: MeridianMissionElement) {
+           <dl class="facts">
+             <div><dt>Runs</dt><dd title="${this.detail_.whereTitle}">
+               ${this.detail_.where}</dd></div>
++            <div><dt>Space</dt><dd id="d-space">${this.detail_.space}</dd></div>
+             <div><dt>Project</dt><dd>${this.detail_.project}</dd></div>
++            ${this.detail_.context ? html`
++              <div><dt>Context</dt><dd id="d-context">
++                <span class="ctx-bar ${this.detail_.context.level}"
++                    style="--p:${Math.min(100, this.detail_.context.pct)}%">
++                  <i></i></span>
++                ${this.detail_.context.text}</dd></div>` : ''}
+             <div><dt>Elapsed</dt><dd>${this.detail_.elapsed}</dd></div>
+             <div><dt>${this.detail_.callsLabel}</dt>
+               <dd>${this.detail_.calls}</dd></div>
+@@ -109,6 +143,11 @@ export function getHtml(this: MeridianMissionElement) {
+               <button id="reveal" class="btn primary"
+                   @click="${this.onRevealClick_}">
+                 ${this.detail_.revealLabel}</button>` : ''}
++            ${this.detail_.canInsights ? html`
++              <button id="insights" class="btn"
++                  title="What the context holds and where the tokens went"
++                  @click="${this.onInsightsClick_}">
++                ${icon('sparkles', 13)} Context Insights</button>` : ''}
+             ${this.detail_.canDismiss ? html`
+               <button id="dismiss" class="btn"
+                   @click="${this.onDismissClick_}">Dismiss</button>` : ''}
+diff --git a/chrome/browser/resources/webui_browser/meridian/mission.ts b/chrome/browser/resources/webui_browser/meridian/mission.ts
+index c332304608..42f98f51e8 100644
+--- a/chrome/browser/resources/webui_browser/meridian/mission.ts
++++ b/chrome/browser/resources/webui_browser/meridian/mission.ts
+@@ -43,6 +43,22 @@ export interface MissionNode {
+   turns: number;
+   selfReported: boolean;
+   log: MissionLog[];
++  // The space of the Workbench tab it runs in.
++  spaceId?: string;
++  // Claude Code's status line numbers.
++  usage?: {
++    context_pct?: number,
++    context_tokens?: number,
++    context_size?: number,
++    compactions?: number,
++  }|null;
++}
++
++export interface MissionSpace {
++  id: string;
++  name: string;
++  icon: string;
++  color: string;
+ }
+ 
+ export interface MissionHistory {
+@@ -63,6 +79,31 @@ export interface MissionSnapshot {
+   history: MissionHistory[];
+   counts: {working: number, waiting: number, live: number};
+   now: number;
++  spaces?: MissionSpace[];
++  activeSpace?: string;
++}
++
++export interface MissionGroup {
++  // A space id, '' for agents outside every space (MCP clients, ⌘J).
++  id: string;
++  label: string;
++  icon: string;
++  count: string;
++}
++
++export interface MissionSpaceChip {
++  id: string;
++  label: string;
++  icon: string;
++  count: number;
++  on: boolean;
++}
++
++export interface MissionContext {
++  pct: number;
++  level: string;
++  text: string;
++  title: string;
+ }
+ 
+ export interface MissionRow {
+@@ -82,6 +123,9 @@ export interface MissionRow {
+   live: boolean;
+   ended: boolean;
+   selected: boolean;
++  // A group's heading above its first agent (All spaces).
++  group: MissionGroup|null;
++  context: MissionContext|null;
+ }
+ 
+ export interface MissionDetail {
+@@ -99,6 +143,9 @@ export interface MissionDetail {
+   canReveal: boolean;
+   revealLabel: string;
+   canDismiss: boolean;
++  space: string;
++  context: MissionContext|null;
++  canInsights: boolean;
+   log: Array<{name: string, summary: string, time: string, ok: string}>;
+   emptyLog: string;
+ }
+@@ -166,6 +213,27 @@ function elapsed(n: MissionNode, now: number): string {
+   return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`;
+ }
+ 
++function context(n: MissionNode): MissionContext|null {
++  const u = n.usage;
++  if (!u || typeof u.context_pct !== 'number') {
++    return null;
++  }
++  const pct = Math.max(0, Math.round(u.context_pct));
++  const k = (x: number) => x >= 1000 ? `${Math.round(x / 1000)}k` : String(x);
++  const tokens = u.context_tokens && u.context_size ?
++      `${k(u.context_tokens)} of ${k(u.context_size)} tokens` :
++      '';
++  return {
++    pct,
++    level: pct >= 90 ? 'bad' : pct >= 70 ? 'warn' : 'ok',
++    text: `${pct}%${tokens ? ` · ${tokens}` : ''}${
++        u.compactions ? ` · compacted ${u.compactions}×` : ''}`,
++    title: `Context: ${pct}% used${tokens ? ` (${tokens})` : ''}`,
++  };
++}
++
++const SPACE_KEY = 'meridian-mission-space';
++
+ function calls(n: MissionNode): string {
+   return n.source === 'codex' ?
+       `${n.turns} turn${n.turns === 1 ? '' : 's'}` :
+@@ -196,6 +264,9 @@ export class MeridianMissionElement extends CrLitElement {
+       historyRows_: {state: true, type: Array},
+       totalCalls_: {state: true, type: Number},
+       empty_: {state: true, type: Boolean},
++      spaceFilter_: {state: true, type: String},
++      spaceChips_: {state: true, type: Array},
++      filteredOut_: {state: true, type: Number},
+     };
+   }
+ 
+@@ -209,6 +280,19 @@ export class MeridianMissionElement extends CrLitElement {
+   protected accessor historyRows_: MissionHistoryRow[] = [];
+   protected accessor totalCalls_: number = 0;
+   protected accessor empty_: boolean = true;
++  // 'all', or a space's id (remembered).
++  protected accessor spaceFilter_: string = 'all';
++  protected accessor spaceChips_: MissionSpaceChip[] = [];
++  // Agents at work in the spaces the filter hides.
++  protected accessor filteredOut_: number = 0;
++
++  constructor() {
++    super();
++    try {
++      this.spaceFilter_ = localStorage.getItem(SPACE_KEY) || 'all';
++    } catch {
++    }
++  }
+ 
+   private timer_: number|null = null;
+   // The browser's clock minus ours.
+@@ -272,18 +356,84 @@ export class MeridianMissionElement extends CrLitElement {
+       list.sort((a, b) => a.startedAt - b.startedAt);
+     }
+     roots.sort((a, b) => b.startedAt - a.startedAt);
++    // Spaces: every agent's, a chip each to show only that space's.
++    const spaces = snap.spaces || [];
++    const spaceOf = (n: MissionNode) =>
++        n.spaceId && spaces.some(s => s.id === n.spaceId) ? n.spaceId : '';
++    const counts = new Map<string, number>();
++    for (const r of roots) {
++      counts.set(spaceOf(r), (counts.get(spaceOf(r)) || 0) + 1);
++    }
++    if (this.spaceFilter_ !== 'all' &&
++        !spaces.some(s => s.id === this.spaceFilter_)) {
++      this.spaceFilter_ = 'all';
++    }
++    this.spaceChips_ = spaces.length < 2 ? [] : [
++      {
++        id: 'all',
++        label: 'All spaces',
++        icon: '',
++        count: roots.length,
++        on: this.spaceFilter_ === 'all',
++      },
++      ...spaces.map(s => ({
++                      id: s.id,
++                      label: s.name,
++                      icon: s.icon,
++                      count: counts.get(s.id) || 0,
++                      on: this.spaceFilter_ === s.id,
++                    })),
++    ];
++    const shown = this.spaceFilter_ === 'all' ?
++        roots :
++        roots.filter(r => spaceOf(r) === this.spaceFilter_);
++    this.filteredOut_ =
++        roots.filter(r => !r.endedAt && !shown.includes(r)).length;
++    // All spaces: grouped by space, in the sidebar's order (outside every
++    // space last), when there's more than one group.
++    const order = (id: string) => {
++      const i = spaces.findIndex(s => s.id === id);
++      return i < 0 ? spaces.length : i;
++    };
++    const grouped = this.spaceFilter_ === 'all' && counts.size > 1;
++    if (grouped) {
++      shown.sort((a, b) => order(spaceOf(a)) - order(spaceOf(b)) ||
++                     b.startedAt - a.startedAt);
++    }
++    const groupOf = (id: string): MissionGroup => {
++      const s = spaces.find(x => x.id === id);
++      const n = counts.get(id) || 0;
++      return {
++        id,
++        label: s ? s.name : 'Outside spaces',
++        icon: s ? s.icon : '',
++        count: `${n} agent${n === 1 ? '' : 's'}`,
++      };
++    };
+     if (this.selected_ && !byId.has(this.selected_)) {
+       this.selected_ = '';
+     }
+-    if (!this.selected_ && roots.length) {
+-      this.selected_ = (roots.find(r => r.status === 'waiting') ||
+-                        roots.find(r => !r.endedAt) || roots[0])!.id;
++    if (this.selected_ && !shown.some(r => r.id === this.selected_) &&
++        !snap.nodes.some(n => n.id === this.selected_ && n.parentId)) {
++      this.selected_ = '';
++    }
++    if (!this.selected_ && shown.length) {
++      this.selected_ = (shown.find(r => r.status === 'waiting') ||
++                        shown.find(r => !r.endedAt) || shown[0])!.id;
+     }
++    let lastGroup: string|null = null;
+     const rows: MissionRow[] = [];
+     const walk = (list: MissionNode[], depth: number) => {
+       for (const n of list) {
+         const sub = n.kind === 'subagent';
++        let group: MissionGroup|null = null;
++        if (grouped && depth === 0 && spaceOf(n) !== lastGroup) {
++          lastGroup = spaceOf(n);
++          group = groupOf(lastGroup);
++        }
+         rows.push({
++          group,
++          context: sub ? null : context(n),
+           id: n.id,
+           depth,
+           label: n.label,
+@@ -311,9 +461,9 @@ export class MeridianMissionElement extends CrLitElement {
+         walk(kids.get(n.id) || [], depth + 1);
+       }
+     };
+-    walk(roots, 0);
++    walk(shown, 0);
+     this.rows_ = rows;
+-    this.empty_ = roots.length === 0;
++    this.empty_ = shown.length === 0;
+     this.totalCalls_ = snap.nodes.reduce(
+         (a, n) => a + (n.source === 'codex' ? 0 : n.toolCalls), 0);
+     const n = byId.get(this.selected_);
+@@ -343,6 +493,12 @@ export class MeridianMissionElement extends CrLitElement {
+       canReveal: !!n.termId || n.kind === 'assistant',
+       revealLabel: n.termId ? 'Open terminal' : 'Open chat',
+       canDismiss: !n.parentId && !!n.endedAt,
++      space: (() => {
++        const s = root && spaces.find(x => x.id === spaceOf(root));
++        return s ? `${s.icon ? s.icon + ' ' : ''}${s.name}` : '—';
++      })(),
++      context: n.kind === 'subagent' ? null : context(n),
++      canInsights: !!n.termId && n.source === 'claude' && !!n.usage,
+       log: n.log.slice().reverse().map(e => ({
+                                          name: prettyTool(e.name),
+                                          summary: e.summary || '',
+@@ -384,6 +540,26 @@ export class MeridianMissionElement extends CrLitElement {
+     });
+   }
+ 
++  protected onSpaceClick_(e: Event) {
++    this.spaceFilter_ = (e.currentTarget as HTMLElement).dataset['id'] || 'all';
++    try {
++      localStorage.setItem(SPACE_KEY, this.spaceFilter_);
++    } catch {
++    }
++  }
++
++  protected onShowAllClick_() {
++    this.spaceFilter_ = 'all';
++    try {
++      localStorage.setItem(SPACE_KEY, 'all');
++    } catch {
++    }
++  }
++
++  protected onInsightsClick_() {
++    this.reveal_(this.selected_, 'insights');
++  }
++
+   protected onRowClick_(e: Event) {
+     this.selected_ = (e.currentTarget as HTMLElement).dataset['id'] || '';
+   }
+@@ -396,13 +572,15 @@ export class MeridianMissionElement extends CrLitElement {
+     this.reveal_(this.selected_);
+   }
+ 
+-  private reveal_(id: string) {
++  private reveal_(id: string, panel: string = '') {
+     const n = this.snapshot?.nodes.find(x => x.id === id);
+     if (!n) {
+       return;
+     }
+     this.hide();
+-    this.fire('meridian-mission-reveal', {id, assistant: n.kind === 'assistant'});
++    this.fire(
++        'meridian-mission-reveal',
++        {id, assistant: n.kind === 'assistant', panel});
+   }
+ 
+   protected onDismissClick_() {
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index d45ff3df95..f2cb81920b 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -1210,8 +1210,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+   }
+ 
+   // Mission Control's "Open terminal": its Workbench tab, on that terminal.
+-  revealMissionNode(id: string) {
+-    return this.handler_.revealMissionNode(id);
++  revealMissionNode(id: string, panel: string = '') {
++    return this.handler_.revealMissionNode(id, panel);
+   }
+ 
+   protected onMissionClick_() {

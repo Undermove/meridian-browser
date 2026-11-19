@@ -25,7 +25,7 @@ now = time.time()
 status = {
   'session_id': 's1', 'session_name': 'Fix the login page', 'transcript_path': os.path.join(cwd, 'session.jsonl'),
   'model': {'id': 'claude-opus-5-5', 'display_name': 'Opus 5.5'}, 'workspace': {'project_dir': cwd, 'current_dir': cwd},
-  'context_window': {'context_window_size': 200000, 'used_percentage': 46,
+  'context_window': {'context_window_size': 200000, 'used_percentage': int(open('ctx.txt').read()) if os.path.exists('ctx.txt') else 46,
                      'current_usage': {'input_tokens': 10, 'cache_creation_input_tokens': 2000, 'cache_read_input_tokens': 89990, 'output_tokens': 300}},
   'rate_limits': {'five_hour': {'used_percentage': 41.5, 'resets_at': now + 7200}, 'seven_day': {'used_percentage': 12, 'resets_at': now + 3 * 86400}},
   'prompt_cache': {'requests': 12, 'misses': 1, 'hit_ratio': 0.87, 'warm': True, 'ttl': '5m', 'expires_at': now + 200, 'miss_causes': {'ttl_expired_5m': 1}},
@@ -76,9 +76,11 @@ function transcript() {
   return lines.join('\n') + '\n';
 }
 
-async function setup({ ownStatusLine }) {
+async function setup({ ownStatusLine, ctx }) {
   const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-ci-')));
   fs.writeFileSync(path.join(project, 'session.jsonl'), transcript());
+  // The context the stand-in reports.
+  if (ctx) fs.writeFileSync(path.join(project, 'ctx.txt'), String(ctx));
   if (ownStatusLine) {
     fs.mkdirSync(path.join(project, 'home', '.claude'), { recursive: true });
     fs.writeFileSync(path.join(project, 'home', '.claude', 'settings.json'), JSON.stringify({ statusLine: { type: 'command', command: 'cat > /dev/null; echo MY-OWN-LINE' } }));
@@ -128,6 +130,12 @@ test('a Claude Code tab takes the session\'s name and shows its context; the top
     // (Section titles show in capitals.)
     await wb.waitFor(`${panel}.includes('WHERE THE USAGE WENT')`, 20000);
     const text = await wb.eval(panel);
+    // MERIDIAN_SHOTS=<folder>: a picture for the changelog.
+    if (process.env.MERIDIAN_SHOTS) {
+      await sleep(500);
+      const { data } = await wb.cdp.send('Page.captureScreenshot', { format: 'png' });
+      fs.writeFileSync(path.join(process.env.MERIDIAN_SHOTS, 'context-insights.png'), Buffer.from(data, 'base64'));
+    }
     if (process.env.SHOT) fs.writeFileSync(process.env.SHOT, Buffer.from((await wb.cdp.send('Page.captureScreenshot', { format: 'png' })).data, 'base64'));
     for (const s of ['USAGE LIMITS', 'CONTEXT WINDOW', 'INSIGHTS', '5-hour window', 'Resets in 2 h', 'Week', '46% used', '92k / 200k', 'System prompt', 'System tools', 'MCP tools', 'Memory files', 'Skills', 'Messages', 'Free space',
       'Compacted 1×', 'Prompt cache: 87%', 'ttl expired 5m ×1', 'The cache went cold 1 time', 'Read /project/src/app.js']) {
@@ -164,5 +172,33 @@ test('without a status line of their own, Meridian\'s shows the context and limi
     await sleep(800);
     await wb.eval(`(() => { window.workbench.ptyWrite(S.activeTerm.id, "printf '\\\\033]0;deploy-logs\\\\007'; sleep 8\\r"); return true; })()`);
     await wb.waitFor(`${tabName} === 'deploy-logs'`, 10000);
+  } finally { await done(); }
+});
+
+// The context gauge sits on the tab's line, between the name and the icons: it slid down onto the
+// tab's bottom edge on the Mac.
+test('the context gauge sits on the tab\'s line, centred with its name, at every level', async () => {
+  // 70%: the gauge turns yellow (it took another element's margin and size then).
+  const { wb, done } = await setup({ ownStatusLine: false, ctx: 70 });
+  try {
+    await wb.eval(`launch('claude').then((t) => !!t)`);
+    await wb.waitFor(`document.querySelector('#term-tab-list .ttab.active .ctx-badge')?.textContent === '70%'`, 15000);
+    // Named by hand, short, as on the person's tab.
+    await wb.eval(`(() => { saveTermName(S.activeTerm, 'Работа'); S.activeTerm.browserTools = true; S.activeTerm.secrets = ['A', 'B', 'C', 'D', 'E']; renderTermTabs(); return true; })()`);
+    await sleep(300);
+    if (process.env.MERIDIAN_SHOTS) {
+      const { data } = await wb.cdp.send('Page.captureScreenshot', { format: 'png' });
+      fs.writeFileSync(path.join(process.env.MERIDIAN_SHOTS, 'ctx-badge-tab.png'), Buffer.from(data, 'base64'));
+    }
+    const g = await wb.eval(`(() => {
+      const tab = document.querySelector('#term-tab-list .ttab.active');
+      const r = (e) => { const b = e.getBoundingClientRect(); return { top: b.top, bottom: b.bottom, left: b.left, right: b.right, mid: (b.top + b.bottom) / 2 }; };
+      const badge = tab.querySelector('.ctx-badge');
+      return { size: getComputedStyle(badge).fontSize, tab: r(tab), name: r(tab.querySelector('.name')), badge: r(tab.querySelector('.ctx-badge')), close: r(tab.querySelector('.tab-close')) };
+    })()`);
+    assert.equal(g.size, '10px', 'the gauge\'s own size');
+    assert.ok(g.badge.top >= g.tab.top && g.badge.bottom <= g.tab.bottom, `inside the tab: ${JSON.stringify(g)}`);
+    assert.ok(Math.abs(g.badge.mid - g.name.mid) <= 2, `centred with the name: ${JSON.stringify(g)}`);
+    assert.ok(g.badge.left >= g.name.right && g.badge.right <= g.close.left, `between the name and the close button: ${JSON.stringify(g)}`);
   } finally { await done(); }
 });

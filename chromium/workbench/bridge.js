@@ -156,6 +156,11 @@
     // The open project's Claude Code sessions, reopened after a restart.
     claudeSessions: () => invoke('claudeSessions'),
     saveClaudeSessions: (list) => invoke('saveClaudeSessions', Array.isArray(list) ? list.slice(0, 20).map((s) => ({ id: str(s?.id), name: str(s?.name), mode: str(s?.mode) })) : []),
+    // Before an agent that works with an online AI starts: "", "always" or "off".
+    aiConsent: () => invoke('aiConsent'),
+    setAiConsent: (value) => invoke('setAiConsent', value === 'always' ? 'always' : ''),
+    // The names on the terminals' tabs, for Mission Control.
+    missionNames: (names) => invoke('missionNames', Object.fromEntries(Object.entries(names && typeof names === 'object' ? names : {}).slice(0, 50).map(([k, v]) => [str(k), str(v).slice(0, 200)]))),
     // Context Insights for the Claude Code session in a terminal.
     contextInsights: (id, opts) => invoke('contextInsights', str(id), { contextSize: Number(opts?.contextSize) || undefined }),
     ptyKill: (id) => invoke('ptyKill', str(id)),

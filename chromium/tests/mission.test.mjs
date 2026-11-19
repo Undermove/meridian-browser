@@ -22,7 +22,13 @@ cwd = os.getcwd()
 def hook(event, **fields):
     for entry in settings['hooks'].get(event, []):
         for h in entry['hooks']:
-            subprocess.run(h['command'], shell=True, input=json.dumps(dict(hook_event_name=event, session_id='s1', cwd=cwd, **fields)), text=True)
+            data = json.dumps(dict(hook_event_name=event, session_id='s1', cwd=cwd, **fields))
+            # Claude Code asks in the terminal while its PermissionRequest hooks run: it doesn't wait for them.
+            if event == 'PermissionRequest':
+                p = subprocess.Popen(h['command'], shell=True, stdin=subprocess.PIPE, text=True, stdout=subprocess.DEVNULL)
+                p.stdin.write(data); p.stdin.close()
+            else:
+                subprocess.run(h['command'], shell=True, input=data, text=True)
 hook('SessionStart', model='claude-opus-5-5', source='startup')
 hook('UserPromptSubmit')
 hook('PreToolUse', tool_name='Bash', tool_use_id='t1', tool_input={'command': 'ANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123 npm test'})
@@ -80,7 +86,8 @@ test('Mission Control: a Workbench session with a subagent, a wait, browser tool
     const s = await waitState((x) => x.nodes.some((n) => n.status === 'waiting'), 'the wait');
     const root = s.nodes.find((n) => n.kind === 'session');
     assert.equal(root.label, 'Claude Code');
-    assert.equal(root.sublabel, 'claude-opus-5-5');
+    // The model, after the agent once the Workbench has named the session.
+    assert.match(root.sublabel, /^(Claude Code · )?claude-opus-5-5$/);
     assert.equal(root.project, path.basename(project));
     assert.match(root.statusText, /Needs permission: Bash/);
     const sub = s.nodes.find((n) => n.kind === 'subagent');
@@ -165,7 +172,7 @@ test('closing the Workbench tab stops its sessions in Mission Control; a closed 
     throw new Error(`timed out waiting for ${what}: ${JSON.stringify(s?.nodes?.map((n) => [n.label, n.status, n.statusText]))}`);
   };
   // Running sessions; `started`: the agent itself is up (its SessionStart hook named the model).
-  const live = (s, started = false) => s.nodes.filter((n) => n.kind === 'session' && !n.endedAt && (!started || n.sublabel === 'claude-opus-5-5'));
+  const live = (s, started = false) => s.nodes.filter((n) => n.kind === 'session' && !n.endedAt && (!started || /claude-opus-5-5$/.test(n.sublabel || '')));
   const openWorkbench = async () => {
     await b.eval('app.$.tabstrip.runCommand(16, 0)');
     const wb = await b.page('chrome://workbench');

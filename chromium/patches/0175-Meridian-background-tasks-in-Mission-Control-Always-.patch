@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 19 Nov 2026 19:51:05 +0400
+Subject: [PATCH 176/177] Meridian: background tasks in Mission Control; Always
+ allow for the agent
+
+A session whose turn is over but that still runs a command in the background
+shows as at work. The browser agent's question offers Always allow (full
+access from then on).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/mission/mission_control.cc       | 22 +++++++++++++++++++
+ .../meridian/mission/mission_control.h        |  7 ++++++
+ .../webui_browser/meridian/agent.css          | 16 ++++++++++++++
+ .../webui_browser/meridian/agent.html.ts      |  4 ++++
+ .../resources/webui_browser/meridian/agent.ts | 14 ++++++++++++
+ .../webui_browser/meridian/mission.css        |  3 ++-
+ .../webui_browser/meridian/mission.ts         | 20 ++++++++++++++---
+ 7 files changed, 82 insertions(+), 4 deletions(-)
+
+diff --git a/chrome/browser/meridian/mission/mission_control.cc b/chrome/browser/meridian/mission/mission_control.cc
+index 72ef8a67ca..fdee349018 100644
+--- a/chrome/browser/meridian/mission/mission_control.cc
++++ b/chrome/browser/meridian/mission/mission_control.cc
+@@ -422,6 +422,27 @@ std::string MissionControl::AgentLine(const Node& n) {
+              : n.label + " · " + n.sublabel;
+ }
+ 
++void MissionControl::SetBackgroundTasks(
++    int owner_tab,
++    const std::map<std::string, int>& counts) {
++  bool changed = false;
++  for (auto& [id, node] : nodes_) {
++    if (node.owner_tab != owner_tab || node.term_id.empty() ||
++        node.ended_at) {
++      continue;
++    }
++    auto it = counts.find(node.term_id);
++    int n = it == counts.end() ? 0 : it->second;
++    if (n != node.background) {
++      node.background = n;
++      changed = true;
++    }
++  }
++  if (changed) {
++    Changed();
++  }
++}
++
+ void MissionControl::SetTerminalNames(
+     int owner_tab,
+     const std::map<std::string, std::string>& names) {
+@@ -1134,6 +1155,7 @@ base::DictValue MissionControl::Snapshot() const {
+                                  ? OptString(n.sublabel)
+                                  : base::Value(AgentLine(n)))
+             .Set("ownerTab", n.owner_tab)
++            .Set("background", n.background)
+             .Set("project", OptString(n.project))
+             .Set("status", n.status)
+             .Set("statusText", OptString(n.status_text))
+diff --git a/chrome/browser/meridian/mission/mission_control.h b/chrome/browser/meridian/mission/mission_control.h
+index 8285d7e5b2..b00ca61ede 100644
+--- a/chrome/browser/meridian/mission/mission_control.h
++++ b/chrome/browser/meridian/mission/mission_control.h
+@@ -113,6 +113,10 @@ class MissionControl : public KeyedService,
+   void AttachTerminal(const std::string& node_id, const std::string& term_id);
+   // The names the Workbench in tab `owner_tab` shows on its terminals' tabs
+   // (terminal id -> name).
++  // How many background commands each session of the Workbench in
++  // `owner_tab` has running (terminal id -> count).
++  void SetBackgroundTasks(int owner_tab,
++                          const std::map<std::string, int>& counts);
+   void SetTerminalNames(int owner_tab,
+                         const std::map<std::string, std::string>& names);
+   // Enter in an agent's terminal (Codex has no per-tool hooks).
+@@ -190,6 +194,9 @@ class MissionControl : public KeyedService,
+     int tool_calls = 0;
+     int errors = 0;
+     int turns = 0;
++    // Commands the agent left running in the background (Claude Code's
++    // background shells), counted by the Workbench.
++    int background = 0;
+     double started_at = 0;
+     double ended_at = 0;
+     double last_event_at = 0;
+diff --git a/chrome/browser/resources/webui_browser/meridian/agent.css b/chrome/browser/resources/webui_browser/meridian/agent.css
+index d49e002bad..8d8e62fe04 100644
+--- a/chrome/browser/resources/webui_browser/meridian/agent.css
++++ b/chrome/browser/resources/webui_browser/meridian/agent.css
+@@ -151,3 +151,19 @@ button:disabled {
+   padding: 0 14px;
+   border-radius: 8px;
+ }
++
++.actions .grow {
++  flex: 1;
++}
++
++.actions .btn.link {
++  padding-left: 0;
++  padding-right: 0;
++  background: none;
++  color: var(--meridian-text-muted);
++}
++
++.actions .btn.link:hover {
++  color: var(--meridian-text);
++  text-decoration: underline;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/agent.html.ts b/chrome/browser/resources/webui_browser/meridian/agent.html.ts
+index 0ec0668ac3..8537e80d43 100644
+--- a/chrome/browser/resources/webui_browser/meridian/agent.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/agent.html.ts
+@@ -25,6 +25,10 @@ ${this.question_ ? html`
+       <h3><b>${this.question_.client}</b> wants to</h3>
+       <pre class="summary">${this.question_.summary}</pre>
+       <div class="actions">
++        <button id="always" class="btn link"
++            title="Don’t ask again: agents act without asking (Settings › AI › Agent access)"
++            @click="${this.onAlwaysClick_}">Always allow</button>
++        <div class="grow"></div>
+         <button id="deny" class="btn" @click="${this.onDenyClick_}">Deny
+         </button>
+         <button id="allow" class="btn primary" @click="${this.onAllowClick_}">
+diff --git a/chrome/browser/resources/webui_browser/meridian/agent.ts b/chrome/browser/resources/webui_browser/meridian/agent.ts
+index 764af9ce2b..8ec3d8a624 100644
+--- a/chrome/browser/resources/webui_browser/meridian/agent.ts
++++ b/chrome/browser/resources/webui_browser/meridian/agent.ts
+@@ -155,6 +155,20 @@ export class MeridianAgentElement extends CrLitElement {
+     this.answer_(false);
+   }
+ 
++  // Don't ask again: agents get full control (Settings > AI > Agent access
++  // brings the questions back); this question and the waiting ones are
++  // allowed.
++  protected async onAlwaysClick_() {
++    if (performance.now() - this.shownAt_ < ALLOW_DELAY_MS) {
++      return;
++    }
++    const {settings} = await this.handler_.getSettings();
++    this.handler_.setSettings({...settings, agentAccess: 'full'});
++    while (this.question_) {
++      this.answer_(true);
++    }
++  }
++
+   protected onCardKeydown_(e: KeyboardEvent) {
+     if (e.key === 'Escape') {
+       e.preventDefault();
+diff --git a/chrome/browser/resources/webui_browser/meridian/mission.css b/chrome/browser/resources/webui_browser/meridian/mission.css
+index dc949267ef..803ad4f9ed 100644
+--- a/chrome/browser/resources/webui_browser/meridian/mission.css
++++ b/chrome/browser/resources/webui_browser/meridian/mission.css
+@@ -277,7 +277,8 @@ button:disabled {
+ 
+ .pill[data-status='thinking'] i,
+ .pill[data-status='tool'] i,
+-.pill[data-status='starting'] i {
++.pill[data-status='starting'] i,
++.pill[data-status='background'] i {
+   background: var(--working);
+ }
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/mission.ts b/chrome/browser/resources/webui_browser/meridian/mission.ts
+index 42f98f51e8..ed8b34d71c 100644
+--- a/chrome/browser/resources/webui_browser/meridian/mission.ts
++++ b/chrome/browser/resources/webui_browser/meridian/mission.ts
+@@ -45,6 +45,8 @@ export interface MissionNode {
+   log: MissionLog[];
+   // The space of the Workbench tab it runs in.
+   spaceId?: string;
++  // Commands it left running in the background.
++  background?: number;
+   // Claude Code's status line numbers.
+   usage?: {
+     context_pct?: number,
+@@ -193,7 +195,18 @@ function prettyTool(name: string): string {
+   return (m ? m[2]! : name || '').replace(/_/g, ' ');
+ }
+ 
++// Waiting for its next prompt with commands still running in the background:
++// at work, not idle.
++function shownStatus(n: MissionNode): string {
++  return n.status === 'idle' && !n.endedAt && n.background ? 'background' :
++                                                             n.status;
++}
++
+ function statusText(n: MissionNode): string {
++  if (shownStatus(n) === 'background') {
++    return `Running ${n.background} task${
++        n.background === 1 ? '' : 's'} in the background`;
++  }
+   if (n.status === 'tool' && n.tool) {
+     return n.tool.name === 'Compacting' ? 'Compacting context' :
+                                           `Running ${prettyTool(n.tool.name)}`;
+@@ -440,7 +453,7 @@ export class MeridianMissionElement extends CrLitElement {
+           sublabel: n.sublabel && n.sublabel !== n.label ? n.sublabel : '',
+           where: sub ? '' : WHERE[n.where] || '',
+           project: sub ? '' : n.project || '',
+-          status: n.status,
++          status: shownStatus(n),
+           statusText: statusText(n),
+           toolSummary: (n.status === 'tool' || n.status === 'waiting') &&
+                   n.tool?.summary ?
+@@ -454,7 +467,8 @@ export class MeridianMissionElement extends CrLitElement {
+               n.source === 'assistant' ? icon('bolt', 13) :
+                                          null,
+           live: !n.endedAt &&
+-              ['starting', 'thinking', 'tool'].includes(n.status),
++              ['starting', 'thinking', 'tool', 'background'].includes(
++                  shownStatus(n)),
+           ended: !!n.endedAt,
+           selected: n.id === this.selected_,
+         });
+@@ -478,7 +492,7 @@ export class MeridianMissionElement extends CrLitElement {
+         n.sublabel !== n.label ? n.sublabel : null,
+         n.parentId && root ? `in ${root.label}` : null,
+       ].filter(Boolean).join(' · '),
+-      status: n.status,
++      status: shownStatus(n),
+       statusText: statusText(n),
+       where: WHERE_LONG[n.where] || n.where || '—',
+       whereTitle: n.selfReported ?

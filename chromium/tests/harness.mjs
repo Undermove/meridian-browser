@@ -198,12 +198,14 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
         };
       }));
     },
-    // A tab's page (the first target whose URL starts with `prefix`), with eval/waitFor/cdp/close.
+    // A tab's page (the first target whose URL starts with `prefix`; the URL itself when `prefix`
+    // ends with '$'), with eval/waitFor/cdp/close.
     async page(prefix, timeout = 15000) {
       const end = Date.now() + timeout;
+      const exact = prefix.endsWith('$') ? prefix.slice(0, -1) : null;
       let t;
       while (!t && Date.now() < end) {
-        try { t = (await (await fetch(`${base}/json/list`)).json()).find((x) => x.type === 'page' && x.url.startsWith(prefix)); } catch {}
+        try { t = (await (await fetch(`${base}/json/list`)).json()).find((x) => x.type === 'page' && (exact !== null ? x.url === exact : x.url.startsWith(prefix))); } catch {}
         if (!t) await sleep(150);
       }
       if (!t) throw new Error(`no page at ${prefix}`);

@@ -1,0 +1,268 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 19 Nov 2026 19:51:01 +0400
+Subject: [PATCH 174/177] Meridian: crash sweep fixes, Workbench icon, context
+ menu test hook
+
+Offers, side panel titles, reading mode in a background tab and the share
+bubble without an anchor no longer crash Meridian's window. The Workbench's
+favicon keeps its colours. --meridian-test-context-menu-command takes @file
+(list / an id) so a test can walk every context menu item.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/favicon/favicon_utils.cc       |  5 ++-
+ chrome/browser/meridian/test_switches.cc      | 34 +++++++++++++++++++
+ chrome/browser/meridian/test_switches.h       | 11 ++++++
+ chrome/browser/ui/browser_commands.cc         |  6 +++-
+ .../read_anything_entry_point_controller.cc   |  5 +--
+ .../sharing_hub_window_controller.cc          |  7 ++++
+ ...chrome_web_contents_view_delegate_views.cc | 23 ++++++++-----
+ ...me_web_contents_view_delegate_views_mac.mm | 23 ++++++++-----
+ .../ui/webui_browser/webui_browser_ui.cc      |  4 ++-
+ 9 files changed, 97 insertions(+), 21 deletions(-)
+
+diff --git a/chrome/browser/favicon/favicon_utils.cc b/chrome/browser/favicon/favicon_utils.cc
+index 398c6080a5..e90edffa96 100644
+--- a/chrome/browser/favicon/favicon_utils.cc
++++ b/chrome/browser/favicon/favicon_utils.cc
+@@ -170,7 +170,10 @@ bool ShouldThemifyFavicon(GURL url) {
+          url.host() != chrome::kChromeUINetExportHost &&
+          url.host() != chrome::kChromeUINewTabHost &&
+          url.host() != chrome::kChromeUIContextualTasksHost &&
+-         url.host() != password_manager::kChromeUIPasswordManagerHost;
++         url.host() != password_manager::kChromeUIPasswordManagerHost &&
++         // Meridian: the Workbench's own icon (</> on the accent) was
++         // recoloured into a grey square on a light sidebar.
++         url.host() != "workbench";
+ }
+ 
+ bool ShouldThemifyFaviconForEntry(content::NavigationEntry* entry) {
+diff --git a/chrome/browser/meridian/test_switches.cc b/chrome/browser/meridian/test_switches.cc
+index 7bb31fef35..43d717d92a 100644
+--- a/chrome/browser/meridian/test_switches.cc
++++ b/chrome/browser/meridian/test_switches.cc
+@@ -5,10 +5,15 @@
+ #include "chrome/browser/meridian/test_switches.h"
+ 
+ #include <limits.h>
++
++#include <algorithm>
+ #include <stdlib.h>
+ 
+ #include "base/command_line.h"
+ #include "base/files/file_util.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/threading/thread_restrictions.h"
+ #include "build/build_config.h"
+ 
+ #if BUILDFLAG(IS_WIN)
+@@ -101,4 +106,33 @@ base::FilePath TestSwitchPath(std::string_view name) {
+              : base::FilePath();
+ }
+ 
++std::optional<int> TestContextMenuCommand(const std::vector<int>& ids) {
++  std::string value = TestSwitchValue("meridian-test-context-menu-command");
++  if (value.empty()) {
++    return std::nullopt;
++  }
++  if (value.starts_with("@")) {
++    base::ScopedAllowBlockingForTesting allow_blocking;
++    base::FilePath file = base::FilePath::FromUTF8Unsafe(value.substr(1));
++    if (!base::ReadFileToString(file, &value)) {
++      return 0;
++    }
++    value = std::string(base::TrimWhitespaceASCII(value, base::TRIM_ALL));
++    if (value == "list") {
++      std::string out;
++      for (int id : ids) {
++        out += base::NumberToString(id) + "\n";
++      }
++      base::WriteFile(file.AddExtensionASCII("ids"), out);
++      return 0;
++    }
++  }
++  int command = 0;
++  if (!base::StringToInt(value, &command) ||
++      std::find(ids.begin(), ids.end(), command) == ids.end()) {
++    return 0;
++  }
++  return command;
++}
++
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/test_switches.h b/chrome/browser/meridian/test_switches.h
+index c6ff6680ee..ef9c51c6ce 100644
+--- a/chrome/browser/meridian/test_switches.h
++++ b/chrome/browser/meridian/test_switches.h
+@@ -8,6 +8,9 @@
+ #include <string>
+ #include <string_view>
+ 
++#include <optional>
++#include <vector>
++
+ #include "base/files/file_path.h"
+ 
+ namespace meridian {
+@@ -25,6 +28,14 @@ bool HasTestSwitch(std::string_view name);
+ std::string TestSwitchValue(std::string_view name);
+ base::FilePath TestSwitchPath(std::string_view name);
+ 
++// --meridian-test-context-menu-command: the context menu item a test picks
++// in place of the native menu a person would click. Its value is a command
++// id, or "@<file>" whose contents are read at each menu: a command id, or
++// "list" to write the menu's command ids (`ids`, one per line) to
++// "<file>.ids". nullopt when the switch isn't set (show the menu); else the
++// command to run, 0 for none.
++std::optional<int> TestContextMenuCommand(const std::vector<int>& ids);
++
+ }  // namespace meridian
+ 
+ #endif  // CHROME_BROWSER_MERIDIAN_TEST_SWITCHES_H_
+diff --git a/chrome/browser/ui/browser_commands.cc b/chrome/browser/ui/browser_commands.cc
+index 18baf2f144..00bd9deb45 100644
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -2221,7 +2221,11 @@ void ShowOffersAndRewardsForPage(BrowserWindowInterface* browser) {
+   autofill::OfferNotificationBubbleControllerImpl* controller =
+       autofill::OfferNotificationBubbleControllerImpl::FromWebContents(
+           web_contents);
+-  CHECK(controller, base::NotFatalUntil::M162);
++  // Meridian: no offer bubble for this page (the command ran without its
++  // page action) is no crash.
++  if (!controller) {
++    return;
++  }
+   controller->ReshowBubble();
+ }
+ 
+diff --git a/chrome/browser/ui/read_anything/read_anything_entry_point_controller.cc b/chrome/browser/ui/read_anything/read_anything_entry_point_controller.cc
+index f42e27e53b..71a75158cf 100644
+--- a/chrome/browser/ui/read_anything/read_anything_entry_point_controller.cc
++++ b/chrome/browser/ui/read_anything/read_anything_entry_point_controller.cc
+@@ -338,9 +338,10 @@ void ReadAnythingEntryPointController::UpdatePageActionVisibility(
+     return;
+   }
+ 
++  // Meridian: a page in a tab that isn't shown (opened in the background, a
++  // space's tab) asked for the chip and crashed here. It just doesn't show.
+   if (!tab->IsActivated()) {
+-    DUMP_WILL_BE_CHECK(!should_show_page_action)
+-        << "should_show_page_action should not be set for inactive tabs.";
++    should_show_page_action = false;
+   }
+ 
+   page_actions::PageActionController* page_action_controller =
+diff --git a/chrome/browser/ui/sharing_hub/sharing_hub_window_controller.cc b/chrome/browser/ui/sharing_hub/sharing_hub_window_controller.cc
+index f5e96d7bb5..636b5b8fe3 100644
+--- a/chrome/browser/ui/sharing_hub/sharing_hub_window_controller.cc
++++ b/chrome/browser/ui/sharing_hub/sharing_hub_window_controller.cc
+@@ -46,6 +46,10 @@ SharingHubBubbleView* SharingHubWindowController::ShowSharingHubBubble(
+   // Meridian: also without a toolbar (the WebUI browser; this crashed).
+   views::BubbleAnchor anchor =
+       bubble_anchor_util::GetToolbarOrPageInfoAnchor(&*browser_, std::nullopt);
++  // Nothing to anchor to (no page info yet): no bubble rather than a crash.
++  if (anchor.IsNull()) {
++    return nullptr;
++  }
+   auto bubble = std::make_unique<SharingHubBubbleViewImpl>(
+       anchor, attempt,
+       SharingHubBubbleController::CreateOrGetFromWebContents(
+@@ -67,6 +71,9 @@ SharingHubWindowController::ShowScreenshotCapturedBubble(
+   // Meridian: also without a toolbar (the WebUI browser; this crashed).
+   views::BubbleAnchor anchor =
+       bubble_anchor_util::GetToolbarOrPageInfoAnchor(&*browser_, std::nullopt);
++  if (anchor.IsNull()) {
++    return nullptr;
++  }
+   auto bubble = std::make_unique<ScreenshotCapturedBubble>(
+       anchor, contents, image,
+       Profile::FromBrowserContext(contents->GetBrowserContext()));
+diff --git a/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views.cc b/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views.cc
+index 83a3e71114..c1cf9c1574 100644
+--- a/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views.cc
++++ b/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views.cc
+@@ -102,15 +102,22 @@ void ChromeWebContentsViewDelegateViews::ShowMenu(
+ 
+   // Meridian's tests: the item a person would pick (by its command id), with
+   // no native menu to click.
+-  if (std::string id = meridian::TestSwitchValue(
+-          "meridian-test-context-menu-command");
+-      !id.empty()) {
+-    int command = 0;
+-    if (base::StringToInt(id, &command) &&
+-        context_menu_->menu_model().GetIndexOfCommandId(command)) {
+-      context_menu_->ExecuteCommand(command, 0);
++  {
++    std::vector<int> ids;
++    const ui::MenuModel& model = context_menu_->menu_model();
++    for (size_t i = 0; i < model.GetItemCount(); ++i) {
++      if (model.GetTypeAt(i) != ui::MenuModel::TYPE_SEPARATOR &&
++          model.GetTypeAt(i) != ui::MenuModel::TYPE_SUBMENU &&
++          model.IsEnabledAt(i) && model.IsVisibleAt(i)) {
++        ids.push_back(model.GetCommandIdAt(i));
++      }
++    }
++    if (std::optional<int> command = meridian::TestContextMenuCommand(ids)) {
++      if (*command) {
++        context_menu_->ExecuteCommand(*command, 0);
++      }
++      return;
+     }
+-    return;
+   }
+ 
+   context_menu_->Show();
+diff --git a/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views_mac.mm b/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views_mac.mm
+index 9bd01cb6ae..a30ad4ab09 100644
+--- a/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views_mac.mm
++++ b/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views_mac.mm
+@@ -214,15 +214,22 @@ void ChromeWebContentsViewDelegateViewsMac::ShowMenu(
+ 
+   // Meridian's tests: the item a person would pick (by its command id), with
+   // no native menu to click.
+-  if (std::string id = meridian::TestSwitchValue(
+-          "meridian-test-context-menu-command");
+-      !id.empty()) {
+-    int command = 0;
+-    if (base::StringToInt(id, &command) &&
+-        context_menu_->menu_model().GetIndexOfCommandId(command)) {
+-      context_menu_->ExecuteCommand(command, 0);
++  {
++    std::vector<int> ids;
++    const ui::MenuModel& model = context_menu_->menu_model();
++    for (size_t i = 0; i < model.GetItemCount(); ++i) {
++      if (model.GetTypeAt(i) != ui::MenuModel::TYPE_SEPARATOR &&
++          model.GetTypeAt(i) != ui::MenuModel::TYPE_SUBMENU &&
++          model.IsEnabledAt(i) && model.IsVisibleAt(i)) {
++        ids.push_back(model.GetCommandIdAt(i));
++      }
++    }
++    if (std::optional<int> command = meridian::TestContextMenuCommand(ids)) {
++      if (*command) {
++        context_menu_->ExecuteCommand(*command, 0);
++      }
++      return;
+     }
+-    return;
+   }
+ 
+   context_menu_->Show();
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_ui.cc b/chrome/browser/ui/webui_browser/webui_browser_ui.cc
+index 7f2952ab92..a54ad97dd8 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_ui.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_ui.cc
+@@ -79,7 +79,9 @@ std::string SidePanelEntryIdToTitle(SidePanelEntryId id) {
+     case SidePanelEntryId::kBookmarks:
+       return l10n_util::GetStringUTF8(IDS_BOOKMARK_MANAGER_TITLE);
+     default:
+-      NOTREACHED();
++      // Meridian: any other panel (reading mode, say) opened here crashed on
++      // NOTREACHED; it shows untitled instead.
++      return std::string();
+   }
+ }
+ 
