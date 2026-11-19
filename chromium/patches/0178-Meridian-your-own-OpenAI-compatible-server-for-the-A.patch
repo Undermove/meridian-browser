@@ -1,0 +1,590 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 19 Nov 2026 20:43:52 +0400
+Subject: [PATCH 179/179] Meridian: your own OpenAI-compatible server for the
+ AI features
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Settings › AI › Your own server: an API address (the whole endpoint works
+too) and an optional key, checked with the server's model list, stored
+encrypted; its chat models in the picker. http:// only on this computer or
+the local network. The consent sheet names the server's host; a server on
+this computer or the local network needs no question.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/ai/ai_service.cc      |  12 +-
+ chrome/browser/meridian/ai/ai_service.h       |   2 +-
+ chrome/browser/meridian/ai/local_agents.cc    | 132 +++++++++++++++++-
+ chrome/browser/meridian/ai/local_agents.h     |  16 ++-
+ chrome/browser/meridian/ai/providers.cc       |  16 ++-
+ chrome/browser/meridian/prefs.cc              |   1 +
+ chrome/browser/meridian/prefs.h               |   3 +
+ chrome/browser/meridian/sidebar.mojom         |   4 +
+ chrome/browser/meridian/sidebar_handler.cc    |  22 +++
+ chrome/browser/meridian/sidebar_handler.h     |   4 +
+ .../webui_browser/meridian/settings.html.ts   |  23 +++
+ .../webui_browser/meridian/settings.ts        |  59 +++++++-
+ 12 files changed, 282 insertions(+), 12 deletions(-)
+
+diff --git a/chrome/browser/meridian/ai/ai_service.cc b/chrome/browser/meridian/ai/ai_service.cc
+index cc5e0196a2..e94e7e4547 100644
+--- a/chrome/browser/meridian/ai/ai_service.cc
++++ b/chrome/browser/meridian/ai/ai_service.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/meridian/ai/ai_service.h"
+ 
++#include "url/gurl.h"
++
+ #include <utility>
+ 
+ #include "base/base64.h"
+@@ -845,10 +847,18 @@ void AiService::SetConsentAsker(ConsentAsker asker) {
+ }
+ 
+ // static
+-std::string AiService::DestinationOf(const std::string& provider) {
++std::string AiService::DestinationOf(const std::string& provider) const {
+   if (provider == "api" || provider == "claude") {
+     return "Anthropic (Claude)";
+   }
++  // The person's own server: by its address; nothing to ask about when it is
++  // on this computer or the local network.
++  if (provider == "custom") {
++    GURL base(profile_->GetPrefs()->GetString(prefs::kAiCustomBase));
++    return !base.is_valid() || ai::LocalAgents::OnLocalNetwork(base)
++               ? std::string()
++               : std::string(base.host());
++  }
+   const ai::Provider* p = ai::FindProvider(provider);
+   if (!p || p->kind == ai::Kind::kOllama || p->kind == ai::Kind::kOpenAiLocal) {
+     return std::string();
+diff --git a/chrome/browser/meridian/ai/ai_service.h b/chrome/browser/meridian/ai/ai_service.h
+index 8cc50292fb..d33e231769 100644
+--- a/chrome/browser/meridian/ai/ai_service.h
++++ b/chrome/browser/meridian/ai/ai_service.h
+@@ -102,7 +102,7 @@ class AiService : public KeyedService {
+                    base::OnceCallback<void(const std::string&)> refuse);
+   // Where a request to `provider` goes, as the question says it: "Anthropic
+   // (Claude)", "OpenAI (ChatGPT)"; empty for a model on this computer.
+-  static std::string DestinationOf(const std::string& provider);
++  std::string DestinationOf(const std::string& provider) const;
+ 
+   ai::LocalAgents& local() { return *local_; }
+   // Chat view conversations.
+diff --git a/chrome/browser/meridian/ai/local_agents.cc b/chrome/browser/meridian/ai/local_agents.cc
+index feb983f3d8..5a7d2d8bd3 100644
+--- a/chrome/browser/meridian/ai/local_agents.cc
++++ b/chrome/browser/meridian/ai/local_agents.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/meridian/ai/local_agents.h"
+ 
+ 
++#include <cstring>
+ #include <utility>
+ 
+ #include "base/base64.h"
+@@ -33,7 +34,9 @@
+ #include "components/prefs/pref_service.h"
+ #include "components/prefs/scoped_user_pref_update.h"
+ #include "content/public/browser/storage_partition.h"
++#include "net/base/ip_address.h"
+ #include "net/base/load_flags.h"
++#include "net/base/url_util.h"
+ #include "net/http/http_response_headers.h"
+ #include "net/traffic_annotation/network_traffic_annotation.h"
+ #include "services/network/public/cpp/resource_request.h"
+@@ -42,6 +45,7 @@
+ #include "services/network/public/cpp/simple_url_loader_stream_consumer.h"
+ #include "services/network/public/mojom/url_response_head.mojom.h"
+ #include "third_party/re2/src/re2/re2.h"
++#include "url/gurl.h"
+ 
+ namespace meridian::ai {
+ 
+@@ -227,7 +231,10 @@ CliOutcome RunCliBlocking(std::string provider_id,
+   return outcome;
+ }
+ 
+-std::string CloudBase(const Provider& p) {
++std::string CloudBase(const Provider& p, const PrefService* prefs) {
++  if (p.id == "custom") {
++    return prefs->GetString(prefs::kAiCustomBase);
++  }
+   std::string mock = TestSwitchValue("meridian-cloud-base-url");
+   return mock.empty() ? p.base : mock + "/" + p.id;
+ }
+@@ -685,7 +692,7 @@ void LocalAgents::HttpChat(const std::string& run_id, Turn turn) {
+                               return;
+                             }
+                             self->StartHttp(run_id, std::move(turn),
+-                                            CloudBase(p) + "/chat/completions",
++                                            CloudBase(p, self->profile_->GetPrefs()) + "/chat/completions",
+                                             key, model);
+                           },
+                           self, run_id, std::move(turn), *key));
+@@ -899,9 +906,12 @@ void LocalAgents::WithCloudKey(
+ void LocalAgents::ListModels(
+     const std::string& id,
+     const std::string& key,
+-    base::OnceCallback<void(int, std::vector<std::string>)> done) {
++    base::OnceCallback<void(int, std::vector<std::string>)> done,
++    const std::string& base) {
+   const Provider* p = FindProvider(id);
+-  auto loader = Request(CloudBase(*p) + "/models", "GET", key, *p);
++  auto loader = Request(
++      (base.empty() ? CloudBase(*p, profile_->GetPrefs()) : base) + "/models",
++      "GET", key, *p);
+   loader->SetTimeoutDuration(base::Seconds(10));
+   network::SimpleURLLoader* raw = loader.get();
+   raw->DownloadToString(
+@@ -1073,7 +1083,121 @@ void LocalAgents::AddCloudKey(
+ 
+ void LocalAgents::RemoveCloudKey(const std::string& id) {
+   ScopedDictPrefUpdate(profile_->GetPrefs(), prefs::kAiCloudKeys)->Remove(id);
++  if (id == "custom") {
++    profile_->GetPrefs()->ClearPref(prefs::kAiCustomBase);
++  }
+   models_.erase(id);
+ }
+ 
++// static
++bool LocalAgents::OnLocalNetwork(const GURL& url) {
++  if (net::IsLocalhost(url) || url.host().ends_with(".local")) {
++    return true;
++  }
++  net::IPAddress ip;
++  return ip.AssignFromIPLiteral(url.HostNoBrackets()) &&
++         !ip.IsPubliclyRoutable();
++}
++
++// static
++std::optional<std::string> LocalAgents::CustomBase(const std::string& raw,
++                                                   std::string* error) {
++  std::string text(base::TrimWhitespaceASCII(raw, base::TRIM_ALL));
++  // The address people copy is often the whole endpoint.
++  for (const char* tail : {"/chat/completions", "/models", "/"}) {
++    while (text.ends_with(tail) && text.size() > strlen(tail)) {
++      text.resize(text.size() - strlen(tail));
++    }
++  }
++  GURL url(text);
++  if (!url.is_valid() || !url.has_host() ||
++      !(url.SchemeIs("https") || url.SchemeIs("http")) ||
++      url.has_username() || url.has_password() || url.has_query() ||
++      url.has_ref()) {
++    *error =
++        "That isn’t an API address. It looks like "
++        "“https://api.example.com/v1”: the part before /chat/completions.";
++    return std::nullopt;
++  }
++  // The key would travel in the clear: only to this computer or the local
++  // network.
++  if (url.SchemeIs("http") && !OnLocalNetwork(url)) {
++    *error =
++        "Use an https:// address. http:// is only for a server on this "
++        "computer or your local network: the key would be sent unencrypted.";
++    return std::nullopt;
++  }
++  return text;
++}
++
++void LocalAgents::AddCustom(
++    const std::string& raw_base,
++    const std::string& raw_key,
++    base::OnceCallback<void(bool, std::string)> done) {
++  std::string error;
++  std::optional<std::string> base = CustomBase(raw_base, &error);
++  if (!base) {
++    std::move(done).Run(false, error);
++    return;
++  }
++  std::string key(base::TrimWhitespaceASCII(raw_key, base::TRIM_ALL));
++  ListModels(
++      "custom", key,
++      base::BindOnce(
++          [](base::WeakPtr<LocalAgents> self, std::string base,
++             std::string key, base::OnceCallback<void(bool, std::string)> done,
++             int status, std::vector<std::string> models) {
++            if (!self) {
++              return;
++            }
++            if (status == 401 || status == 403) {
++              std::move(done).Run(false,
++                                  "The server didn’t accept this key.");
++              return;
++            }
++            if (status != 200) {
++              std::move(done).Run(
++                  false, status == 0
++                             ? "Couldn’t reach " + std::string(GURL(base).host()) +
++                                   ". Check the address and your connection."
++                             : "The server answered " +
++                                   base::NumberToString(status) +
++                                   " for " + base +
++                                   "/models: is this an OpenAI-compatible "
++                                   "API address?");
++              return;
++            }
++            if (models.empty()) {
++              std::move(done).Run(false,
++                                  "The server didn’t list any chat models.");
++              return;
++            }
++            self->models_["custom"] = {base::TimeTicks::Now(), models};
++            g_browser_process->os_crypt_async()->GetInstance(base::BindOnce(
++                [](base::WeakPtr<LocalAgents> self, std::string base,
++                   std::string key,
++                   base::OnceCallback<void(bool, std::string)> done,
++                   scoped_refptr<os_crypt_async::Encryptor> encryptor) {
++                  std::string sealed;
++                  if (!self || !encryptor ||
++                      !encryptor->EncryptString(key, &sealed)) {
++                    std::move(done).Run(
++                        false,
++                        "Meridian couldn’t reach the keychain to store the "
++                        "key safely.");
++                    return;
++                  }
++                  self->profile_->GetPrefs()->SetString(prefs::kAiCustomBase,
++                                                        base);
++                  ScopedDictPrefUpdate(self->profile_->GetPrefs(),
++                                       prefs::kAiCloudKeys)
++                      ->Set("custom", base::Base64Encode(sealed));
++                  std::move(done).Run(true, std::string());
++                },
++                self, base, key, std::move(done)));
++          },
++          weak_factory_.GetWeakPtr(), *base, key, std::move(done)),
++      *base);
++}
++
+ }  // namespace meridian::ai
+diff --git a/chrome/browser/meridian/ai/local_agents.h b/chrome/browser/meridian/ai/local_agents.h
+index 08cf01a04d..6ff841add0 100644
+--- a/chrome/browser/meridian/ai/local_agents.h
++++ b/chrome/browser/meridian/ai/local_agents.h
+@@ -20,6 +20,8 @@
+ 
+ class Profile;
+ 
++class GURL;
++
+ namespace meridian::ai {
+ 
+ // The other AIs that can answer (providers.h): coding-agent CLIs started per
+@@ -80,6 +82,17 @@ class LocalAgents {
+       base::OnceCallback<void(bool ok, std::string provider, std::string error)>
+           done);
+   void RemoveCloudKey(const std::string& id);
++  // The person's own OpenAI-compatible server: its address (checked: https,
++  // or http on this computer / the local network) and key (may be empty);
++  // checked with its model list before it's stored.
++  void AddCustom(const std::string& base,
++                 const std::string& key,
++                 base::OnceCallback<void(bool ok, std::string error)> done);
++  // An address as typed -> the API base, or nullopt and why.
++  static std::optional<std::string> CustomBase(const std::string& raw,
++                                               std::string* error);
++  // This computer or the local network (no AI service on the internet).
++  static bool OnLocalNetwork(const GURL& url);
+   void CloudModels(const std::string& id,
+                    base::OnceCallback<void(std::vector<std::string> models,
+                                            std::string error)> done);
+@@ -119,7 +132,8 @@ class LocalAgents {
+   void ListModels(const std::string& id,
+                   const std::string& key,
+                   base::OnceCallback<void(int status,
+-                                          std::vector<std::string>)> done);
++                                          std::vector<std::string>)> done,
++                  const std::string& base = std::string());
+ 
+   raw_ptr<Profile> profile_;
+   base::FilePath workdir_;
+diff --git a/chrome/browser/meridian/ai/providers.cc b/chrome/browser/meridian/ai/providers.cc
+index d440e18eee..123cdc7e50 100644
+--- a/chrome/browser/meridian/ai/providers.cc
++++ b/chrome/browser/meridian/ai/providers.cc
+@@ -193,6 +193,16 @@ std::vector<Provider> MakeProviders() {
+     provider.docs = c.console;
+     p.push_back(std::move(provider));
+   }
++  // Any other OpenAI-compatible API (a company's gateway, Together, vLLM…):
++  // its address is the person's (prefs::kAiCustomBase).
++  Provider custom;
++  custom.id = "custom";
++  custom.label = "Custom";
++  custom.vendor = "Your AI server";
++  custom.kind = Kind::kCloud;
++  custom.policy = Policy::kDefault;
++  custom.plan = "any OpenAI-compatible API: its address and key";
++  p.push_back(std::move(custom));
+   return p;
+ }
+ 
+@@ -720,7 +730,9 @@ std::vector<std::string> ChatModels(const std::string& id,
+                                     const base::DictValue& answer) {
+   std::vector<std::string> out;
+   auto it = Cloud().find(id);
+-  if (it == Cloud().end()) {
++  // The person's own server: every model it lists that can chat.
++  const bool custom = id == "custom";
++  if (it == Cloud().end() && !custom) {
+     return out;
+   }
+   const base::ListValue* list = answer.FindList("data");
+@@ -730,7 +742,7 @@ std::vector<std::string> ChatModels(const std::string& id,
+   if (!list) {
+     return out;
+   }
+-  RE2 keep(it->second.keep);
++  RE2 keep(custom ? std::string(".") : std::string(it->second.keep));
+   RE2 not_chat(kNotChat);
+   for (const base::Value& m : *list) {
+     if (!m.is_dict()) {
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index c5de57ba2e..085b602664 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -29,6 +29,7 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterStringPref(kAiProvider, std::string());
+   registry->RegisterStringPref(kAiConsent, std::string());
+   registry->RegisterDictionaryPref(kAiCloudKeys);
++  registry->RegisterStringPref(kAiCustomBase, std::string());
+   registry->RegisterDictionaryPref(kAiModels);
+   registry->RegisterBooleanPref(kAiOtherAgents, false);
+   registry->RegisterBooleanPref(kAiTidy, true);
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index 24dc774ea4..b9db6cad1f 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -54,6 +54,9 @@ inline constexpr char kAiConsent[] = "meridian.ai_consent";
+ // Other providers' API keys: provider id -> key encrypted with OSCrypt
+ // (base64).
+ inline constexpr char kAiCloudKeys[] = "meridian.ai_cloud_keys";
++// The person's own OpenAI-compatible server ("custom"): its API base, such as
++// "https://api.together.xyz/v1" (its key is in kAiCloudKeys).
++inline constexpr char kAiCustomBase[] = "meridian.ai_custom_base";
+ // The model picked per cloud provider (provider id -> model); missing = the
+ // default.
+ inline constexpr char kAiModels[] = "meridian.ai_models";
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index cebf74ed9e..a84f5880a3 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -753,6 +753,10 @@ interface SidebarHandler {
+   // company, stored encrypted. `provider` is "api" for a Claude key.
+   AddAiKey(string key) => (bool ok, string provider, string error);
+   RemoveCloudKey(string id);
++  // The person's own OpenAI-compatible server ("custom"): its API address
++  // and key (may be empty), checked with its model list before it's stored.
++  AddCustomAi(string base_url, string key) => (bool ok, string error);
++  GetCustomAi() => (string base_url);
+   // The chat models a cloud key can use, and the one picked ("" = default).
+   GetCloudModels(string id)
+       => (array<string> models, string chosen, string error);
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index d066ae463d..74653d3643 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -1154,6 +1154,28 @@ void SidebarHandler::GetAiProviders(bool fresh,
+           std::move(callback)));
+ }
+ 
++void SidebarHandler::AddCustomAi(const std::string& base_url,
++                                 const std::string& key,
++                                 AddCustomAiCallback callback) {
++  AiService* ai = AiServiceFactory::GetForProfile(browser_->GetProfile());
++  if (!ai) {
++    std::move(callback).Run(false, "AI isn’t available in a private window.");
++    return;
++  }
++  ai->local().AddCustom(
++      base_url, key,
++      base::BindOnce(
++          [](AddCustomAiCallback callback, bool ok, std::string error) {
++            std::move(callback).Run(ok, error);
++          },
++          std::move(callback)));
++}
++
++void SidebarHandler::GetCustomAi(GetCustomAiCallback callback) {
++  std::move(callback).Run(
++      browser_->GetProfile()->GetPrefs()->GetString(prefs::kAiCustomBase));
++}
++
+ void SidebarHandler::AddAiKey(const std::string& key,
+                               AddAiKeyCallback callback) {
+   AiService* ai = AiServiceFactory::GetForProfile(browser_->GetProfile());
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 7f93ead860..087a39b6fd 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -229,6 +229,10 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void GetAiProviders(bool fresh, GetAiProvidersCallback callback) override;
+   void AddAiKey(const std::string& key, AddAiKeyCallback callback) override;
+   void RemoveCloudKey(const std::string& id) override;
++  void AddCustomAi(const std::string& base_url,
++                   const std::string& key,
++                   AddCustomAiCallback callback) override;
++  void GetCustomAi(GetCustomAiCallback callback) override;
+   void GetCloudModels(const std::string& id,
+                       GetCloudModelsCallback callback) override;
+   void SetCloudModel(const std::string& id, const std::string& model) override;
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index ee0aadbf81..fa4da92189 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -506,6 +506,29 @@ export function getHtml(this: MeridianSettingsElement) {
+                     @click="${this.onSaveKeyClick_}">Add</button>
+               </div>
+             </div>
++            <div class="card" id="customCard">
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Your own server</div>
++                  <div class="row-desc">Any OpenAI-compatible API: a company
++                    gateway, Together, vLLM, a server at home. The key can be
++                    empty.</div>
++                </div>
++              </div>
++              <div class="row">
++                <input id="customBase" class="text grow" type="url"
++                    placeholder="https://api.example.com/v1" spellcheck="false"
++                    autocomplete="off" .value="${this.customBase_}"
++                    @keydown="${this.onCustomKeydown_}">
++              </div>
++              <div class="row">
++                <input id="customKey" class="text grow" type="password"
++                    placeholder="API key (optional)" spellcheck="false"
++                    autocomplete="off" @keydown="${this.onCustomKeydown_}">
++                <button id="saveCustom" class="btn primary"
++                    @click="${this.onSaveCustomClick_}">Connect</button>
++              </div>
++            </div>
+             <p class="note" id="keyMessage">${this.keyMessage_ ||
+                 'Anthropic, OpenAI, Google Gemini, OpenRouter, xAI, Mistral, DeepSeek or Groq: Meridian recognises the key, checks it with that company and only then saves it, encrypted. Pages never see it. You pay that company for what you use.'}</p>
+           </div>
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 363eb627b7..ed9ecc21ba 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -105,6 +105,15 @@ export interface SetupRequest {
+   command: string;
+ }
+ 
++// "api.example.com" from a server's address.
++function hostOf(url: string): string {
++  try {
++    return new URL(url).host;
++  } catch {
++    return url;
++  }
++}
++
+ const MARKS: {[id: string]: string} = {
+   openai: '#10a37f',
+   gemini: '#4285f4',
+@@ -180,6 +189,7 @@ export class MeridianSettingsElement extends CrLitElement {
+       aiRows_: {state: true, type: Array},
+       otherRows_: {state: true, type: Array},
+       keyRows_: {state: true, type: Array},
++      customBase_: {state: true, type: String},
+       claudeRow_: {state: true, type: Object},
+       autoOn_: {state: true, type: Boolean},
+       otherAgents_: {state: true, type: Boolean},
+@@ -229,6 +239,8 @@ export class MeridianSettingsElement extends CrLitElement {
+   protected accessor aiRows_: AiRow[] = [];
+   protected accessor otherRows_: AiRow[] = [];
+   protected accessor keyRows_: KeyRow[] = [];
++  // The person's own OpenAI-compatible server, if connected.
++  protected accessor customBase_: string = '';
+   protected accessor claudeRow_: AiRow|null = null;
+   protected accessor autoOn_: boolean = true;
+   protected accessor otherAgents_: boolean = false;
+@@ -480,6 +492,7 @@ export class MeridianSettingsElement extends CrLitElement {
+   // Finding the CLIs goes through the login shell and can take seconds: the
+   // page draws first and fills in after.
+   private async loadProviders_(fresh: boolean) {
++    this.customBase_ = (await this.handler_.getCustomAi()).baseUrl;
+     const {providers} = await this.handler_.getAiProviders(fresh);
+     this.providers_ = providers;
+     for (const p of providers) {
+@@ -526,8 +539,10 @@ export class MeridianSettingsElement extends CrLitElement {
+       actionLabel = 'Check';
+     }
+     const cloud = p.kind === 'cloud';
+-    let desc = cloud ? `${p.vendor} · your API key, pay as you go` :
+-                       `${p.vendor} · works with ${p.plan}`;
++    let desc = p.id === 'custom' ?
++        `${hostOf(this.customBase_)} · your OpenAI-compatible server` :
++        cloud ? `${p.vendor} · your API key, pay as you go` :
++                `${p.vendor} · works with ${p.plan}`;
+     if (!cloud && p.account) {
+       desc += ` · ${p.account}`;
+     }
+@@ -578,7 +593,9 @@ export class MeridianSettingsElement extends CrLitElement {
+         this.providers_.filter(p => p.kind === 'cloud' && p.installed)
+             .map(p => ({
+                    id: p.id,
+-                   vendor: p.vendor,
++                   vendor: p.id === 'custom' ?
++                       `Your server (${hostOf(this.customBase_)})` :
++                       p.vendor,
+                    desc: keyText(`Answers in ⌘T and ⌘J as ${p.label}.`),
+                  }));
+     this.claudeRow_ = {
+@@ -776,6 +793,39 @@ export class MeridianSettingsElement extends CrLitElement {
+         keyText(`Saved, encrypted on this Mac. ${name} answers in ⌘T and ⌘J now.`);
+   }
+ 
++  protected async onSaveCustomClick_() {
++    const baseInput =
++        this.shadowRoot.querySelector<HTMLInputElement>('#customBase');
++    const keyInput =
++        this.shadowRoot.querySelector<HTMLInputElement>('#customKey');
++    const base = baseInput?.value.trim() || '';
++    if (!base) {
++      baseInput?.focus();
++      return;
++    }
++    this.keyMessage_ = 'Checking the server…';
++    const {ok, error} =
++        await this.handler_.addCustomAi(base, keyInput?.value.trim() || '');
++    if (!ok) {
++      this.keyMessage_ = error;
++      return;
++    }
++    keyInput!.value = '';
++    this.customBase_ = (await this.handler_.getCustomAi()).baseUrl;
++    const {custom: _old, ...rest} = this.cloudModels_;
++    this.cloudModels_ = rest;
++    this.save_({aiProvider: 'custom'});
++    await this.loadProviders_(false);
++    this.keyMessage_ = `Connected to ${
++        hostOf(this.customBase_)}. It answers in ⌘T and ⌘J now.`;
++  }
++
++  protected onCustomKeydown_(e: KeyboardEvent) {
++    if (e.key === 'Enter') {
++      this.onSaveCustomClick_();
++    }
++  }
++
+   protected onKeyInputKeydown_(e: KeyboardEvent) {
+     if (e.key === 'Enter') {
+       this.onSaveKeyClick_();
+@@ -794,6 +844,9 @@ export class MeridianSettingsElement extends CrLitElement {
+   protected async onRemoveCloudKeyClick_(e: Event) {
+     const id = (e.currentTarget as HTMLElement).dataset['id'] || '';
+     this.handler_.removeCloudKey(id);
++    if (id === 'custom') {
++      this.customBase_ = '';
++    }
+     if (this.settings_?.aiProvider === id) {
+       this.save_({aiProvider: ''});
+     }
