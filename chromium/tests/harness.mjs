@@ -140,6 +140,10 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
   const proc = spawn(app, [
     `--user-data-dir=${profile}`, `--remote-debugging-port=${port}`, '--use-mock-keychain',
     '--meridian-keep-keyboard-layout',
+    // In the background, beside the person working on this Mac: never the active app, no windows
+    // on screen, no Dock icon (input goes over the DevTools protocol). MERIDIAN_FOREGROUND=1 shows
+    // them (the few tests that need a real window ask for it themselves).
+    ...(process.platform === 'darwin' && !process.env.MERIDIAN_FOREGROUND && !args.includes('--meridian-test-foreground') ? ['--meridian-test-background'] : []),
     ...(firstRun ? [] : ['--no-first-run']), '--no-default-browser-check', '--window-size=1280,860',
     // Keep drawing when the window is covered or the display sleeps (input waits for frames).
     '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
