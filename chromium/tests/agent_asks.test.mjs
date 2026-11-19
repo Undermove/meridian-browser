@@ -52,7 +52,9 @@ def permission(tool, inp, suggestions):
     current[0] = None
     for p in procs:
         if p.poll() is None:
-            try: os.killpg(p.pid, 9)
+            try:
+                if hasattr(os, 'killpg'): os.killpg(p.pid, 9)
+                else: p.kill()
             except Exception: pass
     print('DECIDED %s %s %s' % (d['behavior'], by, json.dumps(d.get('updatedPermissions', []))), flush=True)
     if d['behavior'] == 'allow': hook('PostToolUse', tool_name=tool, tool_input=inp, tool_use_id='u-' + tool, tool_response={})
