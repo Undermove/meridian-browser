@@ -67,5 +67,6 @@ test('the command bar answers sums, units, currencies and times as you type; Ret
     await b.waitFor(`${CB}.getElementById('quick')?.querySelector('.switch').textContent === 'Copied'`);
     await b.waitFor(`!${open}`);
     if (process.platform === 'darwin') assert.equal(execFileSync('pbpaste').toString(), '42');
+    if (process.platform === 'win32') assert.equal(execFileSync('powershell', ['-NoProfile', '-Command', 'Get-Clipboard']).toString().trim(), '42');
   } finally { await b.close(); ecb.close(); }
 });
