@@ -1,6 +1,7 @@
 // When the browser process crashes, every window and the agents working in them go with it. A
 // watcher reopens Meridian after a crash (not after a clean quit). Here in its dry mode: it only
-// leaves its mark, so no window appears on the screen.
+// leaves its mark, so no window appears on the screen. (On Windows the browser is ended outright,
+// without a clean exit, as a crash does.)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -10,17 +11,19 @@ import { launch, SB } from './harness.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const MARK = 'Meridian Crash Relaunch';
+// The browser ends without a clean exit (Windows has no SIGSEGV to send: it is ended outright).
+const CRASH = process.platform === 'win32' ? 'SIGKILL' : 'SIGSEGV';
 const exitType = (profile) => { try { return JSON.parse(fs.readFileSync(path.join(profile, 'Default', 'Preferences'), 'utf8')).profile?.exit_type; } catch { return undefined; } };
 const waitFor = async (what, ms = 15000) => { for (const end = Date.now() + ms; Date.now() < end; await sleep(200)) if (what()) return true; return false; };
 
-test('a crash of the browser reopens it (the watcher marks it); a clean quit does not', { skip: process.platform !== 'darwin' && 'macOS watcher' }, async () => {
+test('a crash of the browser reopens it (the watcher marks it); a clean quit does not', { skip: !['darwin', 'win32'].includes(process.platform) && 'macOS and Windows watcher' }, async () => {
   // A crash.
   let profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
   let b = await launch(['about:blank'], { profile, args: ['--meridian-crash-relaunch=dry'] });
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
     assert.ok(await waitFor(() => exitType(profile) === 'Crashed'), 'the running browser counts as not cleanly exited');
-    process.kill(b.proc.pid, 'SIGSEGV');
+    process.kill(b.proc.pid, CRASH);
     assert.ok(await waitFor(() => fs.existsSync(path.join(profile, MARK))), 'the watcher would reopen Meridian');
     assert.equal(fs.readFileSync(path.join(profile, MARK), 'utf8'), 'would relaunch');
   } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); }
@@ -41,7 +44,7 @@ test('a crash of the browser reopens it (the watcher marks it); a clean quit doe
   b = await launch(['about:blank'], { profile });
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-    process.kill(b.proc.pid, 'SIGSEGV');
+    process.kill(b.proc.pid, CRASH);
     await sleep(4000);
     assert.equal(fs.existsSync(path.join(profile, MARK)), false);
   } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); }
