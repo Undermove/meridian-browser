@@ -103,6 +103,10 @@ test('full access: an MCP client lists, opens, reads, clicks, types, screenshots
     assert.equal(tabs.find((t) => t.zone === 'today').title, 'Home');
     const opened = (await mcp.call('open_tab', { url: s.url('/form'), activate: true })).value;
     assert.equal(opened.title, 'Form');
+    // Local files stay closed to agents, with an honest error rather than "https://file///...".
+    const local = await mcp.call('open_tab', { url: 'file:///etc/hosts' });
+    assert.match(local.error || '', /only http\(s\) URLs/);
+    assert.ok(!(await mcp.call('list_tabs')).value.some((t) => /file\//.test(t.url || '')), 'no tab for the file URL');
     // The window names the agent while it works.
     await b.waitFor(`app.$.agent.working && ${AG}.querySelector('.what').textContent.includes('test-client')`);
     const page = (await mcp.call('read_page')).value;
