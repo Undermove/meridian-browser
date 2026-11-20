@@ -57,7 +57,7 @@ function baseOf(id) {
 function headersFor(id, key) {
   const h = { authorization: `Bearer ${key}` };
   // OpenRouter shows which app sent the request (their optional attribution headers).
-  if (id === 'openrouter') { h['HTTP-Referer'] = 'https://undermove.github.io/meridian-browser/'; h['X-Title'] = 'Meridian'; }
+  if (id === 'openrouter') { h['HTTP-Referer'] = 'https://meridianbrowser.app/'; h['X-Title'] = 'Meridian'; }
   return h;
 }
 
