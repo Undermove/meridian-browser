@@ -1,0 +1,892 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Sat, 21 Nov 2026 02:00:26 +0400
+Subject: [PATCH 218/219] Meridian: answers right in the command bar (sums,
+ units, currencies, times); Return copies
+
+As in Brk/Raycast: "2+2*3", "15% of 240", "5 km in miles", "100 f to c",
+"100 usd in eur" (the ECB's daily rates, fetched when first asked, once a
+day, without cookies), "time in tokyo", "5pm london in new york". A
+number or a word alone stays a search.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   2 +
+ chrome/browser/meridian/currency_rates.cc     | 140 ++++++
+ chrome/browser/meridian/currency_rates.h      |  32 ++
+ chrome/browser/meridian/sidebar.mojom         |   3 +
+ chrome/browser/meridian/sidebar_handler.cc    |  14 +
+ chrome/browser/meridian/sidebar_handler.h     |   1 +
+ .../browser/resources/webui_browser/BUILD.gn  |   1 +
+ .../webui_browser/meridian/command_bar.css    |  16 +
+ .../meridian/command_bar.html.ts              |  12 +
+ .../webui_browser/meridian/command_bar.ts     |  52 +++
+ .../resources/webui_browser/meridian/icons.ts |   3 +
+ .../webui_browser/meridian/quick_answers.ts   | 422 ++++++++++++++++++
+ 12 files changed, 698 insertions(+)
+ create mode 100644 chrome/browser/meridian/currency_rates.cc
+ create mode 100644 chrome/browser/meridian/currency_rates.h
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/quick_answers.ts
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index cf84edf43c..a64a2cff40 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -322,6 +322,8 @@ source_set("meridian") {
+     "space_profiles.cc",
+     "space_profiles.h",
+     "little_window.h",
++    "currency_rates.cc",
++    "currency_rates.h",
+     "sidebar_handler.cc",
+     "sidebar_handler.h",
+     "sidebar_service_factory.cc",
+diff --git a/chrome/browser/meridian/currency_rates.cc b/chrome/browser/meridian/currency_rates.cc
+new file mode 100644
+index 0000000000..464f48ed89
+--- /dev/null
++++ b/chrome/browser/meridian/currency_rates.cc
+@@ -0,0 +1,140 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/currency_rates.h"
++
++#include <memory>
++#include <utility>
++#include <vector>
++
++#include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/time/time.h"
++#include "chrome/browser/meridian/test_switches.h"
++#include "chrome/browser/profiles/profile.h"
++#include "content/public/browser/storage_partition.h"
++#include "net/base/load_flags.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "third_party/re2/src/re2/re2.h"
++#include "url/gurl.h"
++
++namespace meridian {
++
++namespace {
++
++constexpr char kEcbUrl[] =
++    "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml";
++
++constexpr net::NetworkTrafficAnnotationTag kAnnotation =
++    net::DefineNetworkTrafficAnnotation("meridian_currency_rates", R"(
++      semantics {
++        sender: "Meridian command bar"
++        description: "The European Central Bank's daily currency reference "
++          "rates, to answer a conversion typed in the command bar."
++        trigger: "The person types a currency conversion, at most once a day."
++        data: "None."
++        destination: OTHER
++      }
++      policy {
++        cookies_allowed: NO
++        setting: "Not typing currency conversions."
++        policy_exception_justification: "Not implemented."
++      })");
++
++struct Cache {
++  std::map<std::string, double> rates;
++  std::string date;
++  base::Time fetched;
++  base::Time failed;
++  std::unique_ptr<network::SimpleURLLoader> loader;
++  std::vector<CurrencyRatesCallback> waiting;
++};
++
++Cache& TheCache() {
++  static base::NoDestructor<Cache> cache;
++  return *cache;
++}
++
++void Answer() {
++  Cache& c = TheCache();
++  std::vector<CurrencyRatesCallback> waiting = std::move(c.waiting);
++  c.waiting.clear();
++  for (CurrencyRatesCallback& cb : waiting) {
++    std::move(cb).Run(c.rates, c.date);
++  }
++}
++
++void OnLoaded(std::optional<std::string> body) {
++  Cache& c = TheCache();
++  c.loader.reset();
++  std::string date;
++  std::map<std::string, double> rates =
++      body ? ParseEcbRates(*body, &date) : std::map<std::string, double>();
++  if (rates.empty()) {
++    c.failed = base::Time::Now();
++  } else {
++    c.rates = std::move(rates);
++    c.date = date;
++    c.fetched = base::Time::Now();
++  }
++  Answer();
++}
++
++}  // namespace
++
++std::map<std::string, double> ParseEcbRates(const std::string& xml,
++                                            std::string* date) {
++  std::map<std::string, double> out;
++  re2::StringPiece input(xml);
++  std::string code;
++  std::string rate;
++  static const base::NoDestructor<re2::RE2> kRate(
++      R"(currency\s*=\s*['"]([A-Z]{3})['"]\s+rate\s*=\s*['"]([0-9.]+)['"])");
++  while (re2::RE2::FindAndConsume(&input, *kRate, &code, &rate)) {
++    double value = 0;
++    if (base::StringToDouble(rate, &value) && value > 0) {
++      out[code] = value;
++    }
++  }
++  std::string day;
++  if (re2::RE2::PartialMatch(xml, R"(time\s*=\s*['"](\d{4}-\d{2}-\d{2})['"])",
++                             &day)) {
++    *date = day;
++  }
++  return out;
++}
++
++void GetCurrencyRates(Profile* profile, CurrencyRatesCallback callback) {
++  Cache& c = TheCache();
++  const base::Time now = base::Time::Now();
++  const bool fresh = !c.rates.empty() && now - c.fetched < base::Hours(24);
++  const bool resting = !c.failed.is_null() && now - c.failed < base::Hours(1);
++  if (fresh || resting || !profile) {
++    std::move(callback).Run(c.rates, c.date);
++    return;
++  }
++  c.waiting.push_back(std::move(callback));
++  if (c.loader) {
++    return;
++  }
++  // Tests point it at their own server.
++  std::string test_url = TestSwitchValue("meridian-test-ecb-url");
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = GURL(test_url.empty() ? kEcbUrl : test_url);
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  request->load_flags = net::LOAD_DISABLE_CACHE;
++  c.loader = network::SimpleURLLoader::Create(std::move(request), kAnnotation);
++  c.loader->SetTimeoutDuration(base::Seconds(10));
++  c.loader->DownloadToString(
++      profile->GetDefaultStoragePartition()
++          ->GetURLLoaderFactoryForBrowserProcess()
++          .get(),
++      base::BindOnce(&OnLoaded),
++      256 * 1024);
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/currency_rates.h b/chrome/browser/meridian/currency_rates.h
+new file mode 100644
+index 0000000000..9048740f1c
+--- /dev/null
++++ b/chrome/browser/meridian/currency_rates.h
+@@ -0,0 +1,32 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_CURRENCY_RATES_H_
++#define CHROME_BROWSER_MERIDIAN_CURRENCY_RATES_H_
++
++#include <map>
++#include <string>
++
++#include "base/functional/callback.h"
++
++class Profile;
++
++namespace meridian {
++
++// The European Central Bank's daily reference rates (per euro), for the
++// command bar's "100 usd in eur". Fetched when someone first asks, at most
++// once a day (after a failure: the last ones kept, again after an hour),
++// without cookies. `date` is the rates' own day; empty rates: none yet.
++using CurrencyRatesCallback =
++    base::OnceCallback<void(std::map<std::string, double> rates,
++                            std::string date)>;
++void GetCurrencyRates(Profile* profile, CurrencyRatesCallback callback);
++
++// The ECB file's rates (`<Cube currency='USD' rate='1.08'/>`) and day.
++std::map<std::string, double> ParseEcbRates(const std::string& xml,
++                                            std::string* date);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_CURRENCY_RATES_H_
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index f96ed2aacc..448154977a 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -741,6 +741,9 @@ interface SidebarHandler {
+   SetAgentsPaused(bool paused);
+   // Settings > AI: the CLIs, and registering Meridian's MCP server with one.
+   GetAgentClis() => (array<AgentCli> clis);
++  // The ECB's daily rates per euro, for the command bar's conversions (empty
++  // while none could be fetched); `date` is their day.
++  GetCurrencyRates() => (map<string, double> rates, string date);
+   ConnectAgentCli(string id) => (bool ok, string output);
+ 
+   // The built-in AI (⌘J, Ask in the command bar), with the person's
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index d0ed9b7c5c..b1aef175fb 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -32,6 +32,7 @@
+ #include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/meridian/agent/agent_cli.h"
++#include "chrome/browser/meridian/currency_rates.h"
+ #include "chrome/browser/meridian/ai/chats.h"
+ #include "chrome/browser/meridian/ai/local_agents.h"
+ #include "chrome/browser/meridian/ai/process_runner.h"
+@@ -994,6 +995,19 @@ void SidebarHandler::SetAgentsPaused(bool paused) {
+   }
+ }
+ 
++void SidebarHandler::GetCurrencyRates(GetCurrencyRatesCallback callback) {
++  meridian::GetCurrencyRates(
++      ActiveSpaceProfile(),
++      base::BindOnce(
++          [](GetCurrencyRatesCallback callback,
++             std::map<std::string, double> rates, std::string date) {
++            base::flat_map<std::string, double> out(rates.begin(),
++                                                    rates.end());
++            std::move(callback).Run(std::move(out), date);
++          },
++          std::move(callback)));
++}
++
+ void SidebarHandler::GetAgentClis(GetAgentClisCallback callback) {
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index b652b2e0c1..59bc46b17b 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -219,6 +219,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void ClearArchive() override;
+   void SetAgentsPaused(bool paused) override;
+   void GetAgentClis(GetAgentClisCallback callback) override;
++  void GetCurrencyRates(GetCurrencyRatesCallback callback) override;
+   void ConnectAgentCli(const std::string& id,
+                        ConnectAgentCliCallback callback) override;
+   void HasAiKey(HasAiKeyCallback callback) override;
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index fd052fa3ce..7be5ebed3d 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -56,6 +56,7 @@ build_webui("build") {
+     "meridian/archive.ts",
+     "meridian/command_bar.html.ts",
+     "meridian/command_bar.ts",
++    "meridian/quick_answers.ts",
+     "meridian/keys.ts",
+     "meridian/layout_fix.ts",
+     "meridian/fav.html.ts",
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.css b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+index c5661335af..f58fd78472 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.css
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+@@ -297,3 +297,19 @@ webui-browser-searchbox::part(searchbox-dropdown) {
+ .keys kbd {
+   font: inherit;
+ }
++
++/* An answer right in the bar ("2+2", "5 km in miles"). */
++.tab-row.quick .quick-value {
++  font-size: 15px;
++  font-weight: 600;
++  font-variant-numeric: tabular-nums;
++  user-select: text;
++}
++
++.tab-row.quick .hint {
++  flex: 1;
++  margin-inline-start: 10px;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+index 025ecff9f1..17887887d7 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+@@ -18,6 +18,18 @@ export function getHtml(this: MeridianCommandBarElement) {
+         .placeholderText="${'Search or Enter URL…'}"
+         @keyup="${this.onAddressKeyup_}"
+         @searchbox-navigated="${this.onAddressSearchboxNavigated_}">
++      ${this.quick_ ? html`
++        <button id="quick" class="tab-row quick ${this.tabSel_ < 0 ? 'sel' : ''}"
++            slot="before-matches" data-kind="${this.quick_.kind}"
++            @mousedown="${this.onTabRowMousedown_}"
++            @click="${this.onQuickClick_}">
++          <span class="tab-icon">${icon(this.quick_.kind === 'time' ? 'clock' :
++                                        'calculator', 16)}</span>
++          <span class="quick-value">${this.quick_.value}</span>
++          <span class="hint">${this.quick_.detail}</span>
++          <span class="switch">${this.copied_ ? 'Copied' : 'Copy'}</span>
++          <span class="go">↵</span>
++        </button>` : ''}
+       ${this.layoutFix_ ? html`
+         <button id="layoutFix" class="tab-row fix" slot="before-matches"
+             title="Typed in the other keyboard layout? (⇥)"
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index 62719981fa..1c0e29d3ff 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -12,6 +12,8 @@ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {TemplateResult} from '//resources/lit/v3_0/lit.rollup.js';
+ 
++import {quickAnswer, wantsCurrency} from './quick_answers.js';
++import type {CurrencyRates, QuickAnswer} from './quick_answers.js';
+ import {SearchboxBrowserProxy} from '//resources/cr_components/searchbox/searchbox_browser_proxy.js';
+ 
+ import type {WebuiBrowserSearchboxElement} from '../webui_browser_searchbox.js';
+@@ -137,6 +139,8 @@ export class MeridianCommandBarElement extends CrLitElement {
+       tabSel_: {state: true, type: Number},
+       tabsFirst_: {state: true, type: Boolean},
+       searchboxShown_: {state: true, type: Boolean},
++      quick_: {state: true, type: Object},
++      copied_: {state: true, type: Boolean},
+     };
+   }
+ 
+@@ -159,6 +163,11 @@ export class MeridianCommandBarElement extends CrLitElement {
+   // The field is made again for another profile (the browser binds each new
+   // one to the active space's profile).
+   protected accessor searchboxShown_: boolean = true;
++  // An answer right in the bar ("2+2", "5 km in miles"); Return copies it.
++  protected accessor quick_: QuickAnswer|null = null;
++  protected accessor copied_: boolean = false;
++  private rates_: CurrencyRates|null = null;
++  private ratesAsked_ = false;
+   private searchboxProfile_: string|null = null;
+   // What the field opened with (⌘L: the page's address).
+   private shownText_: string = '';
+@@ -318,6 +327,23 @@ export class MeridianCommandBarElement extends CrLitElement {
+     const features = found.filter(x => x.setting && x.m === 3)
+                          .concat(found.filter(x => !(x.setting && x.m === 3)));
+     this.featureRows_ = features.map(x => x.f);
++    if (changed.has('query_' as keyof MeridianCommandBarElement)) {
++      this.copied_ = false;
++      this.quick_ = quickAnswer(this.query_, new Date(), this.rates_);
++      // The rates come once someone asks for a currency (then once a day).
++      if (!this.ratesAsked_ && wantsCurrency(this.query_)) {
++        this.ratesAsked_ = true;
++        browserProxyFactory.getInstance().handler.getCurrencyRates().then(
++            ({rates, date}) => {
++              if (Object.keys(rates).length) {
++                this.rates_ = {rates, date};
++                this.quick_ = quickAnswer(this.query_, new Date(), this.rates_);
++              } else {
++                this.ratesAsked_ = false;
++              }
++            });
++      }
++    }
+     const first = q !== '' && !!rows[0] && starts(rows[0]);
+     if (changed.has('query_' as keyof MeridianCommandBarElement)) {
+       this.tabsFirst_ = first;
+@@ -406,6 +432,24 @@ export class MeridianCommandBarElement extends CrLitElement {
+     this.asking_ = false;
+   }
+ 
++  protected onQuickClick_() {
++    this.copyQuick_();
++  }
++
++  private copyQuick_() {
++    if (!this.quick_) {
++      return;
++    }
++    // Only the number with its unit ("3.10686 mi" copies "3.10686 mi").
++    navigator.clipboard.writeText(this.quick_.value).catch(() => {});
++    this.copied_ = true;
++    setTimeout(() => {
++      if (this.copied_) {
++        this.hide();
++      }
++    }, 450);
++  }
++
+   private ask_() {
+     const text = this.address_.text().trim();
+     if (!text || !this.hasAiKey_) {
+@@ -450,6 +494,14 @@ export class MeridianCommandBarElement extends CrLitElement {
+       this.applyLayoutFix_();
+       return;
+     }
++    // Return with an answer in the bar copies it (unless a row below was
++    // picked with the arrows).
++    if (e.key === 'Enter' && this.quick_ && this.tabSel_ < 0 &&
++        this.address_?.selectedLine() <= 0 && !e.shiftKey && !e.altKey) {
++      own();
++      this.copyQuick_();
++      return;
++    }
+     const features = this.featureRows_.length;
+     if (e.key === 'Enter' && this.tabSel_ >= 0 &&
+         this.tabSel_ < features + this.tabRows_.length) {
+diff --git a/chrome/browser/resources/webui_browser/meridian/icons.ts b/chrome/browser/resources/webui_browser/meridian/icons.ts
+index da44c9873e..379ec753b1 100644
+--- a/chrome/browser/resources/webui_browser/meridian/icons.ts
++++ b/chrome/browser/resources/webui_browser/meridian/icons.ts
+@@ -40,6 +40,7 @@ export type IconName =
+     'expand'|
+     'history'|
+     'clock'|
++    'calculator'|
+     'bolt'|
+     'sparkles'|
+     'layers'|
+@@ -153,6 +154,8 @@ export function icon(name: IconName, size = 16): TemplateResult {
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3L4.5 9"/><path d="M4.5 4.5V9H9"/><path d="M12 8v4.2l2.8 1.8"/></svg>`;
+     case 'clock':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>`;
++    case 'calculator':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5.5" y="3.5" width="13" height="17" rx="2"/><path d="M8.5 7.5h7M9 12h.01M12 12h.01M15 12h.01M9 15.5h.01M12 15.5h.01M15 15.5h.01"/></svg>`;
+     case 'bolt':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 3.5L5.5 13.5h6l-1 7 7.5-10h-6z"/></svg>`;
+     case 'sparkles':
+diff --git a/chrome/browser/resources/webui_browser/meridian/quick_answers.ts b/chrome/browser/resources/webui_browser/meridian/quick_answers.ts
+new file mode 100644
+index 0000000000..aed2be5f12
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/quick_answers.ts
+@@ -0,0 +1,422 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Answers right in the command bar as you type, like Raycast's or Brk's:
++// arithmetic ("2+2*3", "15% of 240", "sqrt 9"), units ("5 km in miles",
++// "100 f to c"), currencies ("100 usd in eur", rates from the European
++// Central Bank) and the time somewhere ("time in tokyo", "5pm london in
++// new york"). Return copies the answer.
++
++export interface QuickAnswer {
++  kind: 'calc'|'unit'|'currency'|'time';
++  // What is shown and copied.
++  value: string;
++  // A line under it: what was understood, where a rate is from.
++  detail: string;
++}
++
++export interface CurrencyRates {
++  // Per euro, e.g. {USD: 1.08}; EUR itself is 1.
++  rates: {[code: string]: number};
++  date: string;
++}
++
++const MAX_LENGTH = 160;
++
++function format(n: number): string {
++  if (!isFinite(n)) {
++    return '';
++  }
++  if (Number.isInteger(n) && Math.abs(n) < 1e15) {
++    return n.toLocaleString('en-US', {maximumFractionDigits: 0});
++  }
++  const precise = Number(n.toPrecision(12));
++  return Math.abs(precise) >= 1e15 || (precise !== 0 && Math.abs(precise) < 1e-6) ?
++      precise.toExponential(6).replace(/\.?0+e/, 'e') :
++      precise.toLocaleString('en-US', {maximumFractionDigits: 10});
++}
++
++// ------------------------------------------------------------- arithmetic
++
++// A recursive-descent reader: + - * / × ÷ ^ % ( ), unary minus, sqrt.
++function evaluate(text: string): number|null {
++  const src = text.replace(/×/g, '*').replace(/÷/g, '/').replace(/,/g, '')
++                  .replace(/\s+/g, '');
++  let at = 0;
++  const peek = () => src[at];
++  const number = (): number|null => {
++    const m = /^\d*\.?\d+(e[+-]?\d+)?/i.exec(src.slice(at));
++    if (!m) {
++      return null;
++    }
++    at += m[0].length;
++    return Number(m[0]);
++  };
++  const factor = (): number|null => {
++    if (peek() === '-') {
++      at++;
++      const v = factor();
++      return v === null ? null : -v;
++    }
++    if (peek() === '+') {
++      at++;
++      return factor();
++    }
++    if (src.slice(at, at + 4).toLowerCase() === 'sqrt') {
++      at += 4;
++      const v = factor();
++      return v === null ? null : Math.sqrt(v);
++    }
++    let v: number|null;
++    if (peek() === '(') {
++      at++;
++      v = sum();
++      if (peek() !== ')') {
++        return null;
++      }
++      at++;
++    } else {
++      v = number();
++    }
++    if (v === null) {
++      return null;
++    }
++    // A trailing % is a hundredth (in "200 * 15%").
++    while (peek() === '%' && !/[\d(]/.test(src[at + 1] || '')) {
++      at++;
++      v /= 100;
++    }
++    if (peek() === '^') {
++      at++;
++      const e = factor();
++      return e === null ? null : Math.pow(v, e);
++    }
++    return v;
++  };
++  const product = (): number|null => {
++    let v = factor();
++    while (v !== null && (peek() === '*' || peek() === '/' || peek() === '%')) {
++      const op = src[at++];
++      const r = factor();
++      if (r === null) {
++        return null;
++      }
++      v = op === '*' ? v * r : op === '/' ? v / r : v % r;
++    }
++    return v;
++  };
++  const sum = (): number|null => {
++    let v = product();
++    while (v !== null && (peek() === '+' || peek() === '-')) {
++      const op = src[at++];
++      const r = product();
++      if (r === null) {
++        return null;
++      }
++      v = op === '+' ? v + r : v - r;
++    }
++    return v;
++  };
++  const v = sum();
++  return v !== null && at === src.length && isFinite(v) ? v : null;
++}
++
++function calc(text: string): QuickAnswer|null {
++  let m = /^(-?[\d.,]+)\s*(%|percent)\s+of\s+(-?[\d.,]+)$/i.exec(text);
++  if (m) {
++    const v = Number(m[1]!.replace(/,/g, '')) / 100 *
++        Number(m[3]!.replace(/,/g, ''));
++    return isFinite(v) ? {kind: 'calc', value: format(v), detail: text} : null;
++  }
++  m = /^(?:square root of|sqrt)\s*\(?\s*([\d.,]+)\s*\)?$/i.exec(text);
++  if (m) {
++    const v = Math.sqrt(Number(m[1]!.replace(/,/g, '')));
++    return isFinite(v) ? {kind: 'calc', value: format(v), detail: text} : null;
++  }
++  // Only something with an operator between two numbers is a sum ("2024"
++  // or "-5" alone are searches).
++  if (!/^[\d\s.,+\-*/×÷^%()]+$/i.test(text) ||
++      !/[\d)]\s*[+\-*/×÷^%]\s*[\d(.-]/.test(text)) {
++    return null;
++  }
++  const v = evaluate(text);
++  return v === null ? null : {kind: 'calc', value: format(v), detail: text};
++}
++
++// ------------------------------------------------------------------ units
++
++interface Unit {
++  dim: string;
++  // In the dimension's base unit (temperature: see TEMPERATURE).
++  factor: number;
++  symbol: string;
++}
++
++const UNITS: {[name: string]: Unit} = {};
++function units(dim: string, symbol: string, factor: number, ...names: string[]) {
++  for (const n of [symbol, ...names]) {
++    UNITS[n.toLowerCase()] = {dim, factor, symbol};
++  }
++}
++// Length (metres).
++units('length', 'mm', 0.001, 'millimeter', 'millimeters', 'millimetre', 'millimetres');
++units('length', 'cm', 0.01, 'centimeter', 'centimeters', 'centimetre', 'centimetres');
++units('length', 'm', 1, 'meter', 'meters', 'metre', 'metres');
++units('length', 'km', 1000, 'kilometer', 'kilometers', 'kilometre', 'kilometres');
++units('length', 'in', 0.0254, 'inch', 'inches', '"');
++units('length', 'ft', 0.3048, 'foot', 'feet', "'");
++units('length', 'yd', 0.9144, 'yard', 'yards');
++units('length', 'mi', 1609.344, 'mile', 'miles');
++units('length', 'nmi', 1852, 'nautical mile', 'nautical miles');
++// Mass (grams).
++units('mass', 'mg', 0.001, 'milligram', 'milligrams');
++units('mass', 'g', 1, 'gram', 'grams');
++units('mass', 'kg', 1000, 'kilogram', 'kilograms', 'kilo', 'kilos');
++units('mass', 't', 1e6, 'tonne', 'tonnes', 'ton', 'tons');
++units('mass', 'oz', 28.349523125, 'ounce', 'ounces');
++units('mass', 'lb', 453.59237, 'lbs', 'pound', 'pounds');
++units('mass', 'st', 6350.29318, 'stone', 'stones');
++// Volume (litres).
++units('volume', 'ml', 0.001, 'milliliter', 'milliliters', 'millilitre', 'millilitres');
++units('volume', 'l', 1, 'liter', 'liters', 'litre', 'litres');
++units('volume', 'tsp', 0.00492892159, 'teaspoon', 'teaspoons');
++units('volume', 'tbsp', 0.0147867648, 'tablespoon', 'tablespoons');
++units('volume', 'fl oz', 0.0295735296, 'floz', 'fluid ounce', 'fluid ounces');
++units('volume', 'cup', 0.2365882365, 'cups');
++units('volume', 'pt', 0.473176473, 'pint', 'pints');
++units('volume', 'qt', 0.946352946, 'quart', 'quarts');
++units('volume', 'gal', 3.785411784, 'gallon', 'gallons');
++// Area (square metres).
++units('area', 'm²', 1, 'm2', 'sq m', 'square meter', 'square meters', 'square metre', 'square metres');
++units('area', 'km²', 1e6, 'km2', 'sq km', 'square kilometer', 'square kilometers');
++units('area', 'ft²', 0.09290304, 'ft2', 'sq ft', 'square foot', 'square feet');
++units('area', 'ac', 4046.8564224, 'acre', 'acres');
++units('area', 'ha', 10000, 'hectare', 'hectares');
++// Speed (metres a second).
++units('speed', 'm/s', 1, 'mps');
++units('speed', 'km/h', 1 / 3.6, 'kmh', 'kph', 'kmph');
++units('speed', 'mph', 0.44704, 'miles per hour');
++units('speed', 'kn', 0.514444, 'knot', 'knots', 'kt');
++// Data (bytes).
++units('data', 'B', 1, 'byte', 'bytes');
++units('data', 'KB', 1e3, 'kilobyte', 'kilobytes');
++units('data', 'MB', 1e6, 'megabyte', 'megabytes');
++units('data', 'GB', 1e9, 'gigabyte', 'gigabytes');
++units('data', 'TB', 1e12, 'terabyte', 'terabytes');
++units('data', 'KiB', 1024, 'kibibyte', 'kibibytes');
++units('data', 'MiB', 1024 ** 2, 'mebibyte', 'mebibytes');
++units('data', 'GiB', 1024 ** 3, 'gibibyte', 'gibibytes');
++units('data', 'TiB', 1024 ** 4, 'tebibyte', 'tebibytes');
++// Time (seconds).
++units('time', 'ms', 0.001, 'millisecond', 'milliseconds');
++units('time', 's', 1, 'sec', 'secs', 'second', 'seconds');
++units('time', 'min', 60, 'mins', 'minute', 'minutes');
++units('time', 'h', 3600, 'hr', 'hrs', 'hour', 'hours');
++units('time', 'd', 86400, 'day', 'days');
++units('time', 'wk', 604800, 'week', 'weeks');
++
++// Temperature: to and from kelvin.
++const TEMPERATURE: {[name: string]: {symbol: string, toK: (v: number) => number,
++                                     fromK: (k: number) => number}} = {};
++for (const [symbol, names, toK, fromK] of [
++         ['°C', ['c', '°c', 'celsius', 'centigrade'], (v: number) => v + 273.15,
++          (k: number) => k - 273.15],
++         ['°F', ['f', '°f', 'fahrenheit'], (v: number) => (v - 32) * 5 / 9 + 273.15,
++          (k: number) => (k - 273.15) * 9 / 5 + 32],
++         ['K', ['k', 'kelvin', 'kelvins'], (v: number) => v, (k: number) => k],
++     ] as Array<[string, string[], (v: number) => number, (k: number) => number]>) {
++  for (const n of names) {
++    TEMPERATURE[n] = {symbol, toK, fromK};
++  }
++}
++
++const CONVERT = /^(-?[\d.,]+)\s*([a-z°"'²/ ]+?)\s+(?:in|to|as|into|=)\s+([a-z°"'²/ ]+)$/i;
++
++function unit(text: string): QuickAnswer|null {
++  const m = CONVERT.exec(text);
++  if (!m) {
++    return null;
++  }
++  const amount = Number(m[1]!.replace(/,/g, ''));
++  const from = m[2]!.trim().toLowerCase();
++  const to = m[3]!.trim().toLowerCase();
++  if (!isFinite(amount)) {
++    return null;
++  }
++  const tf = TEMPERATURE[from];
++  const tt = TEMPERATURE[to];
++  if (tf && tt) {
++    const v = tt.fromK(tf.toK(amount));
++    return {kind: 'unit', value: `${format(Number(v.toFixed(2)))} ${tt.symbol}`,
++            detail: `${format(amount)} ${tf.symbol}`};
++  }
++  const uf = UNITS[from];
++  const ut = UNITS[to];
++  if (!uf || !ut || uf.dim !== ut.dim) {
++    return null;
++  }
++  const v = amount * uf.factor / ut.factor;
++  return {kind: 'unit', value: `${format(Number(v.toPrecision(6)))} ${ut.symbol}`,
++          detail: `${format(amount)} ${uf.symbol}`};
++}
++
++// -------------------------------------------------------------- currency
++
++// The ECB's daily reference rates (and the euro).
++const CURRENCIES = new Set([
++  'EUR', 'USD', 'JPY', 'BGN', 'CZK', 'DKK', 'GBP', 'HUF', 'PLN', 'RON', 'SEK',
++  'CHF', 'ISK', 'NOK', 'TRY', 'AUD', 'BRL', 'CAD', 'CNY', 'HKD', 'IDR', 'ILS',
++  'INR', 'KRW', 'MXN', 'MYR', 'NZD', 'PHP', 'SGD', 'THB', 'ZAR',
++]);
++const SIGNS: {[sign: string]: string} =
++    {'$': 'USD', '€': 'EUR', '£': 'GBP', '¥': 'JPY', '₹': 'INR'};
++
++// Whether the text asks for a currency (the bar fetches the rates then).
++export function wantsCurrency(text: string): boolean {
++  return currencyQuery(text) !== null;
++}
++
++function currencyQuery(text: string):
++    {amount: number, from: string, to: string}|null {
++  const m = /^([$€£¥₹])?\s*([\d.,]+)\s*([a-z]{3}|[$€£¥₹])?\s+(?:in|to|as|into|=)\s+([a-z]{3}|[$€£¥₹])$/i
++                .exec(text.trim());
++  if (!m) {
++    return null;
++  }
++  const code = (s: string|undefined) =>
++      s ? (SIGNS[s] || s.toUpperCase()) : '';
++  const from = code(m[1]) || code(m[3]);
++  const to = code(m[4]);
++  const amount = Number(m[2]!.replace(/,/g, ''));
++  if (!CURRENCIES.has(from) || !CURRENCIES.has(to) || from === to ||
++      !isFinite(amount)) {
++    return null;
++  }
++  return {amount, from, to};
++}
++
++function currency(text: string, rates: CurrencyRates|null): QuickAnswer|null {
++  const q = currencyQuery(text);
++  if (!q || !rates) {
++    return null;
++  }
++  const per = (c: string) => c === 'EUR' ? 1 : rates.rates[c];
++  const a = per(q.from);
++  const b = per(q.to);
++  if (!a || !b) {
++    return null;
++  }
++  const v = q.amount / a * b;
++  return {kind: 'currency', value: `${v.toLocaleString('en-US', {
++            minimumFractionDigits: 2, maximumFractionDigits: 2})} ${q.to}`,
++          detail: `${format(q.amount)} ${q.from} · ECB rate of ${rates.date}`};
++}
++
++// ------------------------------------------------------------------ time
++
++const ZONES: {[name: string]: string} = {
++  'london': 'Europe/London', 'ldn': 'Europe/London', 'uk': 'Europe/London',
++  'paris': 'Europe/Paris', 'berlin': 'Europe/Berlin',
++  'madrid': 'Europe/Madrid', 'rome': 'Europe/Rome',
++  'amsterdam': 'Europe/Amsterdam', 'lisbon': 'Europe/Lisbon',
++  'moscow': 'Europe/Moscow', 'msk': 'Europe/Moscow',
++  'kyiv': 'Europe/Kyiv', 'istanbul': 'Europe/Istanbul',
++  'tbilisi': 'Asia/Tbilisi', 'batumi': 'Asia/Tbilisi',
++  'georgia': 'Asia/Tbilisi', 'yerevan': 'Asia/Yerevan',
++  'dubai': 'Asia/Dubai', 'almaty': 'Asia/Almaty',
++  'delhi': 'Asia/Kolkata', 'mumbai': 'Asia/Kolkata', 'india': 'Asia/Kolkata',
++  'bangkok': 'Asia/Bangkok', 'singapore': 'Asia/Singapore', 'sg': 'Asia/Singapore',
++  'hong kong': 'Asia/Hong_Kong', 'hk': 'Asia/Hong_Kong',
++  'beijing': 'Asia/Shanghai', 'shanghai': 'Asia/Shanghai',
++  'tokyo': 'Asia/Tokyo', 'japan': 'Asia/Tokyo', 'seoul': 'Asia/Seoul',
++  'sydney': 'Australia/Sydney', 'melbourne': 'Australia/Melbourne',
++  'auckland': 'Pacific/Auckland',
++  'new york': 'America/New_York', 'nyc': 'America/New_York', 'ny': 'America/New_York',
++  'boston': 'America/New_York', 'miami': 'America/New_York',
++  'toronto': 'America/Toronto', 'chicago': 'America/Chicago',
++  'denver': 'America/Denver', 'austin': 'America/Chicago',
++  'san francisco': 'America/Los_Angeles', 'sf': 'America/Los_Angeles',
++  'la': 'America/Los_Angeles', 'los angeles': 'America/Los_Angeles',
++  'seattle': 'America/Los_Angeles', 'vancouver': 'America/Vancouver',
++  'mexico city': 'America/Mexico_City', 'sao paulo': 'America/Sao_Paulo',
++  'buenos aires': 'America/Argentina/Buenos_Aires',
++  'utc': 'UTC', 'gmt': 'UTC',
++};
++
++function zoneOf(name: string): string|null {
++  const key = name.trim().toLowerCase();
++  if (ZONES[key]) {
++    return ZONES[key];
++  }
++  // Any zone by its city ("asia/kathmandu" → "kathmandu").
++  const all = (Intl as unknown as {supportedValuesOf?: (k: string) => string[]})
++                  .supportedValuesOf?.('timeZone') || [];
++  return all.find(z => z.split('/').pop()!.replace(/_/g, ' ').toLowerCase() ===
++                       key) || null;
++}
++
++function clock(date: Date, zone: string): string {
++  return new Intl.DateTimeFormat('en-US', {
++    timeZone: zone, hour: 'numeric', minute: '2-digit',
++    weekday: 'short',
++  }).format(date);
++}
++
++// The offset of `zone` from UTC at `date`, in minutes.
++function offsetOf(date: Date, zone: string): number {
++  const parts = new Intl.DateTimeFormat('en-US', {
++    timeZone: zone, hourCycle: 'h23', year: 'numeric', month: 'numeric',
++    day: 'numeric', hour: 'numeric', minute: 'numeric',
++  }).formatToParts(date);
++  const get = (t: string) => Number(parts.find(p => p.type === t)!.value);
++  const asUtc = Date.UTC(get('year'), get('month') - 1, get('day'),
++                         get('hour'), get('minute'));
++  return Math.round((asUtc - date.getTime()) / 60000);
++}
++
++function time(text: string, now: Date): QuickAnswer|null {
++  let m = /^(?:time|now|what time is it)\s+in\s+(.+)$/i.exec(text);
++  if (m) {
++    const zone = zoneOf(m[1]!);
++    return zone ? {kind: 'time', value: clock(now, zone),
++                   detail: `Now in ${m[1]!.trim()} (${zone})`} :
++                  null;
++  }
++  // "5pm london in new york", "17:30 tokyo to sf".
++  m = /^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s+(.+?)\s+(?:in|to)\s+(.+)$/i.exec(text);
++  if (!m || (!m[2] && !m[3])) {
++    return null;
++  }
++  const from = zoneOf(m[4]!);
++  const to = zoneOf(m[5]!);
++  if (!from || !to) {
++    return null;
++  }
++  let hour = Number(m[1]);
++  const minute = Number(m[2] || 0);
++  if (m[3]) {
++    hour = hour % 12 + (m[3].toLowerCase() === 'pm' ? 12 : 0);
++  }
++  if (hour > 23 || minute > 59) {
++    return null;
++  }
++  // That time today where it was said, as an instant.
++  const day = new Intl.DateTimeFormat('en-CA', {timeZone: from}).format(now);
++  const [y, mo, d] = day.split('-').map(Number) as [number, number, number];
++  const guess = new Date(Date.UTC(y, mo - 1, d, hour, minute));
++  const instant = new Date(guess.getTime() - offsetOf(guess, from) * 60000);
++  return {kind: 'time', value: clock(instant, to),
++          detail: `${clock(instant, from)} in ${m[4]!.trim()}`};
++}
++
++// ---------------------------------------------------------------- answer
++
++export function quickAnswer(typed: string, now: Date,
++                            rates: CurrencyRates|null): QuickAnswer|null {
++  const text = typed.trim();
++  if (!text || text.length > MAX_LENGTH || /^[a-z][\w+.-]*:\/\//i.test(text)) {
++    return null;
++  }
++  return currency(text, rates) || unit(text) || time(text, now) || calc(text);
++}
