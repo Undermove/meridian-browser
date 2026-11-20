@@ -93,8 +93,10 @@ test('other AIs: Ollama, a cloud key with a model picker, and Codex (sessions, S
   const openAi = async () => {
     await b.eval('app.$.tabstrip.runCommand(13, 0)');
     await b.waitFor(`app.$.settings.open && !!${ST}.querySelector('[data-id="ai"]')`);
-    await b.click(`${ST}.querySelector('[data-id="ai"]')`);
-    await b.waitFor(`!!${ST}.getElementById('aiRows')`);
+    // Not a click at its place: Settings may still be coming in, and a click on the overlay
+    // behind it closes Settings.
+    await b.eval(`${ST}.querySelector('[data-id="ai"]').click()`);
+    await b.waitFor(`app.$.settings.open && !!${ST}.getElementById('aiRows')`);
   };
   const ask = async (text, expect) => {
     if (!(await b.eval('app.$.ask.open'))) await b.eval('app.$.tabstrip.runCommand(14, 0)');
@@ -128,9 +130,11 @@ test('other AIs: Ollama, a cloud key with a model picker, and Codex (sessions, S
     // A cloud key: a wrong one is refused, the right one is recognised as OpenAI and answers.
     await openAi();
     await b.eval(`${ST}.getElementById('aiKey').value = 'sk-proj-wrong00000000000000000000000'`);
+    await b.eval(`${ST}.getElementById('saveKey').scrollIntoView({ block: 'center' })`);
     await b.click(`${ST}.getElementById('saveKey')`);
     await b.waitFor(`${ST}.getElementById('keyMessage').textContent.includes('didn’t accept')`);
     await b.eval(`${ST}.getElementById('aiKey').value = ${JSON.stringify(GOOD)}`);
+    await b.eval(`${ST}.getElementById('saveKey').scrollIntoView({ block: 'center' })`);
     await b.click(`${ST}.getElementById('saveKey')`);
     await b.waitFor(`${ST}.getElementById('keyMessage').textContent.includes('ChatGPT answers')`);
     assert.equal((await settings()).aiProvider, 'openai');
