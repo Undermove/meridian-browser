@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 20 Nov 2026 18:38:52 +0400
+Subject: [PATCH 206/206] Meridian: agents can choose an option in a <select>
+
+type_text into a dropdown chooses the option it names (text or value) and sends
+input/change; get_interactive_elements lists a dropdown's options and names it
+by its <label>.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/agent/agent_page.js   | 35 +++++++++++++++-
+ .../browser/meridian/agent/agent_service.cc   | 42 +++++++++++++++++++
+ chrome/browser/meridian/agent/agent_service.h |  2 +
+ .../browser/meridian/agent/agent_tools.json   |  2 +-
+ 4 files changed, 78 insertions(+), 3 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_page.js b/chrome/browser/meridian/agent/agent_page.js
+index 5b664bfd57..1a5b2eb3e3 100644
+--- a/chrome/browser/meridian/agent/agent_page.js
++++ b/chrome/browser/meridian/agent/agent_page.js
+@@ -70,6 +70,10 @@
+                       hostOf(el).getAttribute('placeholder') ||
+                       hostOf(el).getAttribute('name'))) || '';
+   const clip = (s, n) => (s || '').replace(/\s+/g, ' ').trim().slice(0, n);
++  // A form field's name the way a person reads it: its <label>, not its contents.
++  const fieldName = (el) => el.getAttribute('aria-label') ||
++      (el.getAttribute('aria-labelledby') || '').split(/\s+/).map((id) => id && document.getElementById(id)?.innerText).filter(Boolean).join(' ') ||
++      [...(el.labels || [])].map((l) => l.innerText).join(' ') || el.getAttribute('title') || el.getAttribute('name') || '';
+ 
+   const find = (spec) => {
+     let el = null;
+@@ -131,7 +135,7 @@
+         const r = el.getBoundingClientRect();
+         const tag = el.tagName.toLowerCase();
+         const type = el.getAttribute('type') || undefined;
+-        const label = clip(labelOf(el) || el.querySelector?.('img')?.alt || el.value && type !== 'password' && el.value || '', 100);
++        const label = clip((tag === 'select' ? fieldName(el) : labelOf(el)) || el.querySelector?.('img')?.alt || el.value && type !== 'password' && el.value || '', 100);
+         const out = {i, tag, label};
+         if (hostOf(el)) out.in_shadow_dom = true;
+         const visible = clip(el.innerText, 100);
+@@ -145,6 +149,12 @@
+           if (v) out.value = v;
+         }
+         if (tag === 'input' && el.placeholder) out.placeholder = clip(el.placeholder, 60);
++        if (tag === 'select') {
++          // A native dropdown opens outside the page: type_text chooses.
++          out.value = clip(el.selectedOptions[0]?.text || '', 80);
++          out.options = [...el.options].slice(0, 40).map((o) => clip(o.text, 60));
++          if (el.options.length > 40) out.options.push(`…${el.options.length - 40} more`);
++        }
+         if (el.disabled) out.disabled = true;
+         if (r.bottom < 0 || r.top > innerHeight) out.offscreen = true;
+         return out;
+@@ -162,9 +172,11 @@
+       return {
+         x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height,
+         tag: el.tagName.toLowerCase(),
+-        label: clip(el.getAttribute('aria-label') || el.innerText || el.value || el.placeholder || '', 80),
++        // A dropdown's text is all its options: its label names it.
++        label: clip(el.tagName === 'SELECT' ? fieldName(el) || 'dropdown' : el.getAttribute('aria-label') || el.innerText || el.value || el.placeholder || '', 80),
+         visible: clip(el.innerText || el.value || '', 120),
+         password: el.type === 'password',
++        select: el.tagName === 'SELECT' || undefined,
+         href: el.closest('a')?.href?.slice(0, 200) || undefined,
+         form: el.form?.action?.slice(0, 200) || undefined,
+       };
+@@ -191,6 +203,25 @@
+       return false;
+     },
+ 
++    // type_text into a <select>: the option whose text (or value) it names.
++    chooseOption(want) {
++      const el = window.__meridianTarget;
++      if (!el || !el.isConnected || el.tagName !== 'SELECT') return {error: 'not a dropdown'};
++      const norm = (s) => String(s || '').trim().replace(/\s+/g, ' ').toLowerCase();
++      const w = norm(want);
++      const options = [...el.options];
++      const option = options.find((o) => norm(o.text) === w) || options.find((o) => norm(o.value) === w) ||
++          options.find((o) => norm(o.text).startsWith(w)) || (w && options.find((o) => norm(o.text).includes(w)));
++      if (!option) return {error: `no option "${clip(want, 60)}"; the options are: ${options.slice(0, 40).map((o) => clip(o.text, 40)).join(' | ')}`};
++      if (option.disabled) return {error: `the option "${clip(option.text, 60)}" is disabled`};
++      el.focus();
++      if (el.multiple) option.selected = true; else el.value = option.value;
++      // What a person's choice sends (pages listen for these).
++      el.dispatchEvent(new Event('input', {bubbles: true}));
++      el.dispatchEvent(new Event('change', {bubbles: true}));
++      return {chosen: clip(option.text, 100)};
++    },
++
+     readTarget() {
+       const el = window.__meridianTarget;
+       if (!el || !el.isConnected) return null;
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index 9c52bf2dd3..5addb54053 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -1638,6 +1638,9 @@ void AgentService::TypeText(std::unique_ptr<Call> call) {
+                                     : t.FindString("tag") ? *t.FindString("tag")
+                                                           : "the focused field";
+             bool password = t.FindBool("password").value_or(false);
++            if (t.FindBool("select").value_or(false)) {
++              return self->ChooseOption(handle, std::move(call), label, value);
++            }
+             std::string summary =
+                 "type into " +
+                 (password ? std::string("a PASSWORD field") : "“" + label + "”") +
+@@ -1728,6 +1731,45 @@ void AgentService::TypeText(std::unique_ptr<Call> call) {
+           weak_factory_.GetWeakPtr(), handle, std::move(call)));
+ }
+ 
++// type_text into a dropdown: the option it names is chosen, the way a
++// person's pick in the (native, out-of-page) list would.
++void AgentService::ChooseOption(tabs::TabHandle handle,
++                                std::unique_ptr<Call> call,
++                                const std::string& label,
++                                const std::string& value) {
++  Confirm(std::move(call), "choose “" + value + "” in “" + label + "”",
++          base::BindOnce(
++              [](base::WeakPtr<AgentService> self, tabs::TabHandle handle,
++                 std::string value, std::unique_ptr<Call> call) {
++                tabs::TabInterface* tab = handle.Get();
++                if (!self || !tab) {
++                  return call->Fail("the tab is gone");
++                }
++                self->RunInPage(
++                    tab->GetContents(),
++                    "__meridianAgent.chooseOption(" +
++                        base::WriteJson(base::Value(value)).value_or("\"\"") +
++                        ")",
++                    base::BindOnce(
++                        [](std::unique_ptr<Call> call, base::Value result) {
++                          if (!result.is_dict()) {
++                            return call->Fail("couldn't look at the page");
++                          }
++                          const base::DictValue& r = result.GetDict();
++                          if (const std::string* error = r.FindString("error")) {
++                            return call->Fail(*error);
++                          }
++                          base::DictValue out;
++                          out.Set("chosen", r.FindString("chosen")
++                                                ? *r.FindString("chosen")
++                                                : std::string());
++                          call->Ok(base::Value(std::move(out)));
++                        },
++                        std::move(call)));
++              },
++              weak_factory_.GetWeakPtr(), handle, value));
++}
++
+ void AgentService::PressKey(std::unique_ptr<Call> call) {
+   struct Key {
+     const char* name;
+diff --git a/chrome/browser/meridian/agent/agent_service.h b/chrome/browser/meridian/agent/agent_service.h
+index 210b7f1ab7..49c7a6f779 100644
+--- a/chrome/browser/meridian/agent/agent_service.h
++++ b/chrome/browser/meridian/agent/agent_service.h
+@@ -107,6 +107,8 @@ class AgentService : public KeyedService {
+   void CloseTab(std::unique_ptr<Call> call);
+   void Click(std::unique_ptr<Call> call);
+   void TypeText(std::unique_ptr<Call> call);
++  void ChooseOption(tabs::TabHandle handle, std::unique_ptr<Call> call,
++                    const std::string& label, const std::string& value);
+   void PressKey(std::unique_ptr<Call> call);
+   void Scroll(std::unique_ptr<Call> call);
+   void WaitFor(std::unique_ptr<Call> call);
+diff --git a/chrome/browser/meridian/agent/agent_tools.json b/chrome/browser/meridian/agent/agent_tools.json
+index f9ff1a4f18..c5599a4e09 100644
+--- a/chrome/browser/meridian/agent/agent_tools.json
++++ b/chrome/browser/meridian/agent/agent_tools.json
+@@ -249,7 +249,7 @@
+  {
+   "name": "type_text",
+   "access": "write",
+-  "description": "Type text into an input/textarea/contenteditable. Optionally clear it first and press Enter after.",
++  "description": "Type text into an input/textarea/contenteditable. Optionally clear it first and press Enter after. For a <select> dropdown, value is the option to choose (its text, as get_interactive_elements lists in options).",
+   "input_schema": {
+    "type": "object",
+    "properties": {
