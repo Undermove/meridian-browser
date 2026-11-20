@@ -178,6 +178,45 @@ test('other AIs: Ollama, a cloud key with a model picker, and Codex (sessions, S
   }
 });
 
+// A report (21.11.2026): OpenCode picked for Ask answered "Unrecognized flag: --dir in command
+// opencode run" (an OpenCode that doesn't know --dir), and the error couldn't even be selected to
+// copy. The stand-in refuses --dir like that OpenCode; the answer and the error are selectable.
+test('OpenCode answers Ask without --dir; what Ask shows can be selected and copied', async () => {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
+  fs.writeFileSync(path.join(bin, 'opencode'), `#!/bin/sh
+if [ "$1" = auth ]; then echo "1 credentials"; exit 0; fi
+for a in "$@"; do if [ "$a" = --dir ]; then echo "Unrecognized flag: --dir in command opencode run" >&2; exit 1; fi; done
+cat > /dev/null
+echo '{"type":"text","sessionID":"ses_1","part":{"text":"OpenCode says the page is blank"}}'
+`, { mode: 0o755 });
+  const b = await launch(['about:blank'], { args: [`--meridian-agents-path=${bin}`] });
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    await b.eval('app.$.tabstrip.runCommand(13, 0)');
+    await b.waitFor(`app.$.settings.open && !!${ST}.querySelector('[data-id="ai"]')`);
+    await b.click(`${ST}.querySelector('[data-id="ai"]')`);
+    await b.waitFor(`!!${ST}.getElementById('aiRows')`);
+    await b.click(`${ST}.getElementById('otherAgents')`);
+    await b.waitFor(`${ST}.getElementById('ai-opencode')?.textContent.includes('Ready')`, 15000);
+    await b.eval(`${ST}.getElementById('ai-opencode').click()`);
+    await b.waitFor(`${ST}.getElementById('ai-opencode').classList.contains('on')`);
+    await b.eval('app.$.settings.hide()');
+    await b.eval('app.$.tabstrip.runCommand(14, 0)');
+    await b.waitFor(`app.$.ask.open && !!${AK}.getElementById('input')`);
+    await b.eval(`(() => { const i = ${AK}.getElementById('input'); i.value = 'What is this page?'; ${AK}.getElementById('send').click(); })()`);
+    await b.waitFor(`[...${AK}.querySelectorAll('.msg.assistant')].pop()?.textContent.includes('OpenCode says the page is blank')`, 15000);
+    // Text in the conversation can be selected (the browser's frame around it can't).
+    for (const sel of ['.msg.user .bubble', '.msg.assistant .answer']) {
+      assert.equal(await b.eval(`getComputedStyle(${AK}.querySelector(${JSON.stringify(sel)})).userSelect`), 'text', sel);
+    }
+    // Selected with the mouse, as a person does: a double-click on a word of the question.
+    const at = await b.eval(`(() => { const r = ${AK}.querySelector('.msg.user .bubble').getBoundingClientRect(); return { x: r.left + 12, y: r.top + r.height / 2 }; })()`);
+    for (const type of ['mousePressed', 'mouseReleased']) await b.cdp.send('Input.dispatchMouseEvent', { type, x: at.x, y: at.y, button: 'left', clickCount: 1 });
+    for (const type of ['mousePressed', 'mouseReleased']) await b.cdp.send('Input.dispatchMouseEvent', { type, x: at.x, y: at.y, button: 'left', clickCount: 2 });
+    assert.match(await b.eval(`String(${AK}.getSelection ? ${AK}.getSelection() : getSelection())`), /What/);
+  } finally { await b.close(); fs.rmSync(bin, { recursive: true, force: true }); }
+});
+
 test('LM Studio installed but off: Start server turns it on, then it answers', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-lms-'));
   const started = path.join(dir, 'started');
