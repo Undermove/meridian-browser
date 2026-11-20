@@ -17,6 +17,16 @@ const colourOf = (img) => `(async () => {
   return { r, g: gr, b, a, chroma: Math.max(r, gr, b) - Math.min(r, gr, b) };
 })()`;
 
+// The icon's colour once it has one (up to 10 s), or the last one seen.
+async function coloured(b, img) {
+  let c;
+  for (const end = Date.now() + 10000; Date.now() < end; await new Promise((r) => setTimeout(r, 200))) {
+    c = await b.eval(colourOf(img));
+    if (c && c.a > 200 && c.chroma > 60) break;
+  }
+  return c;
+}
+
 test('the Workbench tab shows its own coloured icon in the sidebar, in Today and pinned', async () => {
   const b = await launch(['about:blank']);
   try {
@@ -24,7 +34,8 @@ test('the Workbench tab shows its own coloured icon in the sidebar, in Today and
     await b.eval(`${T}.runCommand(16, 0)`);
     const row = `[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.url.startsWith('chrome://workbench'))`;
     await b.waitFor(`!!${row}?.tab.favicon?.dataUrl`, 15000);
-    let c = await b.eval(colourOf(`${row}.shadowRoot.querySelector('img')`));
+    // Until the page's own icon comes, a tab shows the default one (grey); then the accent.
+    let c = await coloured(b, `${row}.shadowRoot.querySelector('img')`);
     assert.ok(c && c.a > 200 && c.chroma > 60, `the accent colour, not grey: ${JSON.stringify(c)}`);
     assert.ok(c.b > c.g, `purple-blue: ${JSON.stringify(c)}`);
 
@@ -32,8 +43,7 @@ test('the Workbench tab shows its own coloured icon in the sidebar, in Today and
     await b.eval(`(() => { const s = ${T}; s.handler_.pinTab(${row}.tab.id, { container: s.state_.activeSpaceId, parentId: '', index: 0 }, ''); return true; })()`);
     const item = `[...${SB}.querySelectorAll('meridian-item')].find((r) => r.item?.url?.startsWith('chrome://workbench'))`;
     await b.waitFor(`!!${item}?.shadowRoot.querySelector('.favicon img')`, 10000);
-    await new Promise((r) => setTimeout(r, 500));
-    c = await b.eval(colourOf(`${item}.shadowRoot.querySelector('.favicon img')`));
+    c = await coloured(b, `${item}.shadowRoot.querySelector('.favicon img')`);
     assert.ok(c && c.a > 200 && c.chroma > 60, `pinned: the accent colour, not grey: ${JSON.stringify(c)}`);
   } finally { await b.close(); }
 });
