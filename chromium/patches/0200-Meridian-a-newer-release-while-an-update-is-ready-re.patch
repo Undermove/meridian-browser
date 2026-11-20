@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 20 Nov 2026 10:42:34 +0400
+Subject: [PATCH 201/201] Meridian: a newer release while an update is ready
+ replaces it
+
+The updater stopped checking once an update was ready, so a restart days later
+installed that one and then offered the next. Now it keeps checking; a newer
+release downloads in the background ("Restart to update" stays on the ready
+one meanwhile, and a failure only goes to the log), then takes its place: one
+restart goes straight to the latest. Each release is staged in its own folder;
+the replaced one is deleted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/updater.cc | 89 ++++++++++++++++++++++--------
+ chrome/browser/meridian/updater.h  | 10 ++++
+ 2 files changed, 75 insertions(+), 24 deletions(-)
+
+diff --git a/chrome/browser/meridian/updater.cc b/chrome/browser/meridian/updater.cc
+index 528f58f7ae..e6176c27f8 100644
+--- a/chrome/browser/meridian/updater.cc
++++ b/chrome/browser/meridian/updater.cc
+@@ -358,15 +358,19 @@ void Updater::CheckNow() {
+ }
+ 
+ void Updater::Check() {
+-  // Busy, or already waiting for a restart.
+-  if (status_ == mojom::UpdateStatus::kChecking ||
+-      status_ == mojom::UpdateStatus::kDownloading ||
+-      status_ == mojom::UpdateStatus::kReady) {
++  // Busy.
++  if (quiet_ || status_ == mojom::UpdateStatus::kChecking ||
++      status_ == mojom::UpdateStatus::kDownloading) {
+     return;
+   }
+   std::string feed =
+       TestFeed() ? TestSwitchValue("meridian-update-feed") : update::kFeed;
+-  Set(mojom::UpdateStatus::kChecking);
++  // Waiting for a restart: a newer release still comes, in the background.
++  if (status_ == mojom::UpdateStatus::kReady) {
++    quiet_ = true;
++  } else {
++    Set(mojom::UpdateStatus::kChecking);
++  }
+   loader_ = Request(feed);
+   loader_->DownloadToString(
+       g_browser_process->shared_url_loader_factory().get(),
+@@ -377,6 +381,17 @@ void Updater::Check() {
+ void Updater::OnFeed(std::optional<std::string> body) {
+   loader_.reset();
+   bool user = std::exchange(user_check_, false);
++  if (quiet_) {
++    std::optional<update::Release> release =
++        body ? update::ParseRelease(*body, Arch(), TestFeed()) : std::nullopt;
++    if (!release || !update::IsNewer(release->version, ready_.version)) {
++      quiet_ = false;
++      return;
++    }
++    release_ = *release;
++    Download();
++    return;
++  }
+   if (!body) {
+     Set(user ? mojom::UpdateStatus::kFailed : mojom::UpdateStatus::kIdle,
+         "Couldn’t reach GitHub to check for updates.");
+@@ -403,14 +418,18 @@ void Updater::Download() {
+            !HasTestSwitch("meridian-test-update-no-delta");
+   const std::string url = delta_ ? delta->second.url : release_.zip_url;
+   download_name_ = delta_ ? delta->second.name : release_.zip_name;
+-  progress_ = 0;
+-  zip_size_ = 0;
+-  Set(mojom::UpdateStatus::kDownloading);
++  if (!quiet_) {
++    progress_ = 0;
++    zip_size_ = 0;
++    Set(mojom::UpdateStatus::kDownloading);
++  }
+   loader_ = Request(url);
+   loader_->SetOnResponseStartedCallback(base::BindOnce(
+       [](Updater* self, const GURL&,
+          const network::mojom::URLResponseHead& head) {
+-        self->zip_size_ = head.content_length;
++        if (!self->quiet_) {
++          self->zip_size_ = head.content_length;
++        }
+       },
+       base::Unretained(this)));
+   loader_->SetOnDownloadProgressCallback(base::BindRepeating(
+@@ -440,7 +459,7 @@ void Updater::OnZip(base::FilePath path) {
+       Download();
+       return;
+     }
+-    Set(mojom::UpdateStatus::kFailed, "The update didn’t download.");
++    Fail("The update didn’t download.");
+     return;
+   }
+   zip_ = path;
+@@ -453,14 +472,12 @@ void Updater::OnZip(base::FilePath path) {
+ void Updater::OnSums(std::optional<std::string> body) {
+   loader_.reset();
+   if (!body) {
+-    Set(mojom::UpdateStatus::kFailed,
+-        "The release has no checksum for this Mac.");
++    Fail("The release has no checksum for this Mac.");
+     return;
+   }
+   sums_ = std::move(*body);
+   if (release_.sig_url.empty()) {
+-    Set(mojom::UpdateStatus::kFailed,
+-        "The release’s checksums aren’t signed by Meridian.");
++    Fail("The release’s checksums aren’t signed by Meridian.");
+     return;
+   }
+   loader_ = Request(release_.sig_url);
+@@ -480,8 +497,7 @@ void Updater::OnSig(std::optional<std::string> body) {
+     }
+   }
+   if (!body || !update::SumsSignedBy(sums_, *body, key)) {
+-    Set(mojom::UpdateStatus::kFailed,
+-        "The release’s checksums aren’t signed by Meridian.");
++    Fail("The release’s checksums aren’t signed by Meridian.");
+     return;
+   }
+   std::optional<std::string> sum = update::FindSum(sums_, download_name_);
+@@ -491,8 +507,7 @@ void Updater::OnSig(std::optional<std::string> body) {
+     return;
+   }
+   if (!sum) {
+-    Set(mojom::UpdateStatus::kFailed,
+-        "The release has no checksum for this Mac.");
++    Fail("The release has no checksum for this Mac.");
+     return;
+   }
+   base::ThreadPool::PostTaskAndReplyWithResult(
+@@ -500,7 +515,7 @@ void Updater::OnSig(std::optional<std::string> body) {
+       {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
+        base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
+       base::BindOnce(&Stage, zip_, *sum,
+-                     dir_.Append("staged").Append("Meridian.app"),
++                     StagedApp(release_.version),
+                      base::apple::OuterBundlePath(), !test_target_,
+                      release_.version, CurrentVersion(), delta_, bundle_),
+       base::BindOnce(&Updater::OnStaged, weak_factory_.GetWeakPtr()));
+@@ -517,20 +532,43 @@ void Updater::OnStaged(
+       Download();
+       return;
+     }
+-    Set(mojom::UpdateStatus::kFailed, error);
++    Fail(error);
+     return;
+   }
+   requirement_ = std::move(error_and_requirement.second);
++  // A newer one in place of the one that was ready: its copy goes.
++  if (!ready_.version.empty() && ready_.version != release_.version) {
++    base::ThreadPool::PostTask(
++        FROM_HERE, {base::MayBlock(), base::TaskPriority::BEST_EFFORT},
++        base::GetDeletePathRecursivelyCallback(
++            StagedApp(ready_.version).DirName()));
++  }
++  ready_ = release_;
++  quiet_ = false;
+   Set(mojom::UpdateStatus::kReady);
+ }
+ 
++void Updater::Fail(std::string error) {
++  if (quiet_) {
++    quiet_ = false;
++    LOG(WARNING) << "Meridian update " << release_.version
++                 << " (over a ready " << ready_.version << "): " << error;
++    return;
++  }
++  Set(mojom::UpdateStatus::kFailed, std::move(error));
++}
++
++base::FilePath Updater::StagedApp(const std::string& version) const {
++  return dir_.Append("staged-" + version).Append("Meridian.app");
++}
++
+ bool Updater::Install() {
+   if (status_ != mojom::UpdateStatus::kReady) {
+     return false;
+   }
+   std::string script = update::SwapScript(
+       base::Process::Current().Pid(),
+-      dir_.Append("staged").Append("Meridian.app"), bundle_,
++      StagedApp(ready_.version), bundle_,
+       /*relaunch=*/!test_target_, requirement_);
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_BLOCKING},
+@@ -575,11 +613,14 @@ mojom::UpdateStatePtr Updater::State() const {
+   auto state = mojom::UpdateState::New();
+   state->status = status_;
+   state->current = CurrentVersion();
+-  state->version = release_.version;
++  // Ready: the one a restart installs (a newer one may be downloading).
++  const update::Release& release =
++      status_ == mojom::UpdateStatus::kReady ? ready_ : release_;
++  state->version = release.version;
+   state->progress = progress_;
+   state->error = error_;
+-  state->page_url = release_.page_url;
+-  state->notes = release_.notes;
++  state->page_url = release.page_url;
++  state->notes = release.notes;
+   return state;
+ }
+ 
+diff --git a/chrome/browser/meridian/updater.h b/chrome/browser/meridian/updater.h
+index 10bd30ec00..164134b69b 100644
+--- a/chrome/browser/meridian/updater.h
++++ b/chrome/browser/meridian/updater.h
+@@ -93,6 +93,11 @@ class Updater : public base::PowerSuspendObserver {
+   // requirement the swap checks again (empty: none).
+   void OnStaged(std::pair<std::string, std::string> error_and_requirement);
+   void Set(mojom::UpdateStatus status, std::string error = std::string());
++  // A failed download or check: the error for the person, or (in the
++  // background, over a ready update) only the log.
++  void Fail(std::string error);
++  // Where a release's app is unpacked and checked before the swap.
++  base::FilePath StagedApp(const std::string& version) const;
+ 
+   bool started_ = false;
+   bool user_check_ = false;
+@@ -103,6 +108,11 @@ class Updater : public base::PowerSuspendObserver {
+   base::FilePath bundle_;
+   base::FilePath zip_;
+   update::Release release_;
++  // The update that is ready ("Restart to update"). A newer release found
++  // meanwhile downloads quietly (`quiet_`) and takes its place when it's
++  // ready, so a restart goes straight to the latest version.
++  update::Release ready_;
++  bool quiet_ = false;
+   // What's downloading: the delta (or the zip), by its asset name.
+   bool delta_ = false;
+   std::string download_name_;

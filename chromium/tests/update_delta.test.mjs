@@ -57,7 +57,9 @@ const BIG2 = Buffer.from(BIG);
 for (let i = 0; i < 40; i++) BIG2.writeUInt32LE(i * 7919, (i * 104729) % (BIG2.length - 4));
 
 // The release: the zip, the delta (unless none), SHA256SUMS of both, signed. Requests are counted.
-async function release({ oldApp, newApp, delta = true, breakDelta = false }) {
+async function release({ oldApp, newApp, delta = true, breakDelta = false, version = NEW }) {
+  const ZIP = `Meridian-${version}-mac-arm64.zip`;
+  const DELTA = `Meridian-${CURRENT}-to-${version}-mac-arm64.delta`;
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-update-')));
   const zip = path.join(dir, ZIP);
   execFileSync('/usr/bin/ditto', ['-c', '-k', '--keepParent', newApp, zip]);
@@ -84,7 +86,7 @@ async function release({ oldApp, newApp, delta = true, breakDelta = false }) {
     const base = `http://127.0.0.1:${s.address().port}`;
     if (req.url === '/feed') {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ tag_name: `v${NEW}`, html_url: `${base}/page`, body: 'Notes', assets: [
+      res.end(JSON.stringify({ tag_name: `v${version}`, html_url: `${base}/page`, body: 'Notes', assets: [
         { name: ZIP, browser_download_url: `${base}/zip` },
         ...(files.delta ? [{ name: DELTA, browser_download_url: `${base}/delta` }] : []),
         { name: 'SHA256SUMS.txt', browser_download_url: `${base}/sums` },
@@ -209,4 +211,49 @@ test('Updates: two real builds, by their difference', { skip: skip || (!process.
     assert.deepEqual(await update(rel, installed), tree(fresh));
     assert.ok(!rel.asked.includes('/zip'), `the zip wasn't downloaded: ${rel.asked}`);
   } finally { rel.s.closeAllConnections(); rel.s.close(); for (const d of [rel.dir, dir]) fs.rmSync(d, { recursive: true, force: true }); }
+});
+
+// An update ready for a restart, and a newer release meanwhile: it downloads in the background, the
+// "Restart to update" pill moves to the newer version, and the restart installs that one directly.
+test('Updates: a newer release while one is ready to install replaces it; a restart goes straight to the latest', { skip }, async () => {
+  const a = apps();
+  const newer = fakeApp(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-newer-')), { version: '9.9.10', chromium: '158.0.3.3', big: BIG2, extra: 'newer\n' });
+  const first = await release({ oldApp: a.old, newApp: a.fresh });
+  const second = await release({ oldApp: a.old, newApp: newer, version: '9.9.10' });
+  // The feed: the first release, then the second.
+  let feed = first.feed;
+  const proxy = http.createServer(async (req, res) => {
+    const body = await (await fetch(feed)).text();
+    res.writeHead(200, { 'content-type': 'application/json' }); res.end(body);
+  });
+  await new Promise((r) => proxy.listen(0, '127.0.0.1', r));
+  const b = await launch(['about:blank'], { args: [`--meridian-update-feed=http://127.0.0.1:${proxy.address().port}/feed`, `--meridian-test-update-key=${PUB}`, `--meridian-test-update-target=${a.installed}`] });
+  const state = () => b.eval('app.$.tabstrip.handler_.getUpdateState().then((r) => r.state)');
+  const until = async (ok, what) => {
+    let s;
+    for (const end = Date.now() + 60000; Date.now() < end; await sleep(200)) { s = await state(); if (ok(s)) return s; }
+    assert.fail(`${what}: ${JSON.stringify(s)}`);
+  };
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    await until((s) => s.status === S.ready && s.version === NEW, 'the first is ready');
+    await b.waitFor(`${SB}.getElementById('updateBanner')?.textContent.includes('Restart to update to ${NEW}')`);
+    // The newer one comes out; the next check (here: Check for Updates) finds it.
+    feed = second.feed;
+    await b.eval('app.$.tabstrip.handler_.checkForUpdates()');
+    await until((s) => s.status === S.ready && s.version === '9.9.10', 'the newer is ready');
+    await b.waitFor(`${SB}.getElementById('updateBanner')?.textContent.includes('Restart to update to 9.9.10')`);
+    assert.ok(!fs.existsSync(path.join(b.profile, 'Meridian Update', `staged-${NEW}`)) || await (async () => {
+      for (let i = 0; i < 30 && fs.existsSync(path.join(b.profile, 'Meridian Update', `staged-${NEW}`)); i++) await sleep(100);
+      return !fs.existsSync(path.join(b.profile, 'Meridian Update', `staged-${NEW}`));
+    })(), 'the older download is gone');
+    await b.eval('app.$.tabstrip.handler_.installUpdate()');
+    for (let i = 0; i < 100 && b.proc.exitCode === null && b.proc.signalCode === null; i++) await sleep(150);
+    for (let i = 0; i < 100 && fs.existsSync(a.installed + '.previous'); i++) await sleep(100);
+    assert.deepEqual(tree(a.installed), tree(newer), 'straight to the latest');
+  } finally {
+    await b.close(); proxy.close();
+    for (const r of [first, second]) { r.s.closeAllConnections(); r.s.close(); fs.rmSync(r.dir, { recursive: true, force: true }); }
+    fs.rmSync(a.dir, { recursive: true, force: true }); fs.rmSync(path.dirname(newer), { recursive: true, force: true });
+  }
 });
