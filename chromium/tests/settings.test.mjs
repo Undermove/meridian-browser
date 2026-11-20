@@ -102,7 +102,7 @@ test('AI: choosing an access level starts the agent socket; Connect shows the ex
     assert.equal((await settings(b)).agentAccess, 'ask');
     // The CLIs, with the command Connect would run (never run here).
     await b.waitFor(`${ST}.querySelectorAll('.row-desc.mono').length === 3`);
-    assert.match(await b.eval(`${ST}.querySelector('.row-desc.mono').textContent`), /mcp add -s user meridian -- .*Meridian --mcp-bridge/);
+    assert.match(await b.eval(`${ST}.querySelector('.row-desc.mono').textContent`), /mcp add -s user meridian -- .*(Meridian|chrome\.exe'?) --mcp-bridge/i);
     // An installed CLI's Connect… (the rows with a command), not the other AI buttons.
     const connect = `[...${ST}.querySelectorAll('.row-desc.mono')].map((d) => d.closest('.row').querySelector('.btn')).find((x) => !x.disabled)`;
     if (await b.eval(`!!${connect}`)) {
@@ -132,7 +132,7 @@ test('AI › Connect Claude Desktop: adds "meridian" to its config, keeps the ot
     await b.eval(`${row}.querySelector('.btn').click()`);
     await b.waitFor(`!!${ST}.querySelector('.command')`);
     assert.match(await b.eval(`${ST}.querySelector('.confirm-card').textContent`), /claude_desktop_config\.json[\s\S]*copy of the old file/);
-    assert.match(await b.eval(`${ST}.querySelector('.command').textContent`), /"meridian": \{[\s\S]*"command": "[^"]+Meridian[\s\S]*--mcp-bridge/);
+    assert.match(await b.eval(`${ST}.querySelector('.command').textContent`), /"meridian": \{[\s\S]*"command": "[^"]+(Meridian|chrome\.exe)"[\s\S]*--mcp-bridge/i);
     await b.eval(`${ST}.getElementById('connectRun').click()`);
     await b.waitFor(`!${ST}.querySelector('.command') && !/Connecting/.test(${ST}.querySelector('#ai .group:last-child .note').textContent)`);
     return b.eval(`${ST}.querySelector('#ai .group:last-child .note').textContent`);
@@ -147,7 +147,7 @@ test('AI › Connect Claude Desktop: adds "meridian" to its config, keeps the ot
     assert.deepEqual(after.preferences, before.preferences, 'numbers survive (big ones are doubles in Chromium)');
     assert.deepEqual(after.mcpServers.files, before.mcpServers.files, 'other servers stay');
     assert.deepEqual(after.mcpServers.meridian.args, ['--mcp-bridge']);
-    assert.match(after.mcpServers.meridian.command, /Meridian(\.exe)?$/);
+    assert.match(after.mcpServers.meridian.command, /(Meridian|chrome)(\.exe)?$/i);
     assert.deepEqual(JSON.parse(fs.readFileSync(`${config}.meridian-backup`, 'utf8')), before, 'the old file is kept');
     // Again: nothing to change.
     assert.match(await connect(), /already connected/);
