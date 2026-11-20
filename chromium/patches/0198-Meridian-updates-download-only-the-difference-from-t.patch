@@ -1,0 +1,591 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 20 Nov 2026 09:39:36 +0400
+Subject: [PATCH 199/199] Meridian: updates download only the difference from
+ the installed version
+
+A release may carry Meridian-<from>-to-<version>-mac-<arch>.delta (listed in
+its signed SHA256SUMS): manifest.json and zstd patches against the old files.
+The updater downloads the one for its version, builds the new app next to the
+installed one (unchanged files cloned, every file checked against the
+manifest's checksum, the installed files against the ones the delta was made
+from), then checks it as it checks a full download. Anything wrong (no delta,
+a changed installation, a broken patch, a failed download): the whole zip, as
+before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn        |   3 +
+ chrome/browser/meridian/update_check.cc |  10 +
+ chrome/browser/meridian/update_check.h  |   8 +
+ chrome/browser/meridian/update_delta.cc | 283 ++++++++++++++++++++++++
+ chrome/browser/meridian/update_delta.h  |  31 +++
+ chrome/browser/meridian/updater.cc      |  72 +++++-
+ chrome/browser/meridian/updater.h       |   8 +
+ 7 files changed, 404 insertions(+), 11 deletions(-)
+ create mode 100644 chrome/browser/meridian/update_delta.cc
+ create mode 100644 chrome/browser/meridian/update_delta.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index a99a854f3a..77f73257cd 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -322,6 +322,8 @@ source_set("meridian") {
+       "arc_logins_mac.mm",
+       "mission/mission_platform_mac.mm",
+       "sidebar_handler_mac.mm",
++      "update_delta.cc",
++      "update_delta.h",
+       "updater.cc",
+       "workbench/native_dialog_mac.mm",
+     ]
+@@ -399,6 +401,7 @@ source_set("meridian") {
+     "//services/network/public/cpp",
+     "//components/viz/common",
+     "//components/viz/host",
++    "//third_party/zstd:decompress",
+     "//media",
+     "//media/capture/mojom:video_capture_buffer",
+     "//components/zoom",
+diff --git a/chrome/browser/meridian/update_check.cc b/chrome/browser/meridian/update_check.cc
+index 8cc419a017..55b7e123d4 100644
+--- a/chrome/browser/meridian/update_check.cc
++++ b/chrome/browser/meridian/update_check.cc
+@@ -140,6 +140,16 @@ std::optional<Release> ParseFor(std::string_view json,
+       if (!IsAllowedDownloadUrl(*url, test_feed)) {
+         continue;
+       }
++      const std::string delta_end =
++          base::StrCat({"-to-", release.version, names.system, arch, ".delta"});
++      if (base::StartsWith(*name, "Meridian-") &&
++          base::EndsWith(*name, delta_end) &&
++          name->size() > delta_end.size() + 9) {
++        std::string from = name->substr(9, name->size() - 9 - delta_end.size());
++        if (Parts(from)) {
++          release.deltas[from] = {*name, *url};
++        }
++      }
+       if (*name == release.zip_name) {
+         release.zip_url = *url;
+       } else if (*name == names.sums || *name == names.sums_other) {
+diff --git a/chrome/browser/meridian/update_check.h b/chrome/browser/meridian/update_check.h
+index 10dcbd05aa..3983d48554 100644
+--- a/chrome/browser/meridian/update_check.h
++++ b/chrome/browser/meridian/update_check.h
+@@ -7,6 +7,7 @@
+ 
+ #include <array>
+ #include <cstdint>
++#include <map>
+ #include <optional>
+ #include <string>
+ #include <string_view>
+@@ -63,6 +64,13 @@ struct Release {
+   std::string page_url;
+   // The release's notes (GitHub's "body", Markdown), at most 20 KB.
+   std::string notes;
++  // Updates as the difference from an earlier version, by that version:
++  // Meridian-<from>-to-<version>-mac-<arch>.delta (update_delta.h).
++  struct Delta {
++    std::string name;
++    std::string url;
++  };
++  std::map<std::string, Delta> deltas;
+ };
+ 
+ // Whether the updater may download `url`: https only, or also http from a
+diff --git a/chrome/browser/meridian/update_delta.cc b/chrome/browser/meridian/update_delta.cc
+new file mode 100644
+index 0000000000..6f92f492b4
+--- /dev/null
++++ b/chrome/browser/meridian/update_delta.cc
+@@ -0,0 +1,283 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/update_delta.h"
++
++#include <sys/clonefile.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <array>
++#include <memory>
++#include <optional>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/files/file.h"
++#include "base/files/file_util.h"
++#include "base/files/memory_mapped_file.h"
++#include "base/json/json_reader.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/values.h"
++#include "crypto/hash.h"
++#include "third_party/zstd/src/lib/zstd.h"
++
++namespace meridian::update {
++namespace {
++
++// The largest file a patch may refer back into (a 1 GB window).
++constexpr int kWindowLog = 30;
++
++// A path inside the app: relative, no "..", nothing odd.
++bool SafeRelative(std::string_view path) {
++  if (path.empty() || path.front() == '/' || path.find('\0') != path.npos) {
++    return false;
++  }
++  for (std::string_view part : base::SplitStringPiece(
++           path, "/", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL)) {
++    if (part.empty() || part == "." || part == "..") {
++      return false;
++    }
++  }
++  return true;
++}
++
++// A link's target stays inside the app.
++bool SafeLink(std::string_view path, std::string_view target) {
++  if (target.empty() || target.front() == '/') {
++    return false;
++  }
++  int depth = static_cast<int>(
++                  base::SplitStringPiece(path, "/", base::KEEP_WHITESPACE,
++                                         base::SPLIT_WANT_ALL)
++                      .size()) -
++              1;
++  for (std::string_view part : base::SplitStringPiece(
++           target, "/", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL)) {
++    if (part == "..") {
++      if (--depth < 0) {
++        return false;
++      }
++    } else if (!part.empty() && part != ".") {
++      ++depth;
++    }
++  }
++  return true;
++}
++
++std::optional<std::string> Sha256Of(const base::FilePath& path) {
++  base::File file(path, base::File::FLAG_OPEN | base::File::FLAG_READ);
++  if (!file.IsValid()) {
++    return std::nullopt;
++  }
++  crypto::hash::Hasher hasher(crypto::hash::kSha256);
++  std::vector<uint8_t> buffer(1 << 20);
++  while (true) {
++    std::optional<size_t> n = file.ReadAtCurrentPos(buffer);
++    if (!n) {
++      return std::nullopt;
++    }
++    if (*n == 0) {
++      break;
++    }
++    hasher.Update(base::span(buffer).first(*n));
++  }
++  std::array<uint8_t, crypto::hash::kSha256Size> digest;
++  hasher.Finish(digest);
++  return base::ToLowerASCII(base::HexEncode(digest));
++}
++
++struct DCtxDeleter {
++  void operator()(ZSTD_DCtx* ctx) const { ZSTD_freeDCtx(ctx); }
++};
++
++// Decompresses `blob` into `out`, with `prefix` (the old file) when there is
++// one, and returns the result's SHA-256 (or nullopt).
++std::optional<std::string> Decode(const base::FilePath& blob,
++                                  const base::FilePath& prefix,
++                                  const base::FilePath& out) {
++  std::unique_ptr<ZSTD_DCtx, DCtxDeleter> ctx(ZSTD_createDCtx());
++  if (!ctx || ZSTD_isError(ZSTD_DCtx_setParameter(
++                  ctx.get(), ZSTD_d_windowLogMax, kWindowLog))) {
++    return std::nullopt;
++  }
++  base::MemoryMappedFile old;
++  if (!prefix.empty()) {
++    if (!old.Initialize(prefix)) {
++      return std::nullopt;
++    }
++    if (ZSTD_isError(ZSTD_DCtx_refPrefix(ctx.get(), old.bytes().data(),
++                                         old.bytes().size()))) {
++      return std::nullopt;
++    }
++  }
++  base::File in(blob, base::File::FLAG_OPEN | base::File::FLAG_READ);
++  base::File output(out, base::File::FLAG_CREATE | base::File::FLAG_WRITE);
++  if (!in.IsValid() || !output.IsValid()) {
++    return std::nullopt;
++  }
++  crypto::hash::Hasher hasher(crypto::hash::kSha256);
++  std::vector<uint8_t> in_buffer(ZSTD_DStreamInSize());
++  std::vector<uint8_t> out_buffer(ZSTD_DStreamOutSize());
++  size_t last = 0;
++  bool any = false;
++  while (true) {
++    std::optional<size_t> n = in.ReadAtCurrentPos(in_buffer);
++    if (!n) {
++      return std::nullopt;
++    }
++    if (*n == 0) {
++      break;
++    }
++    any = true;
++    ZSTD_inBuffer input = {in_buffer.data(), *n, 0};
++    while (input.pos < input.size) {
++      ZSTD_outBuffer o = {out_buffer.data(), out_buffer.size(), 0};
++      last = ZSTD_decompressStream(ctx.get(), &o, &input);
++      if (ZSTD_isError(last)) {
++        return std::nullopt;
++      }
++      auto produced = base::span(out_buffer).first(o.pos);
++      if (!output.WriteAtCurrentPosAndCheck(produced)) {
++        return std::nullopt;
++      }
++      hasher.Update(produced);
++    }
++  }
++  // The whole frame, not a cut-off one.
++  if (!any || last != 0) {
++    return std::nullopt;
++  }
++  // The rest of a frame the last read didn't flush.
++  while (true) {
++    ZSTD_inBuffer input = {nullptr, 0, 0};
++    ZSTD_outBuffer o = {out_buffer.data(), out_buffer.size(), 0};
++    size_t left = ZSTD_decompressStream(ctx.get(), &o, &input);
++    if (ZSTD_isError(left)) {
++      return std::nullopt;
++    }
++    auto produced = base::span(out_buffer).first(o.pos);
++    if (!output.WriteAtCurrentPosAndCheck(produced)) {
++      return std::nullopt;
++    }
++    hasher.Update(produced);
++    if (o.pos == 0) {
++      break;
++    }
++  }
++  std::array<uint8_t, crypto::hash::kSha256Size> digest;
++  hasher.Finish(digest);
++  return base::ToLowerASCII(base::HexEncode(digest));
++}
++
++}  // namespace
++
++std::string ApplyDelta(const base::FilePath& delta,
++                       const base::FilePath& from,
++                       const base::FilePath& staged) {
++  std::string text;
++  if (!base::ReadFileToStringWithMaxSize(delta.Append("manifest.json"), &text,
++                                         16 << 20)) {
++    return "no manifest";
++  }
++  std::optional<base::Value> manifest =
++      base::JSONReader::Read(text, base::JSON_PARSE_RFC);
++  const base::ListValue* entries =
++      manifest && manifest->is_dict() ? manifest->GetDict().FindList("entries")
++                                      : nullptr;
++  if (!entries || manifest->GetDict().FindInt("format").value_or(0) != 1) {
++    return "not a delta this version reads";
++  }
++  if (base::PathExists(staged) || mkdir(staged.value().c_str(), 0755) != 0) {
++    return "can't create the new app";
++  }
++  int n = 0;
++  for (const base::Value& value : *entries) {
++    ++n;
++    const base::DictValue* entry = value.GetIfDict();
++    const std::string* path = entry ? entry->FindString("path") : nullptr;
++    const std::string* type = entry ? entry->FindString("type") : nullptr;
++    if (!path || !type || !SafeRelative(*path)) {
++      return "a bad entry " + base::NumberToString(n);
++    }
++    const base::FilePath target = staged.Append(*path);
++    const int mode = entry->FindInt("mode").value_or(0644) & 0777;
++    if (*type == "dir") {
++      if (mkdir(target.value().c_str(), 0755) != 0 && errno != EEXIST) {
++        return "can't create " + *path;
++      }
++      chmod(target.value().c_str(), mode | 0700);
++      continue;
++    }
++    if (*type == "link") {
++      const std::string* link = entry->FindString("target");
++      if (!link || !SafeLink(*path, *link) ||
++          symlink(link->c_str(), target.value().c_str()) != 0) {
++        return "can't link " + *path;
++      }
++      continue;
++    }
++    if (*type != "file") {
++      return "a bad entry " + *path;
++    }
++    const std::string* sha = entry->FindString("sha256");
++    const std::string* source = entry->FindString("source");
++    if (!sha || !source) {
++      return "a bad entry " + *path;
++    }
++    std::optional<std::string> made;
++    if (*source == "same" || *source == "patch") {
++      // The old file it was made from.
++      const std::string* from_path = entry->FindString("from");
++      const std::string* from_sha = entry->FindString("from_sha256");
++      if (!from_path || !from_sha || !SafeRelative(*from_path)) {
++        return "a bad entry " + *path;
++      }
++      const base::FilePath old = from.Append(*from_path);
++      if (base::IsLink(old)) {
++        return "the installed app has a link at " + *from_path;
++      }
++      std::optional<std::string> old_sha = Sha256Of(old);
++      if (old_sha != *from_sha) {
++        return "the installed app differs at " + *from_path + " (" +
++               old_sha.value_or("unreadable") + ")";
++      }
++      if (*source == "same") {
++        // A copy that shares the data on APFS (or a plain copy).
++        if (clonefile(old.value().c_str(), target.value().c_str(),
++                      CLONE_NOFOLLOW) != 0 &&
++            !base::CopyFile(old, target)) {
++          return "can't copy " + *path;
++        }
++        made = *from_sha;
++      } else {
++        const std::string* blob = entry->FindString("blob");
++        if (!blob || !SafeRelative(*blob)) {
++          return "a bad entry " + *path;
++        }
++        made = Decode(delta.Append(*blob), old, target);
++      }
++    } else if (*source == "data") {
++      const std::string* blob = entry->FindString("blob");
++      if (!blob || !SafeRelative(*blob)) {
++        return "a bad entry " + *path;
++      }
++      made = Decode(delta.Append(*blob), base::FilePath(), target);
++    } else {
++      return "a bad entry " + *path;
++    }
++    if (made != *sha) {
++      return "the result differs at " + *path;
++    }
++    if (chmod(target.value().c_str(), mode) != 0) {
++      return "can't set the mode of " + *path;
++    }
++  }
++  return std::string();
++}
++
++}  // namespace meridian::update
+diff --git a/chrome/browser/meridian/update_delta.h b/chrome/browser/meridian/update_delta.h
+new file mode 100644
+index 0000000000..79ff565c96
+--- /dev/null
++++ b/chrome/browser/meridian/update_delta.h
+@@ -0,0 +1,31 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_UPDATE_DELTA_H_
++#define CHROME_BROWSER_MERIDIAN_UPDATE_DELTA_H_
++
++#include <string>
++
++#include "base/files/file_path.h"
++
++namespace meridian::update {
++
++// An update as the difference from one version (tools/make_delta.py): a
++// folder with manifest.json, which lists every file, folder and link of the
++// new app, and files/<n>.zst: a file new in this version (zstd), or the
++// changes to a file of the old one (zstd with the old file as its prefix,
++// as `zstd --patch-from`).
++//
++// Builds the new app at `staged` (which mustn't exist) from the running app
++// `from` and that folder. Every file the manifest takes from the old app must
++// be the one it was made from, and every file it ends up with is checked
++// against the manifest's checksum. Returns an error (for the log; the updater
++// then downloads the whole app) or an empty string.
++std::string ApplyDelta(const base::FilePath& delta,
++                       const base::FilePath& from,
++                       const base::FilePath& staged);
++
++}  // namespace meridian::update
++
++#endif  // CHROME_BROWSER_MERIDIAN_UPDATE_DELTA_H_
+diff --git a/chrome/browser/meridian/updater.cc b/chrome/browser/meridian/updater.cc
+index 9b6fb8ed57..528f58f7ae 100644
+--- a/chrome/browser/meridian/updater.cc
++++ b/chrome/browser/meridian/updater.cc
+@@ -26,6 +26,7 @@
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/lifetime/application_lifetime.h"
+ #include "chrome/browser/meridian/test_switches.h"
++#include "chrome/browser/meridian/update_delta.h"
+ #include "chrome/common/chrome_paths.h"
+ #include "crypto/hash.h"
+ #include "net/base/load_flags.h"
+@@ -165,7 +166,9 @@ std::pair<std::string, std::string> Stage(base::FilePath zip,
+                                           base::FilePath running,
+                                           bool check_signature,
+                                           std::string version,
+-                                          std::string current) {
++                                          std::string current,
++                                          bool delta,
++                                          base::FilePath installed) {
+   auto fail = [](std::string error) {
+     return std::make_pair(std::move(error), std::string());
+   };
+@@ -205,13 +208,34 @@ std::pair<std::string, std::string> Stage(base::FilePath zip,
+       mkdir(unpacked.value().c_str(), 0700) != 0) {
+     return fail("The download couldn’t be unpacked.");
+   }
+-  if (!base::GetAppOutputWithExitCode(
+-          {"/usr/bin/ditto", "-x", "-k", zip.value(), unpacked.value()}, &out,
+-          &code) ||
+-      code != 0 || !base::DirectoryExists(staged)) {
+-    return fail("The download couldn’t be unpacked.");
++  if (delta) {
++    // The difference from this version: the new app built from the running
++    // one (update_delta.h).
++    base::FilePath parts = unpacked.Append("delta");
++    std::string error;
++    if (mkdir(parts.value().c_str(), 0700) != 0 ||
++        !base::GetAppOutputWithExitCode(
++            {"/usr/bin/ditto", "-x", "-k", zip.value(), parts.value()}, &out,
++            &code) ||
++        code != 0) {
++      error = "couldn’t unpack";
++    } else {
++      error = update::ApplyDelta(parts, installed, staged);
++    }
++    base::DeletePathRecursively(parts);
++    base::DeleteFile(zip);
++    if (!error.empty()) {
++      return fail("delta: " + error);
++    }
++  } else {
++    if (!base::GetAppOutputWithExitCode(
++            {"/usr/bin/ditto", "-x", "-k", zip.value(), unpacked.value()}, &out,
++            &code) ||
++        code != 0 || !base::DirectoryExists(staged)) {
++      return fail("The download couldn’t be unpacked.");
++    }
++    base::DeleteFile(zip);
+   }
+-  base::DeleteFile(zip);
+   if (Plist(staged, "CFBundleIdentifier") !=
+       Plist(running, "CFBundleIdentifier")) {
+     return fail("The download isn’t Meridian.");
+@@ -369,10 +393,20 @@ void Updater::OnFeed(std::optional<std::string> body) {
+     Set(mojom::UpdateStatus::kAvailable);
+     return;
+   }
++  Download();
++}
++
++void Updater::Download() {
++  auto delta = release_.deltas.find(CurrentVersion());
++  delta_ = delta != release_.deltas.end() &&
++           delta_failed_for_ != release_.version &&
++           !HasTestSwitch("meridian-test-update-no-delta");
++  const std::string url = delta_ ? delta->second.url : release_.zip_url;
++  download_name_ = delta_ ? delta->second.name : release_.zip_name;
+   progress_ = 0;
+   zip_size_ = 0;
+   Set(mojom::UpdateStatus::kDownloading);
+-  loader_ = Request(release_.zip_url);
++  loader_ = Request(url);
+   loader_->SetOnResponseStartedCallback(base::BindOnce(
+       [](Updater* self, const GURL&,
+          const network::mojom::URLResponseHead& head) {
+@@ -394,13 +428,18 @@ void Updater::OnFeed(std::optional<std::string> body) {
+   loader_->DownloadToFile(
+       g_browser_process->shared_url_loader_factory().get(),
+       base::BindOnce(&Updater::OnZip, weak_factory_.GetWeakPtr()),
+-      dir_.Append(release_.zip_name), kMaxZip);
++      dir_.Append(download_name_), kMaxZip);
+ }
+ 
+ void Updater::OnZip(base::FilePath path) {
+   bool ok = loader_ && loader_->NetError() == net::OK && !path.empty();
+   loader_.reset();
+   if (!ok) {
++    if (delta_) {
++      delta_failed_for_ = release_.version;
++      Download();
++      return;
++    }
+     Set(mojom::UpdateStatus::kFailed, "The update didn’t download.");
+     return;
+   }
+@@ -445,7 +484,12 @@ void Updater::OnSig(std::optional<std::string> body) {
+         "The release’s checksums aren’t signed by Meridian.");
+     return;
+   }
+-  std::optional<std::string> sum = update::FindSum(sums_, release_.zip_name);
++  std::optional<std::string> sum = update::FindSum(sums_, download_name_);
++  if (!sum && delta_) {
++    delta_failed_for_ = release_.version;
++    Download();
++    return;
++  }
+   if (!sum) {
+     Set(mojom::UpdateStatus::kFailed,
+         "The release has no checksum for this Mac.");
+@@ -458,7 +502,7 @@ void Updater::OnSig(std::optional<std::string> body) {
+       base::BindOnce(&Stage, zip_, *sum,
+                      dir_.Append("staged").Append("Meridian.app"),
+                      base::apple::OuterBundlePath(), !test_target_,
+-                     release_.version, CurrentVersion()),
++                     release_.version, CurrentVersion(), delta_, bundle_),
+       base::BindOnce(&Updater::OnStaged, weak_factory_.GetWeakPtr()));
+ }
+ 
+@@ -467,6 +511,12 @@ void Updater::OnStaged(
+   const std::string& error = error_and_requirement.first;
+   if (!error.empty()) {
+     LOG(WARNING) << "Meridian update " << release_.version << ": " << error;
++    // The difference didn't work here: the whole app instead.
++    if (delta_) {
++      delta_failed_for_ = release_.version;
++      Download();
++      return;
++    }
+     Set(mojom::UpdateStatus::kFailed, error);
+     return;
+   }
+diff --git a/chrome/browser/meridian/updater.h b/chrome/browser/meridian/updater.h
+index 46fc777c6f..10bd30ec00 100644
+--- a/chrome/browser/meridian/updater.h
++++ b/chrome/browser/meridian/updater.h
+@@ -83,6 +83,9 @@ class Updater : public base::PowerSuspendObserver {
+   void OnLocated(Located located);
+   void Check();
+   void OnFeed(std::optional<std::string> body);
++  // Downloads the update: only the difference from this version when the
++  // release has it (and it hasn't failed here), else the whole app.
++  void Download();
+   void OnZip(base::FilePath path);
+   void OnSums(std::optional<std::string> body);
+   void OnSig(std::optional<std::string> body);
+@@ -100,6 +103,11 @@ class Updater : public base::PowerSuspendObserver {
+   base::FilePath bundle_;
+   base::FilePath zip_;
+   update::Release release_;
++  // What's downloading: the delta (or the zip), by its asset name.
++  bool delta_ = false;
++  std::string download_name_;
++  // The release whose delta didn't work here: the whole app for it.
++  std::string delta_failed_for_;
+   std::string sums_;
+   std::string requirement_;
+   mojom::UpdateStatus status_ = mojom::UpdateStatus::kIdle;
