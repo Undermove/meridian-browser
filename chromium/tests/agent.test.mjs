@@ -59,6 +59,29 @@ function site() {
   return new Promise((r) => server.listen(0, '127.0.0.1', () => r({ server, url: (p) => `http://127.0.0.1:${server.address().port}${p}` })));
 }
 
+// An agent outside Meridian (Claude Code in a terminal) lost its browser tools when the browser
+// crashed: every call failed at once with "Meridian is not running". Now the bridge waits for the
+// browser to come back (it reopens itself after a crash) and the call goes through.
+test('a tool call while the browser is down after a crash waits for it to come back', async () => {
+  const profile = profileWith({ agent_access: 'full' });
+  let b = await launch(['about:blank'], { profile });
+  const mcp = bridge(profile);
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { clientInfo: { name: 'patient' } });
+    assert.equal((await mcp.call('list_tabs')).error, null);
+    process.kill(b.proc.pid, 'SIGKILL');  // a crash
+    await b.close();
+    const pending = mcp.call('list_tabs');
+    await sleep(3000);
+    b = await launch(['about:blank'], { profile });
+    const after = await pending;
+    assert.equal(after.error, null, `answered once the browser was back: ${after.error}`);
+    assert.ok(Array.isArray(after.value));
+  } finally { mcp.close(); await b.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
 // A dropdown (<select>): its options are listed, and type_text chooses one, with the page's change
 // event (an agent recording a demo couldn't pick a category on a shop's admin page, 20.11.2026).
 test('type_text chooses an option in a <select>; get_interactive_elements lists the options', async () => {

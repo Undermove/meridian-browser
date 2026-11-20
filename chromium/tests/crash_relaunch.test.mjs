@@ -12,7 +12,8 @@ import { launch, SB } from './harness.mjs';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const MARK = 'Meridian Crash Relaunch';
 // The browser ends without a clean exit (Windows has no SIGSEGV to send: it is ended outright).
-const CRASH = process.platform === 'win32' ? 'SIGKILL' : 'SIGSEGV';
+// Ended outright, as a crash does (a real SIGSEGV makes macOS write a crash report, slowing the next tests).
+const CRASH = 'SIGKILL';
 const exitType = (profile) => { try { return JSON.parse(fs.readFileSync(path.join(profile, 'Default', 'Preferences'), 'utf8')).profile?.exit_type; } catch { return undefined; } };
 const waitFor = async (what, ms = 15000) => { for (const end = Date.now() + ms; Date.now() < end; await sleep(200)) if (what()) return true; return false; };
 
