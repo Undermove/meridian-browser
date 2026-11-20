@@ -4,6 +4,7 @@
 # chromium/dist/:
 #   Meridian-<version>-mac-<arch>.dmg   drag to Applications
 #   Meridian-<version>-mac-<arch>.zip   for install.sh and the in-app updater
+#   Meridian-<old>-to-<version>-mac-<arch>.delta   updates from the last few releases (upload them too)
 #   SHA256SUMS.txt                      checked by both
 #   SHA256SUMS.txt.sig                  the updater trusts no checksum without it (upload it too)
 #   Meridian-mac-<arch>.dmg             the same .dmg for the site's download button
@@ -107,7 +108,28 @@ if [ -n "$TEAM" ] && [ -n "${MERIDIAN_NOTARY_PROFILE:-}" ]; then
   rm "$OUT/$NAME.zip"; ditto -c -k --sequesterRsrc --keepParent "$T/Meridian.app" "$OUT/$NAME.zip"; rm -rf "$T"
 fi
 
-(cd "$OUT" && shasum -a 256 "$NAME.dmg" "$NAME.zip" > SHA256SUMS.txt)
+# Updates as the difference from the last few releases (tools/make_delta.py): an installed Meridian
+# 0.6.13 or later downloads only Meridian-<its version>-to-<version>-mac-<arch>.delta, and the whole
+# zip when there's none or it doesn't fit. Their zips are kept in ~/.cache/meridian-releases.
+# MERIDIAN_DELTAS: how many earlier releases (default 3; 0: none).
+DELTAS=()
+if [ "${MERIDIAN_DELTAS:-3}" -gt 0 ] && command -v zstd >/dev/null && command -v gh >/dev/null; then
+  CACHE="$HOME/.cache/meridian-releases"; mkdir -p "$CACHE"
+  T="$(mktemp -d)"; ditto -x -k "$OUT/$NAME.zip" "$T/new"
+  for tag in $(gh release list -R Undermove/meridian-browser --exclude-drafts --exclude-pre-releases \
+                 -L 20 --json tagName -q '.[].tagName' | grep -vx "v$VERSION" | head -n "${MERIDIAN_DELTAS:-3}"); do
+    from="${tag#v}"; zip="Meridian-$from-mac-$ARCH.zip"
+    [ -f "$CACHE/$zip" ] || gh release download "$tag" -R Undermove/meridian-browser -p "$zip" -D "$CACHE" || continue
+    rm -rf "$T/old"; ditto -x -k "$CACHE/$zip" "$T/old"
+    delta="Meridian-$from-to-$VERSION-mac-$ARCH.delta"
+    python3 "$HERE/tools/make_delta.py" "$T/old/Meridian.app" "$T/new/Meridian.app" "$OUT/$delta" && DELTAS+=("$delta")
+  done
+  rm -rf "$T"
+else
+  echo "No deltas (MERIDIAN_DELTAS=0, or zstd or gh missing): updates download the whole app."
+fi
+
+(cd "$OUT" && shasum -a 256 "$NAME.dmg" "$NAME.zip" ${DELTAS[@]+"${DELTAS[@]}"} > SHA256SUMS.txt)
 
 # The checksums, signed with Meridian's release key (Ed25519; the private key never enters the repo).
 # The updater only trusts SHA256SUMS.txt under this signature, checked with the public key built
