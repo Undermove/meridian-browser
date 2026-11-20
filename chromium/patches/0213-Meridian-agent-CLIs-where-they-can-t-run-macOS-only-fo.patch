@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Sat, 21 Nov 2026 01:25:14 +0400
+Subject: [PATCH 214/214] Meridian: agent CLIs where they can't run: "macOS
+ only for now", not offered
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Agent CLIs (Codex, OpenCode, Cursor, Qwen, Amp, Goose, Droid, Copilot)
+answer Ask only inside the macOS sandbox (SandboxedArgv); elsewhere nothing
+ran them, yet Settings > AI showed them as Ready and Ask stayed silent. Now
+their rows say "macOS only for now" and can't be picked (no sign-in check is
+run either), and one picked before (an older setting, or synced from a Mac)
+answers Ask with "<name> answers Ask on macOS only for now; pick another AI
+in Settings › AI."
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/meridian/ai/local_agents.cc    | 24 +++++++++++++++++++
+ chrome/browser/meridian/ai/local_agents.h     |  2 ++
+ chrome/browser/meridian/sidebar.mojom         |  3 +++
+ chrome/browser/meridian/sidebar_handler.cc    |  1 +
+ .../webui_browser/meridian/settings.ts        |  8 +++++--
+ 5 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/meridian/ai/local_agents.cc b/chrome/browser/meridian/ai/local_agents.cc
+index 6e461b2643..afb208bdb6 100644
+--- a/chrome/browser/meridian/ai/local_agents.cc
++++ b/chrome/browser/meridian/ai/local_agents.cc
+@@ -21,6 +21,7 @@
+ #include "base/synchronization/lock.h"
+ #include "base/task/bind_post_task.h"
+ #include "base/task/thread_pool.h"
++#include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/meridian/ai/process_runner.h"
+ #include "chrome/browser/meridian/prefs.h"
+@@ -81,6 +82,15 @@ std::string TestPath() {
+   return TestSwitchValue("meridian-agents-path");
+ }
+ 
++// Agent CLIs answer only inside a sandbox that keeps them out of credentials
++// and other browsers' data (SandboxedArgv); there is one on macOS only.
++#if BUILDFLAG(IS_MAC)
++constexpr bool kCliSandbox = true;
++#else
++constexpr bool kCliSandbox = false;
++#endif
++constexpr char kMacOnly[] = "macOS only for now";
++
+ // The login environment, for CLIs whose output is parsed: no colours, no
+ // interactive prompts.
+ std::map<std::string, std::string> ChildEnv() {
+@@ -159,6 +169,13 @@ std::vector<LocalAgents::Status> ListBlocking() {
+     if (p.kind == Kind::kCli) {
+       std::string bin = FindBin(p, path);
+       status.installed = !bin.empty();
++      if (!kCliSandbox) {
++        // Not offered: nothing here would run it (and nothing is run to ask
++        // whether it's signed in).
++        status.unavailable = kMacOnly;
++        out.push_back(std::move(status));
++        continue;
++      }
+       std::optional<AuthCheck> check = AuthCheckFor(p);
+       if (status.installed && check) {
+         std::vector<std::string> argv = {bin};
+@@ -503,6 +520,13 @@ void LocalAgents::Chat(const std::string& run_id,
+     HttpChat(run_id, std::move(turn));
+     return;
+   }
++  if (!kCliSandbox) {
++    // Chosen before (or on a Mac, synced): said, never silent.
++    Finish(run_id, "error",
++           p->label + " answers Ask on " + kMacOnly +
++               "; pick another AI in Settings › AI.");
++    return;
++  }
+   Run* r = runs_[run_id].get();
+   r->cancel = base::MakeRefCounted<CancelFlag>();
+   r->parser = MakeParser(*p);
+diff --git a/chrome/browser/meridian/ai/local_agents.h b/chrome/browser/meridian/ai/local_agents.h
+index 6ff841add0..f8689c577b 100644
+--- a/chrome/browser/meridian/ai/local_agents.h
++++ b/chrome/browser/meridian/ai/local_agents.h
+@@ -47,6 +47,8 @@ class LocalAgents {
+     // A local server that is installed but off: the CLI that starts it
+     // (LM Studio's `lms`), else empty.
+     std::string start_with;
++    // Why it can't answer on this system ("macOS only for now"), else empty.
++    std::string unavailable;
+   };
+ 
+   // Blocking: `<start_with> server start`, in the background; whether it
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 8760d2af97..f96ed2aacc 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -446,6 +446,9 @@ struct AiProvider {
+   // A local server that is installed but off and Meridian can start
+   // (RunAiSetup "start").
+   bool can_start;
++  // Why it can't answer on this system ("macOS only for now"; agent CLIs
++  // need a sandbox), else empty: shown as its status, the row disabled.
++  string unavailable;
+   string login_command;
+   string docs;
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index d96dd85dec..d0ed9b7c5c 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -1148,6 +1148,7 @@ void SidebarHandler::GetAiProviders(bool fresh,
+               m->install_command = s.install_command;
+               m->install_missing = s.install_missing;
+               m->can_start = !s.installed && !s.start_with.empty();
++              m->unavailable = s.unavailable;
+               m->login_command = p->login;
+               m->docs = p->docs;
+               out.push_back(std::move(m));
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 6e48219ad7..988bd764fa 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -517,7 +517,11 @@ export class MeridianSettingsElement extends CrLitElement {
+     let statusKind = 'ok';
+     let action = '';
+     let actionLabel = '';
+-    if (!installed && p.canStart) {
++    if (p.unavailable) {
++      // Can't answer on this system: said, and not offered.
++      status = p.unavailable;
++      statusKind = '';
++    } else if (!installed && p.canStart) {
+       status = 'Server off';
+       statusKind = '';
+       action = 'start';
+@@ -558,7 +562,7 @@ export class MeridianSettingsElement extends CrLitElement {
+       status,
+       statusKind,
+       on: chosen === p.id,
+-      disabled: !installed,
++      disabled: !installed || !!p.unavailable,
+       action: cloud ? '' : action,
+       actionLabel,
+       mark: p.label.charAt(0),
+-- 
+2.52.0.windows.1
+

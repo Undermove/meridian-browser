@@ -278,3 +278,36 @@ if (args[0] === 'server' && args[1] === 'start') require('fs').writeFileSync(${J
     for (const d of [dir, bin]) fs.rmSync(d, { recursive: true, force: true });
   }
 });
+
+// Where agent CLIs can't run (no sandbox: NO_CLI), they aren't offered: each says so and can't be
+// picked; one picked before (an older setting, or synced from a Mac) answers Ask with that, never
+// silence.
+test('agent CLIs where they can’t run: “macOS only for now”, can’t be picked; one picked before says so in Ask', { skip: !NO_CLI && 'agent CLIs run here' }, async () => {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
+  fakeCodex(bin);
+  const b = await launch(['about:blank'], { args: [`--meridian-agents-path=${bin}`] });
+  const settings = () => b.eval(`${H}.getSettings().then(({settings}) => settings)`);
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    await b.eval('app.$.tabstrip.runCommand(13, 0)');
+    await b.waitFor(`app.$.settings.open && !!${ST}.querySelector('[data-id="ai"]')`);
+    await b.click(`${ST}.querySelector('[data-id="ai"]')`);
+    await b.waitFor(`!!${ST}.getElementById('aiRows')`);
+    await b.click(`${ST}.getElementById('otherAgents')`);
+    for (const id of ['codex', 'opencode', 'cursor', 'qwen', 'amp', 'goose', 'droid', 'copilot']) {
+      await b.waitFor(`${ST}.getElementById('ai-${id}')?.textContent.includes('macOS only for now')`, 15000);
+      assert.equal(await b.eval(`${ST}.getElementById('ai-${id}').hasAttribute('disabled')`), true, `${id} can't be picked`);
+    }
+    await b.eval(`${ST}.getElementById('ai-codex').click()`);
+    await sleep(500);
+    assert.notEqual((await settings()).aiProvider, 'codex');
+
+    // Picked before: Ask says why, and where to pick another.
+    await b.eval(`${H}.getSettings().then(({settings}) => ${H}.setSettings({...settings, aiProvider: 'codex', aiOtherAgents: true}))`);
+    await b.eval('app.$.settings.hide()');
+    await b.eval('app.$.tabstrip.runCommand(14, 0)');
+    await b.waitFor(`app.$.ask.open && !!${AK}.getElementById('input')`);
+    await b.eval(`(() => { const i = ${AK}.getElementById('input'); i.value = 'hello'; ${AK}.getElementById('send').click(); })()`);
+    await b.waitFor(`${AK}.textContent.includes('Codex answers Ask on macOS only for now; pick another AI in Settings › AI.')`, 15000);
+  } finally { await b.close(); fs.rmSync(bin, { recursive: true, force: true }); }
+});
