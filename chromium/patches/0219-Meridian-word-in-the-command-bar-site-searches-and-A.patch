@@ -1,0 +1,470 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Sat, 21 Nov 2026 02:59:51 +0400
+Subject: [PATCH 220/221] =?UTF-8?q?Meridian:=20"word=20=E2=87=A5"=20in=20t?=
+ =?UTF-8?q?he=20command=20bar:=20site=20searches=20and=20AIs;=20"keyword?=
+ =?UTF-8?q?=20words"=20searches=20that=20site?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- A site search's keyword then Tab: the bar becomes a pill, Return searches
+  that site. Arc's way works too: "kiwi pear" with kiwi a site's keyword
+  searches kiwi (it went to the default search before).
+- claude / codex / ask / ai / page / summarize then Tab: Return asks that AI
+  in Ask (page and summarize with the page; Summarize with nothing typed
+  sums the page up). Backspace in an empty field leaves the mode.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/ai/ai_service.cc      |   6 +-
+ chrome/browser/meridian/sidebar.mojom         |  15 +++
+ chrome/browser/meridian/sidebar_handler.cc    |  50 +++++++
+ chrome/browser/meridian/sidebar_handler.h     |   9 ++
+ .../resources/webui_browser/app.html.ts       |   2 +
+ chrome/browser/resources/webui_browser/app.ts |  12 ++
+ .../resources/webui_browser/meridian/ask.ts   |  24 ++++
+ .../webui_browser/meridian/command_bar.css    |  20 +++
+ .../meridian/command_bar.html.ts              |   8 ++
+ .../webui_browser/meridian/command_bar.ts     | 122 ++++++++++++++++++
+ 10 files changed, 266 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/meridian/ai/ai_service.cc b/chrome/browser/meridian/ai/ai_service.cc
+index e94e7e4547..8bca13a196 100644
+--- a/chrome/browser/meridian/ai/ai_service.cc
++++ b/chrome/browser/meridian/ai/ai_service.cc
+@@ -928,8 +928,10 @@ void AiService::OnConsent(const std::string& choice) {
+ }
+ 
+ void AiService::Chat(Request request, EventCallback events) {
+-  // Nothing leaves before the person allowed it.
+-  if (std::string provider = CurrentProvider(); !ConsentGiven(provider)) {
++  // Nothing leaves before the person allowed it (for whoever answers).
++  if (std::string provider = request.provider.empty() ? CurrentProvider()
++                                                      : request.provider;
++      !ConsentGiven(provider)) {
+     WhenAllowed(
+         provider,
+         base::BindOnce(&AiService::Chat, weak_factory_.GetWeakPtr(),
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 448154977a..242174ae20 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -453,6 +453,12 @@ struct AiProvider {
+   string docs;
+ };
+ 
++// A site search the command bar can run by its keyword.
++struct SearchKeyword {
++  string keyword;
++  string name;
++};
++
+ // A coding-agent CLI Meridian can register its MCP server with.
+ struct AgentCli {
+   // "claude" or "codex".
+@@ -754,6 +760,15 @@ interface SidebarHandler {
+   // A turn; answers stream back as OnAiEvent. `mode` is "chat" or "ask";
+   // `with_page` adds the active page's text.
+   AiChat(string session_id, string text, string mode, bool with_page);
++  // The same, answered by `provider` ("claude-code", "codex"…; empty: the one
++  // picked in Settings > AI), from the command bar's "claude ⇥" and the like.
++  AiChatWith(string session_id, string text, string mode, bool with_page,
++             string provider);
++  // The site searches with a keyword ("yt" for YouTube…), for the command
++  // bar's "keyword ⇥".
++  GetSearchKeywords() => (array<SearchKeyword> keywords);
++  // The search `keyword` runs for `terms` (empty if there is no such one).
++  SearchUrl(string keyword, string terms) => (string url);
+   AiStop(string session_id);
+   AiReset(string session_id);
+   // Can anything answer, and who ("Claude", "Ollama"…).
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index b1aef175fb..c780babf7c 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -33,6 +33,9 @@
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/meridian/agent/agent_cli.h"
+ #include "chrome/browser/meridian/currency_rates.h"
++#include "chrome/browser/search_engines/template_url_service_factory.h"
++#include "components/search_engines/template_url.h"
++#include "components/search_engines/template_url_service.h"
+ #include "chrome/browser/meridian/ai/chats.h"
+ #include "chrome/browser/meridian/ai/local_agents.h"
+ #include "chrome/browser/meridian/ai/process_runner.h"
+@@ -1079,6 +1082,52 @@ void SidebarHandler::AiChat(const std::string& session_id,
+                             const std::string& text,
+                             const std::string& mode,
+                             bool with_page) {
++  AiChatWith(session_id, text, mode, with_page, std::string());
++}
++
++void SidebarHandler::GetSearchKeywords(GetSearchKeywordsCallback callback) {
++  std::vector<mojom::SearchKeywordPtr> out;
++  TemplateURLService* service =
++      TemplateURLServiceFactory::GetForProfile(ActiveSpaceProfile());
++  if (service) {
++    for (const TemplateURL* t : service->GetTemplateURLs()) {
++      // Searches the person can type a keyword for (not extensions' own).
++      if (t->type() != TemplateURL::NORMAL || t->keyword().empty() ||
++          !t->url_ref().SupportsReplacement(service->search_terms_data())) {
++        continue;
++      }
++      auto k = mojom::SearchKeyword::New();
++      k->keyword = base::UTF16ToUTF8(t->keyword());
++      k->name = base::UTF16ToUTF8(t->short_name());
++      out.push_back(std::move(k));
++    }
++  }
++  std::move(callback).Run(std::move(out));
++}
++
++void SidebarHandler::SearchUrl(const std::string& keyword,
++                               const std::string& terms,
++                               SearchUrlCallback callback) {
++  TemplateURLService* service =
++      TemplateURLServiceFactory::GetForProfile(ActiveSpaceProfile());
++  const TemplateURL* t =
++      service ? service->GetTemplateURLForKeyword(base::UTF8ToUTF16(keyword))
++              : nullptr;
++  if (!t || !t->url_ref().SupportsReplacement(service->search_terms_data())) {
++    std::move(callback).Run(std::string());
++    return;
++  }
++  GURL url(t->url_ref().ReplaceSearchTerms(
++      TemplateURLRef::SearchTermsArgs(base::UTF8ToUTF16(terms)),
++      service->search_terms_data()));
++  std::move(callback).Run(url.is_valid() ? url.spec() : std::string());
++}
++
++void SidebarHandler::AiChatWith(const std::string& session_id,
++                                const std::string& text,
++                                const std::string& mode,
++                                bool with_page,
++                                const std::string& provider) {
+   AiService* ai = AiServiceFactory::GetForProfile(browser_->GetProfile());
+   auto events = base::BindRepeating(
+       [](base::WeakPtr<SidebarHandler> self, std::string session_id,
+@@ -1097,6 +1146,7 @@ void SidebarHandler::AiChat(const std::string& session_id,
+   request.text = text;
+   request.mode = mode == "ask" ? "ask" : "chat";
+   request.use_tools = true;
++  request.provider = provider;
+   content::WebContents* contents = model()->GetActiveWebContents();
+   GURL url = contents ? contents->GetLastCommittedURL() : GURL();
+   if (!with_page || !contents || !url.SchemeIsHTTPOrHTTPS()) {
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 59bc46b17b..fda7b0b269 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -225,6 +225,15 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void HasAiKey(HasAiKeyCallback callback) override;
+   void SetAiKey(const std::string& key, SetAiKeyCallback callback) override;
+   void RemoveAiKey() override;
++  void AiChatWith(const std::string& session_id,
++                  const std::string& text,
++                  const std::string& mode,
++                  bool with_page,
++                  const std::string& provider) override;
++  void GetSearchKeywords(GetSearchKeywordsCallback callback) override;
++  void SearchUrl(const std::string& keyword,
++                 const std::string& terms,
++                 SearchUrlCallback callback) override;
+   void AiChat(const std::string& session_id,
+               const std::string& text,
+               const std::string& mode,
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 39e2e99ecd..cb0b2cc676 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -160,6 +160,8 @@ export function getHtml(this: WebuiBrowserAppElement) {
+   <meridian-command-bar id="commandBar" .tabs="${this.commandBarTabs_}"
+       @command-bar-switch-tab="${this.onCommandBarSwitchTab_}"
+       @command-bar-feature="${this.onCommandBarFeature_}"
++      @command-bar-ask="${this.onCommandBarAsk_}"
++      @command-bar-open-url="${this.onCommandBarOpenUrl_}"
+       @command-bar-closed="${this.onCommandBarClosed_}"
+       @command-bar-reload="${this.onCommandBarReload_}">
+   </meridian-command-bar>
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 02729f4792..972dcca131 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -1184,6 +1184,18 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.$.contentRegion.activeWebview?.focusContent();
+   }
+ 
++  // "claude ⇥ question" and the like in the command bar.
++  protected onCommandBarAsk_(e: CustomEvent<{text: string, withPage: boolean,
++                                              provider: string, who: string}>) {
++    const {text, withPage, provider, who} = e.detail;
++    this.$.ask.askNow(text, withPage, provider, who);
++  }
++
++  // A site search by its keyword ("yt ⇥ cats").
++  protected onCommandBarOpenUrl_(e: CustomEvent<string>) {
++    this.$.tabstrip.openUrl(e.detail);
++  }
++
+   protected onCommandBarSwitchTab_(e: CustomEvent<string>) {
+     this.$.tabstrip.activateTab(e.detail);
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/ask.ts b/chrome/browser/resources/webui_browser/meridian/ask.ts
+index 38d679f8d9..6445193942 100644
+--- a/chrome/browser/resources/webui_browser/meridian/ask.ts
++++ b/chrome/browser/resources/webui_browser/meridian/ask.ts
+@@ -85,6 +85,30 @@ export class MeridianAskElement extends CrLitElement {
+     }
+   }
+ 
++  // Opens the panel and asks `text` (with the page or not), answered by
++  // `provider` ("" = the one picked in Settings > AI).
++  async askNow(text: string, withPage: boolean, provider: string,
++               who: string) {
++    if (!this.open) {
++      await this.toggle();
++    }
++    if (this.busy_) {
++      return;
++    }
++    this.withPage_ = withPage;
++    if (who) {
++      this.who_ = who;
++    }
++    this.messages_ = [
++      ...this.messages_,
++      {role: 'user', text, tools: [], error: ''},
++      {role: 'assistant', text: '', tools: [], error: ''},
++    ];
++    this.busy_ = true;
++    this.handler_.aiChatWith(this.sessionId_, text, 'chat', withPage,
++                             provider);
++  }
++
+   async toggle() {
+     this.open = !this.open;
+     if (this.open) {
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.css b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+index f58fd78472..b6ceec5148 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.css
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+@@ -313,3 +313,23 @@ webui-browser-searchbox::part(searchbox-dropdown) {
+   text-overflow: ellipsis;
+   white-space: nowrap;
+ }
++
++/* "word ⇥": the mode the bar is in, above the field. */
++.mode-pill {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  margin: 10px 14px 0;
++  font-size: 12px;
++}
++
++.mode-pill .mode-label {
++  padding: 3px 10px;
++  border-radius: 999px;
++  background: color-mix(in srgb, var(--meridian-space, #6b6bd6) 22%, transparent);
++  font-weight: 600;
++}
++
++.mode-pill .mode-hint {
++  color: var(--meridian-text-muted, #888);
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+index 17887887d7..ef5ea81812 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+@@ -12,6 +12,14 @@ export function getHtml(this: MeridianCommandBarElement) {
+   return html`<!--_html_template_start_-->
+ <div id="overlay" @mousedown="${this.onOverlayMousedown_}">
+   <div id="bar">
++    ${this.mode_ ? html`
++      <div id="mode" class="mode-pill" data-provider="${this.mode_.provider ?? ''}"
++          data-keyword="${this.mode_.keyword ?? ''}">
++        <span class="tab-icon">${icon(this.mode_.keyword !== undefined ?
++                                      'search' : 'sparkles', 14)}</span>
++        <span class="mode-label">${this.mode_.label}</span>
++        <span class="mode-hint">${this.mode_.placeholder}</span>
++      </div>` : ''}
+     ${this.searchboxShown_ ? html`
+     <webui-browser-searchbox id="address" ?new-tab="${this.newTab}"
+         .newTab="${this.newTab}" .inlineDropdown="${true}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index 1c0e29d3ff..5a0d7d16c3 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -47,6 +47,36 @@ export interface CommandBarFeature {
+   words: string[];
+ }
+ 
++// "word ⇥": the bar turns into a pill, and Return asks that AI (or searches
++// that site) with what is typed after it, as in Brk and Raycast.
++export interface CommandBarMode {
++  // What shows in the pill.
++  label: string;
++  // An AI ("" = the one picked in Settings > AI), or a site search.
++  provider?: string;
++  keyword?: string;
++  withPage: boolean;
++  // Sent when nothing is typed ("summarize ⇥ ↵").
++  empty?: string;
++  placeholder: string;
++}
++
++export const MODES: {[word: string]: CommandBarMode} = {
++  claude: {label: 'Claude Code', provider: 'claude-code', withPage: false,
++           placeholder: 'Ask Claude Code…'},
++  codex: {label: 'Codex', provider: 'codex', withPage: false,
++          placeholder: 'Ask Codex…'},
++  ask: {label: 'Ask AI', provider: '', withPage: false,
++        placeholder: 'Ask anything…'},
++  ai: {label: 'Ask AI', provider: '', withPage: false,
++       placeholder: 'Ask anything…'},
++  page: {label: 'Ask This Page', provider: '', withPage: true,
++         placeholder: 'Ask about this page…'},
++  summarize: {label: 'Summarize', provider: '', withPage: true,
++              empty: 'Summarize this page in a few short points.',
++              placeholder: 'Return summarizes this page (or ask for a focus)…'},
++};
++
+ export const FEATURES: CommandBarFeature[] = [
+   {id: 'workbench', name: 'Workbench', hint: 'Files, editor and terminals',
+    keys: keyText('⇧⌘E'), icon: 'code',
+@@ -140,6 +170,7 @@ export class MeridianCommandBarElement extends CrLitElement {
+       tabsFirst_: {state: true, type: Boolean},
+       searchboxShown_: {state: true, type: Boolean},
+       quick_: {state: true, type: Object},
++      mode_: {state: true, type: Object},
+       copied_: {state: true, type: Boolean},
+     };
+   }
+@@ -167,6 +198,9 @@ export class MeridianCommandBarElement extends CrLitElement {
+   protected accessor quick_: QuickAnswer|null = null;
+   protected accessor copied_: boolean = false;
+   private rates_: CurrencyRates|null = null;
++  // "word ⇥" picked: what Return does with the text.
++  protected accessor mode_: CommandBarMode|null = null;
++  private keywords_: Map<string, string> = new Map();
+   private ratesAsked_ = false;
+   private searchboxProfile_: string|null = null;
+   // What the field opened with (⌘L: the page's address).
+@@ -386,6 +420,10 @@ export class MeridianCommandBarElement extends CrLitElement {
+     this.clearAnswer_();
+     browserProxyFactory.getInstance().handler.getAiStatus().then(
+         ({ready}) => this.hasAiKey_ = ready);
++    this.mode_ = null;
++    browserProxyFactory.getInstance().handler.getSearchKeywords().then(
++        ({keywords}) => this.keywords_ =
++            new Map(keywords.map(k => [k.keyword.toLowerCase(), k.name])));
+     if (this.searchboxProfile_ !== this.profileId) {
+       this.searchboxShown_ = false;
+       await this.updateComplete;
+@@ -410,6 +448,7 @@ export class MeridianCommandBarElement extends CrLitElement {
+       return;
+     }
+     this.open = false;
++    this.mode_ = null;
+     this.query_ = '';
+     this.address_.reset('');
+     this.clearAnswer_();
+@@ -432,6 +471,47 @@ export class MeridianCommandBarElement extends CrLitElement {
+     this.asking_ = false;
+   }
+ 
++  private enterMode_(mode: CommandBarMode) {
++    this.mode_ = mode;
++    this.quick_ = null;
++    this.query_ = '';
++    this.address_.reset('');
++    this.address_.focusInput();
++  }
++
++  private runMode_() {
++    this.runModeWith_(this.inputValue_().trim());
++  }
++
++  private runModeWith_(typed: string) {
++    const mode = this.mode_;
++    if (!mode) {
++      return;
++    }
++    const text = typed || mode.empty || '';
++    if (!text) {
++      return;
++    }
++    if (mode.keyword !== undefined) {
++      browserProxyFactory.getInstance()
++          .handler.searchUrl(mode.keyword, text)
++          .then(({url}) => {
++            if (url) {
++              this.fire('command-bar-open-url', url);
++            }
++          });
++    } else {
++      this.fire('command-bar-ask', {
++        text,
++        withPage: mode.withPage,
++        provider: mode.provider || '',
++        who: mode.provider ? mode.label : '',
++      });
++    }
++    this.mode_ = null;
++    this.hide();
++  }
++
+   protected onQuickClick_() {
+     this.copyQuick_();
+   }
+@@ -488,6 +568,48 @@ export class MeridianCommandBarElement extends CrLitElement {
+       this.hide();
+       return;
+     }
++    // "word ⇥": an AI or a site search ("claude", "yt"…); a site's own
++    // keyword comes first. Backspace in an empty field leaves it.
++    if (e.key === 'Tab' && !e.shiftKey && !this.mode_) {
++      const word = this.inputValue_().trim().toLowerCase();
++      const site = this.keywords_.get(word);
++      const mode = site !== undefined ?
++          {label: site || word, keyword: word, withPage: false,
++           placeholder: `Search ${site || word}…`} :
++          (Object.hasOwn(MODES, word) ? MODES[word]! : null);
++      if (mode) {
++        own();
++        this.enterMode_(mode);
++        return;
++      }
++    }
++    if (this.mode_ && e.key === 'Backspace' && !this.inputValue_()) {
++      own();
++      this.mode_ = null;
++      return;
++    }
++    if (this.mode_ && e.key === 'Enter') {
++      own();
++      this.runMode_();
++      return;
++    }
++    // Arc's way too: "kiwi pear" with a site's keyword first searches that
++    // site (Chromium's own keyword mode let go of it: the bug Meridian had).
++    if (e.key === 'Enter' && !this.mode_ && this.tabSel_ < 0 &&
++        this.address_?.selectedLine() <= 0 && !e.shiftKey && !e.altKey) {
++      const typed = this.inputValue_().trim();
++      const space = typed.indexOf(' ');
++      const word = space > 0 ? typed.slice(0, space).toLowerCase() : '';
++      const terms = space > 0 ? typed.slice(space + 1).trim() : '';
++      if (word && terms && this.keywords_.has(word)) {
++        own();
++        this.mode_ = {label: word, keyword: word, withPage: false,
++                      placeholder: ''};
++        this.address_.reset(terms);
++        this.runModeWith_(terms);
++        return;
++      }
++    }
+     // ⇥ takes the other layout's reading.
+     if (e.key === 'Tab' && !e.shiftKey && this.layoutFix_) {
+       own();
