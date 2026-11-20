@@ -40,7 +40,7 @@ Meridian is a free, open-source browser built on Chromium, so sites, Google sign
 
 ## Move in from Arc or Chrome
 
-<p align="center"><img src="docs/readme/arc-import.gif" width="720" alt="Importing an Arc setup into Meridian in one click"></p>
+<p align="center"><img src="docs/readme/arc-import.webp" width="720" alt="Importing an Arc setup into Meridian in one click"></p>
 
 One click, on your computer. Nothing leaves it, and the other browser isn't changed.
 
@@ -53,11 +53,11 @@ One click, on your computer. Nothing leaves it, and the other browser isn't chan
 
 <table>
 <tr>
-<td width="50%"><img src="docs/readme/spaces.gif" alt="Switching spaces"><br><b>Spaces</b> with their own colour, icon and <b>profile</b>: separate cookies and logins for work and personal. <code>⌃1…9</code> or <code>⌘⌥←/→</code> to switch.</td>
-<td width="50%"><img src="docs/readme/command-bar.gif" alt="The ⌘T command bar"><br><b>⌘T command bar</b>: open tabs in every space, history, the archive, commands and the web in one list. Ask a question right there and the answer streams under it.</td>
+<td width="50%"><img src="docs/readme/spaces.webp" alt="Switching spaces"><br><b>Spaces</b> with their own colour, icon and <b>profile</b>: separate cookies and logins for work and personal. <code>⌃1…9</code> or <code>⌘⌥←/→</code> to switch.</td>
+<td width="50%"><img src="docs/readme/command-bar.webp" alt="The ⌘T command bar"><br><b>⌘T command bar</b>: open tabs in every space, history, the archive, commands and the web in one list. Ask a question right there and the answer streams under it.</td>
 </tr>
 <tr>
-<td><img src="docs/readme/split-view.gif" alt="Split view"><br><b>Split view</b> (<code>⌃⇧=</code>) with a draggable divider.</td>
+<td><img src="docs/readme/split-view.webp" alt="Split view"><br><b>Split view</b> (<code>⌃⇧=</code>) with a draggable divider.</td>
 <td><img src="docs/readme/boosts.gif" alt="Boosts"><br><b>Boosts</b>, as in Arc: a site your way (colour, dark mode, font, Zap to hide elements, your own CSS and JavaScript), or ask Claude to restyle it. Arc's boosts come over with the import.</td>
 </tr>
 </table>
@@ -70,12 +70,12 @@ One click, on your computer. Nothing leaves it, and the other browser isn't chan
 
 ## For AI agents
 
-<p align="center"><img src="docs/readme/agent-asks.gif" width="820" alt="Claude Code asks before running a command, right in Meridian"></p>
+<p align="center"><img src="docs/readme/agent-asks.webp" width="820" alt="Claude Code asks before running a command, right in Meridian"></p>
 
 <table>
 <tr>
 <td width="50%"><img src="docs/readme/workbench.jpg" alt="The Workbench"><br><b>Workbench</b> (<code>⇧⌘E</code>): a browser tab with a file tree, the Monaco editor and real terminals. One-click launchers for Claude Code, Codex, Gemini CLI, Copilot, OpenCode and more. Put it in split view next to your <code>localhost</code>.</td>
-<td width="50%"><img src="docs/readme/context-insights.gif" alt="Context Insights"><br><b>Context Insights</b>: each Claude Code tab shows how full its context is; one click explains where the tokens went (files read twice, a cold prompt cache, compactions) and shows your 5-hour and weekly limits.</td>
+<td width="50%"><img src="docs/readme/context-insights.webp" alt="Context Insights"><br><b>Context Insights</b>: each Claude Code tab shows how full its context is; one click explains where the tokens went (files read twice, a cold prompt cache, compactions) and shows your 5-hour and weekly limits.</td>
 </tr>
 <tr>
 <td><img src="docs/readme/mission-control.jpg" alt="Mission Control"><br><b>Mission Control</b> (<code>⇧⌘M</code>): every agent at work, in every space: Claude Code and Codex sessions with their subagents, MCP clients, ⌘J chats. What each one is doing, how full its context is, and who waits for you.</td>
