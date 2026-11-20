@@ -47,7 +47,7 @@ One click, on your computer. Nothing leaves it, and the other browser isn't chan
 | From | What comes over |
 |---|---|
 | **Arc** | Spaces with their colours and icons, pinned tabs, folders, Favorites and Today, your **logins** (Arc's cookies, copied into the matching profiles; on macOS after you allow the keychain prompt), saved **passwords** and cards, history and Boosts |
-| **Google Chrome** (File › Import from Chrome…) | A space per Chrome profile, its bookmarks as pinned tabs and folders, the tabs you had open, sign-ins, passwords, history and extensions |
+| **Google Chrome** | File › Import from Chrome…: a space per Chrome profile, its bookmarks as pinned tabs and folders, the tabs you had open, sign-ins, passwords, history and extensions |
 
 ## The Arc workflow
 
