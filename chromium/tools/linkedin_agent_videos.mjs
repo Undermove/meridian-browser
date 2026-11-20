@@ -296,7 +296,7 @@ function encode(rec, chipFile, file) {
   if (speed > 1) {
     inputs.push('-i', chipFile);
     const frameWidth = Number(execFileSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width', '-of', 'csv=p=0', frames[0].file]).toString().trim());
-    vf = `[0:v]${vf}[v];[1:v]scale=iw*${WIDTH}/${frameWidth}:-1[c];[v][c]overlay=W-w-24:24`;
+    vf = `[0:v]${vf}[v];[1:v]scale=iw*${WIDTH}/${frameWidth}:-1[c];[v][c]overlay=20:H-h-64`;
   }
   execFileSync('ffmpeg', ['-y', '-loglevel', 'error', ...inputs, speed > 1 ? '-filter_complex' : '-vf', vf,
     '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '20', '-preset', 'slow', '-movflags', '+faststart', file]);
