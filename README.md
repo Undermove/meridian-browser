@@ -10,7 +10,7 @@
   &nbsp;·&nbsp;
   <a href="https://github.com/Undermove/meridian-browser/releases/latest/download/Meridian-win.exe"><b>Download for Windows</b></a> (x64)
   &nbsp;·&nbsp;
-  <a href="https://undermove.github.io/meridian-browser/">Website</a>
+  <a href="https://meridianbrowser.app/">Website</a>
 </p>
 
 <p align="center"><b>Importing from Arc or Chrome: one click.</b> Spaces, pinned tabs, folders, favorites, bookmarks, open tabs, saved passwords and your logins.<br>Arc stops working on December 22, 2026.</p>
@@ -46,7 +46,7 @@ Meridian is a free, open-source browser built on Chromium, so sites, Google sign
 
 | | |
 |---|---|
-| **macOS** (Apple silicon) | [Meridian-mac-arm64.dmg](https://github.com/Undermove/meridian-browser/releases/latest/download/Meridian-mac-arm64.dmg), or in Terminal: `curl -fsSL https://undermove.github.io/meridian-browser/install.sh \| bash` |
+| **macOS** (Apple silicon) | [Meridian-mac-arm64.dmg](https://github.com/Undermove/meridian-browser/releases/latest/download/Meridian-mac-arm64.dmg), or in Terminal: `curl -fsSL https://meridianbrowser.app/install.sh \| bash` |
 | **Windows 10 and 11** (x64) | [Meridian-win.exe](https://github.com/Undermove/meridian-browser/releases/latest/download/Meridian-win.exe) |
 
 Linux and Intel Macs aren't supported by the current version.
@@ -110,7 +110,7 @@ Meridian is a set of patches on Chromium plus its own UI. The code and build ste
 
 ## Privacy
 
-No account, no server, no telemetry. AI features talk only to the AI you connect. Details: [privacy page](https://undermove.github.io/meridian-browser/privacy.html).
+No account, no server, no telemetry. AI features talk only to the AI you connect. Details: [privacy page](https://meridianbrowser.app/privacy.html).
 
 ## License
 

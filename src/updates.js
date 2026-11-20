@@ -9,7 +9,7 @@ const { spawn } = require('child_process');
 
 const REPO = 'Undermove/meridian-browser';
 const FEED = `https://api.github.com/repos/${REPO}/releases/latest`;
-const INSTALL_SH = 'https://undermove.github.io/meridian-browser/install.sh';
+const INSTALL_SH = 'https://meridianbrowser.app/install.sh';
 const RELEASES = `https://github.com/${REPO}/releases/latest`;
 const FIRST_CHECK = 15_000;
 const EVERY = 24 * 60 * 60 * 1000;

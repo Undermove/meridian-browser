@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Meridian installer for macOS and Linux.
 #
-#   curl -fsSL https://undermove.github.io/meridian-browser/install.sh | bash
+#   curl -fsSL https://meridianbrowser.app/install.sh | bash
 #
 # Downloads the latest release from GitHub, checks it against the release's SHA256SUMS.txt and installs it:
 #   macOS: /Applications/Meridian.app (or ~/Applications if /Applications isn't writable)
