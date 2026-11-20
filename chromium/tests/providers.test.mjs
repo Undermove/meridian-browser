@@ -7,12 +7,16 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { launch, SB } from './harness.mjs';
+import { standIn } from './stand_in.mjs';
 
 const AK = 'app.$.ask.shadowRoot';
 const ST = 'app.$.settings.shadowRoot';
 const H = 'app.$.tabstrip.handler_';
 const GOOD = 'sk-proj-good000000000000000000000000';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Agent CLIs answer Ask only inside a sandbox that keeps them out of credentials and other
+// browsers' data; Meridian has one on macOS only (SandboxedArgv), so elsewhere they don't run.
+const NO_CLI = process.platform === 'win32' && 'agent CLIs run only in a sandbox, which Windows doesn’t have yet';
 
 function serve(handler) {
   const requests = [];
@@ -56,17 +60,26 @@ const cloud = () => serve((req, res, json) => {
 function fakeCodex(dir) {
   const log = path.join(dir, 'log');
   fs.mkdirSync(log);
-  const script = `#!/bin/sh
-if [ "$1" = login ]; then echo "Logged in using ChatGPT"; exit 0; fi
-n=$(ls ${log} | grep -c args)
-printf '%s\\n' "$@" > ${log}/$n.args
-cat > ${log}/$n.stdin
-echo $$ > ${log}/$n.pid
-echo '{"type":"thread.started","thread_id":"t-1"}'
-if grep -q slow ${log}/$n.stdin; then sleep 30; fi
-echo '{"type":"item.completed","item":{"type":"agent_message","text":"Codex answer '$n'"}}'
-`;
-  fs.writeFileSync(path.join(dir, 'codex'), script, { mode: 0o755 });
+  standIn(dir, 'codex', `const fs = require('fs'), path = require('path');
+const log = ${JSON.stringify(log)};
+const args = process.argv.slice(2);
+if (args[0] === 'login') {
+  console.log('Logged in using ChatGPT');
+} else {
+  const n = fs.readdirSync(log).filter((f) => f.includes('args')).length;
+  fs.writeFileSync(path.join(log, n + '.args'), args.map((a) => a + '\\n').join(''));
+  let stdin = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (d) => { stdin += d; });
+  process.stdin.on('end', () => {
+    fs.writeFileSync(path.join(log, n + '.stdin'), stdin);
+    fs.writeFileSync(path.join(log, n + '.pid'), String(process.pid));
+    console.log('{"type":"thread.started","thread_id":"t-1"}');
+    const answer = () => console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'Codex answer ' + n } }));
+    if (stdin.includes('slow')) setTimeout(answer, 30000); else answer();
+  });
+}
+`);
   return log;
 }
 
@@ -131,35 +144,38 @@ test('other AIs: Ollama, a cloud key with a model picker, and Codex (sessions, S
     assert.equal(sent.body.stream, true);
     assert.equal(sent.body.messages[1].content, 'and you?');
 
-    // Codex, once "Other agents" is on: signed in (from `codex login status`), read-only sandbox,
-    // the prompt on stdin; the next turn resumes its session with only the new message.
-    await openAi();
-    await b.click(`${ST}.getElementById('otherAgents')`);
-    await b.waitFor(`${ST}.getElementById('ai-codex')?.textContent.includes('Ready')`);
-    await b.click(`${ST}.getElementById('ai-codex')`);
-    await b.waitFor(`${ST}.getElementById('ai-codex').classList.contains('on')`);
-    await b.eval('app.$.settings.hide()');
-    await b.eval(`${AK}.getElementById('new').click()`);
-    await ask('first question', 'Codex answer 0');
-    const args0 = fs.readFileSync(path.join(log, '0.args'), 'utf8').split('\n');
-    assert.equal(args0[0], 'exec');
-    assert.ok(args0.includes('sandbox_mode="read-only"'));
-    assert.match(fs.readFileSync(path.join(log, '0.stdin'), 'utf8'), /<meridian_guide>[\s\S]*first question$/);
-    await ask('second question', 'Codex answer 1');
-    const args1 = fs.readFileSync(path.join(log, '1.args'), 'utf8').split('\n');
-    assert.deepEqual(args1.slice(0, 2), ['exec', 'resume']);
-    assert.ok(args1.includes('t-1'));
-    assert.equal(fs.readFileSync(path.join(log, '1.stdin'), 'utf8'), 'second question');
+    // (Not on Windows: see NO_CLI.)
+    if (!NO_CLI) {
+      // Codex, once "Other agents" is on: signed in (from `codex login status`), read-only sandbox,
+      // the prompt on stdin; the next turn resumes its session with only the new message.
+      await openAi();
+      await b.click(`${ST}.getElementById('otherAgents')`);
+      await b.waitFor(`${ST}.getElementById('ai-codex')?.textContent.includes('Ready')`);
+      await b.click(`${ST}.getElementById('ai-codex')`);
+      await b.waitFor(`${ST}.getElementById('ai-codex').classList.contains('on')`);
+      await b.eval('app.$.settings.hide()');
+      await b.eval(`${AK}.getElementById('new').click()`);
+      await ask('first question', 'Codex answer 0');
+      const args0 = fs.readFileSync(path.join(log, '0.args'), 'utf8').split('\n');
+      assert.equal(args0[0], 'exec');
+      assert.ok(args0.includes('sandbox_mode="read-only"'));
+      assert.match(fs.readFileSync(path.join(log, '0.stdin'), 'utf8'), /<meridian_guide>[\s\S]*first question$/);
+      await ask('second question', 'Codex answer 1');
+      const args1 = fs.readFileSync(path.join(log, '1.args'), 'utf8').split('\n');
+      assert.deepEqual(args1.slice(0, 2), ['exec', 'resume']);
+      assert.ok(args1.includes('t-1'));
+      assert.equal(fs.readFileSync(path.join(log, '1.stdin'), 'utf8'), 'second question');
 
-    // Stop kills the CLI.
-    await ask('a slow one');
-    await b.waitFor(`${AK}.querySelector('#stop') !== null`);
-    for (let i = 0; i < 50 && !fs.existsSync(path.join(log, '2.pid')); i++) await sleep(100);
-    const pid = Number(fs.readFileSync(path.join(log, '2.pid'), 'utf8'));
-    await b.eval(`${AK}.getElementById('stop').click()`);
-    let alive = true;
-    for (let i = 0; i < 40 && alive; i++) { await sleep(100); try { process.kill(pid, 0); } catch { alive = false; } }
-    assert.equal(alive, false, 'the CLI was killed');
+      // Stop kills the CLI.
+      await ask('a slow one');
+      await b.waitFor(`${AK}.querySelector('#stop') !== null`);
+      for (let i = 0; i < 50 && !fs.existsSync(path.join(log, '2.pid')); i++) await sleep(100);
+      const pid = Number(fs.readFileSync(path.join(log, '2.pid'), 'utf8'));
+      await b.eval(`${AK}.getElementById('stop').click()`);
+      let alive = true;
+      for (let i = 0; i < 40 && alive; i++) { await sleep(100); try { process.kill(pid, 0); } catch { alive = false; } }
+      assert.equal(alive, false, 'the CLI was killed');
+    }
 
     // Removing the key: the row goes, and the key never sat in Preferences as plain text.
     await openAi();
@@ -181,14 +197,19 @@ test('other AIs: Ollama, a cloud key with a model picker, and Codex (sessions, S
 // A report (21.11.2026): OpenCode picked for Ask answered "Unrecognized flag: --dir in command
 // opencode run" (an OpenCode that doesn't know --dir), and the error couldn't even be selected to
 // copy. The stand-in refuses --dir like that OpenCode; the answer and the error are selectable.
-test('OpenCode answers Ask without --dir; what Ask shows can be selected and copied', async () => {
+test('OpenCode answers Ask without --dir; what Ask shows can be selected and copied', { skip: NO_CLI }, async () => {
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
-  fs.writeFileSync(path.join(bin, 'opencode'), `#!/bin/sh
-if [ "$1" = auth ]; then echo "1 credentials"; exit 0; fi
-for a in "$@"; do if [ "$a" = --dir ]; then echo "Unrecognized flag: --dir in command opencode run" >&2; exit 1; fi; done
-cat > /dev/null
-echo '{"type":"text","sessionID":"ses_1","part":{"text":"OpenCode says the page is blank"}}'
-`, { mode: 0o755 });
+  standIn(bin, 'opencode', `const args = process.argv.slice(2);
+if (args[0] === 'auth') {
+  console.log('1 credentials');
+} else if (args.includes('--dir')) {
+  console.error('Unrecognized flag: --dir in command opencode run');
+  process.exitCode = 1;
+} else {
+  process.stdin.resume();
+  process.stdin.on('end', () => console.log(JSON.stringify({ type: 'text', sessionID: 'ses_1', part: { text: 'OpenCode says the page is blank' } })));
+}
+`);
   const b = await launch(['about:blank'], { args: [`--meridian-agents-path=${bin}`] });
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
@@ -229,8 +250,9 @@ test('LM Studio installed but off: Start server turns it on, then it answers', a
     for (const piece of ['LM Studio ', `heard: ${question}`]) res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: piece } }] })}\n\n`);
     res.end('data: [DONE]\n\n');
   });
-  const lms = path.join(dir, 'lms');
-  fs.writeFileSync(lms, `#!/bin/sh\n[ "$1 $2" = "server start" ] && touch ${JSON.stringify(started)}\n`, { mode: 0o755 });
+  const lms = standIn(dir, 'lms', `const args = process.argv.slice(2);
+if (args[0] === 'server' && args[1] === 'start') require('fs').writeFileSync(${JSON.stringify(started)}, '');
+`);
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
   const b = await launch(['about:blank'], { args: [`--meridian-agents-path=${bin}`, `--meridian-lmstudio-url=${lm.base}`, `--meridian-lms-path=${lms}`] });
   try {
