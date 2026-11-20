@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Fri, 20 Nov 2026 10:45:41 +0400
+Subject: [PATCH 202/202] Meridian: Windows: a newer release while an update is
+ ready replaces it
+
+As on macOS (0200): the Windows updater stopped checking once an installer was
+ready, so a restart days later ran that one and then offered the next. Now it
+keeps checking; a newer release's installer downloads in the background
+("Restart to update" stays on the ready one meanwhile, and a failure only goes
+to the log), then takes its place, and the older installer is deleted. Restart
+to update runs the ready one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/meridian/updater_win.cc | 93 +++++++++++++++++++-------
+ 1 file changed, 68 insertions(+), 25 deletions(-)
+
+diff --git a/chrome/browser/meridian/updater_win.cc b/chrome/browser/meridian/updater_win.cc
+index 683a82365f..ab9a2e1f51 100644
+--- a/chrome/browser/meridian/updater_win.cc
++++ b/chrome/browser/meridian/updater_win.cc
+@@ -264,15 +264,19 @@ void Updater::CheckNow() {
+ }
+ 
+ void Updater::Check() {
+-  // Busy, or already waiting for a restart.
+-  if (status_ == mojom::UpdateStatus::kChecking ||
+-      status_ == mojom::UpdateStatus::kDownloading ||
+-      status_ == mojom::UpdateStatus::kReady) {
++  // Busy.
++  if (quiet_ || status_ == mojom::UpdateStatus::kChecking ||
++      status_ == mojom::UpdateStatus::kDownloading) {
+     return;
+   }
+   std::string feed =
+       TestFeed() ? TestSwitchValue("meridian-update-feed") : update::kFeed;
+-  Set(mojom::UpdateStatus::kChecking);
++  // Waiting for a restart: a newer release still comes, in the background.
++  if (status_ == mojom::UpdateStatus::kReady) {
++    quiet_ = true;
++  } else {
++    Set(mojom::UpdateStatus::kChecking);
++  }
+   loader_ = Request(feed);
+   loader_->DownloadToString(
+       g_browser_process->shared_url_loader_factory().get(),
+@@ -282,6 +286,18 @@ void Updater::Check() {
+ void Updater::OnFeed(std::optional<std::string> body) {
+   loader_.reset();
+   bool user = std::exchange(user_check_, false);
++  if (quiet_) {
++    std::optional<update::Release> release =
++        body ? update::ParseWindowsRelease(*body, Arch(), TestFeed())
++             : std::nullopt;
++    if (!release || !update::IsNewer(release->version, ready_.version)) {
++      quiet_ = false;
++      return;
++    }
++    release_ = *release;
++    Download();
++    return;
++  }
+   if (!body) {
+     Set(user ? mojom::UpdateStatus::kFailed : mojom::UpdateStatus::kIdle,
+         "Couldn’t reach GitHub to check for updates.");
+@@ -299,19 +315,27 @@ void Updater::OnFeed(std::optional<std::string> body) {
+     Set(mojom::UpdateStatus::kAvailable);
+     return;
+   }
+-  progress_ = 0;
+-  zip_size_ = 0;
+-  Set(mojom::UpdateStatus::kDownloading);
++  Download();
++}
++
++void Updater::Download() {
++  if (!quiet_) {
++    progress_ = 0;
++    zip_size_ = 0;
++    Set(mojom::UpdateStatus::kDownloading);
++  }
+   loader_ = Request(release_.zip_url);
+   loader_->SetOnResponseStartedCallback(base::BindOnce(
+       [](Updater* self, const GURL&,
+          const network::mojom::URLResponseHead& head) {
+-        self->zip_size_ = head.content_length;
++        if (!self->quiet_) {
++          self->zip_size_ = head.content_length;
++        }
+       },
+       base::Unretained(this)));
+   loader_->SetOnDownloadProgressCallback(base::BindRepeating(
+       [](Updater* self, uint64_t current) {
+-        if (self->zip_size_ > 0) {
++        if (!self->quiet_ && self->zip_size_ > 0) {
+           double progress = static_cast<double>(current) / self->zip_size_;
+           // A few updates are enough.
+           if (progress - self->progress_ >= 0.02 || progress >= 1) {
+@@ -332,7 +356,7 @@ void Updater::OnZip(base::FilePath path) {
+   bool ok = loader_ && loader_->NetError() == net::OK && !path.empty();
+   loader_.reset();
+   if (!ok) {
+-    Set(mojom::UpdateStatus::kFailed, "The update didn’t download.");
++    Fail("The update didn’t download.");
+     return;
+   }
+   zip_ = path;
+@@ -345,14 +369,12 @@ void Updater::OnZip(base::FilePath path) {
+ void Updater::OnSums(std::optional<std::string> body) {
+   loader_.reset();
+   if (!body) {
+-    Set(mojom::UpdateStatus::kFailed,
+-        "The release has no checksum for Windows.");
++    Fail("The release has no checksum for Windows.");
+     return;
+   }
+   sums_ = std::move(*body);
+   if (release_.sig_url.empty()) {
+-    Set(mojom::UpdateStatus::kFailed,
+-        "The release’s checksums aren’t signed by Meridian.");
++    Fail("The release’s checksums aren’t signed by Meridian.");
+     return;
+   }
+   loader_ = Request(release_.sig_url);
+@@ -373,14 +395,12 @@ void Updater::OnSig(std::optional<std::string> body) {
+     }
+   }
+   if (!body || !update::SumsSignedBy(sums_, *body, key)) {
+-    Set(mojom::UpdateStatus::kFailed,
+-        "The release’s checksums aren’t signed by Meridian.");
++    Fail("The release’s checksums aren’t signed by Meridian.");
+     return;
+   }
+   std::optional<std::string> sum = update::FindSum(sums_, release_.zip_name);
+   if (!sum) {
+-    Set(mojom::UpdateStatus::kFailed,
+-        "The release has no checksum for Windows.");
++    Fail("The release has no checksum for Windows.");
+     return;
+   }
+   base::ThreadPool::PostTaskAndReplyWithResult(
+@@ -396,17 +416,37 @@ void Updater::OnStaged(
+   const std::string& error = error_and_requirement.first;
+   if (!error.empty()) {
+     LOG(WARNING) << "Meridian update " << release_.version << ": " << error;
+-    Set(mojom::UpdateStatus::kFailed, error);
++    Fail(error);
+     return;
+   }
++  // A newer one in place of the one that was ready: its installer goes.
++  if (!ready_.version.empty() && ready_.zip_name != release_.zip_name) {
++    base::ThreadPool::PostTask(
++        FROM_HERE, {base::MayBlock(), base::TaskPriority::BEST_EFFORT},
++        base::GetDeleteFileCallback(dir_.AppendUTF8(ready_.zip_name)));
++  }
++  ready_ = release_;
++  quiet_ = false;
+   Set(mojom::UpdateStatus::kReady);
+ }
+ 
++void Updater::Fail(std::string error) {
++  if (quiet_) {
++    quiet_ = false;
++    LOG(WARNING) << "Meridian update " << release_.version
++                 << " (over a ready " << ready_.version << "): " << error;
++    return;
++  }
++  Set(mojom::UpdateStatus::kFailed, std::move(error));
++}
++
+ bool Updater::Install() {
+   if (status_ != mojom::UpdateStatus::kReady) {
+     return false;
+   }
+   const int pid = static_cast<int>(base::Process::Current().Pid());
++  // The ready one (a newer one may be downloading into the same folder).
++  const base::FilePath installer = dir_.AppendUTF8(ready_.zip_name);
+   std::string script;
+   if (test_target_) {
+     // A test: the installer isn't run, a copy of it lands where the test
+@@ -419,10 +459,10 @@ bool Updater::Install() {
+              id + "\" 2>nul | find \" " + id +
+              " \" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)\r\n"
+              "copy /y \"" +
+-             zip_.AsUTF8Unsafe() + "\" \"" + target.AsUTF8Unsafe() +
++             installer.AsUTF8Unsafe() + "\" \"" + target.AsUTF8Unsafe() +
+              "\" >nul\r\n";
+   } else {
+-    script = update::WindowsInstallScript(pid, zip_, bundle_);
++    script = update::WindowsInstallScript(pid, installer, bundle_);
+   }
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_BLOCKING},
+@@ -469,11 +509,14 @@ mojom::UpdateStatePtr Updater::State() const {
+   auto state = mojom::UpdateState::New();
+   state->status = status_;
+   state->current = CurrentVersion();
+-  state->version = release_.version;
++  // Ready: the one a restart installs (a newer one may be downloading).
++  const update::Release& release =
++      status_ == mojom::UpdateStatus::kReady ? ready_ : release_;
++  state->version = release.version;
+   state->progress = progress_;
+   state->error = error_;
+-  state->page_url = release_.page_url;
+-  state->notes = release_.notes;
++  state->page_url = release.page_url;
++  state->notes = release.notes;
+   return state;
+ }
+ 

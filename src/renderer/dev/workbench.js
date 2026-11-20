@@ -210,7 +210,8 @@ async function setProject(p, { reattach = false } = {}) {
   try { const u = new URL(location.href); if (u.searchParams.get('project') !== p.root) { u.searchParams.set('project', p.root); history.replaceState(history.state, '', u.href); } } catch {}
   await loadDir('', true);
   renderTree();
-  const alive = reattach ? await reattachTerminals() : S.terms.length;
+  // (Also when none are open here: terminals that outlived a crash of the browser come back.)
+  const alive = reattach || !S.terms.length ? await reattachTerminals() : S.terms.length;
   if (!alive) await restoreClaudeSessions(p.root);
   layoutTerminals();
   emit('project', p);

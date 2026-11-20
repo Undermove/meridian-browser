@@ -1,0 +1,1382 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 20 Nov 2026 23:17:42 +0400
+Subject: [PATCH 209/209] Meridian: Claude Code sessions outlive a crash of the
+ browser
+
+- A terminal host (the browser's binary, --meridian-term-host) keeps a second
+  fd of every Workbench terminal's pty: a crash no longer closes the pty, so
+  the programs in it (Claude Code mid-work) go on. While no browser reads them
+  the host keeps their output; the reopened Workbench takes them back and
+  shows them, instead of resuming the sessions anew. A clean quit still
+  closes them (the profile's exit_type), unclaimed ones are hung up after 2 h.
+- Mission Control's socket keeps its path per profile, and an adopted session
+  keeps its token: its hooks reach the new browser (status, session id).
+- The MCP bridge waits up to 45 s for a browser that went down instead of
+  failing every call at once.
+- macOS and Linux; Windows terminals are pseudoconsoles in the browser.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   7 +
+ chrome/browser/meridian/agent/mcp_bridge.cc   |  28 +-
+ chrome/browser/meridian/helper_modes.cc       |   8 +
+ .../browser/meridian/mission/event_channel.cc |  49 +-
+ .../browser/meridian/mission/event_channel.h  |   7 +
+ .../meridian/mission/mission_control.cc       |  16 +-
+ .../meridian/mission/mission_control.h        |   3 +-
+ .../browser/meridian/workbench/term_host.cc   | 549 ++++++++++++++++++
+ chrome/browser/meridian/workbench/term_host.h |  64 ++
+ chrome/browser/meridian/workbench/terminal.cc |  42 +-
+ chrome/browser/meridian/workbench/terminal.h  |  11 +
+ .../meridian/workbench/terminal_win.cc        |  10 +
+ .../meridian/workbench/workbench_handler.cc   | 158 ++++-
+ .../meridian/workbench/workbench_handler.h    |  14 +
+ 14 files changed, 946 insertions(+), 20 deletions(-)
+ create mode 100644 chrome/browser/meridian/workbench/term_host.cc
+ create mode 100644 chrome/browser/meridian/workbench/term_host.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 8d689fa53a..cf84edf43c 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -115,6 +115,12 @@ source_set("ai_providers") {
+     "mission/secrets.cc",
+     "mission/secrets.h",
+   ]
++  if (is_posix) {
++    sources += [
++      "workbench/term_host.cc",
++      "workbench/term_host.h",
++    ]
++  }
+   public_deps = [
+     ":test_switches", "//base" ]
+   deps = [
+@@ -243,6 +249,7 @@ source_set("helper_modes") {
+     ":guard_hook",
+     ":mcp_bridge",
+     ":mission_hook",
++    ":workbench_core",
+     "//base",
+   ]
+   if (is_mac) {
+diff --git a/chrome/browser/meridian/agent/mcp_bridge.cc b/chrome/browser/meridian/agent/mcp_bridge.cc
+index a67394ccba..59d08122c1 100644
+--- a/chrome/browser/meridian/agent/mcp_bridge.cc
++++ b/chrome/browser/meridian/agent/mcp_bridge.cc
+@@ -21,6 +21,7 @@
+ #include "base/rand_util.h"
+ #include "base/synchronization/lock.h"
+ #include "base/threading/platform_thread.h"
++#include "base/time/time.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/values.h"
+ #include "chrome/browser/meridian/agent/agent_embed.h"  // generated
+@@ -42,6 +43,9 @@ constexpr char kSwitch[] = "--mcp-bridge";
+ constexpr char kNotRunning[] =
+     "Meridian is not running, or AI agent access is off. Open Meridian > "
+     "Settings > AI and choose an access level.";
++// Its endpoint is there but nobody answers: the browser went down (a crash)
++// and is coming back (it reopens itself), or is still starting.
++constexpr char kRestarting[] = "Meridian is restarting.";
+ 
+ base::span<const char*> Args(int argc, const char** argv) {
+   // SAFETY: main() gives `argc` arguments in `argv`.
+@@ -148,7 +152,7 @@ std::optional<base::DictValue> Ask(const base::FilePath& user_data_dir,
+ #endif
+   if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+     close(fd);
+-    *error = kNotRunning;
++    *error = kRestarting;
+     return std::nullopt;
+   }
+   request.Set("token", *token);
+@@ -176,7 +180,10 @@ std::optional<base::DictValue> Ask(const base::FilePath& user_data_dir,
+   std::optional<base::Value> value = base::JSONReader::Read(
+       response.substr(0, response.find('\n')), 0);
+   if (!value || !value->is_dict()) {
+-    *error = "Meridian closed the connection.";
++    *error =
++        "Meridian closed the connection while doing this (it may have "
++        "crashed; it reopens itself). Check the tabs and the page "
++        "(list_tabs, read_page) before doing it again.";
+     return std::nullopt;
+   }
+   return std::move(*value).TakeDict();
+@@ -256,10 +263,21 @@ base::DictValue CallTool(const base::FilePath& user_data_dir,
+   const base::DictValue* args = params.FindDict("arguments");
+   request.Set("input", args ? args->Clone() : base::DictValue());
+   std::string error;
+-  std::optional<base::DictValue> response =
+-      Ask(user_data_dir, std::move(request), &error);
++  std::optional<base::DictValue> response;
++  // A browser that went down is waited for (it reopens itself after a
++  // crash): the agent carries on instead of giving up. Only when nothing was
++  // sent yet, so no action runs twice.
++  const base::TimeTicks give_up = base::TimeTicks::Now() + base::Seconds(45);
++  while (!(response = Ask(user_data_dir, request.Clone(), &error)) &&
++         error == kRestarting && base::TimeTicks::Now() < give_up) {
++    base::PlatformThread::Sleep(base::Seconds(1));
++  }
+   if (!response) {
+-    return Text(error, true);
++    return Text(error == kRestarting
++                    ? "Meridian isn't answering (it went down and hasn't "
++                      "come back yet). Try again in a minute."
++                    : error,
++                true);
+   }
+   if (const std::string* e = response->FindString("error")) {
+     return Text(*e, true);
+diff --git a/chrome/browser/meridian/helper_modes.cc b/chrome/browser/meridian/helper_modes.cc
+index ce7fd3d42d..f4cf93bc5a 100644
+--- a/chrome/browser/meridian/helper_modes.cc
++++ b/chrome/browser/meridian/helper_modes.cc
+@@ -12,6 +12,9 @@
+ #endif
+ #include "chrome/browser/meridian/mission/mission_hook.h"
+ #include "chrome/browser/meridian/workbench/guard_hook.h"
++#if BUILDFLAG(IS_POSIX)
++#include "chrome/browser/meridian/workbench/term_host.h"
++#endif
+ 
+ #if BUILDFLAG(IS_WIN)
+ #include <windows.h>
+@@ -42,6 +45,11 @@ std::optional<int> Run(int argc, const char** argv) {
+   if (IsMcpBridge(argc, argv)) {
+     return RunMcpBridge(argc, argv);
+   }
++#if BUILDFLAG(IS_POSIX)
++  if (workbench::IsTermHost(argc, argv)) {
++    return workbench::RunTermHost(argc, argv);
++  }
++#endif
+ #if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
+   if (IsCrashWatcher(argc, argv)) {
+     return RunCrashWatcher(argc, argv);
+diff --git a/chrome/browser/meridian/mission/event_channel.cc b/chrome/browser/meridian/mission/event_channel.cc
+index bec47513bf..2273b5e556 100644
+--- a/chrome/browser/meridian/mission/event_channel.cc
++++ b/chrome/browser/meridian/mission/event_channel.cc
+@@ -27,6 +27,9 @@
+ #include "chrome/browser/meridian/local_socket.h"
+ #include "chrome/browser/meridian/private_file.h"
+ #include "chrome/browser/meridian/real_path.h"
++#if BUILDFLAG(IS_POSIX)
++#include "chrome/browser/meridian/workbench/term_host.h"
++#endif
+ #include "crypto/secure_util.h"
+ 
+ #if BUILDFLAG(IS_WIN)
+@@ -67,11 +70,21 @@ class EventChannel::Server : public base::RefCountedThreadSafe<Server> {
+   explicit Server(EventCallback on_event) : on_event_(std::move(on_event)) {}
+ 
+   // Blocking: creates the socket and serves until Stop().
+-  void Run(base::OnceCallback<void(base::FilePath)> started) {
++  void Run(base::FilePath stable_dir,
++           base::OnceCallback<void(base::FilePath)> started) {
+     base::ScopedBlockingCall blocking(FROM_HERE,
+                                       base::BlockingType::WILL_BLOCK);
+     base::FilePath dir;
+-    if (!base::CreateNewTempDirectory(FILE_PATH_LITERAL("mm-"), &dir)) {
++#if BUILDFLAG(IS_POSIX)
++    if (!stable_dir.empty()) {
++      dir = base::FilePath(
++          workbench::StableRuntimeDir(stable_dir.value(), "mission"));
++    }
++#endif
++    if (!dir.empty()) {
++      // A crashed browser's socket may be left: this one takes its place.
++      base::DeleteFile(dir.AppendASCII("events.sock"));
++    } else if (!base::CreateNewTempDirectory(FILE_PATH_LITERAL("mm-"), &dir)) {
+       std::move(started).Run(base::FilePath());
+       return;
+     }
+@@ -94,6 +107,11 @@ class EventChannel::Server : public base::RefCountedThreadSafe<Server> {
+       return;
+     }
+     MakePrivate(path, 0600);
++    stable_ = !stable_dir.empty();
++    {
++      struct stat st;
++      bound_inode_ = lstat(name.c_str(), &st) == 0 ? st.st_ino : 0;
++    }
+     SetSocketNonBlocking(listener.get());
+     int wake[2];
+     if (pipe(wake) != 0) {
+@@ -161,9 +179,21 @@ class EventChannel::Server : public base::RefCountedThreadSafe<Server> {
+       ReadTails();
+     }
+     listener.reset();
+-    base::DeletePathRecursively(dir_);
++    if (!stable_) {
++      base::DeletePathRecursively(dir_);
++    } else {
++      // The folder stays (the next run uses it); the socket goes if it's
++      // still ours (a browser started meanwhile may have its own there).
++      struct stat st;
++      if (lstat(name.c_str(), &st) == 0 && st.st_ino == bound_inode_) {
++        unlink(name.c_str());
++      }
++    }
+   }
+ 
++  bool stable_ = false;
++  ino_t bound_inode_ = 0;
++
+   void Stop() {
+     stop_ = true;
+     if (wake_write_ >= 0) {
+@@ -183,9 +213,13 @@ class EventChannel::Server : public base::RefCountedThreadSafe<Server> {
+ 
+   std::string Register(const std::string& session) {
+     std::string token = base::HexEncodeLower(base::RandBytesAsVector(32));
++    RegisterToken(token, session);
++    return token;
++  }
++
++  void RegisterToken(const std::string& token, const std::string& session) {
+     base::AutoLock hold(lock_);
+     sessions_[token] = {session, kBurst, base::TimeTicks::Now()};
+-    return token;
+   }
+ 
+   void Unregister(const std::string& token) {
+@@ -366,7 +400,7 @@ void EventChannel::Start(base::OnceCallback<void(base::FilePath)> done) {
+   base::ThreadPool::PostTask(
+       FROM_HERE,
+       {base::MayBlock(), base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
+-      base::BindOnce(&Server::Run, server_, std::move(started)));
++      base::BindOnce(&Server::Run, server_, stable_dir_, std::move(started)));
+ }
+ 
+ // static
+@@ -390,6 +424,11 @@ std::string EventChannel::Register(const std::string& session) {
+   return server_->Register(session);
+ }
+ 
++void EventChannel::RegisterToken(const std::string& token,
++                                 const std::string& session) {
++  server_->RegisterToken(token, session);
++}
++
+ void EventChannel::Unregister(const std::string& token) {
+   server_->Unregister(token);
+ }
+diff --git a/chrome/browser/meridian/mission/event_channel.h b/chrome/browser/meridian/mission/event_channel.h
+index 54e84cc58b..36d6387dc6 100644
+--- a/chrome/browser/meridian/mission/event_channel.h
++++ b/chrome/browser/meridian/mission/event_channel.h
+@@ -41,11 +41,17 @@ class EventChannel {
+ 
+   // Starts listening (once); `done` gets the socket path, or empty.
+   void Start(base::OnceCallback<void(base::FilePath)> done);
++  // Before Start: the socket's folder is the same across browser runs for
++  // this profile folder (an agent that outlived a crash still sends there),
++  // instead of a fresh one.
++  void SetUserDataDir(const base::FilePath& dir) { stable_dir_ = dir; }
+   // The path once started, else empty.
+   const base::FilePath& socket_path() const { return socket_path_; }
+ 
+   // A new session; returns its token.
+   std::string Register(const std::string& session);
++  // A token an agent already has (it outlived a crash of the browser).
++  void RegisterToken(const std::string& token, const std::string& session);
+   // Docker sandboxes can't reach the socket: they append lines to
+   // <dir>/events.jsonl in a fresh private dir that is mounted into the
+   // container. Everything in that dir is hostile (the file may be swapped
+@@ -61,6 +67,7 @@ class EventChannel {
+ 
+   scoped_refptr<Server> server_;
+   base::FilePath socket_path_;
++  base::FilePath stable_dir_;
+   bool starting_ = false;
+   std::vector<base::OnceCallback<void(base::FilePath)>> waiting_;
+   base::WeakPtrFactory<EventChannel> weak_factory_{this};
+diff --git a/chrome/browser/meridian/mission/mission_control.cc b/chrome/browser/meridian/mission/mission_control.cc
+index 9b459ccc4b..000a80aacc 100644
+--- a/chrome/browser/meridian/mission/mission_control.cc
++++ b/chrome/browser/meridian/mission/mission_control.cc
+@@ -174,6 +174,7 @@ MissionControl::MissionControl(Profile* profile)
+   channel_ = std::make_unique<EventChannel>(base::BindRepeating(
+       &MissionControl::OnHookEvent, weak_factory_.GetWeakPtr()));
+   LoadHistory();
++  channel_->SetUserDataDir(profile->GetPath().DirName());
+   channel_->Start(base::DoNothing());
+   sweep_.Start(FROM_HERE, base::Seconds(5),
+                base::BindRepeating(&MissionControl::Sweep,
+@@ -294,7 +295,8 @@ MissionControl::Registration MissionControl::RegisterTerminal(
+     const std::string& project,
+     int owner_tab,
+     bool sandbox,
+-    bool in_shell) {
++    bool in_shell,
++    const std::string& reuse_token) {
+   std::string kind = kind_id;
+   if (kind.starts_with("sandbox-")) {
+     kind = kind.substr(8);
+@@ -330,7 +332,8 @@ MissionControl::Registration MissionControl::RegisterTerminal(
+   // The first agent session: macOS will ask once about notifications (they
+   // come when an agent waits), so say so before its prompt appears.
+   PrefService* prefs = profile_->GetPrefs();
+-  if (!in_shell && !prefs->GetBoolean(prefs::kMissionNotifyIntro) &&
++  if (!in_shell && reuse_token.empty() &&
++      !prefs->GetBoolean(prefs::kMissionNotifyIntro) &&
+       prefs->GetBoolean(prefs::kMissionNotify)) {
+     prefs->SetBoolean(prefs::kMissionNotifyIntro, true);
+     for (Observer& o : observers_) {
+@@ -342,7 +345,14 @@ MissionControl::Registration MissionControl::RegisterTerminal(
+     }
+   }
+   if (kind == "claude" || kind == "codex") {
+-    out.token = channel_->Register(out.node_id);
++    // A session that outlived a crash of the browser keeps the token it has.
++    if (reuse_token.size() == 64 &&
++        std::ranges::all_of(reuse_token, base::IsHexDigit<char>)) {
++      out.token = reuse_token;
++      channel_->RegisterToken(out.token, out.node_id);
++    } else {
++      out.token = channel_->Register(out.node_id);
++    }
+     terminals_[out.token] = out.node_id;
+     token_hashes_[base::HexEncodeLower(
+                       crypto::hash::Sha256(base::as_byte_span(out.token)))
+diff --git a/chrome/browser/meridian/mission/mission_control.h b/chrome/browser/meridian/mission/mission_control.h
+index bfe2792693..bb958c8501 100644
+--- a/chrome/browser/meridian/mission/mission_control.h
++++ b/chrome/browser/meridian/mission/mission_control.h
+@@ -92,7 +92,8 @@ class MissionControl : public KeyedService,
+                                 const std::string& project,
+                                 int owner_tab,
+                                 bool sandbox = false,
+-                                bool in_shell = false);
++                                bool in_shell = false,
++                                const std::string& reuse_token = std::string());
+   // A Docker sandbox session: a private dir mounted at /meridian with the
+   // hook script (run by node in the container), Claude Code's settings and
+   // the events file the browser follows. Blocking (writes files);
+diff --git a/chrome/browser/meridian/workbench/term_host.cc b/chrome/browser/meridian/workbench/term_host.cc
+new file mode 100644
+index 0000000000..83670b46ab
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/term_host.cc
+@@ -0,0 +1,549 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/workbench/term_host.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <signal.h>
++#include <spawn.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/time.h>
++#include <sys/un.h>
++#include <time.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <array>
++#include <map>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/base64.h"
++#include "base/command_line.h"
++#include "base/compiler_specific.h"
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "build/build_config.h"
++
++extern char** environ;
++
++namespace meridian::workbench {
++
++namespace {
++
++constexpr std::string_view kSwitch = "--meridian-term-host=";
++constexpr size_t kMaxOutput = 1 << 20;            // per terminal, the tail
++constexpr time_t kOrphanSeconds = 2 * 60 * 60;    // unclaimed: hung up
++constexpr time_t kIdleSeconds = 30;               // nothing kept: the host ends
++
++base::span<const char*> Args(int argc, const char** argv) {
++  return UNSAFE_BUFFERS(base::span(argv, static_cast<size_t>(argc)));
++}
++
++// A short path (sun_path holds 104 bytes) in a folder only this user can
++// use, one socket per profile folder.
++std::string SocketPath(const std::string& user_data_dir) {
++  uint64_t h = 1469598103934665603ull;  // FNV-1a
++  for (unsigned char c : user_data_dir) {
++    h = (h ^ c) * 1099511628211ull;
++  }
++  std::string dir = "/tmp/meridian-term-" + base::NumberToString(getuid());
++  mkdir(dir.c_str(), 0700);
++  return dir + "/" + base::HexEncodeLower(base::byte_span_from_ref(h)) +
++         ".sock";
++}
++
++std::string ProfileHash(const std::string& user_data_dir) {
++  uint64_t h = 1469598103934665603ull;  // FNV-1a
++  for (unsigned char c : user_data_dir) {
++    h = (h ^ c) * 1099511628211ull;
++  }
++  return base::HexEncodeLower(base::byte_span_from_ref(h));
++}
++
++bool SafeDir(const std::string& socket) {
++  struct stat st;
++  std::string dir = socket.substr(0, socket.rfind('/'));
++  return lstat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode) &&
++         st.st_uid == getuid() && (st.st_mode & 0077) == 0;
++}
++
++bool FillAddr(const std::string& path, sockaddr_un* addr) {
++  *addr = {};
++  addr->sun_family = AF_UNIX;
++  if (path.size() >= sizeof(addr->sun_path)) {
++    return false;
++  }
++  std::ranges::copy(path, base::span(addr->sun_path).begin());
++  return true;
++}
++
++int Connect(const std::string& path) {
++  sockaddr_un addr;
++  if (!SafeDir(path) || !FillAddr(path, &addr)) {
++    return -1;
++  }
++  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
++  if (fd < 0) {
++    return -1;
++  }
++  fcntl(fd, F_SETFD, FD_CLOEXEC);
++  timeval tv = {5, 0};
++  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++  if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
++    close(fd);
++    return -1;
++  }
++  return fd;
++}
++
++// One message, with an fd riding along if `pass` >= 0.
++bool SendMsg(int sock, std::string_view data, int pass) {
++  iovec iov = {const_cast<char*>(data.data()), data.size()};
++  msghdr msg = {};
++  msg.msg_iov = &iov;
++  msg.msg_iovlen = 1;
++  alignas(cmsghdr) std::array<char, CMSG_SPACE(sizeof(int))> control = {};
++  if (pass >= 0) {
++    msg.msg_control = control.data();
++    msg.msg_controllen = control.size();
++    cmsghdr* c = CMSG_FIRSTHDR(&msg);
++    c->cmsg_level = SOL_SOCKET;
++    c->cmsg_type = SCM_RIGHTS;
++    c->cmsg_len = CMSG_LEN(sizeof(int));
++    UNSAFE_BUFFERS(memcpy(CMSG_DATA(c), &pass, sizeof(int)));
++  }
++  ssize_t n = sendmsg(sock, &msg, 0);
++  if (n < 0) {
++    return false;
++  }
++  // The rest (never with the fd again).
++  for (size_t sent = static_cast<size_t>(n); sent < data.size();) {
++    ssize_t m = write(sock, data.substr(sent).data(), data.size() - sent);
++    if (m <= 0) {
++      return false;
++    }
++    sent += static_cast<size_t>(m);
++  }
++  return true;
++}
++
++// Reads until EOF (or `stop_at_newline`), keeping the first fd that came.
++std::string ReceiveAll(int sock, int* fd, bool stop_at_newline) {
++  std::string out;
++  std::array<char, 65536> buffer;
++  while (true) {
++    iovec iov = {buffer.data(), buffer.size()};
++    msghdr msg = {};
++    msg.msg_iov = &iov;
++    msg.msg_iovlen = 1;
++    alignas(cmsghdr) std::array<char, CMSG_SPACE(sizeof(int) * 4)> control = {};
++    msg.msg_control = control.data();
++    msg.msg_controllen = control.size();
++    ssize_t n = recvmsg(sock, &msg, 0);
++    if (n < 0 && errno == EINTR) {
++      continue;
++    }
++    for (cmsghdr* c = CMSG_FIRSTHDR(&msg); c;
++         c = UNSAFE_BUFFERS(CMSG_NXTHDR(&msg, c))) {
++      if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
++        size_t count = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
++        for (size_t i = 0; i < count; ++i) {
++          int got;
++          UNSAFE_BUFFERS(memcpy(&got, CMSG_DATA(c) + i * sizeof(int),
++                                sizeof(int)));
++          if (fd && *fd < 0) {
++            *fd = got;
++            fcntl(got, F_SETFD, FD_CLOEXEC);
++          } else {
++            close(got);
++          }
++        }
++      }
++    }
++    if (n <= 0) {
++      break;
++    }
++    out.append(buffer.data(), static_cast<size_t>(n));
++    if (stop_at_newline && out.find('\n') != std::string::npos) {
++      break;
++    }
++    if (out.size() > 8 * kMaxOutput) {
++      break;
++    }
++  }
++  return out;
++}
++
++std::string B64(std::string_view s) {
++  return base::Base64Encode(base::as_byte_span(s));
++}
++
++std::string UnB64(std::string_view s) {
++  std::string out;
++  base::Base64Decode(s, &out);
++  return out;
++}
++
++// ------------------------------------------------------------------ host
++
++struct Kept {
++  int pid = 0;
++  int browser = 0;
++  std::string root;
++  std::string meta;
++  int fd = -1;
++  bool orphan = false;
++  time_t since = 0;
++  std::string output;
++};
++
++bool Alive(int pid) {
++  return pid > 0 && (kill(pid, 0) == 0 || errno == EPERM);
++}
++
++// The browser that ended quit cleanly (the profile says "Normal", not
++// "Crashed"): its terminals close, as they did before the host.
++bool QuitCleanly(const std::string& user_data_dir) {
++  if (user_data_dir.empty()) {
++    return false;
++  }
++  int fd = open((user_data_dir + "/Default/Preferences").c_str(), O_RDONLY);
++  if (fd < 0) {
++    return false;
++  }
++  std::string prefs;
++  std::array<char, 65536> chunk;
++  ssize_t n;
++  while ((n = read(fd, chunk.data(), chunk.size())) > 0) {
++    prefs.append(chunk.data(), static_cast<size_t>(n));
++  }
++  close(fd);
++  return prefs.find("\"exit_type\":\"Crashed\"") == std::string::npos;
++}
++
++void HangUp(Kept& k) {
++  kill(-k.pid, SIGHUP);
++  kill(k.pid, SIGHUP);
++  close(k.fd);
++}
++
++void Serve(int client, std::map<std::string, Kept>& kept) {
++  int fd = -1;
++  std::string line = ReceiveAll(client, &fd, true);
++  line = line.substr(0, line.find('\n'));
++  std::vector<std::string> f = base::SplitString(
++      line, "\t", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL);
++  std::string reply = "ERR\n";
++  if (f.size() == 6 && f[0] == "KEEP" && fd >= 0) {
++    Kept k;
++    int pid = 0;
++    int browser = 0;
++    if (base::StringToInt(f[2], &pid) && base::StringToInt(f[3], &browser)) {
++      k.pid = pid;
++      k.browser = browser;
++      k.root = UnB64(f[4]);
++      k.meta = UnB64(f[5]);
++      k.fd = fd;
++      fd = -1;
++      if (auto it = kept.find(f[1]); it != kept.end()) {
++        close(it->second.fd);
++      }
++      kept[f[1]] = std::move(k);
++      reply = "OK\n";
++    }
++  } else if (f.size() == 2 && f[0] == "DROP") {
++    if (auto it = kept.find(f[1]); it != kept.end()) {
++      close(it->second.fd);
++      kept.erase(it);
++    }
++    reply = "OK\n";
++  } else if (f.size() == 2 && f[0] == "LIST") {
++    std::string root = UnB64(f[1]);
++    reply.clear();
++    for (const auto& [key, k] : kept) {
++      // Only what a browser that's gone left (the browser alive now still
++      // has the others).
++      if (k.root == root && !Alive(k.browser)) {
++        reply += key + "\t" + base::NumberToString(k.pid) + "\t" + B64(k.meta) +
++                 "\n";
++      }
++    }
++    reply += "END\n";
++  } else if (f.size() == 2 && f[0] == "TAKE") {
++    auto it = kept.find(f[1]);
++    if (it != kept.end() && !Alive(it->second.browser)) {
++      // The fd rides on the first byte; the output follows.
++      SendMsg(client, "T" + B64(it->second.output) + "\n", it->second.fd);
++      close(it->second.fd);
++      kept.erase(it);
++      reply.clear();
++    }
++  } else if (f.size() == 1 && f[0] == "PING") {
++    reply = "OK\n";
++  }
++  if (fd >= 0) {
++    close(fd);
++  }
++  if (!reply.empty()) {
++    SendMsg(client, reply, -1);
++  }
++}
++
++}  // namespace
++
++bool IsTermHost(int argc, const char** argv) {
++  for (const char* a : Args(argc, argv).subspan(1u)) {
++    if (a && std::string_view(a).starts_with(kSwitch)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++int RunTermHost(int argc, const char** argv) {
++  std::string path;
++  std::string user_data_dir;
++  for (const char* a : Args(argc, argv).subspan(1u)) {
++    if (a && std::string_view(a).starts_with(kSwitch)) {
++      path = std::string(std::string_view(a).substr(kSwitch.size()));
++    } else if (a && std::string_view(a).starts_with("--user-data-dir=")) {
++      user_data_dir = std::string(std::string_view(a).substr(16));
++    }
++  }
++  sockaddr_un addr;
++  if (path.empty() || !SafeDir(path) || !FillAddr(path, &addr)) {
++    return 2;
++  }
++  signal(SIGPIPE, SIG_IGN);
++  signal(SIGHUP, SIG_IGN);
++  int listener = socket(AF_UNIX, SOCK_STREAM, 0);
++  // Another host already serves this socket: it stays.
++  if (int probe = Connect(path); probe >= 0) {
++    close(probe);
++    return 0;
++  }
++  unlink(path.c_str());
++  if (listener < 0 ||
++      bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
++      listen(listener, 16) != 0) {
++    return 1;
++  }
++  chmod(path.c_str(), 0600);
++  std::map<std::string, Kept> kept;
++  time_t empty_since = time(nullptr);
++  std::array<char, 65536> chunk;
++  while (true) {
++    time_t now = time(nullptr);
++    // Terminals whose browser is gone: after a crash the host reads them
++    // from now on; after a clean quit they close.
++    for (auto it = kept.begin(); it != kept.end();) {
++      Kept& k = it->second;
++      if (!k.orphan && !Alive(k.browser)) {
++        if (QuitCleanly(user_data_dir)) {
++          HangUp(k);
++          it = kept.erase(it);
++          continue;
++        }
++        k.orphan = true;
++        k.since = now;
++      }
++      ++it;
++    }
++    std::vector<pollfd> fds = {{listener, POLLIN, 0}};
++    std::vector<std::string> keys;
++    for (const auto& [key, k] : kept) {
++      if (k.orphan) {
++        fds.push_back({k.fd, POLLIN, 0});
++        keys.push_back(key);
++      }
++    }
++    int ready = poll(fds.data(), fds.size(), 1000);
++    if (ready > 0 && (fds[0].revents & POLLIN)) {
++      int client = accept(listener, nullptr, nullptr);
++      if (client >= 0) {
++        timeval tv = {5, 0};
++        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++        Serve(client, kept);
++        close(client);
++      }
++    }
++    for (size_t i = 1; ready > 0 && i < fds.size(); ++i) {
++      if (!fds[i].revents) {
++        continue;
++      }
++      auto it = kept.find(keys[i - 1]);
++      if (it == kept.end()) {
++        continue;
++      }
++      ssize_t n = read(it->second.fd, chunk.data(), chunk.size());
++      if (n > 0) {
++        std::string& out = it->second.output;
++        out.append(chunk.data(), static_cast<size_t>(n));
++        if (out.size() > kMaxOutput) {
++          out.erase(0, out.size() - kMaxOutput);
++        }
++      } else if (n == 0 || (errno != EAGAIN && errno != EINTR)) {
++        // The program ended (the pty's other side closed).
++        close(it->second.fd);
++        kept.erase(it);
++      }
++    }
++    // Unclaimed too long: hung up, as closing its terminal would.
++    for (auto it = kept.begin(); it != kept.end();) {
++      if (it->second.orphan && now - it->second.since > kOrphanSeconds) {
++        HangUp(it->second);
++        it = kept.erase(it);
++      } else {
++        ++it;
++      }
++    }
++    if (!kept.empty()) {
++      empty_since = now;
++    } else if (now - empty_since > kIdleSeconds) {
++      break;
++    }
++  }
++  close(listener);
++  unlink(path.c_str());
++  return 0;
++}
++
++// ------------------------------------------------------------------ browser
++
++std::string StableRuntimeDir(const std::string& user_data_dir,
++                             const std::string& what) {
++  std::string base = "/tmp/meridian-term-" + base::NumberToString(getuid());
++  mkdir(base.c_str(), 0700);
++  std::string dir = base + "/" + ProfileHash(user_data_dir) + "-" + what;
++  mkdir(dir.c_str(), 0700);
++  struct stat st;
++  if (!SafeDir(base + "/x") || lstat(dir.c_str(), &st) != 0 ||
++      !S_ISDIR(st.st_mode) || st.st_uid != getuid() ||
++      (st.st_mode & 0077) != 0) {
++    return std::string();
++  }
++  return dir;
++}
++
++namespace {
++
++std::string Request(const std::string& user_data_dir,
++                    const std::string& line,
++                    int pass,
++                    int* fd_out,
++                    bool start_host) {
++  const std::string path = SocketPath(user_data_dir);
++  int sock = Connect(path);
++  if (sock < 0 && start_host) {
++    // Started detached: its own session, nothing of the browser's open.
++    std::string exe =
++        base::CommandLine::ForCurrentProcess()->GetProgram().value();
++    std::string sw = std::string(kSwitch) + path;
++    std::string dir = "--user-data-dir=" + user_data_dir;
++    std::vector<char*> argv = {exe.data(), sw.data(), dir.data(), nullptr};
++    posix_spawn_file_actions_t files;
++    posix_spawn_file_actions_init(&files);
++    for (int f = 0; f < 3; ++f) {
++      posix_spawn_file_actions_addopen(&files, f, "/dev/null",
++                                       f == 0 ? O_RDONLY : O_WRONLY, 0);
++    }
++    posix_spawnattr_t attr;
++    posix_spawnattr_init(&attr);
++    short flags = POSIX_SPAWN_SETSID;
++#if BUILDFLAG(IS_MAC)
++    flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
++#endif
++    posix_spawnattr_setflags(&attr, flags);
++    pid_t pid = 0;
++    posix_spawn(&pid, exe.c_str(), &files, &attr, argv.data(), environ);
++    posix_spawnattr_destroy(&attr);
++    posix_spawn_file_actions_destroy(&files);
++    for (int i = 0; i < 60 && sock < 0; ++i) {
++      usleep(50000);
++      sock = Connect(path);
++    }
++  }
++  if (sock < 0) {
++    if (pass >= 0) {
++      close(pass);
++    }
++    return {};
++  }
++  SendMsg(sock, line + "\n", pass);
++  if (pass >= 0) {
++    close(pass);
++  }
++  shutdown(sock, SHUT_WR);
++  std::string reply = ReceiveAll(sock, fd_out, false);
++  close(sock);
++  return reply;
++}
++
++}  // namespace
++
++bool KeepTerminal(const std::string& user_data_dir,
++                  const std::string& key,
++                  int pid,
++                  int master,
++                  const std::string& root,
++                  const std::string& meta) {
++  return Request(user_data_dir,
++                 "KEEP\t" + key + "\t" + base::NumberToString(pid) + "\t" +
++                     base::NumberToString(getpid()) + "\t" + B64(root) + "\t" +
++                     B64(meta),
++                 master, nullptr, true) == "OK\n";
++}
++
++void DropTerminal(const std::string& user_data_dir, const std::string& key) {
++  Request(user_data_dir, "DROP\t" + key, -1, nullptr, false);
++}
++
++std::vector<OrphanTerminal> AdoptTerminals(const std::string& user_data_dir,
++                                           const std::string& root) {
++  std::vector<OrphanTerminal> out;
++  std::string list =
++      Request(user_data_dir, "LIST\t" + B64(root), -1, nullptr, false);
++  for (const std::string& line : base::SplitString(
++           list, "\n", base::KEEP_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++    std::vector<std::string> f = base::SplitString(
++        line, "\t", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL);
++    int pid = 0;
++    if (f.size() != 3 || !base::StringToInt(f[1], &pid)) {
++      continue;
++    }
++    int fd = -1;
++    std::string got =
++        Request(user_data_dir, "TAKE\t" + f[0], -1, &fd, false);
++    if (fd < 0 || got.empty() || got[0] != 'T') {
++      if (fd >= 0) {
++        close(fd);
++      }
++      continue;
++    }
++    OrphanTerminal t;
++    t.key = f[0];
++    t.pid = pid;
++    t.master = fd;
++    t.meta = UnB64(f[2]);
++    std::string b64 = got.substr(1);
++    while (!b64.empty() && b64.back() == '\n') {
++      b64.pop_back();
++    }
++    t.output = UnB64(b64);
++    out.push_back(std::move(t));
++  }
++  return out;
++}
++
++}  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/term_host.h b/chrome/browser/meridian/workbench/term_host.h
+new file mode 100644
+index 0000000000..6476c220e8
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/term_host.h
+@@ -0,0 +1,64 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_WORKBENCH_TERM_HOST_H_
++#define CHROME_BROWSER_MERIDIAN_WORKBENCH_TERM_HOST_H_
++
++#include <string>
++#include <vector>
++
++namespace meridian::workbench {
++
++// Workbench terminals (Claude Code among them) are the browser's children:
++// when the browser crashed, their pty closed and they ended with it. The
++// terminal host keeps a second fd of each pty's master side, so a crash of
++// the browser doesn't close the pty. Once the browser that handed a terminal
++// over is gone, the host reads what the terminal prints (so the program
++// doesn't stall on a full pty) and keeps it; the reopened browser takes the
++// terminal back, with that output, and the Workbench shows it again instead
++// of resuming the session anew. Unclaimed for two hours, a terminal is hung
++// up; with nothing to keep, the host ends.
++//
++// The host is the browser's own binary: `--meridian-term-host=<socket>`
++// (macOS and Linux; Windows terminals are pseudoconsoles in the browser).
++
++bool IsTermHost(int argc, const char** argv);
++int RunTermHost(int argc, const char** argv);
++
++// A folder only this user can use, the same for a profile folder across
++// browser runs (sockets an agent outliving a crash still knows): created if
++// missing, empty if it can't be made safe.
++std::string StableRuntimeDir(const std::string& user_data_dir,
++                             const std::string& what);
++
++// Browser side. All block (sockets): call them on a MayBlock sequence.
++
++// Hands the host a terminal (`master` is a dup the call closes). Starts the
++// host if it isn't running. `key` is unique across browser runs.
++bool KeepTerminal(const std::string& user_data_dir,
++                  const std::string& key,
++                  int pid,
++                  int master,
++                  const std::string& root,
++                  const std::string& meta);
++
++// The terminal ended (or was closed) in the browser: the host lets it go.
++void DropTerminal(const std::string& user_data_dir, const std::string& key);
++
++struct OrphanTerminal {
++  std::string key;
++  int pid = 0;
++  int master = -1;   // owned by the caller now
++  std::string meta;  // what KeepTerminal was given
++  std::string output;  // printed while no browser read it
++};
++
++// The terminals of `root` that a browser which is gone left behind (none if
++// no host runs: it isn't started for this).
++std::vector<OrphanTerminal> AdoptTerminals(const std::string& user_data_dir,
++                                           const std::string& root);
++
++}  // namespace meridian::workbench
++
++#endif  // CHROME_BROWSER_MERIDIAN_WORKBENCH_TERM_HOST_H_
+diff --git a/chrome/browser/meridian/workbench/terminal.cc b/chrome/browser/meridian/workbench/terminal.cc
+index b118215e6f..ed3a5f5692 100644
+--- a/chrome/browser/meridian/workbench/terminal.cc
++++ b/chrome/browser/meridian/workbench/terminal.cc
+@@ -140,10 +140,11 @@ class Terminal::Io : public base::RefCountedThreadSafe<Terminal::Io> {
+         on_data_.Run(std::move(text));
+       }
+     }
+-    // Wait for the exit without reaping, mark it, then reap.
++    // Wait for the exit without reaping, mark it, then reap. (An adopted
++    // process isn't our child: it ended or let go of the pty; no status.)
+     siginfo_t info = {};
+-    HANDLE_EINTR(waitid(P_PID, static_cast<id_t>(pid_), &info,
+-                        WEXITED | WNOWAIT));
++    const bool child = HANDLE_EINTR(waitid(P_PID, static_cast<id_t>(pid_),
++                                           &info, WEXITED | WNOWAIT)) == 0;
+     {
+       base::AutoLock hold(lock_);
+       exited_ = true;
+@@ -154,7 +155,7 @@ class Terminal::Io : public base::RefCountedThreadSafe<Terminal::Io> {
+     int status = 0;
+     int code = -1;
+     int signal = 0;
+-    if (HANDLE_EINTR(waitpid(pid_, &status, 0)) == pid_) {
++    if (child && HANDLE_EINTR(waitpid(pid_, &status, 0)) == pid_) {
+       if (WIFEXITED(status)) {
+         code = WEXITSTATUS(status);
+       } else if (WIFSIGNALED(status)) {
+@@ -194,6 +195,11 @@ class Terminal::Io : public base::RefCountedThreadSafe<Terminal::Io> {
+ 
+   void CloseOnWriter() { close(master_); }
+ 
++ public:
++  int master() const { return master_; }
++
++ private:
++
+   const int pid_;
+   const int master_;
+   const scoped_refptr<base::SequencedTaskRunner> writer_;
+@@ -285,6 +291,34 @@ std::unique_ptr<Terminal> Terminal::Start(const Spec& spec,
+   return terminal;
+ }
+ 
++// static
++std::unique_ptr<Terminal> Terminal::Adopt(int pid,
++                                          int master,
++                                          DataCallback on_data,
++                                          ExitCallback on_exit) {
++  if (pid <= 0 || master < 0) {
++    return nullptr;
++  }
++  fcntl(master, F_SETFD, FD_CLOEXEC);
++  auto terminal = base::WrapUnique(new Terminal(pid));
++  terminal->io_ = base::MakeRefCounted<Io>(pid, master, std::move(on_data),
++                                           std::move(on_exit));
++  base::ThreadPool::PostTask(
++      FROM_HERE,
++      {base::MayBlock(), base::WithBaseSyncPrimitives(),
++       base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
++      base::BindOnce(&Io::Run, terminal->io_));
++  return terminal;
++}
++
++int Terminal::DupMaster() const {
++  if (pid_ <= 0 || !io_) {
++    return -1;
++  }
++  int fd = fcntl(io_->master(), F_DUPFD_CLOEXEC, 0);
++  return fd;
++}
++
+ Terminal::Terminal(int pid) : pid_(pid) {}
+ 
+ Terminal::~Terminal() {
+diff --git a/chrome/browser/meridian/workbench/terminal.h b/chrome/browser/meridian/workbench/terminal.h
+index 075c93e2bb..04d44d8cef 100644
+--- a/chrome/browser/meridian/workbench/terminal.h
++++ b/chrome/browser/meridian/workbench/terminal.h
+@@ -42,6 +42,13 @@ class Terminal {
+   static std::unique_ptr<Terminal> Start(const Spec& spec,
+                                          DataCallback on_data,
+                                          ExitCallback on_exit);
++  // A process that already runs on a pty (one that outlived a browser that
++  // crashed, from the terminal host): its master side, owned from now on.
++  static std::unique_ptr<Terminal> Adopt(int pid,
++                                         int master,
++                                         DataCallback on_data,
++                                         ExitCallback on_exit);
++
+   Terminal(const Terminal&) = delete;
+   Terminal& operator=(const Terminal&) = delete;
+   // Kills the process group if it still runs.
+@@ -53,6 +60,10 @@ class Terminal {
+   void Kill();
+   int pid() const { return pid_; }
+ 
++  // A second fd of the pty's master side (for the terminal host to keep, so
++  // the process outlives a crash of the browser), or -1.
++  int DupMaster() const;
++
+  private:
+   class Io;
+   explicit Terminal(int pid);
+diff --git a/chrome/browser/meridian/workbench/terminal_win.cc b/chrome/browser/meridian/workbench/terminal_win.cc
+index 42b201dce4..416832421c 100644
+--- a/chrome/browser/meridian/workbench/terminal_win.cc
++++ b/chrome/browser/meridian/workbench/terminal_win.cc
+@@ -317,4 +317,14 @@ void Terminal::Kill() {
+   io_->Stop();
+ }
+ 
++// Windows: pseudoconsoles live in the browser (no terminal host yet).
++// static
++std::unique_ptr<Terminal> Terminal::Adopt(int, int, DataCallback, ExitCallback) {
++  return nullptr;
++}
++
++int Terminal::DupMaster() const {
++  return -1;
++}
++
+ }  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 8321ccf56e..26cc508f4d 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -17,6 +17,7 @@
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/stringprintf.h"
++#include "base/rand_util.h"
+ #include "base/task/bind_post_task.h"
+ #include "base/task/thread_pool.h"
+ #include "base/uuid.h"
+@@ -43,6 +44,11 @@
+ #include "chrome/browser/meridian/workbench/workbench_service.h"
+ #include "chrome/browser/meridian/workbench/workbench_service_factory.h"
+ #include "chrome/browser/meridian/workbench/terminal.h"
++#if BUILDFLAG(IS_POSIX)
++#include <signal.h>
++
++#include "chrome/browser/meridian/workbench/term_host.h"
++#endif
+ #include "chrome/browser/ui/tab_contents/chrome_web_contents_view_handle_drop.h"
+ #include "chrome/browser/platform_util.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -285,6 +291,7 @@ WorkbenchHandler::~WorkbenchHandler() {
+   mission::MissionControl* mission =
+       mission::MissionControlFactory::GetForProfile(profile_);
+   for (auto& [id, term] : terms_) {
++    DropFromHost(term);
+     cleanup.insert(cleanup.end(), term.cleanup.begin(), term.cleanup.end());
+     // Live containers go with the page, like its terminals.
+     StopSandbox(term);
+@@ -765,6 +772,19 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+     return std::move(reply).Run(base::Value(true));
+   }
+   if (method == "ptyList") {
++#if BUILDFLAG(IS_POSIX)
++    if (project_ && UseTermHost() &&
++        adopted_roots_.insert(project_->root().AsUTF8Unsafe()).second) {
++      base::ThreadPool::PostTaskAndReplyWithResult(
++          FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++          base::BindOnce(&AdoptTerminals,
++                         profile_->GetPath().DirName().AsUTF8Unsafe(),
++                         project_->root().AsUTF8Unsafe()),
++          base::BindOnce(&WorkbenchHandler::OnAdopted,
++                         weak_factory_.GetWeakPtr(), std::move(reply)));
++      return;
++    }
++#endif
+     base::ListValue list;
+     for (const auto& [id, term] : terms_) {
+       list.Append(TermInfo(id, term));
+@@ -776,6 +796,7 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+     if (it == terms_.end()) {
+       return std::move(reply).Run(base::unexpected("no such terminal"));
+     }
++    DropFromHost(it->second);
+     std::vector<base::FilePath> cleanup = std::move(it->second.cleanup);
+     if (!it->second.guard_token.empty()) {
+       WorkbenchServiceFactory::GetForProfile(profile_)->UnregisterGuard(
+@@ -2226,7 +2247,7 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+              int rows, mission::MissionControl::Registration registration,
+              std::map<std::string, std::string> secrets,
+              std::vector<std::string> secret_names, std::string guard_token,
+-             Reply reply,
++             std::string mission_kind, bool in_shell, Reply reply,
+              std::pair<base::expected<LaunchSpec, std::string>,
+                        std::map<std::string, std::string>> made) {
+             mission::MissionControl* mission =
+@@ -2284,6 +2305,8 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+             term.mission_token = registration.token;
+             term.guard_token = guard_token;
+             term.secrets = secret_names;
++            term.mission_kind = mission_kind;
++            term.in_shell = in_shell;
+             if (mission && !registration.node_id.empty()) {
+               mission->AttachTerminal(registration.node_id, id);
+             }
+@@ -2295,11 +2318,13 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+             info.Set("notes", std::move(notes));
+             info.Set("browserTools", spec->browser_tools);
+             self->terms_[id] = std::move(term);
++            self->KeepInHost(id);
+             std::move(reply).Run(base::Value(std::move(info)));
+           },
+           weak_factory_.GetWeakPtr(), kind, cols, rows,
+           std::move(registration), std::move(secrets), std::move(secret_names),
+-          guard_token, std::move(reply)));
++          guard_token, shell_claude ? std::string("claude") : kind,
++          shell_claude, std::move(reply)));
+ }
+ 
+ base::DictValue WorkbenchHandler::TermInfo(const std::string& id,
+@@ -2325,6 +2350,134 @@ base::DictValue WorkbenchHandler::TermInfo(const std::string& id,
+                               : base::Value(term.mission_node));
+ }
+ 
++bool WorkbenchHandler::UseTermHost() const {
++#if BUILDFLAG(IS_POSIX)
++  // Not under tests (they end browsers outright: their shells would be kept
++  // for hours), unless a test asks for it.
++  const base::CommandLine& cl = *base::CommandLine::ForCurrentProcess();
++  return cl.HasSwitch("meridian-term-host-test") ||
++         (!cl.HasSwitch("remote-debugging-port") &&
++          !cl.HasSwitch("remote-debugging-pipe"));
++#else
++  return false;
++#endif
++}
++
++void WorkbenchHandler::KeepInHost(const std::string& id) {
++#if BUILDFLAG(IS_POSIX)
++  auto it = terms_.find(id);
++  if (!project_ || !UseTermHost() || it == terms_.end() ||
++      !it->second.terminal) {
++    return;
++  }
++  Term& term = it->second;
++  int fd = term.terminal->DupMaster();
++  if (fd < 0) {
++    return;
++  }
++  term.host_key = base::NumberToString(getpid()) + "-" +
++                  base::HexEncodeLower(base::RandBytesAsVector(8));
++  std::string meta =
++      base::WriteJson(base::DictValue()
++                          .Set("kind", term.kind)
++                          .Set("title", term.title)
++                          .Set("mission", !term.mission_node.empty())
++                          .Set("mission_kind", term.mission_kind)
++                          .Set("in_shell", term.in_shell)
++                          .Set("token", term.mission_token))
++          .value_or("{}");
++  base::ThreadPool::PostTask(
++      FROM_HERE,
++      {base::MayBlock(), base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
++      base::BindOnce(base::IgnoreResult(&KeepTerminal),
++                     profile_->GetPath().DirName().AsUTF8Unsafe(),
++                     term.host_key, term.terminal->pid(), fd,
++                     project_->root().AsUTF8Unsafe(), std::move(meta)));
++#endif
++}
++
++void WorkbenchHandler::DropFromHost(Term& term) {
++#if BUILDFLAG(IS_POSIX)
++  if (term.host_key.empty()) {
++    return;
++  }
++  base::ThreadPool::PostTask(
++      FROM_HERE,
++      {base::MayBlock(), base::TaskShutdownBehavior::BLOCK_SHUTDOWN},
++      base::BindOnce(&DropTerminal,
++                     profile_->GetPath().DirName().AsUTF8Unsafe(),
++                     term.host_key));
++  term.host_key.clear();
++#endif
++}
++
++void WorkbenchHandler::OnAdopted(
++    Reply reply,
++    std::vector<OrphanTerminal> orphans) {
++#if BUILDFLAG(IS_POSIX)
++  mission::MissionControl* mission =
++      mission::MissionControlFactory::GetForProfile(profile_);
++  tabs::TabInterface* tab =
++      tabs::TabInterface::MaybeGetFromContents(web_ui()->GetWebContents());
++  for (OrphanTerminal& o : orphans) {
++    std::string id = "t" + base::NumberToString(++term_seq_);
++    std::unique_ptr<Terminal> terminal = Terminal::Adopt(
++        o.pid, o.master,
++        base::BindPostTaskToCurrentDefault(base::BindRepeating(
++            &WorkbenchHandler::OnTerminalData, weak_factory_.GetWeakPtr(), id)),
++        base::BindPostTaskToCurrentDefault(base::BindOnce(
++            &WorkbenchHandler::OnTerminalExit, weak_factory_.GetWeakPtr(), id)));
++    if (!terminal) {
++      continue;
++    }
++    std::optional<base::Value> meta = base::JSONReader::Read(o.meta, 0);
++    base::DictValue m =
++        meta && meta->is_dict() ? std::move(*meta).TakeDict() : base::DictValue();
++    auto str = [&](const char* key) {
++      const std::string* v = m.FindString(key);
++      return v ? *v : std::string();
++    };
++    Term term;
++    term.terminal = std::move(terminal);
++    term.kind = str("kind").empty() ? "shell" : str("kind");
++    term.title = str("title");
++    term.mission_kind = str("mission_kind");
++    term.in_shell = m.FindBool("in_shell").value_or(false);
++    term.scrollback =
++        "\r\n\x1b[2m[Meridian restarted; this session kept running]\x1b[0m"
++        "\r\n" +
++        o.output.substr(o.output.size() > kScrollbackBytes
++                            ? o.output.size() - kScrollbackBytes
++                            : 0);
++    // Its hooks still have their token and Mission Control's socket (the
++    // same path across runs): the session shows, and reports, again.
++    if (mission && m.FindBool("mission").value_or(false) &&
++        !term.mission_kind.empty()) {
++      mission::MissionControl::Registration registration =
++          mission->RegisterTerminal(term.mission_kind, project_->name(),
++                                    tab ? tab->GetHandle().raw_value() : 0,
++                                    /*sandbox=*/false, term.in_shell,
++                                    str("token"));
++      term.mission_node = registration.node_id;
++      term.mission_token = registration.token;
++      if (!registration.node_id.empty()) {
++        mission->AttachTerminal(registration.node_id, id);
++      }
++    }
++    const int pid = term.terminal->pid();
++    terms_[id] = std::move(term);
++    KeepInHost(id);
++    // A full-screen program (Claude Code) draws itself again.
++    kill(-pid, SIGWINCH);
++  }
++#endif
++  base::ListValue list;
++  for (const auto& [id, term] : terms_) {
++    list.Append(TermInfo(id, term));
++  }
++  std::move(reply).Run(base::Value(std::move(list)));
++}
++
+ void WorkbenchHandler::OnTerminalData(std::string id, std::string data) {
+   auto it = terms_.find(id);
+   if (it == terms_.end()) {
+@@ -2348,6 +2501,7 @@ void WorkbenchHandler::OnTerminalExit(std::string id, int code, int signal) {
+   if (it == terms_.end()) {
+     return;
+   }
++  DropFromHost(it->second);
+   base::DictValue exited;
+   exited.Set("code", code);
+   exited.Set("signal", signal ? base::Value(signal) : base::Value());
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.h b/chrome/browser/meridian/workbench/workbench_handler.h
+index 0fdeaa851c..f3ce24d47c 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.h
++++ b/chrome/browser/meridian/workbench/workbench_handler.h
+@@ -24,6 +24,7 @@
+ #include "chrome/browser/meridian/mission/mission_control.h"
+ #include "chrome/browser/meridian/workbench/guard_server.h"
+ #include "chrome/browser/meridian/workbench/project_fs.h"
++#include "chrome/browser/meridian/workbench/term_host.h"
+ #include "content/public/browser/web_ui_message_handler.h"
+ #include "ui/shell_dialogs/select_file_dialog.h"
+ 
+@@ -94,6 +95,11 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+     std::string then;
+     // The vault secrets in its environment (names only).
+     std::vector<std::string> secrets;
++    // Its key at the terminal host (empty if not handed over).
++    std::string host_key;
++    // Mission Control's kind for it, and whether that runs in a shell.
++    std::string mission_kind;
++    bool in_shell = false;
+   };
+ 
+   void HandleInvoke(const base::ListValue& args);
+@@ -185,6 +191,14 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+   // Context Insights, by transcript: each read on where the last one stopped.
+   std::map<std::string, std::unique_ptr<ContextInsights>> insights_;
+   int term_seq_ = 0;
++  // The terminal host (term_host.h): hands a terminal over, lets it go, and
++  // takes back the ones a crashed browser left for a project.
++  void KeepInHost(const std::string& id);
++  void DropFromHost(Term& term);
++  bool UseTermHost() const;
++  void OnAdopted(Reply reply,
++                 std::vector<OrphanTerminal> orphans);
++  std::set<std::string> adopted_roots_;
+   scoped_refptr<ui::SelectFileDialog> dialog_;
+   Reply pick_reply_;
+   // What the folder dialog is for: a project or a hub's parent folder.

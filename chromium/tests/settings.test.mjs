@@ -87,7 +87,8 @@ test('Links: a rule, then Try it says where a link goes; Chromium settings open 
 
 test('AI: choosing an access level starts the agent socket; Connect shows the exact command first', async () => {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
-  const b = await launch(['about:blank'], { profile });
+  // Never the person's real Claude Desktop config.
+  const b = await launch(['about:blank'], { profile, args: [`--meridian-claude-desktop-config=${path.join(profile, 'none', 'c.json')}`] });
   const endpoint = path.join(profile, 'Meridian Agent.json');
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
@@ -100,8 +101,8 @@ test('AI: choosing an access level starts the agent socket; Connect shows the ex
     assert.ok(fs.existsSync(endpoint), 'the socket is up');
     assert.equal((await settings(b)).agentAccess, 'ask');
     // The CLIs, with the command Connect would run (never run here).
-    await b.waitFor(`${ST}.querySelectorAll('.row-desc.mono').length === 2`);
-    assert.match(await b.eval(`${ST}.querySelector('.row-desc.mono').textContent`), /mcp add -s user meridian -- .*Meridian --mcp-bridge/);
+    await b.waitFor(`${ST}.querySelectorAll('.row-desc.mono').length === 3`);
+    assert.match(await b.eval(`${ST}.querySelector('.row-desc.mono').textContent`), /mcp add -s user meridian -- .*(Meridian|chrome\.exe'?) --mcp-bridge/i);
     // An installed CLI's Connect… (the rows with a command), not the other AI buttons.
     const connect = `[...${ST}.querySelectorAll('.row-desc.mono')].map((d) => d.closest('.row').querySelector('.btn')).find((x) => !x.disabled)`;
     if (await b.eval(`!!${connect}`)) {
@@ -115,6 +116,45 @@ test('AI: choosing an access level starts the agent socket; Connect shows the ex
     await b.eval(`[...${ST}.querySelectorAll('.seg')].find((x) => x.dataset.name === 'agents' && x.dataset.value === 'off').click()`);
     for (let i = 0; i < 50 && fs.existsSync(endpoint); i++) await new Promise((r) => setTimeout(r, 100));
     assert.equal(fs.existsSync(endpoint), false);
+  } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
+test('AI › Connect Claude Desktop: adds "meridian" to its config, keeps the other keys and a backup, refuses broken JSON', async () => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  const dir = path.join(profile, 'Claude');
+  const config = path.join(dir, 'claude_desktop_config.json');
+  fs.mkdirSync(dir);
+  const before = { globalShortcut: 'Alt+Space', preferences: { seenAt: 1763600000000, split: 0.42, on: true }, mcpServers: { files: { command: 'npx', args: ['-y', 'fs-server'] } } };
+  fs.writeFileSync(config, JSON.stringify(before, null, 2));
+  const b = await launch(['about:blank'], { profile, args: [`--meridian-claude-desktop-config=${config}`] });
+  const row = `[...${ST}.querySelectorAll('.row')].find((r) => r.querySelector('.row-label')?.textContent.trim() === 'Claude Desktop')`;
+  const connect = async () => {
+    await b.eval(`${row}.querySelector('.btn').click()`);
+    await b.waitFor(`!!${ST}.querySelector('.command')`);
+    assert.match(await b.eval(`${ST}.querySelector('.confirm-card').textContent`), /claude_desktop_config\.json[\s\S]*copy of the old file/);
+    assert.match(await b.eval(`${ST}.querySelector('.command').textContent`), /"meridian": \{[\s\S]*"command": "[^"]+(Meridian|chrome\.exe)"[\s\S]*--mcp-bridge/i);
+    await b.eval(`${ST}.getElementById('connectRun').click()`);
+    await b.waitFor(`!${ST}.querySelector('.command') && !/Connecting/.test(${ST}.querySelector('#ai .group:last-child .note').textContent)`);
+    return b.eval(`${ST}.querySelector('#ai .group:last-child .note').textContent`);
+  };
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    await open(b, 'ai');
+    await b.waitFor(`!!${row} && !${row}.querySelector('.btn').disabled`);
+    assert.match(await connect(), /Claude Desktop is connected[\s\S]*Quit and reopen Claude Desktop/);
+    const after = JSON.parse(fs.readFileSync(config, 'utf8'));
+    assert.equal(after.globalShortcut, 'Alt+Space', 'other keys stay');
+    assert.deepEqual(after.preferences, before.preferences, 'numbers survive (big ones are doubles in Chromium)');
+    assert.deepEqual(after.mcpServers.files, before.mcpServers.files, 'other servers stay');
+    assert.deepEqual(after.mcpServers.meridian.args, ['--mcp-bridge']);
+    assert.match(after.mcpServers.meridian.command, /(Meridian|chrome)(\.exe)?$/i);
+    assert.deepEqual(JSON.parse(fs.readFileSync(`${config}.meridian-backup`, 'utf8')), before, 'the old file is kept');
+    // Again: nothing to change.
+    assert.match(await connect(), /already connected/);
+    // A file it can't read back is never overwritten.
+    fs.writeFileSync(config, '{ "mcpServers": ');
+    assert.match(await connect(), /wasn’t connected: .*isn’t valid JSON/);
+    assert.equal(fs.readFileSync(config, 'utf8'), '{ "mcpServers": ');
   } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
 

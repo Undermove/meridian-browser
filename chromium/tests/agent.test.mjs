@@ -50,10 +50,72 @@ function site() {
     if (req.url === '/form') {
       res.end(`<title>Form</title><h1>Sign up</h1><input id=name aria-label="Your name">
         <button onclick="document.title='Hello ' + document.getElementById('name').value">Say hello</button>`);
+    } else if (req.url === '/filter') {
+      // A native dropdown: its list opens outside the page, so clicks and keys can't pick from it.
+      res.end(`<title>Filter</title><label for=cat>Category</label>
+        <select id=cat onchange="document.title = 'Filter: ' + this.value"><option value="">All (30)</option><option>Winter</option><option>Summer</option><option value="k">Kitchen</option><option disabled>Archived</option></select>`);
     } else res.end('<title>Home</title><p>Welcome to the test site</p>');
   });
   return new Promise((r) => server.listen(0, '127.0.0.1', () => r({ server, url: (p) => `http://127.0.0.1:${server.address().port}${p}` })));
 }
+
+// An agent outside Meridian (Claude Code in a terminal) lost its browser tools when the browser
+// crashed: every call failed at once with "Meridian is not running". Now the bridge waits for the
+// browser to come back (it reopens itself after a crash) and the call goes through.
+test('a tool call while the browser is down after a crash waits for it to come back', async () => {
+  const profile = profileWith({ agent_access: 'full' });
+  let b = await launch(['about:blank'], { profile });
+  const mcp = bridge(profile);
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { clientInfo: { name: 'patient' } });
+    assert.equal((await mcp.call('list_tabs')).error, null);
+    process.kill(b.proc.pid, 'SIGKILL');  // a crash
+    await b.close();
+    const pending = mcp.call('list_tabs');
+    await sleep(3000);
+    b = await launch(['about:blank'], { profile });
+    const after = await pending;
+    assert.equal(after.error, null, `answered once the browser was back: ${after.error}`);
+    assert.ok(Array.isArray(after.value));
+  } finally { mcp.close(); await b.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
+// A dropdown (<select>): its options are listed, and type_text chooses one, with the page's change
+// event (an agent recording a demo couldn't pick a category on a shop's admin page, 20.11.2026).
+test('type_text chooses an option in a <select>; get_interactive_elements lists the options', async () => {
+  const s = await site();
+  const profile = profileWith({ agent_access: 'ask' });
+  const b = await launch([s.url('/filter')], { profile });
+  const mcp = bridge(profile);
+  const answer = async (pending, re) => {
+    await b.waitFor(`!!${AG}.getElementById('ask')`);
+    assert.match(await b.eval(`${AG}.querySelector('.summary').textContent`), re);
+    await sleep(700);
+    await b.click(`${AG}.getElementById('allow')`);
+    return pending;
+  };
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { clientInfo: { name: 'chooser' } });
+    const els = (await mcp.call('get_interactive_elements')).value;
+    const select = els.find((e) => e.tag === 'select');
+    assert.deepEqual(select.options, ['All (30)', 'Winter', 'Summer', 'Kitchen', 'Archived']);
+    assert.equal(select.value, 'All (30)');
+    assert.equal(select.label, 'Category', 'named by its <label>, not by its options');
+    // The question says what it chooses, and the page hears it.
+    const chose = await answer(mcp.call('type_text', { element_index: select.i, value: 'winter' }), /choose “winter” in “Category/);
+    assert.equal(chose.value.chosen, 'Winter');
+    await b.waitFor(`app.$.tabstrip.state_.spaces.some(() => true) && [...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'Filter: Winter')`);
+    // By value too; and an option that isn't there names the ones that are.
+    assert.equal((await answer(mcp.call('type_text', { selector: '#cat', value: 'k' }), /choose “k”/)).value.chosen, 'Kitchen');
+    const none = await answer(mcp.call('type_text', { selector: '#cat', value: 'Spring' }), /choose “Spring”/);
+    assert.match(none.error, /no option "Spring"; the options are: All \(30\) \| Winter \| Summer \| Kitchen/);
+    assert.match((await answer(mcp.call('type_text', { selector: '#cat', value: 'Archived' }), /Archived/)).error, /disabled/);
+  } finally { mcp.close(); await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
 
 // run_javascript answers for the code it was given. One shared result slot let a call that didn't
 // compile (or one still running) hand back the previous call's result, and an IIFE ("return" inside)
@@ -103,6 +165,10 @@ test('full access: an MCP client lists, opens, reads, clicks, types, screenshots
     assert.equal(tabs.find((t) => t.zone === 'today').title, 'Home');
     const opened = (await mcp.call('open_tab', { url: s.url('/form'), activate: true })).value;
     assert.equal(opened.title, 'Form');
+    // Local files stay closed to agents, with an honest error rather than "https://file///...".
+    const local = await mcp.call('open_tab', { url: 'file:///etc/hosts' });
+    assert.match(local.error || '', /only http\(s\) URLs/);
+    assert.ok(!(await mcp.call('list_tabs')).value.some((t) => /file\//.test(t.url || '')), 'no tab for the file URL');
     // The window names the agent while it works.
     await b.waitFor(`app.$.agent.working && ${AG}.querySelector('.what').textContent.includes('test-client')`);
     const page = (await mcp.call('read_page')).value;
