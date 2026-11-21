@@ -1080,9 +1080,10 @@ function mountTerm(info) {
     return true;
   });
   xterm.attachCustomWheelEventHandler((e) => termWheel(t, e));
-  const links = termLinks(t);
+  const links = termExtraLinks(t, termLinks(t));
   xterm.registerLinkProvider(links);
   termLinkClicks(t, links);
+  termExtras(t, links);
   termDrops(t);
   xterm.onResize(({ cols, rows }) => { if (!t.exited) wb.ptyResize(t.id, cols, rows); });
   S.terms.push(t);
@@ -1248,6 +1249,7 @@ function dragTermTab(el, t, e) {
 }
 
 function renderTermTabs() {
+  termStripRender();
   // Not under the name being typed (a status update would drop it), nor under a tab being dragged.
   if (S.renamingTerm || S.draggingTerm) return;
   const list = $('#term-tab-list');

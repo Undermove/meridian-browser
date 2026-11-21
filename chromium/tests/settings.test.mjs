@@ -92,7 +92,8 @@ test('AI: choosing an access level starts the agent socket; Connect shows the ex
   const endpoint = path.join(profile, 'Meridian Agent.json');
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
-    assert.equal(fs.existsSync(endpoint), false, 'off by default');
+    // Off until the person decides, but a connected agent can ask (the private socket is up).
+    assert.equal((await settings(b)).agentAccess, 'off');
     await open(b);
     await b.eval(`[...${ST}.querySelectorAll('.tab')].find((t) => t.dataset.id === 'ai').click()`);
     await b.waitFor(`!!${ST}.getElementById('agentsAsk')`);
@@ -142,6 +143,7 @@ test('AI › Connect Claude Desktop: adds "meridian" to its config, keeps the ot
     await open(b, 'ai');
     await b.waitFor(`!!${row} && !${row}.querySelector('.btn').disabled`);
     assert.match(await connect(), /Claude Desktop is connected[\s\S]*Quit and reopen Claude Desktop/);
+    await b.waitFor(`app.$.tabstrip.handler_.getSettings().then((r) => r.settings.agentAccess === 'full')`);
     const after = JSON.parse(fs.readFileSync(config, 'utf8'));
     assert.equal(after.globalShortcut, 'Alt+Space', 'other keys stay');
     assert.deepEqual(after.preferences, before.preferences, 'numbers survive (big ones are doubles in Chromium)');
@@ -181,4 +183,15 @@ test('The member tab: the card shows the name and since when; clicking the name 
     await open(b, 'member');
     await b.waitFor(`${MC}.getElementById('name')?.textContent.trim() === 'Ada Lovelace'`);
   } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
+test('the sidebar toggle: after the traffic lights in a window, at the sidebar edge in full screen', { skip: process.platform === 'win32' ? 'Windows has its own top bar' : false }, async () => {
+  const b = await launch(['about:blank']);
+  const left = (id) => `app.shadowRoot.getElementById('${id}').getBoundingClientRect().left`;
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    assert.ok(await b.eval(`${left('sidebarToggle')} > ${left('urlPill')} + 60`), 'room for the traffic lights');
+    await b.eval(`(() => { app.fullscreenMode_ = 'browser'; return true; })()`);
+    await b.waitFor(`Math.abs(${left('sidebarToggle')} - ${left('urlPill')}) < 1`);
+  } finally { await b.close(); }
 });
