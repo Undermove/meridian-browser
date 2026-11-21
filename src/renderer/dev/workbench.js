@@ -298,6 +298,17 @@ function agentMark(kind, cls = 'mark') {
 
 function renderLauncher() {
   const bar = $('#launcher');
+  // Not under a pressed mouse button: the click would be lost with the button.
+  if (!bar._watched) {
+    bar._watched = true;
+    bar.addEventListener('mousedown', () => { bar._pressed = true; });
+    window.addEventListener('mouseup', () => setTimeout(() => {
+      if (!bar._pressed) return;
+      bar._pressed = false;
+      if (bar._redraw) { bar._redraw = false; renderLauncher(); }
+    }, 0));
+  }
+  if (bar._pressed) { bar._redraw = true; return; }
   bar.innerHTML = '';
   const agents = S.info?.agents || {};
   for (const kind of [...agentKinds(), 'shell']) {

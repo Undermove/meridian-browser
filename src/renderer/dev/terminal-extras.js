@@ -3,6 +3,9 @@
  * (so the program never changes size), and a right click has the usual actions. */
 
 const IMAGE_RE = /(?:^|[\s('"`[=])((?:[A-Za-z]:[\\/]|~[\\/]|\.{1,2}[\\/]|[\\/])?(?:[^\s'"`()[\]<>:|\\/]+[\\/])*[^\s'"`()[\]<>:|\\/]+\.(?:png|jpe?g|gif|webp))(?=$|[\s'"`)\],.:;!?])/gi;
+const QUOTED_IMAGE_RE = /(["'`])([^"'`\n]{1,512}?\.(?:png|jpe?g|gif|webp))\1/gi;
+const PATH_START_RE = /(?:^|[\s(=])(?=[A-Za-z]:[\\/]|~[\\/]|\/)/g;
+const SPACED_IMAGE_RE = /^[^\n"'`<>|]*?\.(?:png|jpe?g|gif|webp)(?=$|[\s"'`)\],.:;!?])/i;
 const STRIP_MAX = 12;
 const THUMB_MAX_BYTES = 8 << 20;
 
@@ -34,10 +37,34 @@ function logicalLine(t, y) {
 
 function imagePathsIn(text) {
   const out = [];
-  for (const m of text.matchAll(IMAGE_RE)) {
-    out.push({ path: m[1], index: m.index + m[0].length - m[1].length });
+  const add = (path, index) => {
+    if (!out.some((o) => o.index === index && o.path.length === path.length)) out.push({ path, index });
+  };
+  for (const m of text.matchAll(IMAGE_RE)) add(m[1], m.index + m[0].length - m[1].length);
+  // Folders with spaces (C:\\Users\\First Last, ~/Library/Application Support): in quotes, or
+  // from where an absolute path starts up to the first image extension. The browser checks each.
+  for (const m of text.matchAll(QUOTED_IMAGE_RE)) add(m[2], m.index + 1);
+  let starts = 0;
+  for (const m of text.matchAll(PATH_START_RE)) {
+    if (++starts > 8) break;
+    const start = m.index + m[0].length;
+    const found = SPACED_IMAGE_RE.exec(text.slice(start, start + 512));
+    if (found && /\s/.test(found[0])) add(found[0], start);
   }
   return out;
+}
+
+// What the file is called, when a shell printed its spaces escaped.
+const unescapedPath = (p) => (wb.platform === 'win32' ? p : p.replace(/\\ /g, ' '));
+
+// Of candidates over the same cells, the longest real path.
+function longestImages(images) {
+  const order = (p) => p.y * 100000 + p.x;
+  const kept = [];
+  for (const i of [...images].sort((a, b) => b.text.length - a.text.length)) {
+    if (!kept.some((k) => order(k.range.start) <= order(i.range.end) && order(i.range.start) <= order(k.range.end))) kept.push(i);
+  }
+  return kept;
 }
 
 // Image paths as links, over what the terminal already links (a web address stays one).
@@ -52,10 +79,10 @@ function termExtraLinks(t, base) {
           .filter((c) => c.range.start.y <= y && c.range.end.y >= y && !(links || []).some((l) => l.isWeb !== false && /^https?:/.test(l.text) && overlap(l.range, c.range)));
         if (!candidates.length) return done(links);
         Promise.all(candidates.map(async (c) => {
-          const info = await imageInfo(c.path);
+          const info = await imageInfo(unescapedPath(c.path));
           return info ? { range: c.range, text: c.path, image: info, open: () => openImageViewer(info), activate: () => {} } : null;
         })).then((found) => {
-          const images = found.filter(Boolean);
+          const images = longestImages(found.filter(Boolean));
           const rest = (links || []).filter((l) => !images.some((i) => overlap(i.range, l.range)));
           const all = rest.concat(images);
           done(all.length ? all : undefined);
