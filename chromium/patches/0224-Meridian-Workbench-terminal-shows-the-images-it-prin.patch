@@ -1,0 +1,259 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Sat, 21 Nov 2026 16:20:52 +0400
+Subject: [PATCH 225/226] Meridian: Workbench terminal shows the images it
+ prints
+
+A path a terminal prints can be read as an image only if it is a regular
+PNG, JPEG, GIF or WebP file under 25 MB, checked after following links.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   2 +
+ .../browser/meridian/workbench/term_images.cc | 136 ++++++++++++++++++
+ .../browser/meridian/workbench/term_images.h  |  28 ++++
+ .../meridian/workbench/workbench_handler.cc   |  32 +++++
+ 4 files changed, 198 insertions(+)
+ create mode 100644 chrome/browser/meridian/workbench/term_images.cc
+ create mode 100644 chrome/browser/meridian/workbench/term_images.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index a64a2cff40..4bc970aae7 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -144,6 +144,8 @@ source_set("workbench_core") {
+     "workbench/customizations_texts.h",
+     "workbench/git_command.cc",
+     "workbench/git_command.h",
++    "workbench/term_images.cc",
++    "workbench/term_images.h",
+     "workbench/hubs.cc",
+     "workbench/hubs.h",
+     "workbench/hubs_texts.h",
+diff --git a/chrome/browser/meridian/workbench/term_images.cc b/chrome/browser/meridian/workbench/term_images.cc
+new file mode 100644
+index 0000000000..b72819c5f3
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/term_images.cc
+@@ -0,0 +1,136 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/workbench/term_images.h"
++
++#include <array>
++#include <cstdint>
++#include <optional>
++#include <string_view>
++#include <vector>
++
++#include "base/base64.h"
++#include "base/files/file.h"
++#include "base/files/file_util.h"
++#include "base/strings/string_util.h"
++#include "build/build_config.h"
++#include "chrome/browser/meridian/real_path.h"
++
++#if BUILDFLAG(IS_POSIX)
++#include <sys/stat.h>
++#endif
++
++namespace meridian::workbench {
++
++namespace {
++
++constexpr int64_t kMaxBytes = 25 << 20;
++
++// The type the first bytes say, if it is the one the extension says.
++std::optional<std::string_view> MimeOf(std::string_view ext,
++                                       base::span<const uint8_t> head) {
++  const auto starts = [&](std::string_view magic, size_t at = 0) {
++    if (head.size() < at + magic.size()) {
++      return false;
++    }
++    for (size_t i = 0; i < magic.size(); ++i) {
++      if (head[at + i] != static_cast<uint8_t>(magic[i])) {
++        return false;
++      }
++    }
++    return true;
++  };
++  if (ext == ".png" && starts("\x89PNG\r\n\x1a\n")) {
++    return "image/png";
++  }
++  if ((ext == ".jpg" || ext == ".jpeg") && starts("\xff\xd8\xff")) {
++    return "image/jpeg";
++  }
++  if (ext == ".gif" && (starts("GIF87a") || starts("GIF89a"))) {
++    return "image/gif";
++  }
++  if (ext == ".webp" && starts("RIFF") && starts("WEBP", 8)) {
++    return "image/webp";
++  }
++  return std::nullopt;
++}
++
++bool IsRegularFile(const base::FilePath& path) {
++#if BUILDFLAG(IS_POSIX)
++  // Before opening: a pipe named .png would block the read forever.
++  base::stat_wrapper_t st;
++  return base::File::Stat(path, &st) == 0 && S_ISREG(st.st_mode);
++#else
++  base::File::Info info;
++  return base::GetFileInfo(path, &info) && !info.is_directory;
++#endif
++}
++
++}  // namespace
++
++base::expected<base::DictValue, std::string> ReadTerminalImage(
++    const std::string& printed,
++    const base::FilePath& root,
++    bool with_data) {
++  if (printed.empty() || printed.size() > 4096 ||
++      printed.find('\0') != std::string::npos) {
++    return base::unexpected("Not an image path");
++  }
++  base::FilePath path;
++  if (printed.starts_with("~/") || printed.starts_with("~\\")) {
++    path = base::GetHomeDir().Append(
++        base::FilePath::FromUTF8Unsafe(printed.substr(2)));
++  } else {
++    path = base::FilePath::FromUTF8Unsafe(printed);
++    if (!path.IsAbsolute()) {
++      if (root.empty()) {
++        return base::unexpected("Not an image path");
++      }
++      path = root.Append(path);
++    }
++  }
++  const base::FilePath real = RealFilePath(path);
++  if (real.empty() || !IsRegularFile(real)) {
++    return base::unexpected("No such image");
++  }
++  const std::string ext =
++      base::ToLowerASCII(real.FinalExtension().empty()
++                             ? std::string()
++                             : base::FilePath(real.FinalExtension())
++                                   .AsUTF8Unsafe());
++  base::File file(real, base::File::FLAG_OPEN | base::File::FLAG_READ);
++  if (!file.IsValid()) {
++    return base::unexpected("Can't open this image");
++  }
++  const int64_t size = file.GetLength();
++  if (size <= 0 || size > kMaxBytes) {
++    return base::unexpected("This image is too large to show");
++  }
++  std::array<uint8_t, 16> head{};
++  const std::optional<size_t> got = file.Read(0, head);
++  if (!got) {
++    return base::unexpected("Can't read this image");
++  }
++  const std::optional<std::string_view> mime =
++      MimeOf(ext, base::span(head).first(*got));
++  if (!mime) {
++    return base::unexpected("Not a PNG, JPEG, GIF or WebP image");
++  }
++  base::DictValue out;
++  out.Set("path", real.AsUTF8Unsafe());
++  out.Set("name", real.BaseName().AsUTF8Unsafe());
++  out.Set("mime", *mime);
++  out.Set("size", static_cast<double>(size));
++  if (with_data) {
++    std::vector<uint8_t> bytes(static_cast<size_t>(size));
++    const std::optional<size_t> read = file.Read(0, bytes);
++    if (!read || *read != bytes.size()) {
++      return base::unexpected("Can't read this image");
++    }
++    out.Set("data", base::Base64Encode(bytes));
++  }
++  return out;
++}
++
++}  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/term_images.h b/chrome/browser/meridian/workbench/term_images.h
+new file mode 100644
+index 0000000000..9199e30024
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/term_images.h
+@@ -0,0 +1,28 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_WORKBENCH_TERM_IMAGES_H_
++#define CHROME_BROWSER_MERIDIAN_WORKBENCH_TERM_IMAGES_H_
++
++#include <string>
++
++#include "base/files/file_path.h"
++#include "base/types/expected.h"
++#include "base/values.h"
++
++namespace meridian::workbench {
++
++// An image a terminal printed the path of (absolute, ~/ or relative to
++// `root`): {path, name, mime, size}, and `data` (base64) when asked. Only a
++// regular file, really a PNG, JPEG, GIF or WebP under that extension after
++// following links, and not over 25 MB: a path in a program's output must not
++// turn into a way to read anything else. Blocks.
++base::expected<base::DictValue, std::string> ReadTerminalImage(
++    const std::string& printed,
++    const base::FilePath& root,
++    bool with_data);
++
++}  // namespace meridian::workbench
++
++#endif  // CHROME_BROWSER_MERIDIAN_WORKBENCH_TERM_IMAGES_H_
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 7ff03c453a..124608ad61 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -45,6 +45,7 @@
+ #include "chrome/browser/meridian/workbench/vault.h"
+ #include "chrome/browser/meridian/workbench/workbench_service.h"
+ #include "chrome/browser/meridian/workbench/workbench_service_factory.h"
++#include "chrome/browser/meridian/workbench/term_images.h"
+ #include "chrome/browser/meridian/workbench/terminal.h"
+ #if BUILDFLAG(IS_POSIX)
+ #include <signal.h>
+@@ -614,6 +615,37 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+                          a),
+                      std::move(reply));
+   }
++  if (method == "termImage" || method == "termImageInfo" ||
++      method == "termImageReveal") {
++    // A path a terminal printed: only ever a real image (term_images.h).
++    const bool reveal = method == "termImageReveal";
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++        base::BindOnce(
++            [](std::string path, base::FilePath root, bool with_data)
++                -> Result {
++              auto image = ReadTerminalImage(path, root, with_data);
++              if (!image.has_value()) {
++                return base::unexpected(image.error());
++              }
++              return base::Value(std::move(*image));
++            },
++            a, project_ ? project_->root() : base::FilePath(),
++            method == "termImage"),
++        base::BindOnce(
++            [](base::WeakPtr<WorkbenchHandler> self, bool reveal, Reply reply,
++               Result r) {
++              if (self && reveal && r.has_value()) {
++                platform_util::ShowItemInFolder(
++                    self->profile_, base::FilePath::FromUTF8Unsafe(
++                                        *r->GetDict().FindString("path")));
++                return std::move(reply).Run(base::Value(true));
++              }
++              std::move(reply).Run(std::move(r));
++            },
++            weak_factory_.GetWeakPtr(), reveal, std::move(reply)));
++    return;
++  }
+   if (method == "reveal") {
+     return OnProject(
+         base::BindOnce(

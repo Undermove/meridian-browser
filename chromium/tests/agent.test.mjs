@@ -241,7 +241,7 @@ test('ask: every action is put to the person; read-only refuses changes; off has
     assert.equal(await b.eval(`!!${AG}.getElementById('ask')`), false, 'not asked again');
   } finally { mcp.close(); await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 
-  const off = profileWith({ agent_access: 'off' });
+  const off = profileWith({ agent_access: 'off', agent_access_decided: true });
   const b2 = await launch(['about:blank'], { profile: off });
   const mcp2 = bridge(off);
   try {
@@ -510,4 +510,44 @@ test('page dialogs: pending_dialog in list_tabs, an error instead of a hang, han
     // No dialog: said so.
     assert.match((await mcp.call('handle_dialog', { tab_id: tabId, action: 'accept' })).error || '', /no open dialog/);
   } finally { mcp.close(); await b.close(); pages.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
+// A connected agent before the person decided: one question in the browser, no trip to Settings.
+test('an agent connected earlier asks once: Allow gives full control and its call goes through; Deny closes the door', async () => {
+  const allowed = profileWith({});
+  const b = await launch(['about:blank'], { profile: allowed });
+  const mcp = bridge(allowed);
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(allowed, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { clientInfo: { name: 'Claude Desktop' } });
+    const first = mcp.call('list_tabs');
+    const second = mcp.call('list_tabs');
+    await b.waitFor(`!!${AG}.getElementById('ask')`);
+    assert.match(await b.eval(`${AG}.querySelector('#ask .summary').textContent`), /control Meridian[\s\S]*signed in/);
+    await sleep(700);
+    await b.click(`${AG}.getElementById('allow')`);
+    assert.equal((await first).error, null);
+    assert.equal((await second).error, null, 'one question for both calls');
+    await b.waitFor(`app.$.tabstrip.handler_.getSettings().then((r) => r.settings.agentAccess === 'full')`);
+    assert.equal((await mcp.call('list_tabs')).error, null);
+    assert.equal(await b.eval(`!!${AG}.getElementById('ask')`), false, 'not asked again');
+  } finally { mcp.close(); await b.close(); fs.rmSync(allowed, { recursive: true, force: true }); }
+
+  const denied = profileWith({});
+  const b2 = await launch(['about:blank'], { profile: denied });
+  const mcp2 = bridge(denied);
+  try {
+    await b2.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(denied, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp2.request('initialize', {});
+    const call = mcp2.call('list_tabs');
+    await b2.waitFor(`!!${AG}.getElementById('ask')`);
+    await sleep(700);
+    await b2.click(`${AG}.getElementById('deny')`);
+    assert.match((await call).error, /declined/);
+    for (let i = 0; i < 60 && fs.existsSync(path.join(denied, 'Meridian Agent.json')); i++) await sleep(100);
+    assert.equal(fs.existsSync(path.join(denied, 'Meridian Agent.json')), false, 'nothing listens after a no');
+    assert.equal(await b2.eval(`app.$.tabstrip.handler_.getSettings().then((r) => r.settings.agentAccess)`), 'off');
+  } finally { mcp2.close(); await b2.close(); fs.rmSync(denied, { recursive: true, force: true }); }
 });

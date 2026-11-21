@@ -202,6 +202,11 @@
     git: (args, opts) => invoke('git', (Array.isArray(args) ? args : []).slice(0, 200).map(str), { stdin: opts?.stdin === undefined ? undefined : str(opts.stdin), repo: opts?.repo ? str(opts.repo) : undefined }),
     gh: (args, opts) => invoke('gh', (Array.isArray(args) ? args : []).slice(0, 200).map(str), { stdin: opts?.stdin === undefined ? undefined : str(opts.stdin), repo: opts?.repo ? str(opts.repo) : undefined }),
     gitInfo: () => invoke('gitInfo'),
+    // An image a terminal printed the path of: real images only (term_images.h).
+    termLastAnswer: (id) => invoke('termLastAnswer', str(id)),
+    termImage: (path) => invoke('termImage', str(path)),
+    termImageInfo: (path) => invoke('termImageInfo', str(path)),
+    termImageReveal: (path) => invoke('termImageReveal', str(path)),
     // The project's repository, the ones its agents worked in, and those inside it.
     gitRepos: () => invoke('gitRepos'),
     gitReadFile: (repo, path) => invoke('gitReadFile', str(repo), str(path)),
