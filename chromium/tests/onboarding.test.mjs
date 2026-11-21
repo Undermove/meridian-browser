@@ -126,7 +126,6 @@ test('the very first launch: one window with the welcome tour, no Chromium first
 
 // ---- A person who has never opened Settings: what's on the computer is found and connected with one Yes.
 const H = 'app.$.tabstrip.handler_';
-const CLI_ONLY_MAC = process.platform === 'win32' && 'the stand-in agent CLIs run on macOS for now';
 
 function firstRun(answer) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-firstrun-'));
@@ -155,7 +154,7 @@ let text = ''; process.stdin.on('data', (d) => { text += d; }); process.stdin.on
     clean() { server.close(); fs.rmSync(dir, { recursive: true, force: true }); } };
 }
 
-test('first run: Claude is found, one Yes connects it, the AI suggests a setup, nothing applied until agreed, Undo', { skip: CLI_ONLY_MAC }, async () => {
+test('first run: Claude is found, one Yes connects it, the AI suggests a setup, nothing applied until agreed, Undo', async () => {
   const answer = JSON.stringify({ title: 'Set up for your docs', spaces: [{ name: 'Reading', icon: '📚', color: '#7fbf8e' }], favorites: [{ title: 'Docs', host: 'HOST' }, { title: 'Evil', host: 'evil.example' }] });
   const f = firstRun('PLACEHOLDER');
   await new Promise((r) => f.server.listen(0, '127.0.0.1', r));
@@ -222,7 +221,7 @@ test('first run: Claude is found, one Yes connects it, the AI suggests a setup, 
   } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); f.clean(); }
 });
 
-test('first run: a broken Claude config is left alone, a failing AI falls back, the tour still ends well', { skip: CLI_ONLY_MAC }, async () => {
+test('first run: a broken Claude config is left alone, a failing AI falls back, the tour still ends well', async () => {
   const f = firstRun('this is not json');
   await new Promise((r) => f.server.listen(0, '127.0.0.1', r));
   const broken = '{ "mcpServers": ';
