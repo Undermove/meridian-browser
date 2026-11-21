@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { launch, SB } from './harness.mjs';
+import { standIn } from './stand_in.mjs';
 
 async function click(wb, expr) {
   const p = await wb.eval(`(() => { const e = ${expr}; const r = e.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width }; })()`);
@@ -19,7 +20,7 @@ async function click(wb, expr) {
 test('Workbench: Meridian asks before an online agent starts; Cancel, Start, Always', async () => {
   const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-wc-')));
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
-  fs.writeFileSync(path.join(bin, 'claude'), '#!/bin/sh\necho "AGENT claude"\nread x\n', { mode: 0o755 });
+  standIn(bin, 'claude', `console.log("AGENT claude"); process.stdin.resume(); process.stdin.once("data", () => process.exit(0));`);
   const b = await launch(['about:blank'], { args: [`--meridian-test-project=${project}`, `--meridian-agents-path=${bin}`, '--meridian-no-notify', '--meridian-test-ai-consent'] });
   let wb;
   const claudeButton = `[...document.querySelectorAll('#launcher .launch')].find((e) => e.textContent.includes('Claude Code'))`;

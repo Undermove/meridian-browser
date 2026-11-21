@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { launch, SB } from './harness.mjs';
+import { standIn } from './stand_in.mjs';
 
 const AGENTS = ['claude', 'codex', 'gemini', 'copilot', 'opencode', 'cursor-agent', 'qwen', 'amp', 'goose', 'droid'];
 
@@ -19,12 +20,20 @@ async function click(wb, expr) {
   }
 }
 
+// More, clicked again if it didn't open: a session just started re-fits the bar under the pointer.
+async function openMore(wb) {
+  for (let i = 0; ; i++) {
+    await click(wb, `document.getElementById('launcher-more')`);
+    try { await wb.waitFor(`!document.getElementById('popover').hidden`, 2000); return; } catch (e) { if (i === 3) throw e; }
+  }
+}
+
 test('Workbench top bar on a small screen: launchers that don’t fit are in More; each one starts from there', async () => {
   const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-wl-')));
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
   // Every agent "installed": a stand-in that says which it is and waits.
   for (const a of AGENTS) {
-    fs.writeFileSync(path.join(bin, a), `#!/bin/sh\necho "AGENT ${a}"\nread x\n`, { mode: 0o755 });
+    standIn(bin, a, `console.log("AGENT ${a}"); process.stdin.resume(); process.stdin.once("data", () => process.exit(0));`);
   }
   const b = await launch(['about:blank'], { args: [`--meridian-test-project=${project}`, `--meridian-agents-path=${bin}`, '--meridian-no-notify', '--window-size=900,700'] });
   let wb;
@@ -45,8 +54,8 @@ test('Workbench top bar on a small screen: launchers that don’t fit are in Mor
     assert.match(bar.shown[bar.shown.length - 1], /^\d+$/, "More shows how many");
 
     // More, then Droid: it starts.
-    await click(wb, `document.getElementById('launcher-more')`);
-    await wb.waitFor(`!document.getElementById('popover').hidden && document.querySelectorAll('#popover .launch-menu .launch').length === ${bar.hidden.length}`);
+    await openMore(wb);
+    await wb.waitFor(`document.querySelectorAll('#popover .launch-menu .launch').length === ${bar.hidden.length}`);
     // Every row of the menu shows its name (the narrow-bar rule that hides names is for the bar).
     const unnamed = await wb.eval(`[...document.querySelectorAll('#popover .launch-menu .launch')].filter((r) => { const l = [...r.children].find((c) => c.tagName === 'SPAN' && !c.matches('.mark, .plug, .ic-slot')); return !l || !l.textContent.trim() || l.getBoundingClientRect().width === 0; }).map((r) => r.title)`);
     assert.deepEqual(unnamed, [], 'rows without a name');
@@ -59,8 +68,7 @@ test('Workbench top bar on a small screen: launchers that don’t fit are in Mor
     if (inBar) {
       await click(wb, `[...document.getElementById('launcher').children].find((e) => !e.hidden && e.textContent.includes('OpenCode'))`);
     } else {
-      await click(wb, `document.getElementById('launcher-more')`);
-      await wb.waitFor(`!document.getElementById('popover').hidden`);
+      await openMore(wb);
       await click(wb, `[...document.querySelectorAll('#popover .launch-menu .launch')].find((e) => e.textContent.includes('OpenCode'))`);
     }
     await wb.waitFor(`S.terms.some((t) => t.kind === 'opencode')`, 10000);
