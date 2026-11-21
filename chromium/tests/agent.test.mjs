@@ -425,6 +425,26 @@ test('the agent\'s tab in a minimized window is visible and drawn while the agen
   } finally { mcp.close(); await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
 
+// A background tab the agent is working in reads as visible to its page, but isn't on the screen:
+// its screenshot is still a frame of that tab (it used to fail with "couldn't capture the tab").
+test('a screenshot of a background tab the agent has just worked in', async () => {
+  const s = await site();
+  const profile = profileWith({ agent_access: 'full', agent_allow_js: true });
+  const b = await launch([s.url('/')], { profile });
+  const mcp = bridge(profile);
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { protocolVersion: '2025-06-18', clientInfo: { name: 'test-client', version: '1' }, capabilities: {} });
+    const { tab_id } = (await mcp.call('open_tab', { url: s.url('/form') })).value;
+    const r = await mcp.call('run_javascript', { tab_id, code: 'await new Promise((r) => setTimeout(r, 800)); return document.visibilityState' });
+    assert.equal(r.value, 'visible');
+    const shot = await mcp.call('screenshot', { tab_id });
+    assert.ok(!shot.error, `the screenshot: ${shot.error}`);
+    assert.ok(shot.image?.data?.length > 1000, 'a real picture');
+  } finally { mcp.close(); await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
 // The page's own dialogs: an agent sees them (list_tabs pending_dialog), gets an error at once from
 // a tab whose page waits for one (it used to hang), and answers them with handle_dialog: alert,
 // confirm (OK / Cancel), prompt (with its text), "Leave site?" (stay / leave), and one in a tab in
