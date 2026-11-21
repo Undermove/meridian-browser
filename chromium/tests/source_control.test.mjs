@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { launch, SB } from './harness.mjs';
+import { standIn } from './stand_in.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
@@ -53,7 +54,7 @@ test('Source Control: changes, a diff, stage, commit, discard, push, pull reques
   fs.writeFileSync(path.join(project, 'app.txt'), 'one\nTWO\nthree\n');
   fs.writeFileSync(path.join(project, 'notes.md'), '# Notes\n');
   // A stand-in GitHub CLI: one open pull request.
-  fs.writeFileSync(path.join(bin, 'gh'), `#!/bin/sh\nif [ "$1 $2" = "pr list" ]; then echo '[{"number":7,"title":"Fix the login","headRefName":"fix-login","url":"https://github.com/example/app/pull/7","state":"OPEN"}]'; fi\n`, { mode: 0o755 });
+  standIn(bin, 'gh', `if (process.argv.slice(2, 4).join(' ') === 'pr list') console.log('[{"number":7,"title":"Fix the login","headRefName":"fix-login","url":"https://github.com/example/app/pull/7","state":"OPEN"}]');`);
   const b = await launch(['about:blank'], { args: [`--meridian-test-project=${project}`, `--meridian-agents-path=${testPath(bin)}`, '--meridian-no-notify'] });
   let wb;
   try {
@@ -150,7 +151,7 @@ test('Changes: another repository an agent worked in, its branch and pull reques
   git(other, 'add', '-A');
   git(other, 'commit', '-q', '-m', 'Work');
   fs.writeFileSync(path.join(other, 'base.txt'), 'edited by the agent\n');
-  fs.writeFileSync(path.join(bin, 'gh'), `#!/bin/sh\nif [ "$1 $2" = "pr view" ]; then echo '{"number":42,"title":"Agent work","url":"https://github.com/example/other/pull/42","state":"OPEN"}'; fi\n`, { mode: 0o755 });
+  standIn(bin, 'gh', `if (process.argv.slice(2, 4).join(' ') === 'pr view') console.log('{"number":42,"title":"Agent work","url":"https://github.com/example/other/pull/42","state":"OPEN"}');`);
   const b = await launch(['about:blank'], { args: [`--meridian-test-project=${project}`, `--meridian-test-git-repo=${other}`, `--meridian-agents-path=${testPath(bin)}`, '--meridian-no-notify'] });
   let wb;
   try {
