@@ -95,6 +95,28 @@ test('an image path printed in the terminal opens large, also outside the projec
   } finally { wb.close(); await b.close(); f.clean(); }
 });
 
+test('image paths with spaces in their folders open whole, quoted or not', async () => {
+  const f = folders();
+  const dir = path.join(f.outside, 'Application Support', 'my shots');
+  fs.mkdirSync(dir, { recursive: true });
+  const pic = path.join(dir, 'agent shot.png');
+  fs.writeFileSync(pic, PNG);
+  const { b, wb } = await workbench(f.project);
+  try {
+    for (const printedAs of [pic, `"${pic}"`]) {
+      await run(wb, WIN ? 'Clear-Host' : 'clear');
+      await sleep(300);
+      await say(wb, `saved ${printedAs} done`);
+      await printed(wb, 'shot.png');
+      await sleep(300);
+      await mouse(wb, await cell(wb, 'shot.png'));
+      await wb.waitFor(`!document.getElementById('img-viewer')?.hidden && document.querySelector('#img-viewer .iv-name')?.textContent === 'agent shot.png'`, 8000);
+      await key(wb, 'Escape', 'Escape', 27);
+      await wb.waitFor(`document.getElementById('img-viewer').hidden`);
+    }
+  } finally { wb.close(); await b.close(); f.clean(); }
+});
+
 test('thumbnails of a session sit above the terminal, latest first, and never resize it', async () => {
   const f = folders();
   const one = path.join(f.outside, 'first.png');
