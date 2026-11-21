@@ -124,26 +124,27 @@ test('an agent’s permission question: a card over any space’s page; Allow, A
     }
     await b.click(card('.allow'));
     await waitTerm('DECIDED allow meridian []');
-    await b.waitFor(`${cards}.length === 0`);
+    await b.waitFor(`![...${cards}].some((c) => c.textContent.includes('npm test'))`, 10000);
 
     // 2. Change a file: Always allow passes Claude Code's own suggestion back.
     await b.waitFor(`${cards}.length === 1 && ${card('.what')}.textContent === 'Change a file'`, 15000);
     await b.click(card('.always'));
     await waitTerm('DECIDED allow meridian [{"destination": "session", "mode": "acceptEdits", "type": "setMode"}]');
-    await b.waitFor(`${cards}.length === 0`);
+    await b.waitFor(`![...${cards}].some((c) => c.textContent.includes('Change a file'))`, 10000);
 
     // 3. Deny.
     await b.waitFor(`${cards}.length === 1 && ${card('.summary')}.textContent === 'rm -rf build'`, 15000);
     assert.ok(!(await b.eval(`!!${card('.always')}`)), 'no suggestion, no Always allow');
     await b.click(card('.deny'));
     await waitTerm('DECIDED deny meridian');
-    await b.waitFor(`${cards}.length === 0`);
+    // The next question may already be here: this card is what has to go.
+    await b.waitFor(`![...${cards}].some((c) => c.textContent.includes('rm -rf build'))`);
 
     // 4. Answered in the terminal first: the card goes away by itself.
     await b.waitFor(`${cards}.length === 1 && ${card('.what')}.textContent === 'Open a web page'`, 15000);
     await wb.eval(`(() => { window.workbench.ptyWrite(S.terms.find((t) => t.kind === 'claude').id, 'y\\r'); return true; })()`);
     await waitTerm('DECIDED allow terminal');
-    await b.waitFor(`${cards}.length === 0`, 10000);
+    await b.waitFor(`![...${cards}].some((c) => c.textContent.includes('Open a web page'))`, 10000);
 
     // 5. A question only the terminal can answer: Open only; Open goes there, in its space.
     await b.waitFor(`${cards}.length === 1 && ${card('.what')}.textContent === 'Has a question for you'`, 15000);
