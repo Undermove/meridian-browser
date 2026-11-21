@@ -93,7 +93,7 @@ test('online AI: Meridian asks before anything is sent; Send, Cancel, Always, an
     assert.equal(api.streamed(), n);
     await b.click(`${AC}.getElementById('always')`);
     await b.waitFor(`${askText}.includes('Hello there')`);
-    assert.equal((await b.eval(`${H}.getSettings().then((r) => r.settings)`)).aiConsent, 'always');
+    assert.deepEqual((await b.eval(`${H}.getAllowedAi()`)).allowed.map((a) => a.id), ['claude-code'], 'Always is for this AI');
     await b.quit();
     b = await launch(['about:blank'], { profile, args });
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length >= 1`);
@@ -102,7 +102,7 @@ test('online AI: Meridian asks before anything is sent; Send, Cancel, Always, an
     assert.ok(!(await b.eval(sheetOpen)), 'Always: no question');
 
     // Back to Ask in Settings: Use another AI… opens Settings › AI; nothing is sent.
-    await b.eval(`${H}.getSettings().then((r) => ${H}.setSettings({ ...r.settings, aiConsent: '' }))`);
+    await b.eval(`${H}.forgetAiConsent('claude-code'), true`);
     await b.quit();
     b = await launch(['about:blank'], { profile, args });
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length >= 1`);

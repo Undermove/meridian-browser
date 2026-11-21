@@ -47,6 +47,9 @@ test('Workbench top bar on a small screen: launchers that don’t fit are in Mor
     // More, then Droid: it starts.
     await click(wb, `document.getElementById('launcher-more')`);
     await wb.waitFor(`!document.getElementById('popover').hidden && document.querySelectorAll('#popover .launch-menu .launch').length === ${bar.hidden.length}`);
+    // Every row of the menu shows its name (the narrow-bar rule that hides names is for the bar).
+    const unnamed = await wb.eval(`[...document.querySelectorAll('#popover .launch-menu .launch')].filter((r) => { const l = [...r.children].find((c) => c.tagName === 'SPAN' && !c.matches('.mark, .plug, .ic-slot')); return !l || !l.textContent.trim() || l.getBoundingClientRect().width === 0; }).map((r) => r.title)`);
+    assert.deepEqual(unnamed, [], 'rows without a name');
     await click(wb, `[...document.querySelectorAll('#popover .launch-menu .launch')].find((e) => e.textContent.includes('Droid'))`);
     await wb.waitFor(`document.getElementById('popover').hidden`);
     await wb.waitFor(`S.terms.some((t) => t.kind === 'droid')`, 10000);

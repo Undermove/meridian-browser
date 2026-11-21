@@ -48,7 +48,7 @@ test('Workbench: Meridian asks before an online agent starts; Cancel, Start, Alw
     await new Promise((r) => setTimeout(r, 500));
     assert.equal(await wb.eval(claudeTerms), 0, 'Cancel starts nothing');
 
-    // Start: it starts; the next one in this Workbench doesn't ask; not remembered.
+    // Start: it starts; the next one doesn't ask; not remembered past a restart.
     await click(wb, claudeButton);
     await wb.waitFor(`${modalText}.includes('Anthropic (Claude)')`);
     await click(wb, `document.querySelector('#modal-overlay [data-a="ok"]')`);
@@ -56,9 +56,17 @@ test('Workbench: Meridian asks before an online agent starts; Cancel, Start, Alw
     await click(wb, claudeButton);
     await wb.waitFor(`${claudeTerms} === 2`);
     assert.equal(await wb.eval(modalText), '');
-    assert.equal(await wb.eval('window.workbench.aiConsent()'), '');
+    assert.equal(await wb.eval(`window.workbench.aiConsent('codex')`), '', 'another agent is still asked about');
 
-    // A new Workbench asks again; Always is remembered for every Workbench after it.
+    // A yes holds until the browser restarts, in every Workbench and in Ask.
+    await wb.eval('location.reload(), true').catch(() => {});
+    wb.close();
+    await openWorkbench();
+    assert.equal(await wb.eval(`window.workbench.aiConsent('claude')`), 'always', 'said yes in this run');
+
+    // Taken back in Settings it asks again; Always is remembered for this agent.
+    await b.eval(`app.$.tabstrip.handler_.forgetAiConsent('claude-code'), true`);
+    await wb.waitFor(`window.workbench.aiConsent('claude').then((s) => s === '')`);
     await wb.eval('location.reload(), true').catch(() => {});
     wb.close();
     await openWorkbench();
@@ -66,7 +74,7 @@ test('Workbench: Meridian asks before an online agent starts; Cancel, Start, Alw
     await wb.waitFor(`${modalText}.includes('Anthropic (Claude)')`);
     await click(wb, `document.querySelector('#modal-overlay [data-a="always"]')`);
     await wb.waitFor(`${claudeTerms} >= 1`);
-    await wb.waitFor(`window.workbench.aiConsent().then((s) => s === 'always')`);
+    await wb.waitFor(`window.workbench.aiConsent('claude').then((s) => s === 'always')`);
     await wb.eval('location.reload(), true').catch(() => {});
     wb.close();
     await openWorkbench();

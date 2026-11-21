@@ -116,7 +116,7 @@ test('other AIs: Ollama, a cloud key with a model picker, and Codex (sessions, S
     await openAi();
     await b.waitFor(`${ST}.getElementById('ai-ollama')?.textContent.includes('Ready')`);
     assert.match(await b.eval(`${ST}.getElementById('ai-ollama').textContent`), /llama3\.2/);
-    assert.equal(await b.eval(`!!${ST}.getElementById('ai-codex')`), false, 'other agents stay hidden until turned on');
+    assert.equal(await b.eval(`!!${ST}.getElementById('ai-cursor')`), false, 'agents that aren’t on this computer wait under “Add another agent”');
     await b.click(`${ST}.getElementById('ai-ollama')`);
     await b.waitFor(`${ST}.getElementById('ai-ollama').classList.contains('on')`);
     assert.equal((await settings()).aiProvider, 'ollama');
@@ -150,12 +150,13 @@ test('other AIs: Ollama, a cloud key with a model picker, and Codex (sessions, S
 
     // (Not on Windows: see NO_CLI.)
     if (!NO_CLI) {
-      // Codex, once "Other agents" is on: signed in (from `codex login status`), read-only sandbox,
-      // the prompt on stdin; the next turn resumes its session with only the new message.
+      // Codex, simply there once it's on this computer: signed in (from `codex login status`),
+      // read-only sandbox, the prompt on stdin; the next turn resumes its session with only the new
+      // message.
       await openAi();
-      await b.click(`${ST}.getElementById('otherAgents')`);
       await b.waitFor(`${ST}.getElementById('ai-codex')?.textContent.includes('Ready')`);
-      await b.click(`${ST}.getElementById('ai-codex')`);
+      // Not a click at its place: the rows above it move as cloud models arrive.
+      await b.eval(`${ST}.getElementById('ai-codex').click()`);
       await b.waitFor(`${ST}.getElementById('ai-codex').classList.contains('on')`);
       await b.eval('app.$.settings.hide()');
       await b.eval(`${AK}.getElementById('new').click()`);

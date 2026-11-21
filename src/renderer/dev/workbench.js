@@ -16,20 +16,20 @@ const dirname = (p) => { const i = String(p).lastIndexOf('/'); return i < 0 ? ''
 const joinPath = (dir, name) => (dir ? `${dir}/${name}` : name);
 
 const AGENT_UI = {
-  claude: { label: 'Claude Code', mark: 'C', color: '#d97757' },
-  codex: { label: 'Codex', mark: 'X', color: '#3c3c46' },
-  gemini: { label: 'Gemini', mark: 'G', color: '#4c8df6' },
-  copilot: { label: 'Copilot', mark: 'P', color: '#8957e5' },
-  opencode: { label: 'OpenCode', mark: 'O', color: '#4b5563' },
-  cursor: { label: 'Cursor', mark: 'U', color: '#1c1c1c' },
-  qwen: { label: 'Qwen Code', mark: 'Q', color: '#615ced' },
-  amp: { label: 'Amp', mark: 'A', color: '#f34e3f' },
-  goose: { label: 'Goose', mark: 'G', color: '#222222' },
-  droid: { label: 'Droid', mark: 'D', color: '#ff6b00' },
+  claude: { label: 'Claude Code', mark: 'Cl', color: '#d97757' },
+  codex: { label: 'Codex', mark: 'Cx', color: '#3c3c46' },
+  gemini: { label: 'Gemini', mark: 'Ge', color: '#4c8df6' },
+  copilot: { label: 'Copilot', mark: 'Co', color: '#8957e5' },
+  opencode: { label: 'OpenCode', mark: 'OC', color: '#4b5563' },
+  cursor: { label: 'Cursor', mark: 'Cu', color: '#1c1c1c' },
+  qwen: { label: 'Qwen Code', mark: 'Qw', color: '#615ced' },
+  amp: { label: 'Amp', mark: 'Am', color: '#f34e3f' },
+  goose: { label: 'Goose', mark: 'Go', color: '#222222' },
+  droid: { label: 'Droid', mark: 'Dr', color: '#ff6b00' },
   shell: { label: 'Shell', mark: '$', color: '#7a808c' },
   // Workbench Pro: sandboxed agents (Docker / OrbStack)
-  'sandbox-claude': { label: 'Claude Code (sandbox)', mark: 'C', color: '#d97757' },
-  'sandbox-codex': { label: 'Codex (sandbox)', mark: 'X', color: '#3c3c46' },
+  'sandbox-claude': { label: 'Claude Code (sandbox)', mark: 'Cl', color: '#d97757' },
+  'sandbox-codex': { label: 'Codex (sandbox)', mark: 'Cx', color: '#3c3c46' },
   'sandbox-shell': { label: 'Shell (sandbox)', mark: '$', color: '#7a808c' },
 };
 
@@ -113,7 +113,7 @@ async function agentConsent(kind) {
   const to = AGENT_DESTINATION[base];
   if (!to || agentConsentGiven.has(base)) return true;
   let state = '';
-  try { state = typeof wb.aiConsent === 'function' ? await wb.aiConsent() : 'always'; } catch {}
+  try { state = typeof wb.aiConsent === 'function' ? await wb.aiConsent(base) : 'always'; } catch {}
   if (state === 'always') return true;
   const label = AGENT_UI[kind]?.label || base;
   return new Promise((resolve) => {
@@ -124,7 +124,7 @@ async function agentConsent(kind) {
       const done = (a) => {
         close();
         if (a === 'ok' || a === 'always') agentConsentGiven.add(base);
-        if (a === 'always') wb.setAiConsent?.('always').catch(() => {});
+        if (a === 'ok' || a === 'always') wb.setAiConsent?.(base, a === 'always' ? 'always' : 'once').catch(() => {});
         resolve(a === 'ok' || a === 'always');
       };
       m.addEventListener('click', (e) => { const a = e.target.closest('[data-a]')?.dataset.a; if (a) done(a); });
