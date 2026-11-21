@@ -20,14 +20,15 @@ test('Edit Space Theme from the space menu: live colour, icon and name; Cancel r
     assert.equal(await b.eval(`${TE}.getElementById('gradient').checked`), true);
     await b.click(`${TE}.querySelector('.em[data-emoji="🚀"]')`);
     await b.waitFor(`app.$.tabstrip.state_.spaces[0].icon === '🚀'`);
-    // Arc's grain over the window's colour.
+    // Arc's grain over the window's colour: on from the start, and it turns off.
+    assert.equal(await b.eval(`app.$.tabstrip.state_.spaces[0].grain && app.hasAttribute('grain')`), true);
     await b.click(`${TE}.getElementById('grain')`);
-    await b.waitFor(`app.$.tabstrip.state_.spaces[0].grain && app.hasAttribute('grain')`);
+    await b.waitFor(`!app.$.tabstrip.state_.spaces[0].grain && !app.hasAttribute('grain')`);
     // Cancel: back to how it was.
     await b.click(`${TE}.getElementById('cancel')`);
     await b.waitFor(`!app.$.themeEditor.open`);
     await b.waitFor(`app.$.tabstrip.state_.spaces[0].color === '${before.color}' && app.$.tabstrip.state_.spaces[0].icon === '${before.icon}'`);
-    await b.waitFor(`!app.$.tabstrip.state_.spaces[0].grain && !app.hasAttribute('grain')`);
+    await b.waitFor(`app.$.tabstrip.state_.spaces[0].grain && app.hasAttribute('grain')`);
 
     // Again, renamed and kept with Done.
     await b.menu(`${SB}.querySelector('.space-header')`, 'Edit Theme…');
@@ -40,6 +41,6 @@ test('Edit Space Theme from the space menu: live colour, icon and name; Cancel r
     const after = await space(b);
     assert.deepEqual([after.name, after.color, after.color2], ['Garden', '#7fbf8e', '#7fbf8e']);
     assert.equal(await b.eval(`${SB}.querySelector('.space-name').textContent`), 'Garden');
-    assert.equal(after.grain, true);
+    assert.equal(after.grain, false);
   } finally { await b.close(); }
 });

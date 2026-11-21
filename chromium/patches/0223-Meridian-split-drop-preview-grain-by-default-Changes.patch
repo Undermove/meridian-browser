@@ -1,0 +1,817 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Sat, 21 Nov 2026 15:49:52 +0400
+Subject: [PATCH 224/224] Meridian: split drop preview, grain by default,
+ Changes beside Files
+
+Held over a tab, a tab shows the empty half it will take, left or right.
+The grain is on unless a space turned it off. Workbench's git shows other
+repositories an agent worked in, for viewing, and a branch against its base.
+Version 0.6.20.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/mission/mission_control.cc       |  11 ++
+ .../meridian/mission/mission_control.h        |   2 +
+ chrome/browser/meridian/sidebar.mojom         |   3 +-
+ chrome/browser/meridian/sidebar_handler.cc    |  27 ++--
+ chrome/browser/meridian/sidebar_handler.h     |   3 +-
+ chrome/browser/meridian/sidebar_service.cc    |   6 +-
+ chrome/browser/meridian/sidebar_service.h     |   2 +-
+ .../meridian/sidebar_service_unittest.cc      |   6 +-
+ chrome/browser/meridian/update_check.h        |   2 +-
+ .../browser/meridian/workbench/git_command.cc | 146 +++++++++++++++++-
+ .../browser/meridian/workbench/git_command.h  |  11 ++
+ .../meridian/workbench/workbench_handler.cc   |  86 ++++++++++-
+ .../meridian/workbench/workbench_handler.h    |   3 +
+ .../browser/resources/webui_browser/app.css   |  44 +++++-
+ .../resources/webui_browser/app.html.ts       |   2 +
+ chrome/browser/resources/webui_browser/app.ts |  22 +++
+ .../resources/webui_browser/meridian/rows.css |  51 ++++++
+ .../webui_browser/meridian/sidebar.ts         |  34 +++-
+ 18 files changed, 428 insertions(+), 33 deletions(-)
+
+diff --git a/chrome/browser/meridian/mission/mission_control.cc b/chrome/browser/meridian/mission/mission_control.cc
+index 000a80aacc..a7f33a69e3 100644
+--- a/chrome/browser/meridian/mission/mission_control.cc
++++ b/chrome/browser/meridian/mission/mission_control.cc
+@@ -419,6 +419,17 @@ std::string MissionControl::TranscriptOf(int owner_tab,
+   return std::string();
+ }
+ 
++std::vector<std::string> MissionControl::TranscriptsOf(int owner_tab) const {
++  std::vector<std::string> out;
++  for (const auto& [id, n] : nodes_) {
++    if (n.owner_tab == owner_tab && n.kind == "session" &&
++        !n.transcript.empty()) {
++      out.push_back(n.transcript);
++    }
++  }
++  return out;
++}
++
+ void MissionControl::AttachTerminal(const std::string& node_id,
+                                     const std::string& term_id) {
+   Node* node = Get(node_id);
+diff --git a/chrome/browser/meridian/mission/mission_control.h b/chrome/browser/meridian/mission/mission_control.h
+index bb958c8501..aa8a52fa3c 100644
+--- a/chrome/browser/meridian/mission/mission_control.h
++++ b/chrome/browser/meridian/mission/mission_control.h
+@@ -85,6 +85,8 @@ class MissionControl : public KeyedService,
+   // The transcript of the Claude Code session in Workbench terminal
+   // `term_id`, from its status line ("" until known).
+   std::string TranscriptOf(int owner_tab, const std::string& term_id) const;
++  // The transcripts of every agent session in that Workbench tab.
++  std::vector<std::string> TranscriptsOf(int owner_tab) const;
+   // `owner_tab`: the Workbench tab's handle id (to open its terminal).
+   // `in_shell`: a shell tab where Claude Code may be started by hand: hidden
+   // until it starts, hidden again when it ends.
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 2427249eaa..c6fea85673 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -685,7 +685,8 @@ interface SidebarHandler {
+   Unsplit();
+   // Arc: a tab dropped onto another in the sidebar. `dropped` joins `onto`
+   // in a split, on its right, and becomes the active tab.
+-  SplitTabs(tabs_api.mojom.NodeId onto, tabs_api.mojom.NodeId dropped);
++  SplitTabs(tabs_api.mojom.NodeId onto, tabs_api.mojom.NodeId dropped,
++            bool dropped_on_left);
+   // Separates the split `tab` is in (the sidebar's Separate Split).
+   UnsplitTab(tabs_api.mojom.NodeId tab);
+   SetSplitRatio(string split_id, double ratio);
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 3772854380..18d197fe15 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -3359,26 +3359,27 @@ void SidebarHandler::Unsplit() {
+ }
+ 
+ void SidebarHandler::SplitTabs(const tabs_api::NodeId& onto,
+-                               const tabs_api::NodeId& dropped) {
+-  tabs::TabInterface* left = TabFor(onto);
+-  tabs::TabInterface* right = TabFor(dropped);
+-  if (!left || !right || left == right || left->GetSplit() ||
+-      right->GetSplit()) {
+-    return;
+-  }
+-  // The dropped tab right after the one it joins: the split keeps the strip's
+-  // order, so it shows on the right.
+-  int from = model()->GetIndexOfTab(right);
+-  int to = model()->GetIndexOfTab(left) + 1;
++                               const tabs_api::NodeId& dropped,
++                               bool dropped_on_left) {
++  tabs::TabInterface* target = TabFor(onto);
++  tabs::TabInterface* moved = TabFor(dropped);
++  if (!target || !moved || target == moved || target->GetSplit() ||
++      moved->GetSplit()) {
++    return;
++  }
++  // The dropped tab right before or after the one it joins: the split keeps
++  // the strip's order, so that is the side it shows on.
++  int from = model()->GetIndexOfTab(moved);
++  int to = model()->GetIndexOfTab(target) + (dropped_on_left ? 0 : 1);
+   if (from < to) {
+     --to;
+   }
+   if (from != to) {
+     model()->MoveWebContentsAt(from, to, /*select_after_move=*/false);
+   }
+-  model()->ActivateTabAt(model()->GetIndexOfTab(right));
++  model()->ActivateTabAt(model()->GetIndexOfTab(moved));
+   model()->AddToNewSplit(
+-      {model()->GetIndexOfTab(left)},
++      {model()->GetIndexOfTab(target)},
+       split_tabs::SplitTabVisualData(split_tabs::SplitTabLayout::kSideBySide),
+       split_tabs::SplitTabCreatedSource::kDragAndDropTab);
+ }
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 0eb1213072..2797d475dc 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -182,7 +182,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void SplitWith(const tabs_api::NodeId& other) override;
+   void Unsplit() override;
+   void SplitTabs(const tabs_api::NodeId& onto,
+-                 const tabs_api::NodeId& dropped) override;
++                 const tabs_api::NodeId& dropped,
++                 bool dropped_on_left) override;
+   void UnsplitTab(const tabs_api::NodeId& tab) override;
+   void SetSplitRatio(const std::string& split_id, double ratio) override;
+   void SearchArchive(const std::string& query,
+diff --git a/chrome/browser/meridian/sidebar_service.cc b/chrome/browser/meridian/sidebar_service.cc
+index e145002516..d8d03fd604 100644
+--- a/chrome/browser/meridian/sidebar_service.cc
++++ b/chrome/browser/meridian/sidebar_service.cc
+@@ -697,9 +697,7 @@ base::DictValue SidebarService::ToValue() const {
+     s.Set("icon", space.icon);
+     s.Set("color", space.color);
+     s.Set("color2", space.color2);
+-    if (space.grain) {
+-      s.Set("grain", true);
+-    }
++    s.Set("grain", space.grain);
+     if (!space.profile.empty()) {
+       s.Set("profile", space.profile);
+     }
+@@ -753,7 +751,7 @@ bool SidebarService::FromValue(const base::DictValue& value,
+     space.icon = str("icon");
+     space.color = str("color");
+     space.color2 = str("color2");
+-    space.grain = d.FindBool("grain").value_or(false);
++    space.grain = d.FindBool("grain").value_or(true);
+     space.profile = str("profile");
+     if (space.color.empty()) {
+       space.color = kDefaultColor;
+diff --git a/chrome/browser/meridian/sidebar_service.h b/chrome/browser/meridian/sidebar_service.h
+index cf4385b89d..c75df76046 100644
+--- a/chrome/browser/meridian/sidebar_service.h
++++ b/chrome/browser/meridian/sidebar_service.h
+@@ -65,7 +65,7 @@ struct Space {
+   std::string color;
+   std::string color2;
+   // Arc's grain: a fine noise over the window's colour.
+-  bool grain = false;
++  bool grain = true;
+   // The profile its tabs live in (ProfileInfo::id).
+   std::string profile;
+   std::vector<Item> pinned;
+diff --git a/chrome/browser/meridian/sidebar_service_unittest.cc b/chrome/browser/meridian/sidebar_service_unittest.cc
+index c9e8b45471..43733d41f9 100644
+--- a/chrome/browser/meridian/sidebar_service_unittest.cc
++++ b/chrome/browser/meridian/sidebar_service_unittest.cc
+@@ -103,7 +103,7 @@ TEST_F(SidebarServiceTest, SavesAndLoadsJson) {
+     ASSERT_TRUE(service.loaded());
+     space = service.CreateSpace("Work", "💼", "#e08a8a", "#f0b5a8");
+     service.SetActiveSpace(space);
+-    service.SetSpaceGrain(space, true);
++    service.SetSpaceGrain(space, false);
+     std::string folder = service.AddItem(space, "", -1, Folder("Design"));
+     service.AddItem(space, folder, -1, Link("Figma", "https://figma.com/"));
+     fav = service.AddItem(kFavorites, "", -1, Link("Mail", "https://mail.example/"));
+@@ -125,8 +125,8 @@ TEST_F(SidebarServiceTest, SavesAndLoadsJson) {
+   ASSERT_TRUE(work);
+   EXPECT_EQ(work->icon, "💼");
+   EXPECT_EQ(work->color2, "#f0b5a8");
+-  EXPECT_TRUE(work->grain);
+-  EXPECT_FALSE(again.spaces()[0].grain);
++  EXPECT_FALSE(work->grain);
++  EXPECT_TRUE(again.spaces()[0].grain);
+   ASSERT_EQ(work->pinned.size(), 1u);
+   EXPECT_FALSE(work->pinned[0].open);
+   ASSERT_EQ(work->pinned[0].children.size(), 1u);
+diff --git a/chrome/browser/meridian/update_check.h b/chrome/browser/meridian/update_check.h
+index 978a6bca39..7076ed84ff 100644
+--- a/chrome/browser/meridian/update_check.h
++++ b/chrome/browser/meridian/update_check.h
+@@ -18,7 +18,7 @@
+ namespace meridian::update {
+ 
+ // This build's version (the release tag without "v").
+-inline constexpr char kVersion[] = "0.6.19";
++inline constexpr char kVersion[] = "0.6.20";
+ 
+ // GitHub's latest release of Meridian.
+ inline constexpr char kFeed[] =
+diff --git a/chrome/browser/meridian/workbench/git_command.cc b/chrome/browser/meridian/workbench/git_command.cc
+index 1436d6e31b..6b2e450e4e 100644
+--- a/chrome/browser/meridian/workbench/git_command.cc
++++ b/chrome/browser/meridian/workbench/git_command.cc
+@@ -8,6 +8,10 @@
+ #include <array>
+ #include <string_view>
+ 
++#include "base/containers/flat_set.h"
++#include "base/files/file.h"
++#include "base/files/file_enumerator.h"
++#include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
+@@ -20,7 +24,14 @@ namespace {
+ constexpr auto kGitCommands = std::to_array<std::string_view>({
+     "status", "diff", "show", "add", "restore", "commit", "branch", "switch",
+     "log", "rev-parse", "fetch", "pull", "push", "remote", "stash",
+-    "ls-files", "rev-list", "for-each-ref", "init",
++    "ls-files", "rev-list", "for-each-ref", "init", "merge-base",
++});
++
++// What a repository other than the open project may be asked: it is shown,
++// never changed, from the Workbench.
++constexpr auto kGitReadOnly = std::to_array<std::string_view>({
++    "status", "diff", "show", "log", "rev-parse", "ls-files", "rev-list",
++    "for-each-ref", "merge-base",
+ });
+ 
+ // Options that run another program, read or write outside the project, or
+@@ -135,6 +146,139 @@ std::string CheckGhArgs(const std::vector<std::string>& args) {
+   return std::string();
+ }
+ 
++std::string CheckReadOnlyGit(const std::vector<std::string>& args) {
++  if (args.empty() ||
++      std::ranges::find(kGitReadOnly, args[0]) == kGitReadOnly.end()) {
++    return "This repository is outside the project: it can be viewed here, "
++           "and changed from the terminal.";
++  }
++  return CheckGitArgs(args);
++}
++
++std::string CheckReadOnlyGh(const std::vector<std::string>& args) {
++  if (args.size() < 2 || args[0] != "pr" ||
++      (args[1] != "view" && args[1] != "list" && args[1] != "status" &&
++       args[1] != "diff")) {
++    return "This repository is outside the project: it can be viewed here, "
++           "and changed from the terminal.";
++  }
++  return CheckGhArgs(args);
++}
++
++namespace {
++
++// The repository a path is in, if any.
++std::optional<base::FilePath> RepoOf(base::FilePath p) {
++  while (!p.empty() && p != p.DirName()) {
++    if (base::PathExists(p.AppendASCII(".git"))) {
++      return p;
++    }
++    p = p.DirName();
++  }
++  return std::nullopt;
++}
++
++// Absolute paths an agent worked with, the latest first: the end of its
++// transcript, `"file_path":"…"` and `"cwd":"…"`.
++void PathsInTranscript(const base::FilePath& transcript,
++                       std::vector<std::string>& out) {
++  constexpr int64_t kTail = 16 << 20;
++  base::File f(transcript, base::File::FLAG_OPEN | base::File::FLAG_READ);
++  if (!f.IsValid()) {
++    return;
++  }
++  const int64_t size = f.GetLength();
++  const int64_t from = std::max<int64_t>(0, size - kTail);
++  std::string text(static_cast<size_t>(size - from), '\0');
++  const std::optional<size_t> got =
++      f.Read(from, base::as_writable_byte_span(text));
++  if (!got) {
++    return;
++  }
++  text.resize(*got);
++  std::vector<std::string> found;
++  for (std::string_view key : {"\"file_path\":\"", "\"cwd\":\""}) {
++    for (size_t at = text.find(key); at != std::string::npos;
++         at = text.find(key, at + 1)) {
++      const size_t begin = at + key.size();
++      const size_t end = text.find('"', begin);
++      if (end == std::string::npos || end - begin > 4096) {
++        continue;
++      }
++      std::string path = text.substr(begin, end - begin);
++      base::ReplaceSubstringsAfterOffset(&path, 0, "\\\\", "\\");
++      found.push_back(std::move(path));
++    }
++  }
++  out.insert(out.end(), found.rbegin(), found.rend());
++}
++
++void NestedRepos(const base::FilePath& dir, int depth,
++                 std::vector<base::FilePath>& out) {
++  if (depth > 3 || out.size() >= 12) {
++    return;
++  }
++  base::FileEnumerator it(dir, false, base::FileEnumerator::DIRECTORIES);
++  for (base::FilePath p = it.Next(); !p.empty(); p = it.Next()) {
++    const std::string name = p.BaseName().AsUTF8Unsafe();
++    if (name.starts_with(".") || name == "node_modules" || name == "vendor" ||
++        name == "dist" || name == "build" || name == "out" ||
++        name == "target") {
++      continue;
++    }
++    if (base::PathExists(p.AppendASCII(".git"))) {
++      out.push_back(p);
++    } else {
++      NestedRepos(p, depth + 1, out);
++    }
++  }
++}
++
++}  // namespace
++
++base::ListValue FindGitRepos(const base::FilePath& project,
++                             const std::vector<std::string>& transcripts,
++                             const std::vector<base::FilePath>& extra) {
++  constexpr size_t kMax = 16;
++  base::ListValue list;
++  base::flat_set<base::FilePath> seen;
++  const auto add = [&](const base::FilePath& p, const char* kind) {
++    if (list.size() < kMax && seen.insert(p).second) {
++      list.Append(base::DictValue()
++                      .Set("path", p.AsUTF8Unsafe())
++                      .Set("name", p.BaseName().AsUTF8Unsafe())
++                      .Set("kind", kind));
++    }
++  };
++  add(project, "project");
++  for (const base::FilePath& p : extra) {
++    add(p, "agent");
++  }
++  std::vector<std::string> paths;
++  for (const std::string& t : transcripts) {
++    PathsInTranscript(base::FilePath::FromUTF8Unsafe(t), paths);
++  }
++  base::flat_set<std::string> looked;
++  for (const std::string& raw : paths) {
++    if (looked.size() >= 300 || !looked.insert(raw).second) {
++      continue;
++    }
++    const base::FilePath p = base::FilePath::FromUTF8Unsafe(raw);
++    if (!p.IsAbsolute()) {
++      continue;
++    }
++    if (std::optional<base::FilePath> repo = RepoOf(p)) {
++      add(*repo, "agent");
++    }
++  }
++  std::vector<base::FilePath> nested;
++  NestedRepos(project, 1, nested);
++  for (const base::FilePath& p : nested) {
++    add(p, "nested");
++  }
++  return list;
++}
++
+ base::DictValue RunGitCommand(const std::string& program,
+                               bool is_git,
+                               const base::FilePath& root,
+diff --git a/chrome/browser/meridian/workbench/git_command.h b/chrome/browser/meridian/workbench/git_command.h
+index a6beb41ef9..9a2805b56e 100644
+--- a/chrome/browser/meridian/workbench/git_command.h
++++ b/chrome/browser/meridian/workbench/git_command.h
+@@ -24,6 +24,17 @@ std::string CheckGhArgs(const std::vector<std::string>& args);
+ 
+ // Runs `program` (git or gh, an absolute path) with `args` in `root`:
+ // {code, stdout, stderr, timedOut, truncated}. Blocking.
++// The same checks for a repository other than the project: viewing only.
++std::string CheckReadOnlyGit(const std::vector<std::string>& args);
++std::string CheckReadOnlyGh(const std::vector<std::string>& args);
++
++// The repositories worth showing: the project, those its agents worked in
++// (from their transcripts, the latest first; `extra` for tests), and those
++// inside it. [{path, name, kind: project|agent|nested}]. Blocks.
++base::ListValue FindGitRepos(const base::FilePath& project,
++                             const std::vector<std::string>& transcripts,
++                             const std::vector<base::FilePath>& extra);
++
+ base::DictValue RunGitCommand(const std::string& program,
+                               bool is_git,
+                               const base::FilePath& root,
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 5237f798e2..7ff03c453a 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -831,7 +831,7 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+   }
+   // (Source Control's git and gh live beside the hub's git.)
+   if (method.starts_with("hub") || method == "git" || method == "gh" ||
+-      method == "gitInfo") {
++      method == "gitInfo" || method == "gitRepos" || method == "gitReadFile") {
+     return HubCall(method, params, std::move(reply));
+   }
+   if (method == "sandboxStatus" || method == "sandboxNetwork") {
+@@ -1120,6 +1120,71 @@ void WorkbenchHandler::HubCall(const std::string& method,
+   }
+   // Source Control: git (and gh for pull requests) in the project, only the
+   // commands and options the panel uses (git_command.h).
++  if (method == "gitRepos") {
++    if (!project_) {
++      return std::move(reply).Run(base::Value(base::ListValue()));
++    }
++    std::vector<std::string> transcripts;
++    if (mission::MissionControl* mission =
++            mission::MissionControlFactory::GetForProfile(profile_)) {
++      tabs::TabInterface* tab =
++          tabs::TabInterface::MaybeGetFromContents(web_ui()->GetWebContents());
++      transcripts =
++          mission->TranscriptsOf(tab ? tab->GetHandle().raw_value() : 0);
++    }
++    std::vector<base::FilePath> extra;
++    if (HasTestSwitch("meridian-test-git-repo")) {
++      extra.push_back(TestSwitchPath("meridian-test-git-repo"));
++    }
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++        base::BindOnce(&FindGitRepos, project_->root(), std::move(transcripts),
++                       std::move(extra)),
++        base::BindOnce(
++            [](base::WeakPtr<WorkbenchHandler> self, Reply reply,
++               base::ListValue repos) {
++              if (self) {
++                self->git_repos_.clear();
++                for (const base::Value& r : repos) {
++                  self->git_repos_.insert(*r.GetDict().FindString("path"));
++                }
++              }
++              std::move(reply).Run(base::Value(std::move(repos)));
++            },
++            weak_factory_.GetWeakPtr(), std::move(reply)));
++    return;
++  }
++  if (method == "gitReadFile") {
++    const std::string* repo = params.size() > 0 && params[0].is_string()
++                                  ? &params[0].GetString()
++                                  : nullptr;
++    const std::string* rel = params.size() > 1 && params[1].is_string()
++                                 ? &params[1].GetString()
++                                 : nullptr;
++    if (!repo || !rel || !git_repos_.contains(*repo)) {
++      return std::move(reply).Run(base::unexpected("unknown repository"));
++    }
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++        base::BindOnce(
++            [](std::string repo, std::string rel) -> Result {
++              std::optional<ProjectFs> fs =
++                  ProjectFs::Open(base::FilePath::FromUTF8Unsafe(repo));
++              if (!fs) {
++                return base::unexpected("the repository can't be opened");
++              }
++              auto bytes = fs->ReadBytes(rel, 4 << 20);
++              if (!bytes.has_value()) {
++                return base::unexpected(bytes.error());
++              }
++              return base::Value(std::move(*bytes));
++            },
++            *repo, *rel),
++        base::BindOnce(
++            [](Reply reply, Result r) { std::move(reply).Run(std::move(r)); },
++            std::move(reply)));
++    return;
++  }
+   if (method == "git" || method == "gh" || method == "gitInfo") {
+     if (!project_) {
+       return std::move(reply).Run(base::unexpected("no project is open"));
+@@ -1138,9 +1203,24 @@ void WorkbenchHandler::HubCall(const std::string& method,
+         stdin_text = in->substr(0, 1 << 20);
+       }
+     }
++    // Another repository the panel found: for viewing.
++    base::FilePath git_root = project_->root();
++    bool other_repo = false;
++    if (params.size() > 1 && params[1].is_dict()) {
++      if (const std::string* repo = params[1].GetDict().FindString("repo");
++          repo && !repo->empty() && *repo != git_root.AsUTF8Unsafe()) {
++        if (!git_repos_.contains(*repo)) {
++          return std::move(reply).Run(base::unexpected("unknown repository"));
++        }
++        git_root = base::FilePath::FromUTF8Unsafe(*repo);
++        other_repo = true;
++      }
++    }
+     const bool is_git = method != "gh";
+     if (method != "gitInfo") {
+-      std::string why = is_git ? CheckGitArgs(args) : CheckGhArgs(args);
++      std::string why =
++          other_repo ? (is_git ? CheckReadOnlyGit(args) : CheckReadOnlyGh(args))
++                     : (is_git ? CheckGitArgs(args) : CheckGhArgs(args));
+       if (!why.empty()) {
+         return std::move(reply).Run(base::unexpected(why));
+       }
+@@ -1172,7 +1252,7 @@ void WorkbenchHandler::HubCall(const std::string& method,
+                                                args, stdin_text,
+                                                std::move(env)));
+             },
+-            method, project_->root(), std::move(args), std::move(stdin_text)),
++            method, git_root, std::move(args), std::move(stdin_text)),
+         base::BindOnce([](Reply reply, Result r) { std::move(reply).Run(std::move(r)); },
+                        std::move(reply)));
+     return;
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.h b/chrome/browser/meridian/workbench/workbench_handler.h
+index f3ce24d47c..698e504275 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.h
++++ b/chrome/browser/meridian/workbench/workbench_handler.h
+@@ -190,6 +190,9 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+   std::map<std::string, Term> terms_;
+   // Context Insights, by transcript: each read on where the last one stopped.
+   std::map<std::string, std::unique_ptr<ContextInsights>> insights_;
++  // Repositories gitRepos found: the only ones git may run in besides the
++  // project.
++  std::set<std::string> git_repos_;
+   int term_seq_ = 0;
+   // The terminal host (term_host.h): hands a terminal over, lets it go, and
+   // takes back the ones a crashed browser left for a project.
+diff --git a/chrome/browser/resources/webui_browser/app.css b/chrome/browser/resources/webui_browser/app.css
+index 21ff0ccb9b..517cdde378 100644
+--- a/chrome/browser/resources/webui_browser/app.css
++++ b/chrome/browser/resources/webui_browser/app.css
+@@ -337,6 +337,48 @@ cr-icon-button[hidden] {
+   display: none;
+ }
+ 
++/* A tab held over another: the empty half of the page it would take. */
++#splitGhost {
++  position: absolute;
++  z-index: 5;
++  box-sizing: border-box;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  padding: 24px;
++  border: 2px dashed color-mix(in srgb, var(--meridian-space) 80%, var(--meridian-text));
++  border-radius: var(--meridian-radius);
++  background: color-mix(in srgb, var(--meridian-space) 24%, var(--meridian-surface));
++  color: var(--meridian-text);
++  font-size: 15px;
++  font-weight: 550;
++  opacity: 0;
++  visibility: hidden;
++  transform: scale(0.985);
++  pointer-events: none;
++  transition: opacity 0.14s ease, transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1),
++      left 0.16s cubic-bezier(0.2, 0.8, 0.2, 1), visibility 0.14s;
++}
++
++#splitGhost.show {
++  opacity: 0.92;
++  visibility: visible;
++  transform: none;
++}
++
++#splitGhost span {
++  overflow: hidden;
++  max-width: 100%;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++@media (prefers-reduced-motion: reduce) {
++  #splitGhost {
++    transition: none;
++  }
++}
++
+ /* ⌘S: the sidebar hides; hovering the window edge slides it back over the
+  * page as a floating card (Electron: body.sidebar-hidden). */
+ #edgeHotzone {
+@@ -830,7 +872,7 @@ cr-icon-button[hidden] {
+   inset: 0;
+   z-index: 0;
+   pointer-events: none;
+-  opacity: 0.32;
++  opacity: 0.24;
+   background-size: 160px;
+   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 1.6 -0.3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+ }
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 3951b8bbb6..8aaec10109 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -119,6 +119,7 @@ export function getHtml(this: WebuiBrowserAppElement) {
+         @meridian-show-command-bar="${this.onMeridianShowCommandBar_}"
+         @meridian-toggle-sidebar="${this.onMeridianToggleSidebar_}"
+         @meridian-splits-changed="${this.onMeridianSplitsChanged_}"
++        @meridian-split-preview="${this.onMeridianSplitPreview_}"
+         @meridian-show-archive="${this.onMeridianShowArchive_}"
+         @meridian-peeks-changed="${this.onMeridianPeeksChanged_}"
+         @meridian-status="${this.onMeridianStatus_}"
+@@ -233,6 +234,7 @@ export function getHtml(this: WebuiBrowserAppElement) {
+         @split-pane-focused="${this.onSplitPaneFocused_}"
+         @peek-action="${this.onPeekAction_}">
+     </content-region>
++    <div id="splitGhost" aria-hidden="true"><span></span></div>
+     <meridian-ask id="ask"
+         @meridian-show-settings="${this.onMeridianShowSettings_}"
+         @meridian-open-url="${this.onMeridianOpenUrl_}"
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 8c4f76f467..e360e4176e 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -708,6 +708,28 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   private splits_: Split[] = [];
+   private activeTabId_ = '';
+ 
++  // A tab held over another: the half of the page it would take.
++  protected onMeridianSplitPreview_(
++      e: CustomEvent<{side: 'left'|'right', title: string}|null>) {
++    const ghost = this.shadowRoot.getElementById('splitGhost')!;
++    const preview = e.detail;
++    if (!preview) {
++      ghost.classList.remove('show');
++      return;
++    }
++    const page = this.$.contentRegion.getBoundingClientRect();
++    const main = this.shadowRoot.getElementById('main')!.getBoundingClientRect();
++    const half = page.width / 2;
++    const left = page.left - main.left + (preview.side === 'right' ? half : 0);
++    ghost.style.top = `${page.top - main.top}px`;
++    ghost.style.height = `${page.height}px`;
++    ghost.style.width = `${half}px`;
++    ghost.style.left = `${left}px`;
++    ghost.dataset['side'] = preview.side;
++    ghost.querySelector('span')!.textContent = preview.title;
++    ghost.classList.add('show');
++  }
++
+   protected onMeridianSplitsChanged_(e: CustomEvent<Split[]>) {
+     this.splits_ = e.detail;
+     this.updateSplit_();
+diff --git a/chrome/browser/resources/webui_browser/meridian/rows.css b/chrome/browser/resources/webui_browser/meridian/rows.css
+index 1919b6346f..12f2660718 100644
+--- a/chrome/browser/resources/webui_browser/meridian/rows.css
++++ b/chrome/browser/resources/webui_browser/meridian/rows.css
+@@ -215,6 +215,57 @@ input.rename {
+ 
+ .row.drop-into {
+   background: color-mix(in srgb, var(--meridian-space) 30%, transparent);
++  transition: padding 0.14s cubic-bezier(0.2, 0.8, 0.2, 1);
++}
++
++/* A split about to happen: the row's tab makes room, and an empty half shows
++ * where the dropped one lands. */
++.row.split-right {
++  padding-right: calc(50% + 4px);
++}
++
++.row.split-left {
++  padding-left: calc(50% + 6px);
++}
++
++.row.split-left::after,
++.row.split-right::after {
++  content: '';
++  position: absolute;
++  top: 4px;
++  bottom: 4px;
++  width: calc(50% - 6px);
++  box-sizing: border-box;
++  border: 1.5px dashed color-mix(in srgb, var(--meridian-space) 75%, var(--meridian-text));
++  border-radius: 6px;
++  background: color-mix(in srgb, var(--meridian-surface) 45%, transparent);
++  animation: split-slot-in 0.14s cubic-bezier(0.2, 0.8, 0.2, 1);
++}
++
++.row.split-left::after {
++  left: 4px;
++}
++
++.row.split-right::after {
++  right: 4px;
++}
++
++@keyframes split-slot-in {
++  from {
++    opacity: 0;
++    transform: scale(0.9);
++  }
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .row.drop-into {
++    transition: none;
++  }
++
++  .row.split-left::after,
++  .row.split-right::after {
++    animation: none;
++  }
+ }
+ 
+ .fav.drop-before {
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 21f4d5d0c4..679826d88e 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -588,6 +588,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.drag_ = null;
+     this.removeAttribute('dragging');
+     this.clearDropMarker_();
++    this.showSplitPreview_();
+   };
+ 
+   private dragSource_(e: Event): HTMLElement|null {
+@@ -602,7 +603,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+ 
+   // Where a drop at the pointer would go.
+   private dropTarget_(e: DragEvent):
+-      {el: HTMLElement, pos?: 'before'|'after'|'into', zone?: string}|null {
++      {el: HTMLElement, pos?: 'before'|'after'|'into', zone?: string,
++       side?: 'left'|'right'}|null {
+     for (const el of e.composedPath()) {
+       if (!(el instanceof HTMLElement)) {
+         continue;
+@@ -623,7 +625,9 @@ export class MeridianSidebarElement extends CrLitElement implements
+         const r = el.getBoundingClientRect();
+         const y = (e.clientY - r.top) / r.height;
+         if (y > 0.25 && y < 0.75 && this.canSplitOnto_(el.dataset['tab'])) {
+-          return {el, pos: 'into'};
++          // Which half of the split the dropped tab takes (Arc).
++          const side = e.clientX < r.left + r.width / 2 ? 'left' : 'right';
++          return {el, pos: 'into', side};
+         }
+         return {el, pos: y < 0.5 ? 'before' : 'after'};
+       }
+@@ -648,11 +652,26 @@ export class MeridianSidebarElement extends CrLitElement implements
+     const m = this.dropMarker_;
+     if (m) {
+       m.classList.remove('drop-before', 'drop-after', 'drop-into',
+-                         'drop-target');
++                         'drop-target', 'split-left', 'split-right');
+     }
+     this.dropMarker_ = null;
+   }
+ 
++  // The empty half on the page where the dropped tab would land.
++  private splitPreview_: string = '';
++
++  private showSplitPreview_(side?: 'left'|'right') {
++    if ((side || '') === this.splitPreview_) {
++      return;
++    }
++    this.splitPreview_ = side || '';
++    const tab = this.drag_?.tab;
++    this.fire('meridian-split-preview', side ? {
++      side,
++      title: (tab && this.tabs_.get(tab)?.title) || '',
++    } : null);
++  }
++
+   private onDragOver_ = (e: DragEvent) => {
+     if (!this.drag_) {
+       return;
+@@ -660,12 +679,17 @@ export class MeridianSidebarElement extends CrLitElement implements
+     const t = this.dropTarget_(e);
+     this.clearDropMarker_();
+     if (!t || t.el === this.drag_.el) {
++      this.showSplitPreview_();
+       return;
+     }
+     e.preventDefault();
+     e.dataTransfer!.dropEffect = 'move';
+     this.dropMarker_ = t.el;
+     t.el.classList.add(t.pos ? 'drop-' + t.pos : 'drop-target');
++    if (t.side) {
++      t.el.classList.add('split-' + t.side);
++    }
++    this.showSplitPreview_(t.side);
+   };
+ 
+   // The list and index an item sits at, for dropping next to it.
+@@ -711,6 +735,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+     e.preventDefault();
+     const t = this.dropTarget_(e);
+     this.clearDropMarker_();
++    this.showSplitPreview_();
+     this.removeAttribute('dragging');
+     const space = this.activeSpace();
+     if (!t || !space || t.el === drag.el) {
+@@ -729,7 +754,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+       // Onto a Today tab: its middle makes a split (Arc), its edges Today's
+       // order; a pinned one comes back to Today.
+       if (drag.tab && t.pos === 'into') {
+-        this.handler_.splitTabs(t.el.dataset['tab'], drag.tab);
++        this.handler_.splitTabs(
++            t.el.dataset['tab'], drag.tab, t.side === 'left');
+       } else if (drag.tab) {
+         this.moveTodayTab_(drag.tab, t.el.dataset['tab'], t.pos === 'before');
+       } else if (drag.item) {

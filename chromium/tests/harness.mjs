@@ -270,7 +270,7 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
     },
     // A real mouse drag from one element to a point in another (fraction fx/fy of its box), through
     // Chromium's drag and drop: intercept the drag the press-and-move starts, then replay it as drag events.
-    async drag(fromExpr, toExpr, { fx = 0.5, fy = 0.5 } = {}) {
+    async drag(fromExpr, toExpr, { fx = 0.5, fy = 0.5, beforeDrop } = {}) {
       const box = (expr) => b.waitFor(`(() => { const el = ${expr}; if (!el) return null; const r = el.getBoundingClientRect(); return r.width ? { x: r.x, y: r.y, w: r.width, h: r.height } : null; })()`);
       const a = await box(fromExpr);
       const from = { x: a.x + a.w / 2, y: a.y + a.h / 2 };
@@ -290,9 +290,16 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
       await sleep(50);  // drop zones that open on dragstart
       const z = await box(toExpr);
       const to = { x: z.x + z.w * fx, y: z.y + z.h * fy };
-      for (const type of ['dragOver', 'drop']) {
-        await b.cdp.send('Input.dispatchDragEvent', { type, x: to.x, y: to.y, data });
+      await b.cdp.send('Input.dispatchDragEvent', { type: 'dragOver', x: to.x, y: to.y, data });
+      // What the person sees while still holding the tab. The first move over an element is its
+      // dragenter; dragover comes with the next one.
+      if (beforeDrop) {
+        await b.cdp.send('Input.dispatchDragEvent', { type: 'dragOver', x: to.x, y: to.y, data });
+        await beforeDrop();
+        // A drop lands only right after a move the page accepted.
+        await b.cdp.send('Input.dispatchDragEvent', { type: 'dragOver', x: to.x, y: to.y, data });
       }
+      await b.cdp.send('Input.dispatchDragEvent', { type: 'drop', x: to.x, y: to.y, data });
       await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', clickCount: 1 });
       await b.cdp.send('Input.setInterceptDrags', { enabled: false });
       b.afterAction?.('a drag');
