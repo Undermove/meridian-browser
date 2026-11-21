@@ -20,10 +20,19 @@ const SCM = {
   diff: null,        // {path, staged}
   timer: null,
   loaded: false,
+  open: false,       // the left pane shows changes instead of files
+  repos: [],         // {path, name, kind}
+  root: '',          // another repository shown ('': the project's); viewing only
+  picking: false,
+  mode: 'changes',   // 'changes' (not committed) or 'branch' (this branch against its base)
+  base: '',
+  mergeBase: '',
+  branchFiles: [],
+  pr: null,
 };
 
 const scmGit = async (args, opts) => {
-  const r = await wb.git(args, opts);
+  const r = await wb.git(args, { ...opts, repo: SCM.root || undefined });
   if (r.timedOut) throw new Error(`git ${args[0]} took too long`);
   return r;
 };
@@ -56,20 +65,91 @@ function scmParseStatus(out) {
 
 async function scmRefresh() {
   if (!S.project) return;
+  // Only the latest look counts: an older one may be of another repository or view.
+  const look = SCM.look = (SCM.look || 0) + 1;
   try {
     SCM.info = SCM.info || await wb.gitInfo();
     if (!SCM.info.git) { SCM.repo = false; SCM.loaded = true; scmRender(); return; }
     const st = await scmGit(['status', '--porcelain=v2', '-z', '--branch', '--untracked-files=all']);
+    if (look !== SCM.look) return;
     SCM.repo = st.code === 0;
     if (SCM.repo) {
       Object.assign(SCM, scmParseStatus(st.stdout));
       const log = await scmGit(['log', '-n', '30', '--format=%h%x09%s%x09%an%x09%ar']);
+      if (look !== SCM.look) return;
       SCM.log = log.code === 0 ? log.stdout.split('\n').filter(Boolean).map((l) => { const [hash, subject, author, when] = l.split('\t'); return { hash, subject, author, when }; }) : [];
+      if (SCM.mode === 'branch') await scmLoadBranch(look);
+      if (look !== SCM.look) return;
     }
     SCM.error = '';
-  } catch (err) { SCM.error = err.message; }
+  } catch (err) { if (look !== SCM.look) return; SCM.error = err.message; }
   SCM.loaded = true;
   scmRender();
+}
+
+// What this branch changed against the one it came from.
+async function scmLoadBranch(look) {
+  let base = '';
+  const head = await scmGit(['rev-parse', '--abbrev-ref', 'origin/HEAD']);
+  if (head.code === 0 && head.stdout.trim() !== 'origin/HEAD') base = head.stdout.trim();
+  for (const c of ['origin/main', 'origin/master', 'main', 'master']) {
+    if (base) break;
+    if (c !== SCM.branch && (await scmGit(['rev-parse', '--verify', '-q', c])).code === 0) base = c;
+  }
+  let mergeBase = '';
+  const files = [];
+  if (base) {
+    const mb = await scmGit(['merge-base', base, 'HEAD']);
+    if (mb.code === 0) {
+      mergeBase = mb.stdout.trim();
+      const d = await scmGit(['diff', '--name-status', '-z', '--no-renames', mergeBase, 'HEAD']);
+      const parts = d.code === 0 ? d.stdout.split('\0').filter(Boolean) : [];
+      for (let i = 0; i + 1 < parts.length; i += 2) files.push({ code: parts[i][0], path: parts[i + 1], committed: true });
+    }
+  }
+  if (look !== SCM.look) return;
+  Object.assign(SCM, { base, mergeBase, branchFiles: files });
+}
+
+async function scmLoadPr() {
+  SCM.pr = null;
+  if (!SCM.info?.gh || !SCM.branch) return;
+  const root = SCM.root;
+  try {
+    const r = await wb.gh(['pr', 'view', '--json', 'number,title,url,state'], { repo: root || undefined });
+    if (root === SCM.root && r.code === 0) { SCM.pr = JSON.parse(r.stdout); scmRender(); }
+  } catch {}
+}
+
+async function scmLoadRepos() {
+  try { SCM.repos = await wb.gitRepos(); } catch { SCM.repos = []; }
+  scmRender();
+}
+
+async function scmPickRepo(repo) {
+  SCM.picking = false;
+  scmCloseDiff();
+  SCM.root = repo.kind === 'project' ? '' : repo.path;
+  Object.assign(SCM, { loaded: false, staged: [], changes: [], log: [], prs: null, pr: null, branchFiles: [] });
+  scmRender();
+  await scmRefresh();
+  scmLoadPr();
+}
+
+function scmSetMode(mode) {
+  SCM.mode = mode;
+  scmCloseDiff();
+  scmRefresh();
+}
+
+function scmSetOpen(open) {
+  SCM.open = open;
+  $('#tree').hidden = open;
+  $('#scm-view').hidden = !open;
+  $('#tree-tools').hidden = open;
+  $('#view-files').classList.toggle('on', !open);
+  $('#view-scm').classList.toggle('on', open);
+  if (open) { scmLoadRepos(); scmRefresh(); scmLoadPr(); }
 }
 
 // Soon after files change (the project's watcher), not on every keystroke of a save.
@@ -79,27 +159,36 @@ function scmSoon() {
 }
 
 function scmRender() {
-  scmRenderChip();
-  if (PRO.activePanel === 'scm') renderPanel();
+  scmRenderCount();
+  if (SCM.open) scmRenderPane();
 }
 
-function scmRenderChip() {
-  let chip = document.getElementById('scm-chip');
-  if (!S.project || !SCM.repo) { chip?.remove(); return; }
-  if (!chip) {
-    const side = document.getElementById('side-buttons');
-    if (!side) return;
-    chip = document.createElement('button');
-    chip.id = 'scm-chip';
-    chip.className = 'chip scm-chip';
-    chip.addEventListener('click', () => (PRO.activePanel === 'scm' ? closePanel() : openPanel('scm')));
-    side.insertBefore(chip, side.firstChild);
-  }
-  const n = SCM.staged.length + SCM.changes.length;
-  chip.classList.toggle('on', PRO.activePanel === 'scm');
-  chip.innerHTML = `${icon('branch', 13)}<span class="scm-branch"></span>${n ? `<span class="scm-count">${n}</span>` : ''}`;
-  chip.querySelector('.scm-branch').textContent = SCM.branch || 'detached';
-  chip.title = `Source Control: ${SCM.branch || 'no branch'}${n ? `, ${n} changed` : ''}`;
+// Keeps the place and the caret: this redraws whenever files change.
+function scmRenderPane() {
+  // Not under a pressed mouse button: the click would be lost with the row.
+  if (SCM.pressed) { SCM.redraw = true; return; }
+  const view = $('#scm-view');
+  const top = view.scrollTop;
+  const box = document.getElementById('scm-message');
+  const typing = box && document.activeElement === box ? [box.selectionStart, box.selectionEnd] : null;
+  const el = document.createElement('div');
+  el.className = 'panel';
+  renderScmPanel(el);
+  iconize(el);
+  // Nothing new: the rows stay, so a click in progress isn't lost.
+  if (view.firstElementChild?.innerHTML === el.innerHTML) return;
+  view.replaceChildren(el);
+  view.scrollTop = top;
+  if (typing) { const b = document.getElementById('scm-message'); b?.focus(); b?.setSelectionRange(...typing); }
+}
+
+function scmRenderCount() {
+  const c = document.getElementById('scm-count');
+  if (!c) return;
+  const n = SCM.repo ? SCM.staged.length + SCM.changes.length : 0;
+  c.hidden = !n;
+  c.textContent = n;
+  $('#view-scm').title = SCM.repo ? `Changes on ${SCM.branch || 'no branch'}${n ? `: ${n}` : ''}` : 'Changes';
 }
 
 async function scmRun(label, fn) {
@@ -174,10 +263,10 @@ const scmPush = () => scmRun('Pushing…', async () => {
 async function scmLoadPrs() {
   if (!SCM.info?.gh) { SCM.prs = null; return; }
   try {
-    const r = await wb.gh(['pr', 'list', '--json', 'number,title,headRefName,url,state', '--limit', '15']);
+    const r = await wb.gh(['pr', 'list', '--json', 'number,title,headRefName,url,state', '--limit', '15'], { repo: SCM.root || undefined });
     SCM.prs = r.code === 0 ? JSON.parse(r.stdout || '[]') : { error: (r.stderr || 'gh failed').trim().split('\n')[0] };
   } catch (err) { SCM.prs = { error: err.message }; }
-  if (PRO.activePanel === 'scm') renderPanel();
+  if (SCM.open) scmRenderPane();
 }
 
 const scmCreatePr = () => scmRun('Creating the pull request…', async () => {
@@ -195,13 +284,19 @@ async function scmShowDiff(file, staged) {
   const monaco = await loadMonaco();
   // The file as it was: in the last commit (staged changes), else as staged.
   let original = '';
-  if (!file.untracked) {
+  if (file.committed) {
+    if (file.code !== 'A') { const r = await scmGit(['show', `${SCM.mergeBase}:${file.path}`]); original = r.code === 0 ? r.stdout : ''; }
+  } else if (!file.untracked) {
     const ref = staged ? `HEAD:${file.orig || file.path}` : `:${file.path}`;
     const r = await scmGit(['show', ref]);
     original = r.code === 0 ? r.stdout : '';
   }
   let modified = '';
-  if (staged) {
+  if (file.committed) {
+    if (file.code !== 'D') { const r = await scmGit(['show', `HEAD:${file.path}`]); modified = r.code === 0 ? r.stdout : ''; }
+  } else if (SCM.root) {
+    if (file.code !== 'D') { try { modified = await wb.gitReadFile(SCM.root, file.path); } catch { modified = ''; } }
+  } else if (staged) {
     const r = await scmGit(['show', `:${file.path}`]);
     modified = r.code === 0 ? r.stdout : '';
   } else if (file.code !== 'D') {
@@ -220,7 +315,8 @@ async function scmShowDiff(file, staged) {
     host.querySelector('#diff-open').addEventListener('click', () => { const p = SCM.diff?.path; scmCloseDiff(); if (p) openFile(p, { focus: true }); });
   }
   host.hidden = false;
-  host.querySelector('.diff-title').textContent = `${file.path} — ${staged ? 'staged' : 'changes'}`;
+  host.querySelector('#diff-open').hidden = !!SCM.root;
+  host.querySelector('.diff-title').textContent = `${file.path} — ${file.committed ? `against ${SCM.base}` : staged ? 'staged' : 'changes'}`;
   if (!S.diffEditor) {
     S.diffEditor = monaco.editor.createDiffEditor(host.querySelector('#diff-host'), {
       renderSideBySide: true, readOnly: true, originalEditable: false, automaticLayout: true,
@@ -233,7 +329,7 @@ async function scmShowDiff(file, staged) {
   const after = monaco.editor.createModel(modified, lang, monaco.Uri.from({ scheme: 'git', path: '/after/' + file.path }));
   S.diffEditor.setModel({ original: before, modified: after });
   SCM.diff = { path: file.path, staged };
-  if (PRO.activePanel === 'scm') renderPanel();
+  if (SCM.open) scmRenderPane();
 }
 
 function scmCloseDiff() {
@@ -242,7 +338,7 @@ function scmCloseDiff() {
   SCM.diff = null;
   if (S.diffEditor) S.diffEditor.setModel(null);
   S.monaco?.editor.getModels().filter((m) => m.uri.scheme === 'git').forEach((m) => m.dispose());
-  if (PRO.activePanel === 'scm') renderPanel();
+  if (SCM.open) scmRenderPane();
 }
 
 // ------------------------------------------------------------------ the panel
@@ -256,7 +352,8 @@ function scmRow(file, staged) {
   code.title = { M: 'Modified', A: 'Added', D: 'Deleted', R: 'Renamed', U: 'Untracked', '!': 'Conflict', T: 'Type changed', C: 'Copied' }[file.code] || file.code;
   row.append(name, dir, h('span', 'grow'));
   const act = (label, title, fn, cls) => { const b = h('button', `icon-btn scm-act ${cls}`, label); b.title = title; b.addEventListener('click', (e) => { e.stopPropagation(); fn(); }); return b; };
-  if (staged) row.append(act('−', 'Unstage', () => scmUnstage([file.path]), 'unstage'));
+  if (SCM.root || file.committed) { /* viewing only */ }
+  else if (staged) row.append(act('−', 'Unstage', () => scmUnstage([file.path]), 'unstage'));
   else {
     row.append(act('↺', file.untracked ? 'Delete' : 'Discard changes', () => scmDiscard(file), 'discard'));
     row.append(act('+', 'Stage', () => scmStage([file.path]), 'stage'));
@@ -266,28 +363,86 @@ function scmRow(file, staged) {
   return row;
 }
 
+// Which repository: the project's, or one an agent changed.
+function scmRepoPicker(el) {
+  if (SCM.repos.length < 2) return;
+  const current = SCM.repos.find((r) => (SCM.root ? r.path === SCM.root : r.kind === 'project')) || SCM.repos[0];
+  const b = h('button', 'scm-repo-btn');
+  b.id = 'scm-repo';
+  b.title = current.path;
+  b.innerHTML = `${icon('folder', 13)}<span class="name"></span>${icon('chevronDown', 12)}`;
+  b.querySelector('.name').textContent = current.name;
+  b.addEventListener('click', () => { SCM.picking = !SCM.picking; scmRender(); });
+  el.append(b);
+  if (!SCM.picking) return;
+  const list = h('div', 'scm-repos');
+  const kinds = { project: 'this project', agent: 'agent changed', nested: 'inside' };
+  for (const r of SCM.repos) {
+    const item = h('button', 'scm-repo-item' + (r === current ? ' on' : ''));
+    item.dataset.repo = r.path;
+    item.title = r.path;
+    item.append(h('span', 'scm-name', r.name), h('span', 'kind', kinds[r.kind] || ''));
+    item.addEventListener('click', () => scmPickRepo(r));
+    list.append(item);
+  }
+  el.append(list);
+}
+
+function scmModes(el) {
+  const m = h('div', 'scm-modes');
+  for (const [id, label] of [['changes', 'Not committed'], ['branch', 'This branch']]) {
+    const b = h('button', 'scm-mode' + (SCM.mode === id ? ' on' : ''), label);
+    b.dataset.mode = id;
+    b.addEventListener('click', () => scmSetMode(id));
+    m.append(b);
+  }
+  el.append(m);
+  if (SCM.pr) {
+    const pr = h('button', 'scm-pr-chip');
+    pr.id = 'scm-this-pr';
+    pr.title = SCM.pr.url;
+    pr.append(h('span', 'scm-num', `#${SCM.pr.number}`), h('span', 'scm-name', SCM.pr.title), h('span', 'scm-dir', SCM.pr.state.toLowerCase()));
+    pr.addEventListener('click', () => wb.toHost({ type: 'link', url: SCM.pr.url }));
+    el.append(pr);
+  }
+}
+
 function renderScmPanel(el) {
+  scmRepoPicker(el);
   if (!SCM.loaded) { el.append(h('p', 'muted', 'Reading the repository…')); scmRefresh(); return; }
   if (!SCM.info?.git) { el.append(h('p', 'muted', 'git isn’t installed on this computer. Install it (on a Mac: xcode-select --install) to use Source Control.')); return; }
   if (!SCM.repo) {
     el.append(h('p', 'muted', 'This folder isn’t a git repository.'));
-    el.append(btn('Initialize Repository', 'primary', () => scmRun('Initializing…', () => scmMust(['init']))));
+    if (!SCM.root) el.append(btn('Initialize Repository', 'primary', () => scmRun('Initializing…', () => scmMust(['init']))));
     return;
   }
   // Branch, pull, push.
   const head = h('div', 'scm-head');
-  const branch = btn('', 'scm-branch-btn', scmBranchMenu, 'Switch or create a branch');
+  const branch = btn('', 'scm-branch-btn', () => { if (!SCM.root) scmBranchMenu(); }, SCM.root ? 'The current branch' : 'Switch or create a branch');
   branch.innerHTML = `${icon('branch', 13)}<span></span>`;
   branch.querySelector('span').textContent = SCM.branch || 'detached';
   head.append(branch, h('span', 'grow'));
-  if (SCM.upstream || SCM.branch) {
+  if (!SCM.root && (SCM.upstream || SCM.branch)) {
     const pull = btn(`Pull${SCM.behind ? ` ↓${SCM.behind}` : ''}`, 'scm-pull', scmPull, 'git pull --ff-only');
     const push = btn(`Push${SCM.ahead ? ` ↑${SCM.ahead}` : ''}`, 'scm-push', scmPush, SCM.upstream ? 'git push' : 'Publish this branch (git push --set-upstream origin)');
     head.append(pull, push);
   }
   el.append(head);
+  scmModes(el);
+  if (SCM.root) el.append(h('p', 'scm-readonly', 'Viewing only: this repository is outside the project.'));
   if (SCM.busy) el.append(h('p', 'muted scm-busy', SCM.busy));
   if (SCM.error) el.append(h('p', 'warn-box', SCM.error));
+  if (SCM.mode === 'branch') {
+    if (!SCM.base) el.append(h('p', 'muted', 'No main branch to compare with.'));
+    else {
+      const g = h('div', 'scm-group');
+      g.append(h('div', 'scm-group-title', `Against ${SCM.base} (${SCM.branchFiles.length})`));
+      g.append(...SCM.branchFiles.map((f) => scmRow(f, false)));
+      el.append(g);
+      if (!SCM.branchFiles.length) el.append(h('p', 'muted', 'This branch has no commits of its own.'));
+    }
+    return;
+  }
   // Commit.
   const msg = h('textarea', 'scm-message');
   msg.id = 'scm-message';
@@ -298,12 +453,12 @@ function renderScmPanel(el) {
   msg.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); scmCommit(); } });
   const commit = btn(SCM.staged.length ? 'Commit' : 'Commit All', 'primary scm-commit', scmCommit);
   commit.disabled = !SCM.staged.length && !SCM.changes.length;
-  el.append(msg, commit);
+  if (!SCM.root) el.append(msg, commit);
   // Changes.
   const group = (title, files, staged) => {
     const g = h('div', 'scm-group');
     const t = h('div', 'scm-group-title', `${title} (${files.length})`);
-    if (files.length) {
+    if (files.length && !SCM.root) {
       const all = h('button', 'icon-btn scm-act', staged ? '−' : '+');
       all.title = staged ? 'Unstage all' : 'Stage all';
       all.addEventListener('click', () => (staged ? scmUnstage(files.map((f) => f.path)) : scmStage(files.map((f) => f.path))));
@@ -322,7 +477,7 @@ function renderScmPanel(el) {
     const create = h('button', 'icon-btn scm-act', '+');
     create.title = 'Create a pull request for this branch (gh pr create --fill)';
     create.addEventListener('click', scmCreatePr);
-    t.append(create);
+    if (!SCM.root) t.append(create);
     g.append(t);
     if (SCM.prs === null) { g.append(h('p', 'muted', 'Loading…')); scmLoadPrs(); }
     else if (SCM.prs.error) g.append(h('p', 'muted', SCM.prs.error));
@@ -350,14 +505,22 @@ function renderScmPanel(el) {
   }
 }
 
-BUILTIN_PANELS.scm = { title: 'Source Control', icon: 'branch', render: renderScmPanel };
-
 // The project's repository: read when a project opens and after files change.
 bus.addEventListener('project', () => {
-  Object.assign(SCM, { info: null, repo: false, loaded: false, staged: [], changes: [], log: [], prs: null, diff: null, message: '' });
-  document.getElementById('scm-chip')?.remove();
+  Object.assign(SCM, { info: null, repo: false, loaded: false, staged: [], changes: [], log: [], prs: null, diff: null, message: '', root: '', repos: [], picking: false, mode: 'changes', pr: null, branchFiles: [] });
   scmRefresh();
+  scmLoadRepos();
 });
 document.addEventListener('DOMContentLoaded', () => {
   wb.onFsChange(() => { if (S.project) scmSoon(); });
+  $('#view-files').addEventListener('click', () => scmSetOpen(false));
+  $('#view-scm').addEventListener('click', () => scmSetOpen(true));
+  $('#scm-view').addEventListener('mousedown', () => { SCM.pressed = true; });
+  window.addEventListener('mouseup', () => setTimeout(() => {
+    if (!SCM.pressed) return;
+    SCM.pressed = false;
+    if (SCM.redraw) { SCM.redraw = false; scmRender(); }
+  }, 0));
+  // Another repository has no watcher here: looked at while it is on screen.
+  setInterval(() => { if (SCM.open && SCM.root && !document.hidden && !SCM.busy) scmRefresh(); }, 5000);
 });

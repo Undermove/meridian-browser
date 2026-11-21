@@ -75,3 +75,33 @@ test('a tab dropped onto another in the sidebar splits them into one row; dragge
     await b.waitFor(`${SB}.querySelectorAll('.split-row').length === 0 && app.$.tabstrip.state_.splits.length === 0`);
   } finally { await b.close(); }
 });
+
+// Arc: while a tab is held over another, an empty half shows where it will land, left or right.
+test('holding a tab over another shows the empty half it will take, on the side it is dropped', async () => {
+  const b = await launch([page('Anchor', '%23fde'), page('Moved', '%23def')]);
+  const row = (t) => `[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === ${JSON.stringify(t)})?.shadowRoot.querySelector('.row')`;
+  const ghost = `app.shadowRoot.getElementById('splitGhost')`;
+  const seen = (side) => async () => {
+    await b.waitFor(`${ghost}.classList.contains('show') && ${ghost}.dataset.side === '${side}'`);
+    await b.waitFor(`getComputedStyle(${ghost}).opacity > 0.9`);
+    const r = await b.eval(`(() => { const g = ${ghost}.getBoundingClientRect(), p = ${CR}.getBoundingClientRect(); return { text: ${ghost}.textContent.trim(), slot: ${row('Anchor')}.classList.contains('split-${side}'), width: g.width / p.width, onLeft: g.left < p.left + p.width / 4 }; })()`);
+    assert.equal(r.text, 'Moved', 'names the tab being moved');
+    assert.ok(r.slot, 'the row shows the empty half too');
+    assert.ok(Math.abs(r.width - 0.5) < 0.03, 'half of the page');
+    assert.equal(r.onLeft, side === 'left');
+  };
+  const titles = `[...${SB}.querySelectorAll('.split-row meridian-tab-row')].map((r) => r.tab.title)`;
+  try {
+    await b.waitFor(today(2));
+    await b.drag(row('Moved'), row('Anchor'), { fx: 0.2, fy: 0.5, beforeDrop: seen('left') });
+    await b.waitFor(`${SB}.querySelectorAll('.split-row').length === 1`);
+    assert.deepEqual(await b.eval(titles), ['Moved', 'Anchor'], 'dropped on the left half');
+    await b.waitFor(`!${ghost}.classList.contains('show')`);
+
+    await b.menu(`${SB}.querySelector('.split-row meridian-tab-row') && [...${SB}.querySelectorAll('.split-row meridian-tab-row')][0].shadowRoot.querySelector('.row')`, 'Separate Split');
+    await b.waitFor(`${SB}.querySelectorAll('.split-row').length === 0`);
+    await b.drag(row('Moved'), row('Anchor'), { fx: 0.8, fy: 0.5, beforeDrop: seen('right') });
+    await b.waitFor(`${SB}.querySelectorAll('.split-row').length === 1`);
+    assert.deepEqual(await b.eval(titles), ['Anchor', 'Moved'], 'dropped on the right half');
+  } finally { await b.close(); }
+});

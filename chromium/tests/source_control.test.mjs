@@ -64,17 +64,17 @@ test('Source Control: changes, a diff, stage, commit, discard, push, pull reques
     await wb.eval(`document.querySelector('#open-folder').click()`);
     await wb.waitFor('!!S.project');
 
-    // The top bar: the branch and two changes.
-    await wb.waitFor(`document.querySelector('#scm-chip .scm-branch')?.textContent === 'main' && document.querySelector('#scm-chip .scm-count')?.textContent === '2'`, 15000).catch(async (e) => {
+    // Above the files: the branch icon with two changes.
+    await wb.waitFor(`SCM.branch === 'main' && document.getElementById('scm-count')?.textContent === '2'`, 15000).catch(async (e) => {
       throw new Error(e.message + ' ' + JSON.stringify(await wb.eval(`[typeof SCM === 'undefined' ? 'no SCM' : JSON.stringify({ info: SCM.info, repo: SCM.repo, loaded: SCM.loaded, error: SCM.error, branch: SCM.branch, n: SCM.changes.length }), typeof window.workbench.git, [...document.scripts].map((s) => s.src.split('/').pop()).join(',')]`)));
     });
-    await mouse(wb, `document.getElementById('scm-chip')`);
-    await wb.waitFor(`PRO.activePanel === 'scm' && document.querySelectorAll('#side-body .scm-row[data-path]').length === 2`);
-    const rows = await wb.eval(`[...document.querySelectorAll('#side-body .scm-row[data-path]')].map((r) => [r.dataset.path, r.querySelector('.scm-code').textContent])`);
+    await mouse(wb, `document.getElementById('view-scm')`);
+    await wb.waitFor(`SCM.open && document.getElementById('tree').hidden && document.querySelectorAll('#scm-view .scm-row[data-path]').length === 2`);
+    const rows = await wb.eval(`[...document.querySelectorAll('#scm-view .scm-row[data-path]')].map((r) => [r.dataset.path, r.querySelector('.scm-code').textContent])`);
     assert.deepEqual(rows.sort(), [['app.txt', 'M'], ['notes.md', 'U']]);
 
     // The diff, side by side.
-    const row = (p) => `document.querySelector('#side-body .scm-row[data-path=${JSON.stringify(p)}]')`;
+    const row = (p) => `document.querySelector('#scm-view .scm-row[data-path=${JSON.stringify(p)}]')`;
     await mouse(wb, row('app.txt'));
     await wb.waitFor(`!document.getElementById('diff-pane')?.hidden && !!S.diffEditor?.getModel()`);
     assert.deepEqual(await wb.eval(`[S.diffEditor.getModel().original.getValue(), S.diffEditor.getModel().modified.getValue()]`), ['one\ntwo\nthree\n', 'one\nTWO\nthree\n']);
@@ -88,14 +88,14 @@ test('Source Control: changes, a diff, stage, commit, discard, push, pull reques
 
     // Stage app.txt (its + on hover), then commit it with a message: notes.md stays a change.
     await mouse(wb, `${row('app.txt')}.querySelector('.stage')`, { hoverFirst: row('app.txt') });
-    await wb.waitFor(`[...document.querySelectorAll('#side-body .scm-group-title')].some((t) => t.textContent.startsWith('Staged (1)'))`);
+    await wb.waitFor(`[...document.querySelectorAll('#scm-view .scm-group-title')].some((t) => t.textContent.startsWith('Staged (1)'))`);
     await mouse(wb, `document.getElementById('scm-message')`);
     await wb.cdp.send('Input.insertText', { text: 'Shout the second line' });
-    await mouse(wb, `document.querySelector('#side-body .scm-commit')`);
-    await wb.waitFor(`document.querySelector('#scm-chip .scm-count')?.textContent === '1'`, 10000);
+    await mouse(wb, `document.querySelector('#scm-view .scm-commit')`);
+    await wb.waitFor(`document.getElementById('scm-count')?.textContent === '1'`, 10000);
     assert.equal(git(project, 'log', '-1', '--format=%s'), 'Shout the second line');
     assert.equal(git(project, 'status', '--porcelain'), '?? notes.md');
-    await wb.waitFor(`[...document.querySelectorAll('#side-body .scm-commit-row .scm-name')].map((e) => e.textContent).join() === 'Shout the second line,First'`);
+    await wb.waitFor(`[...document.querySelectorAll('#scm-view .scm-commit-row .scm-name')].map((e) => e.textContent).join() === 'Shout the second line,First'`);
 
     // Discard a change (after saying so): the committed version is back.
     fs.writeFileSync(path.join(project, 'app.txt'), 'oops\n');
@@ -107,12 +107,12 @@ test('Source Control: changes, a diff, stage, commit, discard, push, pull reques
     assert.equal(fs.readFileSync(path.join(project, 'app.txt'), 'utf8'), 'one\nTWO\nthree\n');
 
     // Push: the branch is published to its remote.
-    await mouse(wb, `document.querySelector('#side-body .scm-push')`);
+    await mouse(wb, `document.querySelector('#scm-view .scm-push')`);
     await wb.waitFor(`!SCM.busy && SCM.upstream === 'origin/main'`, 20000);
     assert.equal(git(remote, 'log', '-1', '--format=%s', 'main'), 'Shout the second line');
 
     // Pull requests, from gh.
-    await wb.waitFor(`document.querySelector('#side-body .scm-pr .scm-name')?.textContent === 'Fix the login'`, 10000);
+    await wb.waitFor(`document.querySelector('#scm-view .scm-pr .scm-name')?.textContent === 'Fix the login'`, 10000);
 
     // git only as the panel uses it, inside the project.
     const refused = (args) => wb.eval(`window.workbench.git(${JSON.stringify(args)}).then(() => 'ran', (e) => e.message)`);
@@ -126,5 +126,69 @@ test('Source Control: changes, a diff, stage, commit, discard, push, pull reques
     wb?.close();
     await b.close();
     for (const d of [project, remote, bin]) fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+// The repository an agent changed need not be the open one: it can be picked, its uncommitted work
+// and its branch against main are shown, its pull request is named, and nothing there can be changed.
+test('Changes: another repository an agent worked in, its branch and pull request, viewing only', async () => {
+  const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-scm-')));
+  const other = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-scm-other-')));
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
+  for (const d of [project, other]) {
+    git(d, 'init', '-q', '-b', 'main');
+    git(d, 'config', 'user.name', 'Test');
+    git(d, 'config', 'user.email', 'test@example.com');
+    git(d, 'config', 'commit.gpgsign', 'false');
+    git(d, 'config', 'core.autocrlf', 'false');
+    fs.writeFileSync(path.join(d, 'base.txt'), 'base\n');
+    git(d, 'add', '-A');
+    git(d, 'commit', '-q', '-m', 'First');
+  }
+  git(other, 'switch', '-q', '-c', 'feature');
+  fs.writeFileSync(path.join(other, 'done.txt'), 'committed on the branch\n');
+  git(other, 'add', '-A');
+  git(other, 'commit', '-q', '-m', 'Work');
+  fs.writeFileSync(path.join(other, 'base.txt'), 'edited by the agent\n');
+  fs.writeFileSync(path.join(bin, 'gh'), `#!/bin/sh\nif [ "$1 $2" = "pr view" ]; then echo '{"number":42,"title":"Agent work","url":"https://github.com/example/other/pull/42","state":"OPEN"}'; fi\n`, { mode: 0o755 });
+  const b = await launch(['about:blank'], { args: [`--meridian-test-project=${project}`, `--meridian-test-git-repo=${other}`, `--meridian-agents-path=${testPath(bin)}`, '--meridian-no-notify'] });
+  let wb;
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    await b.eval('app.$.tabstrip.runCommand(16, 0)');
+    wb = await b.page('chrome://workbench');
+    await wb.waitFor(`!document.querySelector('#welcome').hidden`, 15000);
+    await wb.eval(`document.querySelector('#open-folder').click()`);
+    await wb.waitFor('!!S.project');
+    await mouse(wb, `document.getElementById('view-scm')`);
+    await wb.waitFor(`!!document.getElementById('scm-repo')`, 10000);
+    await mouse(wb, `document.getElementById('scm-repo')`);
+    const item = `document.querySelector('.scm-repo-item[data-repo=${JSON.stringify(other).replace(/\\/g, '\\\\')}]')`;
+    await wb.waitFor(`!!${item}`);
+    await mouse(wb, item);
+
+    // Its uncommitted change, with the real text in the diff, and no way to change it.
+    const row = `document.querySelector('#scm-view .scm-row[data-path="base.txt"]')`;
+    await wb.waitFor(`SCM.branch === 'feature' && !!${row}`, 10000);
+    assert.equal(await wb.eval(`!!document.getElementById('scm-message') || !!document.querySelector('#scm-view .stage, #scm-view .discard, #scm-view .scm-push')`), false, 'viewing only');
+    await mouse(wb, row);
+    await wb.waitFor(`S.diffEditor?.getModel()?.modified.getValue() === 'edited by the agent\\n'`);
+    assert.equal(await wb.eval(`S.diffEditor.getModel().original.getValue()`), 'base\n');
+
+    // The branch against main, and the branch's pull request.
+    await mouse(wb, `document.querySelector('.scm-mode[data-mode="branch"]')`);
+    await wb.waitFor(`SCM.mode === 'branch' && !!document.querySelector('#scm-view .scm-row[data-path="done.txt"]')`, 10000);
+    await wb.waitFor(`document.querySelector('#scm-this-pr .scm-name')?.textContent === 'Agent work'`, 10000);
+
+    // Refused by the browser too, not just hidden.
+    const write = await wb.eval(`window.workbench.git(['add', '-A'], { repo: ${JSON.stringify(other)} }).then(() => 'ran', (e) => e.message)`);
+    assert.match(write, /outside the project/);
+    const unknown = await wb.eval(`window.workbench.git(['status'], { repo: ${JSON.stringify(os.tmpdir())} }).then(() => 'ran', (e) => e.message)`);
+    assert.match(unknown, /unknown repository/);
+    assert.ok(git(other, 'status', '--porcelain').includes('base.txt'), 'the work is untouched');
+  } finally {
+    wb?.close();
+    await b.close();
+    for (const d of [project, other, bin]) fs.rmSync(d, { recursive: true, force: true });
   }
 });
