@@ -571,3 +571,35 @@ test('an agent connected earlier asks once: Allow gives full control and its cal
     assert.equal(await b2.eval(`app.$.tabstrip.handler_.getSettings().then((r) => r.settings.agentAccess)`), 'off');
   } finally { mcp2.close(); await b2.close(); fs.rmSync(denied, { recursive: true, force: true }); }
 });
+
+test('a space with its own profile doesn\'t take over the agent: Settings of the browser decide', async () => {
+  const s = await site();
+  const profile = profileWith({ agent_access: 'full', agent_access_decided: true, agent_allow_js: true });
+  const b = await launch([s.url('/form')], { profile });
+  const T = 'app.$.tabstrip';
+  const info = path.join(profile, 'Meridian Agent.json');
+  let mcp;
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(info); i++) await sleep(100);
+    const first = JSON.parse(fs.readFileSync(info, 'utf8')).socket;
+    const { profileId } = await b.eval(`${T}.handler_.addProfile('Work')`);
+    const { spaceId } = await b.eval(`${T}.handler_.createSpace('Client', '', '', '')`);
+    await b.eval(`${T}.handler_.setSpaceProfile(${JSON.stringify(spaceId)}, ${JSON.stringify(profileId)})`);
+    await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(spaceId)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(spaceId)}`);
+    await b.eval(`${T}.openUrl(${JSON.stringify(s.url('/form?work'))})`);
+    await b.page(s.url('/form?work'));
+    await sleep(500);
+    assert.equal(JSON.parse(fs.readFileSync(info, 'utf8')).socket, first, 'the same agent server');
+
+    mcp = bridge(profile);
+    await mcp.request('initialize', { protocolVersion: '2025-06-18', clientInfo: { name: 'test-client', version: '1' }, capabilities: {} });
+    assert.equal((await mcp.call('run_javascript', { code: '1 + 1' })).value, 2);
+
+    // Turned off from a window showing that space: nothing listens any more.
+    await b.eval(`${T}.handler_.getSettings().then((r) => ${T}.handler_.setSettings({ ...r.settings, agentAccess: 'off' }))`);
+    for (let i = 0; i < 60 && fs.existsSync(info); i++) await sleep(100);
+    assert.equal(fs.existsSync(info), false, 'nothing listens after Off');
+  } finally { mcp?.close(); await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
