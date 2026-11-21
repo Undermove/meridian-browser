@@ -12,7 +12,7 @@ import { standIn } from './stand_in.mjs';
 const AK = 'app.$.ask.shadowRoot';
 const AC = 'app.$.aiConsent.shadowRoot';
 const H = 'app.$.tabstrip.handler_';
-const NO_CLI = process.platform === 'win32';
+const NO_CLI = process.platform === 'win32' && 'Codex is an agent CLI, and those run on macOS only for now';
 
 function fakes(dir) {
   standIn(dir, 'claude', `if (process.argv[2] === 'auth') { console.log(JSON.stringify({ loggedIn: true })); process.exit(0); }
