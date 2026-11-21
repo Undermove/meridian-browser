@@ -99,7 +99,7 @@ Linux and Intel Macs aren't supported by the current version.
 
 **First launch.** The macOS build will be Apple-signed soon; until then, open it once, then **System Settings › Privacy & Security › Open Anyway**. On Windows, if SmartScreen says "Windows protected your PC", click **More info › Run anyway**. Every release has signed `SHA256SUMS.txt` to check the download.
 
-**Updates** come by themselves: Meridian checks every hour, shows what's new, and restarts with your tabs.
+**Updates** come by themselves: Meridian checks every 20 minutes, shows what's new, and restarts with your tabs.
 
 ## Connect Claude Code (MCP)
 
