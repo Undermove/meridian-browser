@@ -209,11 +209,17 @@ test('first run: Claude is found, one Yes connects it, the AI suggests a setup, 
     await b.waitFor(`!${OB}.getElementById('undoSetup')`);
 
     // Claude Desktop reads its config when it starts: restart, asked first.
-    await b.click(`${OB}.getElementById('restartClaude')`);
-    await b.waitFor(`!!${OB}.getElementById('restartGo')`);
-    assert.match(await b.eval(`${OB}.querySelector('.confirm .card').textContent`), /unsaved/);
-    await b.click(`${OB}.getElementById('restartGo')`);
-    await b.waitFor(`/restarted/i.test(${OB}.querySelector('.ai-done')?.textContent || '')`);
+    if (process.platform === 'win32') {
+      // Meridian can't reopen it there: it says what to do and promises nothing.
+      assert.match(await b.eval(`${OB}.querySelector('.ai-done').textContent`), /Close Claude and open it again/);
+      assert.equal(await b.eval(`!!${OB}.getElementById('restartClaude')`), false);
+    } else {
+      await b.click(`${OB}.getElementById('restartClaude')`);
+      await b.waitFor(`!!${OB}.getElementById('restartGo')`);
+      assert.match(await b.eval(`${OB}.querySelector('.confirm .card').textContent`), /unsaved/);
+      await b.click(`${OB}.getElementById('restartGo')`);
+      await b.waitFor(`/restarted/i.test(${OB}.querySelector('.ai-done')?.textContent || '')`);
+    }
 
     // A hint is the real thing.
     await b.click(`${OB}.querySelector('.try[data-try="ask"]')`);
