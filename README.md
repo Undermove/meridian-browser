@@ -30,7 +30,9 @@
   <a href="#known-limitations">Limitations</a>
 </p>
 
-Meridian is a free, open-source browser built on Chromium, so sites, Google sign-in, passkeys and extensions work like in Chrome. On top of it: the Arc sidebar you know, and a home for coding agents (Claude Code, Codex and others) right next to the page they work on. **Arc stops working on December 22, 2026**; Meridian brings your whole setup over in one click.
+**Meridian is a replacement for Arc first.** Arc stops working on December 22, 2026. If you just want the browser Arc was, that's what you get: the sidebar, Spaces and Boosts, with your whole setup brought over in one click. It's free, open source and built on Chromium, so sites, Google sign-in, passkeys and extensions work like in Chrome.
+
+**AI agents are there if you want them.** If you work with coding agents (Claude Code, Codex and others), they get a home right next to the page they work on. If you don't, you can ignore that part and just browse.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/readme/features-dark.webp">
@@ -69,6 +71,8 @@ One click, on your computer. Nothing leaves it, and the other browser isn't chan
 - Also: private windows, a theme editor per space, built-in ad and tracker blocking, Chrome extensions, a hideable sidebar on either side, every shortcut configurable.
 
 ## For AI agents
+
+Optional. Skip this section if you only came for the browser.
 
 <p align="center"><img src="docs/readme/agent-asks.webp" width="820" alt="Claude Code asks before running a command, right in Meridian"></p>
 
