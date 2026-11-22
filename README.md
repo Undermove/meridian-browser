@@ -161,7 +161,7 @@ Found a vulnerability? Please open a private security advisory on GitHub.
 
 ## Build from source
 
-Meridian is a set of patches on Chromium plus its own UI. The code and build steps are on the [`chromium-port`](https://github.com/Undermove/meridian-browser/tree/chromium-port/chromium) branch (about 60 GB free space and a few hours for the first build). The `src/` folder on this branch is the earlier Electron version (0.4.x), kept for reference.
+Meridian is a set of patches on Chromium plus its own UI. The code and build steps are in [`chromium/`](chromium/) (about 60 GB free space and a few hours for the first build). The `src/` folder and the root `package.json` are the earlier Electron version (0.4.x), kept for reference.
 
 ## Privacy
 
