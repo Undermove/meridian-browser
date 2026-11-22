@@ -1,0 +1,613 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 19 Nov 2026 14:04:48 +0400
+Subject: [PATCH 173/202] Meridian: Restart to update shows what's new first;
+ after an update, the changelog
+
+The sidebar's pill and Settings' Restart to Update open a sheet with the
+release's notes (GitHub's, Markdown), Full changelog, Later and Restart now.
+The first window after an update opens the public changelog at the new
+version's entry (not on a new install; tests set its address with
+--meridian-test-changelog-url).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/prefs.cc              |   1 +
+ chrome/browser/meridian/prefs.h               |   2 +
+ chrome/browser/meridian/sidebar.mojom         |   2 +
+ chrome/browser/meridian/sidebar_handler.cc    |  28 ++++
+ chrome/browser/meridian/sidebar_handler.h     |   1 +
+ chrome/browser/meridian/update_check.cc       |   3 +
+ chrome/browser/meridian/update_check.h        |   2 +
+ chrome/browser/meridian/updater.cc            |   1 +
+ chrome/browser/meridian/updater_win.cc        |   1 +
+ .../browser/resources/webui_browser/BUILD.gn  |   3 +
+ .../resources/webui_browser/app.html.ts       |   5 +
+ chrome/browser/resources/webui_browser/app.ts |  11 +-
+ .../webui_browser/meridian/settings.ts        |   5 +-
+ .../webui_browser/meridian/sidebar.ts         |   5 +-
+ .../webui_browser/meridian/update_sheet.css   | 147 ++++++++++++++++++
+ .../meridian/update_sheet.html.ts             |  42 +++++
+ .../webui_browser/meridian/update_sheet.ts    | 101 ++++++++++++
+ 17 files changed, 357 insertions(+), 3 deletions(-)
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/update_sheet.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/update_sheet.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/update_sheet.ts
+
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index ada6503927..3a29b11568 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -14,6 +14,7 @@ namespace meridian::prefs {
+ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterDictionaryPref(kAtc);
+   registry->RegisterBooleanPref(kOnboarded, false);
++  registry->RegisterStringPref(kLastVersion, std::string());
+   registry->RegisterBooleanPref(kWindowsGathered, false);
+   registry->RegisterStringPref(kMode, "everyday");
+   registry->RegisterBooleanPref(kSidebarRight, false);
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index ecee7335b7..604a57b404 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -15,6 +15,8 @@ namespace meridian::prefs {
+ inline constexpr char kAtc[] = "meridian.atc";
+ // The welcome tour was finished or skipped.
+ inline constexpr char kOnboarded[] = "meridian.onboarded";
++// The version that last ran: a newer one opens the changelog at its entry.
++inline constexpr char kLastVersion[] = "meridian.last_version";
+ // Whether the windows left by the old one-window-per-profile model were
+ // gathered into one (once).
+ inline constexpr char kWindowsGathered[] = "meridian.windows_gathered";
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index af99a132a5..39fcfe1b55 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -75,6 +75,8 @@ struct UpdateState {
+   double progress;
+   string error;
+   string page_url;
++  // The release notes (Markdown), shown before restarting to update.
++  string notes;
+ };
+ 
+ // A Meridian profile: its own cookies, logins and site data. The main one
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 7350873236..c5e7b74638 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -2268,6 +2268,34 @@ void SidebarHandler::Notify() {
+ 
+ void SidebarHandler::GetState(GetStateCallback callback) {
+   std::move(callback).Run(BuildState());
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&SidebarHandler::MaybeShowWhatsNew,
++                                weak_factory_.GetWeakPtr()));
++}
++
++// What's new: the first window after an update opens the changelog at the
++// new version's entry (not on a new install, which is onboarded instead).
++void SidebarHandler::MaybeShowWhatsNew() {
++  static bool checked = false;
++  if (checked || !HoldsSpaceTabs(browser_.get())) {
++    return;
++  }
++  checked = true;
++  PrefService* prefs = browser_->GetProfile()->GetPrefs();
++  const std::string last = prefs->GetString(prefs::kLastVersion);
++  prefs->SetString(prefs::kLastVersion, update::kVersion);
++  const bool updated = last.empty() ? prefs->GetBoolean(prefs::kOnboarded)
++                                    : update::IsNewer(update::kVersion, last);
++  std::string page = "https://undermove.github.io/meridian-browser/changelog.html";
++  if (TestSwitchesAllowed()) {
++    // Tests: only one that asks for it.
++    page = TestSwitchValue("meridian-test-changelog-url");
++  }
++  if (!updated || page.empty()) {
++    return;
++  }
++  OpenInSpace(browser_.get(), service_->active_space_id(),
++              GURL(page + "#v" + update::kVersion), /*active=*/true);
+ }
+ 
+ void SidebarHandler::CreateSpace(const std::string& name,
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 17eb395adc..a4a127d924 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -315,6 +315,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   // Mission Control's snapshot with each session's space and the spaces, as
+   // JSON for the page.
+   std::string MissionJson(base::DictValue snapshot);
++  void MaybeShowWhatsNew();
+   // Coalesces notifications into one OnStateChanged per task.
+   void ScheduleNotify();
+   void Notify();
+diff --git a/chrome/browser/meridian/update_check.cc b/chrome/browser/meridian/update_check.cc
+index 2edea63cf0..8cc419a017 100644
+--- a/chrome/browser/meridian/update_check.cc
++++ b/chrome/browser/meridian/update_check.cc
+@@ -121,6 +121,9 @@ std::optional<Release> ParseFor(std::string_view json,
+   if (const std::string* page = dict.FindString("html_url")) {
+     release.page_url = *page;
+   }
++  if (const std::string* body = dict.FindString("body")) {
++    base::TruncateUTF8ToByteSize(*body, 20000, &release.notes);
++  }
+   release.zip_name = base::StrCat(
+       {"Meridian-", release.version, names.system, arch, names.ending});
+   if (const base::ListValue* assets = dict.FindList("assets")) {
+diff --git a/chrome/browser/meridian/update_check.h b/chrome/browser/meridian/update_check.h
+index 7634545ee3..3b74ee6f17 100644
+--- a/chrome/browser/meridian/update_check.h
++++ b/chrome/browser/meridian/update_check.h
+@@ -61,6 +61,8 @@ struct Release {
+   std::string sums_url;
+   std::string sig_url;
+   std::string page_url;
++  // The release's notes (GitHub's "body", Markdown), at most 20 KB.
++  std::string notes;
+ };
+ 
+ // Whether the updater may download `url`: https only, or also http from a
+diff --git a/chrome/browser/meridian/updater.cc b/chrome/browser/meridian/updater.cc
+index 1346b7b291..50c0415773 100644
+--- a/chrome/browser/meridian/updater.cc
++++ b/chrome/browser/meridian/updater.cc
+@@ -512,6 +512,7 @@ mojom::UpdateStatePtr Updater::State() const {
+   state->progress = progress_;
+   state->error = error_;
+   state->page_url = release_.page_url;
++  state->notes = release_.notes;
+   return state;
+ }
+ 
+diff --git a/chrome/browser/meridian/updater_win.cc b/chrome/browser/meridian/updater_win.cc
+index b49c23ee5a..19752587f8 100644
+--- a/chrome/browser/meridian/updater_win.cc
++++ b/chrome/browser/meridian/updater_win.cc
+@@ -456,6 +456,7 @@ mojom::UpdateStatePtr Updater::State() const {
+   state->progress = progress_;
+   state->error = error_;
+   state->page_url = release_.page_url;
++  state->notes = release_.notes;
+   return state;
+ }
+ 
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index eea197b1e9..e417335161 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -47,6 +47,8 @@ build_webui("build") {
+     "meridian/chat.ts",
+     "meridian/mission.html.ts",
+     "meridian/mission.ts",
++    "meridian/update_sheet.html.ts",
++    "meridian/update_sheet.ts",
+     "meridian/archive.ts",
+     "meridian/command_bar.html.ts",
+     "meridian/command_bar.ts",
+@@ -108,6 +110,7 @@ build_webui("build") {
+     "meridian/boost_editor.css",
+     "meridian/chat.css",
+     "meridian/mission.css",
++    "meridian/update_sheet.css",
+     "meridian/command_bar.css",
+     "meridian/home.css",
+     "meridian/onboarding.css",
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 50635d73c9..f8ccf7af1d 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -133,6 +133,7 @@ export function getHtml(this: WebuiBrowserAppElement) {
+         @meridian-tidy="${this.onMeridianTidy_}"
+         @meridian-chat="${this.onMeridianChat_}"
+         @meridian-mission="${this.onMeridianMission_}"
++        @meridian-update-confirm="${this.onMeridianUpdateConfirm_}"
+         @meridian-mission-state="${this.onMeridianMissionState_}"
+         @meridian-mission-toast="${this.onMeridianMissionToast_}"
+         @meridian-link-preview="${this.onMeridianLinkPreview_}">
+@@ -167,8 +168,12 @@ export function getHtml(this: WebuiBrowserAppElement) {
+   <meridian-settings id="settings"
+       @meridian-onboarding="${this.onMeridianOnboarding_}"
+       @meridian-edit-theme="${this.onMeridianEditTheme_}"
++      @meridian-update-confirm="${this.onMeridianUpdateConfirm_}"
+       @meridian-open-url="${this.onMeridianOpenUrl_}">
+   </meridian-settings>
++  <meridian-update-sheet id="updateSheet"
++      @meridian-open-url="${this.onMeridianOpenUrl_}">
++  </meridian-update-sheet>
+   <meridian-theme-editor id="themeEditor"></meridian-theme-editor>
+   <meridian-mission id="mission" .snapshot="${this.missionSnapshot_}"
+       @meridian-mission-reveal="${this.onMeridianMissionReveal_}"
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index f2699583a4..3b809070ca 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -22,6 +22,7 @@ import './meridian/ask.js';
+ import './meridian/tidy.js';
+ import './meridian/chat.js';
+ import './meridian/mission.js';
++import './meridian/update_sheet.js';
+ import './meridian/site_control.js';
+ import './meridian/boost_editor.js';
+ import 'chrome://resources/cr_elements/cr_button/cr_button.js';
+@@ -47,6 +48,7 @@ import type {MeridianArchiveElement} from './meridian/archive.js';
+ import type {MeridianTidyElement, TidyApply} from './meridian/tidy.js';
+ import type {MeridianChatElement} from './meridian/chat.js';
+ import type {MeridianMissionElement, MissionSnapshot} from './meridian/mission.js';
++import type {MeridianUpdateSheetElement} from './meridian/update_sheet.js';
+ import type {CommandBarTab, MeridianCommandBarElement} from './meridian/command_bar.js';
+ import type {MeridianOnboardingElement} from './meridian/onboarding.js';
+ import type {MeridianAskElement} from './meridian/ask.js';
+@@ -58,7 +60,7 @@ import type {MeridianBoostEditorElement} from './meridian/boost_editor.js';
+ import type {MeridianSiteControlElement} from './meridian/site_control.js';
+ import type {IconName} from './meridian/icons.js';
+ import {Command} from './sidebar.mojom-webui.js';
+-import type {Space, Split, TidyTab} from './sidebar.mojom-webui.js';
++import type {Space, Split, TidyTab, UpdateState} from './sidebar.mojom-webui.js';
+ import {isWindows} from './meridian/keys.js';
+ 
+ const SIDEBAR_HIDDEN_KEY = 'meridian.sidebarHidden';
+@@ -126,6 +128,7 @@ export interface WebuiBrowserAppElement {
+     tidy: MeridianTidyElement,
+     chat: MeridianChatElement,
+     mission: MeridianMissionElement,
++    updateSheet: MeridianUpdateSheetElement,
+     commandBar: MeridianCommandBarElement,
+     onboarding: MeridianOnboardingElement,
+     settings: MeridianSettingsElement,
+@@ -858,6 +861,12 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     }
+   }
+ 
++  // "Restart to update" (the sidebar's or Settings'): what's new first.
++  protected onMeridianUpdateConfirm_(e: CustomEvent<UpdateState>) {
++    this.$.settings.open = false;
++    this.$.updateSheet.show(e.detail);
++  }
++
+   protected onMeridianMissionWorkbench_() {
+     this.$.tabstrip.openWorkbench();
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index ac0ff080a7..c95050532f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -350,7 +350,10 @@ export class MeridianSettingsElement extends CrLitElement {
+   }
+ 
+   protected onRestartUpdateClick_() {
+-    this.handler_.installUpdate();
++    // What's new, then Restart now or Later.
++    if (this.update_) {
++      this.fire('meridian-update-confirm', this.update_);
++    }
+   }
+ 
+   protected onReleasePageClick_() {
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index f2cb81920b..eed0701264 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -1248,7 +1248,10 @@ export class MeridianSidebarElement extends CrLitElement implements
+   }
+ 
+   protected onUpdateClick_() {
+-    this.handler_.installUpdate();
++    // What's new, then Restart now or Later.
++    if (this.update_) {
++      this.fire('meridian-update-confirm', this.update_);
++    }
+   }
+ 
+   protected onClearDownloadsClick_() {
+diff --git a/chrome/browser/resources/webui_browser/meridian/update_sheet.css b/chrome/browser/resources/webui_browser/meridian/update_sheet.css
+new file mode 100644
+index 0000000000..ae9f6a1402
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/update_sheet.css
+@@ -0,0 +1,147 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #scheme=relative
++ * #css_wrapper_metadata_end */
++
++:host {
++  position: fixed;
++  inset: 0;
++  z-index: 60;
++  display: none;
++  color: var(--meridian-text);
++  font-size: 13px;
++}
++
++:host([open]) {
++  display: block;
++}
++
++#overlay {
++  position: absolute;
++  inset: 0;
++  display: flex;
++  justify-content: center;
++  align-items: center;
++  background: var(--meridian-overlay);
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
++}
++
++#card {
++  width: min(520px, 92vw);
++  max-height: min(620px, 84vh);
++  display: flex;
++  flex-direction: column;
++  border-radius: 14px;
++  background: var(--meridian-surface);
++  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35),
++    0 0 0 0.5px var(--meridian-border);
++  overflow: hidden;
++  outline: none;
++}
++
++header {
++  display: flex;
++  gap: 12px;
++  align-items: center;
++  padding: 18px 20px 12px;
++}
++
++.badge {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  width: 36px;
++  height: 36px;
++  flex: none;
++  border-radius: 10px;
++  color: var(--meridian-space);
++  background: color-mix(in srgb, var(--meridian-space) 14%, transparent);
++}
++
++#title {
++  font-size: 15px;
++  font-weight: 650;
++}
++
++.sub,
++.muted {
++  color: var(--meridian-text-muted);
++  font-size: 12px;
++}
++
++.notes {
++  flex: 1;
++  min-height: 0;
++  overflow-y: auto;
++  padding: 4px 20px 12px;
++  line-height: 1.5;
++}
++
++.notes h1,
++.notes h2,
++.notes h3 {
++  font-size: 13px;
++  margin: 14px 0 4px;
++}
++
++.notes ul {
++  margin: 4px 0;
++  padding-left: 18px;
++}
++
++.notes li {
++  margin: 3px 0;
++}
++
++.notes p {
++  margin: 6px 0;
++}
++
++footer {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  padding: 12px 16px 14px 20px;
++  border-top: 1px solid var(--meridian-border);
++}
++
++.grow {
++  flex: 1;
++}
++
++a {
++  color: var(--meridian-space);
++  text-decoration: none;
++  font-size: 12.5px;
++}
++
++a:hover {
++  text-decoration: underline;
++}
++
++.btn {
++  height: 28px;
++  padding: 0 14px;
++  border: 0;
++  border-radius: 8px;
++  font: inherit;
++  font-weight: 550;
++  color: var(--meridian-text);
++  background: color-mix(in srgb, var(--meridian-text) 8%, transparent);
++  cursor: pointer;
++}
++
++.btn.primary {
++  color: white;
++  background: var(--meridian-space);
++}
++
++.btn:disabled {
++  opacity: 0.6;
++  cursor: default;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/update_sheet.html.ts b/chrome/browser/resources/webui_browser/meridian/update_sheet.html.ts
+new file mode 100644
+index 0000000000..a3821d4396
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/update_sheet.html.ts
+@@ -0,0 +1,42 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {icon} from './icons.js';
++import {renderMarkdown} from './markdown.js';
++import type {MeridianUpdateSheetElement} from './update_sheet.js';
++
++export function getHtml(this: MeridianUpdateSheetElement) {
++  return html`<!--_html_template_start_-->
++<div id="overlay" @mousedown="${this.onOverlayMousedown_}"
++    @keydown="${this.onKeydown_}">
++  <div id="card" role="dialog" aria-labelledby="title" tabindex="-1">
++    <header>
++      <span class="badge">${icon('sparkles', 18)}</span>
++      <div>
++        <div id="title">Meridian ${this.state_?.version} is ready</div>
++        <div class="sub">You have ${this.state_?.current}. Meridian quits and
++          opens again with your tabs.</div>
++      </div>
++    </header>
++    <div id="notes" class="notes">
++      ${!this.notes_() ? html`
++        <p class="muted">Fixes and improvements.</p>` :
++        html`${renderMarkdown(this.notes_())}`}
++    </div>
++    <footer>
++      <a id="changelog" href="#" @click="${this.onChangelogClick_}">
++        Full changelog</a>
++      <div class="grow"></div>
++      <button id="later" class="btn" @click="${this.onLaterClick_}">
++        Later</button>
++      <button id="restart" class="btn primary" ?disabled="${this.restarting_}"
++          @click="${this.onRestartClick_}">
++        ${this.restarting_ ? 'Restarting…' : 'Restart now'}</button>
++    </footer>
++  </div>
++</div>
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/update_sheet.ts b/chrome/browser/resources/webui_browser/meridian/update_sheet.ts
+new file mode 100644
+index 0000000000..8100476e3d
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/update_sheet.ts
+@@ -0,0 +1,101 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// "Restart to update" asks first: what's new in the version (its release
++// notes), then Restart now or Later.
++
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {browserProxyFactory} from '../sidebar.mojom-webui.js';
++import type {UpdateState} from '../sidebar.mojom-webui.js';
++
++import {getCss} from './update_sheet.css.js';
++import {getHtml} from './update_sheet.html.js';
++
++// The public changelog; a version's entry is #v<version>.
++export const CHANGELOG_URL =
++    'https://undermove.github.io/meridian-browser/changelog.html';
++
++export class MeridianUpdateSheetElement extends CrLitElement {
++  static get is() {
++    return 'meridian-update-sheet';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      open: {type: Boolean, reflect: true},
++      state_: {state: true, type: Object},
++      restarting_: {state: true, type: Boolean},
++    };
++  }
++
++  accessor open: boolean = false;
++  protected accessor state_: UpdateState|null = null;
++  protected accessor restarting_: boolean = false;
++
++  async show(update: UpdateState) {
++    this.state_ = update;
++    this.restarting_ = false;
++    this.open = true;
++    await this.updateComplete;
++    this.shadowRoot.querySelector<HTMLElement>('#restart')?.focus();
++  }
++
++  hide() {
++    this.open = false;
++  }
++
++  protected notes_(): string {
++    // GitHub's release notes; the first heading repeats the version.
++    return (this.state_?.notes || '')
++        .replace(/^\s*#\s*Meridian[^\n]*\n/i, '')
++        .trim();
++  }
++
++  protected onRestartClick_() {
++    this.restarting_ = true;
++    browserProxyFactory.getInstance().handler.installUpdate();
++  }
++
++  protected onLaterClick_() {
++    this.hide();
++  }
++
++  protected onChangelogClick_(e: Event) {
++    e.preventDefault();
++    this.fire('meridian-open-url',
++              `${CHANGELOG_URL}#v${this.state_?.version || ''}`);
++    this.hide();
++  }
++
++  protected onOverlayMousedown_(e: MouseEvent) {
++    if (e.target === e.currentTarget) {
++      this.hide();
++    }
++  }
++
++  protected onKeydown_(e: KeyboardEvent) {
++    if (e.key === 'Escape') {
++      e.preventDefault();
++      this.hide();
++    }
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-update-sheet': MeridianUpdateSheetElement;
++  }
++}
++
++customElements.define(MeridianUpdateSheetElement.is,
++                      MeridianUpdateSheetElement);

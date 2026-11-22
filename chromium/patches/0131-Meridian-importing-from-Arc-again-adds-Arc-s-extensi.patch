@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Sun, 15 Nov 2026 21:06:31 +0400
+Subject: [PATCH 132/202] Meridian: importing from Arc again adds Arc's
+ extensions again
+
+Arc's extensions were added once per Arc profile: a profile gone through
+was skipped for good, so an extension installed in Arc later, or one that
+didn't arrive the first time, never came with "Import from Arc" run again.
+Settings only offered to add them one by one.
+
+An import the person runs themselves now goes through every profile
+again; the pass Meridian makes when it starts still leaves the profiles
+it has done alone, so what the person removed stays removed until they
+import again. An extension already here or on its way isn't asked for
+twice.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ chrome/browser/meridian/sidebar_handler.cc | 26 ++++++++++++++--------
+ chrome/browser/meridian/sidebar_handler.h  |  7 ++++--
+ 2 files changed, 22 insertions(+), 11 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 250bd46346..f2e2b99700 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -1880,7 +1880,7 @@ void SidebarHandler::OnArcRead(ImportArcCallback callback,
+   MainProfileFor(browser_->GetProfile())
+       ->GetPrefs()
+       ->SetBoolean(prefs::kArcImported, true);
+-  AddArcExtensions();
++  AddArcExtensions(/*again=*/true);
+   ActivateSpace(service_->active_space_id());
+   ScheduleNotify();
+   std::move(callback).Run(true);
+@@ -1945,7 +1945,7 @@ void SidebarHandler::OnSidebarChanged() {
+       main_prefs->SetBoolean(prefs::kArcImported, true);
+     }
+     if (main_prefs->GetBoolean(prefs::kArcImported)) {
+-      AddArcExtensions();
++      AddArcExtensions(/*again=*/false);
+     }
+   }
+   ScheduleNotify();
+@@ -2746,15 +2746,16 @@ Profile* SidebarHandler::ActiveSpaceProfile() {
+   return space ? LoadSpaceProfile(main, space->profile) : main;
+ }
+ 
+-void SidebarHandler::AddArcExtensions() {
++void SidebarHandler::AddArcExtensions(bool again) {
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+       base::BindOnce(&ReadArcExtensions),
+       base::BindOnce(&SidebarHandler::OnArcExtensionsRead,
+-                     weak_factory_.GetWeakPtr()));
++                     weak_factory_.GetWeakPtr(), again));
+ }
+ 
+-void SidebarHandler::OnArcExtensionsRead(std::vector<ArcExtension> found) {
++void SidebarHandler::OnArcExtensionsRead(bool again,
++                                         std::vector<ArcExtension> found) {
+   // Tests serve their own extensions, not signed by the Web Store (with
+   // --apps-gallery-update-url).
+   if (HasTestSwitch("meridian-test-unsigned-store")) {
+@@ -2772,8 +2773,10 @@ void SidebarHandler::OnArcExtensionsRead(std::vector<ArcExtension> found) {
+   std::map<Profile*, std::set<std::string>> added;
+   std::set<std::string> now_done;
+   for (const ArcExtension& e : found) {
+-    // Only into Meridian's own profiles: the main one and the spaces'.
+-    if (done.contains(e.profile) ||
++    // Only into Meridian's own profiles: the main one and the spaces'. A
++    // profile gone through before is left alone when Meridian starts (what
++    // the person removed since stays removed), not when they import again.
++    if ((!again && done.contains(e.profile)) ||
+         (!e.profile.empty() && !service_->FindProfile(e.profile))) {
+       continue;
+     }
+@@ -2782,8 +2785,11 @@ void SidebarHandler::OnArcExtensionsRead(std::vector<ArcExtension> found) {
+       continue;
+     }
+     now_done.insert(e.profile);
++    // Here already, or on its way (an import run twice asks once).
+     if (extensions::ExtensionRegistry::Get(profile)->GetExtensionById(
+-            e.id, extensions::ExtensionRegistry::EVERYTHING)) {
++            e.id, extensions::ExtensionRegistry::EVERYTHING) ||
++        extensions::PendingExtensionManager::Get(profile)->IsIdPending(
++            e.id)) {
+       continue;
+     }
+     if (extensions::PendingExtensionManager::Get(profile)->AddFromSync(
+@@ -2814,7 +2820,9 @@ void SidebarHandler::OnArcExtensionsRead(std::vector<ArcExtension> found) {
+   if (!now_done.empty()) {
+     ScopedListPrefUpdate update(prefs, prefs::kArcExtensionsAdded);
+     for (const std::string& id : now_done) {
+-      update->Append(id);
++      if (!done.contains(id)) {
++        update->Append(id);
++      }
+     }
+   }
+ }
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 232bd0f206..fd60999a56 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -288,8 +288,11 @@ class SidebarHandler : public mojom::SidebarHandler,
+   // Arc's extensions, each added to its Arc profile's Meridian profile from
+   // the Chrome Web Store the way Chrome adds an account's extensions on a new
+   // computer (sync): once per profile, after an Arc import.
+-  void AddArcExtensions();
+-  void OnArcExtensionsRead(std::vector<ArcExtension> found);
++  // `again`: the person asked for the import themselves, so the extensions
++  // of Arc profiles that were already gone through are added too (ones
++  // installed in Arc since, or that didn't arrive the first time).
++  void AddArcExtensions(bool again);
++  void OnArcExtensionsRead(bool again, std::vector<ArcExtension> found);
+   // The profile of the space shown.
+   Profile* ActiveSpaceProfile();
+   // Coalesces notifications into one OnStateChanged per task.

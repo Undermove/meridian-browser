@@ -1,0 +1,249 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Mon, 16 Nov 2026 20:52:44 +0400
+Subject: [PATCH 154/202] Meridian: agents' file uploads: Always on a site, and
+ Ask/Always/Never in Settings
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/meridian/agent/agent_service.cc   | 51 +++++++++++++++----
+ chrome/browser/meridian/prefs.cc              |  2 +
+ chrome/browser/meridian/prefs.h               |  5 ++
+ chrome/browser/meridian/sidebar.mojom         |  4 ++
+ chrome/browser/meridian/sidebar_handler.cc    | 19 +++++++
+ .../webui_browser/meridian/settings.html.ts   | 25 +++++++++
+ .../webui_browser/meridian/settings.ts        | 10 ++++
+ 7 files changed, 105 insertions(+), 11 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index aac6c5c8b0..3c84211728 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -34,6 +34,7 @@
+ #include "chrome/browser/meridian/archive_service.h"
+ #include "chrome/browser/meridian/little_window.h"
+ #include "chrome/browser/meridian/prefs.h"
++#include "components/prefs/scoped_user_pref_update.h"
+ #include "chrome/browser/meridian/private_file.h"
+ #include "chrome/browser/meridian/real_path.h"
+ #include "chrome/browser/meridian/sidebar_handler.h"
+@@ -1978,15 +1979,10 @@ void AgentService::UploadChecked(
+             // does the last one first).
+             std::string who =
+                 call->client.empty() ? std::string("An agent") : call->client;
+-            // Always asked, whatever the access level: a local file leaves
+-            // the computer.
+-            workbench::AskNative(
+-                contents,
+-                "Upload a file from your computer to " + host + "?",
+-                who + " wants to upload:\n" + real.AsUTF8Unsafe() +
+-                    "\nSize: " + mb + "\nInto: “" + label + "”",
+-                {"Don’t upload", "Upload this file"},
+-                base::BindOnce(
++            // Asked, whatever the access level (a local file leaves the
++            // computer), unless the person said for good: Settings > AI
++            // agents > File uploads, or "Always on <site>" here.
++            base::OnceCallback<void(int)> decided = base::BindOnce(
+                     [](base::WeakPtr<AgentService> self,
+                        tabs::TabHandle handle, std::unique_ptr<Call> call,
+                        std::string mark, base::FilePath real, std::string mb,
+@@ -2000,7 +1996,11 @@ void AgentService::UploadChecked(
+                         self->RunInPage(contents,
+                                         "__meridianAgent.unmarkFileInput()",
+                                         base::DoNothing());
+-                        return call->Fail("The person declined this upload.");
++                        return call->Fail(
++                            choice < 0 ? "Uploads by agents are turned off in "
++                                         "Meridian's Settings (AI agents > "
++                                         "File uploads)."
++                                       : "The person declined this upload.");
+                       }
+                       // A private copy of exactly what was approved: the
+                       // page reads the file later, and it mustn't be swapped
+@@ -2029,7 +2029,36 @@ void AgentService::UploadChecked(
+                               self, handle, std::move(call), mark, real, mb,
+                               label));
+                     },
+-                    self, handle, std::move(call), mark, real, mb, label));
++                    self, handle, std::move(call), mark, real, mb, label);
++            PrefService* prefs = self->profile_->GetPrefs();
++            const std::string& mode = prefs->GetString(prefs::kAgentUploads);
++            if (mode == "never") {
++              return std::move(decided).Run(-1);
++            }
++            if (mode == "always" ||
++                std::ranges::contains(prefs->GetList(prefs::kAgentUploadSites),
++                               base::Value(host))) {
++              return std::move(decided).Run(1);
++            }
++            workbench::AskNative(
++                contents,
++                "Upload a file from your computer to " + host + "?",
++                who + " wants to upload:\n" + real.AsUTF8Unsafe() +
++                    "\nSize: " + mb + "\nInto: “" + label + "”",
++                {"Don’t upload", "Upload this file", "Always on " + host},
++                base::BindOnce(
++                    [](base::WeakPtr<AgentService> self, std::string host,
++                       base::OnceCallback<void(int)> decided, int choice) {
++                      if (choice == 2 && self) {
++                        ScopedListPrefUpdate sites(self->profile_->GetPrefs(),
++                                                   prefs::kAgentUploadSites);
++                        if (!std::ranges::contains(*sites, base::Value(host))) {
++                          sites->Append(host);
++                        }
++                      }
++                      std::move(decided).Run(choice == 2 ? 1 : choice);
++                    },
++                    self, host, std::move(decided)));
+           },
+           weak_factory_.GetWeakPtr(), handle, std::move(call), file->first,
+           file->second));
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index 936095ec53..d35cb32936 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -21,6 +21,8 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterTimePref(kArcDataImportedAt, base::Time());
+   registry->RegisterStringPref(kAgentAccess, "off");
+   registry->RegisterBooleanPref(kAgentAllowJs, false);
++  registry->RegisterStringPref(kAgentUploads, "ask");
++  registry->RegisterListPref(kAgentUploadSites);
+   registry->RegisterStringPref(kAiKey, std::string());
+   registry->RegisterStringPref(kAiProvider, std::string());
+   registry->RegisterDictionaryPref(kAiCloudKeys);
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index b670b29853..2bbcbab8c5 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -32,6 +32,11 @@ inline constexpr char kArcDataImportedAt[] = "meridian.arc_data_imported_at";
+ inline constexpr char kAgentAccess[] = "meridian.agent_access";
+ // Agents may run JavaScript in pages (on top of ask/full).
+ inline constexpr char kAgentAllowJs[] = "meridian.agent_allow_js";
++// Files agents upload from the computer: "ask" (each one, unless its site is
++// in kAgentUploadSites), "always" or "never".
++inline constexpr char kAgentUploads[] = "meridian.agent_uploads";
++// Sites (hosts) whose uploads the person allowed for good.
++inline constexpr char kAgentUploadSites[] = "meridian.agent_upload_sites";
+ // The Anthropic API key, encrypted with OSCrypt (base64).
+ inline constexpr char kAiKey[] = "meridian.ai_key";
+ // Who answers Ask and the ⌘J panel: "" (automatic), "api" (Claude on the key
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 31721ccbe8..a786b01b09 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -303,6 +303,10 @@ struct Settings {
+   // AI agents (MCP): "off", "read", "ask" or "full"; JavaScript in pages.
+   string agent_access;
+   bool agent_allow_js;
++  // Files agents upload: "ask", "always" or "never"; the sites allowed for
++  // good (no question there).
++  string agent_uploads;
++  array<string> agent_upload_sites;
+   Atc atc;
+   bool is_default_browser;
+   // Meridian's version and the Chromium it is built on.
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 6f54e2b83a..2ed8208a36 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -125,6 +125,7 @@
+ #include "components/viz/common/frame_sinks/copy_output_result.h"
+ #include "components/viz/common/frame_sinks/copy_output_request.h"
+ #include "base/base64.h"
++#include <algorithm>
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface_iterator.h"
+ #include "ui/views/widget/widget_delegate.h"
+ #include "ui/views/window/client_view.h"
+@@ -1724,6 +1725,12 @@ void SidebarHandler::GetSettings(GetSettingsCallback callback) {
+   settings->atc = AtcToMojo(prefs->GetDict(prefs::kAtc));
+   settings->agent_access = prefs->GetString(prefs::kAgentAccess);
+   settings->agent_allow_js = prefs->GetBoolean(prefs::kAgentAllowJs);
++  settings->agent_uploads = prefs->GetString(prefs::kAgentUploads);
++  for (const base::Value& site : prefs->GetList(prefs::kAgentUploadSites)) {
++    if (site.is_string()) {
++      settings->agent_upload_sites.push_back(site.GetString());
++    }
++  }
+   settings->ai_provider = prefs->GetString(prefs::kAiProvider);
+   settings->ai_other_agents = prefs->GetBoolean(prefs::kAiOtherAgents);
+   settings->ai_tidy = prefs->GetBoolean(prefs::kAiTidy);
+@@ -1780,6 +1787,18 @@ void SidebarHandler::SetSettings(mojom::SettingsPtr settings) {
+     prefs->SetString(prefs::kAgentAccess, access);
+   }
+   prefs->SetBoolean(prefs::kAgentAllowJs, settings->agent_allow_js);
++  const std::string& uploads = settings->agent_uploads;
++  if (uploads == "ask" || uploads == "always" || uploads == "never") {
++    prefs->SetString(prefs::kAgentUploads, uploads);
++  }
++  // Sites only go from the list here (one is added from the upload question).
++  base::ListValue sites;
++  for (const base::Value& site : prefs->GetList(prefs::kAgentUploadSites)) {
++    if (std::ranges::contains(settings->agent_upload_sites, site.GetString())) {
++      sites.Append(site.Clone());
++    }
++  }
++  prefs->SetList(prefs::kAgentUploadSites, std::move(sites));
+   const std::string& provider = settings->ai_provider;
+   if (provider.empty() || provider == "api" || ai::FindProvider(provider)) {
+     prefs->SetString(prefs::kAiProvider, provider);
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index f6b9083bf8..6403010087 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -594,6 +594,31 @@ export function getHtml(this: MeridianSettingsElement) {
+                     .checked="${this.settings_.agentAllowJs}"
+                     @change="${this.onAllowJsChange_}"><span></span></label>
+               </div>
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">File uploads</div>
++                  <div class="row-desc">Files agents upload from your Mac to a
++                    site (a video to YouTube). Ask: each one, except on the
++                    sites below.</div>
++                </div>
++                <div class="segmented">
++                  ${(['ask', 'always', 'never'] as const).map(v => html`
++                    <button class="seg ${this.settings_!.agentUploads === v ? 'on' : ''}"
++                        id="uploads-${v}" data-name="uploads" data-value="${v}"
++                        @click="${this.onSegmentClick_}">${
++                          {ask: 'Ask', always: 'Always', never: 'Never'}[v]}</button>`)}
++                </div>
++              </div>
++              ${this.settings_.agentUploadSites.map(site => html`
++                <div class="row upload-site">
++                  <div class="row-text">
++                    <div class="row-label">${site}</div>
++                    <div class="row-desc">Uploads here without asking.</div>
++                  </div>
++                  <button class="icon-btn danger" title="Ask again on ${site}"
++                      data-site="${site}" @click="${this.onUploadSiteRemoveClick_}">
++                    ${icon('trash', 15)}</button>
++                </div>`)}
+             </div>
+           </div>
+           <div class="group">
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 38a544124d..ac0ff080a7 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -704,9 +704,19 @@ export class MeridianSettingsElement extends CrLitElement {
+       this.save_({mode: value});
+     } else if (name === 'agents') {
+       this.save_({agentAccess: value});
++    } else if (name === 'uploads') {
++      this.save_({agentUploads: value});
+     }
+   }
+ 
++  protected onUploadSiteRemoveClick_(e: Event) {
++    const site = (e.currentTarget as HTMLElement).dataset['site'];
++    this.save_({
++      agentUploadSites:
++          this.settings_!.agentUploadSites.filter(s => s !== site),
++    });
++  }
++
+   protected onAllowJsChange_(e: Event) {
+     this.save_({agentAllowJs: (e.target as HTMLInputElement).checked});
+   }

@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Mon, 16 Nov 2026 01:11:00 +0400
+Subject: [PATCH 139/202] Meridian: the sidebar's edge drags to make it wider
+ or narrower
+
+Arc's sidebar resizes; Meridian's was 276 px and nothing else. Its inner
+edge is a handle now: dragged, the sidebar follows the pointer, from 200 px
+to half the window (520 px at most), and the page takes the rest. The width
+is kept (with "sidebar hidden", in the page's storage) and a double click
+on the edge gives the sidebar its own width back. On the right side too;
+not while the sidebar is hidden and slides over the page.
+
+While the edge is dragged the page doesn't take the pointer, as with the
+split view's divider: over the page the moves would go to it and the drag
+would stop at the sidebar's edge.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../browser/resources/webui_browser/app.css   | 37 +++++++++
+ .../resources/webui_browser/app.html.ts       |  2 +
+ chrome/browser/resources/webui_browser/app.ts | 80 +++++++++++++++++++
+ 3 files changed, 119 insertions(+)
+
+diff --git a/chrome/browser/resources/webui_browser/app.css b/chrome/browser/resources/webui_browser/app.css
+index 35d2a488aa..b2b5763775 100644
+--- a/chrome/browser/resources/webui_browser/app.css
++++ b/chrome/browser/resources/webui_browser/app.css
+@@ -93,6 +93,43 @@
+   min-height: 0;
+ }
+ 
++/* Arc: the sidebar's inner edge drags to make it wider or narrower; a double
++ * click gives it its own width back. */
++#sidebarResize {
++  position: absolute;
++  top: 0;
++  bottom: 0;
++  /* Inside the sidebar, over its padding: the page starts right at its
++   * edge and would take a press that lands past it. */
++  right: 0;
++  width: 8px;
++  cursor: col-resize;
++  z-index: 2;
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
++}
++
++:host([sidebar-right]) #sidebarResize {
++  right: auto;
++  left: 0;
++}
++
++/* Hidden, the sidebar is a card over the page that comes and goes. */
++:host([sidebar-hidden]) #sidebarResize {
++  display: none;
++}
++
++:host([sidebar-resizing]) {
++  cursor: col-resize;
++  user-select: none;
++}
++
++/* While the edge is dragged the page must not swallow the pointer (as with
++ * the split view's divider, content_region.css). */
++:host([sidebar-resizing]) #main {
++  pointer-events: none;
++}
++
+ #sidebarTop {
+   app-region: drag;
+   -webkit-app-region: drag;
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 558f483b62..a631ec5547 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -150,6 +150,8 @@ export function getHtml(this: WebuiBrowserAppElement) {
+     </meridian-sidebar>
+     <webui-browser-bookmark-bar id="bookmarkBar" hidden>
+     </webui-browser-bookmark-bar>
++    <div id="sidebarResize" @pointerdown="${this.onSidebarResizePointerdown_}"
++        @dblclick="${this.onSidebarResizeDblclick_}"></div>
+   </div>
+   <meridian-command-bar id="commandBar" .tabs="${this.commandBarTabs_}"
+       @command-bar-switch-tab="${this.onCommandBarSwitchTab_}"
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 5dd52e421b..6e2d119a4b 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -61,6 +61,20 @@ import {isWindows} from './meridian/keys.js';
+ 
+ const SIDEBAR_HIDDEN_KEY = 'meridian.sidebarHidden';
+ 
++// The sidebar's width, when a person dragged its edge (Arc); in CSS pixels.
++const SIDEBAR_WIDTH_KEY = 'meridian.sidebarWidth';
++const SIDEBAR_MIN_WIDTH = 200;
++const SIDEBAR_MAX_WIDTH = 520;
++
++function readSidebarWidth(): number {
++  try {
++    const width = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
++    return width >= SIDEBAR_MIN_WIDTH && width <= SIDEBAR_MAX_WIDTH ? width : 0;
++  } catch {
++    return 0;
++  }
++}
++
+ function readSidebarHidden(): boolean {
+   try {
+     return localStorage.getItem(SIDEBAR_HIDDEN_KEY) === '1';
+@@ -498,7 +512,73 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     }
+   }
+ 
++  // No wider than half the window, so the page keeps the larger part.
++  private sidebarWidthFor_(width: number): number {
++    const most = Math.max(
++        SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, window.innerWidth / 2));
++    return Math.round(Math.min(most, Math.max(SIDEBAR_MIN_WIDTH, width)));
++  }
++
++  private setSidebarWidth_(width: number) {
++    if (width) {
++      this.style.setProperty('--meridian-sidebar-w', `${width}px`);
++    } else {
++      this.style.removeProperty('--meridian-sidebar-w');
++    }
++  }
++
++  // The sidebar's inner edge, dragged.
++  protected onSidebarResizePointerdown_(e: PointerEvent) {
++    const sidebar = this.shadowRoot.getElementById('sidebar');
++    const handle = e.currentTarget as HTMLElement;
++    if (e.button !== 0 || !sidebar) {
++      return;
++    }
++    e.preventDefault();
++    handle.setPointerCapture(e.pointerId);
++    this.toggleAttribute('sidebar-resizing', true);
++    const rect = sidebar.getBoundingClientRect();
++    const right = this.sidebarRight_;
++    // The edge stays under the pointer where it was taken.
++    const start = e.clientX;
++    const widthAt = (x: number) => this.sidebarWidthFor_(
++        rect.width + (right ? start - x : x - start));
++    let width = 0;
++    const move = (ev: PointerEvent) => {
++      width = widthAt(ev.clientX);
++      this.setSidebarWidth_(width);
++    };
++    const up = () => {
++      handle.removeEventListener('pointermove', move);
++      handle.removeEventListener('pointerup', up);
++      handle.removeEventListener('pointercancel', up);
++      this.toggleAttribute('sidebar-resizing', false);
++      if (!width) {
++        return;  // a click, nothing dragged
++      }
++      try {
++        localStorage.setItem(SIDEBAR_WIDTH_KEY, String(width));
++      } catch {
++        // Storage unavailable: the width lasts until the window closes.
++      }
++    };
++    handle.addEventListener('pointermove', move);
++    handle.addEventListener('pointerup', up);
++    handle.addEventListener('pointercancel', up);
++  }
++
++  // A double click on the edge: the sidebar's own width again.
++  protected onSidebarResizeDblclick_() {
++    this.setSidebarWidth_(0);
++    try {
++      localStorage.removeItem(SIDEBAR_WIDTH_KEY);
++    } catch {
++      // Nothing was kept.
++    }
++  }
++
+   protected override firstUpdated() {
++    this.setSidebarWidth_(readSidebarWidth());
+     browserProxyFactory.getInstance()
+         .callbackRouter.setFocusToLocationBar.addListener(
+             this.setFocusToLocationBar.bind(this));

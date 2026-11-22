@@ -28,7 +28,7 @@ const cleanErr = (err) => String(err?.message || err).replace(/^Error invoking r
 
 const DEFAULTS = {
   editor: { fontSize: 13, fontFamily: '', lineHeight: 20, minimap: false, wordWrap: 'off', tabSize: 2, theme: 'auto' },
-  terminal: { fontSize: 12.5, fontFamily: '', lineHeight: 1.15 },
+  terminal: { fontSize: 12.5, fontFamily: '', lineHeight: 1.15, scrollSpeed: 1 },
   layout: { treeWidth: 240, terminalHeight: '38%', sidePanelWidth: 320, showTree: true },
   ui: { accent: '' },
 };
@@ -45,7 +45,7 @@ function sanitizeSettings(raw) {
       minimap: typeof e.minimap === 'boolean' ? e.minimap : false, wordWrap: pick(e.wordWrap, ['off', 'on', 'bounded', 'wordWrapColumn'], 'off'),
       tabSize: Math.round(num(e.tabSize, 1, 16, 2)), theme: pick(e.theme, ['auto', 'light', 'dark', 'hc-black', 'hc-light'], 'auto'),
     },
-    terminal: { fontSize: num(t.fontSize, 8, 40, DEFAULTS.terminal.fontSize), fontFamily: font(t.fontFamily), lineHeight: num(t.lineHeight, 1, 3, DEFAULTS.terminal.lineHeight) },
+    terminal: { fontSize: num(t.fontSize, 8, 40, DEFAULTS.terminal.fontSize), fontFamily: font(t.fontFamily), lineHeight: num(t.lineHeight, 1, 3, DEFAULTS.terminal.lineHeight), scrollSpeed: num(t.scrollSpeed, 0.1, 10, DEFAULTS.terminal.scrollSpeed) },
     layout: {
       treeWidth: Math.round(num(l.treeWidth, 120, 800, DEFAULTS.layout.treeWidth)),
       terminalHeight: typeof l.terminalHeight === 'string' && /^\d{1,4}(\.\d+)?(px|%|vh)$/.test(l.terminalHeight) ? l.terminalHeight : DEFAULTS.layout.terminalHeight,
@@ -58,7 +58,7 @@ function sanitizeSettings(raw) {
 
 // Hooks read by workbench.js
 function proEditorTheme() { return PRO.settings?.editor.theme || 'auto'; }
-function proTerminalOptions() { const t = PRO.settings?.terminal; return t ? { fontSize: t.fontSize, fontFamily: t.fontFamily, lineHeight: t.lineHeight } : {}; }
+function proTerminalOptions() { const t = PRO.settings?.terminal; return t ? { fontSize: t.fontSize, fontFamily: t.fontFamily, lineHeight: t.lineHeight, scrollSpeed: t.scrollSpeed } : {}; }
 
 function applySettings(prev) {
   const s = PRO.settings;
@@ -450,7 +450,7 @@ function renderSideTabs() {
     b.addEventListener('click', () => openPanel(id));
     return b;
   }));
-  for (const [id, btn] of [['hub', '#btn-hub'], ['secrets', '#btn-secrets'], ['customize', '#btn-customize']]) $(btn).classList.toggle('on', PRO.activePanel === id);
+  for (const [id, btn] of [['hub', '#btn-hub'], ['secrets', '#btn-secrets'], ['customize', '#btn-customize'], ['insights', '#limits-chip']]) $(btn)?.classList.toggle('on', PRO.activePanel === id);
   if (PRO.activePanel && !panelById(PRO.activePanel) && !PRO.reloading) closePanel();
 }
 
@@ -772,7 +772,8 @@ function proLauncherExtras(bar) {
 
 async function sandboxMenu(anchor) {
   const st = await refreshSandbox(true);
-  anchor = $('#sandbox-btn') || anchor;
+  // The button itself, unless it's in the top bar's More menu.
+  anchor = ($('#sandbox-btn')?.offsetParent && $('#sandbox-btn')) || anchor;
   if (!st || !st.installed) {
     popover(anchor, `<h3>Run agents in a sandbox</h3>
       <p>Install OrbStack or Docker Desktop to run Claude Code, Codex or a shell in a container that only sees this project — no home folder, no SSH keys, no Docker socket.</p>

@@ -16,20 +16,20 @@ const dirname = (p) => { const i = String(p).lastIndexOf('/'); return i < 0 ? ''
 const joinPath = (dir, name) => (dir ? `${dir}/${name}` : name);
 
 const AGENT_UI = {
-  claude: { label: 'Claude Code', mark: 'C', color: '#d97757' },
-  codex: { label: 'Codex', mark: 'X', color: '#3c3c46' },
-  gemini: { label: 'Gemini', mark: 'G', color: '#4c8df6' },
-  copilot: { label: 'Copilot', mark: 'P', color: '#8957e5' },
-  opencode: { label: 'OpenCode', mark: 'O', color: '#4b5563' },
-  cursor: { label: 'Cursor', mark: 'U', color: '#1c1c1c' },
-  qwen: { label: 'Qwen Code', mark: 'Q', color: '#615ced' },
-  amp: { label: 'Amp', mark: 'A', color: '#f34e3f' },
-  goose: { label: 'Goose', mark: 'G', color: '#222222' },
-  droid: { label: 'Droid', mark: 'D', color: '#ff6b00' },
+  claude: { label: 'Claude Code', mark: 'Cl', color: '#d97757' },
+  codex: { label: 'Codex', mark: 'Cx', color: '#3c3c46' },
+  gemini: { label: 'Gemini', mark: 'Ge', color: '#4c8df6' },
+  copilot: { label: 'Copilot', mark: 'Co', color: '#8957e5' },
+  opencode: { label: 'OpenCode', mark: 'OC', color: '#4b5563' },
+  cursor: { label: 'Cursor', mark: 'Cu', color: '#1c1c1c' },
+  qwen: { label: 'Qwen Code', mark: 'Qw', color: '#615ced' },
+  amp: { label: 'Amp', mark: 'Am', color: '#f34e3f' },
+  goose: { label: 'Goose', mark: 'Go', color: '#222222' },
+  droid: { label: 'Droid', mark: 'Dr', color: '#ff6b00' },
   shell: { label: 'Shell', mark: '$', color: '#7a808c' },
   // Workbench Pro: sandboxed agents (Docker / OrbStack)
-  'sandbox-claude': { label: 'Claude Code (sandbox)', mark: 'C', color: '#d97757' },
-  'sandbox-codex': { label: 'Codex (sandbox)', mark: 'X', color: '#3c3c46' },
+  'sandbox-claude': { label: 'Claude Code (sandbox)', mark: 'Cl', color: '#d97757' },
+  'sandbox-codex': { label: 'Codex (sandbox)', mark: 'Cx', color: '#3c3c46' },
   'sandbox-shell': { label: 'Shell (sandbox)', mark: '$', color: '#7a808c' },
 };
 
@@ -100,6 +100,40 @@ function askText(title, value = '', hint = '') {
   });
 }
 
+// Where each agent sends your prompts and the project's files. Before the first start (once per
+// Workbench, or never again after "Always start"), the person decides.
+const AGENT_DESTINATION = {
+  claude: 'Anthropic (Claude)', codex: 'OpenAI (Codex)', gemini: 'Google (Gemini)', copilot: 'GitHub (Copilot)',
+  cursor: 'Anysphere (Cursor)', qwen: 'Alibaba (Qwen)', amp: 'Sourcegraph (Amp)', droid: 'Factory (Droid)',
+  goose: 'the AI service Goose is set up with', opencode: 'the AI service OpenCode is set up with',
+};
+const agentConsentGiven = new Set();
+async function agentConsent(kind) {
+  const base = String(kind).replace(/^sandbox-/, '');
+  const to = AGENT_DESTINATION[base];
+  if (!to || agentConsentGiven.has(base)) return true;
+  let state = '';
+  try { state = typeof wb.aiConsent === 'function' ? await wb.aiConsent(base) : 'always'; } catch {}
+  if (state === 'always') return true;
+  const label = AGENT_UI[kind]?.label || base;
+  return new Promise((resolve) => {
+    modal(`<h3>${esc(label)} sends what you type and the project's files to ${esc(to)}</h3>
+      <p>Nothing has been sent yet. Choose once: Meridian remembers it (Settings › AI).</p>
+      <div class="modal-actions"><button class="btn" data-a="cancel">Cancel</button><button class="btn" data-a="always">Always start, don't ask</button><button class="btn accent" data-a="ok">Start</button></div>`, (m, close) => {
+      setTimeout(() => $('[data-a="cancel"]', m).focus(), 0);
+      const done = (a) => {
+        close();
+        if (a === 'ok' || a === 'always') agentConsentGiven.add(base);
+        if (a === 'ok' || a === 'always') wb.setAiConsent?.(base, a === 'always' ? 'always' : 'once').catch(() => {});
+        resolve(a === 'ok' || a === 'always');
+      };
+      m.addEventListener('click', (e) => { const a = e.target.closest('[data-a]')?.dataset.a; if (a) done(a); });
+      m.addEventListener('keydown', (e) => { if (e.key === 'Escape') done('cancel'); });
+      $('#modal-overlay').addEventListener('dismiss', () => resolve(false), { once: true });
+    });
+  });
+}
+
 function confirmBox(title, detail, okLabel = 'OK', danger = false) {
   return new Promise((resolve) => {
     modal(`<h3>${esc(title)}</h3>${detail ? `<p>${esc(detail)}</p>` : ''}
@@ -162,6 +196,7 @@ async function setProject(p, { reattach = false } = {}) {
     for (const t of [...S.tabs]) closeTab(t, { force: true });
   }
   S.project = p;
+  S.savedSessions = null;
   S.tree.clear();
   S.selected = null;
   document.title = p.name;
@@ -171,9 +206,13 @@ async function setProject(p, { reattach = false } = {}) {
   $('#welcome').hidden = true;
   $('#main').hidden = false;
   wb.toHost({ type: 'project', root: p.root, name: p.name });
+  // The tab's address names the project, so the tab reopens it after a restart (as a pinned hub does).
+  try { const u = new URL(location.href); if (u.searchParams.get('project') !== p.root) { u.searchParams.set('project', p.root); history.replaceState(history.state, '', u.href); } } catch {}
   await loadDir('', true);
   renderTree();
-  if (reattach) await reattachTerminals();
+  // (Also when none are open here: terminals that outlived a crash of the browser come back.)
+  const alive = reattach || !S.terms.length ? await reattachTerminals() : S.terms.length;
+  if (!alive) await restoreClaudeSessions(p.root);
   layoutTerminals();
   emit('project', p);
 }
@@ -227,7 +266,8 @@ function renderWelcome() {
     for (const r of info.recents.slice(0, 6)) recents.appendChild(recentRow(r, () => openRecent(r.path)));
   }
   const agents = $('#welcome-agents');
-  agents.innerHTML = '<h2>Agents on this computer</h2>';
+  agents.innerHTML = '<h2>Agents on this computer</h2><div class="agent-list"></div>';
+  const list = agents.querySelector('.agent-list');
   for (const id of agentKinds()) {
     const a = info.agents?.[id];
     const row = document.createElement('div');
@@ -238,7 +278,8 @@ function renderWelcome() {
     const st = row.querySelector('.state');
     st.textContent = a?.installed ? 'Installed' : `Not installed — ${a?.install || ''}`;
     st.classList.toggle('ok', !!a?.installed);
-    agents.appendChild(row);
+    if (!a?.installed) st.title = st.textContent;
+    list.appendChild(row);
   }
   const err = $('#terminal-error');
   err.hidden = info.terminals !== false;
@@ -257,6 +298,17 @@ function agentMark(kind, cls = 'mark') {
 
 function renderLauncher() {
   const bar = $('#launcher');
+  // Not under a pressed mouse button: the click would be lost with the button.
+  if (!bar._watched) {
+    bar._watched = true;
+    bar.addEventListener('mousedown', () => { bar._pressed = true; });
+    window.addEventListener('mouseup', () => setTimeout(() => {
+      if (!bar._pressed) return;
+      bar._pressed = false;
+      if (bar._redraw) { bar._redraw = false; renderLauncher(); }
+    }, 0));
+  }
+  if (bar._pressed) { bar._redraw = true; return; }
   bar.innerHTML = '';
   const agents = S.info?.agents || {};
   for (const kind of [...agentKinds(), 'shell']) {
@@ -278,17 +330,65 @@ function renderLauncher() {
     b.title = !installed ? `${AGENT_UI[kind].label} is not installed`
       : kind === 'shell' ? 'Open a shell in the project'
       : `Start ${AGENT_UI[kind].label} in the project${a?.mcp ? ' — with Meridian browser tools' : ''}`;
-    b.addEventListener('click', () => (installed ? launch(kind) : installHint(b, kind)));
+    // `anchor`: where a hint shows (the More button when this one is in its menu).
+    b._run = (anchor) => (installed ? launch(kind) : installHint(anchor, kind));
+    b.addEventListener('click', () => b._run(b));
     bar.appendChild(b);
+    if (kind === 'claude' && installed) bar.appendChild(resumeButton('launch resume'));
   }
   if (typeof proLauncherExtras === 'function') proLauncherExtras(bar); // Workbench Pro: sandbox + plugin launchers
   iconize(bar);
+  fitLauncher();
+}
+
+// The launchers that don't fit the top bar go into a "More" menu at its end (the last ones first),
+// so every agent stays one click away on a small screen.
+function fitLauncher() {
+  const bar = $('#launcher');
+  if (!bar) return;
+  bar.querySelector('#launcher-more')?.remove();
+  bar.classList.remove('compact');
+  const items = [...bar.children];
+  for (const el of items) el.hidden = false;
+  if (bar.scrollWidth <= bar.clientWidth + 1) return;
+  const more = document.createElement('button');
+  more.id = 'launcher-more';
+  more.className = 'launch more';
+  more.title = 'More agents';
+  more.setAttribute('aria-haspopup', 'menu');
+  bar.appendChild(more);
+  const hidden = [];
+  // Claude Code stays; everything after it can go.
+  for (let i = items.length - 1; i > 0 && bar.scrollWidth > bar.clientWidth + 1; i--) {
+    items[i].hidden = true;
+    hidden.unshift(items[i]);
+    more.innerHTML = `<span class="ic-slot" data-icon="more" data-size="14"></span><span class="more-n">${hidden.length}</span>`;
+    more.title = `More agents: ${hidden.map((e) => e.textContent.trim()).join(', ')}`;
+    iconize(more);
+  }
+  if (!hidden.length) { more.remove(); return; }
+  // Still too narrow: Claude Code's button shows only its mark.
+  if (bar.scrollWidth > bar.clientWidth + 1) bar.classList.add('compact');
+  more.addEventListener('click', () => {
+    popover(more, '<div class="launch-menu" role="menu"></div>', (pop, close) => {
+      const list = $('.launch-menu', pop);
+      for (const el of hidden) {
+        const row = el.cloneNode(true);
+        row.hidden = false;
+        row.removeAttribute('id');
+        row.classList.add('menu-row');
+        row.setAttribute('role', 'menuitem');
+        row.addEventListener('click', () => { close(); el._run ? el._run(more) : el.click(); });
+        list.appendChild(row);
+      }
+    });
+  });
 }
 
 function installHint(anchor, kind) {
   const a = S.info?.agents?.[kind] || {};
   popover(anchor, `<h3>${esc(AGENT_UI[kind].label)} isn’t installed</h3>
-    <p>Install it in a terminal, then click the button again.</p>
+    <p>${a.needs ? `This command needs ${esc(a.needs)}, which isn’t on this computer: install that first. ` : ''}Install it in a terminal, then click the button again.</p>
     <div class="cmd">${esc(a.install || '')}</div>
     <div class="row"><button class="btn small" data-a="copy">Copy command</button><button class="btn small accent" data-a="shell" ${S.project ? '' : 'disabled'}>Open a shell</button></div>`, (pop, close) => {
     pop.addEventListener('click', (e) => {
@@ -794,6 +894,172 @@ function newXterm() {
   return { xterm, fit };
 }
 
+// Scrolling as in a Mac app: the lines follow the fingers at a steady rate. xterm hands a program
+// that takes the mouse (a full-screen agent) slow trackpad moves at a third of their size and quick
+// ones whole, so the scroll crawled, then jumped. `terminal.scrollSpeed` in settings.json sets the
+// rate; ⌥ scrolls five times faster.
+const synthetic = new WeakSet();
+function scrollSpeed() {
+  // eslint-disable-next-line no-undef
+  const v = typeof proTerminalOptions === 'function' ? proTerminalOptions().scrollSpeed : undefined;
+  return v > 0 ? v : 1;
+}
+function termWheel(t, e) {
+  if (synthetic.has(e) || e.deltaMode !== WheelEvent.DOM_DELTA_PIXEL || !e.deltaY) return true;
+  const ownMouse = t.xterm.modes.mouseTrackingMode !== 'none' || t.xterm.buffer.active.type === 'alternate';
+  if (!ownMouse) {
+    t.xterm.options.scrollSensitivity = scrollSpeed();
+    return true;
+  }
+  const lineHeight = t.el.querySelector('.xterm-screen')?.getBoundingClientRect().height / t.xterm.rows || 16;
+  t.wheelRest = (t.wheelRest || 0) + (e.deltaY / lineHeight) * scrollSpeed() * (e.altKey ? 5 : 1);
+  const lines = Math.trunc(t.wheelRest);
+  t.wheelRest -= lines;
+  // The same wheel a line at a time: xterm tells the program one line for each wheel event.
+  for (let i = 0; i < Math.min(Math.abs(lines), 300); i++) {
+    const ev = new WheelEvent('wheel', { deltaY: Math.sign(lines), deltaMode: WheelEvent.DOM_DELTA_LINE, clientX: e.clientX, clientY: e.clientY, bubbles: true, cancelable: true });
+    synthetic.add(ev);
+    e.target.dispatchEvent(ev);
+  }
+  e.preventDefault();
+  return false;
+}
+
+// Links in what programs print: web addresses open in a tab next to this one; a project file
+// (src/app.ts, src/app.ts:42, ./README.md:3:7) opens in the editor at its line.
+const URL_RE = /\bhttps?:\/\/[^\s<>"'`]+/g;
+const FILE_RE = /(?:^|[\s('"`[])((?:\.{1,2}\/|\/)?[\w@.-]+(?:\/[\w@.-]+)*\.[A-Za-z0-9]{1,8})(?::(\d+))?(?::(\d+))?/g;
+function termLinks(t) {
+  return {
+    provideLinks(y, done) {
+      const buf = t.xterm.buffer.active;
+      // The whole logical line: a long address wraps over several rows.
+      let first = y - 1;
+      while (first > 0 && buf.getLine(first)?.isWrapped) first--;
+      let last = y - 1;
+      while (buf.getLine(last + 1)?.isWrapped) last++;
+      const cols = t.xterm.cols;
+      let text = '';
+      for (let i = first; i <= last; i++) text += (buf.getLine(i)?.translateToString(i === last) || '').padEnd(i === last ? 0 : cols);
+      const at = (offset) => ({ x: (offset % cols) + 1, y: first + Math.floor(offset / cols) + 1 });
+      const range = (start, length) => ({ start: at(start), end: at(start + length - 1) });
+      const onRow = (r) => r.start.y <= y && r.end.y >= y;
+      const links = [];
+      for (const m of text.matchAll(URL_RE)) {
+        // Not the sentence's full stop or closing bracket (a bracket the address opened stays).
+        let url = m[0].replace(/[.,;:!?'"]+$/, '');
+        while (/[)\]}>]$/.test(url) && (url.match(/[([{<]/g) || []).length < (url.match(/[)\]}>]/g) || []).length) url = url.slice(0, -1).replace(/[.,;:!?'"]+$/, '');
+        const r = range(m.index, url.length);
+        if (onRow(r)) links.push({ range: r, text: url, open: () => wb.toHost({ type: 'link', url }), activate: () => {} });
+      }
+      const files = [];
+      for (const m of text.matchAll(FILE_RE)) {
+        if (/^https?:/.test(text.slice(Math.max(0, m.index - 8), m.index + 1)) || m[1].includes('//')) continue;
+        const start = m.index + m[0].indexOf(m[1]);
+        const length = m[0].length - (start - m.index);
+        const r = range(start, length);
+        if (onRow(r) && !links.some((l) => l.range.start.y === r.start.y && l.range.start.x <= r.start.x && l.range.end.x >= r.end.x)) files.push({ r, path: m[1], line: +m[2] || 0, col: +m[3] || 0 });
+      }
+      if (!files.length || !S.project) return done(links.length ? links : undefined);
+      // Only paths that are files of the project.
+      const root = S.project.root.replace(/\/$/, '') + '/';
+      Promise.all(files.map(async (f) => {
+        let rel = f.path.startsWith(root) ? f.path.slice(root.length) : f.path.replace(/^\.\//, '');
+        if (rel.startsWith('/') || rel.startsWith('../')) return null;
+        const st = await wb.stat(rel).catch(() => null);
+        return st?.exists && !st.dir ? { range: f.r, text: f.path, open: () => openFileAt(rel, f.line, f.col), activate: () => {} } : null;
+      })).then((found) => {
+        const all = links.concat(found.filter(Boolean));
+        done(all.length ? all : undefined);
+      });
+    },
+  };
+}
+// A click opens the link under it. Not xterm's own activation: a click that focuses the terminal
+// (back from another tab) redraws it, and xterm forgets the link it was over.
+function termLinkClicks(t, provider) {
+  let down = null;
+  t.el.addEventListener('mousedown', (e) => { down = e.button === 0 ? { x: e.clientX, y: e.clientY } : null; }, true);
+  t.el.addEventListener('mouseup', (e) => {
+    if (!down || e.button !== 0 || Math.hypot(e.clientX - down.x, e.clientY - down.y) > 4 || t.xterm.hasSelection()) return;
+    // A program that takes the mouse gets plain clicks; ⌘-click still opens.
+    if (t.xterm.modes.mouseTrackingMode !== 'none' && !e.metaKey) return;
+    const screen = t.el.querySelector('.xterm-screen')?.getBoundingClientRect();
+    const cell = t.xterm._core._renderService?.dimensions?.css?.cell;
+    if (!screen || !cell?.width) return;
+    const x = Math.floor((e.clientX - screen.left) / cell.width) + 1;
+    const row = Math.floor((e.clientY - screen.top) / cell.height);
+    if (x < 1 || row < 0 || row >= t.xterm.rows) return;
+    const y = t.xterm.buffer.active.viewportY + row + 1;
+    provider.provideLinks(y, (links) => {
+      const hit = (links || []).find((l) => {
+        const { start: a, end: b } = l.range;
+        return (y > a.y || (y === a.y && x >= a.x)) && (y < b.y || (y === b.y && x <= b.x));
+      });
+      hit?.open();
+    });
+  }, true);
+}
+async function openFileAt(rel, line, col) {
+  const tab = await openFile(rel, { focus: true });
+  if (tab?.model && S.editor && line) {
+    const pos = { lineNumber: line, column: col || 1 };
+    S.editor.setPosition(pos);
+    S.editor.revealPositionInCenter(pos);
+  }
+}
+
+// Files dropped on a terminal, or an image pasted with ⌘V: their paths are typed into it, as
+// Warp and iTerm do; Claude Code attaches an image from its path. A file with no path (an image
+// from a page, a screenshot copied to the clipboard) is saved first.
+// A path as the shell takes it: a backslash before each special on the Mac and Linux; on Windows
+// (PowerShell, cmd) in double quotes when it has a space or a special, its backslashes kept.
+const shellQuote = (p) => (wb.platform !== 'win32' ? p.replace(/([^\w@%+=:,./-])/g, '\\$1') : /[^\w@%+=:,./\\-]/.test(p) ? `"${p}"` : p);
+async function pathsOf(t, files, dropped) {
+  let paths = dropped ? await wb.droppedPaths(files.map((f) => ({ name: f.name, size: f.size }))).catch(() => []) : [];
+  if (paths.length !== files.length) {
+    paths = [];
+    for (const f of files) {
+      if (!f.size || f.size > 50 * 1024 * 1024) continue;
+      const bytes = new Uint8Array(await f.arrayBuffer());
+      let bin = '';
+      for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      const name = f.name && f.name !== 'image.png' ? f.name : `pasted-${Date.now()}.${(f.type.split('/')[1] || 'png').replace('jpeg', 'jpg')}`;
+      const saved = await wb.saveDrop(name, btoa(bin)).catch(() => null);
+      if (saved) paths.push(saved);
+    }
+  }
+  if (paths.length && !t.exited) t.xterm.paste(paths.map(shellQuote).join(' ') + ' ');
+  t.xterm.focus();
+}
+function termDrops(t) {
+  const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
+  t.el.addEventListener('dragover', (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    t.el.classList.add('drop-target');
+  });
+  t.el.addEventListener('dragleave', () => t.el.classList.remove('drop-target'));
+  t.el.addEventListener('drop', (e) => {
+    t.el.classList.remove('drop-target');
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    pathsOf(t, [...e.dataTransfer.files], true);
+  });
+  // ⌘V with only an image on the clipboard (a screenshot): its saved path. Text pastes as before.
+  t.el.addEventListener('paste', (e) => {
+    const cd = e.clipboardData;
+    if (!cd || cd.getData('text/plain')) return;
+    const images = [...cd.files].filter((f) => f.type.startsWith('image/'));
+    if (!images.length) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    pathsOf(t, images, false);
+  }, true);
+}
+
 function mountTerm(info) {
   const el = document.createElement('div');
   el.className = 'term hidden';
@@ -801,21 +1067,45 @@ function mountTerm(info) {
   const { xterm, fit } = newXterm();
   xterm.open(el);
   const t = { id: info.id, kind: info.kind, title: info.title, xterm, fit, el, exited: info.exited, browserTools: info.browserTools,
-    secrets: info.secrets || [], guard: !!info.guard, sandbox: !!info.sandbox, then: info.then || null };
+    secrets: info.secrets || [], guard: !!info.guard, sandbox: !!info.sandbox, then: info.then || null, root: S.project?.root || '' };
   if (typeof proGuardPaste === 'function') proGuardPaste(t); // Workbench Pro: secret paste guard
+  t.custom = savedTermNames()[t.id] || '';
+  // The title the program sets (OSC 0/2): Claude Code names it after the session, with a spinner or
+  // ✳ in front; a shell, after the folder or the command running.
+  xterm.onTitleChange((title) => {
+    let clean = String(title).replace(/^[^\p{L}\p{N}~/.]+/u, '').trim().slice(0, 80);
+    // On Windows a program that sets no title has its own path as one (ConPTY): that's no name.
+    if (/^([a-z]:\\|\\\\)[^\n]*\.exe$/i.test(clean)) clean = '';
+    if (clean === t.auto) return;
+    t.auto = clean;
+    renderTermTabs();
+  });
   xterm.onData((data) => { if (!t.exited) wb.ptyWrite(t.id, data); else if (data === '\r') restartTerm(t); });
   xterm.attachCustomKeyEventHandler((e) => {
     if (e.type === 'keydown' && (IS_MAC ? e.metaKey : e.ctrlKey && e.shiftKey) && e.key.toLowerCase() === 'k') { xterm.clear(); return false; }
+    // ⇧↩ is a new line in the prompt, not Enter (Claude Code, Codex): ESC ↩, as Warp and iTerm send.
+    if (e.key === 'Enter' && e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      if (e.type === 'keydown' && !t.exited) wb.ptyWrite(t.id, '\x1b\r');
+      return false;
+    }
     return true;
   });
+  xterm.attachCustomWheelEventHandler((e) => termWheel(t, e));
+  const links = termExtraLinks(t, termLinks(t));
+  xterm.registerLinkProvider(links);
+  termLinkClicks(t, links);
+  termExtras(t, links);
+  termDrops(t);
   xterm.onResize(({ cols, rows }) => { if (!t.exited) wb.ptyResize(t.id, cols, rows); });
   S.terms.push(t);
   return t;
 }
 
-async function launch(kind) {
+async function launch(kind, { resume = false, resumeId, resumeMode, name } = {}) {
   if (!S.project) { toast('Open a project first'); return null; }
   if (S.info?.terminals === false) { toast(`Terminals are unavailable: ${S.info.terminalError || ''}`, 5000); return null; }
+  // Where it sends what you type, said first (not for a session reopened after a restart).
+  if (!resumeId && !(await agentConsent(kind))) return null;
   // Workbench Pro: a sandbox gets only the vault secrets picked for this session.
   let secrets;
   if (String(kind).startsWith('sandbox-') && typeof proPickSandboxSecrets === 'function') {
@@ -828,17 +1118,19 @@ async function launch(kind) {
     // Size the pty right from the start so TUIs (Claude Code, Codex) draw correctly.
     const host = $('#term-host');
     const dims = estimateDims(host);
-    info = await wb.ptyCreate({ kind, cols: dims.cols, rows: dims.rows, secrets });
+    info = await wb.ptyCreate({ kind, cols: dims.cols, rows: dims.rows, secrets, resume, resumeId, resumeMode });
   } catch (err) {
     toast(err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, ''), 5000);
     if (/not installed/i.test(err.message)) refreshInfo();
     return null;
   }
   const t = mountTerm(info);
+  if (resumeId) { t.sessionId = resumeId; t.permissionMode = resumeMode || ''; if (name) saveTermName(t, name); }
   for (const n of info.notes || []) t.xterm.writeln(`\x1b[2m${n}\x1b[0m`);
   if (t.secrets.length && !t.sandbox) t.xterm.writeln(`\x1b[2mVault: ${t.secrets.join(', ')} ${t.secrets.length === 1 ? 'is' : 'are'} set in this session’s environment (values hidden).\x1b[0m`);
-  if (t.guard) t.xterm.writeln('\x1b[2mSecret-file guard: Meridian asks before Claude Code reads .env, keys or credentials (file tools by path; shell commands only by a name match, so it is a safety net, not a wall).\x1b[0m');
-  if (info.browserTools) t.xterm.writeln(`\x1b[2mMeridian browser tools are connected for this session (access: ${ACCESS_LABEL[S.info?.agentAccess] || 'off'} — change it in Settings → AI).\x1b[0m`);
+  // (A shell tab gets them too, for Claude Code started there: no notes in a plain shell.)
+  if (t.guard && kind !== 'shell') t.xterm.writeln('\x1b[2mSecret-file guard: Meridian asks before Claude Code reads .env, keys or credentials (file tools by path; shell commands only by a name match, so it is a safety net, not a wall).\x1b[0m');
+  if (info.browserTools && kind !== 'shell') t.xterm.writeln(`\x1b[2mMeridian browser tools are connected for this session (access: ${ACCESS_LABEL[S.info?.agentAccess] || 'off'} — change it in Settings → AI).\x1b[0m`);
   activateTerm(t);
   return t;
 }
@@ -856,15 +1148,17 @@ async function restartTerm(t) {
 
 async function killTerm(t, { quiet = false } = {}) {
   if (!quiet && !t.exited && t.kind !== 'shell') {
-    if (!(await confirmBox(`Stop ${t.title}?`, 'The agent session in this terminal will end.', 'Stop', true))) return;
+    if (!(await confirmBox(`Stop ${termName(t)}?`, 'The agent session in this terminal will end.', 'Stop', true))) return;
   }
   try { await wb.ptyKill(t.id); } catch {}
+  t.closed = true;
   t.xterm.dispose();
   t.el.remove();
   const i = S.terms.indexOf(t);
   S.terms.splice(i, 1);
   if (S.activeTerm === t) S.activeTerm = S.terms[Math.min(i, S.terms.length - 1)] || null;
   if (S.activeTerm) activateTerm(S.activeTerm); else renderTermTabs();
+  if (t.kind === 'claude') saveClaudeSessions();
 }
 
 function activateTerm(t) {
@@ -880,17 +1174,109 @@ function fitActive() {
   try { t.fit.fit(); } catch {}
 }
 
+// Names given by hand (double click on a tab), by terminal, for as long as the terminals live.
+function savedTermNames() {
+  try { return JSON.parse(sessionStorage.getItem('termNames') || '{}'); } catch { return {}; }
+}
+
+function saveTermName(t, name) {
+  t.custom = name;
+  const all = savedTermNames();
+  if (name) all[t.id] = name; else delete all[t.id];
+  try { sessionStorage.setItem('termNames', JSON.stringify(all)); } catch {}
+  if (t.kind === 'claude') saveClaudeSessions();
+}
+
+// A name given by hand, else the session's name (Claude Code's status line), else the terminal's title.
+function termName(t) {
+  return t.custom || (typeof termSessionName === 'function' && termSessionName(t)) || t.auto || t.title;
+}
+
+function renameTerm(t) {
+  const nameEl = [...document.querySelectorAll('#term-tab-list .ttab')][S.terms.indexOf(t)]?.querySelector('.name');
+  if (!nameEl) return;
+  S.renamingTerm = t;
+  const input = document.createElement('input');
+  input.className = 'rename';
+  input.value = termName(t);
+  input.spellcheck = false;
+  nameEl.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = (keep) => {
+    if (done) return;
+    done = true;
+    S.renamingTerm = null;
+    // Empty: back to the name the program gives.
+    if (keep) saveTermName(t, input.value.trim().slice(0, 80));
+    renderTermTabs();
+    t.xterm.focus();
+  };
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') finish(true);
+    else if (e.key === 'Escape') finish(false);
+  });
+  input.addEventListener('blur', () => finish(true));
+  input.addEventListener('click', (e) => e.stopPropagation());
+}
+
+// Drag a terminal's tab along the strip to put it elsewhere (pointer events, so a mouse and a
+// trackpad both do). The order is kept: Claude Code tabs come back in it after a restart.
+function dragTermTab(el, t, e) {
+  if (e.button !== 0 || e.target.closest('.tab-close, .ctx-badge, .rename')) return;
+  const list = $('#term-tab-list');
+  const startX = e.clientX;
+  let dragging = false;
+  const others = () => [...list.children].filter((x) => x !== el);
+  const move = (ev) => {
+    if (!dragging && Math.abs(ev.clientX - startX) < 5) return;
+    if (!dragging) {
+      dragging = true;
+      S.draggingTerm = t;
+      el.classList.add('dragging');
+    }
+    el.style.transform = `translateX(${ev.clientX - startX}px)`;
+  };
+  const up = (ev) => {
+    window.removeEventListener('pointermove', move, true);
+    window.removeEventListener('pointerup', up, true);
+    if (!dragging) return;
+    S.draggingTerm = null;
+    S.termDraggedAt = Date.now();
+    // Its new place: after every other tab whose middle the pointer passed.
+    const tabs = others();
+    const index = tabs.filter((x) => { const r = x.getBoundingClientRect(); return r.left + r.width / 2 < ev.clientX; }).length;
+    const order = S.terms.filter((x) => x !== t);
+    const before = tabs[index] ? S.terms[[...list.children].indexOf(tabs[index])] : null;
+    order.splice(before ? order.indexOf(before) : order.length, 0, t);
+    S.terms = order;
+    renderTermTabs();
+    saveClaudeSessions();
+  };
+  window.addEventListener('pointermove', move, true);
+  window.addEventListener('pointerup', up, true);
+}
+
 function renderTermTabs() {
+  termStripRender();
+  // Not under the name being typed (a status update would drop it), nor under a tab being dragged.
+  if (S.renamingTerm || S.draggingTerm) return;
   const list = $('#term-tab-list');
   list.replaceChildren(...S.terms.map((t) => {
     const el = document.createElement('div');
     el.className = `ttab${t === S.activeTerm ? ' active' : ''}${t.exited ? ' exited' : ''}`;
     el.setAttribute('role', 'tab');
-    el.appendChild(agentMark(AGENT_UI[t.kind] ? t.kind : 'shell'));
+    // A shell tab with Claude Code running in it looks like a Claude Code tab.
+    el.appendChild(agentMark(t.kind === 'shell' && t.sessionId ? 'claude' : AGENT_UI[t.kind] ? t.kind : 'shell'));
     const name = document.createElement('span');
     name.className = 'name';
-    name.textContent = t.title + (t.exited ? ' (exited)' : '');
+    name.textContent = termName(t) + (t.exited ? ' (exited)' : '');
+    el.title = `${termName(t)}\nDouble-click to rename`;
     el.appendChild(name);
+    const badge = typeof termUsageBadge === 'function' ? termUsageBadge(t) : null;
+    if (badge) el.appendChild(badge);
     if (t.browserTools) { const p = document.createElement('span'); p.className = 'plug'; p.title = 'Meridian browser tools connected'; p.innerHTML = icon('globe', 11); el.appendChild(p); }
     // Workbench Pro: sandbox and vault indicators (secret NAMES only)
     if (t.sandbox) { const p = document.createElement('span'); p.className = 'plug sbx'; p.title = 'Runs in a Docker sandbox: only this project is visible'; p.innerHTML = icon('shield', 11); el.appendChild(p); }
@@ -898,12 +1284,32 @@ function renderTermTabs() {
     const x = document.createElement('button');
     x.className = 'tab-close'; x.title = t.exited ? 'Close' : 'Stop and close'; x.innerHTML = icon('x', 12);
     el.appendChild(x);
-    el.addEventListener('click', (e) => { if (e.target.closest('.tab-close')) killTerm(t); else activateTerm(t); });
+    // A double click renames: told by the click count, since the first click redraws the tabs.
+    el.addEventListener('pointerdown', (e) => dragTermTab(el, t, e));
+    el.addEventListener('click', (e) => {
+      // The click that ends a drag isn't one.
+      if (Date.now() - (S.termDraggedAt || 0) < 300) return;
+      if (e.target.closest('.tab-close')) killTerm(t);
+      else if (e.detail === 2 && !e.target.closest('.ctx-badge')) renameTerm(t);
+      else if (e.detail < 2) activateTerm(t);
+    });
     el.addEventListener('mousedown', (e) => { if (e.button === 1) { e.preventDefault(); killTerm(t); } });
     return el;
   }));
   $('#term-empty').hidden = S.terms.length > 0;
   renderTermStart();
+  sendMissionNames();
+}
+
+// Mission Control shows each session under the name on its tab (only when one changes).
+let lastMissionNames = '';
+function sendMissionNames() {
+  if (typeof wb.missionNames !== 'function') return;
+  const names = Object.fromEntries(S.terms.filter((t) => t.id && !t.exited).map((t) => [t.id, termName(t) || '']));
+  const key = JSON.stringify(names);
+  if (key === lastMissionNames) return;
+  lastMissionNames = key;
+  wb.missionNames(names).catch(() => {});
 }
 
 // A project with no terminal yet: one big button for the agent that's installed (the first of Claude Code,
@@ -919,13 +1325,28 @@ function renderTermStart() {
   b.append(agentMark(kind), document.createTextNode(`Start ${AGENT_UI[kind].label}`));
   b.addEventListener('click', () => launch(kind));
   box.appendChild(b);
+  if (kind === 'claude') box.appendChild(resumeButton('btn big term-resume-btn'));
+}
+
+// Claude Code's list of this project's recent sessions (also ones whose tab was closed), to pick one up.
+function resumeButton(className) {
+  const b = document.createElement('button');
+  b.className = className;
+  const mark = agentMark('claude');
+  mark.textContent = '↻';
+  const label = document.createElement('span');
+  label.textContent = 'Resume Claude Code…';
+  b.append(mark, label);
+  b.title = 'Pick up a recent Claude Code session in this project';
+  b.addEventListener('click', () => launch('claude', { resume: true }));
+  return b;
 }
 
 function layoutTerminals() { renderTermTabs(); fitActive(); }
 
 async function reattachTerminals() {
   let list = [];
-  try { list = await wb.ptyList(); } catch { return; }
+  try { list = await wb.ptyList(); } catch { return 0; }
   for (const info of list) {
     if (S.terms.some((t) => t.id === info.id)) continue;
     const t = mountTerm(info);
@@ -933,6 +1354,56 @@ async function reattachTerminals() {
     if (info.exited) t.xterm.writeln(`\r\n\x1b[2m[process exited — press Enter to restart]\x1b[0m`);
   }
   if (S.terms.length) activateTerm(S.terms[S.terms.length - 1]);
+  return list.length;
+}
+
+// Claude Code tabs come back after the browser restarts (an update, say): each project remembers
+// its Claude sessions (the id Claude Code's status line gives, the permission mode its hooks report,
+// and a name given by hand), and when
+// the Workbench opens the project with no terminals running, they open again with `claude --resume`,
+// in the same order. A tab closed by hand is forgotten.
+function saveClaudeSessions() {
+  const root = S.project?.root;
+  if (!root || S.restoringSessions || typeof wb.saveClaudeSessions !== 'function') return;
+  // (Claude Code started by hand in a shell tab too, while it runs there.)
+  const list = S.terms.filter((t) => (t.kind === 'claude' || t.kind === 'shell') && t.root === root && t.sessionId && !t.closed)
+    .map((t) => ({ id: t.sessionId, name: t.custom || '', mode: t.permissionMode || '' }));
+  const key = JSON.stringify(list);
+  if (S.savedSessions === key) return;
+  S.savedSessions = key;
+  wb.saveClaudeSessions(list).catch(() => { S.savedSessions = null; });
+}
+
+// The status line told us a terminal's session id (it changes on /clear, so keep following it).
+function noteClaudeSessions(usage) {
+  let changed = false;
+  for (const t of S.terms) {
+    const claude = t.kind === 'claude' || t.kind === 'shell';
+    const id = usage?.[t.id]?.session_id;
+    if (claude && typeof id === 'string' && id && id !== t.sessionId) { t.sessionId = id; changed = true; }
+    // The permission mode it's in (bypass, auto, accept edits…), to resume it in the same one.
+    const mode = usage?.[t.id]?.permission_mode;
+    if (claude && typeof mode === 'string' && mode && mode !== t.permissionMode) { t.permissionMode = mode; changed = true; }
+    // Claude Code quit in a shell tab: the shell stays, nothing to bring back.
+    if (t.kind === 'shell' && t.sessionId && !usage?.[t.id]) { t.sessionId = ''; t.permissionMode = ''; changed = true; }
+  }
+  if (changed) saveClaudeSessions();
+}
+
+async function restoreClaudeSessions(root) {
+  let list = [];
+  try { list = (await wb.claudeSessions()) || []; } catch { return; }
+  list = list.filter((s) => s && /^[\w-]{1,80}$/.test(String(s.id)));
+  S.savedSessions = JSON.stringify(list);
+  if (!list.length || S.info?.agents?.claude?.installed === false) return;
+  S.restoringSessions = true;
+  try {
+    for (const s of list) {
+      if (S.project?.root !== root) break;
+      await launch('claude', { resumeId: String(s.id), resumeMode: typeof s.mode === 'string' ? s.mode : '', name: typeof s.name === 'string' ? s.name.slice(0, 80) : '' });
+    }
+  } finally { S.restoringSessions = false; }
+  saveClaudeSessions();
 }
 
 function initTerminals() {
@@ -954,6 +1425,15 @@ function initTerminals() {
     fitActive();
   });
   new ResizeObserver(() => fitActive()).observe($('#term-host'));
+  // The launchers fit again whenever the bar or what shares it (the project's name, the buttons on
+  // the right) changes size.
+  {
+    let queued = false;
+    const refit = () => { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; fitLauncher(); }); };
+    const ro = new ResizeObserver(refit);
+    for (const el of $('#topbar')?.children || []) if (el.id !== 'launcher') ro.observe(el);
+    if ($('#topbar')) ro.observe($('#topbar'));
+  }
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { for (const t of S.terms) t.xterm.options.theme = termTheme(); });
 }
 
@@ -1018,8 +1498,18 @@ function onHostCommand(msg) {
   }
   if (msg.type === 'pick-project') pickProject();
   // Mission Control: "Open terminal" on an agent node, and the live counts for the topbar chip.
-  if (msg.type === 'focus-term') { const t = S.terms.find((x) => x.id === String(msg.id)); if (t) { $('#term-area').classList.remove('collapsed'); activateTerm(t); } }
+  if (msg.type === 'focus-term') {
+    const t = S.terms.find((x) => x.id === String(msg.id));
+    if (t) {
+      $('#term-area').classList.remove('collapsed');
+      activateTerm(t);
+      // From Mission Control's "Context Insights".
+      if (msg.panel === 'insights' && typeof openPanel === 'function') { CI.termId = t.id; openPanel('insights'); }
+    }
+  }
   if (msg.type === 'mission' && typeof missionChip === 'function') missionChip(msg);
+  if (msg.type === 'mission' && typeof insightsUsage === 'function') insightsUsage(msg.usage);
+  if (msg.type === 'mission') noteClaudeSessions(msg.usage);
   if (typeof proHostCommand === 'function') proHostCommand(msg); // Workbench Pro: new-hub, customize, safe-mode
 }
 

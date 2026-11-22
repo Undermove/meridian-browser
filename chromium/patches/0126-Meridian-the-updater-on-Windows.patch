@@ -1,0 +1,753 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Sun, 15 Nov 2026 17:37:19 +0400
+Subject: [PATCH 127/202] Meridian: the updater on Windows
+
+Off macOS Settings only showed the version. On Windows Meridian now updates
+itself as on the Mac: it asks GitHub for the latest release a little after
+it starts and then daily, downloads that release's installer
+(Meridian-<version>-win-<arch>-setup.exe), and checks it against the
+checksums the Windows build publishes beside it (SHA256SUMS-win.txt), which
+it trusts only under Meridian's release key, the same one as the Mac's.
+"Restart to update" quits and lets a small script run the installer once
+Meridian is gone, then open it again. Only a copy an installer put there
+updates itself; a build in out/ doesn't.
+
+The release parsing is one function for both systems with the names each
+looks for; the Mac's are what they were.
+
+Linux keeps the stub.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ chrome/browser/meridian/BUILD.gn              |   9 +-
+ chrome/browser/meridian/update_check.cc       |  81 ++-
+ chrome/browser/meridian/update_check.h        |  15 +
+ .../browser/meridian/update_check_unittest.cc |  62 +++
+ chrome/browser/meridian/updater_win.cc        | 472 ++++++++++++++++++
+ 5 files changed, 629 insertions(+), 10 deletions(-)
+ create mode 100644 chrome/browser/meridian/updater_win.cc
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 5213c7992c..99d15c1fa8 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -315,14 +315,19 @@ source_set("meridian") {
+     ]
+   } else {
+     if (is_win) {
+-      sources += [ "arc_logins_win.cc" ]
++      sources += [
++        "arc_logins_win.cc",
++        "updater_win.cc",
++      ]
+       libs = [ "crypt32.lib" ]
++    } else {
++      # Linux: no updater yet (Settings shows the version).
++      sources += [ "updater_stub.cc" ]
+     }
+ 
+     # Windows and Linux: the same things with Chromium's own UI toolkit.
+     sources += [
+       "mission/mission_platform_views.cc",
+-      "updater_stub.cc",
+       "workbench/native_dialog_views.cc",
+     ]
+   }
+diff --git a/chrome/browser/meridian/update_check.cc b/chrome/browser/meridian/update_check.cc
+index 8bcfb49dc4..2edea63cf0 100644
+--- a/chrome/browser/meridian/update_check.cc
++++ b/chrome/browser/meridian/update_check.cc
+@@ -86,9 +86,22 @@ bool IsAllowedDownloadUrl(std::string_view url, bool test_feed) {
+          (gurl.SchemeIs("https") || (test_feed && gurl.SchemeIs("http")));
+ }
+ 
+-std::optional<Release> ParseRelease(std::string_view json,
+-                                    std::string_view arch,
+-                                    bool test_feed) {
++namespace {
++
++// What a release's files are called for one system.
++struct AssetNames {
++  // The package is "Meridian-<version><system><architecture><ending>".
++  std::string_view system;
++  std::string_view ending;
++  std::string_view sums;
++  std::string_view sums_other;
++  std::string_view signature;
++};
++
++std::optional<Release> ParseFor(std::string_view json,
++                                std::string_view arch,
++                                bool test_feed,
++                                const AssetNames& names) {
+   std::optional<base::Value> value =
+       base::JSONReader::Read(json, base::JSON_PARSE_RFC);
+   if (!value || !value->is_dict()) {
+@@ -108,9 +121,8 @@ std::optional<Release> ParseRelease(std::string_view json,
+   if (const std::string* page = dict.FindString("html_url")) {
+     release.page_url = *page;
+   }
+-  release.zip_name = base::StringPrintf("Meridian-%s-mac-%s.zip",
+-                                        release.version.c_str(),
+-                                        std::string(arch).c_str());
++  release.zip_name = base::StrCat(
++      {"Meridian-", release.version, names.system, arch, names.ending});
+   if (const base::ListValue* assets = dict.FindList("assets")) {
+     for (const base::Value& asset : *assets) {
+       if (!asset.is_dict()) {
+@@ -127,9 +139,9 @@ std::optional<Release> ParseRelease(std::string_view json,
+       }
+       if (*name == release.zip_name) {
+         release.zip_url = *url;
+-      } else if (*name == "SHA256SUMS.txt" || *name == "SHA256SUMS") {
++      } else if (*name == names.sums || *name == names.sums_other) {
+         release.sums_url = *url;
+-      } else if (*name == "SHA256SUMS.txt.sig") {
++      } else if (*name == names.signature) {
+         release.sig_url = *url;
+       }
+     }
+@@ -140,6 +152,59 @@ std::optional<Release> ParseRelease(std::string_view json,
+   return release;
+ }
+ 
++}  // namespace
++
++std::optional<Release> ParseRelease(std::string_view json,
++                                    std::string_view arch,
++                                    bool test_feed) {
++  return ParseFor(json, arch, test_feed,
++                  {"-mac-", ".zip", "SHA256SUMS.txt", "SHA256SUMS",
++                   "SHA256SUMS.txt.sig"});
++}
++
++std::optional<Release> ParseWindowsRelease(std::string_view json,
++                                           std::string_view arch,
++                                           bool test_feed) {
++  return ParseFor(json, arch, test_feed,
++                  {"-win-", "-setup.exe", "SHA256SUMS-win.txt",
++                   "SHA256SUMS-win.txt", "SHA256SUMS-win.txt.sig"});
++}
++
++std::string WindowsInstallScript(int pid,
++                                 const base::FilePath& setup,
++                                 const base::FilePath& browser) {
++  // Paths in double quotes: a Windows file name has none in it, and "%" (the
++  // one thing cmd would still expand inside quotes) is doubled.
++  auto quoted = [](const base::FilePath& path) {
++    std::string text = path.AsUTF8Unsafe();
++    base::ReplaceSubstringsAfterOffset(&text, 0, "%", "%%");
++    return "\"" + text + "\"";
++  };
++  const std::string id = base::NumberToString(pid);
++  std::string script =
++      "@echo off\r\n"
++      "chcp 65001 >nul\r\n"
++      // ping is the wait that works without a console.
++      ":wait\r\n"
++      "tasklist /fi \"PID eq " + id + "\" 2>nul | find \" " + id +
++      " \" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)\r\n"
++      "set tries=0\r\n"
++      ":install\r\n"
++      "ping -n 3 127.0.0.1 >nul\r\n" +
++      quoted(setup) +
++      " --do-not-launch-chrome\r\n"
++      "if not errorlevel 1 goto done\r\n"
++      "set /a tries+=1\r\n"
++      "if %tries% lss 5 goto install\r\n"
++      "echo the installer failed\r\n"
++      ":done\r\n";
++  if (!browser.empty()) {
++    script += "start \"\" " + quoted(browser) + "\r\n";
++  }
++  script += "del " + quoted(setup) + "\r\n";
++  return script;
++}
++
+ std::optional<std::string> FindSum(std::string_view sums,
+                                    std::string_view name) {
+   for (std::string_view line : base::SplitStringPiece(
+diff --git a/chrome/browser/meridian/update_check.h b/chrome/browser/meridian/update_check.h
+index f0cb3da071..0153674283 100644
+--- a/chrome/browser/meridian/update_check.h
++++ b/chrome/browser/meridian/update_check.h
+@@ -75,6 +75,21 @@ std::optional<Release> ParseRelease(std::string_view json,
+                                     std::string_view arch,
+                                     bool test_feed = false);
+ 
++// The same for Windows: the installer Meridian-<version>-win-<arch>-setup.exe
++// as `zip_name`/`zip_url`, with the checksums and their signature the Windows
++// build makes for it, SHA256SUMS-win.txt and SHA256SUMS-win.txt.sig (signed
++// with the same release key).
++std::optional<Release> ParseWindowsRelease(std::string_view json,
++                                           std::string_view arch,
++                                           bool test_feed = false);
++// The script that installs an update on Windows once Meridian has quit (run
++// hidden with cmd.exe): waits for `pid` to exit, runs the installer `setup`
++// (a few tries: Meridian's other processes may take a moment to go), then
++// opens `browser` unless it is empty, and removes the installer.
++std::string WindowsInstallScript(int pid,
++                                 const base::FilePath& setup,
++                                 const base::FilePath& browser);
++
+ // A raw Ed25519 public key from base64 (--meridian-test-update-key), or
+ // nullopt.
+ std::optional<std::array<uint8_t, 32>> ParsePublicKey(std::string_view base64);
+diff --git a/chrome/browser/meridian/update_check_unittest.cc b/chrome/browser/meridian/update_check_unittest.cc
+index 2329ee4da9..a0876a9fde 100644
+--- a/chrome/browser/meridian/update_check_unittest.cc
++++ b/chrome/browser/meridian/update_check_unittest.cc
+@@ -8,6 +8,9 @@
+ 
+ #include "base/base64.h"
+ #include "base/containers/span.h"
++#include "base/base_paths.h"
++#include "base/path_service.h"
++#include "base/command_line.h"
+ #include "base/files/file_util.h"
+ #include "base/files/scoped_temp_dir.h"
+ #include "base/process/launch.h"
+@@ -212,5 +215,64 @@ TEST(UpdateCheckTest, TheSwapScriptChecksTheSignatureAgainFirst) {
+ }
+ #endif  // !BUILDFLAG(IS_WIN)
+ 
++TEST(UpdateCheckTest, AWindowsReleaseIsTheInstallerWithItsOwnChecksums) {
++  static constexpr char kWindowsJson[] = R"({
++    "tag_name": "v1.2.0", "html_url": "https://example.test/page",
++    "assets": [
++      {"name": "Meridian-1.2.0-mac-arm64.zip",
++       "browser_download_url": "https://example.test/mac.zip"},
++      {"name": "SHA256SUMS.txt",
++       "browser_download_url": "https://example.test/mac-sums"},
++      {"name": "SHA256SUMS.txt.sig",
++       "browser_download_url": "https://example.test/mac-sig"},
++      {"name": "Meridian-1.2.0-win-x64-setup.exe",
++       "browser_download_url": "https://example.test/setup.exe"},
++      {"name": "SHA256SUMS-win.txt",
++       "browser_download_url": "https://example.test/win-sums"},
++      {"name": "SHA256SUMS-win.txt.sig",
++       "browser_download_url": "https://example.test/win-sig"}]})";
++  std::optional<Release> r = ParseWindowsRelease(kWindowsJson, "x64");
++  ASSERT_TRUE(r);
++  EXPECT_EQ(r->version, "1.2.0");
++  EXPECT_EQ(r->zip_name, "Meridian-1.2.0-win-x64-setup.exe");
++  EXPECT_EQ(r->zip_url, "https://example.test/setup.exe");
++  EXPECT_EQ(r->sums_url, "https://example.test/win-sums");
++  EXPECT_EQ(r->sig_url, "https://example.test/win-sig");
++  // No installer for that architecture; and the Mac's zip is still found by
++  // the Mac, with the Mac's checksums.
++  EXPECT_FALSE(ParseWindowsRelease(kWindowsJson, "arm64"));
++  std::optional<Release> mac = ParseRelease(kWindowsJson, "arm64");
++  ASSERT_TRUE(mac);
++  EXPECT_EQ(mac->sums_url, "https://example.test/mac-sums");
++  EXPECT_EQ(mac->sig_url, "https://example.test/mac-sig");
++}
++
++#if BUILDFLAG(IS_WIN)
++// The script runs for real, with a harmless program (doskey, which takes any
++// argument and succeeds) standing in for the
++// installer: it waits for a process that is gone, runs the stand-in, and
++// removes it.
++TEST(UpdateCheckTest, TheWindowsInstallScriptRunsTheInstallerAndRemovesIt) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  base::FilePath system;
++  ASSERT_TRUE(base::PathService::Get(base::DIR_SYSTEM, &system));
++  // A name with a space and a percent sign.
++  base::FilePath setup = dir.GetPath().AppendASCII("Meridian 100% setup.exe");
++  ASSERT_TRUE(base::CopyFile(system.AppendASCII("doskey.exe"), setup));
++  base::FilePath script = dir.GetPath().AppendASCII("update.cmd");
++  ASSERT_TRUE(base::WriteFile(
++      script, WindowsInstallScript(999999, setup, base::FilePath())));
++  base::CommandLine line(system.AppendASCII("cmd.exe"));
++  line.AppendArgNative(L"/d");
++  line.AppendArgNative(L"/c");
++  line.AppendArgPath(script);
++  std::string out;
++  ASSERT_TRUE(base::GetAppOutput(line, &out));
++  EXPECT_EQ(out.find("the installer failed"), std::string::npos) << out;
++  EXPECT_FALSE(base::PathExists(setup));
++}
++#endif
++
+ }  // namespace
+ }  // namespace meridian::update
+diff --git a/chrome/browser/meridian/updater_win.cc b/chrome/browser/meridian/updater_win.cc
+new file mode 100644
+index 0000000000..c9db7834f6
+--- /dev/null
++++ b/chrome/browser/meridian/updater_win.cc
+@@ -0,0 +1,472 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/updater.h"
++
++#include <algorithm>
++#include <array>
++#include <utility>
++#include <vector>
++
++#include "base/base_paths.h"
++#include "base/command_line.h"
++#include "base/containers/span.h"
++#include "base/files/file.h"
++#include "base/files/file_util.h"
++#include "base/logging.h"
++#include "base/no_destructor.h"
++#include "base/path_service.h"
++#include "base/process/launch.h"
++#include "base/process/process.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/task/thread_pool.h"
++#include "build/build_config.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/lifetime/application_lifetime.h"
++#include "chrome/browser/meridian/real_path.h"
++#include "chrome/browser/meridian/test_switches.h"
++#include "chrome/browser/meridian/update_check.h"
++#include "chrome/common/chrome_paths.h"
++#include "crypto/hash.h"
++#include "net/base/load_flags.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "services/network/public/mojom/url_response_head.mojom.h"
++
++// The updater on Windows (updater.cc is the macOS one; updater.h says what
++// both do). The same release feed, the same release key over the checksums;
++// what is downloaded is the installer (Meridian-<version>-win-<arch>-
++// setup.exe), and "Restart to update" quits and lets a small script run it
++// and open Meridian again. Only a copy that an installer put there updates
++// itself: a build in out/ doesn't.
++//
++// Tests: --meridian-update-feed and --meridian-test-update-key as on macOS;
++// --meridian-test-update-target=<file in the temp folder> gets a copy of the
++// downloaded installer instead of the installer being run.
++namespace meridian {
++
++namespace {
++
++constexpr base::TimeDelta kFirstCheck = base::Seconds(15);
++constexpr base::TimeDelta kEvery = base::Hours(24);
++constexpr int64_t kMaxInstaller = int64_t{2} << 30;
++
++constexpr net::NetworkTrafficAnnotationTag kAnnotation =
++    net::DefineNetworkTrafficAnnotation("meridian_updater_win", R"(
++        semantics {
++          sender: "Meridian Updater"
++          description:
++            "Meridian asks GitHub whether a newer release exists and "
++            "downloads its installer, its checksums and their signature."
++          trigger:
++            "A little after Meridian starts, then daily, and Check for "
++            "Updates in Settings."
++          data: "Nothing about the person: plain requests for public files."
++          destination: OTHER
++          destination_other: "GitHub releases of Meridian."
++          user_data {
++            type: NONE
++          }
++          internal {
++            contacts {
++              owners: "//chrome/browser/meridian/OWNERS"
++            }
++          }
++          last_reviewed: "2026-11-15"
++        }
++        policy {
++          cookies_allowed: NO
++          setting: "There is no setting; a build that wasn't installed "
++                   "doesn't check."
++          policy_exception_justification: "Not implemented."
++        })");
++
++const char* Arch() {
++#if defined(ARCH_CPU_ARM64)
++  return "arm64";
++#else
++  return "x64";
++#endif
++}
++
++// A stand-in GitHub (tests); it may serve over http and sign with a test key.
++bool TestFeed() {
++  return HasTestSwitch("meridian-update-feed");
++}
++
++std::string CurrentVersion() {
++  return HasTestSwitch("meridian-test-version")
++             ? TestSwitchValue("meridian-test-version")
++             : std::string(update::kVersion);
++}
++
++// Whether this copy was put here by Meridian's installer, which keeps itself
++// beside the browser's code (<version>\Installer\setup.exe): only such a copy
++// can be updated by running a newer installer. Blocking.
++bool IsInstalledCopy() {
++  base::FilePath module_dir;
++  return base::PathService::Get(base::DIR_MODULE, &module_dir) &&
++         base::PathExists(module_dir.AppendASCII("Installer")
++                              .AppendASCII("setup.exe"));
++}
++
++// Whether a test may have `target` written: a file in the temp folder.
++// Blocking.
++bool IsTestTarget(const base::FilePath& target) {
++  base::FilePath dir = RealFilePath(target.DirName());
++  base::FilePath temp;
++  if (dir.empty() || !base::GetTempDir(&temp)) {
++    return false;
++  }
++  base::FilePath real_temp = RealFilePath(temp);
++  return !real_temp.empty() && (dir == real_temp || real_temp.IsParent(dir));
++}
++
++std::unique_ptr<network::SimpleURLLoader> Request(const std::string& url) {
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = GURL(url);
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  request->load_flags = net::LOAD_DISABLE_CACHE;
++  // Not IDLE: SimpleURLLoader would write the file at BEST_EFFORT, which
++  // waits for startup to finish.
++  request->priority = net::LOW;
++  request->headers.SetHeader("Accept", "application/vnd.github+json");
++  auto loader =
++      network::SimpleURLLoader::Create(std::move(request), kAnnotation);
++  loader->SetRetryOptions(
++      2, network::SimpleURLLoader::RETRY_ON_NETWORK_CHANGE |
++             network::SimpleURLLoader::RETRY_ON_5XX);
++  return loader;
++}
++
++// On a worker: whether the downloaded installer is the one the signed
++// checksums name. An error for the person, or none (the second of the pair
++// is the macOS updater's code-signing requirement; there is none here).
++std::pair<std::string, std::string> Verify(base::FilePath installer,
++                                           std::string sum) {
++  auto fail = [](std::string error) {
++    return std::make_pair(std::move(error), std::string());
++  };
++  base::File file(installer, base::File::FLAG_OPEN | base::File::FLAG_READ);
++  if (!file.IsValid()) {
++    return fail("The download is missing.");
++  }
++  crypto::hash::Hasher hasher(crypto::hash::kSha256);
++  std::vector<uint8_t> buffer(1 << 20);
++  while (true) {
++    std::optional<size_t> n = file.ReadAtCurrentPos(buffer);
++    if (!n) {
++      return fail("The download couldn’t be read.");
++    }
++    if (*n == 0) {
++      break;
++    }
++    hasher.Update(base::span(buffer).first(*n));
++  }
++  std::array<uint8_t, crypto::hash::kSha256Size> digest;
++  hasher.Finish(digest);
++  if (base::HexEncodeLower(digest) != sum) {
++    file.Close();
++    base::DeleteFile(installer);
++    return fail("The download doesn’t match the release’s checksum.");
++  }
++  return std::make_pair(std::string(), std::string());
++}
++
++}  // namespace
++
++// static
++Updater& Updater::Get() {
++  static base::NoDestructor<Updater> updater;
++  return *updater;
++}
++
++Updater::Updater() = default;
++Updater::~Updater() = default;
++
++void Updater::Start() {
++  if (started_) {
++    return;
++  }
++  started_ = true;
++  base::PathService::Get(chrome::DIR_USER_DATA, &dir_);
++  dir_ = dir_.AppendASCII("Meridian Update");
++  // The browser to open again after the update.
++  base::PathService::Get(base::FILE_EXE, &bundle_);
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(
++          [](base::FilePath test_target, base::FilePath dir) {
++            base::CreateDirectory(dir);
++            Located located;
++            // (`is_signed` is the macOS word for "a release, not a build in
++            // out/".)
++            located.is_signed = IsInstalledCopy();
++            located.in_place = located.is_signed;
++            if (!test_target.empty()) {
++              if (!IsTestTarget(test_target)) {
++                LOG(WARNING) << "Meridian update: the test target isn’t in "
++                                "the temp folder";
++                return located;
++              }
++              located.test_target = true;
++              located.in_place = true;
++            }
++            return located;
++          },
++          TestSwitchPath("meridian-test-update-target"), dir_),
++      base::BindOnce(&Updater::OnLocated, weak_factory_.GetWeakPtr()));
++}
++
++void Updater::OnLocated(Located located) {
++  in_place_ = located.in_place;
++  test_target_ = located.test_target;
++  located_ = true;
++  if (user_check_) {
++    Check();
++  }
++  if (!located.is_signed && !TestFeed()) {
++    return;
++  }
++  first_.Start(FROM_HERE, TestFeed() ? base::TimeDelta() : kFirstCheck,
++               base::BindOnce(&Updater::Check, weak_factory_.GetWeakPtr()));
++  timer_.Start(FROM_HERE, kEvery,
++               base::BindRepeating(&Updater::Check,
++                                   weak_factory_.GetWeakPtr()));
++}
++
++void Updater::CheckNow() {
++  user_check_ = true;
++  Start();
++  if (located_) {
++    Check();
++  }
++}
++
++void Updater::Check() {
++  // Busy, or already waiting for a restart.
++  if (status_ == mojom::UpdateStatus::kChecking ||
++      status_ == mojom::UpdateStatus::kDownloading ||
++      status_ == mojom::UpdateStatus::kReady) {
++    return;
++  }
++  std::string feed =
++      TestFeed() ? TestSwitchValue("meridian-update-feed") : update::kFeed;
++  Set(mojom::UpdateStatus::kChecking);
++  loader_ = Request(feed);
++  loader_->DownloadToString(
++      g_browser_process->shared_url_loader_factory().get(),
++      base::BindOnce(&Updater::OnFeed, weak_factory_.GetWeakPtr()), 1 << 20);
++}
++
++void Updater::OnFeed(std::optional<std::string> body) {
++  loader_.reset();
++  bool user = std::exchange(user_check_, false);
++  if (!body) {
++    Set(user ? mojom::UpdateStatus::kFailed : mojom::UpdateStatus::kIdle,
++        "Couldn’t reach GitHub to check for updates.");
++    return;
++  }
++  std::optional<update::Release> release =
++      update::ParseWindowsRelease(*body, Arch(), TestFeed());
++  if (!release || !update::IsNewer(release->version, CurrentVersion())) {
++    Set(mojom::UpdateStatus::kUpToDate);
++    return;
++  }
++  release_ = *release;
++  if (!in_place_) {
++    // A build that wasn't installed: the release page has the installer.
++    Set(mojom::UpdateStatus::kAvailable);
++    return;
++  }
++  progress_ = 0;
++  zip_size_ = 0;
++  Set(mojom::UpdateStatus::kDownloading);
++  loader_ = Request(release_.zip_url);
++  loader_->SetOnResponseStartedCallback(base::BindOnce(
++      [](Updater* self, const GURL&,
++         const network::mojom::URLResponseHead& head) {
++        self->zip_size_ = head.content_length;
++      },
++      base::Unretained(this)));
++  loader_->SetOnDownloadProgressCallback(base::BindRepeating(
++      [](Updater* self, uint64_t current) {
++        if (self->zip_size_ > 0) {
++          double progress = static_cast<double>(current) / self->zip_size_;
++          // A few updates are enough.
++          if (progress - self->progress_ >= 0.02 || progress >= 1) {
++            self->progress_ = progress;
++            self->observers_.Notify(&Observer::OnUpdateStateChanged);
++          }
++        }
++      },
++      base::Unretained(this)));
++  // (`zip_` and `OnZip` are the macOS names; here it is the installer.)
++  loader_->DownloadToFile(
++      g_browser_process->shared_url_loader_factory().get(),
++      base::BindOnce(&Updater::OnZip, weak_factory_.GetWeakPtr()),
++      dir_.AppendUTF8(release_.zip_name), kMaxInstaller);
++}
++
++void Updater::OnZip(base::FilePath path) {
++  bool ok = loader_ && loader_->NetError() == net::OK && !path.empty();
++  loader_.reset();
++  if (!ok) {
++    Set(mojom::UpdateStatus::kFailed, "The update didn’t download.");
++    return;
++  }
++  zip_ = path;
++  loader_ = Request(release_.sums_url);
++  loader_->DownloadToString(
++      g_browser_process->shared_url_loader_factory().get(),
++      base::BindOnce(&Updater::OnSums, weak_factory_.GetWeakPtr()), 64 << 10);
++}
++
++void Updater::OnSums(std::optional<std::string> body) {
++  loader_.reset();
++  if (!body) {
++    Set(mojom::UpdateStatus::kFailed,
++        "The release has no checksum for Windows.");
++    return;
++  }
++  sums_ = std::move(*body);
++  if (release_.sig_url.empty()) {
++    Set(mojom::UpdateStatus::kFailed,
++        "The release’s checksums aren’t signed by Meridian.");
++    return;
++  }
++  loader_ = Request(release_.sig_url);
++  loader_->DownloadToString(
++      g_browser_process->shared_url_loader_factory().get(),
++      base::BindOnce(&Updater::OnSig, weak_factory_.GetWeakPtr()), 4 << 10);
++}
++
++void Updater::OnSig(std::optional<std::string> body) {
++  loader_.reset();
++  // No checksum is trusted before the signature over all of them is.
++  std::array<uint8_t, 32> key = update::kReleaseKey;
++  if (TestFeed()) {
++    if (std::optional<std::array<uint8_t, 32>> test_key =
++            update::ParsePublicKey(
++                TestSwitchValue("meridian-test-update-key"))) {
++      key = *test_key;
++    }
++  }
++  if (!body || !update::SumsSignedBy(sums_, *body, key)) {
++    Set(mojom::UpdateStatus::kFailed,
++        "The release’s checksums aren’t signed by Meridian.");
++    return;
++  }
++  std::optional<std::string> sum = update::FindSum(sums_, release_.zip_name);
++  if (!sum) {
++    Set(mojom::UpdateStatus::kFailed,
++        "The release has no checksum for Windows.");
++    return;
++  }
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE,
++      {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
++       base::TaskShutdownBehavior::SKIP_ON_SHUTDOWN},
++      base::BindOnce(&Verify, zip_, *sum),
++      base::BindOnce(&Updater::OnStaged, weak_factory_.GetWeakPtr()));
++}
++
++void Updater::OnStaged(
++    std::pair<std::string, std::string> error_and_requirement) {
++  const std::string& error = error_and_requirement.first;
++  if (!error.empty()) {
++    LOG(WARNING) << "Meridian update " << release_.version << ": " << error;
++    Set(mojom::UpdateStatus::kFailed, error);
++    return;
++  }
++  Set(mojom::UpdateStatus::kReady);
++}
++
++bool Updater::Install() {
++  if (status_ != mojom::UpdateStatus::kReady) {
++    return false;
++  }
++  const int pid = static_cast<int>(base::Process::Current().Pid());
++  std::string script;
++  if (test_target_) {
++    // A test: the installer isn't run, a copy of it lands where the test
++    // said.
++    base::FilePath target = TestSwitchPath("meridian-test-update-target");
++    // Once Meridian has quit, as the real script does.
++    const std::string id = base::NumberToString(pid);
++    script = "@echo off\r\nchcp 65001 >nul\r\n:wait\r\n"
++             "tasklist /fi \"PID eq " +
++             id + "\" 2>nul | find \" " + id +
++             " \" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)\r\n"
++             "copy /y \"" +
++             zip_.AsUTF8Unsafe() + "\" \"" + target.AsUTF8Unsafe() +
++             "\" >nul\r\n";
++  } else {
++    script = update::WindowsInstallScript(pid, zip_, bundle_);
++  }
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_BLOCKING},
++      base::BindOnce(
++          [](base::FilePath dir, std::string script) {
++            base::FilePath path = dir.AppendASCII("update.cmd");
++            base::FilePath cmd;
++            if (!base::WriteFile(path, script) ||
++                !base::PathService::Get(base::DIR_SYSTEM, &cmd)) {
++              return false;
++            }
++            base::CommandLine line(cmd.AppendASCII("cmd.exe"));
++            line.AppendArgNative(L"/d");
++            line.AppendArgNative(L"/c");
++            line.AppendArgPath(path);
++            base::LaunchOptions options;
++            // No console window; the script outlives Meridian.
++            options.start_hidden = true;
++            return base::LaunchProcess(line, options).IsValid();
++          },
++          dir_, std::move(script)),
++      base::BindOnce(
++          [](base::WeakPtr<Updater> self, bool started) {
++            if (!started) {
++              if (self) {
++                self->Set(mojom::UpdateStatus::kFailed,
++                          "Couldn’t start the update.");
++              }
++              return;
++            }
++            // Quit as from the menu: the session is saved and comes back in
++            // the new version.
++            chrome::AttemptExit();
++          },
++          weak_factory_.GetWeakPtr()));
++  return true;
++}
++
++mojom::UpdateStatePtr Updater::State() const {
++  auto state = mojom::UpdateState::New();
++  state->status = status_;
++  state->current = CurrentVersion();
++  state->version = release_.version;
++  state->progress = progress_;
++  state->error = error_;
++  state->page_url = release_.page_url;
++  return state;
++}
++
++void Updater::Set(mojom::UpdateStatus status, std::string error) {
++  status_ = status;
++  error_ = std::move(error);
++  observers_.Notify(&Observer::OnUpdateStateChanged);
++}
++
++void Updater::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void Updater::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++}  // namespace meridian

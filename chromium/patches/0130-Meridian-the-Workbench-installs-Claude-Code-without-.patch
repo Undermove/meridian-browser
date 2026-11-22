@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Sun, 15 Nov 2026 20:21:27 +0400
+Subject: [PATCH 131/202] Meridian: the Workbench installs Claude Code without
+ Node.js
+
+The install hint for Claude Code was "npm install -g ...", which does
+nothing on a computer without Node.js. It is now Claude Code's own
+installer (curl ... install.sh | bash; on Windows the PowerShell one, the
+shell the Workbench opens there), which needs nothing else.
+
+That installer puts `claude` in ~/.local/bin, which the environment
+Meridian read at its start may not have on its PATH (it is read once): the
+folder is added to the search path, so the agent is found right after it
+is installed, without restarting Meridian.
+
+For the agents whose command is still npm's, the list says when npm isn't
+there ("needs": Node.js), for the page to tell the person first.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ chrome/browser/meridian/ai/process_runner.cc | 17 +++++++++++++++
+ chrome/browser/meridian/workbench/agents.cc  | 23 ++++++++++++++++++--
+ 2 files changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/meridian/ai/process_runner.cc b/chrome/browser/meridian/ai/process_runner.cc
+index ef172318a8..087b238817 100644
+--- a/chrome/browser/meridian/ai/process_runner.cc
++++ b/chrome/browser/meridian/ai/process_runner.cc
+@@ -456,6 +456,15 @@ std::map<std::string, std::string> LoginEnvironment() {
+     std::string test_path = TestPath();
+     if (!test_path.empty()) {
+       env["PATH"] = test_path + ";" + Env("SystemRoot") + "\\System32";
++    } else if (env.contains("HOME")) {
++      // Where the installers of agent CLIs (Claude Code's own, others') put
++      // them. A PATH that got the folder after Meridian started doesn't have
++      // it yet, and this environment is read once.
++      std::string local_bin = env["HOME"] + "\\.local\\bin";
++      if (!base::ToLowerASCII(env["PATH"])
++               .contains(base::ToLowerASCII(local_bin))) {
++        env["PATH"] += ";" + local_bin;
++      }
+     }
+ #else
+     std::string shell = Env("SHELL");
+@@ -505,6 +514,14 @@ std::map<std::string, std::string> LoginEnvironment() {
+           env[name] = value;
+         }
+       }
++      // Where the installers of agent CLIs (Claude Code's own, others') put
++      // them. A shell profile that got the folder after Meridian started
++      // isn't read again: this environment is read once.
++      std::string local_bin = env["HOME"] + "/.local/bin";
++      if (!env["HOME"].empty() &&
++          !(":" + env["PATH"] + ":").contains(":" + local_bin + ":")) {
++        env["PATH"] += ":" + local_bin;
++      }
+     }
+     env.erase("TERM");
+ #endif  // BUILDFLAG(IS_WIN)
+diff --git a/chrome/browser/meridian/workbench/agents.cc b/chrome/browser/meridian/workbench/agents.cc
+index ff084e52a8..82d727776b 100644
+--- a/chrome/browser/meridian/workbench/agents.cc
++++ b/chrome/browser/meridian/workbench/agents.cc
+@@ -5,6 +5,8 @@
+ #include "chrome/browser/meridian/workbench/agents.h"
+ 
+ 
++#include <string_view>
++
+ #include "base/files/file_util.h"
+ #include "base/json/json_writer.h"
+ #include "base/no_destructor.h"
+@@ -31,11 +33,22 @@ struct Agent {
+   bool extra;
+ };
+ 
++// Claude Code's own installer (code.claude.com/docs/en/setup): needs no
++// Node.js, puts `claude` in ~/.local/bin and keeps it up to date. Windows's
++// is for PowerShell, the shell the Workbench opens there.
++#if BUILDFLAG(IS_WIN)
++constexpr char kClaudeInstall[] = "irm https://claude.ai/install.ps1 | iex";
++constexpr char kNpm[] = "npm.cmd";
++#else
++constexpr char kClaudeInstall[] =
++    "curl -fsSL https://claude.ai/install.sh | bash";
++constexpr char kNpm[] = "npm";
++#endif
++
+ const std::vector<Agent>& Agents() {
+   static const base::NoDestructor<std::vector<Agent>> agents(
+       std::vector<Agent>{
+-          {"claude", "Claude Code", "claude",
+-           "npm install -g @anthropic-ai/claude-code", true, false},
++          {"claude", "Claude Code", "claude", kClaudeInstall, true, false},
+           {"codex", "Codex", "codex", "npm install -g @openai/codex", true,
+            false},
+           {"gemini", "Gemini", "gemini", "npm install -g @google/gemini-cli",
+@@ -80,6 +93,12 @@ base::DictValue DetectAgents(const std::string& search_path) {
+     agent.Set("installed", !path.empty());
+     agent.Set("path", path.empty() ? base::Value() : base::Value(path));
+     agent.Set("install", a.install);
++    // What the install command itself needs and isn't here, for the page
++    // to say so before the person runs it.
++    if (path.empty() && std::string_view(a.install).starts_with("npm ") &&
++        FindExecutable(kNpm, search_path).empty()) {
++      agent.Set("needs", "Node.js (nodejs.org)");
++    }
+     agent.Set("mcp", a.mcp);
+     agent.Set("extra", a.extra);
+     out.Set(a.id, std::move(agent));

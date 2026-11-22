@@ -1,0 +1,841 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 18 Nov 2026 19:20:01 +0400
+Subject: [PATCH 164/202] Meridian: no crash where Chromium reaches for a
+ toolbar or BrowserView the WebUI window hasn't got
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Save address (the window had no autofill bubble handler; the window lookup
+by tab found no BrowserView), the iOS promo, send tab to self, storage
+pressure, relaunch, sharing, ⌘W on a strip-pinned tab, downloads deep scan,
+web app focus, sign-in interception, batch upload, accessibility announce.
+Autofill bubbles and the others sit where page info would, as the password
+bubble does (bubble_anchor_util::GetToolbarOrPageInfoAnchor).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../batch_upload/batch_upload_service.cc      |   8 +-
+ .../ui/autofill/address_bubbles_controller.cc |  11 +-
+ chrome/browser/ui/browser_commands.cc         |   7 +-
+ .../ios_promos_utils.cc                       |   6 ++
+ .../sharing_hub_window_controller.cc          |   7 +-
+ .../ui/signin/signin_view_controller.cc       |  11 +-
+ .../views/accessibility/accessibility_util.cc |   7 +-
+ .../autofill/autofill_bubble_handler_impl.cc  | 102 +++++++++++++-----
+ .../autofill/autofill_bubble_handler_impl.h   |   3 +
+ .../ui/views/bubble_anchor_util_views.cc      |  13 +++
+ .../ui/views/bubble_anchor_util_views.h       |   8 ++
+ chrome/browser/ui/views/frame/browser_view.cc |  12 ++-
+ ...cation_controller_platform_impl_desktop.cc |   4 +
+ .../relaunch_recommended_bubble_view.cc       |  15 ++-
+ .../send_tab_to_self_bubble_controller.cc     |  14 ++-
+ .../sharing/sharing_window_controller.cc      |   4 +-
+ .../storage/storage_pressure_bubble_view.cc   |  15 ++-
+ .../web_applications/web_app_launch_utils.cc  |   3 +-
+ .../webui/downloads/downloads_dom_handler.cc  |  14 ++-
+ .../ui/webui_browser/webui_browser_window.cc  |  12 ++-
+ .../ui/webui_browser/webui_browser_window.h   |   7 ++
+ 21 files changed, 218 insertions(+), 65 deletions(-)
+
+diff --git a/chrome/browser/profiles/batch_upload/batch_upload_service.cc b/chrome/browser/profiles/batch_upload/batch_upload_service.cc
+index 77ad5fe9b1..31fb6fad6b 100644
+--- a/chrome/browser/profiles/batch_upload/batch_upload_service.cc
++++ b/chrome/browser/profiles/batch_upload/batch_upload_service.cc
+@@ -378,9 +378,13 @@ void BatchUploadService::TriggerAvatarButtonSavingDataText(
+   CHECK(browser);
+   CHECK(state_.saving_browser_state_);
+   // Show the text.
++  // Meridian: no avatar button in the WebUI browser (this crashed).
++  BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser);
++  if (!browser_view) {
++    return;
++  }
+   state_.saving_browser_state_->avatar_override_clear_callback_ =
+-      BrowserView::GetBrowserViewForBrowser(browser)
+-          ->toolbar_button_provider()
++      browser_view->toolbar_button_provider()
+           ->GetAvatarToolbarButtonInterface()
+           ->SetExplicitButtonState(
+               l10n_util::GetStringUTF16(
+diff --git a/chrome/browser/ui/autofill/address_bubbles_controller.cc b/chrome/browser/ui/autofill/address_bubbles_controller.cc
+index f422e81db8..8a34348247 100644
+--- a/chrome/browser/ui/autofill/address_bubbles_controller.cc
++++ b/chrome/browser/ui/autofill/address_bubbles_controller.cc
+@@ -27,6 +27,7 @@
+ #include "chrome/browser/ui/autofill/edit_address_profile_dialog_controller_impl.h"
+ #include "chrome/browser/ui/autofill/save_address_bubble_controller.h"
+ #include "chrome/browser/ui/autofill/update_address_bubble_controller.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+ #include "chrome/browser/ui/browser_window.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/desktop_to_mobile_promos/ios_promos_utils.h"
+@@ -313,10 +314,14 @@ void AddressBubblesController::SetUpBubble(
+ }
+ 
+ void AddressBubblesController::MaybeShowIOSDektopAddressPromo() {
++  // Meridian: by the tab, not through a BrowserView (the WebUI browser has
++  // none; Save on "Save address?" crashed here).
+   BrowserWindowInterface* browser =
+-      BrowserWindow::FindBrowserWindowWithWebContents(web_contents())
+-          ->AsBrowserView()
+-          ->browser();
++      GlobalBrowserCollection::GetInstance()->FindBrowserWithTab(
++          web_contents());
++  if (!browser) {
++    return;
++  }
+ 
+   // Verify if user is eligible for iOS promo, and attempt showing if they are.
+   ios_promos_utils::VerifyIOSPromoEligibility(
+diff --git a/chrome/browser/ui/browser_commands.cc b/chrome/browser/ui/browser_commands.cc
+index 224dc66bf6..18baf2f144 100644
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -1506,10 +1506,11 @@ void CloseTab(BrowserWindowInterface* browser) {
+ 
+   // If all selected tabs are pinned, show a confirmation toast if one isn't
+   // already shown.
+-  if (all_selected_tabs_pinned &&
++  // Meridian: the WebUI browser has no BrowserView (its CHECK crashed ⌘W on
++  // a tab an extension pinned in the strip); the tab just closes.
++  BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser);
++  if (all_selected_tabs_pinned && browser_view &&
+       toast_controller->GetCurrentToastId() != ToastId::kClosePinnedTab) {
+-    BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser);
+-    CHECK(browser_view);
+     ui::Accelerator accelerator;
+     CHECK(
+         browser_view->GetAcceleratorForCommandId(IDC_CLOSE_TAB, &accelerator));
+diff --git a/chrome/browser/ui/desktop_to_mobile_promos/ios_promos_utils.cc b/chrome/browser/ui/desktop_to_mobile_promos/ios_promos_utils.cc
+index 0c96916fa8..82b58fd31d 100644
+--- a/chrome/browser/ui/desktop_to_mobile_promos/ios_promos_utils.cc
++++ b/chrome/browser/ui/desktop_to_mobile_promos/ios_promos_utils.cc
+@@ -161,6 +161,12 @@ void OnIOSPromoClassificationResult(
+   // TODO(https://crbug.com/511194274): Convert this to a scoped handle that
+   // prevents other promos until the promo dialog is closed. This was originally
+   // released in `IOSPromoBubble::IOSPromoBubbleDelegate::OnDismissal()`.
++  // Meridian: the promo bubble anchors to the toolbar, which the WebUI
++  // browser hasn't got (it crashed after saving a password, card or address).
++  if (!BrowserView::GetBrowserViewForBrowser(browser.get())) {
++    RunCallback(std::move(promo_not_shown_callback));
++    return;
++  }
+   if (promos_utils::UserNotClassifiedAsMobileDeviceSwitcher(result) &&
+       feature_engagement::NonIphPromo::RequestPermissionToShow(
+           browser->GetProfile(),
+diff --git a/chrome/browser/ui/sharing_hub/sharing_hub_window_controller.cc b/chrome/browser/ui/sharing_hub/sharing_hub_window_controller.cc
+index dd8784f81c..f5e96d7bb5 100644
+--- a/chrome/browser/ui/sharing_hub/sharing_hub_window_controller.cc
++++ b/chrome/browser/ui/sharing_hub/sharing_hub_window_controller.cc
+@@ -11,6 +11,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/sharing_hub/sharing_hub_bubble_controller.h"
++#include "chrome/browser/ui/views/bubble_anchor_util_views.h"
+ #include "chrome/browser/ui/views/frame/toolbar_button_provider.h"
+ #include "chrome/browser/ui/views/sharing_hub/screenshot/screenshot_captured_bubble.h"
+ #include "chrome/browser/ui/views/toolbar/pinned_toolbar_actions.h"
+@@ -42,8 +43,9 @@ SharingHubWindowController::~SharingHubWindowController() = default;
+ #if !BUILDFLAG(IS_CHROMEOS)
+ SharingHubBubbleView* SharingHubWindowController::ShowSharingHubBubble(
+     share::ShareAttempt attempt) {
++  // Meridian: also without a toolbar (the WebUI browser; this crashed).
+   views::BubbleAnchor anchor =
+-      ToolbarButtonProvider::From(&*browser_)->GetBubbleAnchor(std::nullopt);
++      bubble_anchor_util::GetToolbarOrPageInfoAnchor(&*browser_, std::nullopt);
+   auto bubble = std::make_unique<SharingHubBubbleViewImpl>(
+       anchor, attempt,
+       SharingHubBubbleController::CreateOrGetFromWebContents(
+@@ -62,8 +64,9 @@ ScreenshotCapturedBubble*
+ SharingHubWindowController::ShowScreenshotCapturedBubble(
+     content::WebContents* contents,
+     const gfx::Image& image) {
++  // Meridian: also without a toolbar (the WebUI browser; this crashed).
+   views::BubbleAnchor anchor =
+-      ToolbarButtonProvider::From(&*browser_)->GetBubbleAnchor(std::nullopt);
++      bubble_anchor_util::GetToolbarOrPageInfoAnchor(&*browser_, std::nullopt);
+   auto bubble = std::make_unique<ScreenshotCapturedBubble>(
+       anchor, contents, image,
+       Profile::FromBrowserContext(contents->GetBrowserContext()));
+diff --git a/chrome/browser/ui/signin/signin_view_controller.cc b/chrome/browser/ui/signin/signin_view_controller.cc
+index d7a4f84bf5..5d70c2739e 100644
+--- a/chrome/browser/ui/signin/signin_view_controller.cc
++++ b/chrome/browser/ui/signin/signin_view_controller.cc
+@@ -624,9 +624,16 @@ void SigninViewController::CreateInterceptionBubble(
+     const WebSigninInterceptor::Delegate::BubbleParameters& bubble_parameters,
+     base::OnceCallback<void(SigninInterceptionResult)> callback) {
+   CHECK(!intercept_bubble_);
++  // Meridian: no avatar button in the WebUI browser (this crashed); the
++  // bubble isn't shown.
++  BrowserView* browser_view =
++      BrowserView::GetBrowserViewForBrowser(&browser_.get());
++  if (!browser_view) {
++    std::move(callback).Run(SigninInterceptionResult::kNotDisplayed);
++    return;
++  }
+   views::BubbleAnchor anchor =
+-      BrowserView::GetBrowserViewForBrowser(&browser_.get())
+-          ->toolbar_button_provider()
++      browser_view->toolbar_button_provider()
+           ->GetAvatarToolbarButtonInterface()
+           ->GetBubbleAnchor(*browser_);
+   intercept_bubble_ = DiceWebSigninInterceptionBubbleView::CreateBubble(
+diff --git a/chrome/browser/ui/views/accessibility/accessibility_util.cc b/chrome/browser/ui/views/accessibility/accessibility_util.cc
+index 88025a3032..5e3b50daf9 100644
+--- a/chrome/browser/ui/views/accessibility/accessibility_util.cc
++++ b/chrome/browser/ui/views/accessibility/accessibility_util.cc
+@@ -37,7 +37,8 @@ void AnnounceInActiveBrowser(const std::u16string& message) {
+     return;
+   }
+ 
+-  BrowserView::GetBrowserViewForBrowser(browser)
+-      ->GetViewAccessibility()
+-      .AnnounceText(message);
++  // Meridian: the WebUI browser is no BrowserView (this crashed).
++  if (BrowserView* browser_view = BrowserView::GetBrowserViewForBrowser(browser)) {
++    browser_view->GetViewAccessibility().AnnounceText(message);
++  }
+ }
+diff --git a/chrome/browser/ui/views/autofill/autofill_bubble_handler_impl.cc b/chrome/browser/ui/views/autofill/autofill_bubble_handler_impl.cc
+index 7afe3769f3..67eb96f74d 100644
+--- a/chrome/browser/ui/views/autofill/autofill_bubble_handler_impl.cc
++++ b/chrome/browser/ui/views/autofill/autofill_bubble_handler_impl.cc
+@@ -35,7 +35,9 @@
+ #include "chrome/browser/ui/views/autofill/save_address_profile_view.h"
+ #include "chrome/browser/ui/views/autofill/update_address_profile_view.h"
+ #include "chrome/browser/ui/views/bubble_anchor_util_views.h"
++#include "chrome/browser/platform_util.h"
+ #include "chrome/browser/ui/views/frame/toolbar_button_provider.h"
++#include "ui/base/base_window.h"
+ #include "components/autofill/core/browser/foundations/autofill_client.h"
+ #include "components/autofill/core/browser/payments/virtual_card_enrollment_manager.h"
+ #include "components/autofill/core/browser/ui/payments/virtual_card_enroll_bubble_controller.h"
+@@ -51,19 +53,51 @@ namespace autofill {
+ 
+ namespace {
+ 
++// Where a bubble for `action_id` anchors: its toolbar icon, or (Meridian's
++// WebUI browser, without a toolbar) where page info would show.
++views::BubbleAnchor AnchorFor(BrowserWindowInterface* browser,
++                              ToolbarButtonProvider* toolbar_button_provider,
++                              std::optional<actions::ActionId> action_id) {
++  if (toolbar_button_provider) {
++    return toolbar_button_provider->GetBubbleAnchor(action_id);
++  }
++  return bubble_anchor_util::GetPageInfoAnchorConfiguration(browser).anchor;
++}
++
++// Meridian (WebUI browser): no toolbar icon to highlight; the bubble gets the
++// window as its parent and, without an anchor, the page info corner.
++void PlaceWithoutToolbar(views::BubbleDialogDelegateView* bubble,
++                         BrowserWindowInterface* browser) {
++  bubble_anchor_util::AnchorConfiguration page_info =
++      bubble_anchor_util::GetPageInfoAnchorConfiguration(browser);
++  if (views::View* view = page_info.anchor.GetIfView()) {
++    bubble->set_parent_window(view->GetWidget()->GetNativeView());
++  } else if (ui::TrackedElement* element = page_info.anchor.GetIfElement()) {
++    bubble->set_parent_window(element->GetNativeView());
++  } else {
++    bubble->set_parent_window(platform_util::GetViewForWindow(
++        browser->GetWindow()->GetNativeWindow()));
++    bubble->SetAnchorRect(bubble_anchor_util::GetPageInfoAnchorRect(browser));
++  }
++  bubble->SetArrow(page_info.bubble_arrow);
++}
++
+ template <typename View, typename... Args>
+   requires(std::derived_from<View, AutofillLocationBarBubble>)
+-View* ShowBubble(ToolbarButtonProvider* toolbar_button_provider,
++View* ShowBubble(BrowserWindowInterface* browser,
++                 ToolbarButtonProvider* toolbar_button_provider,
+                  std::optional<actions::ActionId> action_id,
+                  ui::ElementIdentifier highlight_element,
+                  bool is_user_gesture,
+                  Args&&... args) {
+   views::BubbleAnchor const anchor_view =
+-      toolbar_button_provider->GetBubbleAnchor(action_id);
++      AnchorFor(browser, toolbar_button_provider, action_id);
+   auto bubble =
+       std::make_unique<View>(anchor_view, std::forward<Args>(args)...);
+   // Handle anchors for icon highlighting.
+-  if (!bubble_anchor_util::IsHighlightable(anchor_view)) {
++  if (!toolbar_button_provider) {
++    PlaceWithoutToolbar(bubble.get(), browser);
++  } else if (!bubble_anchor_util::IsHighlightable(anchor_view)) {
+     bubble->SetHighlightedElement(highlight_element);
+   }
+ 
+@@ -84,10 +118,11 @@ View* ShowBubble(ToolbarButtonProvider* toolbar_button_provider,
+ 
+ template <typename View, typename... Args>
+   requires std::derived_from<View, AutofillLocationBarBubble>
+-View* ShowAddressProfileBubble(ToolbarButtonProvider* toolbar_button_provider,
++View* ShowAddressProfileBubble(BrowserWindowInterface* browser,
++                               ToolbarButtonProvider* toolbar_button_provider,
+                                bool is_user_gesture,
+                                Args&&... args) {
+-  return ShowBubble<View>(toolbar_button_provider,
++  return ShowBubble<View>(browser, toolbar_button_provider,
+                           kActionShowAddressesBubbleOrPage,
+                           kAutofillAddressPageActionElementId, is_user_gesture,
+                           std::forward<Args>(args)...);
+@@ -98,7 +133,8 @@ View* ShowAddressProfileBubble(ToolbarButtonProvider* toolbar_button_provider,
+ AutofillBubbleHandlerImpl::AutofillBubbleHandlerImpl(
+     BrowserWindowInterface* browser,
+     ToolbarButtonProvider* toolbar_button_provider)
+-    : toolbar_button_provider_(toolbar_button_provider),
++    : browser_(browser),
++      toolbar_button_provider_(toolbar_button_provider),
+       scoped_user_data_(browser->GetUnownedUserDataHost(), *this) {}
+ 
+ AutofillBubbleHandlerImpl::~AutofillBubbleHandlerImpl() = default;
+@@ -115,12 +151,12 @@ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowSaveCreditCardBubble(
+     case PaymentsBubbleType::kUploadCardholderNameUpdate:
+     case PaymentsBubbleType::kUploadInProgress:
+       return ShowBubble<SaveCardOfferBubbleViews>(
+-          toolbar_button_provider_, kActionShowPaymentsBubbleOrPage,
++          browser_, toolbar_button_provider_, kActionShowPaymentsBubbleOrPage,
+           kAutofillSavePaymentsPageActionElementId, is_user_gesture,
+           web_contents, controller);
+     case PaymentsBubbleType::kManageCards:
+       return ShowBubble<SaveCardManageCardsBubbleViews>(
+-          toolbar_button_provider_, kActionShowPaymentsBubbleOrPage,
++          browser_, toolbar_button_provider_, kActionShowPaymentsBubbleOrPage,
+           kAutofillSavePaymentsPageActionElementId, is_user_gesture,
+           web_contents, controller);
+     case PaymentsBubbleType::kUploadComplete:
+@@ -140,12 +176,12 @@ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowIbanBubble(
+     case IbanBubbleType::kUploadSave:
+     case IbanBubbleType::kUploadInProgress:
+       return ShowBubble<SaveIbanBubbleView>(
+-          toolbar_button_provider_, kActionShowPaymentsBubbleOrPage,
++          browser_, toolbar_button_provider_, kActionShowPaymentsBubbleOrPage,
+           kAutofillSavePaymentsPageActionElementId, is_user_gesture,
+           web_contents, controller);
+     case IbanBubbleType::kManageSavedIban:
+       return ShowBubble<ManageSavedIbanBubbleView>(
+-          toolbar_button_provider_, kActionShowPaymentsBubbleOrPage,
++          browser_, toolbar_button_provider_, kActionShowPaymentsBubbleOrPage,
+           kAutofillSavePaymentsPageActionElementId, is_user_gesture,
+           web_contents, controller);
+     case IbanBubbleType::kUploadCompleted:
+@@ -160,7 +196,7 @@ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowOfferNotificationBubble(
+     OfferNotificationBubbleController* controller,
+     bool is_user_gesture) {
+   return ShowBubble<OfferNotificationBubbleViews>(
+-      toolbar_button_provider_, kActionOffersAndRewardsForPage,
++      browser_, toolbar_button_provider_, kActionOffersAndRewardsForPage,
+       kOfferNotificationChipElementId, is_user_gesture, web_contents,
+       controller);
+ }
+@@ -170,7 +206,7 @@ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowSaveAddressProfileBubble(
+     std::unique_ptr<SaveAddressBubbleController> controller,
+     bool is_user_gesture) {
+   return ShowAddressProfileBubble<SaveAddressProfileView>(
+-      toolbar_button_provider_, is_user_gesture, std::move(controller),
++      browser_, toolbar_button_provider_, is_user_gesture, std::move(controller),
+       web_contents);
+ }
+ 
+@@ -178,11 +214,13 @@ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowSaveAddressProfileBubble(
+ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowAddressSignInPromo(
+     content::WebContents* web_contents,
+     const AutofillProfile& autofill_profile) {
+-  views::BubbleAnchor anchor = toolbar_button_provider_->GetBubbleAnchor(
++  views::BubbleAnchor anchor = AnchorFor(browser_, toolbar_button_provider_, 
+       kActionShowAddressesBubbleOrPage);
+   AddressSignInPromoView* bubble =
+       new AddressSignInPromoView(anchor, web_contents, autofill_profile);
+-  if (!bubble_anchor_util::IsHighlightable(anchor)) {
++  if (!toolbar_button_provider_) {
++    PlaceWithoutToolbar(bubble, browser_);
++  } else if (!bubble_anchor_util::IsHighlightable(anchor)) {
+     bubble->SetHighlightedElement(kAutofillAddressPageActionElementId);
+   }
+ 
+@@ -196,7 +234,7 @@ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowSaveAutofillAiDataBubble(
+     content::WebContents* web_contents,
+     AutofillAiImportDataController* controller) {
+   return ShowBubble<AutofillAiImportDataBubbleView>(
+-      toolbar_button_provider_, kActionShowAddressesBubbleOrPage,
++      browser_, toolbar_button_provider_, kActionShowAddressesBubbleOrPage,
+       kAutofillAddressPageActionElementId, /*is_user_gesture=*/false,
+       web_contents, controller);
+ }
+@@ -206,7 +244,7 @@ AutofillBubbleHandlerImpl::ShowAutofillAiLocalSaveNotification(
+     content::WebContents* web_contents,
+     AutofillAiImportDataController* controller) {
+   return ShowBubble<AutofillAiLocalSaveNotificationView>(
+-      toolbar_button_provider_, kActionShowAddressesBubbleOrPage,
++      browser_, toolbar_button_provider_, kActionShowAddressesBubbleOrPage,
+       kAutofillAddressPageActionElementId, /*is_user_gesture=*/false,
+       web_contents, controller);
+ }
+@@ -216,7 +254,7 @@ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowUpdateAddressProfileBubble(
+     std::unique_ptr<UpdateAddressBubbleController> controller,
+     bool is_user_gesture) {
+   return ShowAddressProfileBubble<UpdateAddressProfileView>(
+-      toolbar_button_provider_, is_user_gesture, std::move(controller),
++      browser_, toolbar_button_provider_, is_user_gesture, std::move(controller),
+       web_contents);
+ }
+ 
+@@ -225,7 +263,7 @@ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowFilledCardInformationBubble(
+     FilledCardInformationBubbleController* controller,
+     bool is_user_gesture) {
+   return ShowBubble<FilledCardInformationBubbleViews>(
+-      toolbar_button_provider_, kActionFilledCardInformation,
++      browser_, toolbar_button_provider_, kActionFilledCardInformation,
+       kAutofillFilledCardInformationPageActionElementId, is_user_gesture,
+       web_contents, controller);
+ }
+@@ -235,9 +273,12 @@ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowVirtualCardEnrollBubble(
+     VirtualCardEnrollBubbleController* controller,
+     bool is_user_gesture) {
+   views::BubbleAnchor anchor =
+-      toolbar_button_provider_->GetBubbleAnchor(kActionVirtualCardEnroll);
++      AnchorFor(browser_, toolbar_button_provider_, kActionVirtualCardEnroll);
+   VirtualCardEnrollBubbleViews* bubble =
+       new VirtualCardEnrollBubbleViews(anchor, web_contents, controller);
++  if (!toolbar_button_provider_) {
++    PlaceWithoutToolbar(bubble, browser_);
++  }
+ 
+   views::BubbleDialogDelegateView::CreateBubble(bubble);
+ 
+@@ -251,7 +292,8 @@ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowVirtualCardEnrollBubble(
+   bubble->ShowForReason(is_user_gesture
+                             ? VirtualCardEnrollBubbleViews::USER_GESTURE
+                             : VirtualCardEnrollBubbleViews::AUTOMATIC);
+-  if (!bubble_anchor_util::IsHighlightable(anchor)) {
++  if (toolbar_button_provider_ &&
++      !bubble_anchor_util::IsHighlightable(anchor)) {
+     bubble->SetHighlightedElement(
+         kAutofillVirtualCardEnrollPageActionElementId);
+   }
+@@ -264,7 +306,7 @@ AutofillBubbleHandlerImpl::ShowVirtualCardEnrollConfirmationBubble(
+     content::WebContents* web_contents,
+     VirtualCardEnrollBubbleController* controller) {
+   views::BubbleAnchor anchor =
+-      toolbar_button_provider_->GetBubbleAnchor(kActionVirtualCardEnroll);
++      AnchorFor(browser_, toolbar_button_provider_, kActionVirtualCardEnroll);
+   base::OnceCallback<void(PaymentsUiClosedReason)> callback =
+       controller->GetOnBubbleClosedCallback();
+   const SavePaymentMethodAndVirtualCardEnrollConfirmationUiParams& ui_params =
+@@ -281,7 +323,7 @@ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowMandatoryReauthBubble(
+     bool is_user_gesture,
+     MandatoryReauthBubbleType bubble_type) {
+   auto anchor =
+-      toolbar_button_provider_->GetBubbleAnchor(kActionAutofillMandatoryReauth);
++      AnchorFor(browser_, toolbar_button_provider_, kActionAutofillMandatoryReauth);
+ 
+   switch (bubble_type) {
+     case MandatoryReauthBubbleType::kOptIn: {
+@@ -313,7 +355,7 @@ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowMandatoryReauthBubble(
+ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowSaveCardConfirmationBubble(
+     content::WebContents* web_contents,
+     SaveCardBubbleController* controller) {
+-  views::BubbleAnchor anchor = toolbar_button_provider_->GetBubbleAnchor(
++  views::BubbleAnchor anchor = AnchorFor(browser_, toolbar_button_provider_, 
+       kActionShowPaymentsBubbleOrPage);
+   base::OnceCallback<void(PaymentsUiClosedReason)> callback =
+       controller->GetOnBubbleClosedCallback();
+@@ -329,7 +371,7 @@ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowSaveCardConfirmationBubble(
+ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowSaveIbanConfirmationBubble(
+     content::WebContents* web_contents,
+     IbanBubbleController* controller) {
+-  views::BubbleAnchor anchor = toolbar_button_provider_->GetBubbleAnchor(
++  views::BubbleAnchor anchor = AnchorFor(browser_, toolbar_button_provider_, 
+       kActionShowPaymentsBubbleOrPage);
+   base::OnceCallback<void(PaymentsUiClosedReason)> callback =
+       controller->GetOnBubbleClosedCallback();
+@@ -344,7 +386,7 @@ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowOmniboxAutofillBubble(
+     content::WebContents* web_contents,
+     OmniboxAutofillBubbleController* controller) {
+   return ShowBubble<OmniboxAutofillBubbleView>(
+-      toolbar_button_provider_, kActionAutofillPayment,
++      browser_, toolbar_button_provider_, kActionAutofillPayment,
+       kAutofillPaymentIconElementId, /*is_user_gesture=*/true, web_contents,
+       controller);
+ }
+@@ -354,7 +396,7 @@ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowPaymentsChurnedUsersBubble(
+     PaymentsChurnedUsersBubbleController* controller,
+     bool is_user_gesture) {
+   return ShowBubble<PaymentsChurnedUsersBubbleView>(
+-      toolbar_button_provider_, kActionShowPaymentsChurnedUsersBubble,
++      browser_, toolbar_button_provider_, kActionShowPaymentsChurnedUsersBubble,
+       kPaymentsChurnedUsersBubbleId, is_user_gesture, web_contents, controller);
+ }
+ 
+@@ -362,7 +404,7 @@ AutofillBubbleBase*
+ AutofillBubbleHandlerImpl::ShowPaymentsChurnedUsersConfirmationBubble(
+     content::WebContents* web_contents,
+     PaymentsChurnedUsersBubbleController* controller) {
+-  views::BubbleAnchor anchor = toolbar_button_provider_->GetBubbleAnchor(
++  views::BubbleAnchor anchor = AnchorFor(browser_, toolbar_button_provider_, 
+       kActionShowPaymentsChurnedUsersBubble);
+   base::OnceCallback<void(PaymentsUiClosedReason)> callback =
+       controller->GetConfirmationBubbleClosedCallback();
+@@ -377,7 +419,7 @@ AutofillBubbleBase* AutofillBubbleHandlerImpl::ShowWalletReminderNoticeBubble(
+     WalletReminderNoticeBubbleController* controller,
+     bool is_user_gesture) {
+   return ShowBubble<WalletReminderNoticeBubbleView>(
+-      toolbar_button_provider_, kActionWalletReminderNotice,
++      browser_, toolbar_button_provider_, kActionWalletReminderNotice,
+       kPageActionWalletReminderNoticeElementId, is_user_gesture, web_contents,
+       controller);
+ }
+@@ -394,7 +436,9 @@ AutofillBubbleHandlerImpl::ShowSaveCardAndVirtualCardEnrollConfirmationBubble(
+           anchor, web_contents, std::move(controller_hide_callback),
+           std::move(ui_params));
+ 
+-  if (!bubble_anchor_util::IsHighlightable(anchor)) {
++  if (!toolbar_button_provider_) {
++    PlaceWithoutToolbar(bubble, browser_);
++  } else if (!bubble_anchor_util::IsHighlightable(anchor)) {
+     bubble->SetHighlightedElement(highlight_element);
+   }
+   views::BubbleDialogDelegateView::CreateBubble(bubble);
+diff --git a/chrome/browser/ui/views/autofill/autofill_bubble_handler_impl.h b/chrome/browser/ui/views/autofill/autofill_bubble_handler_impl.h
+index ccc8c38791..c288ff34a1 100644
+--- a/chrome/browser/ui/views/autofill/autofill_bubble_handler_impl.h
++++ b/chrome/browser/ui/views/autofill/autofill_bubble_handler_impl.h
+@@ -121,6 +121,9 @@ class AutofillBubbleHandlerImpl : public AutofillBubbleHandler {
+       ui::ElementIdentifier highlight_element,
+       SavePaymentMethodAndVirtualCardEnrollConfirmationUiParams ui_params);
+ 
++  // Meridian: null in the WebUI browser, which has no toolbar; the bubbles
++  // then sit where page info would (as the password bubble does).
++  raw_ptr<BrowserWindowInterface> browser_ = nullptr;
+   raw_ptr<ToolbarButtonProvider> toolbar_button_provider_ = nullptr;
+ 
+   ui::ScopedUnownedUserData<AutofillBubbleHandler> scoped_user_data_;
+diff --git a/chrome/browser/ui/views/bubble_anchor_util_views.cc b/chrome/browser/ui/views/bubble_anchor_util_views.cc
+index 2071beb0ea..9b421c27d0 100644
+--- a/chrome/browser/ui/views/bubble_anchor_util_views.cc
++++ b/chrome/browser/ui/views/bubble_anchor_util_views.cc
+@@ -20,6 +20,7 @@
+ #include "chrome/browser/ui/views/permissions/chip/permission_dashboard_view.h"
+ #include "chrome/browser/ui/views/picture_in_picture/document_pip_host.h"
+ #include "chrome/browser/ui/views/toolbar/app_menu_control.h"
++#include "chrome/browser/ui/views/frame/toolbar_button_provider.h"
+ #include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ #include "chrome/browser/ui/webui/webui_embedding_context.h"
+ #include "components/payments/core/features.h"
+@@ -232,4 +233,16 @@ bool IsHighlightable(views::BubbleAnchor anchor) {
+   }
+ }
+ 
++views::BubbleAnchor GetToolbarOrPageInfoAnchor(
++    BrowserWindowInterface* browser,
++    std::optional<actions::ActionId> action_id) {
++  if (!browser) {
++    return views::BubbleAnchor();
++  }
++  if (ToolbarButtonProvider* provider = ToolbarButtonProvider::From(browser)) {
++    return provider->GetBubbleAnchor(action_id);
++  }
++  return GetPageInfoAnchorConfiguration(browser).anchor;
++}
++
+ }  // namespace bubble_anchor_util
+diff --git a/chrome/browser/ui/views/bubble_anchor_util_views.h b/chrome/browser/ui/views/bubble_anchor_util_views.h
+index 301a26688b..cd2c81e90a 100644
+--- a/chrome/browser/ui/views/bubble_anchor_util_views.h
++++ b/chrome/browser/ui/views/bubble_anchor_util_views.h
+@@ -8,6 +8,7 @@
+ #include <optional>
+ 
+ #include "chrome/browser/ui/bubble_anchor_util.h"
++#include "ui/actions/action_id.h"
+ #include "ui/base/interaction/element_identifier.h"
+ #include "ui/views/bubble/bubble_border.h"
+ #include "ui/views/bubble/bubble_dialog_delegate_view.h"
+@@ -43,6 +44,13 @@ AnchorConfiguration GetPageInfoAnchorConfiguration(
+     BrowserWindowInterface* browser,
+     Anchor = Anchor::kLocationBar);
+ 
++// Meridian: the toolbar anchor for `action_id`, or, in a window without a
++// toolbar (the WebUI browser), where page info would show. Upstream code
++// reached for the toolbar there and crashed; callers return when it is null.
++views::BubbleAnchor GetToolbarOrPageInfoAnchor(
++    BrowserWindowInterface* browser,
++    std::optional<actions::ActionId> action_id);
++
+ // Returns the anchor configuration for the permission bubble.
+ AnchorConfiguration GetPermissionPromptBubbleAnchorConfiguration(
+     content::WebContents* web_contents);
+diff --git a/chrome/browser/ui/views/frame/browser_view.cc b/chrome/browser/ui/views/frame/browser_view.cc
+index dbbbf29f89..d3e5629656 100644
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1193,12 +1193,16 @@ BrowserWindow* BrowserWindow::FindBrowserWindowWithWebContents(
+   // level NativeView.
+   if (const auto* widget = views::Widget::GetTopLevelWidgetForNativeView(
+           web_contents->GetNativeView())) {
+-    return BrowserView::GetBrowserViewForNativeWindow(
+-        widget->GetNativeWindow());
++    // Meridian: the WebUI browser window is no BrowserView; it is found by
++    // its tab below (returning null here crashed "Save address?").
++    if (BrowserView* view = BrowserView::GetBrowserViewForNativeWindow(
++            widget->GetNativeWindow())) {
++      return view;
++    }
+   }
+-  const auto* browser =
++  BrowserWindowInterface* browser =
+       GlobalBrowserCollection::GetInstance()->FindBrowserWithTab(web_contents);
+-  return browser ? BrowserView::GetBrowserViewForBrowser(browser) : nullptr;
++  return browser ? BrowserWindow::FromBrowser(browser) : nullptr;
+ }
+ 
+ // static
+diff --git a/chrome/browser/ui/views/relaunch_notification/relaunch_notification_controller_platform_impl_desktop.cc b/chrome/browser/ui/views/relaunch_notification/relaunch_notification_controller_platform_impl_desktop.cc
+index e51c2e15d3..1a64428bf9 100644
+--- a/chrome/browser/ui/views/relaunch_notification/relaunch_notification_controller_platform_impl_desktop.cc
++++ b/chrome/browser/ui/views/relaunch_notification/relaunch_notification_controller_platform_impl_desktop.cc
+@@ -58,6 +58,10 @@ void RelaunchNotificationControllerPlatformImpl::NotifyRelaunchRecommended(
+ 
+   widget_ = RelaunchRecommendedBubbleView::ShowBubble(
+       browser, detection_time, base::BindRepeating(&chrome::AttemptRelaunch));
++  // Meridian: no bubble where there is nothing to anchor it to.
++  if (!widget_) {
++    return;
++  }
+ 
+   // Monitor the widget so that |widget_| can be cleared on close.
+   widget_->AddObserver(this);
+diff --git a/chrome/browser/ui/views/relaunch_notification/relaunch_recommended_bubble_view.cc b/chrome/browser/ui/views/relaunch_notification/relaunch_recommended_bubble_view.cc
+index e19737242e..b121f9ee63 100644
+--- a/chrome/browser/ui/views/relaunch_notification/relaunch_recommended_bubble_view.cc
++++ b/chrome/browser/ui/views/relaunch_notification/relaunch_recommended_bubble_view.cc
+@@ -2,6 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include "chrome/browser/ui/views/bubble_anchor_util_views.h"
+ #include "chrome/browser/ui/views/relaunch_notification/relaunch_recommended_bubble_view.h"
+ 
+ #include <utility>
+@@ -45,9 +46,19 @@ views::Widget* RelaunchRecommendedBubbleView::ShowBubble(
+ 
+   // Anchor the popup to the browser's app menu.
+   auto* browser_view = BrowserView::GetBrowserViewForBrowser(browser);
+-  auto* control = browser_view->toolbar_button_provider()->GetAppMenuControl();
++  auto* control = browser_view
++                      ? browser_view->toolbar_button_provider()
++                            ->GetAppMenuControl()
++                      : nullptr;
++  // Meridian: no BrowserView in the WebUI browser (this crashed); where page
++  // info would show.
+   views::BubbleAnchor anchor =
+-      control ? control->GetAnchor() : views::BubbleAnchor();
++      control ? control->GetAnchor()
++              : bubble_anchor_util::GetToolbarOrPageInfoAnchor(browser,
++                                                               std::nullopt);
++  if (!browser_view && anchor.IsNull()) {
++    return nullptr;
++  }
+   auto* bubble_view = new RelaunchRecommendedBubbleView(anchor, detection_time,
+                                                         std::move(on_accept));
+   if (anchor) {
+diff --git a/chrome/browser/ui/views/send_tab_to_self/send_tab_to_self_bubble_controller.cc b/chrome/browser/ui/views/send_tab_to_self/send_tab_to_self_bubble_controller.cc
+index e450d5b628..19be5f0528 100644
+--- a/chrome/browser/ui/views/send_tab_to_self/send_tab_to_self_bubble_controller.cc
++++ b/chrome/browser/ui/views/send_tab_to_self/send_tab_to_self_bubble_controller.cc
+@@ -1,6 +1,7 @@
+ // Copyright 2019 The Chromium Authors
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
++#include "chrome/browser/ui/views/bubble_anchor_util_views.h"
+ #include "chrome/browser/ui/views/send_tab_to_self/send_tab_to_self_bubble_controller.h"
+ 
+ #include <string_view>
+@@ -126,8 +127,13 @@ void SendTabToSelfBubbleController::ShowBubbleImpl(
+                          browser_weak_ptr));
+       return;
+     }
+-    anchor = ToolbarButtonProvider::From(browser)->GetBubbleAnchor(
+-        kActionSendTabToSelf);
++    // Meridian: no toolbar in the WebUI browser (this crashed on "Send to
++    // your devices"): where page info would show.
++    anchor = bubble_anchor_util::GetToolbarOrPageInfoAnchor(
++        browser, kActionSendTabToSelf);
++    if (anchor.IsNull()) {
++      return;
++    }
+   }
+ 
+   ShowBubbleWithAnchor(reason, browser_weak_ptr, std::move(anchor));
+@@ -143,8 +149,8 @@ void SendTabToSelfBubbleController::ShowBubbleWithAnchor(
+     }
+     // PinnedToolbarActions failed to find an anchor. Try ToolbarButtonProvider
+     // as it has fallback anchor logic.
+-    auto new_anchor = ToolbarButtonProvider::From(browser.get())
+-                          ->GetBubbleAnchor(kActionSendTabToSelf);
++    auto new_anchor = bubble_anchor_util::GetToolbarOrPageInfoAnchor(
++        browser.get(), kActionSendTabToSelf);
+     if (new_anchor.IsNull()) {
+       return;
+     }
+diff --git a/chrome/browser/ui/views/sharing/sharing_window_controller.cc b/chrome/browser/ui/views/sharing/sharing_window_controller.cc
+index bb2c4ee387..ff3ec7dd47 100644
+--- a/chrome/browser/ui/views/sharing/sharing_window_controller.cc
++++ b/chrome/browser/ui/views/sharing/sharing_window_controller.cc
+@@ -2,6 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include "chrome/browser/ui/views/bubble_anchor_util_views.h"
+ #include "chrome/browser/ui/views/sharing/sharing_window_controller.h"
+ 
+ #include <utility>
+@@ -28,8 +29,9 @@ SharingWindowController::~SharingWindowController() = default;
+ SharingDialog* SharingWindowController::ShowSharingDialog(
+     content::WebContents* contents,
+     SharingDialogData data) {
++  // Meridian: also without a toolbar (the WebUI browser; this crashed).
+   views::BubbleAnchor anchor =
+-      ToolbarButtonProvider::From(&*browser_)->GetBubbleAnchor(std::nullopt);
++      bubble_anchor_util::GetToolbarOrPageInfoAnchor(&*browser_, std::nullopt);
+   auto dialog_view = std::make_unique<SharingDialogView>(
+       std::move(anchor), contents, std::move(data));
+   auto* dialog_view_ptr = dialog_view.get();
+diff --git a/chrome/browser/ui/views/storage/storage_pressure_bubble_view.cc b/chrome/browser/ui/views/storage/storage_pressure_bubble_view.cc
+index 116b292f45..302ff7268f 100644
+--- a/chrome/browser/ui/views/storage/storage_pressure_bubble_view.cc
++++ b/chrome/browser/ui/views/storage/storage_pressure_bubble_view.cc
+@@ -2,6 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include "chrome/browser/ui/views/bubble_anchor_util_views.h"
+ #include "chrome/browser/ui/views/storage/storage_pressure_bubble_view.h"
+ 
+ #include "base/feature_list.h"
+@@ -45,9 +46,19 @@ void StoragePressureBubbleView::ShowBubble(const url::Origin& origin) {
+   }
+ 
+   auto* browser_view = BrowserView::GetBrowserViewForBrowser(bwi);
+-  auto* control = browser_view->toolbar_button_provider()->GetAppMenuControl();
++  auto* control = browser_view
++                      ? browser_view->toolbar_button_provider()
++                            ->GetAppMenuControl()
++                      : nullptr;
++  // Meridian: no BrowserView in the WebUI browser (this crashed); where page
++  // info would show.
+   views::BubbleAnchor anchor =
+-      control ? control->GetAnchor() : views::BubbleAnchor();
++      control ? control->GetAnchor()
++              : bubble_anchor_util::GetToolbarOrPageInfoAnchor(bwi,
++                                                               std::nullopt);
++  if (!browser_view && anchor.IsNull()) {
++    return;
++  }
+   StoragePressureBubbleView* bubble =
+       new StoragePressureBubbleView(anchor, bwi, origin);
+   views::BubbleDialogDelegateView::CreateBubble(bubble)->Show();
+diff --git a/chrome/browser/ui/web_applications/web_app_launch_utils.cc b/chrome/browser/ui/web_applications/web_app_launch_utils.cc
+index 5a33060097..0912cd4789 100644
+--- a/chrome/browser/ui/web_applications/web_app_launch_utils.cc
++++ b/chrome/browser/ui/web_applications/web_app_launch_utils.cc
+@@ -982,7 +982,8 @@ void FocusAppContainer(BrowserWindowInterface* browser, int tab_index) {
+     tab_strip_model->ActivateTabAt(tab_index);
+   }
+   // This call will un-minimize the window.
+-  CHECK_DEREF(BrowserView::GetBrowserViewForBrowser(browser)).Activate();
++  // Meridian: the WebUI browser is no BrowserView (its CHECK crashed).
++  BrowserWindow::FromBrowser(browser)->Activate();
+ }
+ 
+ }  // namespace web_app
+diff --git a/chrome/browser/ui/webui/downloads/downloads_dom_handler.cc b/chrome/browser/ui/webui/downloads/downloads_dom_handler.cc
+index 049825d73c..fcaba8cfe5 100644
+--- a/chrome/browser/ui/webui/downloads/downloads_dom_handler.cc
++++ b/chrome/browser/ui/webui/downloads/downloads_dom_handler.cc
+@@ -141,11 +141,15 @@ void PromptForScanningInBubble(content::WebContents* web_contents,
+   if (!browser) {
+     return;
+   }
+-  BrowserWindow::FromBrowser(browser)
+-      ->GetDownloadBubbleUIController()
+-      ->GetDownloadDisplayController()
+-      ->OpenSecuritySubpage(
+-          OfflineItemUtils::GetContentIdForDownload(download));
++  // Meridian: the WebUI browser has no download bubble (this crashed on
++  // "Deep scan").
++  DownloadBubbleUIController* bubble =
++      BrowserWindow::FromBrowser(browser)->GetDownloadBubbleUIController();
++  if (!bubble || !bubble->GetDownloadDisplayController()) {
++    return;
++  }
++  bubble->GetDownloadDisplayController()->OpenSecuritySubpage(
++      OfflineItemUtils::GetContentIdForDownload(download));
+ #endif
+ }
+ 
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index bb9281a891..14533a000e 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/meridian/status_bubble.h"
+ #include "chrome/browser/meridian/workbench/native_dialog.h"
++#include "chrome/browser/ui/views/autofill/autofill_bubble_handler_impl.h"
+ #include "chrome/browser/ui/webui_browser/webui_browser_window.h"
+ 
+ #include "base/check.h"
+@@ -263,6 +264,7 @@ WebUIBrowserWindow::~WebUIBrowserWindow() {
+   // it wants to de-register itself for focus stuff.
+   scoped_extensions_container_user_data_.reset();
+   extensions_container_.reset();
++  autofill_bubble_handler_.reset();
+   widget_->RemoveObserver(this);
+   widget_.reset();
+ }
+@@ -965,8 +967,14 @@ void WebUIBrowserWindow::OnContentsElementShown(ui::TrackedElement* element) {
+ 
+ autofill::AutofillBubbleHandler*
+ WebUIBrowserWindow::GetAutofillBubbleHandler() {
+-  NOTIMPLEMENTED_LOG_ONCE();
+-  return nullptr;
++  // Meridian: Chromium shows "Save address?" and the like through this
++  // without a null check (a null here crashed on a form's submit).
++  if (!autofill_bubble_handler_) {
++    autofill_bubble_handler_ =
++        std::make_unique<autofill::AutofillBubbleHandlerImpl>(
++            browser_, /*toolbar_button_provider=*/nullptr);
++  }
++  return autofill_bubble_handler_.get();
+ }
+ 
+ LocationBar* WebUIBrowserWindow::GetLocationBar() const {
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.h b/chrome/browser/ui/webui_browser/webui_browser_window.h
+index 6c9bd5f822..63d236cf75 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.h
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.h
+@@ -38,6 +38,10 @@ class Widget;
+ 
+ class BrowserWindowInterface;
+ class ExtensionsContainer;
++
++namespace autofill {
++class AutofillBubbleHandlerImpl;
++}
+ class WebUIToolbarExtensionsContainer;
+ class WebUIBrowserModalDialogHost;
+ class WebUIBrowserSidePanelUI;
+@@ -306,6 +310,9 @@ class WebUIBrowserWindow : public BrowserWindow,
+   raw_ptr<views::WebView> web_view_ = nullptr;
+   std::unique_ptr<WebUIStubLocationBar> location_bar_;
+   std::unique_ptr<StatusBubble> status_bubble_;
++  // Meridian: save address / card / IBAN bubbles, placed without a toolbar
++  // (created on first use).
++  std::unique_ptr<autofill::AutofillBubbleHandlerImpl> autofill_bubble_handler_;
+ 
+   // A mapping between accelerators and Chrome command IDs as defined in
+   // //chrome/app/chrome_command_ids.h.

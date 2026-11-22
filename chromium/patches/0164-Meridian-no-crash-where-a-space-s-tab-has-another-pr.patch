@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 18 Nov 2026 19:37:38 +0400
+Subject: [PATCH 165/202] Meridian: no crash where a space's tab has another
+ profile than its window; links before the spaces load
+
+Discarding a space tab made the replacement in the window's profile (a
+CHECK); an app reparent from a space tab broke a same-profile CHECK and now
+leaves the tab; windows open only when Chromium allows it (CreateBrowserWindow
+CHECKs it, e.g. while quitting); a side panel the WebUI browser lacks no
+longer CHECKs; a null sidebar service is no crash. A link opened before the
+spaces loaded waits for them instead of being dropped; Boost's Improve finds
+the AI set up in the main profile from a space tab too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/boosts/boost_tab_helper.cc       |  8 ++-
+ chrome/browser/meridian/little_window.cc      | 49 +++++++++++++++++++
+ chrome/browser/meridian/little_window.h       |  5 ++
+ chrome/browser/meridian/space_profiles.cc     |  3 ++
+ .../tab_lifecycle_unit.cc                     |  5 +-
+ .../ui/side_panel/side_panel_ui_base.cc       |  6 ++-
+ chrome/browser/ui/tabs/tab_features.cc        |  4 +-
+ .../web_applications/web_app_launch_utils.cc  | 10 ++++
+ 8 files changed, 85 insertions(+), 5 deletions(-)
+
+diff --git a/chrome/browser/meridian/boosts/boost_tab_helper.cc b/chrome/browser/meridian/boosts/boost_tab_helper.cc
+index 0991ff4d58..f674f33106 100644
+--- a/chrome/browser/meridian/boosts/boost_tab_helper.cc
++++ b/chrome/browser/meridian/boosts/boost_tab_helper.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/meridian/boosts/boost_tab_helper.h"
+ 
++#include "chrome/browser/meridian/space_profiles.h"
++
+ #include <algorithm>
+ #include <utility>
+ 
+@@ -547,8 +549,10 @@ void BoostTabHelper::OnOutline(
+     std::string wish,
+     base::OnceCallback<void(std::string, std::string)> done,
+     base::Value outline) {
+-  Profile* profile =
+-      Profile::FromBrowserContext(web_contents()->GetBrowserContext());
++  // The AI is set up in the main profile (Settings > AI), also for a tab of
++  // a space with its own profile.
++  Profile* profile = MainProfileFor(
++      Profile::FromBrowserContext(web_contents()->GetBrowserContext()));
+   AiService* ai = AiServiceFactory::GetForProfile(profile);
+   BoostService* s = service();
+   if (!ai || !s) {
+diff --git a/chrome/browser/meridian/little_window.cc b/chrome/browser/meridian/little_window.cc
+index 8daa39c844..e0b3787bb0 100644
+--- a/chrome/browser/meridian/little_window.cc
++++ b/chrome/browser/meridian/little_window.cc
+@@ -7,6 +7,7 @@
+ #include <map>
+ 
+ #include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
+ #include "base/no_destructor.h"
+ #include "chrome/browser/meridian/atc.h"
+ #include "chrome/browser/meridian/prefs.h"
+@@ -65,12 +66,50 @@ std::string SpaceOrActive(Profile* profile, const std::string& space_id) {
+ 
+ }  // namespace
+ 
++namespace {
++
++// A link that came before the spaces loaded (Meridian started by it): opened
++// once they have. It used to be dropped.
++class PendingLink : public SidebarService::Observer {
++ public:
++  PendingLink(Profile* profile, SidebarService* service, GURL url)
++      : profile_(profile), service_(service), url_(std::move(url)) {
++    service_->AddObserver(this);
++  }
++
++  void OnSidebarChanged() override {
++    if (!service_->loaded()) {
++      return;
++    }
++    service_->RemoveObserver(this);
++    Profile* profile = profile_;
++    GURL url = url_;
++    delete this;
++    OpenExternalLink(profile, url);
++  }
++
++ private:
++  raw_ptr<Profile> profile_;
++  raw_ptr<SidebarService> service_;
++  GURL url_;
++};
++
++}  // namespace
++
++bool CanCreateWindow(Profile& profile) {
++  return GetBrowserWindowCreationStatusForProfile(profile) ==
++         BrowserWindowInterface::CreationStatus::kOk;
++}
++
+ BrowserWindowInterface* OpenLittleWindow(Profile* profile,
+                                          const GURL& url,
+                                          const std::string& space_id) {
+   // The window is the main profile's (its bar is Meridian's WebUI); the page
+   // is in the space's profile.
+   profile = MainProfileFor(profile);
++  if (!CanCreateWindow(*profile)) {
++    return nullptr;
++  }
+   BrowserWindowCreateParams params(*profile, /*from_user_gesture=*/true);
+   gfx::Rect work_area =
+       display::Screen::Get()->GetDisplayForNewWindows().work_area();
+@@ -153,6 +192,9 @@ BrowserWindowInterface* FindOrCreateMainWindow(
+   if (found) {
+     return found;
+   }
++  if (!CanCreateWindow(*profile)) {
++    return nullptr;
++  }
+   BrowserWindowCreateParams params(*profile, /*from_user_gesture=*/true);
+   params.should_trigger_session_restore = false;
+   return CreateBrowserWindow(std::move(params));
+@@ -160,6 +202,13 @@ BrowserWindowInterface* FindOrCreateMainWindow(
+ 
+ void OpenExternalLink(Profile* profile, const GURL& url) {
+   SidebarService* service = SidebarServiceFactory::GetForProfile(profile);
++  if (!service) {
++    return;
++  }
++  if (!service->loaded()) {
++    new PendingLink(profile, service, url);
++    return;
++  }
+   std::vector<std::string> space_ids;
+   for (const Space& space : service->spaces()) {
+     space_ids.push_back(space.id);
+diff --git a/chrome/browser/meridian/little_window.h b/chrome/browser/meridian/little_window.h
+index cbad409442..a74d76510c 100644
+--- a/chrome/browser/meridian/little_window.h
++++ b/chrome/browser/meridian/little_window.h
+@@ -24,6 +24,11 @@ BrowserWindowInterface* OpenLittleWindow(Profile* profile,
+ 
+ bool IsLittleWindow(const BrowserWindowInterface* browser);
+ 
++// Whether a window may open for `profile` now: not while the app quits, the
++// profile is being deleted or a policy forbids it (CreateBrowserWindow
++// CHECKs it).
++bool CanCreateWindow(Profile& profile);
++
+ // The space a Little window's page is in ("" for any other window).
+ std::string LittleSpaceOf(const BrowserWindowInterface* browser);
+ // Opens the Little window's page again in `space_id` (its profile), in place
+diff --git a/chrome/browser/meridian/space_profiles.cc b/chrome/browser/meridian/space_profiles.cc
+index 8a154c34d0..ad2bf27a61 100644
+--- a/chrome/browser/meridian/space_profiles.cc
++++ b/chrome/browser/meridian/space_profiles.cc
+@@ -281,6 +281,9 @@ void GatherSpaceWindows() {
+     return;
+   }
+   if (!into) {
++    if (!CanCreateWindow(*main)) {
++      return;
++    }
+     BrowserWindowCreateParams params(*main, /*from_user_gesture=*/false);
+     params.initial_bounds = strays.front()->GetWindow()->GetBounds();
+     params.should_trigger_session_restore = false;
+diff --git a/chrome/browser/resource_coordinator/tab_lifecycle_unit.cc b/chrome/browser/resource_coordinator/tab_lifecycle_unit.cc
+index 6f872ee5a8..e73bc7001b 100644
+--- a/chrome/browser/resource_coordinator/tab_lifecycle_unit.cc
++++ b/chrome/browser/resource_coordinator/tab_lifecycle_unit.cc
+@@ -271,7 +271,10 @@ void TabLifecycleUnitSource::TabLifecycleUnit::FinishDiscard(
+     LifecycleUnitDiscardReason discard_reason,
+     uint64_t tab_memory_footprint_estimate) {
+   content::WebContents* const old_contents = web_contents();
+-  content::WebContents::CreateParams create_params(tab_strip_model_->profile());
++  // Meridian: in the tab's own profile (a space's), not the window's; the
++  // discard CHECKs that both are the same.
++  content::WebContents::CreateParams create_params(
++      old_contents->GetBrowserContext());
+   // TODO(fdoray): Consider setting |initially_hidden| to true when the tab is
+   // OCCLUDED. Will require checking that the tab reload correctly when it
+   // becomes VISIBLE.
+diff --git a/chrome/browser/ui/side_panel/side_panel_ui_base.cc b/chrome/browser/ui/side_panel/side_panel_ui_base.cc
+index e4d83955b2..8bfc955338 100644
+--- a/chrome/browser/ui/side_panel/side_panel_ui_base.cc
++++ b/chrome/browser/ui/side_panel/side_panel_ui_base.cc
+@@ -56,7 +56,11 @@ void SidePanelUIBase::Show(SidePanelEntry::Key entry_key,
+                            std::optional<SidePanelOpenTrigger> open_trigger,
+                            bool suppress_animations) {
+   std::optional<UniqueKey> unique_key = GetUniqueKeyForKey(entry_key);
+-  CHECK(unique_key.has_value());
++  // Meridian: the WebUI browser registers fewer panels (history clusters,
++  // tabs from other devices, comments); asking for one was a CHECK.
++  if (!unique_key.has_value()) {
++    return;
++  }
+   Show(unique_key.value(), open_trigger, suppress_animations);
+ }
+ 
+diff --git a/chrome/browser/ui/tabs/tab_features.cc b/chrome/browser/ui/tabs/tab_features.cc
+index ed769cfd20..d1bf04c47f 100644
+--- a/chrome/browser/ui/tabs/tab_features.cc
++++ b/chrome/browser/ui/tabs/tab_features.cc
+@@ -1509,7 +1509,9 @@ void TabFeatures::WillDiscardContents(tabs::TabInterface* tab,
+                                       content::WebContents* new_contents) {
+   CHECK_EQ(old_contents, tab->GetContents(), base::NotFatalUntil::M162);
+ 
+-  Profile* profile = tab->GetBrowserWindowInterface()->GetProfile();
++  // Meridian: the tab's own profile (a space's), not the window's.
++  Profile* profile =
++      Profile::FromBrowserContext(new_contents->GetBrowserContext());
+ 
+   CreateSessionServiceTabHelper(new_contents);
+ 
+diff --git a/chrome/browser/ui/web_applications/web_app_launch_utils.cc b/chrome/browser/ui/web_applications/web_app_launch_utils.cc
+index 0912cd4789..ed1a391dea 100644
+--- a/chrome/browser/ui/web_applications/web_app_launch_utils.cc
++++ b/chrome/browser/ui/web_applications/web_app_launch_utils.cc
+@@ -566,6 +566,16 @@ BrowserWindowInterface* ReparentWebContentsIntoAppBrowser(
+   // indication to the user, so disallow it.
+   CHECK(!profile->IsOffTheRecord(), base::NotFatalUntil::M162);
+ 
++  // Meridian: a space with its own profile has its tabs in a window of the
++  // main profile. Moving one into an app window of the tab's profile broke
++  // the CHECK that both windows share a profile; the tab stays where it is.
++  if (BrowserWindowInterface* source =
++          GlobalBrowserCollection::GetInstance()->FindBrowserWithTab(contents);
++      source && source->GetProfile() != profile) {
++    std::move(completion_callback).Run(contents);
++    return nullptr;
++  }
++
+   // Clear navigation history that occurred before the user most recently
+   // entered the app's scope. The minimal-ui Back button will be initially
+   // disabled if the previous page was outside scope. Packaged apps are not

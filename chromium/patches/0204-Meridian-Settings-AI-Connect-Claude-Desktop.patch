@@ -1,0 +1,331 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 20 Nov 2026 18:21:53 +0400
+Subject: [PATCH 205/205] =?UTF-8?q?Meridian:=20Settings=20=E2=80=BA=20AI?=
+ =?UTF-8?q?=20=E2=80=BA=20Connect=20Claude=20Desktop?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds "meridian" to Claude Desktop's mcpServers in claude_desktop_config.json,
+keeping a backup and every other key; refuses files it can't parse.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/agent/agent_cli.cc    | 145 +++++++++++++++++-
+ chrome/browser/meridian/agent/agent_cli.h     |  11 +-
+ chrome/browser/meridian/sidebar.mojom         |   5 +-
+ chrome/browser/meridian/sidebar_handler.cc    |   1 +
+ .../webui_browser/meridian/settings.css       |   7 +
+ .../webui_browser/meridian/settings.html.ts   |  14 +-
+ .../webui_browser/meridian/settings.ts        |  13 +-
+ 7 files changed, 185 insertions(+), 11 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_cli.cc b/chrome/browser/meridian/agent/agent_cli.cc
+index afb7232726..769ff6ce77 100644
+--- a/chrome/browser/meridian/agent/agent_cli.cc
++++ b/chrome/browser/meridian/agent/agent_cli.cc
+@@ -7,6 +7,11 @@
+ #include "base/command_line.h"
+ #include "base/environment.h"
+ #include "base/files/file_util.h"
++#include "base/files/important_file_writer.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/path_service.h"
++#include "base/values.h"
+ #include "base/no_destructor.h"
+ #include "base/process/launch.h"
+ #include "base/strings/string_split.h"
+@@ -86,18 +91,156 @@ std::string CommandOf(const Known& cli) {
+   return command;
+ }
+ 
++// ---- Claude Desktop
++
++constexpr char kDesktopId[] = "claude-desktop";
++
++base::FilePath DesktopConfig() {
++  const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++  if (cl->HasSwitch(kClaudeDesktopConfigSwitch)) {
++    return cl->GetSwitchValuePath(kClaudeDesktopConfigSwitch);
++  }
++#if BUILDFLAG(IS_WIN)
++  base::FilePath roaming;
++  base::PathService::Get(base::DIR_ROAMING_APP_DATA, &roaming);
++  return roaming.Append(L"Claude").Append(L"claude_desktop_config.json");
++#else
++  return base::GetHomeDir()
++      .Append("Library/Application Support/Claude")
++      .Append("claude_desktop_config.json");
++#endif
++}
++
++// Installed: Claude Desktop made its folder (on its first start), or the app
++// is there.
++bool DesktopInstalled() {
++  if (base::DirectoryExists(DesktopConfig().DirName())) {
++    return true;
++  }
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          kClaudeDesktopConfigSwitch)) {
++    return false;
++  }
++#if BUILDFLAG(IS_WIN)
++  base::FilePath local;
++  return base::PathService::Get(base::DIR_LOCAL_APP_DATA, &local) &&
++         base::DirectoryExists(local.Append(L"AnthropicClaude"));
++#else
++  return base::DirectoryExists(base::FilePath("/Applications/Claude.app")) ||
++         base::DirectoryExists(
++             base::GetHomeDir().Append("Applications/Claude.app"));
++#endif
++}
++
++base::DictValue DesktopServer() {
++  return base::DictValue()
++      .Set("command",
++           base::CommandLine::ForCurrentProcess()->GetProgram().AsUTF8Unsafe())
++      .Set("args", base::ListValue().Append("--mcp-bridge"));
++}
++
++// What Connect adds, the way the file will read.
++std::string DesktopCommand() {
++  std::string program;
++  base::JSONWriter::Write(
++      base::Value(
++          base::CommandLine::ForCurrentProcess()->GetProgram().AsUTF8Unsafe()),
++      &program);
++  return "\"meridian\": {\n  \"command\": " + program +
++         ",\n  \"args\": [\"--mcp-bridge\"]\n}";
++}
++
++// The config file as the person knows it: ~/Library/...
++std::string DisplayPath(const base::FilePath& file) {
++  const std::string home = base::GetHomeDir().AsUTF8Unsafe();
++  const std::string path = file.AsUTF8Unsafe();
++  if (!home.empty() && base::StartsWith(path, home + "/")) {
++    return "~" + path.substr(home.size());
++  }
++  return path;
++}
++
++base::FilePath DesktopBackup(const base::FilePath& config) {
++  return config.AddExtensionASCII("meridian-backup");
++}
++
++bool ConnectDesktop(std::string* output) {
++  const base::FilePath config = DesktopConfig();
++  base::DictValue root;
++  std::string text;
++  const bool existed = base::PathExists(config);
++  if (existed) {
++    if (!base::ReadFileToString(config, &text)) {
++      *output = "couldn\u2019t read " + config.AsUTF8Unsafe();
++      return false;
++    }
++    if (!base::TrimWhitespaceASCII(text, base::TRIM_ALL).empty()) {
++      std::optional<base::DictValue> parsed = base::JSONReader::ReadDict(
++          text, base::JSON_ALLOW_TRAILING_COMMAS);
++      if (!parsed) {
++        // Never overwrite a file we can't read back.
++        *output = config.AsUTF8Unsafe() +
++                  " isn\u2019t valid JSON; fix it (or move it away) and "
++                  "try again";
++        return false;
++      }
++      root = std::move(*parsed);
++    }
++  }
++  base::Value* servers = root.Find("mcpServers");
++  if (servers && !servers->is_dict()) {
++    *output = "\"mcpServers\" in " + config.AsUTF8Unsafe() +
++              " isn\u2019t an object; nothing was changed";
++    return false;
++  }
++  base::DictValue server = DesktopServer();
++  if (servers) {
++    const base::DictValue* current = servers->GetDict().FindDict("meridian");
++    if (current && *current == server) {
++      *output = "already connected";
++      return true;
++    }
++  }
++  if (existed && !base::CopyFile(config, DesktopBackup(config))) {
++    *output = "couldn\u2019t back up " + config.AsUTF8Unsafe();
++    return false;
++  }
++  if (!servers) {
++    servers = root.Set("mcpServers", base::DictValue());
++  }
++  servers->GetDict().Set("meridian", std::move(server));
++  std::string json;
++  base::JSONWriter::WriteWithOptions(
++      root, base::JSONWriter::OPTIONS_PRETTY_PRINT, &json);
++  if (!base::CreateDirectory(config.DirName()) ||
++      !base::ImportantFileWriter::WriteFileAtomically(config, json)) {
++    *output = "couldn\u2019t write " + config.AsUTF8Unsafe();
++    return false;
++  }
++  *output = existed ? "the old file is saved as " +
++                          DesktopBackup(config).BaseName().AsUTF8Unsafe()
++                    : "a new config file";
++  return true;
++}
++
+ }  // namespace
+ 
+ std::vector<AgentCli> DetectAgentClis() {
+   std::string path = LoginPath();
+   std::vector<AgentCli> out;
+   for (const Known& cli : KnownClis()) {
+-    out.push_back({cli.id, cli.name, Which(cli.id, path), CommandOf(cli)});
++    out.push_back({cli.id, cli.name, Which(cli.id, path), CommandOf(cli), ""});
+   }
++  out.push_back({kDesktopId, "Claude Desktop",
++                 DesktopInstalled() ? DesktopConfig().AsUTF8Unsafe() : "",
++                 DesktopCommand(), DisplayPath(DesktopConfig())});
+   return out;
+ }
+ 
+ bool ConnectAgentCli(const std::string& id, std::string* output) {
++  if (id == kDesktopId) {
++    return ConnectDesktop(output);
++  }
+   for (const Known& cli : KnownClis()) {
+     if (cli.id != id) {
+       continue;
+diff --git a/chrome/browser/meridian/agent/agent_cli.h b/chrome/browser/meridian/agent/agent_cli.h
+index 3fa00e62f7..0720716ce2 100644
+--- a/chrome/browser/meridian/agent/agent_cli.h
++++ b/chrome/browser/meridian/agent/agent_cli.h
+@@ -15,14 +15,21 @@ namespace meridian {
+ // started from the Dock don't inherit it); the person sees the exact command
+ // before it runs. Both functions block (they run processes).
+ struct AgentCli {
+-  std::string id;       // "claude" or "codex"
++  std::string id;       // "claude", "codex" or "claude-desktop"
+   std::string name;     // "Claude Code"
+   std::string path;     // empty if not found
+-  std::string command;  // what Connect runs
++  std::string command;  // what Connect runs (or, for Claude Desktop, adds)
++  std::string file;     // Claude Desktop: the config file Connect edits
+ };
+ 
+ std::vector<AgentCli> DetectAgentClis();
+ 
++// Claude Desktop has no CLI: Connect adds "meridian" to the mcpServers of
++// claude_desktop_config.json, keeping a copy of the old file next to it and
++// leaving every other key alone. The switch points it elsewhere (tests).
++inline constexpr char kClaudeDesktopConfigSwitch[] =
++    "meridian-claude-desktop-config";
++
+ // Runs the CLI's "mcp add"; `output` is what it printed. Already registered
+ // counts as connected.
+ bool ConnectAgentCli(const std::string& id, std::string* output);
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 47b0ba1728..8760d2af97 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -457,8 +457,11 @@ struct AgentCli {
+   string name;
+   // Found on the login shell's PATH.
+   bool found;
+-  // The exact command "Connect" runs (shown to the person first).
++  // The exact command "Connect" runs (shown to the person first). For
++  // Claude Desktop: the "meridian" entry it adds to `file`.
+   string command;
++  // Claude Desktop's config file (empty for the CLIs).
++  string file;
+ };
+ 
+ // A starting setup for the welcome tour (setup_profile.h).
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 0806af20f9..d96dd85dec 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -1007,6 +1007,7 @@ void SidebarHandler::GetAgentClis(GetAgentClisCallback callback) {
+               m->name = cli.name;
+               m->found = !cli.path.empty();
+               m->command = cli.command;
++              m->file = cli.file;
+               out.push_back(std::move(m));
+             }
+             std::move(callback).Run(std::move(out));
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.css b/chrome/browser/resources/webui_browser/meridian/settings.css
+index 019d760f33..38ae6e45e5 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.css
++++ b/chrome/browser/resources/webui_browser/meridian/settings.css
+@@ -630,3 +630,10 @@ select:focus {
+     background: transparent;
+   }
+ }
++
++/* Claude Desktop's config path: long, with no spaces to break at. */
++.confirm-card .file {
++  font-family: ui-monospace, Menlo, monospace;
++  font-size: 0.92em;
++  overflow-wrap: anywhere;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index fa4da92189..dd7ca3f342 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -680,7 +680,7 @@ export function getHtml(this: MeridianSettingsElement) {
+                 <div class="row">
+                   <div class="row-text">
+                     <div class="row-label">${cli.name}</div>
+-                    <div class="row-desc mono">${cli.command}</div>
++                    <div class="row-desc mono">${cli.file || cli.command}</div>
+                   </div>
+                   <button class="btn" data-id="${cli.id}"
+                       ?disabled="${!cli.found}" @click="${this.onConnectClick_}">
+@@ -778,14 +778,20 @@ export function getHtml(this: MeridianSettingsElement) {
+       <div class="confirm">
+         <div class="confirm-card">
+           <h3>Connect ${this.connecting_.name}?</h3>
+-          <p>Meridian will run this command, which adds Meridian to
+-            ${this.connecting_.name}'s MCP servers:</p>
++          ${this.connecting_.file ? html`
++            <p>Meridian will add this to Claude Desktop's MCP servers in
++              <span class="file">${this.connecting_.file}</span>. Other
++              settings stay as they are, and a copy of the old file is kept
++              next to it.</p>` : html`
++            <p>Meridian will run this command, which adds Meridian to
++              ${this.connecting_.name}'s MCP servers:</p>`}
+           <pre class="command">${this.connecting_.command}</pre>
+           <div class="confirm-actions">
+             <button class="btn" @click="${this.onConnectCancelClick_}">
+               Cancel</button>
+             <button id="connectRun" class="btn primary"
+-                @click="${this.onConnectRunClick_}">Run</button>
++                @click="${this.onConnectRunClick_}">
++                ${this.connecting_.file ? 'Connect' : 'Run'}</button>
+           </div>
+         </div>
+       </div>` : ''}
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index b826f6c2ba..6e48219ad7 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -761,9 +761,16 @@ export class MeridianSettingsElement extends CrLitElement {
+     }
+     this.connectResult_ = `Connecting ${cli.name}…`;
+     const {ok, output} = await this.handler_.connectAgentCli(cli.id);
+-    this.connectResult_ = ok ?
+-        `${cli.name} is connected. Start a new session there to use Meridian.` :
+-        `${cli.name} wasn’t connected: ${output}`;
++    if (!ok) {
++      this.connectResult_ = `${cli.name} wasn’t connected: ${output}`;
++    } else if (cli.file) {
++      // Claude Desktop reads its config only when it starts.
++      this.connectResult_ = `${cli.name} is connected (${output}). Quit ` +
++          'and reopen Claude Desktop to use Meridian.';
++    } else {
++      this.connectResult_ =
++          `${cli.name} is connected. Start a new session there to use Meridian.`;
++    }
+   }
+ 
+   protected async onSaveKeyClick_() {

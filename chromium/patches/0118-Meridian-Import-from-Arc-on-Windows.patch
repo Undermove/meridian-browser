@@ -1,0 +1,359 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Sun, 15 Nov 2026 14:13:30 +0400
+Subject: [PATCH 119/202] Meridian: Import from Arc on Windows
+
+Arc for Windows is a packaged app: what macOS keeps in Application
+Support/Arc is in its package's folder under %LOCALAPPDATA%\Packages,
+laid out the same way, so the sidebar, the profiles and the rest are read
+from there.
+
+Its cookies, passwords and cards are encrypted as Chromium does on Windows:
+AES-256-GCM with a key kept in "Local State", wrapped by Windows's data
+protection for the account (no prompt, unlike the Mac's keychain). Values
+under a scheme that can't be read from outside ("v20", a key bound to the
+app) are counted as failed instead of being taken for clear text.
+
+While Arc is open nobody else can read its cookie databases on Windows.
+The import then says so ("busy") and the tour asks to quit Arc and try
+again, rather than bringing the passwords alone.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ chrome/browser/meridian/BUILD.gn              |  5 ++
+ chrome/browser/meridian/arc_import.cc         | 24 ++++++
+ chrome/browser/meridian/arc_logins.cc         | 84 ++++++++++++++-----
+ chrome/browser/meridian/arc_logins.h          | 13 ++-
+ chrome/browser/meridian/arc_logins_win.cc     | 71 ++++++++++++++++
+ .../webui_browser/meridian/onboarding.ts      |  2 +
+ 6 files changed, 176 insertions(+), 23 deletions(-)
+ create mode 100644 chrome/browser/meridian/arc_logins_win.cc
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 3284867109..5213c7992c 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -314,6 +314,11 @@ source_set("meridian") {
+       "Security.framework",
+     ]
+   } else {
++    if (is_win) {
++      sources += [ "arc_logins_win.cc" ]
++      libs = [ "crypt32.lib" ]
++    }
++
+     # Windows and Linux: the same things with Chromium's own UI toolkit.
+     sources += [
+       "mission/mission_platform_views.cc",
+diff --git a/chrome/browser/meridian/arc_import.cc b/chrome/browser/meridian/arc_import.cc
+index 7bd8468bc7..a8159c1e27 100644
+--- a/chrome/browser/meridian/arc_import.cc
++++ b/chrome/browser/meridian/arc_import.cc
+@@ -14,6 +14,7 @@
+ #include "base/files/file_util.h"
+ #include "base/json/json_reader.h"
+ #include "base/path_service.h"
++#include "build/build_config.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/stringprintf.h"
+@@ -210,11 +211,34 @@ base::FilePath ArcDataDir() {
+   if (HasTestSwitch(kArcDirSwitch)) {
+     return TestSwitchPath(kArcDirSwitch);
+   }
++#if BUILDFLAG(IS_WIN)
++  // Arc is a packaged app there: what macOS keeps in Application Support is
++  // in its package's folder, %LOCALAPPDATA%\Packages\TheBrowserCompany.Arc_
++  // <publisher id>\LocalCache\Local\Arc.
++  base::FilePath local;
++  if (!base::PathService::Get(base::DIR_LOCAL_APP_DATA, &local)) {
++    return base::FilePath();
++  }
++  base::FileEnumerator packages(local.AppendASCII("Packages"), false,
++                                base::FileEnumerator::DIRECTORIES,
++                                FILE_PATH_LITERAL("TheBrowserCompany.Arc_*"));
++  for (base::FilePath package = packages.Next(); !package.empty();
++       package = packages.Next()) {
++    base::FilePath arc = package.AppendASCII("LocalCache")
++                             .AppendASCII("Local")
++                             .AppendASCII("Arc");
++    if (base::DirectoryExists(arc)) {
++      return arc;
++    }
++  }
++  return base::FilePath();
++#else
+   base::FilePath home;
+   if (!base::PathService::Get(base::DIR_HOME, &home)) {
+     return base::FilePath();
+   }
+   return home.AppendASCII("Library/Application Support/Arc");
++#endif
+ }
+ 
+ std::optional<ArcSidebar> ParseArcSidebar(const base::DictValue& root) {
+diff --git a/chrome/browser/meridian/arc_logins.cc b/chrome/browser/meridian/arc_logins.cc
+index 9cce092b46..38366bd1dd 100644
+--- a/chrome/browser/meridian/arc_logins.cc
++++ b/chrome/browser/meridian/arc_logins.cc
+@@ -43,6 +43,7 @@
+ #include "components/password_manager/core/browser/password_store/password_store_interface.h"
+ #include "components/password_manager/core/browser/password_store/stored_credential.h"
+ #include "content/public/browser/storage_partition.h"
++#include "crypto/aead.h"
+ #include "crypto/aes_cbc.h"
+ #include "crypto/hash.h"
+ #include "net/cookies/canonical_cookie.h"
+@@ -201,12 +202,29 @@ std::optional<std::string> Decrypt(base::span<const uint8_t> enc,
+                                    const std::string& host_key,
+                                    int version) {
+   if (enc.size() < 3 || enc[0] != 'v' || enc[1] != '1' || enc[2] != '0') {
++    // Another scheme ("v20": a key bound to the app that wrote it) can't be
++    // read from outside; anything else is legacy clear text.
++    if (enc.size() >= 3 && enc[0] == 'v' && base::IsAsciiDigit(enc[1]) &&
++        base::IsAsciiDigit(enc[2])) {
++      return std::nullopt;
++    }
+     return std::string(enc.begin(), enc.end());  // legacy clear text
+   }
+-  std::array<uint8_t, crypto::aes_cbc::kBlockSize> iv;
+-  iv.fill(' ');
+-  std::optional<std::vector<uint8_t>> plain =
+-      crypto::aes_cbc::Decrypt(key, iv, enc.subspan(3u));
++  std::optional<std::vector<uint8_t>> plain;
++  if (key.size() == 32) {
++    // Windows: a 12-byte nonce, then AES-256-GCM.
++    constexpr size_t kNonce = 12;
++    if (enc.size() < 3 + kNonce) {
++      return std::nullopt;
++    }
++    plain = crypto::aead::Open(crypto::aead::AES_256_GCM, key,
++                               enc.subspan(3u + kNonce),
++                               enc.subspan(3u, kNonce), {});
++  } else {
++    std::array<uint8_t, crypto::aes_cbc::kBlockSize> iv;
++    iv.fill(' ');
++    plain = crypto::aes_cbc::Decrypt(key, iv, enc.subspan(3u));
++  }
+   if (!plain) {
+     return std::nullopt;
+   }
+@@ -502,23 +520,36 @@ ReadResult ReadArc(bool with_cookies) {
+     out.result.error = "no-data";
+     return out;
+   }
+-  std::string password = ArcPassword(&out.result.error);
+-  if (password.empty()) {
+-    if (out.result.error.empty()) {
+-      out.result.error = "denied";
++  std::vector<uint8_t> key;
++#if BUILDFLAG(IS_WIN)
++  // Windows: the key itself, from Arc's "Local State" (tests give a password,
++  // as on macOS, and get that scheme).
++  if (!HasTestSwitch(kArcSafeStorageSwitch)) {
++    key = internal::ReadArcOsCryptKey(&out.result.error);
++    if (key.empty()) {
++      return out;
+     }
+-    return out;
+   }
+-  std::array<uint8_t, 16> key;
+-  static constexpr char kSalt[] = "saltysalt";
+-  bool derived = PKCS5_PBKDF2_HMAC_SHA1(
+-      password.data(), password.size(),
+-      reinterpret_cast<const uint8_t*>(kSalt), sizeof(kSalt) - 1, 1003,
+-      key.size(), key.data());
+-  OPENSSL_cleanse(password.data(), password.size());
+-  if (!derived) {
+-    out.result.error = "read";
+-    return out;
++#endif
++  if (key.empty()) {
++    std::string password = ArcPassword(&out.result.error);
++    if (password.empty()) {
++      if (out.result.error.empty()) {
++        out.result.error = "denied";
++      }
++      return out;
++    }
++    key.resize(16);
++    static constexpr char kSalt[] = "saltysalt";
++    bool derived = PKCS5_PBKDF2_HMAC_SHA1(
++        password.data(), password.size(),
++        reinterpret_cast<const uint8_t*>(kSalt), sizeof(kSalt) - 1, 1003,
++        key.size(), key.data());
++    OPENSSL_cleanse(password.data(), password.size());
++    if (!derived) {
++      out.result.error = "read";
++      return out;
++    }
+   }
+   std::map<std::string,
+            std::set<std::tuple<std::string, std::string, std::string>>>
+@@ -526,11 +557,14 @@ ReadResult ReadArc(bool with_cookies) {
+   std::map<std::string, std::set<LoginKey>> seen_logins;
+   std::map<std::string, std::set<std::u16string>> seen_cards;
+   bool any = false;
++  [[maybe_unused]] bool cookies_unread = false;
+   for (const ArcProfile& p : profiles) {
+     std::string target = ProfileIdForArcDir(p.dir);
+     if (with_cookies && !p.cookies.empty()) {
+-      any |= ReadProfile(p.cookies, key, seen[target], out.cookies[target],
+-                         out.result.failed);
++      bool read = ReadProfile(p.cookies, key, seen[target],
++                              out.cookies[target], out.result.failed);
++      any |= read;
++      cookies_unread |= !read;
+     }
+     for (const base::FilePath& db : p.logins) {
+       any |= ReadPasswords(db, key, seen_logins[target], out.passwords[target],
+@@ -554,6 +588,14 @@ ReadResult ReadArc(bool with_cookies) {
+   if (!any) {
+     out.result.error = "read";
+   }
++#if BUILDFLAG(IS_WIN)
++  // Windows: while Arc is open nobody else can read its cookie databases,
++  // not even to copy them. The person is told to quit Arc and try again,
++  // rather than getting the passwords alone and staying signed out.
++  if (cookies_unread && out.cookies.empty()) {
++    out.result.error = "busy";
++  }
++#endif
+   return out;
+ }
+ 
+diff --git a/chrome/browser/meridian/arc_logins.h b/chrome/browser/meridian/arc_logins.h
+index e6fbeca58c..b0aaa8e8d6 100644
+--- a/chrome/browser/meridian/arc_logins.h
++++ b/chrome/browser/meridian/arc_logins.h
+@@ -27,7 +27,7 @@ namespace meridian {
+ 
+ // Brings Arc's cookies (the sites you're signed in to) and saved passwords
+ // into this profile, so you stay signed in, with the payment cards saved in
+-// Arc (their numbers are encrypted the same way). macOS only.
++// Arc (their numbers are encrypted the same way). macOS and Windows.
+ //
+ // Arc is Chromium: each profile folder in Arc's "User Data" has a Cookies
+ // database and a "Login Data" one (saved passwords) whose values are
+@@ -39,6 +39,11 @@ namespace meridian {
+ //   stripped.
+ // Reading the password makes macOS ask the person first.
+ //
++// Windows: the key is in Arc's "Local State", wrapped by Windows's data
++// protection for this account (arc_logins_win.cc), and
++//   value = "v10" + nonce (12 bytes) + AES-256-GCM(key, nonce)
++// with the same SHA256(host_key) in front of a cookie's plaintext.
++//
+ // Nothing leaves the machine and Arc is never written to: each database is
+ // copied to a private temp folder, read, and the copy deleted. Cookie values,
+ // passwords and the key are never logged. Passwords already saved here (the
+@@ -54,7 +59,8 @@ struct ArcLoginsResult {
+   int cards = 0;
+   int failed = 0;
+   // Empty on success, else "no-data", "not-found" (no key in the keychain),
+-  // "denied" (the person said no) or "read".
++  // "denied" (the person said no), "busy" (Windows: Arc is open and holds
++  // its cookie databases) or "read".
+   std::string error;
+ };
+ 
+@@ -74,6 +80,9 @@ namespace internal {
+ // macOS: "Arc Safe Storage" from the login keychain (macOS asks first);
+ // empty with `error` set if it isn't there or the person said no.
+ std::string ReadArcKeychainPassword(std::string* error);
++// Windows: the 32-byte key from Arc's "Local State"; empty with `error` set
++// if it isn't there or Windows wouldn't unwrap it.
++std::vector<uint8_t> ReadArcOsCryptKey(std::string* error);
+ 
+ // Opens a private copy of an Arc database (Arc may be running) in `tmp`.
+ bool OpenCopy(const base::FilePath& db_file,
+diff --git a/chrome/browser/meridian/arc_logins_win.cc b/chrome/browser/meridian/arc_logins_win.cc
+new file mode 100644
+index 0000000000..ee91e97ce6
+--- /dev/null
++++ b/chrome/browser/meridian/arc_logins_win.cc
+@@ -0,0 +1,71 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/arc_logins.h"
++
++#include <windows.h>
++
++#include <dpapi.h>
++
++#include <optional>
++#include <string>
++
++#include "base/base64.h"
++#include "base/containers/span.h"
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
++#include "base/values.h"
++#include "chrome/browser/meridian/arc_import.h"
++#include "third_party/boringssl/src/include/openssl/mem.h"
++
++namespace meridian::internal {
++
++// Arc on Windows keeps the key its cookies and passwords are encrypted with
++// as Chromium does there: in "Local State" beside the profiles, under
++// os_crypt.encrypted_key, base64 of "DPAPI" and the key as Windows's data
++// protection wrapped it for this account. Only this account can unwrap it,
++// and Windows doesn't ask.
++std::vector<uint8_t> ReadArcOsCryptKey(std::string* error) {
++  std::string json;
++  if (!base::ReadFileToStringWithMaxSize(
++          ArcDataDir().AppendASCII("User Data").AppendASCII("Local State"),
++          &json, 16 * 1024 * 1024)) {
++    *error = "no-data";
++    return {};
++  }
++  std::optional<base::Value> state = base::JSONReader::Read(json, 0);
++  const std::string* encoded =
++      state && state->is_dict()
++          ? state->GetDict().FindStringByDottedPath("os_crypt.encrypted_key")
++          : nullptr;
++  std::optional<std::vector<uint8_t>> wrapped =
++      encoded ? base::Base64Decode(*encoded) : std::nullopt;
++  static constexpr std::string_view kPrefix = "DPAPI";
++  if (!wrapped || wrapped->size() <= kPrefix.size() ||
++      base::as_string_view(base::span(*wrapped).first(kPrefix.size())) !=
++          kPrefix) {
++    *error = "not-found";
++    return {};
++  }
++  base::span<uint8_t> data = base::span(*wrapped).subspan(kPrefix.size());
++  DATA_BLOB in = {static_cast<DWORD>(data.size()), data.data()};
++  DATA_BLOB out = {};
++  if (!::CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr,
++                            CRYPTPROTECT_UI_FORBIDDEN, &out)) {
++    *error = "denied";
++    return {};
++  }
++  // SAFETY: CryptUnprotectData returns `cbData` bytes at `pbData`.
++  auto plain = UNSAFE_BUFFERS(base::span(out.pbData, size_t{out.cbData}));
++  std::vector<uint8_t> key(plain.begin(), plain.end());
++  OPENSSL_cleanse(plain.data(), plain.size());
++  ::LocalFree(out.pbData);
++  if (key.size() != 32) {
++    *error = "read";
++    return {};
++  }
++  return key;
++}
++
++}  // namespace meridian::internal
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+index 491ce7df94..1aaa266ad9 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+@@ -385,6 +385,8 @@ export class MeridianOnboardingElement extends CrLitElement {
+       ].filter(x => x);
+       this.note_ = error === 'denied' ?
+           'Sign-ins weren’t brought over. You can try again from File > Import from Arc.' :
++          error === 'busy' ?
++          'Sign-ins weren’t brought over: Arc is open. Quit Arc, then try again from File > Import from Arc.' :
+           error ? 'Arc’s sign-ins couldn’t be read.' :
+                   `You’re still signed in to your sites (${
+                       [`${imported.toLocaleString()} sign-ins`, ...more].join(

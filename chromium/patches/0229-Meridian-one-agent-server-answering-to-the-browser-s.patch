@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Sat, 21 Nov 2026 22:41:00 +0400
+Subject: [PATCH 230/230] Meridian: one agent server, answering to the
+ browser's Settings; 0.6.25
+
+A space with its own profile started a second agent server that took over
+the connection file, while acting on the main window. Its access prefs, not
+the ones in Settings, then decided what an agent could do.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/agent/agent_service_factory.cc     | 13 ++++++++++---
+ chrome/browser/meridian/ai/ai_service.cc        |  3 ++-
+ chrome/browser/meridian/sidebar_handler.cc      | 17 ++++++++++-------
+ chrome/browser/meridian/update_check.h          |  2 +-
+ .../meridian/workbench/workbench_handler.cc     |  3 ++-
+ 5 files changed, 25 insertions(+), 13 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_service_factory.cc b/chrome/browser/meridian/agent/agent_service_factory.cc
+index 7ec70887a4..0bec432c03 100644
+--- a/chrome/browser/meridian/agent/agent_service_factory.cc
++++ b/chrome/browser/meridian/agent/agent_service_factory.cc
+@@ -7,14 +7,17 @@
+ #include "chrome/browser/history/history_service_factory.h"
+ #include "chrome/browser/meridian/agent/agent_service.h"
+ #include "chrome/browser/meridian/sidebar_service_factory.h"
++#include "chrome/browser/meridian/space_profiles.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/search_engines/template_url_service_factory.h"
+ 
+ namespace meridian {
+ 
+ AgentService* AgentServiceFactory::GetForProfile(Profile* profile) {
+-  return static_cast<AgentService*>(
+-      GetInstance()->GetServiceForBrowserContext(profile, /*create=*/true));
++  // One agent server for the whole browser: a space's profile holds cookies,
++  // not the person's decisions about agents.
++  return static_cast<AgentService*>(GetInstance()->GetServiceForBrowserContext(
++      MainProfileFor(profile), /*create=*/true));
+ }
+ 
+ AgentServiceFactory* AgentServiceFactory::GetInstance() {
+@@ -40,7 +43,11 @@ AgentServiceFactory::~AgentServiceFactory() = default;
+ std::unique_ptr<KeyedService>
+ AgentServiceFactory::BuildServiceInstanceForBrowserContext(
+     content::BrowserContext* context) const {
+-  return std::make_unique<AgentService>(Profile::FromBrowserContext(context));
++  Profile* profile = Profile::FromBrowserContext(context);
++  if (IsSpaceProfile(profile)) {
++    return nullptr;
++  }
++  return std::make_unique<AgentService>(profile);
+ }
+ 
+ bool AgentServiceFactory::ServiceIsCreatedWithBrowserContext() const {
+diff --git a/chrome/browser/meridian/ai/ai_service.cc b/chrome/browser/meridian/ai/ai_service.cc
+index 193f1e668e..5175465a81 100644
+--- a/chrome/browser/meridian/ai/ai_service.cc
++++ b/chrome/browser/meridian/ai/ai_service.cc
+@@ -26,6 +26,7 @@
+ #include "chrome/browser/meridian/mission/mission_control.h"
+ #include "chrome/browser/meridian/mission/mission_control_factory.h"
+ #include "chrome/browser/meridian/prefs.h"
++#include "chrome/browser/meridian/space_profiles.h"
+ #include "chrome/browser/meridian/test_switches.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "components/os_crypt/async/browser/os_crypt_async.h"
+@@ -1230,7 +1231,7 @@ void AiService::Step(const std::string& id, std::string key, int step) {
+     body.Set("output_config", base::DictValue().Set("effort", "medium"));
+   }
+   if (session->use_tools) {
+-    PrefService* prefs = profile_->GetPrefs();
++    PrefService* prefs = MainProfileFor(profile_)->GetPrefs();
+     std::string access = prefs->GetString(prefs::kAgentAccess);
+     bool js = prefs->GetBoolean(prefs::kAgentAllowJs);
+     base::ListValue tools;
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index d4193a42fa..1dc261b328 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -1925,7 +1925,7 @@ void SidebarHandler::AllowAiProvider(const std::string& id) {
+ }
+ 
+ void SidebarHandler::GrantAgentAccess() {
+-  PrefService* prefs = browser_->GetProfile()->GetPrefs();
++  PrefService* prefs = MainProfileFor(browser_->GetProfile())->GetPrefs();
+   if (prefs->GetBoolean(prefs::kAgentAccessDecided) ||
+       prefs->GetString(prefs::kAgentAccess) != "off") {
+     return;
+@@ -2199,9 +2199,10 @@ void SidebarHandler::GetSettings(GetSettingsCallback callback) {
+                                                    : "system";
+   settings->archive_after_hours = prefs->GetInteger(prefs::kArchiveAfterHours);
+   settings->atc = AtcToMojo(prefs->GetDict(prefs::kAtc));
+-  settings->agent_access = prefs->GetString(prefs::kAgentAccess);
++  PrefService* main_prefs = MainProfileFor(browser_->GetProfile())->GetPrefs();
++  settings->agent_access = main_prefs->GetString(prefs::kAgentAccess);
+   settings->ai_consent = prefs->GetString(prefs::kAiConsent);
+-  settings->agent_allow_js = prefs->GetBoolean(prefs::kAgentAllowJs);
++  settings->agent_allow_js = main_prefs->GetBoolean(prefs::kAgentAllowJs);
+   settings->agent_uploads = prefs->GetString(prefs::kAgentUploads);
+   for (const base::Value& site : prefs->GetList(prefs::kAgentUploadSites)) {
+     if (site.is_string()) {
+@@ -2258,17 +2259,19 @@ void SidebarHandler::SetSettings(mojom::SettingsPtr settings) {
+       hours == 720) {
+     prefs->SetInteger(prefs::kArchiveAfterHours, hours);
+   }
++  // Agents answer to the main profile, whichever space this window shows.
++  PrefService* agent_prefs = MainProfileFor(browser_->GetProfile())->GetPrefs();
+   const std::string& access = settings->agent_access;
+   if (access == "off" || access == "read" || access == "ask" ||
+       access == "full") {
+     // (Every settings save carries it: only a change is a decision.)
+-    const bool changed = access != prefs->GetString(prefs::kAgentAccess);
+-    prefs->SetString(prefs::kAgentAccess, access);
++    const bool changed = access != agent_prefs->GetString(prefs::kAgentAccess);
++    agent_prefs->SetString(prefs::kAgentAccess, access);
+     if (changed) {
+-      prefs->SetBoolean(prefs::kAgentAccessDecided, true);
++      agent_prefs->SetBoolean(prefs::kAgentAccessDecided, true);
+     }
+   }
+-  prefs->SetBoolean(prefs::kAgentAllowJs, settings->agent_allow_js);
++  agent_prefs->SetBoolean(prefs::kAgentAllowJs, settings->agent_allow_js);
+   const std::string& consent = settings->ai_consent;
+   if (consent.empty() || consent == "always" || consent == "off") {
+     prefs->SetString(prefs::kAiConsent, consent);
+diff --git a/chrome/browser/meridian/update_check.h b/chrome/browser/meridian/update_check.h
+index fae4ebd56b..73752a4283 100644
+--- a/chrome/browser/meridian/update_check.h
++++ b/chrome/browser/meridian/update_check.h
+@@ -18,7 +18,7 @@
+ namespace meridian::update {
+ 
+ // This build's version (the release tag without "v").
+-inline constexpr char kVersion[] = "0.6.24";
++inline constexpr char kVersion[] = "0.6.25";
+ 
+ // GitHub's latest release of Meridian.
+ inline constexpr char kFeed[] =
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index b94517f0bb..1e491b2d8d 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -29,6 +29,7 @@
+ #include "chrome/browser/meridian/private_file.h"
+ #include "chrome/browser/meridian/real_path.h"
+ #include "chrome/browser/meridian/sidebar_handler.h"
++#include "chrome/browser/meridian/space_profiles.h"
+ #include "chrome/browser/meridian/test_switches.h"
+ #include "chrome/browser/meridian/workbench/agents.h"
+ #include "chrome/browser/meridian/ai/ai_service.h"
+@@ -1953,7 +1954,7 @@ void WorkbenchHandler::GuardDecision(
+ 
+ void WorkbenchHandler::Info(Reply reply) {
+   std::string access =
+-      profile_->GetPrefs()->GetString(prefs::kAgentAccess);
++      MainProfileFor(profile_)->GetPrefs()->GetString(prefs::kAgentAccess);
+   base::DictValue project =
+       project_ ? ProjectInfo() : base::DictValue();
+   bool has_project = project_.has_value();

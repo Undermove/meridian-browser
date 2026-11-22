@@ -1,0 +1,233 @@
+// Chromium's own bubbles in Meridian's window (there is no toolbar or location bar to anchor them):
+// permission prompts (asked with or without a click), "download multiple files" and saving a
+// password. A test switch lists them and presses their buttons. Camera and location are only
+// dismissed here: allowing them would bring up macOS's own prompt.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { launch, SB } from './harness.mjs';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const PROMPT = 'PermissionPromptBubbleBaseView';
+
+function site() {
+  const s = http.createServer((req, res) => {
+    if (req.url.startsWith('/file')) {
+      res.writeHead(200, { 'content-disposition': `attachment; filename="${req.url.slice(1)}.txt"` });
+      res.end('x');
+      return;
+    }
+    if (req.method === 'POST') req.resume();
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(req.url === '/done' ? '<title>Signed in</title><h1>Welcome back</h1><p>You are signed in.</p>' :
+      `<title>Login</title><form action="/done" method="post"><input name="u" id="u" autocomplete="username">` +
+      `<input type="password" name="p" id="p" autocomplete="current-password"><button id="go">Sign in</button></form>`);
+  });
+  return s;
+}
+
+async function open(profile) {
+  const s = site();
+  await new Promise((r) => s.listen(0, '127.0.0.1', r));
+  // localhost: a secure context, as the permissions need.
+  const url = `http://localhost:${s.address().port}/`;
+  const b = await launch([url], { profile, args: ['--meridian-test-bubbles', '--use-fake-device-for-media-stream'] });
+  await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'Login')`);
+  const page = await b.page(url);
+  // With a click (user activation) or without one, as a site asks on load.
+  const run = (code, gesture = true) => page.cdp.send('Runtime.evaluate', { expression: code, userGesture: gesture, awaitPromise: false, returnByValue: true });
+  const bubbles = (action = '') => b.eval(`app.$.tabstrip.handler_.testBubbles(${JSON.stringify(action)}).then((r) => r.bubbles)`);
+  const waitBubble = async (name) => {
+    for (let i = 0; i < 50; i++) { if ((await bubbles()).includes(name)) return; await sleep(100); }
+    assert.fail(`no ${name}: ${JSON.stringify(await bubbles())}`);
+  };
+  return { s, url, b, page, run, bubbles, waitBubble };
+}
+
+test('Bubbles: permission prompts show (also without a click) and their answer reaches the page', async () => {
+  const { s, b, page, run, bubbles, waitBubble } = await open();
+  try {
+    // Notifications, allowed.
+    await run(`Notification.requestPermission().then((r) => { window.notif = r; })`);
+    await waitBubble(PROMPT);
+    await bubbles('accept');
+    await page.waitFor(`window.notif === 'granted'`);
+    // Location asked on load, with no click: still a bubble (Chromium's quiet icon would sit in a
+    // location bar Meridian doesn't have). Dismissed.
+    await run(`navigator.geolocation.getCurrentPosition(() => {}, () => {})`, false);
+    await waitBubble(PROMPT);
+    await bubbles('cancel');
+    // Camera: dismissed too.
+    await run(`navigator.mediaDevices.getUserMedia({ video: true }).catch(() => {})`);
+    await waitBubble(PROMPT);
+    await bubbles('cancel');
+    assert.deepEqual(await bubbles(), []);
+  } finally {
+    await b.close(); s.closeAllConnections(); s.close();
+  }
+});
+
+test('Bubbles: a second download from the same page asks first', async () => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-dl-')));
+  fs.mkdirSync(path.join(profile, 'Default'));
+  fs.writeFileSync(path.join(profile, 'Default', 'Preferences'), JSON.stringify({ download: { default_directory: dir, prompt_for_download: false, directory_upgrade: true } }));
+  const { s, b, page, run, bubbles, waitBubble } = await open(profile);
+  try {
+    await run(`(() => { const get = (n) => { const a = document.createElement('a'); a.href = '/' + n; document.body.append(a); a.click(); }; get('file1'); setTimeout(() => get('file2'), 500); })()`);
+    await waitBubble(PROMPT);
+    assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith('.txt')), ['file1.txt']);
+    await bubbles('accept');
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(dir, 'file2.txt')); i++) await sleep(100);
+    assert.ok(fs.existsSync(path.join(dir, 'file2.txt')), 'the second file came after Allow');
+
+    page.close();
+  } finally {
+    await b.close(); s.closeAllConnections(); s.close();
+    for (const d of [profile, dir]) fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('Bubbles: a submitted password is offered for saving, and Save stores it', async () => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  fs.mkdirSync(path.join(profile, 'Default'));
+  // No leak check first (it asks Google, which the offer waits for).
+  fs.writeFileSync(path.join(profile, 'Default', 'Preferences'), JSON.stringify({ profile: { password_manager_leak_detection: false } }));
+  const { s, b, page, run, bubbles, waitBubble } = await open(profile);
+  try {
+    // Sign in, typing like a person (Chromium offers only what was typed): "Save password?" in
+    // the window; Save stores it.
+    const type = async (id, text) => {
+      await page.eval(`(document.getElementById('${id}').focus(), true)`);
+      await page.cdp.send('Input.insertText', { text });
+    };
+    await type('u', 'dima');
+    await type('p', 'correct-horse-7');
+    await page.cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' });
+    await page.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await waitBubble('PasswordSaveUpdateView');
+    await bubbles('accept');
+    for (let i = 0; i < 30 && (await bubbles()).length; i++) await sleep(100);
+    assert.deepEqual(await bubbles(), []);
+    // Saved: the password manager has it for this site.
+    await b.eval(`app.$.tabstrip.openUrl('chrome://password-manager/passwords')`);
+    const pm = await b.page('chrome://password-manager');
+    await pm.waitFor(`(() => { const deep = (root) => [root, ...[...root.querySelectorAll('*')].filter((e) => e.shadowRoot).flatMap((e) => deep(e.shadowRoot))]; return deep(document).some((r) => r.textContent?.includes('localhost')); })()`, 15000);
+    pm.close();
+    page.close();
+  } finally {
+    await b.close(); s.closeAllConnections(); s.close();
+    fs.rmSync(profile, { recursive: true, force: true });
+  }
+});
+
+test('Bubbles in a space of another profile: a permission prompt, and a password saved in that profile only', async () => {
+  const { s, url, b } = await open();
+  const T = 'app.$.tabstrip';
+  try {
+    const { profileId } = await b.eval(`${T}.handler_.addProfile('Work')`);
+    const { spaceId } = await b.eval(`${T}.handler_.createSpace('Client', '', '', '')`);
+    await b.eval(`${T}.handler_.setSpaceProfile(${JSON.stringify(spaceId)}, ${JSON.stringify(profileId)})`);
+    await b.waitFor(`${T}.state_.spaces.find((x) => x.name === 'Client')?.profileId === ${JSON.stringify(profileId)}`);
+    await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(spaceId)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(spaceId)}`);
+    const workUrl = url + '?work';
+    await b.eval(`${T}.openUrl(${JSON.stringify(workUrl)})`);
+    const page = await b.page(workUrl);
+    await page.waitFor(`!!document.getElementById('u')`);
+    const bubbles = (action = '') => b.eval(`${T}.handler_.testBubbles(${JSON.stringify(action)}).then((r) => r.bubbles)`);
+    const waitBubble = async (name, ms = 5000) => {
+      for (const end = Date.now() + ms; Date.now() < end; await sleep(100)) if ((await bubbles()).includes(name)) return;
+      assert.fail(`no ${name}: ${JSON.stringify(await bubbles())}`);
+    };
+
+    // Notifications, allowed, in the Work tab.
+    await page.cdp.send('Runtime.evaluate', { expression: `Notification.requestPermission().then((r) => { window.notif = r; })`, userGesture: true });
+    await waitBubble(PROMPT);
+    await bubbles('accept');
+    await page.waitFor(`window.notif === 'granted'`);
+
+    // A password typed and submitted there: offered, saved.
+    const type = async (id, text) => {
+      await page.eval(`(document.getElementById('${id}').focus(), true)`);
+      await page.cdp.send('Input.insertText', { text });
+    };
+    await type('u', 'work-user');
+    await type('p', 'staple-battery-9');
+    await page.cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' });
+    await page.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await waitBubble('PasswordSaveUpdateView', 15000);
+    await bubbles('accept');
+    for (let i = 0; i < 30 && (await bubbles()).length; i++) await sleep(100);
+    page.close();
+
+    // The password manager of each profile, opened from its own space.
+    const passwordsHere = async () => {
+      await b.eval(`${T}.openUrl('chrome://password-manager/passwords')`);
+      const pm = await b.page('chrome://password-manager');
+      const has = async () => pm.eval(`(() => { const deep = (root) => [root, ...[...root.querySelectorAll('*')].filter((e) => e.shadowRoot).flatMap((e) => deep(e.shadowRoot))]; return deep(document).some((r) => r.textContent?.includes('localhost')); })()`);
+      let found = false;
+      for (const end = Date.now() + 8000; Date.now() < end && !found; await sleep(300)) found = await has();
+      pm.close();
+      await b.eval(`(() => { const t = [...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.url.startsWith('chrome://password-manager')); app.$.tabstrip.tabStripService_.closeNodes([t.tab.id]); return true; })()`);
+      await sleep(500);
+      return found;
+    };
+    assert.equal(await passwordsHere(), true, "in Work's password manager");
+    await b.eval(`${T}.handler_.activateSpace(${T}.state_.spaces[0].id)`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${T}.state_.spaces[0].id`);
+    assert.equal(await passwordsHere(), false, "not in the main profile's");
+  } finally {
+    await b.close(); s.closeAllConnections(); s.close();
+  }
+});
+
+// A form with an address, typed and submitted like a person: Chromium offers "Save address?". The
+// window had no autofill bubble handler, and the offer crashed the whole browser (a report from a
+// user, 18.11.2026: an enrolment form on developer.apple.com). Save stores the address.
+test('Bubbles: a submitted address is offered for saving (the browser lives), and Save stores it', async () => {
+  const s = http.createServer((req, res) => {
+    if (req.method === 'POST') req.resume();
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(req.url === '/done' ? '<title>Thanks</title><h1>Saved</h1>' :
+      '<title>Address</title><form action="/done" method="post">' +
+      [['given', 'given-name'], ['family', 'family-name'], ['tel', 'tel'], ['street', 'address-line1'], ['apt', 'address-line2'],
+        ['city', 'address-level2'], ['state', 'address-level1'], ['zip', 'postal-code']].map(([id, ac]) => `<input id="${id}" name="${id}" autocomplete="${ac}">`).join('') +
+      '<select id="country" name="country" autocomplete="country"><option value="">-</option><option value="US">United States</option><option value="GE">Georgia</option></select>' +
+      '<button id="go">Continue</button></form>');
+  });
+  await new Promise((r) => s.listen(0, '127.0.0.1', r));
+  const url = `http://localhost:${s.address().port}/`;
+  const b = await launch([url], { args: ['--meridian-test-bubbles'] });
+  try {
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'Address')`);
+    const page = await b.page(url);
+    const bubbles = (action = '') => b.eval(`app.$.tabstrip.handler_.testBubbles(${JSON.stringify(action)}).then((r) => r.bubbles)`);
+    for (const [id, text] of [['given', 'Ada'], ['family', 'Lovelace'], ['tel', '+1 650 253 0000'], ['street', '1600 Amphitheatre Pkwy'],
+      ['apt', 'Suite 12'], ['city', 'Mountain View'], ['state', 'CA'], ['zip', '94043']]) {
+      await page.eval(`(document.getElementById('${id}').focus(), true)`);
+      await page.cdp.send('Input.insertText', { text });
+    }
+    await page.eval(`(() => { const c = document.getElementById('country'); c.value = 'US'; c.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+    // A click on the button, as a person submits it.
+    const at = await page.eval(`(() => { const r = document.getElementById('go').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+    for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+      await page.cdp.send('Input.dispatchMouseEvent', { type, x: at.x, y: at.y, button: type === 'mouseMoved' ? 'none' : 'left', clickCount: 1 });
+    }
+    let list = [];
+    for (let i = 0; i < 100 && !list.includes('SaveAddressProfileView'); i++) { await sleep(100); list = await bubbles(); }
+    assert.ok(list.includes('SaveAddressProfileView'), `"Save address?" shows: ${JSON.stringify(list)}`);
+    assert.equal(await b.eval('1 + 1'), 2, 'the browser lives');
+    await bubbles('accept');
+    for (let i = 0; i < 30 && (await bubbles()).length; i++) await sleep(100);
+    page.close();
+    // Saved: Settings › Addresses has it.
+    await b.eval(`app.$.tabstrip.openUrl('chrome://settings/addresses')`);
+    const st = await b.page('chrome://settings');
+    await st.waitFor(`(() => { const deep = (root) => [root, ...[...root.querySelectorAll('*')].filter((e) => e.shadowRoot).flatMap((e) => deep(e.shadowRoot))]; return deep(document).some((r) => r.textContent?.includes('1600 Amphitheatre')); })()`, 15000);
+    st.close();
+  } finally { await b.close(); s.closeAllConnections(); s.close(); }
+});

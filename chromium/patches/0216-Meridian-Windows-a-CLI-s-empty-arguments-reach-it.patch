@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Sat, 21 Nov 2026 01:38:11 +0400
+Subject: [PATCH 217/217] Meridian: Windows: a CLI's empty arguments reach it
+
+base::CommandLine leaves an empty argument out of the command line it builds,
+so Claude Code's `--tools ""` (and `--setting-sources ""`) arrived as
+`--tools --permission-mode`: the tools weren't turned off as asked. RunProcess
+on Windows now quotes every argument itself, as CommandLineToArgvW reads it
+back ("" for an empty one).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../browser/meridian/ai/process_runner_win.cc | 34 +++++++++++++++++--
+ 1 file changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/chrome/browser/meridian/ai/process_runner_win.cc b/chrome/browser/meridian/ai/process_runner_win.cc
+index fc60130b86..157e276d70 100644
+--- a/chrome/browser/meridian/ai/process_runner_win.cc
++++ b/chrome/browser/meridian/ai/process_runner_win.cc
+@@ -51,6 +51,31 @@ bool MakePipe(bool child_reads,
+   return ::SetHandleInformation(ours->get(), HANDLE_FLAG_INHERIT, 0) != 0;
+ }
+ 
++// One argument as CommandLineToArgvW (and so the C runtime) reads it back.
++// base::CommandLine leaves an empty argument out (`--tools ""` arrived as
++// `--tools --permission-mode`), so the line is put together here.
++std::wstring Quoted(const std::wstring& arg) {
++  if (!arg.empty() && arg.find_first_of(L" \t\n\v\"") == std::wstring::npos) {
++    return arg;
++  }
++  std::wstring out(1, L'"');
++  size_t slashes = 0;
++  for (wchar_t c : arg) {
++    if (c == L'\\') {
++      ++slashes;
++      continue;
++    }
++    // Backslashes before a quote are doubled, and the quote escaped.
++    out.append(c == L'"' ? slashes * 2 + 1 : slashes, L'\\');
++    slashes = 0;
++    out.push_back(c);
++  }
++  // Before the closing quote, too.
++  out.append(slashes * 2, L'\\');
++  out.push_back(L'"');
++  return out;
++}
++
+ }  // namespace
+ 
+ ProcessResult RunProcess(
+@@ -75,9 +100,12 @@ ProcessResult RunProcess(
+                                     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)) {
+     return result;
+   }
+-  base::CommandLine command(base::FilePath::FromUTF8Unsafe(spec.argv[0]));
+-  for (size_t i = 1; i < spec.argv.size(); ++i) {
+-    command.AppendArgNative(base::UTF8ToWide(spec.argv[i]));
++  std::wstring command;
++  for (const std::string& arg : spec.argv) {
++    if (!command.empty()) {
++      command.push_back(L' ');
++    }
++    command += Quoted(base::UTF8ToWide(arg));
+   }
+   base::LaunchOptions options;
+   options.stdin_handle = in_read.get();
+-- 
+2.52.0.windows.1
+

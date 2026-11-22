@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 19 Nov 2026 19:51:03 +0400
+Subject: [PATCH 175/202] Meridian: check for updates every hour and after the
+ Mac wakes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/updater.cc     | 21 +++++++++++++++++++--
+ chrome/browser/meridian/updater.h      |  9 +++++++--
+ chrome/browser/meridian/updater_win.cc | 21 +++++++++++++++++++--
+ 3 files changed, 45 insertions(+), 6 deletions(-)
+
+diff --git a/chrome/browser/meridian/updater.cc b/chrome/browser/meridian/updater.cc
+index 50c0415773..9b6fb8ed57 100644
+--- a/chrome/browser/meridian/updater.cc
++++ b/chrome/browser/meridian/updater.cc
+@@ -10,6 +10,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/power_monitor/power_monitor.h"
+ #include "base/apple/bundle_locations.h"
+ #include "base/files/file.h"
+ #include "base/files/file_util.h"
+@@ -39,7 +40,8 @@ namespace meridian {
+ namespace {
+ 
+ constexpr base::TimeDelta kFirstCheck = base::Seconds(15);
+-constexpr base::TimeDelta kEvery = base::Hours(24);
++// Hourly, so a new version shows within the hour (and after a sleep).
++constexpr base::TimeDelta kEvery = base::Hours(1);
+ constexpr int64_t kMaxZip = int64_t{2} << 30;
+ 
+ constexpr net::NetworkTrafficAnnotationTag kAnnotation =
+@@ -249,7 +251,19 @@ Updater& Updater::Get() {
+ }
+ 
+ Updater::Updater() = default;
+-Updater::~Updater() = default;
++Updater::~Updater() {
++  if (base::PowerMonitor::GetInstance()->IsInitialized()) {
++    base::PowerMonitor::GetInstance()->RemovePowerSuspendObserver(this);
++  }
++}
++
++void Updater::OnResume() {
++  // A moment for the network to come back.
++  if (located_ && timer_.IsRunning()) {
++    first_.Start(FROM_HERE, base::Seconds(30),
++                 base::BindOnce(&Updater::Check, weak_factory_.GetWeakPtr()));
++  }
++}
+ 
+ void Updater::Start() {
+   if (started_) {
+@@ -303,6 +317,9 @@ void Updater::OnLocated(Located located) {
+   }
+   first_.Start(FROM_HERE, TestFeed() ? base::TimeDelta() : kFirstCheck,
+                base::BindOnce(&Updater::Check, weak_factory_.GetWeakPtr()));
++  if (base::PowerMonitor::GetInstance()->IsInitialized()) {
++    base::PowerMonitor::GetInstance()->AddPowerSuspendObserver(this);
++  }
+   timer_.Start(FROM_HERE, kEvery,
+                base::BindRepeating(&Updater::Check,
+                                    weak_factory_.GetWeakPtr()));
+diff --git a/chrome/browser/meridian/updater.h b/chrome/browser/meridian/updater.h
+index ed67b836bb..46fc777c6f 100644
+--- a/chrome/browser/meridian/updater.h
++++ b/chrome/browser/meridian/updater.h
+@@ -13,6 +13,7 @@
+ #include "base/files/file_path.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/observer_list.h"
++#include "base/power_monitor/power_observer.h"
+ #include "base/timer/timer.h"
+ #include "chrome/browser/meridian/sidebar.mojom.h"
+ #include "chrome/browser/meridian/update_check.h"
+@@ -39,7 +40,7 @@ namespace meridian {
+ // with), and --meridian-test-update-target=<Meridian.app in the temp folder>
+ // swaps that one instead of the running app, without the code-signature
+ // check and without opening it.
+-class Updater {
++class Updater : public base::PowerSuspendObserver {
+  public:
+   class Observer : public base::CheckedObserver {
+    public:
+@@ -66,7 +67,11 @@ class Updater {
+  private:
+   friend class base::NoDestructor<Updater>;
+   Updater();
+-  ~Updater();
++  ~Updater() override;
++
++  // base::PowerSuspendObserver: a Mac that slept checks again when it wakes
++  // (the hourly timer stands still while it sleeps).
++  void OnResume() override;
+ 
+   // Found off the UI thread when the updater starts.
+   struct Located {
+diff --git a/chrome/browser/meridian/updater_win.cc b/chrome/browser/meridian/updater_win.cc
+index 19752587f8..683a82365f 100644
+--- a/chrome/browser/meridian/updater_win.cc
++++ b/chrome/browser/meridian/updater_win.cc
+@@ -9,6 +9,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/power_monitor/power_monitor.h"
+ #include "base/base_paths.h"
+ #include "base/command_line.h"
+ #include "base/containers/span.h"
+@@ -51,7 +52,8 @@ namespace meridian {
+ namespace {
+ 
+ constexpr base::TimeDelta kFirstCheck = base::Seconds(15);
+-constexpr base::TimeDelta kEvery = base::Hours(24);
++// Hourly, so a new version shows within the hour (and after a sleep).
++constexpr base::TimeDelta kEvery = base::Hours(1);
+ constexpr int64_t kMaxInstaller = int64_t{2} << 30;
+ 
+ constexpr net::NetworkTrafficAnnotationTag kAnnotation =
+@@ -185,7 +187,19 @@ Updater& Updater::Get() {
+ }
+ 
+ Updater::Updater() = default;
+-Updater::~Updater() = default;
++Updater::~Updater() {
++  if (base::PowerMonitor::GetInstance()->IsInitialized()) {
++    base::PowerMonitor::GetInstance()->RemovePowerSuspendObserver(this);
++  }
++}
++
++void Updater::OnResume() {
++  // A moment for the network to come back.
++  if (located_ && timer_.IsRunning()) {
++    first_.Start(FROM_HERE, base::Seconds(30),
++                 base::BindOnce(&Updater::Check, weak_factory_.GetWeakPtr()));
++  }
++}
+ 
+ void Updater::Start() {
+   if (started_) {
+@@ -233,6 +247,9 @@ void Updater::OnLocated(Located located) {
+   }
+   first_.Start(FROM_HERE, TestFeed() ? base::TimeDelta() : kFirstCheck,
+                base::BindOnce(&Updater::Check, weak_factory_.GetWeakPtr()));
++  if (base::PowerMonitor::GetInstance()->IsInitialized()) {
++    base::PowerMonitor::GetInstance()->AddPowerSuspendObserver(this);
++  }
+   timer_.Start(FROM_HERE, kEvery,
+                base::BindRepeating(&Updater::Check,
+                                    weak_factory_.GetWeakPtr()));

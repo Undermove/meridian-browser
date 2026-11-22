@@ -1,0 +1,364 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 19 Nov 2026 23:16:36 +0400
+Subject: [PATCH 192/202] Meridian: git in the Workbench (Source Control)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Workbench page can run git, and gh for pull requests, in the open
+project: only the commands the Source Control panel uses (status, diff,
+show, add, restore, commit, branch, switch, log, fetch, pull, push…), with
+paths inside the project, no option that runs another program or reaches
+outside it (-c, -C, --exec, --upload-pack, --output, --ext-diff…), remotes
+by name only (no ext:: or file:// addresses), no shell, no prompts, a
+timeout and an output cap; fixed safe settings for every run (no fsmonitor,
+pager or external diff; ext:: transport off).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   2 +
+ .../browser/meridian/workbench/git_command.cc | 186 ++++++++++++++++++
+ .../browser/meridian/workbench/git_command.h  |  36 ++++
+ .../meridian/workbench/workbench_handler.cc   |  64 +++++-
+ 4 files changed, 287 insertions(+), 1 deletion(-)
+ create mode 100644 chrome/browser/meridian/workbench/git_command.cc
+ create mode 100644 chrome/browser/meridian/workbench/git_command.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 5435183873..71e164e78d 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -136,6 +136,8 @@ source_set("workbench_core") {
+     "workbench/customizations.cc",
+     "workbench/customizations.h",
+     "workbench/customizations_texts.h",
++    "workbench/git_command.cc",
++    "workbench/git_command.h",
+     "workbench/hubs.cc",
+     "workbench/hubs.h",
+     "workbench/hubs_texts.h",
+diff --git a/chrome/browser/meridian/workbench/git_command.cc b/chrome/browser/meridian/workbench/git_command.cc
+new file mode 100644
+index 0000000000..1436d6e31b
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/git_command.cc
+@@ -0,0 +1,186 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/workbench/git_command.h"
++
++#include <algorithm>
++#include <array>
++#include <string_view>
++
++#include "base/functional/bind.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "chrome/browser/meridian/ai/process_runner.h"
++
++namespace meridian::workbench {
++
++namespace {
++
++constexpr auto kGitCommands = std::to_array<std::string_view>({
++    "status", "diff", "show", "add", "restore", "commit", "branch", "switch",
++    "log", "rev-parse", "fetch", "pull", "push", "remote", "stash",
++    "ls-files", "rev-list", "for-each-ref", "init",
++});
++
++// Options that run another program, read or write outside the project, or
++// change git's configuration for the run.
++bool Dangerous(std::string_view a) {
++  for (std::string_view bad :
++       {"--exec", "--upload-pack", "--receive-pack", "--git-dir",
++        "--work-tree", "--namespace", "--config", "--output", "--ext-diff",
++        "--textconv", "--template", "--separate-git-dir", "--super-prefix",
++        "--exec-path", "--receive", "--upload"}) {
++    if (a.starts_with(bad)) {
++      return true;
++    }
++  }
++  // Short options git reads a program or a directory from.
++  return a == "-c" || a == "-C" || a == "-o" || a.starts_with("-u") ||
++         a.contains("::");
++}
++
++// A path the panel names: inside the project.
++bool InsideProject(std::string_view p) {
++  if (p.empty()) {
++    return true;
++  }
++  if (p.starts_with("/") || p.starts_with("\\") || p.starts_with("~") ||
++      (p.size() > 1 && p[1] == ':') || p.contains('\0')) {
++    return false;
++  }
++  for (std::string_view part :
++       base::SplitStringPiece(p, "/\\", base::KEEP_WHITESPACE,
++                              base::SPLIT_WANT_ALL)) {
++    if (part == "..") {
++      return false;
++    }
++  }
++  return true;
++}
++
++}  // namespace
++
++std::string CheckGitArgs(const std::vector<std::string>& args) {
++  if (args.empty() || args.size() > 200) {
++    return "git: no command";
++  }
++  if (std::ranges::find(kGitCommands, args[0]) == kGitCommands.end()) {
++    return "git " + args[0] + " isn't available in the Workbench";
++  }
++  bool paths = false;
++  for (size_t i = 1; i < args.size(); ++i) {
++    const std::string& a = args[i];
++    if (a.size() > 4096) {
++      return "git: argument too long";
++    }
++    if (a == "--") {
++      paths = true;
++      continue;
++    }
++    if (paths) {
++      if (!InsideProject(a)) {
++        return "git: a path outside the project";
++      }
++      continue;
++    }
++    if (a.starts_with("-") && Dangerous(a)) {
++      return "git: the option " + a + " isn't available in the Workbench";
++    }
++    // "HEAD:path" and ":path" (a file at a commit or in the index).
++    if (size_t colon = a.find(':'); colon != std::string::npos &&
++                                    !a.starts_with("-") &&
++                                    !InsideProject(a.substr(colon + 1))) {
++      return "git: a path outside the project";
++    }
++    // Remotes are named, not given as an address (no ext::, file:// or a
++    // path): a remote's name, a branch, a refspec.
++    if ((args[0] == "push" || args[0] == "pull" || args[0] == "fetch") &&
++        !a.starts_with("-")) {
++      const bool name_like =
++          !a.contains("::") && !a.contains("//") && !a.starts_with("/") &&
++          !a.starts_with(".") && !a.contains('@') &&
++          std::ranges::all_of(a, [](char c) {
++            return base::IsAsciiAlphaNumeric(c) || c == '-' || c == '_' ||
++                   c == '.' || c == '/' || c == ':' || c == '+';
++          });
++      if (!name_like) {
++        return "git: name the remote, not its address";
++      }
++    }
++  }
++  if (args[0] == "remote" && args.size() > 1 && args[1] != "-v" &&
++      args[1] != "get-url") {
++    return "git remote: only listing";
++  }
++  return std::string();
++}
++
++std::string CheckGhArgs(const std::vector<std::string>& args) {
++  if (args.size() < 2) {
++    return "gh: no command";
++  }
++  const std::string cmd = args[0] + " " + args[1];
++  if (cmd != "pr list" && cmd != "pr view" && cmd != "pr create" &&
++      cmd != "pr status" && cmd != "pr checkout" && cmd != "auth status" &&
++      cmd != "pr diff") {
++    return "gh " + cmd + " isn't available in the Workbench";
++  }
++  for (const std::string& a : args) {
++    if (a.starts_with("--repo") || a == "-R" || a.contains('\0') ||
++        a.size() > 8192) {
++      return "gh: the option " + a + " isn't available in the Workbench";
++    }
++  }
++  return std::string();
++}
++
++base::DictValue RunGitCommand(const std::string& program,
++                              bool is_git,
++                              const base::FilePath& root,
++                              const std::vector<std::string>& args,
++                              const std::optional<std::string>& stdin_text,
++                              std::map<std::string, std::string> env) {
++  ai::ProcessSpec spec;
++  spec.argv = {program};
++  if (is_git) {
++    // Nothing configured runs another program on the side, no pager, no
++    // prompt for a password (the terminal is there for that).
++    for (const char* c :
++         {"core.fsmonitor=false", "core.pager=cat", "diff.external=",
++          "protocol.ext.allow=never", "core.sshCommand=ssh -oBatchMode=yes",
++          "credential.interactive=never", "color.ui=false"}) {
++      spec.argv.push_back("-c");
++      spec.argv.push_back(c);
++    }
++    spec.argv.push_back("--no-pager");
++  }
++  spec.argv.insert(spec.argv.end(), args.begin(), args.end());
++  env["GIT_TERMINAL_PROMPT"] = "0";
++  env["GIT_OPTIONAL_LOCKS"] = "0";
++  env["GH_PROMPT_DISABLED"] = "1";
++  env["NO_COLOR"] = "1";
++  env["LC_ALL"] = "C";
++  spec.env = std::move(env);
++  spec.cwd = root.AsUTF8Unsafe();
++  spec.stdin_text = stdin_text;
++  const bool network = args[0] == "fetch" || args[0] == "pull" ||
++                       args[0] == "push" || !is_git;
++  spec.timeout = network ? base::Seconds(120) : base::Seconds(20);
++  spec.max_output = 8u << 20;
++  std::string out;
++  ai::ProcessResult r = ai::RunProcess(
++      spec, base::MakeRefCounted<ai::CancelFlag>(),
++      base::BindRepeating([](std::string* out,
++                             std::string_view chunk) { out->append(chunk); },
++                          base::Unretained(&out)));
++  return base::DictValue()
++      .Set("started", r.started)
++      .Set("code", r.exit_code)
++      .Set("stdout", std::move(out))
++      .Set("stderr", r.stderr_text)
++      .Set("timedOut", r.timed_out)
++      .Set("truncated", r.too_long);
++}
++
++}  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/git_command.h b/chrome/browser/meridian/workbench/git_command.h
+new file mode 100644
+index 0000000000..a6beb41ef9
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/git_command.h
+@@ -0,0 +1,36 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_WORKBENCH_GIT_COMMAND_H_
++#define CHROME_BROWSER_MERIDIAN_WORKBENCH_GIT_COMMAND_H_
++
++#include <map>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/values.h"
++
++namespace meridian::workbench {
++
++// The Workbench's Source Control panel runs git (and gh, for pull requests)
++// in the open project: only the commands it uses, with paths inside the
++// project, no options that would run another program or reach outside it,
++// no shell. Empty when `args` may run, else why not.
++std::string CheckGitArgs(const std::vector<std::string>& args);
++std::string CheckGhArgs(const std::vector<std::string>& args);
++
++// Runs `program` (git or gh, an absolute path) with `args` in `root`:
++// {code, stdout, stderr, timedOut, truncated}. Blocking.
++base::DictValue RunGitCommand(const std::string& program,
++                              bool is_git,
++                              const base::FilePath& root,
++                              const std::vector<std::string>& args,
++                              const std::optional<std::string>& stdin_text,
++                              std::map<std::string, std::string> env);
++
++}  // namespace meridian::workbench
++
++#endif  // CHROME_BROWSER_MERIDIAN_WORKBENCH_GIT_COMMAND_H_
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 5428d1a17e..8321ccf56e 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -33,6 +33,7 @@
+ #include "chrome/browser/meridian/workbench/context_insights.h"
+ #include "chrome/browser/meridian/workbench/customizations.h"
+ #include "net/base/url_util.h"
++#include "chrome/browser/meridian/workbench/git_command.h"
+ #include "chrome/browser/meridian/workbench/hubs.h"
+ #include "chrome/browser/meridian/workbench/native_dialog.h"
+ #include "chrome/browser/meridian/workbench/sandbox.h"
+@@ -801,7 +802,9 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+   if (method.starts_with("custom")) {
+     return CustomCall(method, params, std::move(reply));
+   }
+-  if (method.starts_with("hub")) {
++  // (Source Control's git and gh live beside the hub's git.)
++  if (method.starts_with("hub") || method == "git" || method == "gh" ||
++      method == "gitInfo") {
+     return HubCall(method, params, std::move(reply));
+   }
+   if (method == "sandboxStatus" || method == "sandboxNetwork") {
+@@ -1088,6 +1091,65 @@ void WorkbenchHandler::HubCall(const std::string& method,
+                         web_ui()->GetWebContents()->GetTopLevelNativeWindow());
+     return;
+   }
++  // Source Control: git (and gh for pull requests) in the project, only the
++  // commands and options the panel uses (git_command.h).
++  if (method == "git" || method == "gh" || method == "gitInfo") {
++    if (!project_) {
++      return std::move(reply).Run(base::unexpected("no project is open"));
++    }
++    std::vector<std::string> args;
++    if (params.size() && params[0].is_list()) {
++      for (const base::Value& a : params[0].GetList()) {
++        if (a.is_string()) {
++          args.push_back(a.GetString());
++        }
++      }
++    }
++    std::optional<std::string> stdin_text;
++    if (params.size() > 1 && params[1].is_dict()) {
++      if (const std::string* in = params[1].GetDict().FindString("stdin")) {
++        stdin_text = in->substr(0, 1 << 20);
++      }
++    }
++    const bool is_git = method != "gh";
++    if (method != "gitInfo") {
++      std::string why = is_git ? CheckGitArgs(args) : CheckGhArgs(args);
++      if (!why.empty()) {
++        return std::move(reply).Run(base::unexpected(why));
++      }
++    }
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE,
++        {base::MayBlock(), base::WithBaseSyncPrimitives(),
++         base::TaskPriority::USER_VISIBLE},
++        base::BindOnce(
++            [](std::string method, base::FilePath root,
++               std::vector<std::string> args,
++               std::optional<std::string> stdin_text) -> Result {
++              std::map<std::string, std::string> env = TerminalEnv();
++              std::string git = GitPath(env["PATH"]);
++              std::string gh = FindExecutable("gh", env["PATH"]);
++              if (method == "gitInfo") {
++                return base::Value(base::DictValue()
++                                       .Set("git", !git.empty())
++                                       .Set("gh", !gh.empty()));
++              }
++              const std::string& program = method == "gh" ? gh : git;
++              if (program.empty()) {
++                return base::unexpected(
++                    method == "gh"
++                        ? std::string("The GitHub CLI (gh) isn't installed.")
++                        : std::string("git isn't installed."));
++              }
++              return base::Value(RunGitCommand(program, method != "gh", root,
++                                               args, stdin_text,
++                                               std::move(env)));
++            },
++            method, project_->root(), std::move(args), std::move(stdin_text)),
++        base::BindOnce([](Reply reply, Result r) { std::move(reply).Run(std::move(r)); },
++                       std::move(reply)));
++    return;
++  }
+   if (method == "hubInfo") {
+     return OnProject(base::BindOnce([](const ProjectFs& p) -> Result {
+                        return base::Value(HubInfo(p.root()));

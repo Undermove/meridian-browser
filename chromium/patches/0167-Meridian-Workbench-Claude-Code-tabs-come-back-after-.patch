@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 19 Nov 2026 00:22:28 +0400
+Subject: [PATCH 168/202] Meridian: Workbench Claude Code tabs come back after
+ a restart
+
+The status line's session id reaches the Workbench; each project's open
+Claude sessions (id and a name given by hand) are kept in the profile's
+prefs, written at once; ptyCreate takes resumeId for claude --resume <id>.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/mission/mission_control.cc       | 18 ++++++
+ .../meridian/mission/mission_control.h        |  5 ++
+ chrome/browser/meridian/prefs.cc              |  1 +
+ chrome/browser/meridian/prefs.h               |  4 ++
+ .../meridian/workbench/workbench_handler.cc   | 60 ++++++++++++++++++-
+ 5 files changed, 85 insertions(+), 3 deletions(-)
+
+diff --git a/chrome/browser/meridian/mission/mission_control.cc b/chrome/browser/meridian/mission/mission_control.cc
+index d1554f8c9d..499a80fdd1 100644
+--- a/chrome/browser/meridian/mission/mission_control.cc
++++ b/chrome/browser/meridian/mission/mission_control.cc
+@@ -15,6 +15,7 @@
+ #include "base/json/json_writer.h"
+ #include "base/rand_util.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/thread_pool.h"
+ #include "chrome/browser/meridian/mission/event_channel.h"
+@@ -134,6 +135,18 @@ base::Value OptString(const std::string& s) {
+ 
+ }  // namespace
+ 
++bool IsSessionId(std::string_view id) {
++  if (id.empty() || id.size() > 80) {
++    return false;
++  }
++  for (char c : id) {
++    if (!base::IsAsciiAlphaNumeric(c) && c != '-' && c != '_') {
++      return false;
++    }
++  }
++  return true;
++}
++
+ MissionControl::Node::Node() = default;
+ MissionControl::Node::Node(const Node&) = default;
+ MissionControl::Node& MissionControl::Node::operator=(const Node&) = default;
+@@ -478,6 +491,11 @@ void MissionControl::OnHookEvent(const std::string& node_id,
+     if (!name.empty()) {
+       usage.Set("session_name", name);
+     }
++    // The session's id, so the Workbench can resume it after a restart.
++    if (const std::string* sid = raw.FindString("session_id");
++        sid && IsSessionId(*sid)) {
++      usage.Set("session_id", *sid);
++    }
+     if (!model.empty()) {
+       usage.Set("model", model);
+     }
+diff --git a/chrome/browser/meridian/mission/mission_control.h b/chrome/browser/meridian/mission/mission_control.h
+index 57f104467d..f76451870b 100644
+--- a/chrome/browser/meridian/mission/mission_control.h
++++ b/chrome/browser/meridian/mission/mission_control.h
+@@ -9,6 +9,7 @@
+ #include <memory>
+ #include <optional>
+ #include <string>
++#include <string_view>
+ #include <vector>
+ 
+ #include "base/files/important_file_writer.h"
+@@ -29,6 +30,10 @@ struct SandboxMount;
+ 
+ namespace meridian::mission {
+ 
++// A Claude Code session id as `claude --resume` takes it: letters, digits,
++// '-' and '_', at most 80 (a UUID in practice).
++bool IsSessionId(std::string_view id);
++
+ class EventChannel;
+ struct NamedSecret;
+ 
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index d35cb32936..ada6503927 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -20,6 +20,7 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterIntegerPref(kArchiveAfterHours, 12);
+   registry->RegisterTimePref(kArcDataImportedAt, base::Time());
+   registry->RegisterStringPref(kAgentAccess, "off");
++  registry->RegisterDictionaryPref(kWorkbenchClaudeSessions);
+   registry->RegisterBooleanPref(kAgentAllowJs, false);
+   registry->RegisterStringPref(kAgentUploads, "ask");
+   registry->RegisterListPref(kAgentUploadSites);
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index 2bbcbab8c5..ecee7335b7 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -30,6 +30,10 @@ inline constexpr char kArcDataImportedAt[] = "meridian.arc_data_imported_at";
+ // What AI agents (MCP clients) may do: "off", "read", "ask" (the person
+ // confirms every action) or "full".
+ inline constexpr char kAgentAccess[] = "meridian.agent_access";
++// The Workbench's open Claude Code sessions, by project folder: a list of
++// {id, name}, reopened with `claude --resume` after the browser restarts.
++inline constexpr char kWorkbenchClaudeSessions[] =
++    "meridian.workbench.claude_sessions";
+ // Agents may run JavaScript in pages (on top of ask/full).
+ inline constexpr char kAgentAllowJs[] = "meridian.agent_allow_js";
+ // Files agents upload from the computer: "ask" (each one, unless its site is
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index fefec0ba91..6034c5fbe5 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -52,6 +52,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "components/split_tabs/split_tab_visual_data.h"
+ #include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_ui.h"
+@@ -657,6 +658,47 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+             weak_factory_.GetWeakPtr(), path, std::move(reply)));
+     return;
+   }
++  // The project's Claude Code sessions to reopen after a restart. Written
++  // to disk right away: the browser may quit (an update) a moment later.
++  if (method == "claudeSessions" || method == "saveClaudeSessions") {
++    if (!project_) {
++      return std::move(reply).Run(base::Value(base::ListValue()));
++    }
++    std::string root = project_->root().AsUTF8Unsafe();
++    PrefService* prefs = profile_->GetPrefs();
++    if (method == "claudeSessions") {
++      const base::ListValue* list =
++          prefs->GetDict(prefs::kWorkbenchClaudeSessions).FindList(root);
++      return std::move(reply).Run(
++          base::Value(list ? list->Clone() : base::ListValue()));
++    }
++    base::ListValue list;
++    if (params.size() > 0 && params[0].is_list()) {
++      for (const base::Value& v : params[0].GetList()) {
++        const std::string* id = v.is_dict() ? v.GetDict().FindString("id")
++                                            : nullptr;
++        if (!id || !mission::IsSessionId(*id) || list.size() >= 20) {
++          continue;
++        }
++        const std::string* name = v.GetDict().FindString("name");
++        std::string short_name;
++        if (name) {
++          base::TruncateUTF8ToByteSize(*name, 240, &short_name);
++        }
++        list.Append(base::DictValue().Set("id", *id).Set("name", short_name));
++      }
++    }
++    {
++      ScopedDictPrefUpdate update(prefs, prefs::kWorkbenchClaudeSessions);
++      if (list.empty()) {
++        update->Remove(root);
++      } else {
++        update->Set(root, std::move(list));
++      }
++    }
++    prefs->CommitPendingWrite();
++    return std::move(reply).Run(base::Value(true));
++  }
+   if (method == "ptyList") {
+     base::ListValue list;
+     for (const auto& [id, term] : terms_) {
+@@ -1885,6 +1927,13 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+   int rows = opts.FindInt("rows").value_or(24);
+   // Claude Code's own list of this folder's recent sessions, to pick one up.
+   bool resume = kind == "claude" && opts.FindBool("resume").value_or(false);
++  // Or one session by its id: the Workbench reopening its Claude tabs after
++  // the browser restarted.
++  std::string resume_id;
++  if (const std::string* sid = opts.FindString("resumeId");
++      kind == "claude" && sid && mission::IsSessionId(*sid)) {
++    resume_id = *sid;
++  }
+   // Host terminals and agents get the project's vault secrets in their
+   // environment (names are shown, values never).
+   std::map<std::string, std::string> secrets =
+@@ -1943,7 +1992,8 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+   files_->PostTaskAndReplyWithResult(
+       FROM_HERE,
+       base::BindOnce(
+-          [](std::string kind, McpBridge bridge, bool resume)
++          [](std::string kind, McpBridge bridge, bool resume,
++             std::string resume_id)
+               -> std::pair<base::expected<LaunchSpec, std::string>,
+                            std::map<std::string, std::string>> {
+             std::map<std::string, std::string> env = TerminalEnv();
+@@ -1969,13 +2019,17 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+ #endif
+             base::expected<LaunchSpec, std::string> spec =
+                 MakeLaunchSpec(kind, env["PATH"], shell, bridge);
+-            if (spec.has_value() && resume && !spec->argv.empty()) {
++            if (spec.has_value() && !resume_id.empty() &&
++                !spec->argv.empty()) {
++              spec->argv.insert(spec->argv.begin() + 1, resume_id);
++              spec->argv.insert(spec->argv.begin() + 1, "--resume");
++            } else if (spec.has_value() && resume && !spec->argv.empty()) {
+               spec->argv.insert(spec->argv.begin() + 1, "--resume");
+               spec->title += " (resumed)";
+             }
+             return {std::move(spec), env};
+           },
+-          kind, std::move(bridge), resume),
++          kind, std::move(bridge), resume, std::move(resume_id)),
+       base::BindOnce(
+           [](base::WeakPtr<WorkbenchHandler> self, std::string kind, int cols,
+              int rows, mission::MissionControl::Registration registration,

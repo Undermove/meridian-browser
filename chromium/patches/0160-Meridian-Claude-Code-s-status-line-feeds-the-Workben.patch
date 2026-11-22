@@ -1,0 +1,1547 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 18 Nov 2026 17:09:59 +0400
+Subject: [PATCH 161/202] Meridian: Claude Code's status line feeds the
+ Workbench (usage limits, context, session name); Context Insights
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   2 +
+ .../meridian/mission/mission_control.cc       |  57 +-
+ .../meridian/mission/mission_control.h        |  16 +
+ .../browser/meridian/mission/mission_hook.cc  | 240 +++++
+ .../browser/meridian/mission/mission_hook.h   |   5 +
+ .../meridian/workbench/context_insights.cc    | 857 ++++++++++++++++++
+ .../meridian/workbench/context_insights.h     | 103 +++
+ .../meridian/workbench/workbench_handler.cc   |  57 ++
+ .../meridian/workbench/workbench_handler.h    |   3 +
+ 9 files changed, 1338 insertions(+), 2 deletions(-)
+ create mode 100644 chrome/browser/meridian/workbench/context_insights.cc
+ create mode 100644 chrome/browser/meridian/workbench/context_insights.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 32813c79f2..7e241cbc07 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -142,6 +142,8 @@ source_set("workbench_core") {
+     "workbench/secret_files.h",
+     "workbench/terminal.cc",
+     "workbench/terminal.h",
++    "workbench/context_insights.cc",
++    "workbench/context_insights.h",
+   ]
+   public_deps = [
+     ":test_switches", "//base" ]
+diff --git a/chrome/browser/meridian/mission/mission_control.cc b/chrome/browser/meridian/mission/mission_control.cc
+index 06a6cd82d9..d1554f8c9d 100644
+--- a/chrome/browser/meridian/mission/mission_control.cc
++++ b/chrome/browser/meridian/mission/mission_control.cc
+@@ -240,7 +240,9 @@ std::optional<workbench::SandboxMount> MissionControl::MakeSandboxMount(
+   mount.env["MERIDIAN_MISSION_FILE"] = "/meridian/events.jsonl";
+   mount.token = token;
+   if (kind == "sandbox-claude") {
+-    // Inside the container the hook is the script, run by node.
++    // Inside the container the hook is the script, run by node; the status
++    // line is Meridian's program, which isn't there.
++    settings.Remove("statusLine");
+     for (auto [event, list] : *settings.FindDict("hooks")) {
+       for (base::Value& entry : list.GetList()) {
+         for (base::Value& hook : *entry.GetDict().FindList("hooks")) {
+@@ -339,7 +341,15 @@ base::DictValue MissionControl::ClaudeHookSettings() const {
+     entry.Set("hooks", base::ListValue().Append(hook.Clone()));
+     hooks.Set(ev, base::ListValue().Append(std::move(entry)));
+   }
+-  return base::DictValue().Set("hooks", std::move(hooks));
++  // The status line too: what Claude Code gives it (context, usage limits,
++  // prompt cache, the session's name) is what the Workbench shows. The
++  // person's own status line still shows (`--status-line` runs it).
++  return base::DictValue()
++      .Set("hooks", std::move(hooks))
++      .Set("statusLine",
++           base::DictValue()
++               .Set("type", "command")
++               .Set("command", "\"" + exe + "\" --mission-hook --status-line"));
+ }
+ 
+ std::string MissionControl::CodexNotifyArg() const {
+@@ -350,6 +360,15 @@ std::string MissionControl::CodexNotifyArg() const {
+   return "notify=[" + json(exe) + ", \"--mission-hook\", \"--codex\"]";
+ }
+ 
++std::string MissionControl::TranscriptOf(const std::string& term_id) const {
++  for (const auto& [id, n] : nodes_) {
++    if (n.term_id == term_id && n.kind == "session" && !n.transcript.empty()) {
++      return n.transcript;
++    }
++  }
++  return std::string();
++}
++
+ void MissionControl::AttachTerminal(const std::string& node_id,
+                                     const std::string& term_id) {
+   Node* node = Get(node_id);
+@@ -445,6 +464,33 @@ void MissionControl::OnHookEvent(const std::string& node_id,
+     }
+     return;
+   }
++  if (event == "Status") {
++    // Numbers only, plus the session's name (cleaned like any label).
++    base::DictValue usage;
++    for (const auto [key, value] : raw) {
++      if (value.is_int() || value.is_double()) {
++        usage.Set(key, value.GetDouble());
++      } else if (key == "cache" && value.is_dict()) {
++        usage.Set(key, value.Clone());
++      }
++    }
++    std::string name = s("session_name", 80);
++    if (!name.empty()) {
++      usage.Set("session_name", name);
++    }
++    if (!model.empty()) {
++      usage.Set("model", model);
++    }
++    if (const std::string* path = raw.FindString("transcript_path")) {
++      root->transcript = path->substr(0, 1024);
++    }
++    usage.Set("compactions", root->compactions);
++    if (usage != root->usage.dict) {
++      root->usage.dict = std::move(usage);
++      Changed();
++    }
++    return;
++  }
+   root->last_event_at = Now();
+   if (root->project.empty()) {
+     root->project = cwd_name;
+@@ -580,6 +626,10 @@ void MissionControl::OnHookEvent(const std::string& node_id,
+       }
+     }
+   } else if (event == "PreCompact") {
++    if (target == root) {
++      root->compactions++;
++      root->usage.dict.Set("compactions", root->compactions);
++    }
+     target->tool = std::make_pair(std::string("Compacting"),
+                                   std::string("context"));
+     SetStatus(*target, "tool");
+@@ -1020,6 +1070,9 @@ base::DictValue MissionControl::Snapshot() const {
+             .Set("tabId", OptString(n.tab_id))
+             .Set("turns", n.turns)
+             .Set("selfReported", n.self_reported)
++            .Set("usage", n.usage.dict.empty()
++                              ? base::Value()
++                              : base::Value(n.usage.dict.Clone()))
+             .Set("log", std::move(log)));
+   }
+   return base::DictValue()
+diff --git a/chrome/browser/meridian/mission/mission_control.h b/chrome/browser/meridian/mission/mission_control.h
+index 0e4f1703a7..57f104467d 100644
+--- a/chrome/browser/meridian/mission/mission_control.h
++++ b/chrome/browser/meridian/mission/mission_control.h
+@@ -73,6 +73,9 @@ class MissionControl : public KeyedService,
+   // ---- Workbench terminals (kind: claude, codex, gemini…) ----
+   // Runs `ready` once the event channel listens (or couldn't start).
+   void WhenChannelReady(base::OnceClosure ready);
++  // The transcript of the Claude Code session in Workbench terminal
++  // `term_id`, from its status line ("" until known).
++  std::string TranscriptOf(const std::string& term_id) const;
+   // `owner_tab`: the Workbench tab's handle id (to open its terminal).
+   Registration RegisterTerminal(const std::string& kind,
+                                 const std::string& project,
+@@ -188,6 +191,19 @@ class MissionControl : public KeyedService,
+     bool pending = false;
+     bool running = false;
+     bool self_reported = false;
++    // Claude Code's status line numbers (context, usage limits, prompt
++    // cache, cost) and its transcript (for Context Insights).
++    struct Usage {
++      Usage() = default;
++      Usage(const Usage& o) : dict(o.dict.Clone()) {}
++      Usage& operator=(const Usage& o) {
++        dict = o.dict.Clone();
++        return *this;
++      }
++      base::DictValue dict;
++    } usage;
++    std::string transcript;
++    int compactions = 0;
+   };
+ 
+   Node* AddNode(Node node);
+diff --git a/chrome/browser/meridian/mission/mission_hook.cc b/chrome/browser/meridian/mission/mission_hook.cc
+index 6f9cd5e178..32c58ed83f 100644
+--- a/chrome/browser/meridian/mission/mission_hook.cc
++++ b/chrome/browser/meridian/mission/mission_hook.cc
+@@ -9,16 +9,27 @@
+ #include <cstring>
+ #include <iostream>
+ #include <iterator>
++#include <optional>
++#include <string>
++#include <vector>
+ 
+ #include "base/containers/span.h"
+ #include "base/files/file_path.h"
++#include "base/files/file_util.h"
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "chrome/browser/meridian/local_socket.h"
+ #include "chrome/browser/meridian/real_path.h"
++#include "build/build_config.h"
+ #include "url/gurl.h"
+ 
++#if BUILDFLAG(IS_POSIX)
++#include <sys/wait.h>
++#include <unistd.h>
++#endif
++
+ namespace meridian::mission {
+ 
+ MERIDIAN_USE_POSIX_SOCKETS();
+@@ -193,8 +204,208 @@ void Send(base::DictValue line) {
+   close(fd);
+ }
+ 
++// ---- Status line (`--mission-hook --status-line`) ----
++
++std::optional<double> Num(const base::DictValue& d, std::string_view path) {
++  const base::Value* v = d.FindByDottedPath(path);
++  if (!v || !(v->is_int() || v->is_double())) {
++    return std::nullopt;
++  }
++  return v->GetDouble();
++}
++
++void SetNum(base::DictValue& out,
++            const char* key,
++            const base::DictValue& in,
++            std::string_view path) {
++  if (std::optional<double> v = Num(in, path)) {
++    out.Set(key, *v);
++  }
++}
++
++// A short cause name (prompt cache misses): letters, digits and _ only.
++std::optional<std::string> CauseName(std::string_view s) {
++  if (s.empty() || s.size() > 40) {
++    return std::nullopt;
++  }
++  for (char c : s) {
++    if (!base::IsAsciiAlphaNumeric(c) && c != '_') {
++      return std::nullopt;
++    }
++  }
++  return std::string(s);
++}
++
++// The settings file a status line of the person's own comes from: the
++// project's (local first), then their user settings. The session's
++// --settings (Meridian's) outranks them all, so Meridian runs theirs.
++std::optional<std::string> OwnStatusLine(const std::string& project_dir) {
++  std::vector<base::FilePath> files;
++  if (!project_dir.empty()) {
++    base::FilePath p = base::FilePath::FromUTF8Unsafe(project_dir)
++                           .AppendASCII(".claude");
++    files.push_back(p.AppendASCII("settings.local.json"));
++    files.push_back(p.AppendASCII("settings.json"));
++  }
++  if (const char* dir = getenv("CLAUDE_CONFIG_DIR"); dir && *dir) {
++    files.push_back(base::FilePath::FromUTF8Unsafe(dir).AppendASCII(
++        "settings.json"));
++  } else if (const char* home = getenv("HOME"); home && *home) {
++    files.push_back(base::FilePath::FromUTF8Unsafe(home)
++                        .AppendASCII(".claude")
++                        .AppendASCII("settings.json"));
++  }
++  for (const base::FilePath& file : files) {
++    std::string text;
++    if (!base::ReadFileToStringWithMaxSize(file, &text, 1 << 20)) {
++      continue;
++    }
++    std::optional<base::Value> v =
++        base::JSONReader::Read(text, base::JSON_ALLOW_TRAILING_COMMAS);
++    if (!v || !v->is_dict()) {
++      continue;
++    }
++    const base::DictValue* line = v->GetDict().FindDict("statusLine");
++    const std::string* command = line ? line->FindString("command") : nullptr;
++    if (command && !command->empty() &&
++        command->find("--mission-hook") == std::string::npos) {
++      return *command;
++    }
++  }
++  return std::nullopt;
++}
++
++#if BUILDFLAG(IS_POSIX)
++// Runs `command` in the shell with `input` on stdin; its stdout.
++std::string RunShell(const std::string& command, const std::string& input) {
++  int in[2], out[2];
++  if (pipe(in) != 0) {
++    return std::string();
++  }
++  if (pipe(out) != 0) {
++    close(in[0]);
++    close(in[1]);
++    return std::string();
++  }
++  pid_t pid = fork();
++  if (pid < 0) {
++    close(in[0]); close(in[1]); close(out[0]); close(out[1]);
++    return std::string();
++  }
++  if (pid == 0) {
++    dup2(in[0], 0);
++    dup2(out[1], 1);
++    close(in[0]); close(in[1]); close(out[0]); close(out[1]);
++    execl("/bin/sh", "sh", "-c", command.c_str(), static_cast<char*>(nullptr));
++    _exit(127);
++  }
++  close(in[0]);
++  close(out[1]);
++  std::string_view rest(input);
++  while (!rest.empty()) {
++    ssize_t n = write(in[1], rest.data(), rest.size());
++    if (n <= 0) {
++      break;
++    }
++    rest.remove_prefix(static_cast<size_t>(n));
++  }
++  close(in[1]);
++  std::string result;
++  char buf[4096];
++  for (ssize_t n; (n = read(out[0], buf, sizeof(buf))) > 0;) {
++    // SAFETY: read() filled `n` bytes of `buf`.
++    result.append(UNSAFE_BUFFERS(std::string_view(buf, static_cast<size_t>(n))));
++    if (result.size() > 64 * 1024) {
++      break;
++    }
++  }
++  close(out[0]);
++  int status = 0;
++  waitpid(pid, &status, 0);
++  return result;
++}
++#endif
++
++// Meridian's own line, when the person has none: context and limits.
++std::string DefaultStatusLine(const base::DictValue& line) {
++  std::string out;
++  auto pct = [](double v) {
++    return base::NumberToString(static_cast<int>(v + 0.5)) + "%";
++  };
++  if (std::optional<double> v = line.FindDouble("context_pct")) {
++    out += "context " + pct(*v);
++  }
++  if (std::optional<double> v = line.FindDouble("five_hour_pct")) {
++    out += (out.empty() ? "" : " · ") + std::string("5h limit ") + pct(*v);
++  }
++  if (std::optional<double> v = line.FindDouble("seven_day_pct")) {
++    out += (out.empty() ? "" : " · ") + std::string("week ") + pct(*v);
++  }
++  return out;
++}
++
+ }  // namespace
+ 
++base::DictValue FromStatusLine(const base::DictValue& in) {
++  base::DictValue out;
++  out.Set("kind", "claude");
++  out.Set("event", "Status");
++  SetIf(out, "session_id", Str(in.Find("session_id"), 80));
++  SetIf(out, "session_name", Str(in.Find("session_name"), 80));
++  SetIf(out, "model", Str(in.FindByDottedPath("model.display_name"), 60));
++  SetIf(out, "version", Str(in.Find("version"), 30));
++  // Its own transcript: read by Meridian for Context Insights, on this
++  // computer; never shown.
++  SetIf(out, "transcript_path", Str(in.Find("transcript_path"), 1024));
++  SetNum(out, "context_pct", in, "context_window.used_percentage");
++  SetNum(out, "context_size", in, "context_window.context_window_size");
++  if (std::optional<double> input = Num(in, "context_window.current_usage.input_tokens")) {
++    out.Set("context_tokens",
++            *input +
++                Num(in, "context_window.current_usage.cache_creation_input_tokens").value_or(0) +
++                Num(in, "context_window.current_usage.cache_read_input_tokens").value_or(0));
++  }
++  SetNum(out, "five_hour_pct", in, "rate_limits.five_hour.used_percentage");
++  SetNum(out, "five_hour_reset", in, "rate_limits.five_hour.resets_at");
++  SetNum(out, "seven_day_pct", in, "rate_limits.seven_day.used_percentage");
++  SetNum(out, "seven_day_reset", in, "rate_limits.seven_day.resets_at");
++  SetNum(out, "spend_pct", in, "rate_limits.spend_limit.used_percentage");
++  SetNum(out, "spend_reset", in, "rate_limits.spend_limit.resets_at");
++  SetNum(out, "spend_usd", in, "rate_limits.spend_limit.used_usd");
++  SetNum(out, "spend_limit_usd", in, "rate_limits.spend_limit.limit_usd");
++  SetIf(out, "spend_period", Str(in.FindByDottedPath("rate_limits.spend_limit.period"), 10));
++  SetNum(out, "cost_usd", in, "cost.total_cost_usd");
++  SetNum(out, "duration_ms", in, "cost.total_duration_ms");
++  SetNum(out, "api_ms", in, "cost.total_api_duration_ms");
++  SetNum(out, "lines_added", in, "cost.total_lines_added");
++  SetNum(out, "lines_removed", in, "cost.total_lines_removed");
++  if (const base::DictValue* cache = in.FindDict("prompt_cache")) {
++    base::DictValue c;
++    for (const char* key :
++         {"requests", "misses", "expected_rebuilds", "hit_ratio",
++          "cache_write_tokens", "miss_recache_tokens", "expires_at",
++          "recache_tokens_if_cold", "last_miss_at"}) {
++      SetNum(c, key, *cache, key);
++    }
++    if (std::optional<bool> warm = cache->FindBool("warm")) {
++      c.Set("warm", *warm);
++    }
++    SetIf(c, "ttl", Str(cache->Find("ttl"), 4));
++    if (const base::DictValue* causes = cache->FindDict("miss_causes")) {
++      base::DictValue m;
++      for (const auto [name, count] : *causes) {
++        std::optional<std::string> cause = CauseName(name);
++        if (cause && (count.is_int() || count.is_double()) && m.size() < 20) {
++          m.Set(*cause, count.GetDouble());
++        }
++      }
++      c.Set("miss_causes", std::move(m));
++    }
++    out.Set("cache", std::move(c));
++  }
++  return out;
++}
++
+ bool IsMissionHook(int argc, const char** argv) {
+   for (const char* arg : Args(argc, argv).subspan(1u)) {
+     if (std::string_view(arg) == kSwitch) {
+@@ -279,6 +490,10 @@ int RunMissionHook(int argc, const char** argv) {
+     Send(FromCodexEvent(args.size() > 1 ? args.back() : ""));
+     return 0;
+   }
++  bool status_line = false;
++  for (const char* a : args) {
++    status_line |= std::string_view(a) == "--status-line";
++  }
+   std::string input;
+   for (int c = std::cin.get(); c != EOF; c = std::cin.get()) {
+     input += static_cast<char>(c);
+@@ -287,6 +502,31 @@ int RunMissionHook(int argc, const char** argv) {
+     }
+   }
+   std::optional<base::Value> ev = base::JSONReader::Read(input, 0);
++  if (status_line) {
++    // Claude Code's status line: the numbers to Meridian, then the person's
++    // own status line (or Meridian's) for the terminal.
++    if (!ev || !ev->is_dict()) {
++      return 0;
++    }
++    base::DictValue line = FromStatusLine(ev->GetDict());
++    std::string text;
++#if BUILDFLAG(IS_POSIX)
++    const std::string* project =
++        ev->GetDict().FindStringByDottedPath("workspace.project_dir");
++    if (std::optional<std::string> own =
++            OwnStatusLine(project ? *project : std::string())) {
++      text = RunShell(*own, input);
++    } else {
++      text = DefaultStatusLine(line);
++    }
++#else
++    text = DefaultStatusLine(line);
++#endif
++    Send(std::move(line));
++    std::cout << text;
++    std::cout.flush();
++    return 0;
++  }
+   if (ev && ev->is_dict()) {
+     Send(FromClaudeEvent(ev->GetDict()));
+   }
+diff --git a/chrome/browser/meridian/mission/mission_hook.h b/chrome/browser/meridian/mission/mission_hook.h
+index b28be2f71a..3e9534d4ef 100644
+--- a/chrome/browser/meridian/mission/mission_hook.h
++++ b/chrome/browser/meridian/mission/mission_hook.h
+@@ -25,6 +25,11 @@ int RunMissionHook(int argc, const char** argv);
+ 
+ // The line for one Claude Code hook event (without the token).
+ base::DictValue FromClaudeEvent(const base::DictValue& event);
++// `--mission-hook --status-line`: Claude Code's status line command. Sends
++// the numbers it gets (context, usage limits, prompt cache, cost, the
++// session's name and transcript) as a "Status" line, then prints the
++// person's own status line (run with the same input) or a short one.
++base::DictValue FromStatusLine(const base::DictValue& status);
+ // The line for one Codex notify payload.
+ base::DictValue FromCodexEvent(const std::string& json);
+ 
+diff --git a/chrome/browser/meridian/workbench/context_insights.cc b/chrome/browser/meridian/workbench/context_insights.cc
+new file mode 100644
+index 0000000000..2d42c35feb
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/context_insights.cc
+@@ -0,0 +1,857 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/workbench/context_insights.h"
++
++#include <algorithm>
++#include <cmath>
++#include <utility>
++
++#include "base/containers/span.h"
++#include "base/files/file.h"
++#include "base/strings/string_view_util.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/time/time.h"
++#include "url/gurl.h"
++
++namespace meridian::workbench {
++
++namespace {
++
++// What a token costs against usage limits, relative to plain input: the
++// API's price ratios (cache reads a tenth, 5-minute cache writes 1.25×,
++// 1-hour writes 2×, output 5×).
++constexpr double kRead = 0.1;
++constexpr double kWrite5m = 1.25;
++constexpr double kWrite1h = 2.0;
++constexpr double kOutput = 5.0;
++// An image in a tool result, roughly (a screenshot near the size limit).
++constexpr double kImageTokens = 1600;
++// A pause after which a 5-minute cache has gone cold.
++constexpr double kColdAfter = 300;
++
++double Tokens(double chars) {
++  return std::round(chars / 4);
++}
++
++double Ts(const base::DictValue& entry) {
++  const std::string* ts = entry.FindString("timestamp");
++  base::Time t;
++  if (!ts || !base::Time::FromUTCString(ts->c_str(), &t)) {
++    return 0;
++  }
++  return t.InSecondsFSinceUnixEpoch();
++}
++
++double Num(const base::DictValue* d, const char* key) {
++  if (!d) {
++    return 0;
++  }
++  const base::Value* v = d->Find(key);
++  return v && (v->is_int() || v->is_double()) ? v->GetDouble() : 0;
++}
++
++std::string Short(std::string_view s, size_t n) {
++  std::string out;
++  for (char c : s) {
++    out += static_cast<unsigned char>(c) < 0x20 ? ' ' : c;
++    if (out.size() >= n) {
++      break;
++    }
++  }
++  if (out.size() >= n) {
++    while (!out.empty() && (out.back() & 0xc0) == 0x80) {
++      out.pop_back();
++    }
++    if (!out.empty()) {
++      out.pop_back();
++    }
++    out += "…";
++  }
++  return std::string(base::TrimWhitespaceASCII(out, base::TRIM_ALL));
++}
++
++// What a tool call works on: a file, a command, a host, a pattern.
++std::string TargetOf(const std::string& tool, const base::DictValue& input) {
++  for (const char* key : {"file_path", "notebook_path"}) {
++    if (const std::string* v = input.FindString(key)) {
++      return Short(*v, 160);
++    }
++  }
++  if (const std::string* v = input.FindString("command")) {
++    return "$ " + Short(*v, 80);
++  }
++  if (const std::string* v = input.FindString("url")) {
++    GURL url(*v);
++    return url.is_valid() ? Short(std::string(url.host()) + std::string(url.path()), 80) : Short(*v, 80);
++  }
++  for (const char* key :
++       {"pattern", "query", "description", "skill", "path", "selector"}) {
++    if (const std::string* v = input.FindString(key)) {
++      return Short(*v, 80);
++    }
++  }
++  return std::string();
++}
++
++// The characters (and images) of a tool result's content.
++std::pair<double, int> ContentSize(const base::Value* content) {
++  if (!content) {
++    return {0, 0};
++  }
++  if (content->is_string()) {
++    return {static_cast<double>(content->GetString().size()), 0};
++  }
++  double chars = 0;
++  int images = 0;
++  if (content->is_list()) {
++    for (const base::Value& block : content->GetList()) {
++      if (!block.is_dict()) {
++        continue;
++      }
++      const std::string* type = block.GetDict().FindString("type");
++      if (type && *type == "image") {
++        images++;
++      } else if (const std::string* text = block.GetDict().FindString("text")) {
++        chars += text->size();
++      } else if (const base::Value* inner = block.GetDict().Find("content")) {
++        auto [c, i] = ContentSize(inner);
++        chars += c;
++        images += i;
++      }
++    }
++  }
++  return {chars, images};
++}
++
++double Weighted(double input,
++                double read,
++                double write5m,
++                double write1h,
++                double output) {
++  return input + read * kRead + write5m * kWrite5m + write1h * kWrite1h +
++         output * kOutput;
++}
++
++base::DictValue Insight(const char* level,
++                        std::string title,
++                        std::string detail,
++                        double share) {
++  return base::DictValue()
++      .Set("level", level)
++      .Set("title", std::move(title))
++      .Set("detail", std::move(detail))
++      .Set("share", share);
++}
++
++std::string K(double tokens) {
++  if (tokens >= 1e6) {
++    return base::NumberToString(std::round(tokens / 1e5) / 10) + "M";
++  }
++  if (tokens >= 1000) {
++    return base::NumberToString(std::round(tokens / 100) / 10) + "k";
++  }
++  return base::NumberToString(static_cast<int>(tokens));
++}
++
++std::string Pct(double share) {
++  return base::NumberToString(static_cast<int>(std::round(share * 100))) + "%";
++}
++
++}  // namespace
++
++ContextInsights::ContextInsights() = default;
++ContextInsights::~ContextInsights() = default;
++
++void ContextInsights::ReadMore(const base::FilePath& path) {
++  base::File file(path, base::File::FLAG_OPEN | base::File::FLAG_READ);
++  if (!file.IsValid()) {
++    return;
++  }
++  int64_t length = file.GetLength();
++  if (length < offset_) {
++    // Rewritten: start over.
++    *this = ContextInsights();
++  }
++  file.Seek(base::File::FROM_BEGIN, offset_);
++  std::vector<char> buf(1 << 20);
++  while (offset_ < length) {
++    std::optional<size_t> n = file.ReadAtCurrentPos(base::as_writable_byte_span(buf));
++    if (!n || *n == 0) {
++      break;
++    }
++    offset_ += static_cast<int64_t>(*n);
++    std::string_view chunk =
++        base::as_string_view(base::span(buf).first(*n));
++    size_t start = 0;
++    for (size_t nl; (nl = chunk.find('\n', start)) != std::string_view::npos;
++         start = nl + 1) {
++      if (partial_.empty()) {
++        Feed(chunk.substr(start, nl - start));
++      } else {
++        partial_.append(chunk.substr(start, nl - start));
++        Feed(partial_);
++        partial_.clear();
++      }
++    }
++    partial_.append(chunk.substr(start));
++    // A line too long to matter (a request body): dropped.
++    if (partial_.size() > (64u << 20)) {
++      partial_.clear();
++    }
++  }
++}
++
++ContextInsights& ContextInsights::operator=(ContextInsights&&) = default;
++
++void ContextInsights::Feed(std::string_view line) {
++  // Request bodies and request metadata: large, and nothing here needs them.
++  if (line.starts_with("{\"type\":\"api-request-blob\"") ||
++      (line.starts_with("{\"type\":\"api-request\"") &&
++       !line.starts_with("{\"type\":\"api-request-shape\""))) {
++    return;
++  }
++  std::optional<base::Value> v = base::JSONReader::Read(line, 0);
++  if (!v || !v->is_dict()) {
++    return;
++  }
++  const base::DictValue& entry = v->GetDict();
++  const std::string* type = entry.FindString("type");
++  if (!type) {
++    return;
++  }
++  bool sidechain = entry.FindBool("isSidechain").value_or(false);
++  if (*type == "assistant") {
++    FeedAssistant(entry, sidechain);
++  } else if (*type == "user") {
++    FeedUser(entry, sidechain);
++  } else if (*type == "attachment") {
++    FeedAttachment(entry);
++  } else if (*type == "api-request-shape") {
++    FeedShape(entry);
++  } else if (*type == "system") {
++    const std::string* subtype = entry.FindString("subtype");
++    if (subtype && *subtype == "compact_boundary" && !sidechain) {
++      const base::DictValue* meta = entry.FindDict("compactMetadata");
++      Compaction c;
++      c.ts = Ts(entry);
++      c.pre = Num(meta, "preTokens");
++      c.post = Num(meta, "postTokens");
++      const std::string* trigger = meta ? meta->FindString("trigger") : nullptr;
++      c.trigger = trigger ? Short(*trigger, 20) : std::string();
++      c.at = static_cast<int>(requests_.size());
++      compactions_.push_back(std::move(c));
++    }
++  } else if (*type == "cost-state") {
++    total_cost_ = Num(&entry, "totalCostUSD");
++    model_costs_.clear();
++    if (const base::DictValue* models = entry.FindDict("modelUsage")) {
++      for (const auto [name, usage] : *models) {
++        if (usage.is_dict()) {
++          model_costs_.Set(Short(name, 60), Num(&usage.GetDict(), "costUSD"));
++        }
++      }
++    }
++  }
++}
++
++void ContextInsights::FeedAssistant(const base::DictValue& entry,
++                                    bool sidechain) {
++  const base::DictValue* message = entry.FindDict("message");
++  if (!message) {
++    return;
++  }
++  const std::string* request_id = entry.FindString("requestId");
++  const std::string* message_id = message->FindString("id");
++  std::string key = request_id ? *request_id : message_id ? *message_id : "";
++  const base::DictValue* usage = message->FindDict("usage");
++  if (usage && !key.empty() && seen_requests_.insert(key).second) {
++    Request r;
++    r.ts = Ts(entry);
++    r.input = Num(usage, "input_tokens");
++    r.cache_read = Num(usage, "cache_read_input_tokens");
++    r.cache_write = Num(usage, "cache_creation_input_tokens");
++    r.cache_write_1h = Num(usage->FindDict("cache_creation"),
++                           "ephemeral_1h_input_tokens");
++    r.output = Num(usage, "output_tokens");
++    if (sidechain) {
++      subagents_.input += r.input;
++      subagents_.cache_read += r.cache_read;
++      subagents_.cache_write += r.cache_write;
++      subagents_.cache_write_1h += r.cache_write_1h;
++      subagents_.output += r.output;
++      subagent_requests_++;
++    } else {
++      requests_.push_back(r);
++      if (const std::string* model = message->FindString("model")) {
++        model_ = Short(*model, 60);
++      }
++    }
++  } else if (usage && !sidechain && !requests_.empty() &&
++             !key.empty()) {
++    // Later lines of the same response: the final output count.
++    requests_.back().output =
++        std::max(requests_.back().output, Num(usage, "output_tokens"));
++  }
++  const base::ListValue* content = message->FindList("content");
++  if (!content) {
++    return;
++  }
++  for (const base::Value& block : *content) {
++    if (!block.is_dict()) {
++      continue;
++    }
++    const base::DictValue& b = block.GetDict();
++    const std::string* type = b.FindString("type");
++    const std::string* id = b.FindString("id");
++    const std::string* name = b.FindString("name");
++    if (!type || *type != "tool_use" || !id || !name ||
++        calls_.contains(*id)) {
++      continue;
++    }
++    ToolCall call;
++    call.name = Short(*name, 80);
++    const base::DictValue* input = b.FindDict("input");
++    call.target = input ? TargetOf(call.name, *input) : std::string();
++    call.sidechain = sidechain;
++    call.prompt = static_cast<int>(prompts_.size()) - 1;
++    calls_[*id] = std::move(call);
++    call_order_.push_back(*id);
++  }
++}
++
++void ContextInsights::FeedUser(const base::DictValue& entry, bool sidechain) {
++  const base::DictValue* message = entry.FindDict("message");
++  if (!message) {
++    return;
++  }
++  const base::Value* content = message->Find("content");
++  bool meta = entry.FindBool("isMeta").value_or(false) ||
++              entry.FindBool("isCompactSummary").value_or(false);
++  auto prompt = [&](std::string_view text) {
++    if (sidechain || meta || text.empty() || text.starts_with("<")) {
++      return;
++    }
++    Prompt p;
++    p.ts = Ts(entry);
++    p.text = Short(text, 120);
++    p.first_request = static_cast<int>(requests_.size());
++    prompts_.push_back(std::move(p));
++  };
++  if (content && content->is_string()) {
++    prompt(content->GetString());
++    return;
++  }
++  if (!content || !content->is_list()) {
++    return;
++  }
++  bool results = false;
++  std::string text;
++  for (const base::Value& block : content->GetList()) {
++    if (!block.is_dict()) {
++      continue;
++    }
++    const base::DictValue& b = block.GetDict();
++    const std::string* type = b.FindString("type");
++    if (type && *type == "tool_result") {
++      results = true;
++      const std::string* id = b.FindString("tool_use_id");
++      auto it = id ? calls_.find(*id) : calls_.end();
++      if (it == calls_.end()) {
++        continue;
++      }
++      auto [chars, images] = ContentSize(b.Find("content"));
++      it->second.tokens = Tokens(chars) + images * kImageTokens;
++      it->second.images = images > 0;
++      if (!sidechain) {
++        it->second.entered = static_cast<int>(requests_.size());
++      }
++    } else if (type && *type == "text" && text.empty()) {
++      if (const std::string* t = b.FindString("text")) {
++        text = *t;
++      }
++    }
++  }
++  if (!results) {
++    prompt(text);
++  }
++}
++
++void ContextInsights::FeedAttachment(const base::DictValue& entry) {
++  const base::DictValue* a = entry.FindDict("attachment");
++  const std::string* type = a ? a->FindString("type") : nullptr;
++  if (!type) {
++    return;
++  }
++  if (*type == "skill_listing") {
++    if (const std::string* content = a->FindString("content")) {
++      if (a->FindBool("isInitial").value_or(false)) {
++        skills_chars_ = content->size();
++      } else {
++        skills_chars_ += content->size();
++      }
++    }
++  } else if (*type == "instructions") {
++    if (const base::ListValue* files = a->FindList("files")) {
++      for (const base::Value& f : *files) {
++        if (!f.is_dict()) {
++          continue;
++        }
++        const std::string* path = f.GetDict().FindString("path");
++        const std::string* content = f.GetDict().FindString("content");
++        if (path && content) {
++          memory_chars_[Short(*path, 200)] = content->size();
++        }
++      }
++    }
++  } else if (*type == "mcp_instructions_delta") {
++    if (const base::ListValue* blocks = a->FindList("addedBlocks")) {
++      for (const base::Value& block : *blocks) {
++        if (block.is_string()) {
++          mcp_instructions_chars_ += block.GetString().size();
++        }
++      }
++    }
++  }
++}
++
++void ContextInsights::FeedShape(const base::DictValue& entry) {
++  const base::DictValue* shape = entry.FindDict("shape");
++  if (!shape) {
++    return;
++  }
++  if (const base::ListValue* system = shape->FindList("system")) {
++    system_chars_ = 0;
++    for (const base::Value& block : *system) {
++      if (block.is_dict()) {
++        if (const std::string* text = block.GetDict().FindString("text")) {
++          system_chars_ += text->size();
++        }
++      }
++    }
++  }
++  if (const base::ListValue* tools = shape->FindList("tools")) {
++    tool_chars_.clear();
++    for (const base::Value& tool : *tools) {
++      if (!tool.is_dict()) {
++        continue;
++      }
++      const std::string* name = tool.GetDict().FindString("name");
++      if (name) {
++        tool_chars_[Short(*name, 120)] =
++            base::WriteJson(tool).value_or("").size();
++      }
++    }
++  }
++}
++
++base::DictValue ContextInsights::Result(
++    std::optional<double> context_size) const {
++  base::DictValue out;
++  double context = requests_.empty() ? 0 : requests_.back().context();
++  double peak = 0;
++  for (const Request& r : requests_) {
++    peak = std::max(peak, r.context());
++  }
++  double size = context_size.value_or(peak > 200000 ? 1000000 : 200000);
++  out.Set("model", model_);
++  out.Set("requests", static_cast<int>(requests_.size()));
++  out.Set("prompts", static_cast<int>(prompts_.size()));
++  out.Set("contextTokens", context);
++  out.Set("contextSize", size);
++  out.Set("costUsd", total_cost_);
++  out.Set("modelCosts", model_costs_.Clone());
++  if (!requests_.empty()) {
++    out.Set("startedAt", requests_.front().ts);
++    out.Set("lastAt", requests_.back().ts);
++  }
++
++  // ---- What the context holds now (estimates, but the total) ----
++  double system = Tokens(system_chars_);
++  double builtin = 0, mcp = 0;
++  std::map<std::string, std::vector<std::pair<std::string, double>>> servers;
++  for (const auto& [name, chars] : tool_chars_) {
++    if (name.starts_with("mcp__")) {
++      mcp += Tokens(chars);
++      size_t sep = name.find("__", 5);
++      std::string server =
++          sep == std::string::npos ? name.substr(5) : name.substr(5, sep - 5);
++      std::string tool =
++          sep == std::string::npos ? name : name.substr(sep + 2);
++      servers[server].emplace_back(tool, Tokens(chars));
++    } else {
++      builtin += Tokens(chars);
++    }
++  }
++  double skills = Tokens(skills_chars_);
++  double memory = 0;
++  base::ListValue memory_files;
++  for (const auto& [path, chars] : memory_chars_) {
++    memory += Tokens(chars);
++    memory_files.Append(
++        base::DictValue().Set("path", path).Set("tokens", Tokens(chars)));
++  }
++  double mcp_instructions = Tokens(mcp_instructions_chars_);
++  double setup = system + builtin + mcp + skills + memory + mcp_instructions;
++  double messages = std::max(0.0, context - setup);
++  out.Set("breakdown",
++          base::DictValue()
++              .Set("systemPrompt", system)
++              .Set("systemTools", builtin)
++              .Set("mcpTools", mcp)
++              .Set("mcpInstructions", mcp_instructions)
++              .Set("skills", skills)
++              .Set("memoryFiles", memory)
++              .Set("messages", messages)
++              .Set("free", std::max(0.0, size - context)));
++  base::ListValue mcp_list;
++  std::vector<std::pair<double, std::string>> server_order;
++  for (const auto& [server, tools] : servers) {
++    double sum = 0;
++    for (const auto& t : tools) {
++      sum += t.second;
++    }
++    server_order.emplace_back(sum, server);
++  }
++  std::sort(server_order.rbegin(), server_order.rend());
++  for (const auto& [sum, server] : server_order) {
++    std::vector<std::pair<std::string, double>> tools = servers.at(server);
++    std::sort(tools.begin(), tools.end(),
++              [](const auto& a, const auto& b) { return a.second > b.second; });
++    base::ListValue list;
++    for (const auto& [tool, tokens] : tools) {
++      list.Append(base::DictValue().Set("name", tool).Set("tokens", tokens));
++    }
++    mcp_list.Append(base::DictValue()
++                        .Set("server", server)
++                        .Set("tokens", sum)
++                        .Set("tools", std::move(list)));
++  }
++  out.Set("mcpServers", std::move(mcp_list));
++  out.Set("memoryFiles", std::move(memory_files));
++
++  // ---- Where the tokens went ----
++  Request total;
++  for (const Request& r : requests_) {
++    total.input += r.input;
++    total.cache_read += r.cache_read;
++    total.cache_write += r.cache_write;
++    total.cache_write_1h += r.cache_write_1h;
++    total.output += r.output;
++  }
++  auto weighted = [](const Request& r) {
++    return Weighted(r.input, r.cache_read, r.cache_write - r.cache_write_1h,
++                    r.cache_write_1h, r.output);
++  };
++  double main_w = weighted(total);
++  double sub_w = weighted(subagents_);
++  double all_w = std::max(1.0, main_w + sub_w);
++  out.Set("spend",
++          base::DictValue()
++              .Set("cacheRead", total.cache_read)
++              .Set("cacheWrite", total.cache_write)
++              .Set("input", total.input)
++              .Set("output", total.output)
++              .Set("subagentTokens", subagents_.context() + subagents_.output)
++              .Set("subagentRequests", subagent_requests_)
++              .Set("weights",
++                   base::DictValue()
++                       .Set("cacheRead", total.cache_read * kRead / all_w)
++                       .Set("cacheWrite",
++                            ((total.cache_write - total.cache_write_1h) *
++                                 kWrite5m +
++                             total.cache_write_1h * kWrite1h) /
++                                all_w)
++                       .Set("input", total.input / all_w)
++                       .Set("output", total.output * kOutput / all_w)
++                       .Set("subagents", sub_w / all_w)));
++
++  // Each tool result: written to the cache once, then read with every
++  // request after it until a compaction drops it.
++  struct Carried {
++    std::string id;
++    int requests;
++    double weight;
++  };
++  std::vector<Carried> carried;
++  std::map<std::string, base::DictValue> by_tool;
++  std::map<std::string, std::pair<int, double>> reads;
++  for (const std::string& id : call_order_) {
++    const ToolCall& c = calls_.at(id);
++    int n = 0;
++    double weight = c.tokens * kWrite5m;
++    if (!c.sidechain && c.entered >= 0) {
++      int end = static_cast<int>(requests_.size());
++      for (const Compaction& k : compactions_) {
++        if (k.at > c.entered) {
++          end = k.at;
++          break;
++        }
++      }
++      n = std::max(0, end - c.entered);
++      weight += c.tokens * n * kRead;
++      carried.push_back({id, n, weight});
++    }
++    base::DictValue& t = by_tool[c.name];
++    t.Set("calls", t.FindInt("calls").value_or(0) + 1);
++    t.Set("tokens", t.FindDouble("tokens").value_or(0) + c.tokens);
++    t.Set("share", t.FindDouble("share").value_or(0) + weight / all_w);
++    if (c.name == "Read" && !c.target.empty()) {
++      reads[c.target].first++;
++      reads[c.target].second += c.tokens;
++    }
++  }
++  std::sort(carried.begin(), carried.end(),
++            [](const Carried& a, const Carried& b) { return a.weight > b.weight; });
++  base::ListValue heavy;
++  for (size_t i = 0; i < carried.size() && i < 12; ++i) {
++    const Carried& c = carried[i];
++    const ToolCall& call = calls_.at(c.id);
++    heavy.Append(base::DictValue()
++                     .Set("tool", call.name)
++                     .Set("target", call.target)
++                     .Set("tokens", call.tokens)
++                     .Set("image", call.images)
++                     .Set("requests", c.requests)
++                     .Set("share", c.weight / all_w));
++  }
++  out.Set("heavyResults", std::move(heavy));
++  std::vector<std::pair<double, std::string>> tool_order;
++  for (const auto& [name, t] : by_tool) {
++    tool_order.emplace_back(t.FindDouble("share").value_or(0), name);
++  }
++  std::sort(tool_order.rbegin(), tool_order.rend());
++  base::ListValue tools;
++  for (size_t i = 0; i < tool_order.size() && i < 12; ++i) {
++    tools.Append(by_tool.at(tool_order[i].second).Clone().Set(
++        "name", tool_order[i].second));
++  }
++  out.Set("tools", std::move(tools));
++  std::vector<std::pair<int, std::string>> reread_order;
++  for (const auto& [path, r] : reads) {
++    if (r.first >= 2) {
++      reread_order.emplace_back(r.first, path);
++    }
++  }
++  std::sort(reread_order.rbegin(), reread_order.rend());
++  base::ListValue rereads;
++  for (size_t i = 0; i < reread_order.size() && i < 10; ++i) {
++    const auto& r = reads.at(reread_order[i].second);
++    rereads.Append(base::DictValue()
++                       .Set("path", reread_order[i].second)
++                       .Set("times", r.first)
++                       .Set("tokens", r.second));
++  }
++  out.Set("rereads", std::move(rereads));
++
++  // A pause long enough for the cache to go cold, then the whole context
++  // written to it again.
++  base::ListValue rebuilds;
++  double rebuilt = 0;
++  int rebuild_count = 0;
++  for (size_t i = 1; i < requests_.size(); ++i) {
++    const Request& r = requests_[i];
++    double gap = r.ts - requests_[i - 1].ts;
++    bool compacted = false;
++    for (const Compaction& k : compactions_) {
++      compacted |= k.at == static_cast<int>(i);
++    }
++    double ttl = r.cache_write_1h > r.cache_write / 2 ? 3600 : kColdAfter;
++    if (!compacted && gap >= ttl && r.cache_write >= 20000) {
++      rebuild_count++;
++      rebuilt += r.cache_write;
++      if (rebuilds.size() < 10) {
++        rebuilds.Append(base::DictValue()
++                            .Set("ts", r.ts)
++                            .Set("pauseMinutes", std::round(gap / 60))
++                            .Set("tokens", r.cache_write));
++      }
++    }
++  }
++  out.Set("coldCache", base::DictValue()
++                           .Set("count", rebuild_count)
++                           .Set("tokens", rebuilt)
++                           .Set("share", rebuilt * kWrite5m / all_w)
++                           .Set("list", std::move(rebuilds)));
++
++  // The prompts that cost the most: every request until the next prompt.
++  struct PromptCost {
++    size_t index;
++    int requests;
++    double weight;
++  };
++  std::vector<PromptCost> prompt_costs;
++  for (size_t p = 0; p < prompts_.size(); ++p) {
++    size_t from = static_cast<size_t>(prompts_[p].first_request);
++    size_t to = p + 1 < prompts_.size()
++                    ? static_cast<size_t>(prompts_[p + 1].first_request)
++                    : requests_.size();
++    double w = 0;
++    for (size_t i = from; i < to && i < requests_.size(); ++i) {
++      w += weighted(requests_[i]);
++    }
++    prompt_costs.push_back({p, static_cast<int>(to > from ? to - from : 0), w});
++  }
++  std::sort(prompt_costs.begin(), prompt_costs.end(),
++            [](const PromptCost& a, const PromptCost& b) {
++              return a.weight > b.weight;
++            });
++  base::ListValue top_prompts;
++  for (size_t i = 0; i < prompt_costs.size() && i < 8; ++i) {
++    const Prompt& p = prompts_[prompt_costs[i].index];
++    top_prompts.Append(base::DictValue()
++                           .Set("text", p.text)
++                           .Set("ts", p.ts)
++                           .Set("requests", prompt_costs[i].requests)
++                           .Set("share", prompt_costs[i].weight / all_w));
++  }
++  out.Set("prompts", std::move(top_prompts));
++
++  // How the context grew (at most 160 points) and where it was compacted.
++  base::ListValue growth;
++  size_t step = std::max<size_t>(1, requests_.size() / 160);
++  for (size_t i = 0; i < requests_.size(); i += step) {
++    growth.Append(base::DictValue()
++                      .Set("ts", requests_[i].ts)
++                      .Set("tokens", requests_[i].context()));
++  }
++  if (!requests_.empty() && (requests_.size() - 1) % step) {
++    growth.Append(base::DictValue()
++                      .Set("ts", requests_.back().ts)
++                      .Set("tokens", requests_.back().context()));
++  }
++  out.Set("growth", std::move(growth));
++  base::ListValue compactions;
++  for (const Compaction& c : compactions_) {
++    compactions.Append(base::DictValue()
++                           .Set("ts", c.ts)
++                           .Set("before", c.pre)
++                           .Set("after", c.post)
++                           .Set("trigger", c.trigger));
++  }
++  out.Set("compactions", std::move(compactions));
++
++  // ---- What to do about it ----
++  base::ListValue insights;
++  if (context >= size * 0.7) {
++    insights.Append(Insight(
++        "warn", "The context is " + Pct(context / size) + " full",
++        "Every request sends all of it again. Run /compact with a note on "
++        "what to keep, or start a new session for the next task.",
++        context / size));
++  }
++  if (compactions_.size() >= 2) {
++    insights.Append(Insight(
++        "info",
++        "Compacted " + base::NumberToString(compactions_.size()) + " times",
++        "A long session: each summary loses detail and the context fills "
++        "again. A fresh session per task keeps it small.",
++        0.05 * static_cast<double>(compactions_.size())));
++  }
++  std::set<std::string> told;
++  for (size_t i = 0, shown = 0; i < carried.size() && shown < 3; ++i) {
++    const Carried& c = carried[i];
++    const ToolCall* call = &calls_.at(c.id);
++    double share = c.weight / all_w;
++    if (share < 0.03 || call->tokens < 2000) {
++      break;
++    }
++    // One insight per file or command: the heaviest time.
++    if (!call->target.empty() && !told.insert(call->name + call->target).second) {
++      continue;
++    }
++    shown++;
++    std::string what = call->name +
++                       (call->target.empty() ? "" : " " + call->target);
++    std::string tip =
++        call->images ? "Screenshots are heavy: read the page as text "
++                         "where that's enough, or capture a smaller area."
++        : call->name == "Bash"
++            ? "Long command output: pipe it through tail, head or grep."
++        : call->name == "Read"
++            ? "A long file: read the part needed (offset and limit)."
++            : "A large result stays in the context until the next "
++              "compaction.";
++    insights.Append(Insight(
++        "warn",
++        what.size() > 90 ? what.substr(0, 90) + "…" : what,
++        "≈" + K(call->tokens) + " tokens, sent again in " +
++            base::NumberToString(c.requests) + " requests after it (" +
++            Pct(share) + " of this session's usage). " + tip,
++        share));
++  }
++  for (size_t i = 0; i < reread_order.size() && i < 2; ++i) {
++    const auto& r = reads.at(reread_order[i].second);
++    if (r.first < 3) {
++      break;
++    }
++    insights.Append(Insight(
++        "info",
++        "Read " + base::NumberToString(r.first) + " times: " +
++            reread_order[i].second,
++        "≈" + K(r.second) + " tokens in all. Each read adds the file to the "
++        "context again; a note of what matters in it, or CLAUDE.md, saves "
++        "the rereads.",
++        r.second * kWrite5m / all_w));
++  }
++  if (rebuild_count > 0 && rebuilt * kWrite5m / all_w >= 0.03) {
++    insights.Append(Insight(
++        "warn",
++        "The cache went cold " + base::NumberToString(rebuild_count) +
++            (rebuild_count == 1 ? " time" : " times"),
++        "After a pause of 5 minutes or more the whole context (" + K(rebuilt) +
++            " tokens in all) was written to the cache again, at 12× the price "
++            "of reading it. /compact before a long break makes the next "
++            "rewrite smaller.",
++        rebuilt * kWrite5m / all_w));
++  }
++  if (mcp >= size * 0.05 || (context > 0 && mcp >= context * 0.15)) {
++    std::string biggest = server_order.empty() ? "" : server_order[0].second;
++    insights.Append(Insight(
++        "info", "MCP tools take ≈" + K(mcp) + " tokens of every request",
++        "Their definitions go with each request" +
++            (biggest.empty() ? std::string(".")
++                             : "; the most from " + biggest + ".") +
++            " Turn off servers this project doesn't use.",
++        // Read from the cache with every request.
++        mcp * static_cast<double>(requests_.size()) * kRead / all_w));
++  }
++  double out_share = total.output * kOutput / all_w;
++  if (out_share >= 0.35) {
++    insights.Append(Insight(
++        "info", "Most of the usage is the model writing (" + Pct(out_share) +
++                    ")",
++        "Output and thinking cost 5× input. A lower effort level (/effort) "
++        "thinks less on simple steps.",
++        out_share));
++  }
++  if (sub_w / all_w >= 0.25) {
++    insights.Append(Insight(
++        "info", "Subagents used " + Pct(sub_w / all_w),
++        base::NumberToString(subagent_requests_) +
++            " requests in subagents. Each starts with its own context; give "
++            "them narrow tasks.",
++        sub_w / all_w));
++  }
++  std::vector<base::Value> sorted;
++  for (base::Value& i : insights) {
++    sorted.push_back(std::move(i));
++  }
++  std::stable_sort(sorted.begin(), sorted.end(),
++                   [](const base::Value& a, const base::Value& b) {
++                     return a.GetDict().FindDouble("share").value_or(0) >
++                            b.GetDict().FindDouble("share").value_or(0);
++                   });
++  base::ListValue sorted_list;
++  for (base::Value& i : sorted) {
++    sorted_list.Append(std::move(i));
++  }
++  out.Set("insights", std::move(sorted_list));
++  return out;
++}
++
++}  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/context_insights.h b/chrome/browser/meridian/workbench/context_insights.h
+new file mode 100644
+index 0000000000..7c0d96688e
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/context_insights.h
+@@ -0,0 +1,103 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_WORKBENCH_CONTEXT_INSIGHTS_H_
++#define CHROME_BROWSER_MERIDIAN_WORKBENCH_CONTEXT_INSIGHTS_H_
++
++#include <map>
++#include <optional>
++#include <set>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/values.h"
++
++namespace meridian::workbench {
++
++// Context Insights: what a Claude Code session's context holds and where its
++// tokens (so its usage limits) went, from the session's transcript (JSONL).
++// Read on this computer; nothing leaves it. Sizes of text are estimates
++// (about 4 characters a token); the API's own counts are exact.
++class ContextInsights {
++ public:
++  ContextInsights();
++  ContextInsights(const ContextInsights&) = delete;
++  ContextInsights& operator=(const ContextInsights&) = delete;
++  ContextInsights& operator=(ContextInsights&&);
++  ~ContextInsights();
++
++  // Reads what was added to `path` since the last call (the whole file the
++  // first time; from the start again if it got shorter).
++  void ReadMore(const base::FilePath& path);
++  // One transcript line.
++  void Feed(std::string_view line);
++  // The analysis. `context_size`: the model's window, if known (else
++  // guessed from the largest context seen).
++  base::DictValue Result(std::optional<double> context_size) const;
++
++ private:
++  struct Request {
++    double ts = 0;
++    double input = 0;
++    double cache_read = 0;
++    double cache_write = 0;
++    double cache_write_1h = 0;
++    double output = 0;
++    double context() const { return input + cache_read + cache_write; }
++  };
++  struct ToolCall {
++    std::string name;
++    std::string target;
++    double tokens = 0;
++    bool images = false;
++    // The main request it entered (-1 until its result comes).
++    int entered = -1;
++    int prompt = -1;
++    bool sidechain = false;
++  };
++  struct Compaction {
++    double ts = 0;
++    double pre = 0;
++    double post = 0;
++    std::string trigger;
++    int at = 0;
++  };
++  struct Prompt {
++    double ts = 0;
++    std::string text;
++    int first_request = 0;
++  };
++
++  void FeedAssistant(const base::DictValue& entry, bool sidechain);
++  void FeedUser(const base::DictValue& entry, bool sidechain);
++  void FeedAttachment(const base::DictValue& entry);
++  void FeedShape(const base::DictValue& entry);
++
++  int64_t offset_ = 0;
++  std::string partial_;
++  std::vector<Request> requests_;
++  Request subagents_;
++  int subagent_requests_ = 0;
++  std::set<std::string> seen_requests_;
++  std::map<std::string, ToolCall> calls_;
++  std::vector<std::string> call_order_;
++  std::vector<Compaction> compactions_;
++  std::vector<Prompt> prompts_;
++  std::string model_;
++  // From the latest request shape: the system prompt and each tool's
++  // definition, in characters.
++  double system_chars_ = 0;
++  std::map<std::string, double> tool_chars_;
++  double skills_chars_ = 0;
++  std::map<std::string, double> memory_chars_;
++  double mcp_instructions_chars_ = 0;
++  base::DictValue model_costs_;
++  double total_cost_ = 0;
++};
++
++}  // namespace meridian::workbench
++
++#endif  // CHROME_BROWSER_MERIDIAN_WORKBENCH_CONTEXT_INSIGHTS_H_
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 261516b9d8..fefec0ba91 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -29,6 +29,7 @@
+ #include "chrome/browser/meridian/sidebar_handler.h"
+ #include "chrome/browser/meridian/test_switches.h"
+ #include "chrome/browser/meridian/workbench/agents.h"
++#include "chrome/browser/meridian/workbench/context_insights.h"
+ #include "chrome/browser/meridian/workbench/customizations.h"
+ #include "net/base/url_util.h"
+ #include "chrome/browser/meridian/workbench/hubs.h"
+@@ -613,6 +614,49 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+                               : base::DictValue(),
+                           std::move(reply));
+   }
++  if (method == "contextInsights") {
++    // A Claude Code session's transcript, read and analysed off this thread.
++    std::string path;
++    if (mission::MissionControl* mission =
++            mission::MissionControlFactory::GetForProfile(profile_)) {
++      path = mission->TranscriptOf(a);
++    }
++    if (path.empty()) {
++      return std::move(reply).Run(base::unexpected(
++          "No session data yet: it comes with Claude Code's first answer."));
++    }
++    std::optional<double> size;
++    if (params.size() > 1 && params[1].is_dict()) {
++      size = params[1].GetDict().FindDouble("contextSize");
++    }
++    std::unique_ptr<ContextInsights> state = std::move(insights_[path]);
++    insights_.erase(path);
++    if (!state) {
++      state = std::make_unique<ContextInsights>();
++    }
++    files_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(
++            [](std::unique_ptr<ContextInsights> state, std::string path,
++               std::optional<double> size) {
++              state->ReadMore(base::FilePath::FromUTF8Unsafe(path));
++              base::DictValue result = state->Result(size);
++              return std::make_pair(std::move(state), std::move(result));
++            },
++            std::move(state), path, size),
++        base::BindOnce(
++            [](base::WeakPtr<WorkbenchHandler> self, std::string path,
++               Reply reply,
++               std::pair<std::unique_ptr<ContextInsights>, base::DictValue>
++                   done) {
++              if (self) {
++                self->insights_[path] = std::move(done.first);
++              }
++              std::move(reply).Run(base::Value(std::move(done.second)));
++            },
++            weak_factory_.GetWeakPtr(), path, std::move(reply)));
++    return;
++  }
+   if (method == "ptyList") {
+     base::ListValue list;
+     for (const auto& [id, term] : terms_) {
+@@ -2474,6 +2518,19 @@ void WorkbenchHandler::OnMissionChanged(const base::DictValue& snapshot) {
+   // The counts for the topbar chip.
+   base::DictValue counts = snapshot.FindDict("counts")->Clone();
+   counts.Set("type", "mission");
++  // Each Claude Code terminal's status line numbers (context, usage limits,
++  // prompt cache, the session's name), by terminal.
++  base::DictValue usage;
++  if (const base::ListValue* nodes = snapshot.FindList("nodes")) {
++    for (const base::Value& n : *nodes) {
++      const std::string* term = n.GetDict().FindString("termId");
++      const base::DictValue* u = n.GetDict().FindDict("usage");
++      if (term && u && terms_.contains(*term)) {
++        usage.Set(*term, u->Clone());
++      }
++    }
++  }
++  counts.Set("usage", std::move(usage));
+   Emit("wb:command", base::Value(std::move(counts)));
+ }
+ 
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.h b/chrome/browser/meridian/workbench/workbench_handler.h
+index b1593c7175..fed0a033a5 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.h
++++ b/chrome/browser/meridian/workbench/workbench_handler.h
+@@ -31,6 +31,7 @@ class Profile;
+ 
+ namespace meridian::workbench {
+ 
++class ContextInsights;
+ class Terminal;
+ 
+ // The Workbench page's only way to the browser (chrome.send "invoke" /
+@@ -176,6 +177,8 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+   std::set<std::string> changed_;
+   base::OneShotTimer flush_;
+   std::map<std::string, Term> terms_;
++  // Context Insights, by transcript: each read on where the last one stopped.
++  std::map<std::string, std::unique_ptr<ContextInsights>> insights_;
+   int term_seq_ = 0;
+   scoped_refptr<ui::SelectFileDialog> dialog_;
+   Reply pick_reply_;

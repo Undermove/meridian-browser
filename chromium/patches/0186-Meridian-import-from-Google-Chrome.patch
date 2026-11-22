@@ -1,0 +1,1402 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 19 Nov 2026 22:02:51 +0400
+Subject: [PATCH 187/202] Meridian: import from Google Chrome
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Arc's import now reads any Chromium browser (ImportSource: its profile
+folders, its keychain item or Local State key, its profile ids). For Google
+Chrome: a space per Chrome profile, named as in Chrome (Local State), its
+bookmarks as pinned tabs and folders (the bar on top, Other and Mobile
+bookmarks as folders), the tabs it had open (its last session file) as
+Today tabs that load when opened; its other profiles in Meridian profiles
+of their own; its sign-ins, passwords, cards, history, form entries,
+addresses, site permissions, site searches and sites' data, as for Arc.
+File > Import from Chrome…, and the welcome tour offers it when there is no
+Arc. The mojo import methods take the source ("arc" or "chrome").
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   5 +
+ chrome/browser/meridian/arc_data.cc           |  65 +++--
+ chrome/browser/meridian/arc_data.h            |   8 +
+ chrome/browser/meridian/arc_import.cc         |   9 +-
+ chrome/browser/meridian/arc_logins.cc         |  79 +++---
+ chrome/browser/meridian/arc_logins.h          |  25 +-
+ chrome/browser/meridian/arc_logins_mac.mm     |   6 +-
+ chrome/browser/meridian/arc_logins_win.cc     |   8 +-
+ chrome/browser/meridian/chrome_import.cc      | 258 ++++++++++++++++++
+ chrome/browser/meridian/chrome_import.h       |  37 +++
+ chrome/browser/meridian/import_source.cc      |  91 ++++++
+ chrome/browser/meridian/import_source.h       |  60 ++++
+ chrome/browser/meridian/prefs.cc              |   2 +
+ chrome/browser/meridian/prefs.h               |   5 +
+ chrome/browser/meridian/sidebar.mojom         |  14 +-
+ chrome/browser/meridian/sidebar_handler.cc    |  63 +++--
+ chrome/browser/meridian/sidebar_handler.h     |  19 +-
+ chrome/browser/resources/webui_browser/app.ts |   2 +-
+ .../webui_browser/meridian/onboarding.html.ts |  21 +-
+ .../webui_browser/meridian/onboarding.ts      |  39 ++-
+ .../webui_browser/meridian/settings.ts        |   6 +-
+ .../webui_browser/meridian/sidebar.ts         |   1 +
+ 22 files changed, 695 insertions(+), 128 deletions(-)
+ create mode 100644 chrome/browser/meridian/chrome_import.cc
+ create mode 100644 chrome/browser/meridian/chrome_import.h
+ create mode 100644 chrome/browser/meridian/import_source.cc
+ create mode 100644 chrome/browser/meridian/import_source.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 10a5d5598b..5435183873 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -60,6 +60,10 @@ source_set("arc_staged") {
+ # The sidebar model alone (no browser deps), so its tests stay small.
+ source_set("model") {
+   sources = [
++    "chrome_import.cc",
++    "chrome_import.h",
++    "import_source.cc",
++    "import_source.h",
+     "arc_import.cc",
+     "arc_import.h",
+     "archive_service.cc",
+@@ -88,6 +92,7 @@ source_set("model") {
+   ]
+   deps = [
+     "//components/pref_registry",
++    "//components/sessions",
+     "//net",
+     "//third_party/boringssl",
+   ]
+diff --git a/chrome/browser/meridian/arc_data.cc b/chrome/browser/meridian/arc_data.cc
+index e321838410..c4f25d6fcb 100644
+--- a/chrome/browser/meridian/arc_data.cc
++++ b/chrome/browser/meridian/arc_data.cc
+@@ -4,6 +4,9 @@
+ 
+ #include "chrome/browser/meridian/arc_data.h"
+ 
++#include "chrome/browser/meridian/chrome_import.h"
++#include "chrome/browser/meridian/import_source.h"
++
+ #include <algorithm>
+ #include <functional>
+ #include <map>
+@@ -126,6 +129,8 @@ struct ProfileRead {
+   ProfileRead() = default;
+   ProfileRead(ProfileRead&&) = default;
+   ProfileRead& operator=(ProfileRead&&) = default;
++  // When the last import from this browser was (a pref).
++  std::string since_pref;
+   history::URLRows history;
+   std::vector<autofill::AutocompleteEntry> forms;
+   std::vector<autofill::AutofillProfile> addresses;
+@@ -717,34 +722,42 @@ void ReadLinkRules(const base::FilePath& file, ArcDataRead& out) {
+   }
+ }
+ 
+-ArcDataRead ReadArcData(base::FilePath main_profile, base::FilePath user_data) {
++ArcDataRead ReadArcData(ImportSource source,
++                        base::FilePath main_profile,
++                        base::FilePath user_data) {
+   ArcDataRead out;
+-  base::FilePath arc = ArcDataDir();
+-  if (arc.empty() || !base::DirectoryExists(arc)) {
++  if (source.user_data.empty() || !base::DirectoryExists(source.user_data)) {
+     return out;
+   }
+   std::map<std::string, std::map<GURL, std::u16string>> sidebar_pages;
+-  if (std::optional<ArcSidebar> sidebar = ReadArcSidebar()) {
+-    out.arc_space_names = sidebar->arc_space_names;
++  // Arc's own files: its sidebar (for the favicons of pinned pages), the
++  // archive, Air Traffic Control's rules, boosts.
++  if (!source.app_data.empty()) {
++    if (std::optional<ArcSidebar> sidebar = ReadArcSidebar()) {
++      out.arc_space_names = sidebar->arc_space_names;
++      sidebar_pages = SidebarPages(*sidebar);
++    }
++    ReadArchive(source.app_data.AppendASCII("StorableArchiveItems.json"), out);
++    ReadLinkRules(source.app_data.AppendASCII("StorableLinkRouting.json"), out);
++    out.boosts = ReadArcBoosts(source.app_data);
++    out.found = !out.archive.empty() || !out.link_rules.empty() ||
++                !out.boosts.empty();
++  } else if (std::optional<ArcSidebar> sidebar = ReadChromeSidebar(source)) {
+     sidebar_pages = SidebarPages(*sidebar);
+   }
+-  ReadArchive(arc.AppendASCII("StorableArchiveItems.json"), out);
+-  ReadLinkRules(arc.AppendASCII("StorableLinkRouting.json"), out);
+-  out.boosts = ReadArcBoosts(arc);
+-  out.found = !out.archive.empty() || !out.link_rules.empty() ||
+-              !out.boosts.empty();
+ 
+-  base::FileEnumerator dirs(arc.AppendASCII("User Data"), false,
++  base::FileEnumerator dirs(source.user_data, false,
+                             base::FileEnumerator::DIRECTORIES);
+   for (base::FilePath dir = dirs.Next(); !dir.empty(); dir = dirs.Next()) {
+     std::string name = dir.BaseName().AsUTF8Unsafe();
+-    int n = 0;
+-    if (name != "Default" && !(name.starts_with("Profile ") &&
+-                               base::StringToInt(name.substr(8), &n))) {
++    if (!IsProfileDir(name)) {
+       continue;
+     }
+-    std::string id = ProfileIdForArcDir(name);
++    std::string id = ProfileIdFor(source, name);
+     ProfileRead& p = out.profiles[id];
++    if (source.kind == "chrome") {
++      p.since_pref = prefs::kChromeDataImportedAt;
++    }
+     ReadHistory(dir.AppendASCII("History"), p.history);
+     {
+       base::ScopedTempDir tmp;
+@@ -929,7 +942,10 @@ void WriteProfile(scoped_refptr<Collector> collector,
+   PrefService* prefs = profile->GetPrefs();
+   // History and form entries newer than the last import (Arc may have been
+   // used since).
+-  base::Time since = prefs->GetTime(prefs::kArcDataImportedAt);
++  const std::string since_pref = data.since_pref.empty()
++                                     ? std::string(prefs::kArcDataImportedAt)
++                                     : data.since_pref;
++  base::Time since = prefs->GetTime(since_pref);
+   base::Time now = base::Time::Now();
+   std::erase_if(data.history, [&](const history::URLRow& row) {
+     return row.last_visit() <= since;
+@@ -937,7 +953,7 @@ void WriteProfile(scoped_refptr<Collector> collector,
+   std::erase_if(data.forms, [&](const autofill::AutocompleteEntry& e) {
+     return e.date_last_used() <= since;
+   });
+-  prefs->SetTime(prefs::kArcDataImportedAt, now);
++  prefs->SetTime(since_pref, now);
+ 
+   if (!data.history.empty()) {
+     if (history::HistoryService* history =
+@@ -1112,15 +1128,24 @@ void Write(base::WeakPtr<Profile> profile,
+ }  // namespace
+ 
+ bool ArcDataAvailable() {
+-  base::FilePath arc = ArcDataDir();
+-  return !arc.empty() && base::DirectoryExists(arc.AppendASCII("User Data"));
++  return DataAvailable(ArcSource());
++}
++
++bool DataAvailable(const ImportSource& source) {
++  return !source.user_data.empty() && base::DirectoryExists(source.user_data);
+ }
+ 
+ void ImportArcData(Profile* profile,
+                    base::OnceCallback<void(ArcDataResult)> done) {
++  ImportData(profile, ArcSource(), std::move(done));
++}
++
++void ImportData(Profile* profile,
++                const ImportSource& source,
++                base::OnceCallback<void(ArcDataResult)> done) {
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+-      base::BindOnce(&ReadArcData, profile->GetPath(),
++      base::BindOnce(&ReadArcData, source, profile->GetPath(),
+                      g_browser_process->profile_manager()->user_data_dir()),
+       base::BindOnce(&Write, profile->GetWeakPtr(), std::move(done)));
+ }
+diff --git a/chrome/browser/meridian/arc_data.h b/chrome/browser/meridian/arc_data.h
+index 505d2ea758..d0d1a7ed48 100644
+--- a/chrome/browser/meridian/arc_data.h
++++ b/chrome/browser/meridian/arc_data.h
+@@ -53,6 +53,14 @@ bool ArcDataAvailable();
+ void ImportArcData(Profile* profile,
+                    base::OnceCallback<void(ArcDataResult)> done);
+ 
++struct ImportSource;
++// The same from another Chromium browser (Google Chrome): its profiles' data;
++// Arc's own files only for Arc.
++bool DataAvailable(const ImportSource& source);
++void ImportData(Profile* profile,
++                const ImportSource& source,
++                base::OnceCallback<void(ArcDataResult)> done);
++
+ }  // namespace meridian
+ 
+ #endif  // CHROME_BROWSER_MERIDIAN_ARC_DATA_H_
+diff --git a/chrome/browser/meridian/arc_import.cc b/chrome/browser/meridian/arc_import.cc
+index a8159c1e27..763ed972ba 100644
+--- a/chrome/browser/meridian/arc_import.cc
++++ b/chrome/browser/meridian/arc_import.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/meridian/arc_import.h"
+ 
++#include "chrome/browser/meridian/import_source.h"
++
+ #include <algorithm>
+ #include <cmath>
+ #include <map>
+@@ -194,12 +196,7 @@ std::string ArcDirOf(const base::Value* profile) {
+ }  // namespace
+ 
+ std::string ProfileIdForArcDir(const std::string& dir) {
+-  int n = 0;
+-  if (dir.starts_with("Profile ") && base::StringToInt(dir.substr(8), &n) &&
+-      n > 0) {
+-    return "Meridian Profile Arc " + base::NumberToString(n);
+-  }
+-  return std::string();
++  return ProfileIdFor(ArcSource(), dir);
+ }
+ 
+ ArcSidebar::ArcSidebar() = default;
+diff --git a/chrome/browser/meridian/arc_logins.cc b/chrome/browser/meridian/arc_logins.cc
+index 38366bd1dd..f9f9eaccaf 100644
+--- a/chrome/browser/meridian/arc_logins.cc
++++ b/chrome/browser/meridian/arc_logins.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/meridian/arc_logins.h"
+ 
++#include "chrome/browser/meridian/import_source.h"
++
+ #include <algorithm>
+ #include <map>
+ #include <memory>
+@@ -110,10 +112,6 @@ using internal::FromWindows;
+ using internal::OpenCopy;
+ using internal::SelectOf;
+ 
+-// Tests: the keychain password for a fake Arc folder (--meridian-arc-dir);
+-// "__deny__" acts like the person clicking Deny.
+-constexpr char kArcSafeStorageSwitch[] = "meridian-arc-safe-storage";
+-constexpr char kArcDirSwitch[] = "meridian-arc-dir";
+ 
+ using password_manager::PasswordForm;
+ using password_manager::StoredCredential;
+@@ -129,17 +127,16 @@ struct ArcProfile {
+ 
+ // "Default" first, then "Profile N" in order; "Guest Profile" and the like
+ // are not real profiles.
+-std::vector<ArcProfile> FindArcProfiles() {
++std::vector<ArcProfile> FindArcProfiles(const ImportSource& source) {
+   std::vector<ArcProfile> out;
+-  base::FilePath user_data = ArcDataDir().AppendASCII("User Data");
+-  base::FileEnumerator dirs(user_data, false, base::FileEnumerator::DIRECTORIES);
++  if (source.user_data.empty()) {
++    return out;
++  }
++  base::FileEnumerator dirs(source.user_data, false,
++                            base::FileEnumerator::DIRECTORIES);
+   for (base::FilePath dir = dirs.Next(); !dir.empty(); dir = dirs.Next()) {
+     std::string name = dir.BaseName().AsUTF8Unsafe();
+-    int n = 0;
+-    bool real = name == "Default" ||
+-                (name.starts_with("Profile ") &&
+-                 base::StringToInt(name.substr(8), &n));
+-    if (!real) {
++    if (!IsProfileDir(name)) {
+       continue;
+     }
+     ArcProfile p{name};
+@@ -170,10 +167,10 @@ std::vector<ArcProfile> FindArcProfiles() {
+   return out;
+ }
+ 
+-// The "Arc Safe Storage" password, or the error code.
+-std::string ArcPassword(std::string* error) {
+-  if (HasTestSwitch(kArcSafeStorageSwitch) && HasTestSwitch(kArcDirSwitch)) {
+-    std::string pw = TestSwitchValue(kArcSafeStorageSwitch);
++// The "<browser> Safe Storage" password, or the error code.
++std::string ArcPassword(const ImportSource& source, std::string* error) {
++  if (HasTestSwitch(source.key_switch) && HasTestSwitch(source.dir_switch)) {
++    std::string pw = TestSwitchValue(source.key_switch);
+     if (pw == "__deny__") {
+       *error = "denied";
+       return std::string();
+@@ -181,7 +178,8 @@ std::string ArcPassword(std::string* error) {
+     return pw;
+   }
+ #if BUILDFLAG(IS_MAC)
+-  return internal::ReadArcKeychainPassword(error);
++  return internal::ReadArcKeychainPassword(source.keychain_service,
++                                          source.keychain_account, error);
+ #else
+   *error = "no-data";
+   return std::string();
+@@ -508,9 +506,9 @@ struct ReadResult {
+   ArcLoginsResult result;
+ };
+ 
+-ReadResult ReadArc(bool with_cookies) {
++ReadResult ReadArc(ImportSource source, bool with_cookies) {
+   ReadResult out;
+-  std::vector<ArcProfile> profiles = FindArcProfiles();
++  std::vector<ArcProfile> profiles = FindArcProfiles(source);
+   if (!with_cookies) {
+     std::erase_if(profiles, [](const ArcProfile& p) {
+       return p.logins.empty() && p.web_data.empty();
+@@ -524,15 +522,16 @@ ReadResult ReadArc(bool with_cookies) {
+ #if BUILDFLAG(IS_WIN)
+   // Windows: the key itself, from Arc's "Local State" (tests give a password,
+   // as on macOS, and get that scheme).
+-  if (!HasTestSwitch(kArcSafeStorageSwitch)) {
+-    key = internal::ReadArcOsCryptKey(&out.result.error);
++  if (!HasTestSwitch(source.key_switch)) {
++    key = internal::ReadArcOsCryptKey(
++        source.user_data.AppendASCII("Local State"), &out.result.error);
+     if (key.empty()) {
+       return out;
+     }
+   }
+ #endif
+   if (key.empty()) {
+-    std::string password = ArcPassword(&out.result.error);
++    std::string password = ArcPassword(source, &out.result.error);
+     if (password.empty()) {
+       if (out.result.error.empty()) {
+         out.result.error = "denied";
+@@ -559,7 +558,7 @@ ReadResult ReadArc(bool with_cookies) {
+   bool any = false;
+   [[maybe_unused]] bool cookies_unread = false;
+   for (const ArcProfile& p : profiles) {
+-    std::string target = ProfileIdForArcDir(p.dir);
++    std::string target = ProfileIdFor(source, p.dir);
+     if (with_cookies && !p.cookies.empty()) {
+       bool read = ReadProfile(p.cookies, key, seen[target],
+                               out.cookies[target], out.result.failed);
+@@ -861,30 +860,42 @@ void Write(base::WeakPtr<Profile> profile,
+ 
+ }  // namespace
+ 
+-bool ArcLoginsAvailable() {
+-  return !FindArcProfiles().empty();
++bool ArcLoginsAvailable(const ImportSource& source) {
++  return !FindArcProfiles(source).empty();
+ }
+ 
+-bool ArcPasswordsAvailable() {
+-  return std::ranges::any_of(FindArcProfiles(), [](const ArcProfile& p) {
++bool ArcPasswordsAvailable(const ImportSource& source) {
++  return std::ranges::any_of(FindArcProfiles(source), [](const ArcProfile& p) {
+     return !p.logins.empty() || !p.web_data.empty();
+   });
+ }
+ 
+-void ImportArcLogins(Profile* profile,
+-                     base::OnceCallback<void(ArcLoginsResult)> done) {
++bool ArcLoginsAvailable() {
++  return ArcLoginsAvailable(ArcSource());
++}
++
++bool ArcPasswordsAvailable() {
++  return ArcPasswordsAvailable(ArcSource());
++}
++
++void ImportLogins(Profile* profile,
++                  const ImportSource& source,
++                  bool with_cookies,
++                  base::OnceCallback<void(ArcLoginsResult)> done) {
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+-      base::BindOnce(&ReadArc, /*with_cookies=*/true),
++      base::BindOnce(&ReadArc, source, with_cookies),
+       base::BindOnce(&Write, profile->GetWeakPtr(), std::move(done)));
+ }
+ 
++void ImportArcLogins(Profile* profile,
++                     base::OnceCallback<void(ArcLoginsResult)> done) {
++  ImportLogins(profile, ArcSource(), /*with_cookies=*/true, std::move(done));
++}
++
+ void ImportArcPasswords(Profile* profile,
+                         base::OnceCallback<void(ArcLoginsResult)> done) {
+-  base::ThreadPool::PostTaskAndReplyWithResult(
+-      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+-      base::BindOnce(&ReadArc, /*with_cookies=*/false),
+-      base::BindOnce(&Write, profile->GetWeakPtr(), std::move(done)));
++  ImportLogins(profile, ArcSource(), /*with_cookies=*/false, std::move(done));
+ }
+ 
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/arc_logins.h b/chrome/browser/meridian/arc_logins.h
+index b0aaa8e8d6..58314effac 100644
+--- a/chrome/browser/meridian/arc_logins.h
++++ b/chrome/browser/meridian/arc_logins.h
+@@ -65,7 +65,17 @@ struct ArcLoginsResult {
+ };
+ 
+ // Whether Arc's cookie or password databases are there (blocking: file IO).
++struct ImportSource;
++
+ bool ArcLoginsAvailable();
++bool ArcLoginsAvailable(const ImportSource& source);
++bool ArcPasswordsAvailable(const ImportSource& source);
++// The sign-ins (cookies, when `with_cookies`), passwords and cards of
++// `source`'s profiles.
++void ImportLogins(Profile* profile,
++                  const ImportSource& source,
++                  bool with_cookies,
++                  base::OnceCallback<void(ArcLoginsResult)> done);
+ // Whether Arc has saved passwords or cards to bring (blocking: file IO).
+ bool ArcPasswordsAvailable();
+ 
+@@ -77,12 +87,15 @@ void ImportArcPasswords(Profile* profile,
+                         base::OnceCallback<void(ArcLoginsResult)> done);
+ 
+ namespace internal {
+-// macOS: "Arc Safe Storage" from the login keychain (macOS asks first);
+-// empty with `error` set if it isn't there or the person said no.
+-std::string ReadArcKeychainPassword(std::string* error);
+-// Windows: the 32-byte key from Arc's "Local State"; empty with `error` set
+-// if it isn't there or Windows wouldn't unwrap it.
+-std::vector<uint8_t> ReadArcOsCryptKey(std::string* error);
++// macOS: "<browser> Safe Storage" from the login keychain (macOS asks
++// first); empty with `error` set if it isn't there or the person said no.
++std::string ReadArcKeychainPassword(const std::string& service,
++                                   const std::string& account,
++                                   std::string* error);
++// Windows: the 32-byte key from the browser's "Local State"; empty with
++// `error` set if it isn't there or Windows wouldn't unwrap it.
++std::vector<uint8_t> ReadArcOsCryptKey(const base::FilePath& local_state,
++                                       std::string* error);
+ 
+ // Opens a private copy of an Arc database (Arc may be running) in `tmp`.
+ bool OpenCopy(const base::FilePath& db_file,
+diff --git a/chrome/browser/meridian/arc_logins_mac.mm b/chrome/browser/meridian/arc_logins_mac.mm
+index 96439c6813..8c4c6fda6c 100644
+--- a/chrome/browser/meridian/arc_logins_mac.mm
++++ b/chrome/browser/meridian/arc_logins_mac.mm
+@@ -10,9 +10,11 @@
+ 
+ namespace meridian::internal {
+ 
+-std::string ReadArcKeychainPassword(std::string* error) {
++std::string ReadArcKeychainPassword(const std::string& service,
++                                   const std::string& account,
++                                   std::string* error) {
+   auto result = crypto::apple::KeychainV2::GetInstance().FindGenericPassword(
+-      "Arc Safe Storage", "Arc");
++      service, account);
+   if (!result.has_value()) {
+     *error = result.error() == errSecItemNotFound ? "not-found" : "denied";
+     return std::string();
+diff --git a/chrome/browser/meridian/arc_logins_win.cc b/chrome/browser/meridian/arc_logins_win.cc
+index ee91e97ce6..9ab5cd6898 100644
+--- a/chrome/browser/meridian/arc_logins_win.cc
++++ b/chrome/browser/meridian/arc_logins_win.cc
+@@ -26,11 +26,11 @@ namespace meridian::internal {
+ // os_crypt.encrypted_key, base64 of "DPAPI" and the key as Windows's data
+ // protection wrapped it for this account. Only this account can unwrap it,
+ // and Windows doesn't ask.
+-std::vector<uint8_t> ReadArcOsCryptKey(std::string* error) {
++std::vector<uint8_t> ReadArcOsCryptKey(const base::FilePath& local_state,
++                                       std::string* error) {
+   std::string json;
+-  if (!base::ReadFileToStringWithMaxSize(
+-          ArcDataDir().AppendASCII("User Data").AppendASCII("Local State"),
+-          &json, 16 * 1024 * 1024)) {
++  if (!base::ReadFileToStringWithMaxSize(local_state, &json,
++                                         16 * 1024 * 1024)) {
+     *error = "no-data";
+     return {};
+   }
+diff --git a/chrome/browser/meridian/chrome_import.cc b/chrome/browser/meridian/chrome_import.cc
+new file mode 100644
+index 0000000000..cdff422f17
+--- /dev/null
++++ b/chrome/browser/meridian/chrome_import.cc
+@@ -0,0 +1,258 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/chrome_import.h"
++
++#include <algorithm>
++#include <memory>
++#include <set>
++
++#include "base/containers/span.h"
++#include "base/files/file_enumerator.h"
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
++#include "base/numerics/byte_conversions.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/meridian/import_source.h"
++#include "components/sessions/core/session_command.h"
++#include "components/sessions/core/session_id.h"
++#include "components/sessions/core/session_service_commands.h"
++#include "components/sessions/core/session_types.h"
++
++namespace meridian {
++
++namespace {
++
++constexpr size_t kMaxItems = 5000;
++constexpr int64_t kMaxFile = 64 * 1024 * 1024;
++
++std::optional<base::DictValue> ReadJson(const base::FilePath& file) {
++  std::string text;
++  if (!base::ReadFileToStringWithMaxSize(file, &text, kMaxFile)) {
++    return std::nullopt;
++  }
++  std::optional<base::Value> v =
++      base::JSONReader::Read(text, base::JSON_ALLOW_TRAILING_COMMAS);
++  if (!v || !v->is_dict()) {
++    return std::nullopt;
++  }
++  return std::move(*v).TakeDict();
++}
++
++void Convert(const base::ListValue& children,
++             int depth,
++             size_t& count,
++             std::vector<Item>& out) {
++  for (const base::Value& v : children) {
++    if (!v.is_dict() || count >= kMaxItems) {
++      continue;
++    }
++    const base::DictValue& node = v.GetDict();
++    const std::string* type = node.FindString("type");
++    const std::string* name = node.FindString("name");
++    if (type && *type == "url") {
++      const std::string* url = node.FindString("url");
++      GURL gurl = url ? GURL(*url) : GURL();
++      // Web pages only: no javascript: bookmarklets, chrome: or file: links.
++      if (!gurl.is_valid() || !gurl.SchemeIsHTTPOrHTTPS()) {
++        continue;
++      }
++      Item item;
++      item.url = gurl;
++      item.title = name && !name->empty() ? *name : gurl.spec();
++      ++count;
++      out.push_back(std::move(item));
++    } else if (type && *type == "folder" && depth < 32) {
++      const base::ListValue* kids = node.FindList("children");
++      Item folder;
++      folder.is_folder = true;
++      folder.open = false;
++      folder.title = name && !name->empty() ? *name : "Folder";
++      if (kids) {
++        Convert(*kids, depth + 1, count, folder.children);
++      }
++      if (!folder.children.empty()) {
++        ++count;
++        out.push_back(std::move(folder));
++      }
++    }
++  }
++}
++
++// The newest session file of a profile (Sessions/Session_<time>).
++base::FilePath NewestSession(const base::FilePath& profile) {
++  base::FileEnumerator files(profile.AppendASCII("Sessions"), false,
++                             base::FileEnumerator::FILES,
++                             FILE_PATH_LITERAL("Session_*"));
++  base::FilePath best;
++  base::Time best_time;
++  for (base::FilePath f = files.Next(); !f.empty(); f = files.Next()) {
++    base::Time t = files.GetInfo().GetLastModifiedTime();
++    if (best.empty() || t > best_time) {
++      best = f;
++      best_time = t;
++    }
++  }
++  return best;
++}
++
++}  // namespace
++
++namespace internal {
++
++std::vector<Item> ChromeBookmarks(const base::DictValue& root) {
++  std::vector<Item> out;
++  size_t count = 0;
++  const base::DictValue* roots = root.FindDict("roots");
++  if (!roots) {
++    return out;
++  }
++  // The bookmarks bar at the top; the other roots as folders below it.
++  if (const base::ListValue* bar =
++          roots->FindListByDottedPath("bookmark_bar.children")) {
++    Convert(*bar, 0, count, out);
++  }
++  for (const auto& [key, title] :
++       {std::pair<const char*, const char*>{"other", "Other bookmarks"},
++        {"synced", "Mobile bookmarks"}}) {
++    const base::ListValue* kids =
++        roots->FindListByDottedPath(std::string(key) + ".children");
++    if (!kids) {
++      continue;
++    }
++    Item folder;
++    folder.is_folder = true;
++    folder.open = false;
++    folder.title = title;
++    Convert(*kids, 1, count, folder.children);
++    if (!folder.children.empty()) {
++      out.push_back(std::move(folder));
++    }
++  }
++  return out;
++}
++
++std::vector<ArcSidebar::Tab> ChromeOpenTabs(const std::string& data) {
++  std::vector<ArcSidebar::Tab> out;
++  base::span<const uint8_t> bytes = base::as_byte_span(data);
++  if (bytes.size() < 8) {
++    return out;
++  }
++  // "SNSS", then the version: 3 is a plain file (5 is encrypted).
++  if (base::U32FromLittleEndian(bytes.first<4>()) != 0x53534E53 ||
++      base::U32FromLittleEndian(bytes.subspan<4, 4>()) != 3) {
++    return out;
++  }
++  std::vector<std::unique_ptr<sessions::SessionCommand>> commands;
++  size_t at = 8;
++  // Each command: its size (2 bytes, with the id), its id (1), its contents.
++  while (at + 3 <= bytes.size()) {
++    size_t size = base::U16FromLittleEndian(bytes.subspan(at).first<2>());
++    at += 2;
++    if (size < 1 || at + size > bytes.size()) {
++      break;
++    }
++    uint8_t id = bytes[at];
++    auto command = std::make_unique<sessions::SessionCommand>(
++        id, static_cast<sessions::SessionCommand::size_type>(size - 1));
++    command->contents().copy_from(bytes.subspan(at + 1, size - 1));
++    at += size;
++    if (id != 255) {  // the marker that the initial state is written
++      commands.push_back(std::move(command));
++    }
++  }
++  std::vector<std::unique_ptr<sessions::SessionWindow>> windows;
++  SessionID active = SessionID::InvalidValue();
++  std::string platform_session_id;
++  std::set<SessionID> discarded;
++  sessions::RestoreSessionFromCommands(commands, &windows, &active,
++                                       &platform_session_id, &discarded);
++  for (const auto& window : windows) {
++    if (window->type != sessions::SessionWindow::TYPE_NORMAL) {
++      continue;
++    }
++    for (const auto& tab : window->tabs) {
++      if (tab->navigations.empty()) {
++        continue;
++      }
++      const sessions::SerializedNavigationEntry& nav =
++          tab->navigations[tab->normalized_navigation_index()];
++      GURL url = nav.virtual_url();
++      if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS() ||
++          out.size() >= 500) {
++        continue;
++      }
++      out.push_back({url, nav.title().empty() ? url.spec()
++                                              : base::UTF16ToUTF8(nav.title())});
++    }
++  }
++  return out;
++}
++
++}  // namespace internal
++
++std::optional<ArcSidebar> ReadChromeSidebar(const ImportSource& source) {
++  if (source.user_data.empty() || !base::DirectoryExists(source.user_data)) {
++    return std::nullopt;
++  }
++  // The names people gave their Chrome profiles.
++  std::optional<base::DictValue> local_state =
++      ReadJson(source.user_data.AppendASCII("Local State"));
++  const base::DictValue* info =
++      local_state ? local_state->FindDictByDottedPath("profile.info_cache")
++                  : nullptr;
++  std::vector<std::string> dirs;
++  base::FileEnumerator found(source.user_data, false,
++                             base::FileEnumerator::DIRECTORIES);
++  for (base::FilePath dir = found.Next(); !dir.empty(); dir = found.Next()) {
++    std::string name = dir.BaseName().AsUTF8Unsafe();
++    if (IsProfileDir(name) &&
++        (base::PathExists(dir.AppendASCII("Bookmarks")) ||
++         base::DirectoryExists(dir.AppendASCII("Sessions")) ||
++         base::PathExists(dir.AppendASCII("History")))) {
++      dirs.push_back(name);
++    }
++  }
++  std::ranges::sort(dirs, {}, [](const std::string& d) {
++    int n = 0;
++    base::StringToInt(d.substr(std::min<size_t>(8, d.size())), &n);
++    return d == "Default" ? -1 : n;
++  });
++  if (dirs.empty()) {
++    return std::nullopt;
++  }
++  ArcSidebar out;
++  for (const std::string& dir : dirs) {
++    base::FilePath path = source.user_data.AppendUTF8(dir);
++    const std::string* name =
++        info ? info->FindStringByDottedPath(dir + ".name") : nullptr;
++    Space space;
++    space.name = name && !name->empty() ? name->substr(0, 60) : "Chrome";
++    if (dirs.size() == 1 && space.name.starts_with("Person ")) {
++      space.name = "Chrome";
++    }
++    space.icon = "🌐";
++    space.profile = ProfileIdFor(source, dir);
++    if (std::optional<base::DictValue> bookmarks =
++            ReadJson(path.AppendASCII("Bookmarks"))) {
++      space.pinned = internal::ChromeBookmarks(*bookmarks);
++    }
++    std::vector<ArcSidebar::Tab> open;
++    base::FilePath session = NewestSession(path);
++    std::string data;
++    if (!session.empty() &&
++        base::ReadFileToStringWithMaxSize(session, &data, kMaxFile)) {
++      open = internal::ChromeOpenTabs(data);
++    }
++    if (!space.profile.empty()) {
++      out.profile_names[space.profile] = space.name;
++    }
++    out.spaces.push_back(std::move(space));
++    out.today.push_back(std::move(open));
++  }
++  return out;
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/chrome_import.h b/chrome/browser/meridian/chrome_import.h
+new file mode 100644
+index 0000000000..392064b5ce
+--- /dev/null
++++ b/chrome/browser/meridian/chrome_import.h
+@@ -0,0 +1,37 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_CHROME_IMPORT_H_
++#define CHROME_BROWSER_MERIDIAN_CHROME_IMPORT_H_
++
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/values.h"
++#include "chrome/browser/meridian/arc_import.h"
++
++namespace meridian {
++
++struct ImportSource;
++
++// Google Chrome's sidebar, the way Meridian keeps one (blocking: file IO):
++// a space per Chrome profile (named as in Chrome), its bookmarks as pinned
++// tabs and folders (the bookmarks bar at the top, "Other bookmarks" and
++// "Mobile bookmarks" as folders), and the tabs it had open as Today tabs.
++// Chrome's other profiles go to Meridian profiles of their own. Only read;
++// nothing leaves the machine.
++std::optional<ArcSidebar> ReadChromeSidebar(const ImportSource& source);
++
++namespace internal {
++// A Bookmarks file's root -> pinned items (web pages and their folders).
++std::vector<Item> ChromeBookmarks(const base::DictValue& root);
++// A session file's (SNSS) open tabs: the current page of each, window by
++// window; empty if it can't be read (or is encrypted).
++std::vector<ArcSidebar::Tab> ChromeOpenTabs(const std::string& file);
++}  // namespace internal
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_CHROME_IMPORT_H_
+diff --git a/chrome/browser/meridian/import_source.cc b/chrome/browser/meridian/import_source.cc
+new file mode 100644
+index 0000000000..39a43b0592
+--- /dev/null
++++ b/chrome/browser/meridian/import_source.cc
+@@ -0,0 +1,91 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/import_source.h"
++
++#include "base/base_paths.h"
++#include "base/path_service.h"
++#include "base/strings/string_number_conversions.h"
++#include "build/build_config.h"
++#include "chrome/browser/meridian/arc_import.h"
++#include "chrome/browser/meridian/test_switches.h"
++
++namespace meridian {
++
++ImportSource::ImportSource() = default;
++ImportSource::ImportSource(const ImportSource&) = default;
++ImportSource& ImportSource::operator=(const ImportSource&) = default;
++ImportSource::~ImportSource() = default;
++
++ImportSource ArcSource() {
++  ImportSource s;
++  s.kind = "arc";
++  s.name = "Arc";
++  s.app_data = ArcDataDir();
++  if (!s.app_data.empty()) {
++    s.user_data = s.app_data.AppendASCII("User Data");
++  }
++  s.keychain_service = "Arc Safe Storage";
++  s.keychain_account = "Arc";
++  s.key_switch = "meridian-arc-safe-storage";
++  s.dir_switch = "meridian-arc-dir";
++  s.profile_prefix = "Meridian Profile Arc ";
++  return s;
++}
++
++ImportSource ChromeSource() {
++  ImportSource s;
++  s.kind = "chrome";
++  s.name = "Google Chrome";
++  s.keychain_service = "Chrome Safe Storage";
++  s.keychain_account = "Chrome";
++  s.key_switch = "meridian-chrome-safe-storage";
++  s.dir_switch = "meridian-chrome-dir";
++  s.profile_prefix = "Meridian Profile Chrome ";
++  // Tests: a fake Chrome user data folder.
++  if (HasTestSwitch(s.dir_switch)) {
++    s.user_data = TestSwitchPath(s.dir_switch);
++    return s;
++  }
++#if BUILDFLAG(IS_WIN)
++  base::FilePath local;
++  if (base::PathService::Get(base::DIR_LOCAL_APP_DATA, &local)) {
++    s.user_data = local.AppendASCII("Google")
++                      .AppendASCII("Chrome")
++                      .AppendASCII("User Data");
++  }
++#elif BUILDFLAG(IS_MAC)
++  base::FilePath home;
++  if (base::PathService::Get(base::DIR_HOME, &home)) {
++    s.user_data = home.AppendASCII("Library/Application Support/Google/Chrome");
++  }
++#else
++  base::FilePath home;
++  if (base::PathService::Get(base::DIR_HOME, &home)) {
++    s.user_data = home.AppendASCII(".config/google-chrome");
++  }
++#endif
++  return s;
++}
++
++ImportSource ImportSourceFor(const std::string& kind) {
++  return kind == "chrome" ? ChromeSource() : ArcSource();
++}
++
++bool IsProfileDir(const std::string& name) {
++  int n = 0;
++  return name == "Default" ||
++         (name.starts_with("Profile ") && base::StringToInt(name.substr(8), &n));
++}
++
++std::string ProfileIdFor(const ImportSource& source, const std::string& dir) {
++  int n = 0;
++  if (dir.starts_with("Profile ") && base::StringToInt(dir.substr(8), &n) &&
++      n > 0) {
++    return source.profile_prefix + base::NumberToString(n);
++  }
++  return std::string();
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/import_source.h b/chrome/browser/meridian/import_source.h
+new file mode 100644
+index 0000000000..2ba7ef939f
+--- /dev/null
++++ b/chrome/browser/meridian/import_source.h
+@@ -0,0 +1,60 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_IMPORT_SOURCE_H_
++#define CHROME_BROWSER_MERIDIAN_IMPORT_SOURCE_H_
++
++#include <string>
++
++#include "base/files/file_path.h"
++
++namespace meridian {
++
++// A Chromium browser Meridian moves in from: Arc or Google Chrome. Both keep
++// their profiles the same way ("Default", "Profile N" with History, Cookies,
++// Login Data…), encrypted with a key from the keychain (macOS) or from
++// "Local State" (Windows), so one import reads either.
++struct ImportSource {
++  ImportSource();
++  ImportSource(const ImportSource&);
++  ImportSource& operator=(const ImportSource&);
++  ~ImportSource();
++
++  // "arc" or "chrome".
++  std::string kind;
++  // For people: "Arc", "Google Chrome".
++  std::string name;
++  // Where the profile folders and "Local State" are.
++  base::FilePath user_data;
++  // Where Arc's own files are (its sidebar, archive, rules); empty for
++  // Chrome.
++  base::FilePath app_data;
++  // macOS keychain item holding the cookie key's password.
++  std::string keychain_service;
++  std::string keychain_account;
++  // Tests: a switch with that password instead of the keychain ("__deny__"
++  // acts like the person clicking Deny), and the one with the fake folder.
++  std::string key_switch;
++  std::string dir_switch;
++  // Meridian profile folders for its profiles other than "Default".
++  std::string profile_prefix;
++};
++
++ImportSource ArcSource();
++ImportSource ChromeSource();
++// "arc" or "chrome" (anything else: Arc).
++ImportSource ImportSourceFor(const std::string& kind);
++
++// The Meridian profile for one of its profile folders: "" (the main one) for
++// "Default", "<prefix>3" for "Profile 3". The same every time, so each part of
++// the import lands in the same profile whichever comes first.
++std::string ProfileIdFor(const ImportSource& source, const std::string& dir);
++
++// Whether `name` is a real profile folder ("Default", "Profile N"; not
++// "Guest Profile" or "System Profile").
++bool IsProfileDir(const std::string& name);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_IMPORT_SOURCE_H_
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index 085b602664..75f9a50b76 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -20,6 +20,8 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterBooleanPref(kSidebarRight, false);
+   registry->RegisterIntegerPref(kArchiveAfterHours, 12);
+   registry->RegisterTimePref(kArcDataImportedAt, base::Time());
++  registry->RegisterTimePref(kChromeDataImportedAt, base::Time());
++  registry->RegisterBooleanPref(kChromeImported, false);
+   registry->RegisterStringPref(kAgentAccess, "off");
+   registry->RegisterDictionaryPref(kWorkbenchClaudeSessions);
+   registry->RegisterBooleanPref(kAgentAllowJs, false);
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index b9db6cad1f..d8b15e6638 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -29,6 +29,11 @@ inline constexpr char kArchiveAfterHours[] = "meridian.archive_after_hours";
+ // When Arc's history and form entries were last brought over (arc_data.h);
+ // the next import brings only what's newer.
+ inline constexpr char kArcDataImportedAt[] = "meridian.arc_data_imported_at";
++// The same for Google Chrome's data, and whether its sidebar (bookmarks,
++// open tabs) came over.
++inline constexpr char kChromeDataImportedAt[] =
++    "meridian.chrome_data_imported_at";
++inline constexpr char kChromeImported[] = "meridian.chrome_imported";
+ // What AI agents (MCP clients) may do: "off", "read", "ask" (the person
+ // confirms every action) or "full".
+ inline constexpr char kAgentAccess[] = "meridian.agent_access";
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index a84f5880a3..47b0ba1728 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -686,23 +686,25 @@ interface SidebarHandler {
+   // Little window: its page again in `space_id` (Arc's space picker).
+   SetLittleSpace(string space_id);
+ 
+-  // Arc's sidebar on this computer (null if there is none).
+-  GetArcPreview() => (ArcPreview? preview);
++  // Moving in from another browser: `source` is "arc" or "chrome" (Google
++  // Chrome: a space per profile, bookmarks as pinned tabs, its open tabs).
++  // Its sidebar on this computer (null if there is none).
++  GetArcPreview(string source) => (ArcPreview? preview);
+   // Brings Arc's spaces, pinned tabs, folders and favorites in; Arc's open
+   // tabs come in as Today tabs that load when first opened.
+-  ImportArc() => (bool ok);
++  ImportArc(string source) => (bool ok);
+   // Arc's sign-ins (cookies), saved passwords and payment cards, each Arc
+   // profile's into its spaces' profile. macOS asks the person before Meridian
+   // may read Arc's key, so the page says so first. `error`: empty, "no-data",
+   // "not-found", "denied" or "read".
+-  ImportArcLogins() => (int32 imported, int32 passwords, int32 cards,
++  ImportArcLogins(string source) => (int32 imported, int32 passwords, int32 cards,
+                         string error);
+   // Arc's saved passwords and cards only (the ones already here stay as they
+   // are).
+-  ImportArcPasswords() => (int32 imported, int32 cards, string error);
++  ImportArcPasswords(string source) => (int32 imported, int32 cards, string error);
+   // Arc's history, form entries, addresses, site permissions, site searches,
+   // sites' storage, Air Traffic Control's rules and archive; nothing to ask.
+-  ImportArcData() => (ArcDataResult result);
++  ImportArcData(string source) => (ArcDataResult result);
+ 
+   // Welcome tour. `use_apps`: look at the installed apps (else a plain
+   // everyday setup); `persona` (developer, designer, manager, everyday)
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 74653d3643..0c2058f2a5 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -47,6 +47,8 @@
+ #include "chrome/browser/meridian/agent/agent_service_factory.h"
+ #include "chrome/browser/meridian/arc_data.h"
+ #include "chrome/browser/meridian/arc_logins.h"
++#include "chrome/browser/meridian/chrome_import.h"
++#include "chrome/browser/meridian/import_source.h"
+ #include "mojo/public/cpp/bindings/callback_helpers.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/meridian/atc.h"
+@@ -1608,13 +1610,20 @@ struct ArcRead {
+ };
+ }  // namespace
+ 
+-void SidebarHandler::GetArcPreview(GetArcPreviewCallback callback) {
++void SidebarHandler::GetArcPreview(const std::string& kind,
++                                   GetArcPreviewCallback callback) {
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+-      base::BindOnce([] {
+-        return ArcRead{ReadArcSidebar(), ArcLoginsAvailable(),
+-                       ArcPasswordsAvailable(), ArcDataAvailable()};
+-      }),
++      base::BindOnce(
++          [](std::string kind) {
++            ImportSource source = ImportSourceFor(kind);
++            return ArcRead{kind == "chrome" ? ReadChromeSidebar(source)
++                                            : ReadArcSidebar(),
++                           ArcLoginsAvailable(source),
++                           ArcPasswordsAvailable(source),
++                           DataAvailable(source)};
++          },
++          kind),
+       base::BindOnce(
+           [](GetArcPreviewCallback callback,
+              ArcRead read) {
+@@ -1658,17 +1667,24 @@ void SidebarHandler::GetArcPreview(GetArcPreviewCallback callback) {
+           std::move(callback)));
+ }
+ 
+-void SidebarHandler::ImportArc(ImportArcCallback callback) {
++void SidebarHandler::ImportArc(const std::string& kind,
++                               ImportArcCallback callback) {
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+-      base::BindOnce(&ReadArcSidebar),
++      base::BindOnce(
++          [](std::string kind) {
++            return kind == "chrome" ? ReadChromeSidebar(ChromeSource())
++                                    : ReadArcSidebar();
++          },
++          kind),
+       base::BindOnce(&SidebarHandler::OnArcRead, weak_factory_.GetWeakPtr(),
+-                     std::move(callback)));
++                     kind, std::move(callback)));
+ }
+ 
+-void SidebarHandler::ImportArcLogins(ImportArcLoginsCallback callback) {
+-  meridian::ImportArcLogins(
+-      browser_->GetProfile(),
++void SidebarHandler::ImportArcLogins(const std::string& kind,
++                                     ImportArcLoginsCallback callback) {
++  meridian::ImportLogins(
++      browser_->GetProfile(), ImportSourceFor(kind), /*with_cookies=*/true,
+       base::BindOnce(
+           [](ImportArcLoginsCallback callback, ArcLoginsResult result) {
+             std::move(callback).Run(result.imported, result.passwords,
+@@ -1677,9 +1693,10 @@ void SidebarHandler::ImportArcLogins(ImportArcLoginsCallback callback) {
+           std::move(callback)));
+ }
+ 
+-void SidebarHandler::ImportArcPasswords(ImportArcPasswordsCallback callback) {
+-  meridian::ImportArcPasswords(
+-      browser_->GetProfile(),
++void SidebarHandler::ImportArcPasswords(const std::string& kind,
++                                        ImportArcPasswordsCallback callback) {
++  meridian::ImportLogins(
++      browser_->GetProfile(), ImportSourceFor(kind), /*with_cookies=*/false,
+       base::BindOnce(
+           [](ImportArcPasswordsCallback callback, ArcLoginsResult result) {
+             std::move(callback).Run(result.passwords, result.cards,
+@@ -1688,9 +1705,10 @@ void SidebarHandler::ImportArcPasswords(ImportArcPasswordsCallback callback) {
+           std::move(callback)));
+ }
+ 
+-void SidebarHandler::ImportArcData(ImportArcDataCallback callback) {
+-  meridian::ImportArcData(
+-      browser_->GetProfile(),
++void SidebarHandler::ImportArcData(const std::string& kind,
++                                   ImportArcDataCallback callback) {
++  meridian::ImportData(
++      browser_->GetProfile(), ImportSourceFor(kind),
+       base::BindOnce(
+           [](ImportArcDataCallback callback, ArcDataResult r) {
+             auto m = mojom::ArcDataResult::New();
+@@ -1983,7 +2001,8 @@ void SidebarHandler::FinishOnboarding() {
+   ScheduleNotify();
+ }
+ 
+-void SidebarHandler::OnArcRead(ImportArcCallback callback,
++void SidebarHandler::OnArcRead(std::string kind,
++                               ImportArcCallback callback,
+                                std::optional<ArcSidebar> arc) {
+   if (!arc || arc->spaces.empty()) {
+     std::move(callback).Run(false);
+@@ -2046,8 +2065,12 @@ void SidebarHandler::OnArcRead(ImportArcCallback callback,
+   }
+   MainProfileFor(browser_->GetProfile())
+       ->GetPrefs()
+-      ->SetBoolean(prefs::kArcImported, true);
+-  AddArcExtensions(/*again=*/true);
++      ->SetBoolean(kind == "chrome" ? prefs::kChromeImported
++                                    : prefs::kArcImported,
++                   true);
++  if (kind != "chrome") {
++    AddArcExtensions(/*again=*/true);
++  }
+   ActivateSpace(service_->active_space_id());
+   ScheduleNotify();
+   std::move(callback).Run(true);
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 087a39b6fd..cf2ac26288 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -191,11 +191,16 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void ClearToday() override;
+   void OpenInMeridian() override;
+   void SetLittleSpace(const std::string& space_id) override;
+-  void GetArcPreview(GetArcPreviewCallback callback) override;
+-  void ImportArc(ImportArcCallback callback) override;
+-  void ImportArcLogins(ImportArcLoginsCallback callback) override;
+-  void ImportArcPasswords(ImportArcPasswordsCallback callback) override;
+-  void ImportArcData(ImportArcDataCallback callback) override;
++  void GetArcPreview(const std::string& source,
++                     GetArcPreviewCallback callback) override;
++  void ImportArc(const std::string& source,
++                 ImportArcCallback callback) override;
++  void ImportArcLogins(const std::string& source,
++                       ImportArcLoginsCallback callback) override;
++  void ImportArcPasswords(const std::string& source,
++                          ImportArcPasswordsCallback callback) override;
++  void ImportArcData(const std::string& source,
++                     ImportArcDataCallback callback) override;
+   void ProposeSetup(bool use_apps,
+                     const std::string& persona,
+                     ProposeSetupCallback callback) override;
+@@ -312,7 +317,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+ 
+   TabStripModel* model();
+   mojom::SidebarStatePtr BuildState();
+-  void OnArcRead(ImportArcCallback callback, std::optional<ArcSidebar> arc);
++  void OnArcRead(std::string source,
++                 ImportArcCallback callback,
++                 std::optional<ArcSidebar> arc);
+   // Arc's extensions, each added to its Arc profile's Meridian profile from
+   // the Chrome Web Store the way Chrome adds an account's extensions on a new
+   // computer (sync): once per profile, after an Arc import.
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index c2f2941c49..02729f4792 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -758,7 +758,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.statusText_ = e.detail;
+   }
+ 
+-  protected onMeridianOnboarding_(e: CustomEvent<'tour'|'arc'>) {
++  protected onMeridianOnboarding_(e: CustomEvent<'tour'|'arc'|'chrome'>) {
+     this.closeSiteControl_();
+     this.$.onboarding.show(e.detail);
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+index 162796cee1..ed5cf9513d 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+@@ -38,14 +38,18 @@ export function getHtml(this: MeridianOnboardingElement) {
+           </div>` : ''}
+ 
+         ${this.step_ === 'arc' && this.arc_ ? html`
+-          <h2>Bring everything from Arc</h2>
+-          <p class="whisper top">Your spaces, pinned tabs and favorites move
+-            over as they are. Arc stays untouched.</p>
++          <h2>Bring everything from ${this.sourceName_}</h2>
++          <p class="whisper top">${this.source_ === 'chrome' ?
++              'Each Chrome profile becomes a space: its bookmarks as pinned ' +
++                  'tabs, the tabs you had open in Today. Chrome stays untouched.' :
++              'Your spaces, pinned tabs and favorites move over as they are. ' +
++                  'Arc stays untouched.'}</p>
+           <div class="arc-move">
+             <div class="arc-stats">
+               <b>${this.arc_.spaceCount} spaces</b>
+               <b>${this.arcTabs_} tabs</b>
+-              <b>${this.arc_.favoriteCount} favorites</b>
++              ${this.arc_.favoriteCount ? html`
++                <b>${this.arc_.favoriteCount} favorites</b>` : ''}
+             </div>
+             <div class="arc-spaces">
+               ${this.arcSpaces_.map(s => html`
+@@ -71,7 +75,7 @@ export function getHtml(this: MeridianOnboardingElement) {
+         ` : ''}
+ 
+         ${this.step_ === 'arc' && !this.arc_ ? html`
+-          <h2>Arc isn’t on this Mac</h2>
++          <h2>${this.sourceName_} isn’t on this computer</h2>
+           <p class="whisper">There is nothing to bring over.</p>` : ''}
+ 
+         ${this.step_ === 'tailor' ? html`
+@@ -171,12 +175,13 @@ export function getHtml(this: MeridianOnboardingElement) {
+     <div class="confirm" role="dialog" aria-modal="true">
+       <div class="card">
+         <h3>Your Mac will ask for permission</h3>
+-        <p>To keep you signed in to your sites, Meridian copies Arc’s
+-          sign-ins, saved passwords and cards.
++        <p>To keep you signed in to your sites, Meridian copies
++          ${this.sourceName_}’s sign-ins, saved passwords and cards.
+           Your Mac will ask whether Meridian may read them: click
+           <b>Allow</b> (and type your Mac password if asked). Meridian needs
+           this only now, so there’s no need for Always Allow.</p>
+-        <p>Nothing leaves your computer, and Arc stays as it is.</p>
++        <p>Nothing leaves your computer, and ${this.sourceName_} stays as it
++          is.</p>
+         <div class="card-actions">
+           <button id="confirmCancel" class="btn ghost"
+               @click="${this.onConfirmCancelClick_}">Cancel</button>
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+index 1aaa266ad9..1fdb75bc30 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+@@ -104,6 +104,8 @@ export class MeridianOnboardingElement extends CrLitElement {
+       chips_: {state: true, type: Array},
+       persona_: {state: true, type: String},
+       arcTabs_: {state: true, type: Number},
++      source_: {state: true, type: String},
++      sourceName_: {state: true, type: String},
+       canStartFresh_: {state: true, type: Boolean},
+     };
+   }
+@@ -112,6 +114,10 @@ export class MeridianOnboardingElement extends CrLitElement {
+   protected accessor step_: StepName = 'hello';
+   protected accessor steps_: StepName[] = [];
+   protected accessor arc_: ArcPreview|null = null;
++  // Where Meridian moves in from: 'arc' or 'chrome'.
++  protected accessor source_: string = 'arc';
++  // "Arc" or "Chrome", as the step says it.
++  protected accessor sourceName_: string = 'Arc';
+   protected accessor withLogins_: boolean = true;
+   protected accessor confirmLogins_: boolean = false;
+   protected accessor proposal_: SetupProposal|null = null;
+@@ -143,16 +149,23 @@ export class MeridianOnboardingElement extends CrLitElement {
+   private fresh_: boolean = false;
+   private helloTimer_: number|null = null;
+ 
+-  // `start`: 'arc' opens straight at the Arc step (File > Import from Arc);
+-  // 'preset' shows the setup for `persona` (the home page's "Set up for me").
+-  async show(start: 'tour'|'arc'|'preset' = 'tour', persona = '') {
++  // `start`: 'arc' or 'chrome' opens straight at the moving-in step (File >
++  // Import from Arc / Chrome); 'preset' shows the setup for `persona` (the
++  // home page's "Set up for me"). The tour moves in from Arc, else Chrome.
++  async show(start: 'tour'|'arc'|'chrome'|'preset' = 'tour', persona = '') {
+     if (this.open) {
+       return;
+     }
+-    const [{preview}, {isDefault}] = await Promise.all([
+-      this.handler_.getArcPreview(),
++    this.source_ = start === 'chrome' ? 'chrome' : 'arc';
++    let [{preview}, {isDefault}] = await Promise.all([
++      this.handler_.getArcPreview(this.source_),
+       this.handler_.isDefaultBrowser(),
+     ]);
++    if (!preview && start === 'tour') {
++      this.source_ = 'chrome';
++      preview = (await this.handler_.getArcPreview('chrome')).preview;
++    }
++    this.sourceName_ = this.source_ === 'chrome' ? 'Chrome' : 'Arc';
+     this.arc_ = preview;
+     this.isDefault_ = isDefault;
+     this.fresh_ = false;
+@@ -171,7 +184,8 @@ export class MeridianOnboardingElement extends CrLitElement {
+       this.pickedFavorites_ = proposal.favorites.map(() => true);
+       this.steps_ = ['preview', 'done'];
+     } else {
+-      this.steps_ = start === 'arc' ? ['arc', 'done'] : this.tourSteps_();
++      this.steps_ = start === 'arc' || start === 'chrome' ? ['arc', 'done'] :
++                                                            this.tourSteps_();
+     }
+     this.step_ = this.steps_[0]!;
+     this.open = true;
+@@ -374,27 +388,28 @@ export class MeridianOnboardingElement extends CrLitElement {
+       return;
+     }
+     this.busy_ = 'Moving in…';
+-    const {ok} = await this.handler_.importArc();
++    const {ok} = await this.handler_.importArc(this.source_);
+     if (ok && this.withLogins_ && this.arc_?.loginsAvailable) {
+       const {imported, passwords, cards, error} =
+-          await this.handler_.importArcLogins();
++          await this.handler_.importArcLogins(this.source_);
+       const more = [
+         passwords ? `${passwords.toLocaleString()} passwords` : '',
+         cards ? `${cards.toLocaleString()} ${cards === 1 ? 'card' : 'cards'}` :
+                 '',
+       ].filter(x => x);
++      const name = this.sourceName_;
+       this.note_ = error === 'denied' ?
+-          'Sign-ins weren’t brought over. You can try again from File > Import from Arc.' :
++          `Sign-ins weren’t brought over. You can try again from File > Import from ${name}.` :
+           error === 'busy' ?
+-          'Sign-ins weren’t brought over: Arc is open. Quit Arc, then try again from File > Import from Arc.' :
+-          error ? 'Arc’s sign-ins couldn’t be read.' :
++          `Sign-ins weren’t brought over: ${name} is open. Quit ${name}, then try again from File > Import from ${name}.` :
++          error ? `${name}’s sign-ins couldn’t be read.` :
+                   `You’re still signed in to your sites (${
+                       [`${imported.toLocaleString()} sign-ins`, ...more].join(
+                           ', ')} brought over).`;
+     }
+     // History, permissions, sites' data and the rest: nothing to ask.
+     if (ok && this.arc_?.dataAvailable) {
+-      const {result} = await this.handler_.importArcData();
++      const {result} = await this.handler_.importArcData(this.source_);
+       window.dispatchEvent(new Event('meridian-icons-changed'));
+       if (!result.error) {
+         this.note_ = [this.note_, 'Your history and the rest came too.']
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index ed9ecc21ba..b826f6c2ba 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -304,7 +304,7 @@ export class MeridianSettingsElement extends CrLitElement {
+     this.handler_.getAgentClis().then(({clis}) => this.clis_ = clis);
+     this.handler_.getArcExtensions().then(
+         ({extensions}) => this.arcExtensions_ = extensions);
+-    this.handler_.getArcPreview().then(
++    this.handler_.getArcPreview('arc').then(
+         ({preview}) => {
+           this.arcPasswords_ = !!preview?.passwordsAvailable;
+           this.arcData_ = !!preview?.dataAvailable;
+@@ -644,7 +644,7 @@ export class MeridianSettingsElement extends CrLitElement {
+   // macOS asks before Meridian may read Arc's key; the row says so.
+   protected async onImportArcPasswordsClick_() {
+     this.arcPasswordsNote_ = 'Bringing them over…';
+-    const {imported, cards, error} = await this.handler_.importArcPasswords();
++    const {imported, cards, error} = await this.handler_.importArcPasswords('arc');
+     const brought = [
+       imported ? `${imported.toLocaleString()} passwords` : '',
+       cards ? `${cards.toLocaleString()} ${cards === 1 ? 'card' : 'cards'}` :
+@@ -660,7 +660,7 @@ export class MeridianSettingsElement extends CrLitElement {
+ 
+   protected async onImportArcDataClick_() {
+     this.arcDataNote_ = 'Bringing it over…';
+-    const {result} = await this.handler_.importArcData();
++    const {result} = await this.handler_.importArcData('arc');
+     window.dispatchEvent(new Event('meridian-icons-changed'));
+     this.arcDataNote_ = result.error ? 'Arc has nothing more to bring.' :
+                                        arcDataSummary(result);
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index cbddc0e138..ba4be9789d 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -1610,6 +1610,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+         {label: 'Archive', icon: 'archive', keys: keyText('⌥⌘A'), separatorBefore: true, action: run(Command.kShowArchive)},
+         {label: 'Downloads', icon: 'download', action: run(Command.kDownloads)},
+         {label: 'Import from Arc…', icon: 'layers', separatorBefore: true, action: run(Command.kImportArc)},
++        {label: 'Import from Chrome…', icon: 'layers', action: () => this.fire('meridian-onboarding', 'chrome')},
+         {label: 'Welcome Tour', icon: 'sparkles', action: run(Command.kWelcomeTour)},
+         {label: 'Settings', icon: 'settings', keys: keyText('⌘,'), separatorBefore: true, action: run(Command.kShowSettings)},
+       ],

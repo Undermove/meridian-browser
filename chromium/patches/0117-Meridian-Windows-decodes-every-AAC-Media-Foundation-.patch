@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Sun, 15 Nov 2026 13:40:09 +0400
+Subject: [PATCH 118/202] Meridian: Windows decodes every AAC (Media
+ Foundation), not just xHE-AAC
+
+Meridian's FFmpeg has no AAC decoder on Windows now, as on the Mac, so
+AAC LC, HE-AAC and HE-AAC v2 go to Media Foundation's decoder in the GPU
+process: with the stream's AudioSpecificConfig and the ADTS header MSE's
+parsers add taken off, or as ADTS for a raw .aac file that has no config.
+H.264 already went to Direct3D 11's decoder; without a GPU that decodes it
+there is no H.264, since nothing else in the build can.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ media/base/win/mf_helpers.cc                  |  4 +-
+ media/ffmpeg/ffmpeg_common.cc                 |  3 +-
+ .../win/media_foundation_audio_decoder.cc     | 42 +++++++++++++++----
+ .../services/gpu_mojo_media_client_win.cc     |  5 +++
+ 4 files changed, 45 insertions(+), 9 deletions(-)
+
+diff --git a/media/base/win/mf_helpers.cc b/media/base/win/mf_helpers.cc
+index e121ba1f9c..ae1236df3e 100644
+--- a/media/base/win/mf_helpers.cc
++++ b/media/base/win/mf_helpers.cc
+@@ -540,7 +540,9 @@ HRESULT GetAacAudioType(const AudioDecoderConfig& decoder_config,
+ 
+   size_t extra_size = wave_format_size - sizeof(WAVEFORMATEX);
+   aac_wave_format->wfx.cbSize = static_cast<WORD>(extra_size);
+-  aac_wave_format->wPayloadType = 0;  // RAW AAC
++  // Meridian: frames with no AudioSpecificConfig beside them are a raw ADTS
++  // stream (an .aac file, MSE's audio/aac), each with its own header.
++  aac_wave_format->wPayloadType = extra_data.empty() ? 1 : 0;  // ADTS : RAW
+   aac_wave_format->wAudioProfileLevelIndication =
+       0xFE;                          // no audio profile specified
+   aac_wave_format->wStructType = 0;  // audio specific config follows
+diff --git a/media/ffmpeg/ffmpeg_common.cc b/media/ffmpeg/ffmpeg_common.cc
+index 591d20e75e..662e3fa11e 100644
+--- a/media/ffmpeg/ffmpeg_common.cc
++++ b/media/ffmpeg/ffmpeg_common.cc
+@@ -403,7 +403,8 @@ bool AVCodecContextToAudioDecoderConfig(const AVCodecContext* codec_context,
+ #else
+       NOTREACHED();
+ #endif
+-    // Meridian: nor for AAC, which macOS decodes (AudioToolbox, float planar).
++    // Meridian: nor for AAC, which the system decodes (AudioToolbox, Media
++    // Foundation), to float planar.
+     case AudioCodec::kAAC:
+       if (sample_format == kUnknownSampleFormat) {
+         sample_format = kSampleFormatPlanarF32;
+diff --git a/media/filters/win/media_foundation_audio_decoder.cc b/media/filters/win/media_foundation_audio_decoder.cc
+index ed9529f3d6..ad58555ff5 100644
+--- a/media/filters/win/media_foundation_audio_decoder.cc
++++ b/media/filters/win/media_foundation_audio_decoder.cc
+@@ -100,7 +100,9 @@ std::optional<MFT_REGISTER_TYPE_INFO> GetTypeInfo(
+ #endif
+ #if BUILDFLAG(USE_PROPRIETARY_CODECS)
+     case AudioCodec::kAAC:
+-      if (config.profile() == AudioCodecProfile::kXHE_AAC &&
++      // Meridian: every AAC goes to Windows's decoder, not only xHE-AAC
++      // (which needs Windows 11 22H2): its FFmpeg has none.
++      if (config.profile() != AudioCodecProfile::kXHE_AAC ||
+           base::win::GetVersion() >= base::win::Version::WIN11_22H2) {
+         return MFT_REGISTER_TYPE_INFO{MFMediaType_Audio, MFAudioFormat_AAC};
+       }
+@@ -115,7 +117,25 @@ std::optional<MFT_REGISTER_TYPE_INFO> GetTypeInfo(
+   }
+ }
+ 
+-bool PopulateInputSample(IMFSample* sample, const DecoderBuffer& input) {
++// Meridian: the size of the ADTS header in front of an AAC frame (MSE's MP4
++// and ADTS parsers put one there), or 0. The decoder was given the stream's
++// AudioSpecificConfig and takes frames without it.
++size_t AdtsHeaderSize(base::span<const uint8_t> frame) {
++  if (frame.size() < 7 || frame[0] != 0xff || (frame[1] & 0xf6) != 0xf0) {
++    return 0;
++  }
++  // 7 bytes, and 2 more of CRC unless protection_absent says there is none.
++  const size_t size = (frame[1] & 1) ? 7 : 9;
++  return frame.size() > size ? size : 0;
++}
++
++// `skip`: bytes at the start of `input` that stay behind (Meridian: an ADTS
++// header).
++bool PopulateInputSample(IMFSample* sample,
++                         const DecoderBuffer& input,
++                         size_t skip) {
++  const base::span<const uint8_t> data =
++      base::span<const uint8_t>(input).subspan(skip);
+   Microsoft::WRL::ComPtr<IMFMediaBuffer> buffer;
+   HRESULT hr = sample->GetBufferByIndex(0, &buffer);
+   RETURN_ON_HR_FAILURE(hr, "Failed to get buffer from sample", false);
+@@ -131,11 +151,11 @@ bool PopulateInputSample(IMFSample* sample, const DecoderBuffer& input) {
+   auto destination = UNSAFE_BUFFERS(base::span(destination_ptr, max_length));
+ 
+   RETURN_ON_FAILURE(!current_length, "Input length is zero", false);
+-  RETURN_ON_FAILURE(input.size() <= max_length, "Input length is too long",
++  RETURN_ON_FAILURE(data.size() <= max_length, "Input length is too long",
+                     false);
+-  destination.copy_prefix_from(input);
++  destination.copy_prefix_from(data);
+ 
+-  hr = buffer->SetCurrentLength(input.size());
++  hr = buffer->SetCurrentLength(data.size());
+   RETURN_ON_HR_FAILURE(hr, "Failed to set buffer length", false);
+ 
+   hr = buffer->Unlock();
+@@ -263,13 +283,21 @@ void MediaFoundationAudioDecoder::Decode(scoped_refptr<DecoderBuffer> buffer,
+     has_reset_ = false;
+   }
+ 
+-  auto sample = CreateEmptySampleWithBuffer(buffer->size(), 0);
++  // Meridian: AAC that isn't a raw ADTS stream (mf_helpers.cc: GetAacAudioType)
++  // goes in without the ADTS header MSE's parsers add.
++  size_t skip = 0;
++  if (config_.codec() == AudioCodec::kAAC &&
++      config_.profile() != AudioCodecProfile::kXHE_AAC &&
++      !config_.extra_data().empty()) {
++    skip = AdtsHeaderSize(*buffer);
++  }
++  auto sample = CreateEmptySampleWithBuffer(buffer->size() - skip, 0);
+   if (!sample) {
+     std::move(decode_cb_bound).Run(DecoderStatus::Codes::kFailed);
+     return;
+   }
+ 
+-  if (!PopulateInputSample(sample.Get(), *buffer)) {
++  if (!PopulateInputSample(sample.Get(), *buffer, skip)) {
+     std::move(decode_cb_bound).Run(DecoderStatus::Codes::kFailed);
+     return;
+   }
+diff --git a/media/mojo/services/gpu_mojo_media_client_win.cc b/media/mojo/services/gpu_mojo_media_client_win.cc
+index 9716800e49..5a5e35a618 100644
+--- a/media/mojo/services/gpu_mojo_media_client_win.cc
++++ b/media/mojo/services/gpu_mojo_media_client_win.cc
+@@ -105,6 +105,11 @@ class GpuMojoMediaClientWin final : public GpuMojoMediaClient {
+         InitializeMediaFoundation()) {
+       audio_configs.emplace_back(AudioCodec::kAAC, AudioCodecProfile::kXHE_AAC);
+     }
++    // Meridian: every AAC; its FFmpeg has no AAC decoder (as on macOS:
++    // gpu_mojo_media_client_mac.cc).
++    if (InitializeMediaFoundation()) {
++      audio_configs.emplace_back(AudioCodec::kAAC, AudioCodecProfile::kUnknown);
++    }
+ 
+     return audio_configs;
+   }

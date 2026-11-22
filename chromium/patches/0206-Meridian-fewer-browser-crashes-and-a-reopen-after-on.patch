@@ -1,0 +1,386 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 20 Nov 2026 21:42:46 +0400
+Subject: [PATCH 207/207] Meridian: fewer browser crashes, and a reopen after
+ one
+
+- LoadWaiter finished (and DeleteSoon'ed itself) more than once: a double free
+  in the browser process (crash 20.11 19:04 in 0.6.13, DeleteHelper::DoDelete
+  on freed memory). FileInputSetter finishes once too.
+- Detaching an embedded tab called ReportBadMessage outside a mojo dispatch
+  (SurfaceEmbedConnector::Detach -> FrameNodeImpl::SetViewportIntersection):
+  a crash of the whole browser; now ignored.
+- macOS: a crash watcher reopens Meridian after a crash of the browser
+  process (not after a clean quit, not twice in 2 minutes, not under tests).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   6 +
+ .../browser/meridian/agent/agent_service.cc   |  14 ++
+ chrome/browser/meridian/crash_watcher_mac.cc  | 218 ++++++++++++++++++
+ chrome/browser/meridian/crash_watcher_mac.h   |  27 +++
+ chrome/browser/meridian/helper_modes.cc       |  10 +
+ .../graph/frame_node_impl.cc                  |   6 +-
+ 6 files changed, 278 insertions(+), 3 deletions(-)
+ create mode 100644 chrome/browser/meridian/crash_watcher_mac.cc
+ create mode 100644 chrome/browser/meridian/crash_watcher_mac.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 77f73257cd..07fa7b3b8c 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -245,6 +245,12 @@ source_set("helper_modes") {
+     ":mission_hook",
+     "//base",
+   ]
++  if (is_mac) {
++    sources += [
++      "crash_watcher_mac.cc",
++      "crash_watcher_mac.h",
++    ]
++  }
+ }
+ 
+ source_set("meridian") {
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index 5addb54053..4862043bd5 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -129,6 +129,14 @@ class LoadWaiter : public content::WebContentsObserver {
+   void DidStopLoading() override { Finish(); }
+   void WebContentsDestroyed() override { Finish(); }
+   void Finish() {
++    // Once: stopping, the 30 s timer and the tab closing can all come before
++    // the deletion runs, and a second DeleteSoon freed it twice (it took the
++    // whole browser down, with every agent in it).
++    if (finished_) {
++      return;
++    }
++    finished_ = true;
++    Observe(nullptr);
+     if (done_) {
+       std::move(done_).Run();
+     }
+@@ -136,6 +144,8 @@ class LoadWaiter : public content::WebContentsObserver {
+                                                                this);
+   }
+ 
++  bool finished_ = false;
++
+   base::OnceClosure done_;
+   base::WeakPtrFactory<LoadWaiter> weak_factory_{this};
+ };
+@@ -386,6 +396,10 @@ class FileInputSetter : public content::DevToolsAgentHostClient {
+   }
+ 
+   void Finish(std::string error) {
++    // Once (a reply and the host closing can both finish it).
++    if (!done_) {
++      return;
++    }
+     if (host_) {
+       host_->DetachClient(this);
+       host_ = nullptr;
+diff --git a/chrome/browser/meridian/crash_watcher_mac.cc b/chrome/browser/meridian/crash_watcher_mac.cc
+new file mode 100644
+index 0000000000..6c1201038d
+--- /dev/null
++++ b/chrome/browser/meridian/crash_watcher_mac.cc
+@@ -0,0 +1,218 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/crash_watcher_mac.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <signal.h>
++#include <spawn.h>
++#include <stdlib.h>
++#include <sys/event.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++#include <fstream>
++#include <sstream>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/compiler_specific.h"
++#include "base/containers/span.h"
++
++extern char** environ;
++
++namespace meridian {
++
++namespace {
++
++constexpr std::string_view kWatcher = "--meridian-crash-watcher=";
++constexpr std::string_view kUserDataDir = "--user-data-dir=";
++constexpr int kLoopSeconds = 120;
++
++bool StartsWith(std::string_view s, std::string_view prefix) {
++  return s.substr(0, prefix.size()) == prefix;
++}
++
++base::span<const char*> Args(int argc, const char** argv) {
++  // main()'s own arguments.
++  return UNSAFE_BUFFERS(base::span(argv, static_cast<size_t>(argc)));
++}
++
++std::string ValueOf(int argc, const char** argv, std::string_view sw) {
++  for (const char* a : Args(argc, argv).subspan(1u)) {
++    if (a && StartsWith(a, sw)) {
++      return std::string(std::string_view(a).substr(sw.size()));
++    }
++  }
++  return {};
++}
++
++bool Has(int argc, const char** argv, std::string_view prefix) {
++  for (const char* a : Args(argc, argv).subspan(1u)) {
++    if (a && StartsWith(a, prefix)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++std::string DefaultUserDataDir() {
++  const char* home = getenv("HOME");
++  return std::string(home ? home : "") +
++         "/Library/Application Support/Meridian Browser";
++}
++
++std::string ReadFile(const std::string& path) {
++  std::ifstream in(path, std::ios::binary);
++  std::stringstream s;
++  s << in.rdbuf();
++  return s.str();
++}
++
++// The profile's exit_type: "Crashed" from start until a clean exit writes
++// "Normal" (Chrome's own "restore pages?" signal).
++bool EndedWithoutCleanExit(const std::string& user_data_dir) {
++  std::string prefs = ReadFile(user_data_dir + "/Default/Preferences");
++  return prefs.find("\"exit_type\":\"Crashed\"") != std::string::npos;
++}
++
++// A browser runs on this profile: its SingletonLock points to a live pid.
++bool ProfileInUse(const std::string& user_data_dir) {
++  char target[512];
++  ssize_t n = readlink((user_data_dir + "/SingletonLock").c_str(), target,
++                       sizeof(target) - 1);
++  if (n <= 0) {
++    return false;
++  }
++  std::string lock(target, static_cast<size_t>(n));  // host-pid
++  size_t dash = lock.rfind('-');
++  if (dash == std::string::npos) {
++    return false;
++  }
++  pid_t pid = static_cast<pid_t>(atoi(lock.substr(dash + 1).c_str()));
++  return pid > 0 && (kill(pid, 0) == 0 || errno == EPERM);
++}
++
++// Too soon after the last relaunch: a crash at startup must not loop.
++bool RelaunchedRecently(const std::string& user_data_dir) {
++  struct stat st;
++  std::string mark = user_data_dir + "/Meridian Crash Relaunch";
++  if (stat(mark.c_str(), &st) == 0 &&
++      time(nullptr) - st.st_mtime < kLoopSeconds) {
++    return true;
++  }
++  std::ofstream(mark, std::ios::trunc) << time(nullptr);
++  return false;
++}
++
++pid_t Spawn(const std::vector<std::string>& args, bool detach) {
++  std::vector<char*> argv;
++  for (const std::string& a : args) {
++    argv.push_back(const_cast<char*>(a.c_str()));
++  }
++  argv.push_back(nullptr);
++  posix_spawn_file_actions_t files;
++  posix_spawn_file_actions_init(&files);
++  for (int fd = 0; fd < 3; ++fd) {
++    posix_spawn_file_actions_addopen(&files, fd, "/dev/null",
++                                     fd == 0 ? O_RDONLY : O_WRONLY, 0);
++  }
++  posix_spawnattr_t attr;
++  posix_spawnattr_init(&attr);
++  // Nothing of the browser's (sockets, files) goes along; its own session, so
++  // it outlives the browser.
++  short flags = POSIX_SPAWN_CLOEXEC_DEFAULT;
++  if (detach) {
++    flags |= POSIX_SPAWN_SETSID;
++  }
++  posix_spawnattr_setflags(&attr, flags);
++  pid_t pid = 0;
++  int rv = posix_spawn(&pid, argv[0], &files, &attr, argv.data(), environ);
++  posix_spawnattr_destroy(&attr);
++  posix_spawn_file_actions_destroy(&files);
++  return rv == 0 ? pid : 0;
++}
++
++}  // namespace
++
++void MaybeStartCrashWatcher(int argc, const char** argv) {
++  if (argc < 1 || !Args(argc, argv)[0] || Has(argc, argv, "--type=")) {
++    return;
++  }
++  const bool forced = Has(argc, argv, "--meridian-crash-relaunch");
++  if (!forced && (Has(argc, argv, "--remote-debugging-") ||
++                  Has(argc, argv, "--meridian-no-crash-relaunch") ||
++                  Has(argc, argv, "--headless") ||
++                  Has(argc, argv, "--meridian-test-"))) {
++    return;
++  }
++  // Only the app as installed (…/Meridian.app/Contents/MacOS/Meridian).
++  std::string exe = Args(argc, argv)[0];
++  if (exe.find(".app/Contents/MacOS/") == std::string::npos) {
++    return;
++  }
++  std::vector<std::string> args = {
++      exe, std::string(kWatcher) + std::to_string(getpid())};
++  std::string dir = ValueOf(argc, argv, kUserDataDir);
++  if (!dir.empty()) {
++    args.push_back(std::string(kUserDataDir) + dir);
++  }
++  // Tests: the watcher only leaves its mark (no window on the screen).
++  if (Has(argc, argv, "--meridian-crash-relaunch=dry")) {
++    args.push_back("--meridian-crash-relaunch=dry");
++  }
++  Spawn(args, true);
++}
++
++bool IsCrashWatcher(int argc, const char** argv) {
++  return Has(argc, argv, kWatcher);
++}
++
++int RunCrashWatcher(int argc, const char** argv) {
++  pid_t browser = static_cast<pid_t>(atoi(ValueOf(argc, argv, kWatcher).c_str()));
++  if (browser <= 0) {
++    return 2;
++  }
++  std::string explicit_dir = ValueOf(argc, argv, kUserDataDir);
++  std::string dir = explicit_dir.empty() ? DefaultUserDataDir() : explicit_dir;
++
++  // Until the browser ends.
++  int kq = kqueue();
++  struct kevent change;
++  EV_SET(&change, browser, EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0,
++         nullptr);
++  if (kq < 0 || kevent(kq, &change, 1, nullptr, 0, nullptr) < 0) {
++    return 0;  // Already gone (or not ours to watch).
++  }
++  struct kevent event;
++  while (kevent(kq, nullptr, 0, &event, 1, nullptr) < 0 && errno == EINTR) {
++  }
++  close(kq);
++
++  // Its helpers and the crash reporter finish first.
++  sleep(2);
++  if (!EndedWithoutCleanExit(dir) || ProfileInUse(dir) ||
++      RelaunchedRecently(dir)) {
++    return 0;
++  }
++  if (Has(argc, argv, "--meridian-crash-relaunch=dry")) {
++    std::ofstream(dir + "/Meridian Crash Relaunch", std::ios::trunc)
++        << "would relaunch";
++    return 0;
++  }
++  // The .app, through Launch Services (as from the Dock).
++  std::string exe = Args(argc, argv)[0];
++  std::string app = exe.substr(0, exe.find(".app/Contents/MacOS/") + 4);
++  std::vector<std::string> open = {"/usr/bin/open", "-a", app};
++  if (!explicit_dir.empty()) {
++    open.insert(open.end(), {"-n", "--args", std::string(kUserDataDir) + dir});
++  }
++  pid_t pid = Spawn(open, false);
++  return pid ? 0 : 1;
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/crash_watcher_mac.h b/chrome/browser/meridian/crash_watcher_mac.h
+new file mode 100644
+index 0000000000..21d9fcb3de
+--- /dev/null
++++ b/chrome/browser/meridian/crash_watcher_mac.h
+@@ -0,0 +1,27 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_CRASH_WATCHER_MAC_H_
++#define CHROME_BROWSER_MERIDIAN_CRASH_WATCHER_MAC_H_
++
++namespace meridian {
++
++// If the browser process crashes, everything in it goes: the windows, and the
++// agents working in them. A small watcher (the browser's own binary with
++// `--meridian-crash-watcher=<pid>`, no windows) waits for the browser to end;
++// if it ended without a clean exit (the profile's exit_type is still
++// "Crashed"), it opens Meridian again, which restores the tabs and the
++// agents' sessions. Not when another Meridian already runs on that profile,
++// not twice within two minutes (a crash at startup), and not under tests
++// (--remote-debugging-*), unless --meridian-crash-relaunch asks for it.
++
++// Called for the browser process before it starts: launches the watcher.
++void MaybeStartCrashWatcher(int argc, const char** argv);
++
++bool IsCrashWatcher(int argc, const char** argv);
++int RunCrashWatcher(int argc, const char** argv);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_CRASH_WATCHER_MAC_H_
+diff --git a/chrome/browser/meridian/helper_modes.cc b/chrome/browser/meridian/helper_modes.cc
+index 7bf21d81f3..c48eedfbba 100644
+--- a/chrome/browser/meridian/helper_modes.cc
++++ b/chrome/browser/meridian/helper_modes.cc
+@@ -5,6 +5,9 @@
+ #include "chrome/browser/meridian/helper_modes.h"
+ 
+ #include "chrome/browser/meridian/agent/mcp_bridge.h"
++#if BUILDFLAG(IS_MAC)
++#include "chrome/browser/meridian/crash_watcher_mac.h"
++#endif
+ #include "chrome/browser/meridian/mission/mission_hook.h"
+ #include "chrome/browser/meridian/workbench/guard_hook.h"
+ 
+@@ -37,6 +40,13 @@ std::optional<int> Run(int argc, const char** argv) {
+   if (IsMcpBridge(argc, argv)) {
+     return RunMcpBridge(argc, argv);
+   }
++#if BUILDFLAG(IS_MAC)
++  if (IsCrashWatcher(argc, argv)) {
++    return RunCrashWatcher(argc, argv);
++  }
++  // The browser itself: a watcher reopens it if it crashes.
++  MaybeStartCrashWatcher(argc, argv);
++#endif
+   return std::nullopt;
+ }
+ 
+diff --git a/components/performance_manager/graph/frame_node_impl.cc b/components/performance_manager/graph/frame_node_impl.cc
+index f9c09f4734..8f6acaec3d 100644
+--- a/components/performance_manager/graph/frame_node_impl.cc
++++ b/components/performance_manager/graph/frame_node_impl.cc
+@@ -492,9 +492,9 @@ void FrameNodeImpl::SetViewportIntersection(
+   // The outermost main frame or embedder is always fully intersecting with the
+   // viewport, so it is not tracked.
+   if (!parent_or_outer_document_or_embedder()) {
+-    mojo::ReportBadMessage(
+-        "The viewport intersection is never sent for the outermost main "
+-        "frame.");
++    // Meridian: SurfaceEmbedConnector::Detach also lands here, when a tab
++    // embedded in the browser UI is detached (not a message from a renderer):
++    // ReportBadMessage outside a mojo dispatch crashed the whole browser.
+     return;
+   }
+ 

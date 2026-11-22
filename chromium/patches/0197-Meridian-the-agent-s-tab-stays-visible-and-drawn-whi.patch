@@ -1,0 +1,379 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 20 Nov 2026 02:53:59 +0400
+Subject: [PATCH 198/202] Meridian: the agent's tab stays visible and drawn
+ while it works in it
+
+An agent's tab in the background, or in a covered or minimized window, is now
+"visible" to its page for 3 minutes after the agent's last call, as a tab
+being shared is (visibilityState, requestAnimationFrame, lists and dialogs
+that draw only when shown); the person's active tab stays as it is.
+Screenshots of a tab that isn't on the screen take one frame of a video
+capture, as Chrome's tab previews. Test switch
+--meridian-test-agent-awake-seconds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   5 +
+ .../browser/meridian/agent/agent_service.cc   | 113 ++++++++++--------
+ chrome/browser/meridian/agent/agent_service.h |   2 +
+ .../meridian/agent/tab_frame_capture.cc       | 113 ++++++++++++++++++
+ .../meridian/agent/tab_frame_capture.h        |  26 ++++
+ 5 files changed, 207 insertions(+), 52 deletions(-)
+ create mode 100644 chrome/browser/meridian/agent/tab_frame_capture.cc
+ create mode 100644 chrome/browser/meridian/agent/tab_frame_capture.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 71e164e78d..a99a854f3a 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -291,6 +291,8 @@ source_set("meridian") {
+     "agent/agent_service.h",
+     "agent/agent_service_factory.cc",
+     "agent/agent_service_factory.h",
++    "agent/tab_frame_capture.cc",
++    "agent/tab_frame_capture.h",
+     "arc_data.cc",
+     "arc_data.h",
+     "arc_logins.cc",
+@@ -396,6 +398,9 @@ source_set("meridian") {
+     "//components/search_engines",
+     "//services/network/public/cpp",
+     "//components/viz/common",
++    "//components/viz/host",
++    "//media",
++    "//media/capture/mojom:video_capture_buffer",
+     "//components/zoom",
+     "//extensions/browser",
+     "//skia",
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index 1f46c35d56..fe9f48d616 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -23,6 +23,8 @@
+ #include "base/json/json_writer.h"
+ #include "base/no_destructor.h"
+ #include "base/strings/string_number_conversions.h"
++#include "chrome/browser/meridian/agent/tab_frame_capture.h"
++#include "chrome/browser/meridian/test_switches.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/strings/utf_string_conversions.h"
+@@ -894,26 +896,58 @@ AgentService::Awake::Awake(Awake&&) = default;
+ AgentService::Awake& AgentService::Awake::operator=(Awake&&) = default;
+ AgentService::Awake::~Awake() = default;
+ 
++// A screenshot's answer: JPEG, at most 1600 px wide.
++// static
++void AgentService::FinishScreenshot(std::unique_ptr<Call> call,
++                                    SkBitmap bitmap) {
++  if (bitmap.drawsNothing()) {
++    return call->Fail("couldn't capture the tab");
++  }
++  if (bitmap.width() > 1600) {
++    gfx::ImageSkia image = gfx::ImageSkia::CreateFrom1xBitmap(bitmap);
++    bitmap = *gfx::ImageSkiaOperations::CreateResizedImage(
++                  image, skia::ImageOperations::RESIZE_GOOD,
++                  gfx::Size(1600, bitmap.height() * 1600 / bitmap.width()))
++                  .bitmap();
++  }
++  std::optional<std::vector<uint8_t>> jpeg = gfx::JPEGCodec::Encode(bitmap, 75);
++  if (!jpeg) {
++    return call->Fail("couldn't encode the screenshot");
++  }
++  call->Ok(base::Value(base::DictValue()
++                           .Set("image", base::Base64Encode(*jpeg))
++                           .Set("mime_type", "image/jpeg")));
++}
++
+ void AgentService::KeepAwake(tabs::TabInterface* tab) {
+   content::WebContents* contents = tab ? tab->GetContents() : nullptr;
+   if (!contents) {
+     return;
+   }
+-  // A background tab Chromium froze (or would throttle): awake while the
+-  // agent works in it, as if it were being captured.
++  // A background tab Chromium froze (or would throttle), or a window that is
++  // covered or minimized: awake, drawn and "visible" to its page while the
++  // agent works in it, as for a tab being shared (the person's active tab
++  // stays as it is).
+   contents->SetPageFrozen(false);
+   const int32_t id = tab->GetHandle().raw_value();
+   Awake& awake = awake_[id];
+   if (!awake.capture) {
+     awake.capture = contents->IncrementCapturerCount(
+-        gfx::Size(), /*stay_hidden=*/true, /*stay_awake=*/true,
++        gfx::Size(), /*stay_hidden=*/false, /*stay_awake=*/true,
+         /*is_activity=*/false);
+   }
+   if (!awake.release) {
+     awake.release = std::make_unique<base::OneShotTimer>();
+   }
++  int seconds = 180;
++  if (int n; base::StringToInt(
++                 meridian::TestSwitchValue("meridian-test-agent-awake-seconds"),
++                 &n) &&
++             n > 0) {
++    seconds = n;
++  }
+   awake.release->Start(
+-      FROM_HERE, base::Minutes(3),
++      FROM_HERE, base::Seconds(seconds),
+       base::BindOnce([](AgentService* self, int32_t id) { self->awake_.erase(id); },
+                      base::Unretained(this), id));
+ }
+@@ -1172,59 +1206,34 @@ void AgentService::Screenshot(std::unique_ptr<Call> call) {
+   content::WebContents* contents = tab->GetContents();
+   // Draws even when the tab is in the background.
+   call->capture = contents->IncrementCapturerCount(
+-      gfx::Size(), /*stay_hidden=*/true, /*stay_awake=*/true,
++      gfx::Size(), /*stay_hidden=*/false, /*stay_awake=*/true,
+       /*is_activity=*/false);
+   content::RenderWidgetHostView* view = contents->GetRenderWidgetHostView();
+   if (!view) {
+     return call->Fail("the tab has no page to capture yet");
+   }
+-  // A moment for a hidden tab to draw its first frame.
+-  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
+-      FROM_HERE,
+-      base::BindOnce(
+-          [](std::unique_ptr<Call> call,
+-             base::WeakPtr<content::WebContents> contents) {
+-            content::RenderWidgetHostView* view =
+-                contents ? contents->GetRenderWidgetHostView() : nullptr;
+-            if (!view) {
+-              return call->Fail("the tab is gone");
+-            }
+-            view->CopyFromSurface(
+-                gfx::Rect(), gfx::Size(), base::Seconds(10),
+-                base::BindOnce(
+-                    [](std::unique_ptr<Call> call,
+-                       const content::CopyFromSurfaceResult& result) {
+-                      if (!result.has_value() || result->bitmap.drawsNothing()) {
+-                        return call->Fail("couldn't capture the tab");
+-                      }
+-                      SkBitmap bitmap = result->bitmap;
+-                      // At most 1600 px wide.
+-                      if (bitmap.width() > 1600) {
+-                        gfx::ImageSkia image =
+-                            gfx::ImageSkia::CreateFrom1xBitmap(bitmap);
+-                        bitmap = *gfx::ImageSkiaOperations::CreateResizedImage(
+-                                      image, skia::ImageOperations::RESIZE_GOOD,
+-                                      gfx::Size(1600, bitmap.height() * 1600 /
+-                                                          bitmap.width()))
+-                                      .bitmap();
+-                      }
+-                      std::optional<std::vector<uint8_t>> jpeg =
+-                          gfx::JPEGCodec::Encode(bitmap, 75);
+-                      if (!jpeg) {
+-                        return call->Fail("couldn't encode the screenshot");
+-                      }
+-                      call->Ok(base::Value(
+-                          base::DictValue()
+-                              .Set("image", base::Base64Encode(*jpeg))
+-                              .Set("mime_type", "image/jpeg")));
+-                    },
+-                    std::move(call)));
+-          },
+-          std::move(call), contents->GetWeakPtr()),
+-      base::Milliseconds(contents->GetVisibility() ==
+-                                 content::Visibility::VISIBLE
+-                             ? 0
+-                             : 400));
++  // On the screen: a copy of what it shows. Not (a background tab, a covered
++  // or minimized window): one frame of a video capture, which draws without
++  // the window (as Chrome's tab previews).
++  if (contents->GetVisibility() == content::Visibility::VISIBLE) {
++    view->CopyFromSurface(
++        gfx::Rect(), gfx::Size(), base::Seconds(10),
++        base::BindOnce(
++            [](std::unique_ptr<Call> call,
++               const content::CopyFromSurfaceResult& result) {
++              FinishScreenshot(std::move(call), result.has_value()
++                                                    ? result->bitmap
++                                                    : SkBitmap());
++            },
++            std::move(call)));
++    return;
++  }
++  const gfx::Size size = gfx::ScaleToCeiledSize(
++      view->GetViewBounds().size(),
++      view->GetDeviceScaleFactor());
++  meridian::CaptureTabFrame(
++      view, size.IsEmpty() ? gfx::Size(1280, 800) : size, base::Seconds(10),
++      base::BindOnce(&FinishScreenshot, std::move(call)));
+ }
+ 
+ // ------------------------------------------------------------------ write
+diff --git a/chrome/browser/meridian/agent/agent_service.h b/chrome/browser/meridian/agent/agent_service.h
+index 0286a39fb2..210b7f1ab7 100644
+--- a/chrome/browser/meridian/agent/agent_service.h
++++ b/chrome/browser/meridian/agent/agent_service.h
+@@ -9,6 +9,7 @@
+ #include <memory>
+ #include <string>
+ 
++#include "third_party/skia/include/core/SkBitmap.h"
+ #include "base/files/file_path.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+@@ -69,6 +70,7 @@ class AgentService : public KeyedService {
+ 
+  private:
+   struct Call;
++  static void FinishScreenshot(std::unique_ptr<Call> call, SkBitmap bitmap);
+   int call_seq_ = 0;
+ 
+   void OnAccessChanged();
+diff --git a/chrome/browser/meridian/agent/tab_frame_capture.cc b/chrome/browser/meridian/agent/tab_frame_capture.cc
+new file mode 100644
+index 0000000000..65f869ce25
+--- /dev/null
++++ b/chrome/browser/meridian/agent/tab_frame_capture.cc
+@@ -0,0 +1,113 @@
++// Copyright 2026 Meridian. All rights reserved.
++#include "chrome/browser/meridian/agent/tab_frame_capture.h"
++
++#include <memory>
++#include <utility>
++
++#include "base/memory/read_only_shared_memory_region.h"
++#include "base/timer/timer.h"
++#include "components/viz/host/client_frame_sink_video_capturer.h"
++#include "content/public/browser/render_widget_host_view.h"
++#include "media/base/video_frame.h"
++#include "media/capture/mojom/video_capture_buffer.mojom.h"
++#include "third_party/skia/include/core/SkColorSpace.h"
++#include "mojo/public/cpp/bindings/remote.h"
++#include "services/viz/privileged/mojom/compositing/frame_sink_video_capture.mojom.h"
++#include "third_party/skia/include/core/SkImageInfo.h"
++#include "ui/gfx/geometry/skia_conversions.h"
++
++namespace meridian {
++namespace {
++
++class OneFrame : public viz::mojom::FrameSinkVideoConsumer {
++ public:
++  OneFrame(base::OnceCallback<void(SkBitmap)> done) : done_(std::move(done)) {}
++
++  void Start(content::RenderWidgetHostView* view,
++             const gfx::Size& size,
++             base::TimeDelta timeout) {
++    capturer_ = view->CreateVideoCapturer();
++    capturer_->SetIsSecure(true);
++    capturer_->SetResolutionConstraints(size, size, false);
++    capturer_->SetAutoThrottlingEnabled(false);
++    capturer_->SetMinSizeChangePeriod(base::TimeDelta());
++    capturer_->SetFormat(media::PIXEL_FORMAT_ARGB);
++    capturer_->SetMinCapturePeriod(base::Milliseconds(50));
++    capturer_->Start(this, viz::mojom::BufferFormatPreference::kDefault);
++    capturer_->RequestRefreshFrame();
++    timer_.Start(FROM_HERE, timeout,
++                 base::BindOnce(&OneFrame::Finish, base::Unretained(this),
++                                SkBitmap()));
++  }
++
++ private:
++  void OnFrameCaptured(
++      media::mojom::VideoBufferHandlePtr data,
++      media::mojom::VideoFrameInfoPtr info,
++      const gfx::Rect& content_rect,
++      mojo::PendingRemote<viz::mojom::FrameSinkVideoConsumerFrameCallbacks>
++          callbacks) override {
++    mojo::Remote<viz::mojom::FrameSinkVideoConsumerFrameCallbacks> release(
++        std::move(callbacks));
++    if (!data->is_read_only_shmem_region()) {
++      return;
++    }
++    base::ReadOnlySharedMemoryMapping mapping =
++        data->get_read_only_shmem_region().Map();
++    if (!mapping.IsValid() ||
++        mapping.size() < media::VideoFrame::AllocationSize(
++                             info->pixel_format, info->coded_size)) {
++      return;
++    }
++    const SkImageInfo image_info = SkImageInfo::MakeN32(
++        content_rect.right(), content_rect.bottom(), kPremul_SkAlphaType,
++        info->color_space.ToSkColorSpace());
++    const size_t row_bytes = media::VideoFrame::RowBytes(
++        media::VideoFrame::Plane::kARGB, info->pixel_format,
++        info->coded_size.width());
++    if (mapping.size() < image_info.computeByteSize(row_bytes)) {
++      return;
++    }
++    SkBitmap frame;
++    frame.installPixels(image_info, const_cast<uint8_t*>(mapping.data()),
++                        row_bytes);
++    SkBitmap cropped;
++    SkBitmap copy;
++    if (!frame.extractSubset(&cropped, gfx::RectToSkIRect(content_rect)) ||
++        !copy.tryAllocPixels(cropped.info()) ||
++        !cropped.readPixels(copy.pixmap())) {
++      return;
++    }
++    Finish(std::move(copy));
++  }
++  void OnNewCaptureVersion(const media::CaptureVersion&) override {}
++  void OnFrameWithEmptyRegionCapture() override {}
++  void OnStopped() override {}
++  void OnLog(const std::string&) override {}
++
++  void Finish(SkBitmap bitmap) {
++    if (!done_) {
++      return;
++    }
++    timer_.Stop();
++    capturer_->Stop();
++    std::move(done_).Run(std::move(bitmap));
++    // Off the capturer's call stack.
++    base::SequencedTaskRunner::GetCurrentDefault()->DeleteSoon(FROM_HERE, this);
++  }
++
++  base::OnceCallback<void(SkBitmap)> done_;
++  std::unique_ptr<viz::ClientFrameSinkVideoCapturer> capturer_;
++  base::OneShotTimer timer_;
++};
++
++}  // namespace
++
++void CaptureTabFrame(content::RenderWidgetHostView* view,
++                     const gfx::Size& size,
++                     base::TimeDelta timeout,
++                     base::OnceCallback<void(SkBitmap)> done) {
++  (new OneFrame(std::move(done)))->Start(view, size, timeout);
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/agent/tab_frame_capture.h b/chrome/browser/meridian/agent/tab_frame_capture.h
+new file mode 100644
+index 0000000000..91da7fbfc1
+--- /dev/null
++++ b/chrome/browser/meridian/agent/tab_frame_capture.h
+@@ -0,0 +1,26 @@
++// Copyright 2026 Meridian. All rights reserved.
++#ifndef CHROME_BROWSER_MERIDIAN_AGENT_TAB_FRAME_CAPTURE_H_
++#define CHROME_BROWSER_MERIDIAN_AGENT_TAB_FRAME_CAPTURE_H_
++
++#include "base/functional/callback.h"
++#include "third_party/skia/include/core/SkBitmap.h"
++#include "ui/gfx/geometry/size.h"
++
++namespace content {
++class RenderWidgetHostView;
++}
++
++namespace meridian {
++
++// One frame of a tab that isn't on the screen (a background tab, a covered or
++// minimized window), the way Chrome takes its tab previews: through a video
++// capturer of the tab's frame sink, which draws without the window. |done|
++// gets an empty bitmap if no frame comes within |timeout|.
++void CaptureTabFrame(content::RenderWidgetHostView* view,
++                     const gfx::Size& size,
++                     base::TimeDelta timeout,
++                     base::OnceCallback<void(SkBitmap)> done);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_AGENT_TAB_FRAME_CAPTURE_H_

@@ -1,0 +1,336 @@
+// Spaces, pinned tabs, folders and favorites: the sidebar model in chrome/browser/meridian.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { launch, tabEl, itemEl, favEl, SB } from './harness.mjs';
+
+const page = (t) => `data:text/html,<title>${t}</title><h1>${t}</h1>`;
+const todayCount = (n) => `${SB}.querySelectorAll('meridian-tab-row').length === ${n}`;
+
+test('pinning a tab moves it from Today to the space; closing it keeps the pin, clicking reopens it', async () => {
+  const b = await launch([page('Docs'), page('Mail')]);
+  try {
+    await b.waitFor(todayCount(2));
+    const space = (await b.state()).spaces[0].name;
+    await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Docs')`, 'Pin Tab');
+    await b.waitFor(todayCount(1));
+    let pinned = await b.pinned();
+    assert.deepEqual(pinned.map((p) => p.title), ['Docs']);
+    assert.ok(pinned[0].loaded);
+
+    // Closing a pinned tab unloads it; the pin stays.
+    await b.click(`${itemEl('Docs')}.shadowRoot.querySelector('.close')`);
+    await b.waitFor(`${itemEl('Docs')}.shadowRoot.querySelector('.row.unloaded')`);
+    pinned = await b.pinned();
+    assert.equal(pinned.length, 1);
+    assert.equal(pinned[0].loaded, false);
+
+    // Clicking the pin opens its page again, as that pin's tab (not a Today tab).
+    await b.click(`${itemEl('Docs')}.shadowRoot.querySelector('.row')`);
+    await b.waitFor(`${itemEl('Docs')}.shadowRoot.querySelector('.row.active')`);
+    assert.equal((await b.tabs()).length, 1, 'Today still has only Mail');
+  } finally { await b.close(); }
+});
+
+test('a new space starts with a new tab and its own colour; switching spaces shows each space\'s tabs', async () => {
+  const b = await launch([page('Home tab')]);
+  try {
+    await b.waitFor(todayCount(1));
+    const tint1 = await b.eval(`getComputedStyle(app).getPropertyValue('--meridian-space').trim()`);
+    await b.plus('New Space');
+    // The new space is active, renaming in place.
+    await b.waitFor(`${SB}.querySelector('.space-header input.rename')`);
+    await b.type('Work');
+    await b.key('Enter', 'Enter', 13);
+    await b.waitFor(`${SB}.querySelector('.space-name')?.textContent === 'Work'`);
+    let state = await b.state();
+    assert.equal(state.spaces.length, 2);
+    assert.equal(state.spaces.find((s) => s.id === state.active).name, 'Work');
+    await b.waitFor(todayCount(1));
+    assert.notEqual((await b.tabs())[0].title, 'Home tab', 'Work shows only its own new tab');
+    const tint2 = await b.eval(`getComputedStyle(app).getPropertyValue('--meridian-space').trim()`);
+    assert.notEqual(tint1, tint2, 'the window takes the space colour');
+
+    // Back to the first space: its tab is back and active.
+    await b.click(`${SB}.querySelectorAll('.space-dot')[0]`);
+    await b.waitFor(`${SB}.querySelector('.space-name')?.textContent !== 'Work'`);
+    await b.waitFor(`${tabEl(0)}?.tab.title === 'Home tab' && ${tabEl(0)}.tab.isActive`);
+    assert.equal((await b.tabs()).length, 1);
+  } finally { await b.close(); }
+});
+
+test('folders hold pins; favorites are shared by every space', async () => {
+  const b = await launch([page('Figma'), page('Linear')]);
+  try {
+    await b.waitFor(todayCount(2));
+    const space = (await b.state()).spaces[0].name;
+    // New folder from the space header, renamed in place.
+    await b.menu(`${SB}.querySelector('.space-header')`, 'New Folder');
+    await b.waitFor(`${itemEl('New Folder')}?.shadowRoot.querySelector('input.rename')`);
+    await b.type('Design');
+    await b.key('Enter', 'Enter', 13);
+    await b.waitFor(`!!${itemEl('Design')}`);
+    // Pin Figma, then move it into the folder through the model (drag & drop comes later).
+    await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Figma')`, 'Pin Tab');
+    await b.waitFor(`!!${itemEl('Figma')}`);
+    await b.eval(`(async () => { const s = app.$.tabstrip; const folder = ${itemEl('Design')}.item.id; const fig = ${itemEl('Figma')}.item.id; s.handler_.moveItem(fig, { container: s.state_.activeSpaceId, parentId: folder, index: 0 }); })()`);
+    await b.waitFor(`(${itemEl('Figma')})?.depth === 1`);
+    // Collapse the folder.
+    await b.click(`${itemEl('Design')}.shadowRoot.querySelector('.row')`);
+    await b.waitFor(`${itemEl('Design')}.shadowRoot.querySelector('.folder-wrap.collapsed')`);
+    assert.deepEqual((await b.pinned()).map((p) => p.title), ['Design']);
+
+    // Linear to favorites; it shows as a tile in every space.
+    await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Linear')`, 'Add to Favorites');
+    await b.waitFor(`${SB}.querySelectorAll('meridian-fav').length === 1`);
+    await b.plus('New Space');
+    await b.waitFor(`${SB}.querySelector('.space-header input.rename')`);
+    await b.key('Escape', 'Escape', 27);
+    await b.waitFor(`app.$.tabstrip.state_.spaces.length === 2 && app.$.tabstrip.state_.activeSpaceId === app.$.tabstrip.state_.spaces[1].id`);
+    assert.equal((await b.favorites()).length, 1, 'favorites are there in the new space too');
+    // Opening the favorite doesn't switch back to the first space.
+    const before = (await b.state()).active;
+    await b.click(favEl(0));
+    await b.waitFor(`${favEl(0)}.shadowRoot.querySelector('.fav.active')`);
+    assert.equal((await b.state()).active, before);
+  } finally { await b.close(); }
+});
+
+test('spaces, pins and which space each tab is in survive a restart', async () => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-keep-'));
+  try {
+    let b = await launch([page('Keep me'), page('Work tab')], { profile });
+    await b.waitFor(todayCount(2));
+    const space = (await b.state()).spaces[0].name;
+    await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Keep me')`, 'Pin Tab');
+    await b.waitFor(`!!${itemEl('Keep me')}`);
+    await b.eval(`app.$.tabstrip.handler_.createSpace('Work', '', '#e08a8a', '#f0b5a8')`);
+    await b.waitFor(`app.$.tabstrip.state_.spaces.length === 2`);
+    await b.menu(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Work tab')`, 'Move to Space > Work');
+    await b.waitFor(todayCount(0));
+    await b.quit();
+
+    // A plain relaunch: Meridian restores the last session by default, like Arc.
+    b = await launch([], { profile });
+    try {
+      await b.waitFor(`app.$.tabstrip.state_?.spaces.length === 2`, 15000);
+      const state = await b.state();
+      assert.deepEqual(state.spaces.map((s) => s.name), [space, 'Work']);
+      assert.ok(await b.waitFor(`!!${itemEl('Keep me')}`));
+      // The restored tabs are back in their spaces: "Keep me" is its pin's tab,
+      // "Work tab" is in Work, not in the first space's Today.
+      await b.waitFor(`app.$.tabstrip.state_.tabs.length === 2`, 15000);
+      const s2 = await b.state();
+      const work = s2.spaces.find((s) => s.name === 'Work').id;
+      assert.ok(s2.tabs.some((t) => t.item), 'pinned tab restored as the pin\'s tab');
+      assert.ok(s2.tabs.some((t) => t.space === work && !t.item), 'Work tab restored into Work');
+    } finally { await b.close(); }
+  } finally { fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
+test('a two-finger swipe on the sidebar drags to the next space: past a third it switches, less springs back; a dot slides too', async () => {
+  const b = await launch([page('Home')]);
+  const T = 'app.$.tabstrip';
+  const active = `${T}.activeSpace().name`;
+  const transform = (id) => `${SB}.getElementById('${id}')?.style.transform || ''`;
+  try {
+    await b.waitFor(todayCount(1));
+    const first = await b.eval(active);
+    const { spaceId } = await b.eval(`${T}.handler_.createSpace('Work', '', '#e0a070', '#f0c8a0')`);
+    await b.waitFor(`${T}.state_.spaces.length === 2`);
+    await b.eval(`${T}.handler_.activateSpace(${T}.state_.spaces[0].id)`);
+    await b.waitFor(`${active} === ${JSON.stringify(first)}`);
+
+    // A short swipe: the next space shows beside the page while the fingers move, then springs back.
+    await b.swipe(`${SB}.getElementById('pages')`, 50, {
+      during: async () => {
+        assert.equal(await b.eval(`${T}.ghost_?.name`), 'Work');
+        assert.match(await b.eval(transform('spacePage')), /translateX\(-\d/);
+        assert.match(await b.eval(transform('ghostPage')), /translateX\(\d/);
+      },
+    });
+    await b.waitFor(`!${T}.ghost_ && !${SB}.getElementById('spacePage').style.transform`);
+    assert.equal(await b.eval(active), first);
+
+    // Past a third of the way: it switches.
+    await b.swipe(`${SB}.getElementById('pages')`, 140);
+    await b.waitFor(`${active} === 'Work'`);
+    await b.waitFor(`!${T}.ghost_ && !${SB}.getElementById('spacePage').style.transform`);
+    assert.equal(await b.eval(`${T}.state_.activeSpaceId`), spaceId);
+
+    // Past the last space it only gives a little and stays.
+    await b.swipe(`${SB}.getElementById('pages')`, 140);
+    await b.waitFor(`!${SB}.getElementById('spacePage').style.transform`);
+    assert.equal(await b.eval(active), 'Work');
+
+    // A dot slides back to the first space.
+    await b.click(`${SB}.querySelectorAll('.space-dot')[0]`);
+    await b.waitFor(`${active} === ${JSON.stringify(first)}`);
+    await b.waitFor(`!${T}.ghost_`);
+  } finally { await b.close(); }
+});
+
+test('a space and a pin made just before a crash are still there after it', async () => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-crash-'));
+  const T = 'app.$.tabstrip';
+  try {
+    let b = await launch([page('Keep')], { profile });
+    try {
+      await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+      await b.waitFor(`${SB}.querySelector('meridian-tab-row').tab.title === 'Keep'`);
+      await b.eval(`${T}.handler_.pinTab(${SB}.querySelector('meridian-tab-row').tab.id, { container: ${T}.state_.activeSpaceId, parentId: '', index: 0 }, '')`);
+      await b.waitFor(`${T}.state_.spaces[0].pinned.length === 1`, 10000, `${T}.state_.spaces[0].pinned`);
+      await b.eval(`${T}.handler_.createSpace('Fresh', '', '', '')`);
+      await b.waitFor(`${T}.state_.spaces.length === 2`);
+      await new Promise((r) => setTimeout(r, 2000));
+      b.proc.kill('SIGKILL');  // a crash: nothing is written on the way out
+    } finally { await b.close(); }
+    b = await launch([], { profile });
+    try {
+      await b.waitFor(`${T}.state_?.spaces.length === 2`, 15000, `${T}.state_?.spaces.map((s) => s.name)`);
+      assert.equal(await b.eval(`${T}.state_.spaces[1].name`), 'Fresh');
+      assert.equal(await b.eval(`${T}.state_.spaces[0].pinned.length`), 1, 'the pin');
+    } finally { await b.close(); }
+  } finally { fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
+// Arc: each space keeps its place in the list; switching away and back doesn't move it.
+test('each space keeps where its list was scrolled to across switches', async () => {
+  const page = (t) => `data:text/html,<title>${t}</title>`;
+  const b = await launch(Array.from({ length: 30 }, (_, i) => page(`A${i + 1}`)));
+  const T = 'app.$.tabstrip';
+  const top = () => b.eval(`${SB}.getElementById('spacePage').scrollTop`);
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 30`);
+    const one = await b.eval(`${T}.state_.activeSpaceId`);
+    const { spaceId: two } = await b.eval(`${T}.handler_.createSpace('Two', '', '', '')`);
+    await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(two)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(two)}`);
+    for (let i = 0; i < 30; i++) await b.eval(`${T}.openUrl(${JSON.stringify(page(`B${i + 1}`))})`);
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length >= 30`);
+    await new Promise((r) => setTimeout(r, 800));
+    await b.eval(`${SB}.getElementById('spacePage').scrollTop = 150`);
+    await new Promise((r) => setTimeout(r, 300));
+    const twoAt = await top();
+    await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(one)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(one)}`);
+    await new Promise((r) => setTimeout(r, 800));
+    await b.eval(`${SB}.getElementById('spacePage').scrollTop = 300`);
+    await new Promise((r) => setTimeout(r, 300));
+    const oneAt = await top();
+    for (const [id, want, name] of [[two, twoAt, 'Two'], [one, oneAt, 'the first'], [two, twoAt, 'Two again']]) {
+      await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(id)})`);
+      await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(id)}`);
+      const seen = [];
+      for (let i = 0; i < 8; i++) { await new Promise((r) => setTimeout(r, 100)); seen.push(Math.round(await top())); }
+      assert.deepEqual([...new Set(seen)], [Math.round(want)], `${name}: where it was, without jumping (${seen})`);
+    }
+  } finally { await b.close(); }
+});
+
+// After a crash the window can open on a new tab of the main profile while the sidebar comes back
+// on a space of another profile. That space's tab is shown; and a pinned tab clicked there opens in
+// it (it used to follow the shown tab into the other space, the sidebar with it).
+test('starting on a space whose tab isn\'t shown: its tab comes up; its pinned tab opens in it', async () => {
+  const http = await import('node:http');
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(`<title>${req.url.slice(1)}</title>`); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const u = (p) => `http://127.0.0.1:${server.address().port}/${p}`;
+  const T = 'app.$.tabstrip';
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-startspace-'));
+  let work;
+  try {
+    let b = await launch([u('main')], { profile });
+    try {
+      await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+      const { profileId } = await b.eval(`${T}.handler_.addProfile('Work')`);
+      ({ spaceId: work } = await b.eval(`${T}.handler_.createSpace('Work', '', '', '')`));
+      await b.eval(`${T}.handler_.setSpaceProfile(${JSON.stringify(work)}, ${JSON.stringify(profileId)})`);
+      await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(work)})`);
+      await b.waitFor(`${T}.state_.profileId === ${JSON.stringify(profileId)}`);
+      await b.eval(`${T}.openUrl(${JSON.stringify(u('sheet'))})`);
+      await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'sheet')`);
+      const id = await b.eval(`[...${T}.tabs_.values()].find((t) => t.title === 'sheet').id`);
+      await b.eval(`${T}.handler_.pinTab(${JSON.stringify(id)}, { container: ${JSON.stringify(work)}, parentId: '', index: -1 }, '')`);
+      await b.waitFor(`${T}.state_.spaces.find((s) => s.id === ${JSON.stringify(work)}).pinned.length === 1`);
+      // Back to the first space, its tab shown; Work's pinned tab unloaded.
+      await b.eval(`${T}.handler_.activateSpace(${T}.state_.spaces[0].id)`);
+      await b.waitFor(`[...${T}.tabs_.values()].find((t) => t.isActive)?.title === 'main'`);
+      await b.eval(`${T}.closeTab(${JSON.stringify(id)})`);
+      await new Promise((r) => setTimeout(r, 2500));
+      await b.quit();
+    } finally { await b.close(); }
+    // The sidebar comes back on Work (as the crash left it); the session on the first space's tab.
+    const file = path.join(profile, 'Default', 'Meridian Sidebar.json');
+    const sidebar = JSON.parse(fs.readFileSync(file, 'utf8'));
+    sidebar.activeSpace = work;
+    fs.writeFileSync(file, JSON.stringify(sidebar));
+    b = await launch([], { profile });
+    try {
+      await b.waitFor(`${T}.state_?.activeSpaceId === ${JSON.stringify(work)}`);
+      // The shown tab is Work's.
+      await b.waitFor(`${T}.state_.tabs.find((t) => t.tabId === [...${T}.tabs_.values()].find((x) => x.isActive)?.id)?.spaceId === ${JSON.stringify(work)}`);
+      await b.click(`[...${SB}.querySelectorAll('#pinned > meridian-item')].find((e) => e.item.title === 'sheet' || e.item.url?.includes('/sheet')).shadowRoot.querySelector('.row')`);
+      await b.waitFor(`[...${T}.tabs_.values()].find((t) => t.isActive)?.title === 'sheet'`);
+      await new Promise((r) => setTimeout(r, 1000));
+      assert.equal(await b.eval(`${T}.state_.activeSpaceId`), work, 'still in Work');
+    } finally { await b.close(); }
+  } finally { server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
+// Closing a tab never leaves its space (Arc): the next tab is one of this space's, though the
+// window's one tab strip holds every space's tabs and the neighbour there is another space's.
+test('⌘W in a space shows the next tab of that space, never another space\'s', async () => {
+  const http = await import('node:http');
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(`<title>${req.url.slice(1)}</title>`); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const u = (p) => `http://127.0.0.1:${server.address().port}/${p}`;
+  const T = 'app.$.tabstrip';
+  const CMD = 1 << 20;
+  const active = (b) => b.eval(`[...${T}.tabs_.values()].find((t) => t.isActive)?.title`);
+  const open = async (b, p) => {
+    await b.eval(`${T}.openUrl(${JSON.stringify(u(p))})`);
+    await b.waitFor(`[...${T}.tabs_.values()].find((t) => t.isActive)?.title === ${JSON.stringify(p)}`);
+  };
+  const b = await launch([u('home')], { args: ['--meridian-test-keys'] });
+  try {
+    await b.waitFor(todayCount(1));
+    const personal = await b.eval(`${T}.state_.spaces[0].id`);
+    const { spaceId: work } = await b.eval(`${T}.handler_.createSpace('Work', '', '', '')`);
+    await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(work)})`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(work)}`);
+    await open(b, 'w1');
+    await open(b, 'w2');
+    // A Personal tab after them in the strip, then one more Work tab after it.
+    await b.click(`${SB}.querySelectorAll('.space-dot')[0]`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(personal)}`);
+    await open(b, 'p2');
+    await b.click(`${SB}.querySelectorAll('.space-dot')[1]`);
+    await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(work)}`);
+    await open(b, 'w3');
+    for (const closing of ['w3', 'w2']) {
+      assert.equal(await active(b), closing);
+      await b.shortcut(13, 'w', CMD);  // ⌘W
+      await b.waitFor(`![...${T}.tabs_.values()].some((t) => t.title === ${JSON.stringify(closing)})`);
+      await new Promise((r) => setTimeout(r, 500));
+      assert.equal(await b.eval(`${T}.state_.activeSpaceId`), work, `still in Work after closing ${closing}`);
+      const shown = await active(b);
+      const space = await b.eval(`${T}.state_.tabs.find((t) => t.tabId === [...${T}.tabs_.values()].find((x) => x.isActive)?.id)?.spaceId`);
+      assert.equal(space, work, `the tab shown after closing ${closing} (${shown}) is Work's`);
+    }
+    // Work's last tabs close too: Work stays, with a new tab, and Personal keeps its own.
+    const workTabs = () => b.eval(`${T}.state_.tabs.filter((t) => t.spaceId === ${JSON.stringify(work)}).length`);
+    for (let left = await workTabs(); left > 0; left--) {
+      const closing = await b.eval(`[...${T}.tabs_.values()].find((t) => t.isActive)?.id`);
+      await b.shortcut(13, 'w', CMD);  // ⌘W
+      await b.waitFor(`![...${T}.tabs_.values()].some((t) => t.id === ${JSON.stringify(closing)})`);
+    }
+    await b.waitFor(`${T}.state_.tabs.find((t) => t.tabId === [...${T}.tabs_.values()].find((x) => x.isActive)?.id)?.spaceId === ${JSON.stringify(work)}`);
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(await b.eval(`${T}.state_.activeSpaceId`), work, 'still in Work after its last tab');
+    assert.equal(await workTabs(), 1, 'a new tab in Work');
+    assert.equal(await b.eval(`${T}.state_.tabs.filter((t) => t.spaceId === ${JSON.stringify(personal)}).length`), 2, 'Personal keeps home and p2');
+  } finally { await b.close(); server.close(); }
+});

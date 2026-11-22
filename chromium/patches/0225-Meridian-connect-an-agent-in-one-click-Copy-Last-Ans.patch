@@ -1,0 +1,465 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Sat, 21 Nov 2026 18:06:52 +0400
+Subject: [PATCH 226/226] Meridian: connect an agent in one click; Copy Last
+ Answer; 0.6.21
+
+Connect gives the agent control unless the person chose a level. An agent
+connected earlier asks once in the browser; a no closes the socket. The
+terminal menu copies the agent's whole last answer. The sidebar toggle sits
+on the traffic lights' line, and at the edge in full screen.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/meridian/agent/agent_service.cc   | 70 ++++++++++++++-
+ chrome/browser/meridian/agent/agent_service.h | 10 +++
+ chrome/browser/meridian/prefs.cc              |  1 +
+ chrome/browser/meridian/prefs.h               |  3 +
+ chrome/browser/meridian/sidebar_handler.cc    |  5 ++
+ chrome/browser/meridian/update_check.h        |  2 +-
+ .../browser/meridian/workbench/term_images.cc | 90 +++++++++++++++++++
+ .../browser/meridian/workbench/term_images.h  |  4 +
+ .../meridian/workbench/workbench_handler.cc   | 25 ++++++
+ .../browser/resources/webui_browser/app.css   | 14 ++-
+ .../webui_browser/meridian/settings.html.ts   |  7 +-
+ .../webui_browser/meridian/settings.ts        |  8 +-
+ 12 files changed, 234 insertions(+), 5 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index 4862043bd5..684a9049e2 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -554,6 +554,9 @@ AgentService::AgentService(Profile* profile) : profile_(profile) {
+   prefs_.Add(prefs::kAgentAccess,
+              base::BindRepeating(&AgentService::OnAccessChanged,
+                                  base::Unretained(this)));
++  prefs_.Add(prefs::kAgentAccessDecided,
++             base::BindRepeating(&AgentService::OnAccessChanged,
++                                 base::Unretained(this)));
+   OnAccessChanged();
+   // Copies of earlier uploads (SnapshotUpload) are no longer needed.
+   base::ThreadPool::PostTask(
+@@ -575,7 +578,10 @@ const base::ListValue& AgentService::Tools() {
+ }
+ 
+ void AgentService::OnAccessChanged() {
+-  bool on = Rank(profile_->GetPrefs()->GetString(prefs::kAgentAccess)) > 0;
++  // Off by the person's decision: nothing listens. Not decided yet: the
++  // private socket is there so that a connected agent can ask.
++  bool on = Rank(profile_->GetPrefs()->GetString(prefs::kAgentAccess)) > 0 ||
++            !profile_->GetPrefs()->GetBoolean(prefs::kAgentAccessDecided);
+   if (on && !server_) {
+     server_ = std::make_unique<AgentServer>(
+         profile_->GetPath().DirName(),
+@@ -598,7 +604,66 @@ BrowserWindowInterface* AgentService::Window() {
+   return FindOrCreateMainWindow(profile_);
+ }
+ 
++void AgentService::AskForAccess(const std::string& client,
++                                base::DictValue request,
++                                Reply reply) {
++  const bool first = waiting_for_access_.empty();
++  waiting_for_access_.emplace_back(std::move(request), std::move(reply));
++  if (!first) {
++    return;
++  }
++  BrowserWindowInterface* window = Window();
++  if (!window) {
++    return OnAccessAnswer(false);
++  }
++  SidebarHandler::AskAgent(
++      window, client,
++      "control Meridian: open pages, click and type,\n"
++      "also on sites where you are signed in",
++      base::BindOnce(&AgentService::OnAccessAnswer,
++                     weak_factory_.GetWeakPtr()));
++}
++
++void AgentService::OnAccessAnswer(bool allowed) {
++  PrefService* prefs = profile_->GetPrefs();
++  if (allowed) {
++    // In this order: "decided" with access still off closes the socket.
++    prefs->SetString(prefs::kAgentAccess, "full");
++    prefs->SetBoolean(prefs::kAgentAccessDecided, true);
++  }
++  auto waiting = std::move(waiting_for_access_);
++  waiting_for_access_.clear();
++  for (auto& [request, reply] : waiting) {
++    if (!allowed) {
++      request.Set("access_declined", true);
++    }
++    Handle(std::move(request), std::move(reply));
++  }
++  if (!allowed) {
++    // After the answers have left: this closes the socket they go through.
++    base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(
++            [](base::WeakPtr<AgentService> self) {
++              if (self) {
++                self->profile_->GetPrefs()->SetBoolean(
++                    prefs::kAgentAccessDecided, true);
++              }
++            },
++            weak_factory_.GetWeakPtr()),
++        base::Seconds(1));
++  }
++}
++
+ void AgentService::Handle(base::DictValue request, Reply reply) {
++  if (request.FindBool("external").value_or(false) &&
++      !request.FindBool("access_declined").value_or(false) &&
++      Rank(profile_->GetPrefs()->GetString(prefs::kAgentAccess)) == 0 &&
++      !profile_->GetPrefs()->GetBoolean(prefs::kAgentAccessDecided)) {
++    const std::string* who = request.FindString("client");
++    const std::string client = who ? who->substr(0, 60) : "An agent";
++    return AskForAccess(client, std::move(request), std::move(reply));
++  }
+   auto call = std::make_unique<Call>();
+   call->reply = std::move(reply);
+   const std::string* tool = request.FindString("tool");
+@@ -623,6 +688,9 @@ void AgentService::Handle(base::DictValue request, Reply reply) {
+   }
+   std::string access = profile_->GetPrefs()->GetString(prefs::kAgentAccess);
+   const std::string& needs = *def->FindString("access");
++  if (request.FindBool("access_declined").value_or(false)) {
++    return call->Fail("The person declined access to Meridian.");
++  }
+   if (Rank(access) == 0) {
+     return call->Fail(
+         "Agent access is off. Open Meridian > Settings > AI to choose an "
+diff --git a/chrome/browser/meridian/agent/agent_service.h b/chrome/browser/meridian/agent/agent_service.h
+index 49c7a6f779..ba295e2bde 100644
+--- a/chrome/browser/meridian/agent/agent_service.h
++++ b/chrome/browser/meridian/agent/agent_service.h
+@@ -6,6 +6,8 @@
+ #define CHROME_BROWSER_MERIDIAN_AGENT_AGENT_SERVICE_H_
+ 
+ #include <map>
++#include <utility>
++#include <vector>
+ #include <memory>
+ #include <string>
+ 
+@@ -136,10 +138,18 @@ class AgentService : public KeyedService {
+   void HandleDialog(std::unique_ptr<Call> call);
+   void SetBoost(std::unique_ptr<Call> call);
+ 
++  // A connected agent's first call, before the person decided: one question
++  // for all the calls waiting; Allow gives it full access.
++  void AskForAccess(const std::string& client,
++                    base::DictValue request,
++                    Reply reply);
++  void OnAccessAnswer(bool allowed);
++
+   raw_ptr<Profile> profile_;
+   PrefChangeRegistrar prefs_;
+   std::unique_ptr<AgentServer> server_;
+   bool paused_ = false;
++  std::vector<std::pair<base::DictValue, Reply>> waiting_for_access_;
+   // Each client's current tab (the last it opened or used).
+   std::map<std::string, tabs::TabHandle> current_tab_;
+   // Tabs an agent works in stay awake (not frozen or throttled in the
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index d85fc1c123..03752c2a29 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -23,6 +23,7 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterTimePref(kChromeDataImportedAt, base::Time());
+   registry->RegisterBooleanPref(kChromeImported, false);
+   registry->RegisterStringPref(kAgentAccess, "off");
++  registry->RegisterBooleanPref(kAgentAccessDecided, false);
+   registry->RegisterDictionaryPref(kWorkbenchClaudeSessions);
+   registry->RegisterBooleanPref(kAgentAllowJs, false);
+   registry->RegisterStringPref(kAgentUploads, "ask");
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index c188847e0c..1660e56a77 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -37,6 +37,9 @@ inline constexpr char kChromeImported[] = "meridian.chrome_imported";
+ // What AI agents (MCP clients) may do: "off", "read", "ask" (the person
+ // confirms every action) or "full".
+ inline constexpr char kAgentAccess[] = "meridian.agent_access";
++// The person decided about agent access (changed it, or answered when an
++// agent first asked). Until then a connected agent's first call asks.
++inline constexpr char kAgentAccessDecided[] = "meridian.agent_access_decided";
+ // The Workbench's open Claude Code sessions, by project folder: a list of
+ // {id, name}, reopened with `claude --resume` after the browser restarts.
+ inline constexpr char kWorkbenchClaudeSessions[] =
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 18d197fe15..d63e7ed315 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -2001,7 +2001,12 @@ void SidebarHandler::SetSettings(mojom::SettingsPtr settings) {
+   const std::string& access = settings->agent_access;
+   if (access == "off" || access == "read" || access == "ask" ||
+       access == "full") {
++    // (Every settings save carries it: only a change is a decision.)
++    const bool changed = access != prefs->GetString(prefs::kAgentAccess);
+     prefs->SetString(prefs::kAgentAccess, access);
++    if (changed) {
++      prefs->SetBoolean(prefs::kAgentAccessDecided, true);
++    }
+   }
+   prefs->SetBoolean(prefs::kAgentAllowJs, settings->agent_allow_js);
+   const std::string& consent = settings->ai_consent;
+diff --git a/chrome/browser/meridian/update_check.h b/chrome/browser/meridian/update_check.h
+index 7076ed84ff..e23775b74e 100644
+--- a/chrome/browser/meridian/update_check.h
++++ b/chrome/browser/meridian/update_check.h
+@@ -18,7 +18,7 @@
+ namespace meridian::update {
+ 
+ // This build's version (the release tag without "v").
+-inline constexpr char kVersion[] = "0.6.20";
++inline constexpr char kVersion[] = "0.6.21";
+ 
+ // GitHub's latest release of Meridian.
+ inline constexpr char kFeed[] =
+diff --git a/chrome/browser/meridian/workbench/term_images.cc b/chrome/browser/meridian/workbench/term_images.cc
+index b72819c5f3..1bd457f040 100644
+--- a/chrome/browser/meridian/workbench/term_images.cc
++++ b/chrome/browser/meridian/workbench/term_images.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/meridian/workbench/term_images.h"
+ 
++#include <algorithm>
+ #include <array>
+ #include <cstdint>
+ #include <optional>
+@@ -13,6 +14,7 @@
+ #include "base/base64.h"
+ #include "base/files/file.h"
+ #include "base/files/file_util.h"
++#include "base/json/json_reader.h"
+ #include "base/strings/string_util.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/meridian/real_path.h"
+@@ -133,4 +135,92 @@ base::expected<base::DictValue, std::string> ReadTerminalImage(
+   return out;
+ }
+ 
++
++namespace {
++
++// The text blocks of one message's content, or "".
++std::string TextOf(const base::ListValue* content) {
++  std::string out;
++  if (!content) {
++    return out;
++  }
++  for (const base::Value& block : *content) {
++    if (!block.is_dict()) {
++      continue;
++    }
++    const std::string* type = block.GetDict().FindString("type");
++    const std::string* text = block.GetDict().FindString("text");
++    if (type && text && (*type == "text" || *type == "output_text") &&
++        !text->empty()) {
++      if (!out.empty()) {
++        out += "\n\n";
++      }
++      out += *text;
++    }
++  }
++  return out;
++}
++
++std::string AnswerInLine(std::string_view line) {
++  std::optional<base::DictValue> d =
++      base::JSONReader::ReadDict(line, base::JSON_PARSE_RFC);
++  if (!d) {
++    return std::string();
++  }
++  const std::string* type = d->FindString("type");
++  if (!type) {
++    return std::string();
++  }
++  if (*type == "assistant") {  // Claude Code
++    const base::DictValue* message = d->FindDict("message");
++    return message ? TextOf(message->FindList("content")) : std::string();
++  }
++  if (*type == "response_item") {  // Codex
++    const base::DictValue* payload = d->FindDict("payload");
++    const std::string* role = payload ? payload->FindString("role") : nullptr;
++    return role && *role == "assistant"
++               ? TextOf(payload->FindList("content"))
++               : std::string();
++  }
++  return std::string();
++}
++
++}  // namespace
++
++std::string LastAnswerInTranscript(const base::FilePath& transcript) {
++  constexpr int64_t kTail = 8 << 20;
++  base::File f(transcript, base::File::FLAG_OPEN | base::File::FLAG_READ);
++  if (!f.IsValid()) {
++    return std::string();
++  }
++  const int64_t size = f.GetLength();
++  const int64_t from = std::max<int64_t>(0, size - kTail);
++  std::string text(static_cast<size_t>(size - from), '\0');
++  const std::optional<size_t> got =
++      f.Read(from, base::as_writable_byte_span(text));
++  if (!got) {
++    return std::string();
++  }
++  text.resize(*got);
++  std::string_view rest(text);
++  while (!rest.empty()) {
++    // The newline before this last line (its own final one aside).
++    const size_t nl =
++        rest.size() < 2 ? std::string_view::npos
++                        : rest.rfind('\n', rest.size() - 2);
++    const bool first = nl == std::string_view::npos;
++    std::string_view line = first ? rest : rest.substr(nl + 1);
++    std::string answer =
++        AnswerInLine(base::TrimWhitespaceASCII(line, base::TRIM_ALL));
++    if (!answer.empty()) {
++      return answer;
++    }
++    if (first) {
++      break;
++    }
++    rest = rest.substr(0, nl + 1);
++  }
++  return std::string();
++}
++
+ }  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/term_images.h b/chrome/browser/meridian/workbench/term_images.h
+index 9199e30024..6d0672da8d 100644
+--- a/chrome/browser/meridian/workbench/term_images.h
++++ b/chrome/browser/meridian/workbench/term_images.h
+@@ -23,6 +23,10 @@ base::expected<base::DictValue, std::string> ReadTerminalImage(
+     const base::FilePath& root,
+     bool with_data);
+ 
++// The agent's latest answer in a session transcript (Claude Code's or
++// Codex's JSONL), as plain text; "" when there is none yet. Blocks.
++std::string LastAnswerInTranscript(const base::FilePath& transcript);
++
+ }  // namespace meridian::workbench
+ 
+ #endif  // CHROME_BROWSER_MERIDIAN_WORKBENCH_TERM_IMAGES_H_
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 124608ad61..b94517f0bb 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -615,6 +615,31 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+                          a),
+                      std::move(reply));
+   }
++  if (method == "termLastAnswer") {
++    // Only that terminal's own session.
++    std::string path;
++    if (HasTestSwitch("meridian-test-transcript")) {
++      path = TestSwitchPath("meridian-test-transcript").AsUTF8Unsafe();
++    } else if (mission::MissionControl* mission =
++                   mission::MissionControlFactory::GetForProfile(profile_)) {
++      tabs::TabInterface* tab =
++          tabs::TabInterface::MaybeGetFromContents(web_ui()->GetWebContents());
++      path = mission->TranscriptOf(tab ? tab->GetHandle().raw_value() : 0, a);
++    }
++    if (path.empty()) {
++      return std::move(reply).Run(base::Value(std::string()));
++    }
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++        base::BindOnce(&LastAnswerInTranscript,
++                       base::FilePath::FromUTF8Unsafe(path)),
++        base::BindOnce(
++            [](Reply reply, std::string answer) {
++              std::move(reply).Run(base::Value(std::move(answer)));
++            },
++            std::move(reply)));
++    return;
++  }
+   if (method == "termImage" || method == "termImageInfo" ||
+       method == "termImageReveal") {
+     // A path a terminal printed: only ever a real image (term_images.h).
+diff --git a/chrome/browser/resources/webui_browser/app.css b/chrome/browser/resources/webui_browser/app.css
+index 517cdde378..fd6b33ca34 100644
+--- a/chrome/browser/resources/webui_browser/app.css
++++ b/chrome/browser/resources/webui_browser/app.css
+@@ -137,8 +137,17 @@
+   align-items: center;
+   gap: 2px;
+   height: 28px;
+-  /* room for the macOS traffic lights */
++  /* room for the macOS traffic lights, and on their centre line */
+   padding-left: 70px;
++  margin-top: -4px;
++  margin-bottom: 12px;
++}
++
++/* Full screen has no traffic lights: the row starts at the sidebar's edge,
++ * in line with the address field. */
++:host([fullscreen-mode='browser']:not([os-win])) #sidebarTop {
++  padding-left: 0;
++  margin-top: 0;
+   margin-bottom: 8px;
+ }
+ 
+@@ -704,6 +713,8 @@ cr-icon-button[hidden] {
+ 
+ :host([sidebar-right]) #sidebarTop {
+   padding-left: 0;
++  margin-top: 0;
++  margin-bottom: 8px;
+ }
+ 
+ :host([sidebar-right]) #main {
+@@ -989,6 +1000,7 @@ cr-icon-button[hidden] {
+ :host([os-win]) #sidebarTop {
+   flex: 1;
+   padding-left: 0;
++  margin-top: 0;
+   margin-bottom: 0;
+ }
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index 1eb9cf4cfc..cb23097a46 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -794,12 +794,17 @@ export function getHtml(this: MeridianSettingsElement) {
+             <p>Meridian will run this command, which adds Meridian to
+               ${this.connecting_.name}'s MCP servers:</p>`}
+           <pre class="command">${this.connecting_.command}</pre>
++          ${this.settings_?.agentAccess === 'off' ? html`
++            <p id="connectAccess">${this.connecting_.name} will be able to
++              control Meridian: open pages, click and type, also on sites
++              where you are signed in. You can change this under Agents.</p>` :
++              ''}
+           <div class="confirm-actions">
+             <button class="btn" @click="${this.onConnectCancelClick_}">
+               Cancel</button>
+             <button id="connectRun" class="btn primary"
+                 @click="${this.onConnectRunClick_}">
+-                ${this.connecting_.file ? 'Connect' : 'Run'}</button>
++                Connect</button>
+           </div>
+         </div>
+       </div>` : ''}
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 3237f6e1ad..e706828d5d 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -772,7 +772,13 @@ export class MeridianSettingsElement extends CrLitElement {
+     const {ok, output} = await this.handler_.connectAgentCli(cli.id);
+     if (!ok) {
+       this.connectResult_ = `${cli.name} wasn’t connected: ${output}`;
+-    } else if (cli.file) {
++      return;
++    }
++    // Connected means it works: no second stop in the settings.
++    if (this.settings_?.agentAccess === 'off') {
++      this.save_({agentAccess: 'full'});
++    }
++    if (cli.file) {
+       // Claude Desktop reads its config only when it starts.
+       this.connectResult_ = `${cli.name} is connected (${output}). Quit ` +
+           'and reopen Claude Desktop to use Meridian.';

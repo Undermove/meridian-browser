@@ -1,0 +1,1369 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Sat, 21 Nov 2026 12:59:50 +0400
+Subject: [PATCH 222/223] Meridian: Ask suggestions, one-click Boosts, AI
+ switcher, consent per AI
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/ai/ai_service.cc      | 116 +++++--
+ chrome/browser/meridian/ai/ai_service.h       |  25 +-
+ .../meridian/boosts/boost_tab_helper.cc       |   5 +-
+ .../meridian/boosts/boost_tab_helper.h        |   3 +
+ chrome/browser/meridian/prefs.cc              |   2 +
+ chrome/browser/meridian/prefs.h               |   4 +
+ chrome/browser/meridian/sidebar.mojom         |  12 +-
+ chrome/browser/meridian/sidebar_handler.cc    |  19 +-
+ chrome/browser/meridian/sidebar_handler.h     |   3 +
+ .../meridian/workbench/workbench_handler.cc   |  12 +-
+ .../resources/webui_browser/app.html.ts       |   4 +-
+ chrome/browser/resources/webui_browser/app.ts |  11 +
+ .../resources/webui_browser/meridian/ask.css  | 175 ++++++++++
+ .../webui_browser/meridian/ask.html.ts        |  57 +++-
+ .../resources/webui_browser/meridian/ask.ts   | 306 +++++++++++++++++-
+ .../webui_browser/meridian/boost_editor.ts    |   2 +-
+ .../webui_browser/meridian/command_bar.ts     |  19 +-
+ .../webui_browser/meridian/settings.html.ts   |  18 +-
+ .../webui_browser/meridian/settings.ts        |  20 +-
+ .../webui_browser/meridian/sidebar.ts         |   5 +
+ 20 files changed, 761 insertions(+), 57 deletions(-)
+
+diff --git a/chrome/browser/meridian/ai/ai_service.cc b/chrome/browser/meridian/ai/ai_service.cc
+index 8bca13a196..2f2adaf9c4 100644
+--- a/chrome/browser/meridian/ai/ai_service.cc
++++ b/chrome/browser/meridian/ai/ai_service.cc
+@@ -6,8 +6,10 @@
+ 
+ #include "url/gurl.h"
+ 
++#include <algorithm>
+ #include <utility>
+ 
++#include "components/prefs/scoped_user_pref_update.h"
+ #include "base/base64.h"
+ #include "base/environment.h"
+ #include "base/json/json_reader.h"
+@@ -380,7 +382,20 @@ AiService::AiService(Profile* profile)
+     : profile_(profile),
+       local_(std::make_unique<ai::LocalAgents>(profile)),
+       chats_(std::make_unique<ai::ChatStore>(
+-          profile->GetPath().AppendASCII("Meridian Chats.json"))) {}
++          profile->GetPath().AppendASCII("Meridian Chats.json"))) {
++  // "Always" used to mean every AI: it stays for the one picked back then,
++  // and the others are asked about once.
++  PrefService* prefs = profile_->GetPrefs();
++  if (!prefs->GetBoolean(prefs::kAiConsentMigrated)) {
++    prefs->SetBoolean(prefs::kAiConsentMigrated, true);
++    if (prefs->GetString(prefs::kAiConsent) == "always") {
++      if (std::string current = CurrentProvider(); !current.empty()) {
++        AllowProvider(current, /*always=*/true);
++      }
++      prefs->SetString(prefs::kAiConsent, std::string());
++    }
++  }
++}
+ 
+ AiService::~AiService() = default;
+ 
+@@ -868,19 +883,64 @@ std::string AiService::DestinationOf(const std::string& provider) const {
+              : p->vendor + " (" + p->label + ")";
+ }
+ 
++namespace {
++
++// Claude on a key and Claude Code go to the same company and are one answer.
++std::string ConsentId(const std::string& provider) {
++  return provider == "api" || provider == "claude" ? "claude-code" : provider;
++}
++
++}  // namespace
++
+ bool AiService::ConsentGiven(const std::string& provider) const {
+   const std::string consent =
+       profile_->GetPrefs()->GetString(prefs::kAiConsent);
+   if (consent == "off") {
+     return false;
+   }
++  const std::string id = ConsentId(provider);
+   // On this computer, said yes already, or a test that doesn't ask about it.
+   return DestinationOf(provider).empty() || consent == "always" ||
+-         consent_this_run_ ||
++         consent_this_run_.contains(id) ||
++         std::ranges::contains(
++             profile_->GetPrefs()->GetList(prefs::kAiConsentAllowed),
++             base::Value(id)) ||
+          (TestSwitchesAllowed() && !HasTestSwitch("meridian-test-ai-consent")) ||
+          Asker().is_null();
+ }
+ 
++void AiService::AllowProvider(const std::string& provider, bool always) {
++  const std::string id = ConsentId(provider);
++  consent_this_run_.insert(id);
++  if (always) {
++    ScopedListPrefUpdate update(profile_->GetPrefs(),
++                                prefs::kAiConsentAllowed);
++    if (!std::ranges::contains(*update, base::Value(id))) {
++      update->Append(id);
++    }
++  }
++}
++
++std::vector<std::pair<std::string, std::string>> AiService::AlwaysAllowed()
++    const {
++  std::vector<std::pair<std::string, std::string>> out;
++  for (const base::Value& v :
++       profile_->GetPrefs()->GetList(prefs::kAiConsentAllowed)) {
++    if (v.is_string()) {
++      std::string to = DestinationOf(v.GetString());
++      out.emplace_back(v.GetString(), to.empty() ? v.GetString() : to);
++    }
++  }
++  return out;
++}
++
++void AiService::ForgetConsent(const std::string& provider) {
++  const std::string id = ConsentId(provider);
++  consent_this_run_.erase(id);
++  ScopedListPrefUpdate update(profile_->GetPrefs(), prefs::kAiConsentAllowed);
++  update->EraseValue(base::Value(id));
++}
++
+ void AiService::WhenAllowed(
+     const std::string& provider,
+     base::OnceClosure go,
+@@ -892,39 +952,55 @@ void AiService::WhenAllowed(
+   if (ConsentGiven(provider)) {
+     return std::move(go).Run();
+   }
+-  const std::string to = DestinationOf(provider);
+-  consent_waiting_.emplace_back(std::move(go), std::move(refuse));
+-  if (consent_waiting_.size() > 1) {
+-    return;  // one question for all of them
++  consent_waiting_.push_back({provider, std::move(go), std::move(refuse)});
++  if (consent_asking_.empty()) {
++    AskNextConsent();  // else one question at a time
++  }
++}
++
++void AiService::AskNextConsent() {
++  if (consent_waiting_.empty()) {
++    return;
+   }
+-  Asker().Run(profile_, to,
++  const std::string provider = consent_waiting_.front().provider;
++  consent_asking_ = ConsentId(provider);
++  Asker().Run(profile_, DestinationOf(provider),
+               base::BindOnce(&AiService::OnConsent,
+                              weak_factory_.GetWeakPtr()));
+ }
+ 
+ void AiService::OnConsent(const std::string& choice) {
+-  if (choice == "always") {
+-    profile_->GetPrefs()->SetString(prefs::kAiConsent, "always");
+-  } else if (choice == "off") {
+-    profile_->GetPrefs()->SetString(prefs::kAiConsent, "off");
+-  }
++  const std::string asked = std::exchange(consent_asking_, std::string());
+   const bool yes = choice == "send" || choice == "always";
+-  if (yes) {
+-    consent_this_run_ = true;
++  const bool off = choice == "off";
++  if (off) {
++    profile_->GetPrefs()->SetString(prefs::kAiConsent, "off");
++  } else if (yes) {
++    AllowProvider(asked, choice == "always");
+   }
+   const std::string why =
+-      choice == "off"     ? "AI features are off. Turn them on in Settings › AI."
++      off                 ? "AI features are off. Turn them on in Settings › AI."
+       : choice == "other" ? "Pick the AI to use in Settings › AI."
+                           : "Not sent: you didn’t allow it.";
+-  auto waiting = std::move(consent_waiting_);
+-  consent_waiting_.clear();
+-  for (auto& [go, refuse] : waiting) {
++  // The answer is about this AI; a request for another one gets its own
++  // question (with AI off, none goes).
++  std::vector<ConsentWait> answered;
++  std::vector<ConsentWait> others;
++  for (ConsentWait& wait : consent_waiting_) {
++    (off || ConsentId(wait.provider) == asked ? answered : others)
++        .push_back(std::move(wait));
++  }
++  consent_waiting_ = std::move(others);
++  for (ConsentWait& wait : answered) {
+     if (yes) {
+-      std::move(go).Run();
++      std::move(wait.go).Run();
+     } else {
+-      std::move(refuse).Run(why);
++      std::move(wait.refuse).Run(why);
+     }
+   }
++  if (consent_asking_.empty()) {
++    AskNextConsent();
++  }
+ }
+ 
+ void AiService::Chat(Request request, EventCallback events) {
+diff --git a/chrome/browser/meridian/ai/ai_service.h b/chrome/browser/meridian/ai/ai_service.h
+index d33e231769..b7c6776fce 100644
+--- a/chrome/browser/meridian/ai/ai_service.h
++++ b/chrome/browser/meridian/ai/ai_service.h
+@@ -8,6 +8,7 @@
+ #include <map>
+ #include <memory>
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <vector>
+ 
+@@ -97,6 +98,13 @@ class AiService : public KeyedService {
+   // The window that asks (SidebarHandler); choices: "send", "always",
+   // "other" (pick another AI), "off", "cancel".
+   static void SetConsentAsker(ConsentAsker asker);
++  // Whether `provider` may be sent to without asking, and saying yes to it:
++  // for this run, or always. Workbench shares these with the panel.
++  bool ConsentGiven(const std::string& provider) const;
++  void AllowProvider(const std::string& provider, bool always);
++  // The AIs with an "always", {id, where it goes}; taking one back.
++  std::vector<std::pair<std::string, std::string>> AlwaysAllowed() const;
++  void ForgetConsent(const std::string& provider);
+   void WhenAllowed(const std::string& provider,
+                    base::OnceClosure go,
+                    base::OnceCallback<void(const std::string&)> refuse);
+@@ -160,13 +168,18 @@ class AiService : public KeyedService {
+   void FinishPreview(const GURL& url, Preview preview);
+ 
+   raw_ptr<Profile> profile_;
+-  // Consent: given for this run; the requests waiting for an answer.
+-  bool consent_this_run_ = false;
+-  std::vector<std::pair<base::OnceClosure,
+-                        base::OnceCallback<void(const std::string&)>>>
+-      consent_waiting_;
++  // Consent, per AI: given for this run; the requests waiting for an answer
++  // and the AI being asked about.
++  struct ConsentWait {
++    std::string provider;
++    base::OnceClosure go;
++    base::OnceCallback<void(const std::string&)> refuse;
++  };
++  std::set<std::string> consent_this_run_;
++  std::vector<ConsentWait> consent_waiting_;
++  std::string consent_asking_;
++  void AskNextConsent();
+   void OnConsent(const std::string& choice);
+-  bool ConsentGiven(const std::string& provider) const;
+   // Link previews: url -> (when, preview); what's being fetched; recent
+   // uncached starts (a page can move links under a still cursor).
+   std::map<GURL, std::pair<base::TimeTicks, Preview>> previews_;
+diff --git a/chrome/browser/meridian/boosts/boost_tab_helper.cc b/chrome/browser/meridian/boosts/boost_tab_helper.cc
+index f674f33106..cc80f7bc08 100644
+--- a/chrome/browser/meridian/boosts/boost_tab_helper.cc
++++ b/chrome/browser/meridian/boosts/boost_tab_helper.cc
+@@ -533,8 +533,10 @@ void BoostTabHelper::OnZapPicked(base::Value result) {
+ void BoostTabHelper::Improve(
+     const std::string& boost_id,
+     const std::string& wish,
++    const std::string& provider,
+     base::OnceCallback<void(std::string, std::string)> done) {
+   target_id_ = boost_id;
++  improve_provider_ = provider;
+   content::RenderFrameHost* frame = web_contents()->GetPrimaryMainFrame();
+   if (BoostHostFor(frame->GetLastCommittedURL()).empty()) {
+     std::move(done).Run("Only websites can be boosted.", std::string());
+@@ -559,7 +561,7 @@ void BoostTabHelper::OnOutline(
+     std::move(done).Run("The AI isn’t available here.", std::string());
+     return;
+   }
+-  if (ai->CurrentProvider().empty()) {
++  if (improve_provider_.empty() && ai->CurrentProvider().empty()) {
+     std::move(done).Run(
+         "Set up an AI in Settings > AI: an Anthropic API key, or another AI.",
+         std::string());
+@@ -586,6 +588,7 @@ void BoostTabHelper::OnOutline(
+       "boost-" + base::Uuid::GenerateRandomV4().AsLowercaseString();
+   request.text = std::move(text);
+   request.system = kImproveSystem;
++  request.provider = improve_provider_;
+   request.mode = "chat";
+ 
+   struct Run {
+diff --git a/chrome/browser/meridian/boosts/boost_tab_helper.h b/chrome/browser/meridian/boosts/boost_tab_helper.h
+index 3f02c97b3e..9beed1a036 100644
+--- a/chrome/browser/meridian/boosts/boost_tab_helper.h
++++ b/chrome/browser/meridian/boosts/boost_tab_helper.h
+@@ -43,6 +43,7 @@ class BoostTabHelper : public content::WebContentsObserver,
+   // `done`: an error, or what changed in a sentence.
+   void Improve(const std::string& boost_id,
+                const std::string& wish,
++               const std::string& provider,
+                base::OnceCallback<void(std::string error, std::string summary)>
+                    done);
+ 
+@@ -74,6 +75,8 @@ class BoostTabHelper : public content::WebContentsObserver,
+       this};
+   base::RepeatingTimer zap_timer_;
+   std::string target_id_;
++  // Who answers an Improve ("": the one picked in Settings > AI).
++  std::string improve_provider_;
+   base::WeakPtrFactory<BoostTabHelper> weak_factory_{this};
+ 
+   WEB_CONTENTS_USER_DATA_KEY_DECL();
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index 75f9a50b76..d85fc1c123 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -30,6 +30,8 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterStringPref(kAiKey, std::string());
+   registry->RegisterStringPref(kAiProvider, std::string());
+   registry->RegisterStringPref(kAiConsent, std::string());
++  registry->RegisterListPref(kAiConsentAllowed);
++  registry->RegisterBooleanPref(kAiConsentMigrated, false);
+   registry->RegisterDictionaryPref(kAiCloudKeys);
+   registry->RegisterStringPref(kAiCustomBase, std::string());
+   registry->RegisterDictionaryPref(kAiModels);
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index d8b15e6638..c188847e0c 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -56,6 +56,10 @@ inline constexpr char kAiProvider[] = "meridian.ai_provider";
+ // Before the AI features send anything to an AI service on the internet:
+ // "" asks (once per run), "always" doesn't, "off" turns them off.
+ inline constexpr char kAiConsent[] = "meridian.ai_consent";
++// The AIs the person said "always send" to, each on its own.
++inline constexpr char kAiConsentAllowed[] = "meridian.ai_consent_allowed";
++// An old "always" (it meant every AI) now covers only the AI picked then.
++inline constexpr char kAiConsentMigrated[] = "meridian.ai_consent_migrated";
+ // Other providers' API keys: provider id -> key encrypted with OSCrypt
+ // (base64).
+ inline constexpr char kAiCloudKeys[] = "meridian.ai_cloud_keys";
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 242174ae20..2427249eaa 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -453,6 +453,12 @@ struct AiProvider {
+   string docs;
+ };
+ 
++// An AI the person said "always send" to, and where it goes.
++struct AllowedAi {
++  string id;
++  string to;
++};
++
+ // A site search the command bar can run by its keyword.
+ struct SearchKeyword {
+   string keyword;
+@@ -645,7 +651,8 @@ interface SidebarHandler {
+   SetBoost(Boost boost) => (string id);
+   DeleteBoost(string id);
+   StartZap(string boost_id);
+-  ImproveBoost(string boost_id, string wish) =>
++  // `provider`: who answers ("": the one picked in Settings > AI).
++  ImproveBoost(string boost_id, string wish, string provider) =>
+       (string error, string summary);
+ 
+   // macOS: hides the window's traffic lights while the sidebar is hidden (they
+@@ -773,6 +780,9 @@ interface SidebarHandler {
+   AiReset(string session_id);
+   // Can anything answer, and who ("Claude", "Ollama"…).
+   GetAiStatus() => (bool ready, string label);
++  // The AIs with an "always send", and taking one back.
++  GetAllowedAi() => (array<AllowedAi> allowed);
++  ForgetAiConsent(string id);
+   // Settings > AI: who can answer. `fresh` re-checks (after an install).
+   GetAiProviders(bool fresh) => (array<AiProvider> providers);
+   // Any provider's API key: recognised by its shape, checked with that
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index c780babf7c..3772854380 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -1085,6 +1085,22 @@ void SidebarHandler::AiChat(const std::string& session_id,
+   AiChatWith(session_id, text, mode, with_page, std::string());
+ }
+ 
++void SidebarHandler::GetAllowedAi(GetAllowedAiCallback callback) {
++  std::vector<mojom::AllowedAiPtr> out;
++  if (AiService* ai = AiServiceFactory::GetForProfile(browser_->GetProfile())) {
++    for (const auto& [id, to] : ai->AlwaysAllowed()) {
++      out.push_back(mojom::AllowedAi::New(id, to));
++    }
++  }
++  std::move(callback).Run(std::move(out));
++}
++
++void SidebarHandler::ForgetAiConsent(const std::string& id) {
++  if (AiService* ai = AiServiceFactory::GetForProfile(browser_->GetProfile())) {
++    ai->ForgetConsent(id);
++  }
++}
++
+ void SidebarHandler::GetSearchKeywords(GetSearchKeywordsCallback callback) {
+   std::vector<mojom::SearchKeywordPtr> out;
+   TemplateURLService* service =
+@@ -3305,6 +3321,7 @@ void SidebarHandler::StartZap(const std::string& boost_id) {
+ 
+ void SidebarHandler::ImproveBoost(const std::string& boost_id,
+                                   const std::string& wish,
++                                  const std::string& provider,
+                                   ImproveBoostCallback callback) {
+   content::WebContents* contents = model()->GetActiveWebContents();
+   BoostTabHelper* helper =
+@@ -3314,7 +3331,7 @@ void SidebarHandler::ImproveBoost(const std::string& boost_id,
+     return;
+   }
+   helper->Improve(
+-      boost_id, wish.substr(0, 2000),
++      boost_id, wish.substr(0, 2000), provider,
+       base::BindOnce(
+           [](ImproveBoostCallback callback, std::string error,
+              std::string summary) { std::move(callback).Run(error, summary); },
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index fda7b0b269..0eb1213072 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -167,6 +167,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void StartZap(const std::string& boost_id) override;
+   void ImproveBoost(const std::string& boost_id,
+                     const std::string& wish,
++                    const std::string& provider,
+                     ImproveBoostCallback callback) override;
+   void SetWindowControlsVisible(bool visible) override;
+   void TestCommand(int32_t command_id) override;
+@@ -230,6 +231,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+                   const std::string& mode,
+                   bool with_page,
+                   const std::string& provider) override;
++  void GetAllowedAi(GetAllowedAiCallback callback) override;
++  void ForgetAiConsent(const std::string& id) override;
+   void GetSearchKeywords(GetSearchKeywordsCallback callback) override;
+   void SearchUrl(const std::string& keyword,
+                  const std::string& terms,
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 2a7030198e..5237f798e2 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -31,6 +31,8 @@
+ #include "chrome/browser/meridian/sidebar_handler.h"
+ #include "chrome/browser/meridian/test_switches.h"
+ #include "chrome/browser/meridian/workbench/agents.h"
++#include "chrome/browser/meridian/ai/ai_service.h"
++#include "chrome/browser/meridian/ai/ai_service_factory.h"
+ #include "chrome/browser/meridian/workbench/context_insights.h"
+ #include "chrome/browser/meridian/workbench/customizations.h"
+ #include "net/base/url_util.h"
+@@ -759,15 +761,19 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+   // the person's answer for the AI features ("", "always" or "off"; tests
+   // don't ask unless --meridian-test-ai-consent).
+   if (method == "aiConsent") {
++    // One answer per AI, shared with Ask (`a`: the agent).
+     std::string consent = profile_->GetPrefs()->GetString(prefs::kAiConsent);
+-    if (TestSwitchesAllowed() && !HasTestSwitch("meridian-test-ai-consent")) {
++    AiService* ai = AiServiceFactory::GetForProfile(profile_);
++    if ((TestSwitchesAllowed() && !HasTestSwitch("meridian-test-ai-consent")) ||
++        (ai && ai->ConsentGiven(a == "claude" ? "claude-code" : a))) {
+       consent = "always";
+     }
+     return std::move(reply).Run(base::Value(consent));
+   }
+   if (method == "setAiConsent") {
+-    if (a == "always") {
+-      profile_->GetPrefs()->SetString(prefs::kAiConsent, "always");
++    if (AiService* ai = AiServiceFactory::GetForProfile(profile_)) {
++      ai->AllowProvider(a == "claude" ? "claude-code" : a,
++                        StringParam(params, 1) == "always");
+     }
+     return std::move(reply).Run(base::Value(true));
+   }
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index cb0b2cc676..3951b8bbb6 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -235,7 +235,9 @@ export function getHtml(this: WebuiBrowserAppElement) {
+     </content-region>
+     <meridian-ask id="ask"
+         @meridian-show-settings="${this.onMeridianShowSettings_}"
+-        @meridian-open-url="${this.onMeridianOpenUrl_}"></meridian-ask>
++        @meridian-open-url="${this.onMeridianOpenUrl_}"
++        @ask-open-urls="${this.onAskOpenUrls_}"
++        @ask-edit-boost="${this.onAskEditBoost_}"></meridian-ask>
+     <side-panel id="sidePanel" @side-panel-closed="${this.onSidePanelClosed_}">
+     </side-panel>
+     <meridian-agent id="agent"
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 972dcca131..8c4f76f467 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -1113,6 +1113,17 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     }
+   };
+ 
++  // Ask's "Suggest a setup": the addresses of what is open (it keeps sites).
++  protected onAskOpenUrls_(e: CustomEvent<string[]>) {
++    e.detail.push(...this.$.tabstrip.openUrls());
++  }
++
++  // Ask made a Boost: its editor, as from the site's controls.
++  protected onAskEditBoost_(e: CustomEvent<string>) {
++    this.onSiteControlAction_(
++        new CustomEvent('site-control-action', {detail: `boost:${e.detail}`}));
++  }
++
+   protected onSiteControlAction_(e: CustomEvent<string>) {
+     let origin = '';
+     try {
+diff --git a/chrome/browser/resources/webui_browser/meridian/ask.css b/chrome/browser/resources/webui_browser/meridian/ask.css
+index 46ac0cc07e..1350469174 100644
+--- a/chrome/browser/resources/webui_browser/meridian/ask.css
++++ b/chrome/browser/resources/webui_browser/meridian/ask.css
+@@ -48,6 +48,7 @@ button:disabled {
+ }
+ 
+ .head {
++  position: relative;
+   display: flex;
+   align-items: center;
+   gap: 4px;
+@@ -226,3 +227,177 @@ textarea {
+   user-select: text;
+   cursor: text;
+ }
++
++/* Before the first question: what the panel can do here. */
++.starters {
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++  margin-top: auto;
++}
++
++.starters-title {
++  margin: 0 0 4px 2px;
++  font-size: 12px;
++  font-weight: 550;
++  color: var(--meridian-text-muted);
++}
++
++.starter {
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++  padding: 9px 11px;
++  border-radius: 10px;
++  text-align: start;
++  background: color-mix(in srgb, var(--meridian-text) 4%, transparent);
++  transition: background 120ms ease, transform 120ms ease;
++}
++
++.starter:hover {
++  background: color-mix(in srgb, var(--meridian-space) 18%, transparent);
++}
++
++.starter:active {
++  transform: scale(0.985);
++}
++
++.starter-label {
++  font-weight: 550;
++  overflow-wrap: anywhere;
++}
++
++.starter-hint {
++  font-size: 11.5px;
++  color: var(--meridian-text-muted);
++}
++
++/* The AI at work: dots until the first word, then a caret after the last. */
++.thinking {
++  display: inline-flex;
++  align-items: center;
++  gap: 4px;
++  min-height: 20px;
++  color: var(--meridian-text-muted);
++  font-size: 12.5px;
++}
++
++.thinking i {
++  width: 5px;
++  height: 5px;
++  border-radius: 50%;
++  background: var(--meridian-space);
++  animation: ask-dot 1.1s ease-in-out infinite;
++}
++
++.thinking i:nth-child(2) {
++  animation-delay: 0.15s;
++}
++
++.thinking i:nth-child(3) {
++  animation-delay: 0.3s;
++}
++
++.thinking span {
++  margin-left: 4px;
++}
++
++@keyframes ask-dot {
++  0%,
++  70%,
++  100% {
++    opacity: 0.3;
++    transform: translateY(0);
++  }
++
++  35% {
++    opacity: 1;
++    transform: translateY(-3px);
++  }
++}
++
++.answer.streaming > :last-child:not(ul, ol, pre)::after,
++.answer.streaming > :is(ul, ol):last-child > li:last-child::after {
++  content: '';
++  display: inline-block;
++  width: 2px;
++  height: 1em;
++  margin-left: 2px;
++  vertical-align: -2px;
++  background: var(--meridian-space);
++  animation: ask-caret 1s steps(2, jump-none) infinite;
++}
++
++@keyframes ask-caret {
++  from {
++    opacity: 1;
++  }
++
++  to {
++    opacity: 0;
++  }
++}
++
++.boost-note {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  margin-top: 2px;
++  color: var(--meridian-text-muted);
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .thinking i,
++  .answer.streaming > :last-child::after,
++  .answer.streaming > :is(ul, ol):last-child > li:last-child::after {
++    animation: none;
++  }
++
++  .starter {
++    transition: none;
++  }
++}
++
++/* Who answers this chat: a menu in the header. */
++button.who {
++  display: inline-flex;
++  align-items: center;
++  gap: 3px;
++  height: 20px;
++}
++
++button.who:hover {
++  color: var(--meridian-text);
++  background: color-mix(in srgb, var(--meridian-text) 13%, transparent);
++}
++
++#whoMenu {
++  position: absolute;
++  z-index: 5;
++  top: 36px;
++  left: 54px;
++  display: flex;
++  flex-direction: column;
++  min-width: 190px;
++  max-height: 320px;
++  overflow-y: auto;
++  padding: 4px;
++  border-radius: 10px;
++  background: var(--meridian-surface);
++  box-shadow: 0 0 0 0.5px var(--meridian-border), 0 6px 22px rgba(0, 0, 0, 0.16);
++}
++
++.who-item {
++  padding: 6px 9px;
++  border-radius: 7px;
++  text-align: start;
++}
++
++.who-item:hover {
++  background: var(--meridian-row-hover);
++}
++
++.who-item.more {
++  margin-top: 3px;
++  color: var(--meridian-text-muted);
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/ask.html.ts b/chrome/browser/resources/webui_browser/meridian/ask.html.ts
+index 33530e5e14..67ff5009f6 100644
+--- a/chrome/browser/resources/webui_browser/meridian/ask.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/ask.html.ts
+@@ -10,17 +10,32 @@ import {keyText} from './keys.js';
+ 
+ export function getHtml(this: MeridianAskElement) {
+   return html`<!--_html_template_start_-->
+-<div id="panel">
++<div id="panel" @click="${this.onPanelClick_}">
+   <div class="head">
+     <span class="title">${icon('sparkles', 15)} Ask</span>
+-    ${this.who_ ? html`<span id="who" class="who">${this.who_}</span>` : ''}
++    ${this.pickedLabel_ || this.who_ ? html`
++      <button id="who" class="who" aria-haspopup="menu"
++          aria-expanded="${this.menuOpen_}"
++          title="Choose who answers this chat" @click="${this.onWhoClick_}"
++          >${this.pickedLabel_ || this.who_}${icon('chevronDown', 11)}</button>`
++        : ''}
++    ${this.menuOpen_ ? html`
++      <div id="whoMenu" role="menu">
++        ${this.choices_.map(c => html`
++          <button class="who-item" role="menuitem" data-id="${c.id}"
++              data-label="${c.label}" @click="${this.onChoiceClick_}">
++            ${c.label}</button>`)}
++        <button id="whoMore" class="who-item more" role="menuitem"
++            @click="${this.onConnectMoreClick_}">Connect another AI…</button>
++      </div>` : ''}
+     <div class="grow"></div>
+     <button id="new" class="icon-btn" title="New chat"
+         @click="${this.onNewClick_}">${icon('plus', 15)}</button>
+     <button id="close" class="icon-btn" title="Close${keyText(' (⌘J)')}"
+         @click="${this.onCloseClick_}">${icon('x', 15)}</button>
+   </div>
+-  <div id="log" @click="${this.onLogClick_}">
++  <div id="log" @click="${this.onLogClick_}"
++      @pointerenter="${this.onLogPointerenter_}">
+     ${!this.hasKey_ ? html`
+       <div class="empty">
+         <p>Ask about the page you're on. Claude can also do things in the
+@@ -28,12 +43,37 @@ export function getHtml(this: MeridianAskElement) {
+         <button id="addKey" class="btn" @click="${this.onSettingsClick_}">
+           Set up AI</button>
+       </div>` : ''}
++    ${this.hasKey_ && !this.rendered_.length ? html`
++      <div class="starters">
++        <p class="starters-title">Try something</p>
++        ${this.starters_().map(s => html`
++          <button class="starter" data-kind="${s.kind}"
++              @click="${this.onStarterClick_}">
++            <span class="starter-label">${s.label}</span>
++            <span class="starter-hint">${s.hint}</span>
++          </button>`)}
++      </div>` : ''}
+     ${this.rendered_.map(m => html`
+       <div class="msg ${m.role}">
+         ${m.role === 'user' ? html`<div class="bubble">${m.text}</div>` : html`
+           ${m.tools ? html`<div class="tools">${icon('globe', 12)} ${m.tools}
+             </div>` : ''}
+-          <div class="answer">${m.body}</div>
++          ${this.busy_ && m.index === this.rendered_.length - 1 && !m.text ?
++              html`<div class="thinking" role="status">
++                <i></i><i></i><i></i>
++                <span>${m.working || 'Thinking'}</span>
++              </div>` : ''}
++          <div class="answer ${this.busy_ && m.text &&
++              m.index === this.rendered_.length - 1 ? 'streaming' : ''}">
++            ${m.body}</div>
++          ${m.boost ? html`
++            <div class="boost-note">
++              ${m.boost.undone ? html`<span>Undone.</span>` : html`
++                <button class="btn undo-boost" data-index="${m.index}"
++                    @click="${this.onUndoBoostClick_}">Undo</button>
++                <button class="btn edit-boost" data-id="${m.boost.id}"
++                    @click="${this.onEditBoostClick_}">Edit</button>`}
++            </div>` : ''}
+           ${m.error ? html`<div class="error">${m.error}</div>` : ''}`}
+       </div>`)}
+   </div>
+@@ -45,11 +85,14 @@ export function getHtml(this: MeridianAskElement) {
+           .checked="${this.withPage_}" @change="${this.onWithPageChange_}">
+         Use this page</label>
+       <div class="grow"></div>
+-      ${this.busy_ ? html`
++      ${this.boosting_ ? html`
++        <button class="btn" disabled>Working…</button>` : ''}
++      ${!this.boosting_ && this.busy_ ? html`
+         <button id="stop" class="btn" @click="${this.onStopClick_}">Stop
+-        </button>` : html`
++        </button>` : ''}
++      ${!this.busy_ ? html`
+         <button id="send" class="btn primary" @click="${this.onSendClick_}">
+-          Send</button>`}
++          Send</button>` : ''}
+     </div>
+   </div>
+ </div>
+diff --git a/chrome/browser/resources/webui_browser/meridian/ask.ts b/chrome/browser/resources/webui_browser/meridian/ask.ts
+index 6445193942..53254402e8 100644
+--- a/chrome/browser/resources/webui_browser/meridian/ask.ts
++++ b/chrome/browser/resources/webui_browser/meridian/ask.ts
+@@ -9,7 +9,7 @@ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {PropertyValues, TemplateResult} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+ import {browserProxyFactory} from '../sidebar.mojom-webui.js';
+-import type {SidebarHandlerInterface} from '../sidebar.mojom-webui.js';
++import type {Boost, Item, SidebarHandlerInterface} from '../sidebar.mojom-webui.js';
+ 
+ import {getCss} from './ask.css.js';
+ import {getHtml} from './ask.html.js';
+@@ -20,6 +20,30 @@ export interface Message {
+   text: string;
+   tools: string[];
+   error: string;
++  // Made by a suggestion: what Undo puts back (null: there was no boost).
++  boost?: BoostResult;
++  // What shows while it works, in place of "Thinking".
++  working?: string;
++}
++
++export interface BoostResult {
++  id: string;
++  host: string;
++  before: Boost|null;
++  undone: boolean;
++}
++
++// An AI that is ready to answer, for the switcher in the panel's header.
++export interface AiChoice {
++  id: string;
++  label: string;
++}
++
++// What the panel offers before the first question.
++export interface Starter {
++  kind: 'focus'|'look'|'tune'|'setup';
++  label: string;
++  hint: string;
+ }
+ 
+ export interface RenderedMessage {
+@@ -28,8 +52,18 @@ export interface RenderedMessage {
+   body: TemplateResult[];
+   tools: string;
+   error: string;
++  boost?: BoostResult;
++  working?: string;
++  index: number;
+ }
+ 
++const FOCUS_WISH =
++    'Make this page distraction-free: keep what I came to read or do, hide ' +
++    'the rest.';
++const LOOK_WISH =
++    'Give this site a calmer, more comfortable look: softer colours, easier ' +
++    'to read text and more room, without hiding anything I need.';
++
+ export class MeridianAskElement extends CrLitElement {
+   static get is() {
+     return 'meridian-ask';
+@@ -52,6 +86,12 @@ export class MeridianAskElement extends CrLitElement {
+       withPage_: {state: true, type: Boolean},
+       hasKey_: {state: true, type: Boolean},
+       who_: {state: true, type: String},
++      host_: {state: true, type: String},
++      boosting_: {state: true, type: Boolean},
++      picked_: {state: true, type: String},
++      pickedLabel_: {state: true, type: String},
++      choices_: {state: true, type: Array},
++      menuOpen_: {state: true, type: Boolean},
+     };
+   }
+ 
+@@ -63,9 +103,18 @@ export class MeridianAskElement extends CrLitElement {
+   // Something can answer (Settings > AI), and who.
+   protected accessor hasKey_: boolean = true;
+   protected accessor who_: string = '';
++  // The active tab's site, for the suggestions ("": not a website).
++  protected accessor host_: string = '';
+ 
+   private readonly handler_: SidebarHandlerInterface =
+       browserProxyFactory.getInstance().handler;
++  // A suggestion's Boost is under way (Stop is for the chat's answers).
++  protected accessor boosting_: boolean = false;
++  // Who answers this chat ("": the one picked in Settings > AI).
++  protected accessor picked_: string = '';
++  protected accessor pickedLabel_: string = '';
++  protected accessor choices_: AiChoice[] = [];
++  protected accessor menuOpen_: boolean = false;
+   private sessionId_: string = crypto.randomUUID();
+   private listenerId_: number|null = null;
+ 
+@@ -96,9 +145,9 @@ export class MeridianAskElement extends CrLitElement {
+       return;
+     }
+     this.withPage_ = withPage;
+-    if (who) {
+-      this.who_ = who;
+-    }
++    // The chat stays with whoever was asked, and the header says so.
++    this.picked_ = provider;
++    this.pickedLabel_ = who;
+     this.messages_ = [
+       ...this.messages_,
+       {role: 'user', text, tools: [], error: ''},
+@@ -115,6 +164,7 @@ export class MeridianAskElement extends CrLitElement {
+       const {ready, label} = await this.handler_.getAiStatus();
+       this.hasKey_ = ready;
+       this.who_ = label;
++      await this.refreshHost_();
+       await this.updateComplete;
+       this.shadowRoot.querySelector<HTMLTextAreaElement>('#input')?.focus();
+     }
+@@ -123,7 +173,10 @@ export class MeridianAskElement extends CrLitElement {
+   override willUpdate(changed: PropertyValues<this>) {
+     super.willUpdate(changed);
+     if (changed.has('messages_' as keyof MeridianAskElement)) {
+-      this.rendered_ = this.messages_.map(m => ({
++      this.rendered_ = this.messages_.map((m, index) => ({
++                                            index,
++                                            boost: m.boost,
++                                            working: m.working,
+                                             role: m.role,
+                                             text: m.text,
+                                             body: m.role === 'assistant' ?
+@@ -178,7 +231,205 @@ export class MeridianAskElement extends CrLitElement {
+       {role: 'assistant', text: '', tools: [], error: ''},
+     ];
+     this.busy_ = true;
+-    this.handler_.aiChat(this.sessionId_, text, 'chat', this.withPage_);
++    this.handler_.aiChatWith(this.sessionId_, text, 'chat', this.withPage_,
++                             this.picked_);
++  }
++
++  private async refreshHost_() {
++    const {state} = await this.handler_.getBoost();
++    this.host_ = state.host;
++  }
++
++  // The tab may have changed since the panel opened.
++  protected onLogPointerenter_() {
++    if (!this.messages_.length) {
++      this.refreshHost_();
++    }
++  }
++
++  protected starters_(): Starter[] {
++    const site: Starter[] = this.host_ ?
++        [
++          {
++            kind: 'focus',
++            label: `Make ${this.host_} distraction-free`,
++            hint: 'Hides the clutter with a Boost. One click undoes it.',
++          },
++          {
++            kind: 'look',
++            label: `Give ${this.host_} a calmer look`,
++            hint: 'Softer colours and easier reading, as a Boost.',
++          },
++        ] :
++        [];
++    return [
++      ...site,
++      {
++        kind: 'tune',
++        label: 'What can I make my own in Meridian?',
++        hint: 'Themes, spaces, Boosts and shortcuts worth trying.',
++      },
++      {
++        kind: 'setup',
++        label: 'Suggest a setup from what I use',
++        hint: 'Sends your space names and the sites you keep open.',
++      },
++    ];
++  }
++
++  protected onStarterClick_(e: Event) {
++    const el = e.currentTarget as HTMLElement;
++    const kind = el.dataset['kind'] as Starter['kind'];
++    const label = el.querySelector('.starter-label')?.textContent?.trim() || '';
++    if (this.busy_) {
++      return;
++    }
++    if (kind === 'focus' || kind === 'look') {
++      this.makeBoost_(label, kind === 'focus' ? FOCUS_WISH : LOOK_WISH);
++    } else if (kind === 'tune') {
++      this.withPage_ = false;
++      this.ask_(label,
++                'What can I personalize in Meridian? Pick the 4 or 5 things ' +
++                    'most worth trying (look of the browser, spaces, Boosts, ' +
++                    'link rules, shortcuts) and say exactly where each one ' +
++                    'is. Answer in my browser language: ' + navigator.language +
++                    '.');
++    } else {
++      this.suggestSetup_(label);
++    }
++  }
++
++  private ask_(shown: string, sent: string) {
++    this.messages_ = [
++      ...this.messages_,
++      {role: 'user', text: shown, tools: [], error: ''},
++      {role: 'assistant', text: '', tools: [], error: ''},
++    ];
++    this.busy_ = true;
++    this.handler_.aiChatWith(this.sessionId_, sent, 'chat', this.withPage_,
++                             this.picked_);
++  }
++
++  // Only names and sites: no addresses of pages, titles or history.
++  private async suggestSetup_(label: string) {
++    const {state} = await this.handler_.getState();
++    const hostOf = (url: string) => {
++      try {
++        const u = new URL(url);
++        return u.protocol.startsWith('http') ? u.host : '';
++      } catch {
++        return '';
++      }
++    };
++    const inItems = (items: Item[]): string[] => items.flatMap(
++        i => [hostOf(i.url), ...inItems(i.children)]);
++    const open: string[] = [];
++    this.fire('ask-open-urls', open);
++    const list = (hosts: string[]) =>
++        [...new Set(hosts.filter(h => h))].slice(0, 40).join(', ') || 'none';
++    const spaces =
++        state.spaces
++            .map(s => `${s.name} (pinned: ${list(inItems(s.pinned))})`)
++            .join('; ');
++    this.withPage_ = false;
++    this.ask_(label,
++              'Suggest how to set up Meridian for the way I use it, from ' +
++                  'this. Give 3 to 5 concrete changes, each naming the sites ' +
++                  'involved and exactly where to do it. Answer in my browser ' +
++                  'language: ' + navigator.language + '.\n\nSpaces: ' + spaces +
++                  '\nFavorites: ' + list(inItems(state.favorites)) +
++                  '\nOpen now: ' + list(open.map(hostOf)));
++  }
++
++  // A real Boost for the site, at once: the click asked for it, and the
++  // answer says what changed and offers Undo.
++  private async makeBoost_(label: string, wish: string) {
++    this.messages_ = [
++      ...this.messages_,
++      {role: 'user', text: label, tools: [], error: ''},
++      {
++        role: 'assistant',
++        text: '',
++        tools: [],
++        error: '',
++        working: 'Looking at the page',
++      },
++    ];
++    this.busy_ = true;
++    this.boosting_ = true;
++    const finish = (patch: Partial<Message>) => {
++      const messages = [...this.messages_];
++      const last = messages[messages.length - 1]!;
++      const {working: _working, ...rest} = last;
++      messages[messages.length - 1] = {...rest, ...patch};
++      this.messages_ = messages;
++      this.busy_ = false;
++      this.boosting_ = false;
++    };
++    const {state} = await this.handler_.getBoost();
++    if (!state.host) {
++      finish({error: 'Only websites can have a Boost.'});
++      return;
++    }
++    const host = state.host;
++    const before = state.boost ? {...state.boost} : null;
++    let id = before?.id || '';
++    if (!id) {
++      ({id} = await this.handler_.setBoost({
++        id: '',
++        host,
++        name: 'My Boost',
++        enabled: true,
++        css: '',
++        js: '',
++        zaps: [],
++        hue: 0,
++        font: '',
++        tint: -1,
++        tintStrength: 60,
++        dark: false,
++        brightness: 100,
++        contrast: 100,
++        saturation: 100,
++        size: 100,
++        textCase: '',
++      }));
++    }
++    const {error, summary} = await this.handler_.improveBoost(id, wish,
++                                                               this.picked_);
++    if (error) {
++      if (!before) {
++        await this.handler_.deleteBoost(id);
++      }
++      finish({error});
++      return;
++    }
++    finish({
++      text: `${summary}\n\nIt's a **Boost** for ${host}: it stays on for ` +
++          'every page of the site. Undo takes it back now; **Edit** changes ' +
++          'or turns it off whenever you like.',
++      boost: {id, host, before, undone: false},
++    });
++  }
++
++  protected async onUndoBoostClick_(e: Event) {
++    const index = Number((e.currentTarget as HTMLElement).dataset['index']);
++    const m = this.messages_[index];
++    if (!m?.boost || m.boost.undone) {
++      return;
++    }
++    if (m.boost.before) {
++      await this.handler_.setBoost(m.boost.before);
++    } else {
++      await this.handler_.deleteBoost(m.boost.id);
++    }
++    const messages = [...this.messages_];
++    messages[index] = {...m, boost: {...m.boost, undone: true}};
++    this.messages_ = messages;
++  }
++
++  protected onEditBoostClick_(e: Event) {
++    this.fire('ask-edit-boost', (e.currentTarget as HTMLElement).dataset['id']);
+   }
+ 
+   protected onInputKeydown_(e: KeyboardEvent) {
+@@ -203,6 +454,49 @@ export class MeridianAskElement extends CrLitElement {
+     this.sessionId_ = crypto.randomUUID();
+     this.messages_ = [];
+     this.busy_ = false;
++    this.boosting_ = false;
++    this.picked_ = '';
++    this.pickedLabel_ = '';
++    this.menuOpen_ = false;
++    this.refreshHost_();
++  }
++
++  protected async onWhoClick_(e: Event) {
++    e.stopPropagation();
++    if (this.menuOpen_) {
++      this.menuOpen_ = false;
++      return;
++    }
++    const [{providers}, {hasKey}, {label}] = await Promise.all([
++      this.handler_.getAiProviders(false),
++      this.handler_.hasAiKey(),
++      this.handler_.getAiStatus(),
++    ]);
++    this.who_ = label;
++    this.choices_ = [
++      ...(hasKey ? [{id: 'api', label: 'Claude'}] : []),
++      ...providers
++          .filter(p => p.installed && p.signedIn !== 0 && !p.unavailable)
++          .map(p => ({id: p.id, label: p.label})),
++    ];
++    this.menuOpen_ = true;
++  }
++
++  protected onChoiceClick_(e: Event) {
++    const el = e.currentTarget as HTMLElement;
++    // A new AI gets its own "this goes to…" before the first thing is sent.
++    this.picked_ = el.dataset['id'] || '';
++    this.pickedLabel_ = el.dataset['label'] || '';
++    this.menuOpen_ = false;
++  }
++
++  protected onConnectMoreClick_() {
++    this.menuOpen_ = false;
++    this.fire('meridian-show-settings', 'ai');
++  }
++
++  protected onPanelClick_() {
++    this.menuOpen_ = false;
+   }
+ 
+   protected onCloseClick_() {
+diff --git a/chrome/browser/resources/webui_browser/meridian/boost_editor.ts b/chrome/browser/resources/webui_browser/meridian/boost_editor.ts
+index fe71a690f4..979bcf5aee 100644
+--- a/chrome/browser/resources/webui_browser/meridian/boost_editor.ts
++++ b/chrome/browser/resources/webui_browser/meridian/boost_editor.ts
+@@ -470,7 +470,7 @@ export class MeridianBoostEditorElement extends CrLitElement {
+     this.note_ = '';
+     this.canUndo_ = false;
+     const {error, summary} = await this.handler_.improveBoost(
+-        this.boost_.id, wish?.value.trim() || '');
++        this.boost_.id, wish?.value.trim() || '', '');
+     this.improving_ = false;
+     this.noteError_ = !!error;
+     this.note_ = error || summary;
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index 5a0d7d16c3..7c62cbfb54 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -201,6 +201,8 @@ export class MeridianCommandBarElement extends CrLitElement {
+   // "word ⇥" picked: what Return does with the text.
+   protected accessor mode_: CommandBarMode|null = null;
+   private keywords_: Map<string, string> = new Map();
++  // "gemini ⇥", "cursor ⇥"…: every AI that is ready to answer.
++  private aiModes_: Map<string, CommandBarMode> = new Map();
+   private ratesAsked_ = false;
+   private searchboxProfile_: string|null = null;
+   // What the field opened with (⌘L: the page's address).
+@@ -424,6 +426,20 @@ export class MeridianCommandBarElement extends CrLitElement {
+     browserProxyFactory.getInstance().handler.getSearchKeywords().then(
+         ({keywords}) => this.keywords_ =
+             new Map(keywords.map(k => [k.keyword.toLowerCase(), k.name])));
++    browserProxyFactory.getInstance().handler.getAiProviders(false).then(
++        ({providers}) => this.aiModes_ = new Map(
++            providers
++                .filter(p => p.installed && p.signedIn !== 0 && !p.unavailable)
++                .map(p => [
++                  ({openai: 'chatgpt', xai: 'grok'} as {[id: string]: string})[
++                      p.id] || p.id,
++                  {
++                    label: p.label,
++                    provider: p.id,
++                    withPage: false,
++                    placeholder: `Ask ${p.label}…`,
++                  },
++                ])));
+     if (this.searchboxProfile_ !== this.profileId) {
+       this.searchboxShown_ = false;
+       await this.updateComplete;
+@@ -576,7 +592,8 @@ export class MeridianCommandBarElement extends CrLitElement {
+       const mode = site !== undefined ?
+           {label: site || word, keyword: word, withPage: false,
+            placeholder: `Search ${site || word}…`} :
+-          (Object.hasOwn(MODES, word) ? MODES[word]! : null);
++          (Object.hasOwn(MODES, word) ? MODES[word]! :
++                                        this.aiModes_.get(word) ?? null);
+       if (mode) {
+         own();
+         this.enterMode_(mode);
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index dd7ca3f342..1eb9cf4cfc 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -443,11 +443,11 @@ export function getHtml(this: MeridianSettingsElement) {
+                 </div>`)}
+               <div class="row">
+                 <div class="row-text">
+-                  <div class="row-label">Other agents</div>
+-                  <div class="row-desc">GitHub Copilot, Codex, Cursor,
+-                    OpenCode, Qwen Code, Amp, Goose, Droid. They use your own
+-                    account in that app and follow that company’s
+-                    rules.</div>
++                  <div class="row-label">Add another agent</div>
++                  <div class="row-desc">Copilot, Codex, Cursor, OpenCode, Qwen
++                    Code, Amp, Goose, Droid. The ones on this computer are
++                    already above. They use your own account in that app and
++                    follow that company’s rules.</div>
+                 </div>
+                 <label class="switch"><input type="checkbox" id="otherAgents"
+                     .checked="${this.otherAgents_}"
+@@ -608,6 +608,14 @@ export function getHtml(this: MeridianSettingsElement) {
+                       @click="${this.onSegmentClick_}">AI off</button>
+                 </div>
+               </div>
++              ${this.allowedAi_.map(a => html`
++                <div class="row allowed-ai">
++                  <div class="row-text">
++                    <div class="row-label">Always sends to ${a.to}</div>
++                  </div>
++                  <button class="btn" id="forget-${a.id}" data-id="${a.id}"
++                      @click="${this.onForgetConsentClick_}">Ask again</button>
++                </div>`)}
+             </div>
+           </div>
+           <div class="group">
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 988bd764fa..3237f6e1ad 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -10,7 +10,7 @@ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+ import {browserProxyFactory, UpdateStatus} from '../sidebar.mojom-webui.js';
+-import type {AgentCli, AiProvider, ArcExtension, Atc, Settings, SidebarHandlerInterface, Space, UpdateState} from '../sidebar.mojom-webui.js';
++import type {AgentCli, AiProvider, AllowedAi, ArcExtension, Atc, Settings, SidebarHandlerInterface, Space, UpdateState} from '../sidebar.mojom-webui.js';
+ 
+ import {arcDataSummary} from './arc_summary.js';
+ import './member_card.js';
+@@ -185,6 +185,7 @@ export class MeridianSettingsElement extends CrLitElement {
+       hasAiKey_: {state: true, type: Boolean},
+       keyMessage_: {state: true, type: String},
+       providers_: {state: true, type: Array},
++      allowedAi_: {state: true, type: Array},
+       cloudModels_: {state: true, type: Object},
+       aiRows_: {state: true, type: Array},
+       otherRows_: {state: true, type: Array},
+@@ -233,6 +234,7 @@ export class MeridianSettingsElement extends CrLitElement {
+   protected accessor keyMessage_: string = '';
+   // Who answers (Settings > AI > Your AI).
+   protected accessor providers_: AiProvider[] = [];
++  protected accessor allowedAi_: AllowedAi[] = [];
+   protected accessor cloudModels_:
+       {[id: string]: {models: string[], chosen: string}} = {};
+   // Derived in willUpdate().
+@@ -493,6 +495,7 @@ export class MeridianSettingsElement extends CrLitElement {
+   // page draws first and fills in after.
+   private async loadProviders_(fresh: boolean) {
+     this.customBase_ = (await this.handler_.getCustomAi()).baseUrl;
++    this.allowedAi_ = (await this.handler_.getAllowedAi()).allowed;
+     const {providers} = await this.handler_.getAiProviders(fresh);
+     this.providers_ = providers;
+     for (const p of providers) {
+@@ -589,9 +592,11 @@ export class MeridianSettingsElement extends CrLitElement {
+     this.autoOn_ = chosen === '';
+     this.aiRows_ =
+         this.providers_
+-            .filter(p => !p.optIn && (p.kind !== 'cloud' || p.installed))
++            // An agent that's on this computer is simply there.
++            .filter(p => (!p.optIn || p.installed) &&
++                        (p.kind !== 'cloud' || p.installed))
+             .map(p => this.aiRow_(p, chosen));
+-    this.otherRows_ = this.providers_.filter(p => p.optIn)
++    this.otherRows_ = this.providers_.filter(p => p.optIn && !p.installed)
+                           .map(p => this.aiRow_(p, chosen));
+     this.keyRows_ =
+         this.providers_.filter(p => p.kind === 'cloud' && p.installed)
+@@ -875,13 +880,20 @@ export class MeridianSettingsElement extends CrLitElement {
+     this.save_({aiProvider: row.dataset['id'] || ''});
+   }
+ 
++  protected onForgetConsentClick_(e: Event) {
++    this.handler_.forgetAiConsent(
++        (e.currentTarget as HTMLElement).dataset['id'] || '');
++    this.allowedAi_ = this.allowedAi_.filter(
++        a => a.id !== (e.currentTarget as HTMLElement).dataset['id']);
++  }
++
+   protected onOtherAgentsChange_(e: Event) {
+     const on = (e.target as HTMLInputElement).checked;
+     const chosen = this.settings_?.aiProvider || '';
+     const picked = this.providers_.find(p => p.id === chosen);
+     this.save_({
+       aiOtherAgents: on,
+-      ...(!on && picked?.optIn ? {aiProvider: ''} : {}),
++      ...(!on && picked?.optIn && !picked.installed ? {aiProvider: ''} : {}),
+     });
+   }
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index ba4be9789d..21f4d5d0c4 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -138,6 +138,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+     return getCss();
+   }
+ 
++  // What is open in this window, for Ask's "Suggest a setup".
++  openUrls(): string[] {
++    return [...this.tabs_.values()].map(t => t.url);
++  }
++
+   override render() {
+     return getHtml.bind(this)();
+   }

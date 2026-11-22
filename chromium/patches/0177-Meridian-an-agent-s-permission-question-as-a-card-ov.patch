@@ -1,0 +1,1074 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 19 Nov 2026 20:00:59 +0400
+Subject: [PATCH 178/202] Meridian: an agent's permission question as a card
+ over any page
+
+Claude Code sessions started from the Workbench get a PermissionRequest hook
+(Meridian --secret-guard --permission) that hands the question to Meridian
+over the guard's socket. Mission Control keeps it (snapshot "asks") and every
+window shows a small card: which session, in which space, wants what; Allow,
+Deny, Always allow (Claude Code's own suggestion) and Open (its terminal, in
+its space). The terminal asks too: whichever answers first counts, and the
+card goes away when the session stops waiting.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/mission/mission_control.cc       | 100 +++++++++++
+ .../meridian/mission/mission_control.h        |  29 ++++
+ chrome/browser/meridian/sidebar.mojom         |   3 +
+ chrome/browser/meridian/sidebar_handler.cc    |   8 +
+ chrome/browser/meridian/sidebar_handler.h     |   3 +
+ .../browser/meridian/workbench/guard_hook.cc  | 154 ++++++++++++-----
+ .../meridian/workbench/guard_server.cc        |   9 +
+ .../browser/meridian/workbench/guard_server.h |  11 +-
+ .../meridian/workbench/workbench_handler.cc   |  45 ++++-
+ .../meridian/workbench/workbench_handler.h    |   3 +-
+ .../browser/resources/webui_browser/BUILD.gn  |   3 +
+ .../resources/webui_browser/app.html.ts       |   6 +-
+ chrome/browser/resources/webui_browser/app.ts |  13 ++
+ .../webui_browser/meridian/agent_asks.css     | 156 ++++++++++++++++++
+ .../webui_browser/meridian/agent_asks.html.ts |  41 +++++
+ .../webui_browser/meridian/agent_asks.ts      | 145 ++++++++++++++++
+ .../webui_browser/meridian/mission.ts         |  13 ++
+ .../webui_browser/meridian/sidebar.ts         |   4 +
+ 18 files changed, 704 insertions(+), 42 deletions(-)
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/agent_asks.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/agent_asks.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/agent_asks.ts
+
+diff --git a/chrome/browser/meridian/mission/mission_control.cc b/chrome/browser/meridian/mission/mission_control.cc
+index fdee349018..aca4af82a9 100644
+--- a/chrome/browser/meridian/mission/mission_control.cc
++++ b/chrome/browser/meridian/mission/mission_control.cc
+@@ -183,6 +183,11 @@ MissionControl::MissionControl(Profile* profile)
+ MissionControl::~MissionControl() = default;
+ 
+ void MissionControl::Shutdown() {
++  for (auto& [id, ask] : asks_) {
++    std::move(ask.done).Run("none");
++  }
++  asks_.clear();
++  ask_order_.clear();
+   sweep_.Stop();
+   flush_.Stop();
+   if (history_writer_.HasPendingWrite()) {
+@@ -993,6 +998,83 @@ void MissionControl::SetStatus(Node& node,
+     }
+   } else {
+     node.waiting_since = 0;
++    // Answered in the terminal (or the session moved on): its questions in
++    // Meridian are over.
++    if (was == "waiting") {
++      CloseAsks(node.root_id.empty() ? node.id : node.root_id);
++    }
++  }
++}
++
++void MissionControl::AskPermission(int owner_tab,
++                                   const std::string& term_id,
++                                   const std::string& tool,
++                                   const std::string& summary,
++                                   bool answerable,
++                                   bool can_always,
++                                   AskDone done) {
++  const Node* session = nullptr;
++  for (const auto& [id, n] : nodes_) {
++    if (n.kind == "session" && n.owner_tab == owner_tab &&
++        n.term_id == term_id && !n.ended_at) {
++      session = &n;
++    }
++  }
++  if (!session) {
++    std::move(done).Run("none");
++    return;
++  }
++  std::string id = "ask-" + RandomId(6);
++  Ask ask;
++  ask.root_id = session->root_id.empty() ? session->id : session->root_id;
++  ask.tool = tool;
++  ask.summary = summary;
++  ask.answerable = answerable;
++  ask.can_always = answerable && can_always;
++  ask.since = Now();
++  ask.done = std::move(done);
++  asks_.emplace(id, std::move(ask));
++  ask_order_.push_back(id);
++  Changed();
++}
++
++bool MissionControl::AnswerPermission(const std::string& id,
++                                      const std::string& choice) {
++  auto it = asks_.find(id);
++  if (it == asks_.end()) {
++    return false;
++  }
++  const Ask& ask = it->second;
++  if (!ask.answerable ||
++      !(choice == "allow" || choice == "deny" ||
++        (choice == "always" && ask.can_always))) {
++    return false;
++  }
++  AskDone done = std::move(it->second.done);
++  asks_.erase(it);
++  std::erase(ask_order_, id);
++  Changed();
++  std::move(done).Run(choice);
++  return true;
++}
++
++void MissionControl::CloseAsks(const std::string& root_id) {
++  std::vector<AskDone> closed;
++  for (auto it = asks_.begin(); it != asks_.end();) {
++    if (it->second.root_id == root_id) {
++      closed.push_back(std::move(it->second.done));
++      std::erase(ask_order_, it->first);
++      it = asks_.erase(it);
++    } else {
++      ++it;
++    }
++  }
++  if (closed.empty()) {
++    return;
++  }
++  Changed();
++  for (AskDone& done : closed) {
++    std::move(done).Run("none");
+   }
+ }
+ 
+@@ -1003,6 +1085,7 @@ void MissionControl::Finish(Node& node,
+   SetStatus(node, status, text);
+   node.ended_at = Now();
+   if (node.parent_id.empty()) {
++    CloseAsks(node.root_id.empty() ? node.id : node.root_id);
+     for (Node* c : Descendants(node.id)) {
+       if (!c->ended_at) {
+         c->tool.reset();
+@@ -1180,8 +1263,25 @@ base::DictValue MissionControl::Snapshot() const {
+             .Set("permissionMode", OptString(n.permission_mode))
+             .Set("log", std::move(log)));
+   }
++  base::ListValue asks;
++  for (const std::string& id : ask_order_) {
++    auto it = asks_.find(id);
++    if (it == asks_.end()) {
++      continue;
++    }
++    const Ask& a = it->second;
++    asks.Append(base::DictValue()
++                    .Set("id", id)
++                    .Set("nodeId", a.root_id)
++                    .Set("tool", a.tool)
++                    .Set("summary", a.summary)
++                    .Set("answerable", a.answerable)
++                    .Set("canAlways", a.can_always)
++                    .Set("since", a.since));
++  }
+   return base::DictValue()
+       .Set("nodes", std::move(nodes))
++      .Set("asks", std::move(asks))
+       .Set("history", history_.Clone())
+       .Set("counts", Counts())
+       .Set("notified", notified_.Clone())
+diff --git a/chrome/browser/meridian/mission/mission_control.h b/chrome/browser/meridian/mission/mission_control.h
+index b00ca61ede..bd14729938 100644
+--- a/chrome/browser/meridian/mission/mission_control.h
++++ b/chrome/browser/meridian/mission/mission_control.h
+@@ -148,6 +148,21 @@ class MissionControl : public KeyedService,
+                        bool stopped);
+   void AssistantReset(const std::string& run_id);
+ 
++  // ---- Permission questions (Claude Code's PermissionRequest) ----
++  // The session in terminal `term_id` of the Workbench in `owner_tab` asks
++  // for permission: shown with the snapshot ("asks") until the person
++  // answers in Meridian, or the terminal answers first (the session stops
++  // waiting): then `done` gets "none". Choices: "allow", "deny", "always".
++  using AskDone = base::OnceCallback<void(const std::string& choice)>;
++  void AskPermission(int owner_tab,
++                     const std::string& term_id,
++                     const std::string& tool,
++                     const std::string& summary,
++                     bool answerable,
++                     bool can_always,
++                     AskDone done);
++  bool AnswerPermission(const std::string& id, const std::string& choice);
++
+   // ---- The view ----
+   base::DictValue Snapshot() const;
+   bool Dismiss(const std::string& id);
+@@ -253,6 +268,8 @@ class MissionControl : public KeyedService,
+   Node* AssistantNode(const std::string& run_id);
+   void OnCodexEvent(Node& root, const base::DictValue& event);
+   void NotifyWaiting(Node& node);
++  // The questions of the session `root_id` are over (it stopped waiting).
++  void CloseAsks(const std::string& root_id);
+   void Changed();
+   void Flush();
+   base::DictValue Counts() const;
+@@ -272,6 +289,18 @@ class MissionControl : public KeyedService,
+     double ts;
+   };
+   std::map<int, Call> calls_;
++  struct Ask {
++    std::string root_id;
++    std::string tool;
++    std::string summary;
++    bool answerable = false;
++    bool can_always = false;
++    double since = 0;
++    AskDone done;
++  };
++  // id -> question, oldest first by id order of arrival (`ask_order_`).
++  std::map<std::string, Ask> asks_;
++  std::vector<std::string> ask_order_;
+   std::map<std::string, double> last_notify_;
+   base::ListValue notified_;
+   bool quiet_ = false;
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 1f2fb3c66e..cebf74ed9e 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -765,6 +765,9 @@ interface SidebarHandler {
+   RevealMissionNode(string id, string panel) => (bool found);
+   DismissMission(string id);
+   ClearMissionHistory();
++  // An agent's permission question (snapshot "asks"): "allow", "deny" or
++  // "always". False when it was already answered (in the terminal).
++  AnswerMissionAsk(string id, string choice) => (bool ok);
+   // Claude proposes folders and shorter titles for these Today tabs; nothing
+   // changes until the page applies it.
+   TidyToday(array<TidyTab> tabs)
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index fb9a50d562..d066ae463d 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -662,6 +662,14 @@ void SidebarHandler::RevealMissionNode(const std::string& id,
+   std::move(callback).Run(true);
+ }
+ 
++void SidebarHandler::AnswerMissionAsk(const std::string& id,
++                                      const std::string& choice,
++                                      AnswerMissionAskCallback callback) {
++  mission::MissionControl* mission =
++      mission::MissionControlFactory::GetForProfile(browser_->GetProfile());
++  std::move(callback).Run(mission && mission->AnswerPermission(id, choice));
++}
++
+ void SidebarHandler::DismissMission(const std::string& id) {
+   if (mission::MissionControl* mission =
+           mission::MissionControlFactory::GetForProfile(
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 214ef4f391..7f93ead860 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -238,6 +238,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void DeleteChat(const std::string& id) override;
+   void GetMissionState(GetMissionStateCallback callback) override;
+   void DismissMission(const std::string& id) override;
++  void AnswerMissionAsk(const std::string& id,
++                        const std::string& choice,
++                        AnswerMissionAskCallback callback) override;
+   void RevealMissionNode(const std::string& id,
+                          const std::string& panel,
+                          RevealMissionNodeCallback callback) override;
+diff --git a/chrome/browser/meridian/workbench/guard_hook.cc b/chrome/browser/meridian/workbench/guard_hook.cc
+index 7e74795105..c6a6a86489 100644
+--- a/chrome/browser/meridian/workbench/guard_hook.cc
++++ b/chrome/browser/meridian/workbench/guard_hook.cc
+@@ -59,6 +59,110 @@ bool IsSecret(std::string p) {
+   return IsSecretFile(p);
+ }
+ 
++// One request to Meridian over the guard's socket; its answer ("" when it
++// can't be reached or doesn't answer within `wait_ms`).
++std::string AskMeridian(base::DictValue request, int wait_ms) {
++  const char* socket_path = getenv("MERIDIAN_GUARD_SOCKET");
++  const char* token = getenv("MERIDIAN_GUARD_TOKEN");
++  sockaddr_un addr = {};
++  if (!socket_path || !token || strlen(socket_path) >= sizeof(addr.sun_path)) {
++    return std::string();
++  }
++  request.Set("token", token);
++  std::string line = base::WriteJson(request).value_or("{}") + "\n";
++  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
++  addr.sun_family = AF_UNIX;
++  base::span(addr.sun_path)
++      .copy_prefix_from(base::span(std::string_view(socket_path)));
++  std::string answer;
++  if (fd >= 0 &&
++      connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
++      WriteSocket(fd, line)) {
++    // The person may take a while to decide.
++    pollfd p = {fd, POLLIN, 0};
++    std::array<char, 4096> chunk;
++    while (poll(&p, 1, wait_ms) > 0) {
++      ssize_t n = read(fd, chunk.data(), chunk.size());
++      if (n <= 0) {
++        break;
++      }
++      answer.append(base::as_string_view(
++          base::span(chunk).first(static_cast<size_t>(n))));
++    }
++  }
++  if (fd >= 0) {
++    close(fd);
++  }
++  return answer;
++}
++
++
++// What a permission question is about, in one line: the command, the file,
++// the address, or the input itself.
++std::string Summary(const base::DictValue& input) {
++  for (const char* key : {"command", "file_path", "notebook_path", "url",
++                          "pattern", "path", "query", "description"}) {
++    if (const std::string* v = input.FindString(key); v && !v->empty()) {
++      return v->substr(0, 2000);
++    }
++  }
++  std::string all = base::WriteJson(input).value_or("");
++  return all == "{}" ? std::string() : all.substr(0, 500);
++}
++
++// `Meridian --secret-guard --permission`: Claude Code's PermissionRequest
++// hook. Claude Code asks in the terminal as always; Meridian shows the same
++// question over whatever page the person is on, and whichever answers first
++// counts. stdout: nothing (the terminal decides) or a decision.
++int RunPermissionHook(const base::DictValue& ev) {
++  const std::string* tool = ev.FindString("tool_name");
++  const base::DictValue* raw = ev.FindDict("tool_input");
++  base::DictValue empty;
++  const base::DictValue& input = raw ? *raw : empty;
++  const base::ListValue* suggestions = ev.FindList("permission_suggestions");
++  // A question to the person or a plan to approve needs its answer typed in
++  // the terminal: the card only says so.
++  const bool answerable = !tool || (*tool != "AskUserQuestion" &&
++                                    *tool != "ExitPlanMode");
++  std::string answer = AskMeridian(
++      base::DictValue()
++          .Set("kind", "permission")
++          .Set("tool", tool ? tool->substr(0, 64) : std::string())
++          .Set("summary", Summary(input))
++          .Set("answerable", answerable)
++          .Set("can_always", answerable && suggestions && !suggestions->empty()),
++      590000);
++  std::optional<base::Value> reply = base::JSONReader::Read(
++      base::TrimWhitespaceASCII(answer, base::TRIM_ALL), 0);
++  const std::string* decision =
++      reply && reply->is_dict() ? reply->GetDict().FindString("decision")
++                                : nullptr;
++  if (!answerable || !decision) {
++    return 0;
++  }
++  base::DictValue out;
++  if (*decision == "allow" || *decision == "always") {
++    out.Set("behavior", "allow");
++    if (*decision == "always" && suggestions) {
++      out.Set("updatedPermissions", suggestions->Clone());
++    }
++  } else if (*decision == "deny") {
++    out.Set("behavior", "deny");
++    out.Set("message", "The person denied this in Meridian.");
++  } else {
++    return 0;
++  }
++  std::cout << base::WriteJson(
++                   base::DictValue().Set(
++                       "hookSpecificOutput",
++                       base::DictValue()
++                           .Set("hookEventName", "PermissionRequest")
++                           .Set("decision", std::move(out))))
++                   .value_or("")
++            << std::flush;
++  return 0;
++}
++
+ }  // namespace
+ 
+ bool IsSecretGuard(int argc, const char** argv) {
+@@ -148,15 +252,17 @@ int RunSecretGuard(int argc, const char** argv) {
+   if (!ev || !ev->is_dict()) {
+     return 0;
+   }
++  for (const char* arg : Args(argc, argv).subspan(1u)) {
++    if (std::string_view(arg) == "--permission") {
++      return RunPermissionHook(ev->GetDict());
++    }
++  }
+   std::optional<GuardHit> hit = CheckToolCall(ev->GetDict());
+   if (!hit) {
+     return 0;
+   }
+-  const char* socket_path = getenv("MERIDIAN_GUARD_SOCKET");
+-  const char* token = getenv("MERIDIAN_GUARD_TOKEN");
+   constexpr char kAsk[] = "This reads a file that may contain secrets.";
+-  sockaddr_un addr = {};
+-  if (!socket_path || !token || strlen(socket_path) >= sizeof(addr.sun_path)) {
++  if (!getenv("MERIDIAN_GUARD_SOCKET") || !getenv("MERIDIAN_GUARD_TOKEN")) {
+     Out("ask", kAsk);
+     return 0;
+   }
+@@ -164,39 +270,13 @@ int RunSecretGuard(int argc, const char** argv) {
+   for (const std::string& p : hit->paths) {
+     paths.Append(p);
+   }
+-  std::string request =
+-      base::WriteJson(base::DictValue()
+-                          .Set("token", token)
+-                          .Set("tool", *ev->GetDict().FindString("tool_name"))
+-                          .Set("paths", std::move(paths))
+-                          .Set("command", hit->command.empty()
+-                                              ? base::Value()
+-                                              : base::Value(hit->command)))
+-          .value_or("{}") +
+-      "\n";
+-  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+-  addr.sun_family = AF_UNIX;
+-  base::span(addr.sun_path)
+-      .copy_prefix_from(base::span(std::string_view(socket_path)));
+-  std::string answer;
+-  if (fd >= 0 &&
+-      connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+-      WriteSocket(fd, request)) {
+-    // The person may take a while to decide.
+-    pollfd p = {fd, POLLIN, 0};
+-    std::array<char, 4096> chunk;
+-    while (poll(&p, 1, 135000) > 0) {
+-      ssize_t n = read(fd, chunk.data(), chunk.size());
+-      if (n <= 0) {
+-        break;
+-      }
+-      answer.append(base::as_string_view(
+-          base::span(chunk).first(static_cast<size_t>(n))));
+-    }
+-  }
+-  if (fd >= 0) {
+-    close(fd);
+-  }
++  std::string answer = AskMeridian(
++      base::DictValue()
++          .Set("tool", *ev->GetDict().FindString("tool_name"))
++          .Set("paths", std::move(paths))
++          .Set("command", hit->command.empty() ? base::Value()
++                                               : base::Value(hit->command)),
++      135000);
+   std::optional<base::Value> reply = base::JSONReader::Read(
+       base::TrimWhitespaceASCII(answer, base::TRIM_ALL), 0);
+   const std::string* decision =
+diff --git a/chrome/browser/meridian/workbench/guard_server.cc b/chrome/browser/meridian/workbench/guard_server.cc
+index 617eff2210..abf6100ecb 100644
+--- a/chrome/browser/meridian/workbench/guard_server.cc
++++ b/chrome/browser/meridian/workbench/guard_server.cc
+@@ -249,6 +249,15 @@ class GuardServer::Core : public base::RefCountedThreadSafe<Core> {
+     if (const std::string* command = req.FindString("command")) {
+       request.command = command->substr(0, 2000);
+     }
++    if (const std::string* kind = req.FindString("kind");
++        kind && *kind == "permission") {
++      request.kind = *kind;
++      if (const std::string* summary = req.FindString("summary")) {
++        request.summary = summary->substr(0, 2000);
++      }
++      request.answerable = req.FindBool("answerable").value_or(false);
++      request.can_always = req.FindBool("can_always").value_or(false);
++    }
+     decide_.Run(session, std::move(request),
+                 base::BindOnce(&Core::Answer, base::WrapRefCounted(this), conn));
+     return std::nullopt;
+diff --git a/chrome/browser/meridian/workbench/guard_server.h b/chrome/browser/meridian/workbench/guard_server.h
+index adfb860511..8f3046b192 100644
+--- a/chrome/browser/meridian/workbench/guard_server.h
++++ b/chrome/browser/meridian/workbench/guard_server.h
+@@ -24,11 +24,20 @@ namespace meridian::workbench {
+ class GuardServer {
+  public:
+   struct Request {
++    // "" (a secret file) or "permission" (Claude Code's PermissionRequest:
++    // the person answers in the terminal or in Meridian, first one counts).
++    std::string kind;
+     std::string tool;
+     std::vector<std::string> paths;
+     std::string command;
++    // permission: what it's about, whether Meridian can answer it (not a
++    // question or a plan) and whether "always" means something.
++    std::string summary;
++    bool answerable = false;
++    bool can_always = false;
+   };
+-  // "allow", "deny" or "ask", and why.
++  // "allow", "deny" or "ask", and why; for a permission also "always" or
++  // "none" (the terminal decides).
+   using Answer = base::OnceCallback<void(std::string decision,
+                                          std::string reason)>;
+   using Decide = base::RepeatingCallback<
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 39f34683af..450e0b1852 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -135,10 +135,21 @@ WorkbenchHandler::Result Wrap(base::expected<T, std::string> r) {
+ // project's .claude/settings*.json, so a repository can't switch it off.
+ base::DictValue GuardHookSettings() {
+   std::string exe = base::CommandLine::ForCurrentProcess()->GetProgram().AsUTF8Unsafe();
++  // Claude Code's permission questions go to Meridian too (it shows them over
++  // any page); the terminal asks as always and the first answer counts.
++  base::ListValue permission = base::ListValue().Append(
++      base::DictValue()
++          .Set("matcher", "*")
++          .Set("hooks", base::ListValue().Append(
++                            base::DictValue()
++                                .Set("type", "command")
++                                .Set("command",
++                                     "\"" + exe + "\" --secret-guard --permission")
++                                .Set("timeout", 600))));
+   return base::DictValue()
+       .Set("disableAllHooks", false)
+       .Set("hooks",
+-           base::DictValue().Set(
++           base::DictValue().Set("PermissionRequest", std::move(permission)).Set(
+                "PreToolUse",
+                base::ListValue().Append(
+                    base::DictValue()
+@@ -1416,10 +1427,37 @@ void WorkbenchHandler::MigrateDotenv(const std::string& rel, Reply reply) {
+ // A Claude Code session wants to read something that looks like a secret
+ // file: the person decides, in a native dialog.
+ void WorkbenchHandler::GuardDecision(
++    std::shared_ptr<std::string> token,
+     std::string root,
+     std::shared_ptr<std::set<std::string>> allowed,
+     GuardServer::Request request,
+     GuardServer::Answer answer) {
++  // Claude Code asks for a permission: the same question over whatever page
++  // the person is on (Mission Control keeps it until one side answers).
++  if (request.kind == "permission") {
++    std::string term_id;
++    for (const auto& [id, term] : terms_) {
++      if (!token->empty() && term.guard_token == *token) {
++        term_id = id;
++      }
++    }
++    tabs::TabInterface* tab =
++        tabs::TabInterface::MaybeGetFromContents(web_ui()->GetWebContents());
++    mission::MissionControl* mission =
++        mission::MissionControlFactory::GetForProfile(profile_);
++    if (term_id.empty() || !tab || !mission) {
++      return std::move(answer).Run("none", std::string());
++    }
++    mission->AskPermission(
++        tab->GetHandle().raw_value(), term_id, request.tool, request.summary,
++        request.answerable, request.can_always,
++        base::BindOnce(
++            [](GuardServer::Answer answer, const std::string& choice) {
++              std::move(answer).Run(choice, std::string());
++            },
++            std::move(answer)));
++    return;
++  }
+   std::string key = request.command.empty()
+                         ? base::JoinString(request.paths, "\n")
+                         : "cmd:" + request.command;
+@@ -2003,9 +2041,12 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+   }
+   std::string guard_token;
+   if (kind == "claude") {
++    // The token, once known: a permission question finds its terminal by it.
++    auto token = std::make_shared<std::string>();
+     guard_token = workbench->RegisterGuard(base::BindRepeating(
+-        &WorkbenchHandler::GuardDecision, weak_factory_.GetWeakPtr(),
++        &WorkbenchHandler::GuardDecision, weak_factory_.GetWeakPtr(), token,
+         project_->root().AsUTF8Unsafe(), std::make_shared<std::set<std::string>>()));
++    *token = guard_token;
+     if (guard_token.empty()) {
+       workbench->UnregisterGuard(guard_token);
+       return std::move(reply).Run(base::unexpected(kNoGuard));
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.h b/chrome/browser/meridian/workbench/workbench_handler.h
+index 24bf98cecd..0fdeaa851c 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.h
++++ b/chrome/browser/meridian/workbench/workbench_handler.h
+@@ -152,7 +152,8 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+                  const base::ListValue& params,
+                  Reply reply);
+   void MigrateDotenv(const std::string& rel, Reply reply);
+-  void GuardDecision(std::string root,
++  void GuardDecision(std::shared_ptr<std::string> token,
++                     std::string root,
+                      std::shared_ptr<std::set<std::string>> allowed,
+                      GuardServer::Request request,
+                      GuardServer::Answer answer);
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index d93526f398..fd052fa3ce 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -47,6 +47,8 @@ build_webui("build") {
+     "meridian/chat.ts",
+     "meridian/mission.html.ts",
+     "meridian/mission.ts",
++    "meridian/agent_asks.html.ts",
++    "meridian/agent_asks.ts",
+     "meridian/ai_consent.html.ts",
+     "meridian/ai_consent.ts",
+     "meridian/update_sheet.html.ts",
+@@ -112,6 +114,7 @@ build_webui("build") {
+     "meridian/boost_editor.css",
+     "meridian/chat.css",
+     "meridian/mission.css",
++    "meridian/agent_asks.css",
+     "meridian/ai_consent.css",
+     "meridian/update_sheet.css",
+     "meridian/command_bar.css",
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index a2b3a4c3b4..39e2e99ecd 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -182,7 +182,11 @@ export function getHtml(this: WebuiBrowserAppElement) {
+       @meridian-mission-reveal="${this.onMeridianMissionReveal_}"
+       @meridian-mission-workbench="${this.onMeridianMissionWorkbench_}">
+   </meridian-mission>
+-  ${this.missionToast_ ? html`
++  <meridian-agent-asks id="agentAsks" .snapshot="${this.missionSnapshot_}"
++      @meridian-ask-answer="${this.onMeridianAskAnswer_}"
++      @meridian-mission-reveal="${this.onMeridianMissionReveal_}">
++  </meridian-agent-asks>
++  ${this.missionToast_ && !this.askShown_(this.missionToast_.nodeId) ? html`
+     <div id="missionToast" role="status"
+         class="${this.missionToast_.nodeId ? '' : 'plain'}">
+       <span class="mt-title">${this.missionToast_.title}</span>
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index c4de721bea..c2f2941c49 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -22,6 +22,7 @@ import './meridian/ask.js';
+ import './meridian/tidy.js';
+ import './meridian/chat.js';
+ import './meridian/mission.js';
++import './meridian/agent_asks.js';
+ import './meridian/ai_consent.js';
+ import './meridian/update_sheet.js';
+ import './meridian/site_control.js';
+@@ -837,12 +838,24 @@ export class WebuiBrowserAppElement extends CrLitElement {
+         () => this.missionToast_ = null, e.detail.nodeId ? 8000 : 1500);
+   }
+ 
++  // A session whose question already shows as a card: no second notice.
++  protected askShown_(nodeId: string): boolean {
++    const asks = this.missionSnapshot_?.asks;
++    return !!nodeId && !!asks?.some(a => a.nodeId === nodeId);
++  }
++
+   protected onMissionToastShowClick_() {
+     const id = this.missionToast_?.nodeId || '';
+     this.missionToast_ = null;
+     this.revealMission_(id, false);
+   }
+ 
++  // An agent's permission question answered on its card.
++  protected async onMeridianAskAnswer_(
++      e: CustomEvent<{id: string, choice: string}>) {
++    await this.$.tabstrip.answerMissionAsk(e.detail.id, e.detail.choice);
++  }
++
+   protected onMeridianMissionReveal_(
+       e: CustomEvent<{id: string, assistant: boolean, panel?: string}>) {
+     this.revealMission_(e.detail.id, e.detail.assistant, e.detail.panel || '');
+diff --git a/chrome/browser/resources/webui_browser/meridian/agent_asks.css b/chrome/browser/resources/webui_browser/meridian/agent_asks.css
+new file mode 100644
+index 0000000000..f3514c16eb
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/agent_asks.css
+@@ -0,0 +1,156 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #scheme=relative
++ * #css_wrapper_metadata_end */
++
++:host {
++  position: fixed;
++  top: 12px;
++  right: 14px;
++  z-index: 65;
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++  width: min(340px, calc(100vw - 28px));
++  color: var(--meridian-text);
++  font-size: 12.5px;
++  pointer-events: none;
++}
++
++.card {
++  pointer-events: auto;
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++  padding: 11px 12px 10px;
++  border-radius: 12px;
++  background: var(--meridian-surface);
++  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.22),
++    0 0 0 0.5px var(--meridian-border);
++  animation: card-in 160ms ease-out;
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
++}
++
++@keyframes card-in {
++  from {
++    opacity: 0;
++    transform: translateY(-6px);
++  }
++}
++
++header {
++  display: flex;
++  align-items: center;
++  gap: 9px;
++}
++
++.mark {
++  width: 22px;
++  height: 22px;
++  flex: none;
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  border-radius: 6px;
++  background: #d97757;
++  color: white;
++  font-size: 12px;
++  font-weight: 700;
++}
++
++.who {
++  flex: 1;
++  min-width: 0;
++}
++
++.title {
++  font-weight: 600;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.where {
++  color: var(--meridian-text-muted);
++  font-size: 11.5px;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.close {
++  width: 22px;
++  height: 22px;
++  border: 0;
++  border-radius: 6px;
++  background: none;
++  color: var(--meridian-text-muted);
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  cursor: pointer;
++}
++
++.close:hover {
++  background: var(--meridian-row-hover);
++}
++
++.what {
++  font-weight: 550;
++}
++
++.summary {
++  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
++  font-size: 11.5px;
++  padding: 6px 8px;
++  border-radius: 7px;
++  background: var(--meridian-row-hover);
++  max-height: 4.5em;
++  overflow: hidden;
++  overflow-wrap: anywhere;
++  white-space: pre-wrap;
++}
++
++.actions {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 6px;
++  margin-top: 2px;
++}
++
++.actions button {
++  height: 26px;
++  padding: 0 10px;
++  border-radius: 7px;
++  border: 0.5px solid var(--meridian-border);
++  background: var(--meridian-surface);
++  color: var(--meridian-text);
++  font: inherit;
++  font-weight: 550;
++  cursor: pointer;
++}
++
++.actions button:hover {
++  background: var(--meridian-row-hover);
++}
++
++.actions button.primary {
++  background: var(--meridian-space, #6b6fd6);
++  border-color: transparent;
++  color: white;
++}
++
++.actions button.quiet {
++  margin-left: auto;
++  border-color: transparent;
++  background: none;
++}
++
++.actions button:disabled {
++  opacity: 0.6;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/agent_asks.html.ts b/chrome/browser/resources/webui_browser/meridian/agent_asks.html.ts
+new file mode 100644
+index 0000000000..380b4ab7a9
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/agent_asks.html.ts
+@@ -0,0 +1,41 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {MeridianAgentAsksElement} from './agent_asks.js';
++import {icon} from './icons.js';
++
++export function getHtml(this: MeridianAgentAsksElement) {
++  return html`<!--_html_template_start_-->
++${this.cards_().map(c => html`
++  <div class="card" role="alertdialog" data-id="${c.ask.id}"
++      aria-label="${c.title} needs you">
++    <header>
++      <span class="mark">C</span>
++      <div class="who">
++        <div class="title">${c.title}</div>
++        ${c.where ? html`<div class="where">${c.where}</div>` : ''}
++      </div>
++      <button class="close" title="Hide (the terminal still asks)"
++          @click="${this.onCloseClick_}">${icon('x', 12)}</button>
++    </header>
++    <div class="what">${c.what}</div>
++    ${c.ask.summary ? html`<div class="summary">${c.ask.summary}</div>` : ''}
++    <div class="actions">
++      ${c.ask.answerable ? html`
++        <button class="allow primary" ?disabled="${this.busy_ === c.ask.id}"
++            @click="${this.onAllowClick_}">Allow</button>
++        <button class="deny" ?disabled="${this.busy_ === c.ask.id}"
++            @click="${this.onDenyClick_}">Deny</button>
++        ${c.ask.canAlways ? html`
++          <button class="always" ?disabled="${this.busy_ === c.ask.id}"
++              @click="${this.onAlwaysClick_}">Always allow</button>` : ''}
++      ` : ''}
++      <button class="open ${c.ask.answerable ? 'quiet' : 'primary'}"
++          @click="${this.onOpenClick_}">Open</button>
++    </div>
++  </div>`)}
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/agent_asks.ts b/chrome/browser/resources/webui_browser/meridian/agent_asks.ts
+new file mode 100644
+index 0000000000..7349eaafcc
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/agent_asks.ts
+@@ -0,0 +1,145 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// An agent working in any space needs the person (Claude Code asks for a
++// permission): a small card over whatever page is open says which session,
++// in which space, wants what. Allow / Deny / Always allow answer right here;
++// Open goes to its terminal. The terminal still asks too: whichever answers
++// first counts, and the card goes away.
++
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {getCss} from './agent_asks.css.js';
++import {getHtml} from './agent_asks.html.js';
++import type {MissionAsk, MissionNode, MissionSnapshot} from './mission.js';
++
++export interface AskCard {
++  ask: MissionAsk;
++  title: string;
++  where: string;
++  what: string;
++}
++
++// What the tool is about to do, in words.
++function toolText(tool: string): string {
++  switch (tool) {
++    case 'Bash':
++    case 'PowerShell':
++    case 'Monitor':
++      return 'Run a command';
++    case 'Edit':
++    case 'MultiEdit':
++    case 'Write':
++    case 'NotebookEdit':
++      return 'Change a file';
++    case 'Read':
++    case 'NotebookRead':
++      return 'Read a file';
++    case 'WebFetch':
++      return 'Open a web page';
++    case 'WebSearch':
++      return 'Search the web';
++    case 'AskUserQuestion':
++      return 'Has a question for you';
++    case 'ExitPlanMode':
++      return 'Has a plan for you to approve';
++    default:
++      if (tool.startsWith('mcp__')) {
++        const parts = tool.split('__');
++        return `Use ${parts.slice(2).join(' ').replace(/_/g, ' ')} (${
++            parts[1]})`;
++      }
++      return tool ? `Use ${tool}` : 'Needs your permission';
++  }
++}
++
++export class MeridianAgentAsksElement extends CrLitElement {
++  static get is() {
++    return 'meridian-agent-asks';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      snapshot: {type: Object},
++      hidden_: {state: true, type: Object},
++      busy_: {state: true, type: String},
++    };
++  }
++
++  accessor snapshot: MissionSnapshot|null = null;
++  // Cards closed with ×: the question stays in the terminal.
++  protected accessor hidden_: Set<string> = new Set();
++  protected accessor busy_: string = '';
++
++  protected cards_(): AskCard[] {
++    const s = this.snapshot;
++    const asks: MissionAsk[] = s?.asks || [];
++    const nodes = new Map<string, MissionNode>(
++        (s?.nodes || []).map(n => [n.id, n]));
++    return asks.filter(a => !this.hidden_.has(a.id)).map(ask => {
++      const node = nodes.get(ask.nodeId);
++      const space = node?.spaceId ?
++          (s?.spaces || []).find(sp => sp.id === node.spaceId) :
++          undefined;
++      const agent = node?.source === 'claude' ? 'Claude Code' : 'An agent';
++      const name = node?.label && node.label !== 'Claude Code' ? node.label : '';
++      return {
++        ask,
++        title: name ? `${agent} · ${name}` : agent,
++        where: [space?.name, node?.project].filter(Boolean).join(' · '),
++        what: toolText(ask.tool),
++      };
++    });
++  }
++
++  protected answer_(ask: MissionAsk, choice: string) {
++    this.busy_ = ask.id;
++    this.fire('meridian-ask-answer', {id: ask.id, choice});
++  }
++
++  protected onAllowClick_(e: Event) {
++    this.answer_(this.askOf_(e), 'allow');
++  }
++
++  protected onDenyClick_(e: Event) {
++    this.answer_(this.askOf_(e), 'deny');
++  }
++
++  protected onAlwaysClick_(e: Event) {
++    this.answer_(this.askOf_(e), 'always');
++  }
++
++  protected onOpenClick_(e: Event) {
++    const ask = this.askOf_(e);
++    this.fire('meridian-mission-reveal', {id: ask.nodeId, assistant: false});
++  }
++
++  protected onCloseClick_(e: Event) {
++    const ask = this.askOf_(e);
++    this.hidden_ = new Set([...this.hidden_, ask.id]);
++  }
++
++  private askOf_(e: Event): MissionAsk {
++    const id = (e.currentTarget as HTMLElement).closest<HTMLElement>(
++                                                     '.card')!.dataset['id']!;
++    return this.cards_().find(c => c.ask.id === id)!.ask;
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-agent-asks': MeridianAgentAsksElement;
++  }
++}
++
++customElements.define(
++    MeridianAgentAsksElement.is, MeridianAgentAsksElement);
+diff --git a/chrome/browser/resources/webui_browser/meridian/mission.ts b/chrome/browser/resources/webui_browser/meridian/mission.ts
+index ed8b34d71c..81bce1a913 100644
+--- a/chrome/browser/resources/webui_browser/meridian/mission.ts
++++ b/chrome/browser/resources/webui_browser/meridian/mission.ts
+@@ -76,8 +76,21 @@ export interface MissionHistory {
+   subagents: number;
+ }
+ 
++// An agent's permission question, until it is answered (here or in the
++// terminal).
++export interface MissionAsk {
++  id: string;
++  nodeId: string;
++  tool: string;
++  summary: string;
++  answerable: boolean;
++  canAlways: boolean;
++  since: number;
++}
++
+ export interface MissionSnapshot {
+   nodes: MissionNode[];
++  asks?: MissionAsk[];
+   history: MissionHistory[];
+   counts: {working: number, waiting: number, live: number};
+   now: number;
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index eed0701264..cbddc0e138 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -1210,6 +1210,10 @@ export class MeridianSidebarElement extends CrLitElement implements
+   }
+ 
+   // Mission Control's "Open terminal": its Workbench tab, on that terminal.
++  answerMissionAsk(id: string, choice: string) {
++    return this.handler_.answerMissionAsk(id, choice);
++  }
++
+   revealMissionNode(id: string, panel: string = '') {
+     return this.handler_.revealMissionNode(id, panel);
+   }

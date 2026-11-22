@@ -1,0 +1,416 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Fri, 20 Nov 2026 21:55:31 +0400
+Subject: [PATCH 208/208] Meridian: Windows: a reopen after a crash too
+
+As on macOS (0206): the browser process starts a watcher (meridian.exe itself,
+--meridian-crash-watcher=<pid>, no windows) that waits on the browser's
+process handle. If the browser ended without a clean exit (Default/Preferences
+still says "exit_type":"Crashed"), no other Meridian holds the profile (its
+lockfile), and there was no relaunch in the last two minutes, it starts
+Meridian again. Only for an installed copy, and not under tests
+(--remote-debugging-*, --headless, --meridian-test-*), unless
+--meridian-crash-relaunch asks for it; =dry only writes
+"<user data>/Meridian Crash Relaunch".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/meridian/BUILD.gn             |   6 +
+ chrome/browser/meridian/crash_watcher_win.cc | 275 +++++++++++++++++++
+ chrome/browser/meridian/crash_watcher_win.h  |  29 ++
+ chrome/browser/meridian/helper_modes.cc      |  19 +-
+ 4 files changed, 325 insertions(+), 4 deletions(-)
+ create mode 100644 chrome/browser/meridian/crash_watcher_win.cc
+ create mode 100644 chrome/browser/meridian/crash_watcher_win.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 07fa7b3b8c..8d689fa53a 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -251,6 +251,12 @@ source_set("helper_modes") {
+       "crash_watcher_mac.h",
+     ]
+   }
++  if (is_win) {
++    sources += [
++      "crash_watcher_win.cc",
++      "crash_watcher_win.h",
++    ]
++  }
+ }
+ 
+ source_set("meridian") {
+diff --git a/chrome/browser/meridian/crash_watcher_win.cc b/chrome/browser/meridian/crash_watcher_win.cc
+new file mode 100644
+index 0000000000..34f8b5bdab
+--- /dev/null
++++ b/chrome/browser/meridian/crash_watcher_win.cc
+@@ -0,0 +1,275 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/crash_watcher_win.h"
++
++#include <windows.h>
++
++#include <objbase.h>
++#include <shlobj.h>
++#include <stdlib.h>
++
++#include <string>
++#include <string_view>
++
++#include "base/command_line.h"
++#include "base/compiler_specific.h"
++#include "base/containers/span.h"
++#include "base/files/file_path.h"
++#include "base/strings/utf_string_conversions.h"
++
++namespace meridian {
++
++namespace {
++
++constexpr std::string_view kWatcher = "--meridian-crash-watcher=";
++constexpr std::string_view kUserDataDir = "--user-data-dir=";
++constexpr std::string_view kDry = "--meridian-crash-relaunch=dry";
++constexpr wchar_t kMark[] = L"\\Meridian Crash Relaunch";
++// In FILETIME's units (100 ns).
++constexpr int64_t kLoop = int64_t{120} * 10'000'000;
++
++bool StartsWith(std::string_view s, std::string_view prefix) {
++  return s.substr(0, prefix.size()) == prefix;
++}
++
++base::span<const char*> Args(int argc, const char** argv) {
++  // main()'s own arguments.
++  return UNSAFE_BUFFERS(base::span(argv, static_cast<size_t>(argc)));
++}
++
++std::string ValueOf(int argc, const char** argv, std::string_view sw) {
++  for (const char* a : Args(argc, argv).subspan(1u)) {
++    if (a && StartsWith(a, sw)) {
++      return std::string(std::string_view(a).substr(sw.size()));
++    }
++  }
++  return {};
++}
++
++bool Has(int argc, const char** argv, std::string_view prefix) {
++  for (const char* a : Args(argc, argv).subspan(1u)) {
++    if (a && StartsWith(a, prefix)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++std::wstring ExePath() {
++  wchar_t path[MAX_PATH * 4];
++  DWORD n = ::GetModuleFileNameW(nullptr, path, std::size(path));
++  return n > 0 && n < std::size(path) ? std::wstring(path, n) : std::wstring();
++}
++
++// %LOCALAPPDATA%\Meridian Browser\User Data (install_static's folder).
++std::wstring DefaultUserDataDir() {
++  PWSTR local = nullptr;
++  std::wstring dir;
++  if (SUCCEEDED(::SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr,
++                                       &local))) {
++    dir = std::wstring(local) + L"\\Meridian Browser\\User Data";
++  }
++  ::CoTaskMemFree(local);
++  return dir;
++}
++
++// A copy that Meridian's installer put there: its version folder (where
++// chrome.dll, this code, is) has Installer\setup.exe, as the updater checks.
++bool IsInstalledCopy() {
++  HMODULE module = nullptr;
++  if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                            reinterpret_cast<LPCWSTR>(&IsCrashWatcher),
++                            &module)) {
++    return false;
++  }
++  wchar_t path[MAX_PATH * 4];
++  DWORD n = ::GetModuleFileNameW(module, path, std::size(path));
++  if (n == 0 || n >= std::size(path)) {
++    return false;
++  }
++  std::wstring dir(path, n);
++  dir.resize(dir.find_last_of(L'\\'));
++  return ::GetFileAttributesW((dir + L"\\Installer\\setup.exe").c_str()) !=
++         INVALID_FILE_ATTRIBUTES;
++}
++
++std::string ReadWholeFile(const std::wstring& path) {
++  HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ,
++                              FILE_SHARE_READ | FILE_SHARE_WRITE |
++                                  FILE_SHARE_DELETE,
++                              nullptr, OPEN_EXISTING, 0, nullptr);
++  if (file == INVALID_HANDLE_VALUE) {
++    return {};
++  }
++  std::string data;
++  char buffer[64 * 1024];
++  DWORD n = 0;
++  while (::ReadFile(file, buffer, sizeof(buffer), &n, nullptr) && n > 0 &&
++         data.size() < (64u << 20)) {
++    data.append(buffer, n);
++  }
++  ::CloseHandle(file);
++  return data;
++}
++
++void WriteWholeFile(const std::wstring& path, std::string_view text) {
++  HANDLE file = ::CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
++                              CREATE_ALWAYS, 0, nullptr);
++  if (file == INVALID_HANDLE_VALUE) {
++    return;
++  }
++  DWORD n = 0;
++  ::WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &n, nullptr);
++  ::CloseHandle(file);
++}
++
++// The profile's exit_type: "Crashed" from start until a clean exit writes
++// "Normal" (Chrome's own "restore pages?" signal).
++bool EndedWithoutCleanExit(const std::wstring& user_data_dir) {
++  return ReadWholeFile(user_data_dir + L"\\Default\\Preferences")
++             .find("\"exit_type\":\"Crashed\"") != std::string::npos;
++}
++
++// A browser runs on this profile: it holds its lockfile (opened for writing,
++// shared for reading only, and deleted when its handle closes).
++bool ProfileInUse(const std::wstring& user_data_dir) {
++  HANDLE lock = ::CreateFileW((user_data_dir + L"\\lockfile").c_str(),
++                              GENERIC_WRITE,
++                              FILE_SHARE_READ | FILE_SHARE_WRITE |
++                                  FILE_SHARE_DELETE,
++                              nullptr, OPEN_EXISTING, 0, nullptr);
++  if (lock != INVALID_HANDLE_VALUE) {
++    ::CloseHandle(lock);
++    return false;
++  }
++  return ::GetLastError() == ERROR_SHARING_VIOLATION;
++}
++
++int64_t Now() {
++  FILETIME now;
++  ::GetSystemTimeAsFileTime(&now);
++  return static_cast<int64_t>(
++      (static_cast<uint64_t>(now.dwHighDateTime) << 32) | now.dwLowDateTime);
++}
++
++// Too soon after the last relaunch: a crash at startup must not loop.
++bool RelaunchedRecently(const std::wstring& user_data_dir) {
++  const std::wstring mark = user_data_dir + kMark;
++  WIN32_FILE_ATTRIBUTE_DATA data;
++  if (::GetFileAttributesExW(mark.c_str(), GetFileExInfoStandard, &data)) {
++    const int64_t written = static_cast<int64_t>(
++        (static_cast<uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) |
++        data.ftLastWriteTime.dwLowDateTime);
++    if (Now() - written < kLoop) {
++      return true;
++    }
++  }
++  WriteWholeFile(mark, "relaunched");
++  return false;
++}
++
++// Out of any job the browser is in (so it outlives a job that ends with the
++// browser), when the job allows it; no handles go along.
++bool Spawn(const base::CommandLine& line) {
++  std::wstring text = line.GetCommandLineString();
++  for (DWORD flags : {DWORD{CREATE_BREAKAWAY_FROM_JOB}, DWORD{0}}) {
++    STARTUPINFOW startup = {};
++    startup.cb = sizeof(startup);
++    PROCESS_INFORMATION process = {};
++    std::wstring mutable_text = text;
++    if (::CreateProcessW(line.GetProgram().value().c_str(),
++                         mutable_text.data(), nullptr, nullptr,
++                         /*bInheritHandles=*/FALSE, flags, nullptr, nullptr,
++                         &startup, &process)) {
++      ::CloseHandle(process.hThread);
++      ::CloseHandle(process.hProcess);
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
++void MaybeStartCrashWatcher(int argc, const char** argv) {
++  if (argc < 1 || Has(argc, argv, "--type=")) {
++    return;
++  }
++  const bool forced = Has(argc, argv, "--meridian-crash-relaunch");
++  if (!forced && (Has(argc, argv, "--remote-debugging-") ||
++                  Has(argc, argv, "--meridian-no-crash-relaunch") ||
++                  Has(argc, argv, "--headless") ||
++                  Has(argc, argv, "--meridian-test-") ||
++                  !IsInstalledCopy())) {
++    return;
++  }
++  const std::wstring exe = ExePath();
++  if (exe.empty()) {
++    return;
++  }
++  base::CommandLine line{base::FilePath(exe)};
++  line.AppendSwitchNative("meridian-crash-watcher",
++                          std::to_wstring(::GetCurrentProcessId()));
++  std::string dir = ValueOf(argc, argv, kUserDataDir);
++  if (!dir.empty()) {
++    line.AppendSwitchPath("user-data-dir",
++                          base::FilePath(base::UTF8ToWide(dir)));
++  }
++  // Tests: the watcher only leaves its mark (no window on the screen).
++  if (Has(argc, argv, kDry)) {
++    line.AppendSwitchASCII("meridian-crash-relaunch", "dry");
++  }
++  Spawn(line);
++}
++
++bool IsCrashWatcher(int argc, const char** argv) {
++  return Has(argc, argv, kWatcher);
++}
++
++int RunCrashWatcher(int argc, const char** argv) {
++  const DWORD browser =
++      static_cast<DWORD>(atoi(ValueOf(argc, argv, kWatcher).c_str()));
++  if (browser == 0) {
++    return 2;
++  }
++  const std::string explicit_dir = ValueOf(argc, argv, kUserDataDir);
++  const std::wstring dir = explicit_dir.empty()
++                               ? DefaultUserDataDir()
++                               : base::UTF8ToWide(explicit_dir);
++  if (dir.empty()) {
++    return 0;
++  }
++
++  // Until the browser ends.
++  HANDLE process = ::OpenProcess(SYNCHRONIZE, FALSE, browser);
++  if (!process) {
++    return 0;  // Already gone (or not ours to watch).
++  }
++  ::WaitForSingleObject(process, INFINITE);
++  ::CloseHandle(process);
++
++  // Its helpers and the crash reporter finish first.
++  ::Sleep(2000);
++  if (!EndedWithoutCleanExit(dir) || ProfileInUse(dir) ||
++      RelaunchedRecently(dir)) {
++    return 0;
++  }
++  if (Has(argc, argv, kDry)) {
++    WriteWholeFile(dir + kMark, "would relaunch");
++    return 0;
++  }
++  const std::wstring exe = ExePath();
++  if (exe.empty()) {
++    return 1;
++  }
++  base::CommandLine line{base::FilePath(exe)};
++  if (!explicit_dir.empty()) {
++    line.AppendSwitchPath("user-data-dir", base::FilePath(dir));
++  }
++  return Spawn(line) ? 0 : 1;
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/crash_watcher_win.h b/chrome/browser/meridian/crash_watcher_win.h
+new file mode 100644
+index 0000000000..4a421feaef
+--- /dev/null
++++ b/chrome/browser/meridian/crash_watcher_win.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_CRASH_WATCHER_WIN_H_
++#define CHROME_BROWSER_MERIDIAN_CRASH_WATCHER_WIN_H_
++
++namespace meridian {
++
++// The Windows side of crash_watcher_mac.h: if the browser process crashes,
++// a small watcher (meridian.exe itself with `--meridian-crash-watcher=<pid>`,
++// no windows) opens Meridian again, which restores the tabs and the agents'
++// sessions. Only when the profile's exit_type is still "Crashed", not when
++// another Meridian holds the profile, not twice within two minutes, only for
++// an installed copy, and not under tests (--remote-debugging-*,
++// --meridian-test-*), unless --meridian-crash-relaunch asks for it
++// (=dry: the watcher only leaves its mark).
++//
++// argv is main()'s, in UTF-8 (helper_modes.cc makes it from the command line).
++
++// Called for the browser process before it starts: launches the watcher.
++void MaybeStartCrashWatcher(int argc, const char** argv);
++
++bool IsCrashWatcher(int argc, const char** argv);
++int RunCrashWatcher(int argc, const char** argv);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_CRASH_WATCHER_WIN_H_
+diff --git a/chrome/browser/meridian/helper_modes.cc b/chrome/browser/meridian/helper_modes.cc
+index c48eedfbba..ce7fd3d42d 100644
+--- a/chrome/browser/meridian/helper_modes.cc
++++ b/chrome/browser/meridian/helper_modes.cc
+@@ -7,6 +7,8 @@
+ #include "chrome/browser/meridian/agent/mcp_bridge.h"
+ #if BUILDFLAG(IS_MAC)
+ #include "chrome/browser/meridian/crash_watcher_mac.h"
++#elif BUILDFLAG(IS_WIN)
++#include "chrome/browser/meridian/crash_watcher_win.h"
+ #endif
+ #include "chrome/browser/meridian/mission/mission_hook.h"
+ #include "chrome/browser/meridian/workbench/guard_hook.h"
+@@ -40,7 +42,7 @@ std::optional<int> Run(int argc, const char** argv) {
+   if (IsMcpBridge(argc, argv)) {
+     return RunMcpBridge(argc, argv);
+   }
+-#if BUILDFLAG(IS_MAC)
++#if BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
+   if (IsCrashWatcher(argc, argv)) {
+     return RunCrashWatcher(argc, argv);
+   }
+@@ -57,10 +59,14 @@ std::optional<int> RunHelperMode() {
+   // Every process of the browser comes through here, the sandboxed ones
+   // too, and those may not load what splits a command line into arguments.
+   // So first the plain text: no helper's switch in it, nothing to do.
++  // The browser itself (no --type=) also comes on, for its crash watcher.
+   const std::wstring_view line(::GetCommandLineW());
+-  if (line.find(L"--secret-guard") == std::wstring_view::npos &&
+-      line.find(L"--mission-hook") == std::wstring_view::npos &&
+-      line.find(L"--mcp-bridge") == std::wstring_view::npos) {
++  const bool helper =
++      line.find(L"--secret-guard") != std::wstring_view::npos ||
++      line.find(L"--mission-hook") != std::wstring_view::npos ||
++      line.find(L"--mcp-bridge") != std::wstring_view::npos ||
++      line.find(L"--meridian-crash-watcher=") != std::wstring_view::npos;
++  if (!helper && line.find(L"--type=") != std::wstring_view::npos) {
+     return std::nullopt;
+   }
+   // main()'s arguments, in UTF-8.
+@@ -74,9 +80,14 @@ std::optional<int> RunHelperMode() {
+     argv.push_back(arg.c_str());
+   }
+   const int argc = static_cast<int>(argv.size());
++  if (IsCrashWatcher(argc, argv.data())) {
++    return RunCrashWatcher(argc, argv.data());
++  }
+   if (!workbench::IsSecretGuard(argc, argv.data()) &&
+       !mission::IsMissionHook(argc, argv.data()) &&
+       !IsMcpBridge(argc, argv.data())) {
++    // The browser: a watcher reopens it if it crashes.
++    MaybeStartCrashWatcher(argc, argv.data());
+     return std::nullopt;
+   }
+   // The lines these programs exchange are JSON with "\n" at the end: as they
+-- 
+2.52.0.windows.1
+

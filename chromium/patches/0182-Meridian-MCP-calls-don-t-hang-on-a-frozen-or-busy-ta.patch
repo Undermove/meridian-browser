@@ -1,0 +1,288 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 19 Nov 2026 21:16:48 +0400
+Subject: [PATCH 183/202] Meridian: MCP calls don't hang on a frozen or busy
+ tab, nor wait in line
+
+The tab an agent works in is woken and kept awake (not frozen or throttled
+in the background) for a few minutes after its last call; a page that
+doesn't answer in 20 s is a tool error saying so (wait_for within its own
+time); the MCP bridge runs each tool call on its own thread, so a call that
+waits doesn't hold up the others.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/meridian/agent/agent_service.cc   | 76 ++++++++++++++++++-
+ chrome/browser/meridian/agent/agent_service.h | 20 ++++-
+ chrome/browser/meridian/agent/mcp_bridge.cc   | 62 ++++++++++++++-
+ 3 files changed, 151 insertions(+), 7 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index 7e7c2390f3..3fd7e63c73 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -419,6 +419,13 @@ struct AgentService::Call {
+     return s ? *s : fallback;
+   }
+   void Ok(base::Value result) {
++    // A page that never answered: an error, whatever the tool made of it.
++    if (const std::string* error =
++            result.is_dict() && result.GetDict().FindBool("page_timeout")
++                ? result.GetDict().FindString("error")
++                : nullptr) {
++      return Fail(*error);
++    }
+     base::DictValue response;
+     response.Set("result", std::move(result));
+     std::move(reply).Run(std::move(response));
+@@ -681,6 +688,7 @@ tabs::TabInterface* AgentService::AnyTabFor(const Call& call) {
+ void AgentService::Activity(const Call& call, tabs::TabInterface* tab) {
+   if (tab) {
+     current_tab_[call.client] = tab->GetHandle();
++    KeepAwake(tab);
+   }
+   if (BrowserWindowInterface* window = Window()) {
+     SidebarHandler::AgentActivity(
+@@ -719,12 +727,65 @@ void AgentService::Confirm(
+ 
+ void AgentService::RunInPage(content::WebContents* contents,
+                              const std::string& expression,
+-                             base::OnceCallback<void(base::Value)> done) {
++                             base::OnceCallback<void(base::Value)> done,
++                             base::TimeDelta timeout) {
+   std::u16string script = base::UTF8ToUTF16(
+       std::string(kAgentPageJs) + "\n;(() => { try { return (" + expression +
+       "); } catch (e) { return {error: String(e && e.message || e)}; } })()");
++  // Whichever comes first: the page's answer or the timeout.
++  auto once =
++      std::make_shared<base::OnceCallback<void(base::Value)>>(std::move(done));
++  auto finish = base::BindRepeating(
++      [](std::shared_ptr<base::OnceCallback<void(base::Value)>> once,
++         base::Value value) {
++        if (*once) {
++          std::move(*once).Run(std::move(value));
++        }
++      },
++      once);
+   contents->GetPrimaryMainFrame()->ExecuteJavaScriptInIsolatedWorld(
+-      script, std::move(done), ISOLATED_WORLD_ID_CHROME_INTERNAL);
++      script, base::BindOnce(finish), ISOLATED_WORLD_ID_CHROME_INTERNAL);
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(
++          finish,
++          base::Value(base::DictValue().Set("page_timeout", true).Set(
++              "error",
++              "The page didn't answer within " +
++                  base::NumberToString(timeout.InSeconds()) +
++                  " seconds: it is busy, or it was frozen in the "
++                  "background. Try again; activate_tab helps if it keeps "
++                  "happening."))),
++      timeout);
++}
++
++AgentService::Awake::Awake() = default;
++AgentService::Awake::Awake(Awake&&) = default;
++AgentService::Awake& AgentService::Awake::operator=(Awake&&) = default;
++AgentService::Awake::~Awake() = default;
++
++void AgentService::KeepAwake(tabs::TabInterface* tab) {
++  content::WebContents* contents = tab ? tab->GetContents() : nullptr;
++  if (!contents) {
++    return;
++  }
++  // A background tab Chromium froze (or would throttle): awake while the
++  // agent works in it, as if it were being captured.
++  contents->SetPageFrozen(false);
++  const int32_t id = tab->GetHandle().raw_value();
++  Awake& awake = awake_[id];
++  if (!awake.capture) {
++    awake.capture = contents->IncrementCapturerCount(
++        gfx::Size(), /*stay_hidden=*/true, /*stay_awake=*/true,
++        /*is_activity=*/false);
++  }
++  if (!awake.release) {
++    awake.release = std::make_unique<base::OneShotTimer>();
++  }
++  awake.release->Start(
++      FROM_HERE, base::Minutes(3),
++      base::BindOnce([](AgentService* self, int32_t id) { self->awake_.erase(id); },
++                     base::Unretained(this), id));
+ }
+ 
+ void AgentService::ReadPageText(content::WebContents* contents,
+@@ -1663,6 +1724,12 @@ void AgentService::WaitFor(std::unique_ptr<Call> call) {
+                       base::Value(base::DictValue().Set("found", true)));
+                 }
+                 if (base::TimeTicks::Now() >= deadline) {
++                  // The page never answered: say so, not "not found".
++                  if (const std::string* error =
++                          found.is_dict() ? found.GetDict().FindString("error")
++                                          : nullptr) {
++                    return call->Fail(*error);
++                  }
+                   return call->Ok(
+                       base::Value(base::DictValue().Set("found", false)));
+                 }
+@@ -1672,7 +1739,10 @@ void AgentService::WaitFor(std::unique_ptr<Call> call) {
+                                    std::move(call)),
+                     base::Milliseconds(250));
+               },
+-              self, contents, expr, deadline, std::move(call)));
++              self, contents, expr, deadline, std::move(call)),
++          // No longer than the wait has left (and a second for the answer).
++          std::clamp(deadline - base::TimeTicks::Now() + base::Seconds(1),
++                     base::Seconds(1), base::Seconds(20)));
+     }
+   };
+   Poll::Step(weak_factory_.GetWeakPtr(), tab->GetContents()->GetWeakPtr(), expr,
+diff --git a/chrome/browser/meridian/agent/agent_service.h b/chrome/browser/meridian/agent/agent_service.h
+index d22579d0a4..17fb1746be 100644
+--- a/chrome/browser/meridian/agent/agent_service.h
++++ b/chrome/browser/meridian/agent/agent_service.h
+@@ -14,6 +14,9 @@
+ #include "base/memory/weak_ptr.h"
+ #include "base/task/cancelable_task_tracker.h"
+ #include "base/types/expected.h"
++#include "base/functional/callback_helpers.h"
++#include "base/time/time.h"
++#include "base/timer/timer.h"
+ #include "base/values.h"
+ #include "components/keyed_service/core/keyed_service.h"
+ #include "components/prefs/pref_change_registrar.h"
+@@ -80,9 +83,12 @@ class AgentService : public KeyedService {
+                std::string summary,
+                base::OnceCallback<void(std::unique_ptr<Call>)> then);
+   void Activity(const Call& call, tabs::TabInterface* tab);
++  // Runs Meridian's page script with `expression`; {error} if the page
++  // doesn't answer within `timeout` (busy, or frozen in the background).
+   void RunInPage(content::WebContents* contents,
+                  const std::string& expression,
+-                 base::OnceCallback<void(base::Value)> done);
++                 base::OnceCallback<void(base::Value)> done,
++                 base::TimeDelta timeout = base::Seconds(20));
+ 
+   // Tools.
+   void ListSpaces(std::unique_ptr<Call> call);
+@@ -131,6 +137,18 @@ class AgentService : public KeyedService {
+   bool paused_ = false;
+   // Each client's current tab (the last it opened or used).
+   std::map<std::string, tabs::TabHandle> current_tab_;
++  // Tabs an agent works in stay awake (not frozen or throttled in the
++  // background) until it leaves them alone for a while.
++  struct Awake {
++    Awake();
++    Awake(Awake&&);
++    Awake& operator=(Awake&&);
++    ~Awake();
++    base::ScopedClosureRunner capture;
++    std::unique_ptr<base::OneShotTimer> release;
++  };
++  std::map<int32_t, Awake> awake_;
++  void KeepAwake(tabs::TabInterface* tab);
+   base::CancelableTaskTracker history_tracker_;
+   base::WeakPtrFactory<AgentService> weak_factory_{this};
+ };
+diff --git a/chrome/browser/meridian/agent/mcp_bridge.cc b/chrome/browser/meridian/agent/mcp_bridge.cc
+index 93ad237188..a67394ccba 100644
+--- a/chrome/browser/meridian/agent/mcp_bridge.cc
++++ b/chrome/browser/meridian/agent/mcp_bridge.cc
+@@ -19,6 +19,8 @@
+ #include "base/json/json_writer.h"
+ #include "base/no_destructor.h"
+ #include "base/rand_util.h"
++#include "base/synchronization/lock.h"
++#include "base/threading/platform_thread.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/values.h"
+ #include "chrome/browser/meridian/agent/agent_embed.h"  // generated
+@@ -59,8 +61,16 @@ base::FilePath UserDataDir(int argc, const char** argv) {
+   return dir;
+ }
+ 
++// Tool calls answer from their own threads: one line at a time.
++base::Lock& WriteLock() {
++  static base::NoDestructor<base::Lock> lock;
++  return *lock;
++}
++
+ void Write(const base::DictValue& message) {
+-  std::cout << base::WriteJson(message).value_or("{}") << "\n" << std::flush;
++  std::string line = base::WriteJson(message).value_or("{}") + "\n";
++  base::AutoLock hold(WriteLock());
++  std::cout << line << std::flush;
+ }
+ 
+ base::DictValue Result(const base::Value* id, base::DictValue result) {
+@@ -172,6 +182,51 @@ std::optional<base::DictValue> Ask(const base::FilePath& user_data_dir,
+   return std::move(*value).TakeDict();
+ }
+ 
++base::DictValue CallTool(const base::FilePath& user_data_dir,
++                         const std::string& client,
++                         const base::DictValue& params);
++
++// One tool call on a thread of its own: a call that waits (a page that is
++// slow to answer, the person deciding) doesn't hold up the others.
++class CallThread : public base::PlatformThread::Delegate {
++ public:
++  CallThread(base::FilePath user_data_dir,
++             std::string client,
++             base::Value id,
++             base::DictValue params)
++      : user_data_dir_(std::move(user_data_dir)),
++        client_(std::move(client)),
++        id_(std::move(id)),
++        params_(std::move(params)) {}
++
++  static void Start(base::FilePath user_data_dir,
++                    std::string client,
++                    base::Value id,
++                    base::DictValue params) {
++    auto* thread = new CallThread(std::move(user_data_dir), std::move(client),
++                                  id.Clone(), std::move(params));
++    if (!base::PlatformThread::CreateNonJoinable(0, thread)) {
++      // No thread to spare: answer here.
++      thread->ThreadMain();
++    }
++  }
++
++  void ThreadMain() override {
++    base::DictValue out;
++    out.Set("jsonrpc", "2.0");
++    out.Set("id", id_.Clone());
++    out.Set("result", CallTool(user_data_dir_, client_, params_));
++    Write(out);
++    delete this;
++  }
++
++ private:
++  const base::FilePath user_data_dir_;
++  const std::string client_;
++  const base::Value id_;
++  const base::DictValue params_;
++};
++
+ // This bridge process, for Mission Control.
+ const std::string& ClientId() {
+   static const base::NoDestructor<std::string> id(
+@@ -247,6 +302,7 @@ int RunMcpBridge(int argc, const char** argv) {
+   const base::FilePath user_data_dir = UserDataDir(argc, argv);
+   std::optional<base::Value> tools = base::JSONReader::Read(kAgentToolsJson, 0);
+   std::string client = "MCP client";
++  ClientId();  // (made once, before any call thread)
+   std::string line;
+   while (std::getline(std::cin, line)) {
+     if (line.empty()) {
+@@ -302,8 +358,8 @@ int RunMcpBridge(int argc, const char** argv) {
+       }
+       Write(Result(id, base::DictValue().Set("tools", std::move(list))));
+     } else if (*method == "tools/call") {
+-      Write(Result(id, CallTool(user_data_dir, client,
+-                                params ? params->Clone() : base::DictValue())));
++      CallThread::Start(user_data_dir, client, id->Clone(),
++                        params ? params->Clone() : base::DictValue());
+     } else {
+       base::DictValue out;
+       out.Set("jsonrpc", "2.0");
