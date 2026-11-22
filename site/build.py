@@ -31,7 +31,7 @@ LANGS = ('en', 'ru')
 RU_META = {
   'index': {
     'title': 'Meridian — браузер с открытым кодом на замену Arc',
-    'description': 'Meridian — бесплатный браузер с открытым кодом для тех, кто любил Arc: спейсы, закреплённые вкладки, сплит-вью, командная строка и импорт из Arc в один клик. Для macOS и Windows.',
+    'description': 'Бесплатный браузер с открытым кодом для тех, кто любил Arc: спейсы, закреплённые вкладки, сплит-вью и импорт из Arc в один клик. Для macOS и Windows.',
     'og_title': 'Meridian — браузер с открытым кодом на замену Arc',
     'og_description': 'Спейсы, закреплённые вкладки, сплит-вью и импорт из Arc в один клик. Бесплатно для macOS и Windows.',
   },
@@ -82,7 +82,7 @@ def strip_lang(text, keep):
 
 
 # The bilingual pages: a Russian page links to their Russian versions, next to it.
-SIBLINGS = re.compile(r'^(?:\./|\.|index\.html|changelog\.html)(?:#.*)?$|^\./#')
+SIBLINGS = re.compile(r'^(?:\./|\.|index\.html|changelog\.html|(?:arc-shutdown|import-from-arc|windows|developers|arc-alternatives)/)(?:#.*)?$|^\./#')
 
 
 def relocate(text, depth, siblings=False):
