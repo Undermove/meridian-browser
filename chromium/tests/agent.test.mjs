@@ -208,6 +208,26 @@ test('full access: an MCP client lists, opens, reads, clicks, types, screenshots
   } finally { mcp.close(); await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
 
+test('going back can not take an agent to a browser page', async () => {
+  const s = await site();
+  const profile = profileWith({ agent_access: 'full' });
+  const b = await launch([s.url('/')], { profile });
+  const mcp = bridge(profile);
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { clientInfo: { name: 'test-client' } });
+    const page = await b.page(s.url('/'));
+    await page.cdp.send('Page.navigate', { url: 'chrome://version/' });
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => /chrome:\\/\\/version/.test(r.tab.url))`);
+    await page.cdp.send('Page.navigate', { url: s.url('/form') });
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'Form')`);
+    page.close();
+    assert.match((await mcp.call('history_nav', { action: 'back' })).error, /only work on web pages/);
+    assert.match((await mcp.call('read_page')).value.text, /Sign up/);
+  } finally { mcp.close(); await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
 test('what a login field holds stays in the page', async () => {
   const s = await site();
   const profile = profileWith({ agent_access: 'full' });
@@ -578,7 +598,7 @@ test('page dialogs: pending_dialog in list_tabs, an error instead of a hang, han
 });
 
 // A connected agent before the person decided: one question in the browser, no trip to Settings.
-test('an agent connected earlier asks once: Allow gives full control and its call goes through; Deny closes the door', async () => {
+test('an agent connected earlier asks once: Allow means it asks before each action, its call goes through; Deny closes the door', async () => {
   const allowed = profileWith({});
   const b = await launch(['about:blank'], { profile: allowed });
   const mcp = bridge(allowed);
@@ -589,14 +609,20 @@ test('an agent connected earlier asks once: Allow gives full control and its cal
     const first = mcp.call('list_tabs');
     const second = mcp.call('list_tabs');
     await b.waitFor(`!!${AG}.getElementById('ask')`);
-    assert.match(await b.eval(`${AG}.querySelector('#ask .summary').textContent`), /control Meridian[\s\S]*signed in/);
+    assert.match(await b.eval(`${AG}.querySelector('#ask .summary').textContent`), /before each action[\s\S]*signed in[\s\S]*can't verify/);
     await sleep(700);
     await b.click(`${AG}.getElementById('allow')`);
     assert.equal((await first).error, null);
     assert.equal((await second).error, null, 'one question for both calls');
-    await b.waitFor(`app.$.tabstrip.handler_.getSettings().then((r) => r.settings.agentAccess === 'full')`);
+    await b.waitFor(`app.$.tabstrip.handler_.getSettings().then((r) => r.settings.agentAccess === 'ask')`);
     assert.equal((await mcp.call('list_tabs')).error, null);
-    assert.equal(await b.eval(`!!${AG}.getElementById('ask')`), false, 'not asked again');
+    assert.equal(await b.eval(`!!${AG}.getElementById('ask')`), false, 'reading needs no question');
+    // A change is still put to the person.
+    const change = mcp.call('open_tab', { url: 'about:blank' });
+    await b.waitFor(`!!${AG}.getElementById('ask')`);
+    await sleep(700);
+    await b.click(`${AG}.getElementById('deny')`);
+    assert.match((await change).error, /declined/);
   } finally { mcp.close(); await b.close(); fs.rmSync(allowed, { recursive: true, force: true }); }
 
   const denied = profileWith({});
