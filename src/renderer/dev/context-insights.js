@@ -22,6 +22,9 @@ const CI_PARTS = [
 
 const CI_SPEND = [['cacheRead', 'Cache reads', '#8a8fe0'], ['cacheWrite', 'Cache writes', '#e0a400'], ['input', 'Uncached input', '#9a9aa6'], ['output', 'Output and thinking', '#6d5fd8'], ['subagents', 'Subagents', '#2f9ea0']];
 
+// Why a turn cost what it did (the transcript has to prove it, else "unknown").
+const CI_CAUSES = [['normal', 'Normal use', '#8a8fe0'], ['cold', 'Cold cache', '#3f8fe0'], ['compaction', 'Compaction', '#e5484d'], ['file', 'Big file read', '#e0a400'], ['mcp', 'MCP load', '#2f9ea0'], ['subagents', 'Subagents', '#30a46c'], ['unknown', 'Unknown', '#7c7c88']];
+
 const ciK = (n) => {
   n = Number(n) || 0;
   const trim = (x) => x.replace(/\.0$/, '');
@@ -68,7 +71,7 @@ function insightsUsage(usage) {
   renderLimitsChip();
   if (typeof renderTermTabs === 'function') renderTermTabs();
   if (PRO.activePanel === 'insights') {
-    renderPanel();
+    ciRedraw();
     // The transcript grew: read the new part (not more often than every 15 s).
     if (Date.now() - CI.lastFetch > 15000) ciFetch();
   }
@@ -121,6 +124,23 @@ function termSessionName(t) { return CI.usage[t.id]?.session_name || ''; }
 
 // ------------------------------------------------------------------ the panel
 
+// A redraw replaces the chart, so it waits while the mouse is dragging over it.
+function ciRedraw() {
+  if (CI.dragging) { CI.redrawAfterDrag = true; return; }
+  renderPanel();
+}
+
+// The bars span the whole session, so they shift as it grows: the selection follows the time.
+function ciKeepRange(before, after) {
+  if (!CI.range || !before?.length || !after?.length) return;
+  const start = before[CI.range.from]?.ts;
+  const end = before[CI.range.to + 1]?.ts ?? Infinity;
+  if (start == null) { CI.range = null; return; }
+  let from = 0, to = 0;
+  after.forEach((b, i) => { if (b.ts <= start) from = i; if (b.ts < end) to = i; });
+  CI.range = { from, to: Math.max(from, to) };
+}
+
 async function ciFetch() {
   const t = ciTerm();
   if (!t || typeof wb.contextInsights !== 'function') return;
@@ -129,17 +149,17 @@ async function ciFetch() {
   const id = t.id;
   try {
     const data = await wb.contextInsights(id, { contextSize: CI.usage[id]?.context_size });
-    if (ciTerm()?.id === id) { CI.data = data; CI.dataTerm = id; CI.error = ''; }
+    if (ciTerm()?.id === id) { ciKeepRange(CI.data?.moneySeries, data?.moneySeries); CI.data = data; CI.dataTerm = id; CI.error = ''; }
   } catch (e) {
     CI.error = String(e?.message || e).replace(/^Error: /, '');
   }
   CI.loading = false;
-  if (PRO.activePanel === 'insights') renderPanel();
+  if (PRO.activePanel === 'insights') ciRedraw();
 }
 
 function renderInsightsPanel(el) {
   const t = ciTerm();
-  if (t && CI.dataTerm !== t.id && !CI.loading) { CI.data = null; ciFetch(); }
+  if (t && CI.dataTerm !== t.id && !CI.loading) { CI.data = null; CI.range = null; ciFetch(); }
   const u = t ? CI.usage[t.id] || {} : {};
   const d = CI.dataTerm === t?.id ? CI.data : null;
   const l = ciLimits();
@@ -227,6 +247,7 @@ function renderInsightsPanel(el) {
 
   el.innerHTML = parts.join('');
   el.querySelector('#ci-refresh')?.addEventListener('click', () => ciFetch());
+  ciWireMoney(el);
   for (const f of el.querySelectorAll('.ci-fold > button')) {
     f.addEventListener('click', () => {
       const id = f.parentElement.dataset.id;
@@ -235,7 +256,7 @@ function renderInsightsPanel(el) {
     });
   }
   // The reset countdowns and the cache's warmth move on their own.
-  const tick = setInterval(() => { if (PRO.activePanel === 'insights') renderPanel(); }, 30000);
+  const tick = setInterval(() => { if (PRO.activePanel === 'insights') ciRedraw(); }, 30000);
   return () => clearInterval(tick);
 }
 
@@ -243,24 +264,92 @@ function ciFold(id, title, body) {
   return `<div class="ci-fold${CI.openSections.has(id) ? ' open' : ''}" data-id="${id}"><button>${icon('chevronRight', 12)}<span>${title}</span></button><div class="ci-fold-body">${body}</div></div>`;
 }
 
-// Dollars over the session, split the same way as the bar above.
+const ciUsd = (n) => `$${n < 0.01 && n > 0 ? n.toFixed(3) : n.toFixed(2)}`;
+const ciTime = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+const ciCauseName = (id) => CI_CAUSES.find(([k]) => k === id)?.[1] || 'Unknown';
+
+// Dollars over the session, each bar coloured by why it cost that.
 function ciMoney(series) {
   const sum = (b) => CI_SPEND.reduce((n, [k]) => n + (b[k] || 0), 0);
-  const usd = (n) => `$${n < 0.01 && n > 0 ? n.toFixed(3) : n.toFixed(2)}`;
-  const time = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const max = Math.max(...series.map(sum)) || 1;
   const peak = series.reduce((a, b) => (sum(b) > sum(a) ? b : a));
-  const bars = series.map((b) => {
+  const range = CI.range && CI.range.to < series.length ? CI.range : null;
+  const bars = series.map((b, i) => {
     const total = sum(b);
-    const lines = CI_SPEND.filter(([k]) => b[k] > 0).map(([k, label]) => `${label}: ${usd(b[k])}`);
-    const title = total ? `${time(b.ts)} · ${usd(total)}\n${lines.join('\n')}` : time(b.ts);
-    const parts = CI_SPEND.map(([k, , c]) => (b[k] > 0 ? `<i style="height:${(b[k] / max) * 100}%;background:${c}"></i>` : '')).join('');
-    return `<div class="bar" title="${ciEsc(title)}">${parts}</div>`;
+    const kinds = CI_SPEND.filter(([k]) => b[k] > 0).map(([k, label]) => `${label}: ${ciUsd(b[k])}`);
+    const causes = CI_CAUSES.filter(([k]) => b.causes?.[k] > 0).map(([k, label]) => `${label}: ${ciUsd(b.causes[k])}`);
+    const title = total ? `${ciTime(b.ts)} · ${ciUsd(total)}\n${causes.join('\n')}\n\n${kinds.join('\n')}` : ciTime(b.ts);
+    const parts = CI_CAUSES.map(([k, , c]) => (b.causes?.[k] > 0 ? `<i style="height:${(b.causes[k] / max) * 100}%;background:${c}"></i>` : '')).join('');
+    const on = range && i >= range.from && i <= range.to;
+    return `<div class="bar${on ? ' sel' : ''}" data-i="${i}" title="${ciEsc(title)}">${parts}</div>`;
   }).join('');
-  return `<div class="ci-money-head"><span>Cost over time</span><span class="muted small">peak ${usd(sum(peak))} at ${time(peak.ts)}</span></div>
-    <div class="ci-money" role="img" aria-label="Session cost over time, by kind of usage">${bars}</div>
-    <div class="ci-row muted small"><span>${time(series[0].ts)}</span><span>${time(series[series.length - 1].ts)}</span></div>
-    <p class="muted small">Claude Code’s cost for this session, shared out by usage. On Pro and Max it’s the API price of this work, not a charge.</p>`;
+  const totals = Object.fromEntries(CI_CAUSES.map(([k]) => [k, series.reduce((n, b) => n + (b.causes?.[k] || 0), 0)]));
+  const legend = CI_CAUSES.filter(([k]) => totals[k] > 0).map(([k, label, c]) => `<div class="ci-row"><span><i class="sw" style="background:${c}"></i>${label}</span><span class="muted">${ciUsd(totals[k])}</span></div>`).join('');
+  return `<div class="ci-money-head"><span>Cost over time</span><span class="muted small">peak ${ciUsd(sum(peak))} at ${ciTime(peak.ts)}</span></div>
+    <div class="ci-money" role="img" aria-label="Session cost over time, coloured by cause. Click a bar or drag across bars to see the turns.">${bars}</div>
+    <div class="ci-row muted small"><span>${ciTime(series[0].ts)}</span><span>${ciTime(series[series.length - 1].ts)}</span></div>
+    <div class="ci-legend">${legend}</div>
+    ${range ? ciRange(series, range) : '<p class="muted small">Click a bar or drag across several to see the turns and what made them cost.</p>'}
+    <p class="muted small">API price: Claude Code’s cost for this session, shared out by usage. On Pro and Max it’s what this work would cost on the API, not a charge. A cause is named only when the transcript shows it.</p>`;
+}
+
+// The selected bars: their turns, the costliest first, and what made them cost.
+function ciRange(series, { from, to }) {
+  const picked = series.slice(from, to + 1);
+  const total = picked.reduce((n, b) => n + CI_SPEND.reduce((m, [k]) => m + (b[k] || 0), 0), 0);
+  const count = picked.reduce((n, b) => n + (b.turnCount || 0), 0);
+  const listed = picked.flatMap((b) => b.turns || []).sort((a, b) => b.usd - a.usd);
+  const shown = listed.slice(0, 30);
+  const restUsd = picked.reduce((n, b) => n + (b.moreUsd || 0), 0) + listed.slice(30).reduce((n, t) => n + t.usd, 0);
+  const rest = count - shown.length;
+  const causes = CI_CAUSES.map(([k, label, c]) => [label, c, picked.reduce((n, b) => n + (b.causes?.[k] || 0), 0)]).filter(([, , v]) => v > 0)
+    .map(([label, c, v]) => `<div class="ci-row"><span><i class="sw" style="background:${c}"></i>${label}</span><span class="muted">${ciUsd(v)}</span></div>`).join('');
+  const end = series[to + 1]?.ts;
+  const when = from === to && !end ? ciTime(series[from].ts) : `${ciTime(series[from].ts)}–${ciTime(end || series[to].ts)}`;
+  const turns = shown.map((t) => {
+    const colour = CI_CAUSES.find(([k]) => k === t.cause)?.[2] || '#7c7c88';
+    return `<div class="ci-turn"><div class="ci-row"><span><i class="sw" style="background:${colour}"></i>Turn ${t.index} · ${ciEsc(ciCauseName(t.cause))}</span><b>${ciUsd(t.usd)}</b></div>${t.why ? `<div class="muted small">${ciEsc(t.why)}</div>` : ''}${t.prompt ? `<div class="muted small ci-path" title="${ciEsc(t.prompt)}">${ciEsc(t.prompt)}</div>` : ''}</div>`;
+  }).join('');
+  return `<div class="ci-range"><div class="ci-range-head"><b>${when} · ${count} ${count === 1 ? 'turn' : 'turns'} · ${ciUsd(total)}</b><button class="ci-range-clear">Clear</button></div>
+    <div class="ci-legend">${causes}</div>${turns || '<p class="muted small">No turns of the main session here.</p>'}
+    ${rest > 0 ? `<p class="muted small">And ${rest} smaller ${rest === 1 ? 'turn' : 'turns'}, ${ciUsd(restUsd)}.</p>` : ''}</div>`;
+}
+
+// A click picks one bar (again: clears it); a drag picks a range.
+function ciWireMoney(el) {
+  const chart = el.querySelector('.ci-money');
+  el.querySelector('.ci-range-clear')?.addEventListener('click', () => { CI.range = null; renderPanel(); });
+  if (!chart) return;
+  const bars = [...chart.querySelectorAll('.bar')];
+  const barAt = (x) => {
+    const r = chart.getBoundingClientRect();
+    return Math.max(0, Math.min(bars.length - 1, Math.floor(((x - r.left) / r.width) * bars.length)));
+  };
+  const paint = (from, to) => bars.forEach((b, i) => b.classList.toggle('sel', i >= from && i <= to));
+  chart.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const anchor = barAt(e.clientX);
+    const was = CI.range;
+    let at = anchor;
+    CI.dragging = true;
+    chart.setPointerCapture(e.pointerId);
+    paint(anchor, anchor);
+    const move = (m) => { at = barAt(m.clientX); paint(Math.min(anchor, at), Math.max(anchor, at)); };
+    const up = () => {
+      chart.removeEventListener('pointermove', move);
+      chart.removeEventListener('pointerup', up);
+      chart.removeEventListener('pointercancel', up);
+      CI.dragging = false;
+      CI.redrawAfterDrag = false;
+      const same = at === anchor && was && was.from === anchor && was.to === anchor;
+      CI.range = same ? null : { from: Math.min(anchor, at), to: Math.max(anchor, at) };
+      renderPanel();
+    };
+    chart.addEventListener('pointermove', move);
+    chart.addEventListener('pointerup', up);
+    chart.addEventListener('pointercancel', up);
+  });
 }
 
 // How the context grew, with the compactions marked.
