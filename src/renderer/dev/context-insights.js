@@ -20,6 +20,8 @@ const CI_PARTS = [
   ['messages', 'Messages', '#6d5fd8'],
 ];
 
+const CI_SPEND = [['cacheRead', 'Cache reads', '#8a8fe0'], ['cacheWrite', 'Cache writes', '#e0a400'], ['input', 'Uncached input', '#9a9aa6'], ['output', 'Output and thinking', '#6d5fd8'], ['subagents', 'Subagents', '#2f9ea0']];
+
 const ciK = (n) => {
   n = Number(n) || 0;
   const trim = (x) => x.replace(/\.0$/, '');
@@ -209,11 +211,12 @@ function renderInsightsPanel(el) {
   // Where the usage went
   if (d && d.requests) {
     const w = d.spend.weights;
-    const kinds = [['cacheRead', 'Cache reads', '#8a8fe0'], ['cacheWrite', 'Cache writes', '#e0a400'], ['input', 'Uncached input', '#9a9aa6'], ['output', 'Output and thinking', '#6d5fd8'], ['subagents', 'Subagents', '#2f9ea0']];
+    const kinds = CI_SPEND;
     parts.push(`<div class="section"><div class="panel-head"><h3>Where the usage went</h3><span class="muted small">${d.requests} requests${d.costUsd ? ` · ≈$${d.costUsd.toFixed(2)}` : ''}</span></div>`);
     parts.push('<div class="ci-stack">' + kinds.map(([k, , c]) => `<i style="width:${(w[k] || 0) * 100}%;background:${c}"></i>`).join('') + '</div>');
     parts.push('<div class="ci-legend">' + kinds.filter(([k]) => w[k] > 0.005).map(([k, label, c]) => `<div class="ci-row"><span><i class="sw" style="background:${c}"></i>${label}</span><span class="muted">${ciPct(w[k])}</span></div>`).join('') + '</div>');
     parts.push('<p class="muted small">Weighted as limits count them: a cache read is a tenth of plain input, a cache write 1.25×, output 5×.</p>');
+    if (d.moneySeries?.length) parts.push(ciMoney(d.moneySeries));
     if (d.tools?.length) parts.push(ciFold('tools', 'By tool', d.tools.map((x) => `<div class="ci-row"><span>${ciEsc(x.name)} <span class="muted">×${x.calls}</span></span><span class="muted">${ciK(x.tokens)} · ${ciPct(x.share)}</span></div>`).join('')));
     if (d.heavyResults?.length) parts.push(ciFold('heavy', 'Heaviest tool results', d.heavyResults.map((x) => `<div class="ci-row"><span class="ci-path" title="${ciEsc(x.target)}">${ciEsc(x.tool)} ${ciEsc(x.target)}</span><span class="muted">${ciK(x.tokens)} ×${x.requests} · ${ciPct(x.share)}</span></div>`).join('')));
     if (d.rereads?.length) parts.push(ciFold('rereads', 'Files read more than once', d.rereads.map((x) => `<div class="ci-row"><span class="ci-path" title="${ciEsc(x.path)}">${ciEsc(x.path)}</span><span class="muted">${x.times}× · ${ciK(x.tokens)}</span></div>`).join('')));
@@ -238,6 +241,26 @@ function renderInsightsPanel(el) {
 
 function ciFold(id, title, body) {
   return `<div class="ci-fold${CI.openSections.has(id) ? ' open' : ''}" data-id="${id}"><button>${icon('chevronRight', 12)}<span>${title}</span></button><div class="ci-fold-body">${body}</div></div>`;
+}
+
+// Dollars over the session, split the same way as the bar above.
+function ciMoney(series) {
+  const sum = (b) => CI_SPEND.reduce((n, [k]) => n + (b[k] || 0), 0);
+  const usd = (n) => `$${n < 0.01 && n > 0 ? n.toFixed(3) : n.toFixed(2)}`;
+  const time = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const max = Math.max(...series.map(sum)) || 1;
+  const peak = series.reduce((a, b) => (sum(b) > sum(a) ? b : a));
+  const bars = series.map((b) => {
+    const total = sum(b);
+    const lines = CI_SPEND.filter(([k]) => b[k] > 0).map(([k, label]) => `${label}: ${usd(b[k])}`);
+    const title = total ? `${time(b.ts)} · ${usd(total)}\n${lines.join('\n')}` : time(b.ts);
+    const parts = CI_SPEND.map(([k, , c]) => (b[k] > 0 ? `<i style="height:${(b[k] / max) * 100}%;background:${c}"></i>` : '')).join('');
+    return `<div class="bar" title="${ciEsc(title)}">${parts}</div>`;
+  }).join('');
+  return `<div class="ci-money-head"><span>Cost over time</span><span class="muted small">peak ${usd(sum(peak))} at ${time(peak.ts)}</span></div>
+    <div class="ci-money" role="img" aria-label="Session cost over time, by kind of usage">${bars}</div>
+    <div class="ci-row muted small"><span>${time(series[0].ts)}</span><span>${time(series[series.length - 1].ts)}</span></div>
+    <p class="muted small">Claude Code’s cost for this session, shared out by usage. On Pro and Max it’s the API price of this work, not a charge.</p>`;
 }
 
 // How the context grew, with the compactions marked.

@@ -219,6 +219,12 @@ test('first run: Claude is found, one Yes connects it, the AI suggests a setup, 
       assert.match(await b.eval(`${OB}.querySelector('.confirm .card').textContent`), /unsaved/);
       await b.click(`${OB}.getElementById('restartGo')`);
       await b.waitFor(`/restarted/i.test(${OB}.querySelector('.ai-done')?.textContent || '')`);
+      // A ready request that asks for a plan; Claude doesn't send it by itself.
+      const done = await b.eval(`${OB}.querySelector('.ai-done').textContent`);
+      assert.match(done, /press Enter, then Allow/);
+      const link = decodeURIComponent(done.match(/\[(claude:\/\/[^\]]+)\]/)[1]);
+      assert.match(link, /^claude:\/\/claude\.ai\/new\?q=Look at the tabs/);
+      assert.match(link, /change nothing until I say yes/);
     }
 
     // A hint is the real thing.

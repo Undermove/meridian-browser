@@ -136,11 +136,21 @@ test('a Claude Code tab takes the session\'s name and shows its context; the top
       const { data } = await wb.cdp.send('Page.captureScreenshot', { format: 'png' });
       fs.writeFileSync(path.join(process.env.MERIDIAN_SHOTS, 'context-insights.png'), Buffer.from(data, 'base64'));
     }
-    if (process.env.SHOT) fs.writeFileSync(process.env.SHOT, Buffer.from((await wb.cdp.send('Page.captureScreenshot', { format: 'png' })).data, 'base64'));
+    if (process.env.SHOT) {
+      await wb.eval(`document.querySelector('.ci-money')?.scrollIntoView({ block: 'center' })`);
+      await sleep(200);
+      fs.writeFileSync(process.env.SHOT, Buffer.from((await wb.cdp.send('Page.captureScreenshot', { format: 'png' })).data, 'base64'));
+    }
     for (const s of ['USAGE LIMITS', 'CONTEXT WINDOW', 'INSIGHTS', '5-hour window', 'Resets in 2 h', 'Week', '46% used', '92k / 200k', 'System prompt', 'System tools', 'MCP tools', 'Memory files', 'Skills', 'Messages', 'Free space',
       'Compacted 1×', 'Prompt cache: 87%', 'ttl expired 5m ×1', 'The cache went cold 1 time', 'Read /project/src/app.js']) {
       assert.ok(text.includes(s), `the panel says “${s}”:\n${text}`);
     }
+    // The money over time, with the same breakdown; the bars add up to Claude Code's own total.
+    assert.ok(text.includes('Cost over time'), text);
+    assert.equal(await wb.eval(`document.querySelectorAll('.ci-money .bar').length`), 40);
+    const money = await wb.eval(`CI.data.moneySeries.reduce((n, b) => n + b.cacheRead + b.cacheWrite + b.input + b.output + b.subagents, 0)`);
+    assert.ok(Math.abs(money - 1.23) < 0.001, `the bars add up to the session's cost: ${money}`);
+    assert.match(await wb.eval(`[...document.querySelectorAll('.ci-money .bar')].map((e) => e.title).join(' ')`), /Cache writes: \$[\s\S]*Output and thinking: \$/);
     // The folds: the MCP server's tools with their sizes, the file read twice.
     await click(wb, `document.querySelector('.ci-fold[data-id="mcp"] > button')`);
     await wb.waitFor(`document.querySelector('.ci-fold[data-id="mcp"]').classList.contains('open')`);
