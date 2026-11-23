@@ -50,6 +50,8 @@ function site() {
     if (req.url === '/form') {
       res.end(`<title>Form</title><h1>Sign up</h1><input id=name aria-label="Your name">
         <button onclick="document.title='Hello ' + document.getElementById('name').value">Say hello</button>`);
+    } else if (req.url === '/login') {
+      res.end(`<title>Login</title><input id=a type=PASSWORD aria-label="Code" value="kept-out-1"><input id=b type=text autocomplete="current-password" aria-label="Shown code" value="kept-out-2">`);
     } else if (req.url === '/filter') {
       // A native dropdown: its list opens outside the page, so clicks and keys can't pick from it.
       res.end(`<title>Filter</title><label for=cat>Category</label>
@@ -203,6 +205,49 @@ test('full access: an MCP client lists, opens, reads, clicks, types, screenshots
     assert.match((await mcp.call('list_tabs')).error, /stopped the agents/);
     await b.eval(`${AG}.getElementById('resume').click()`);
     assert.equal((await mcp.call('list_tabs')).error, null);
+  } finally { mcp.close(); await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
+test('what a login field holds stays in the page', async () => {
+  const s = await site();
+  const profile = profileWith({ agent_access: 'full' });
+  const b = await launch([s.url('/login')], { profile });
+  const mcp = bridge(profile);
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { clientInfo: { name: 'test-client' } });
+    const els = (await mcp.call('get_interactive_elements')).value;
+    assert.doesNotMatch(JSON.stringify(els), /kept-out/);
+    for (const e of els) {
+      const typed = await mcp.call('type_text', { element_index: e.i, value: 'x' });
+      assert.equal(typed.error, null);
+      assert.equal(typed.value.field_now, undefined);
+      assert.doesNotMatch(JSON.stringify(await mcp.call('click', { element_index: e.i })), /kept-out/);
+    }
+    assert.match((await mcp.call('click', { text: 'kept-out-1' })).error, /not found/);
+  } finally { mcp.close(); await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
+test('an approval holds for the page it was asked about', async () => {
+  const s = await site();
+  const profile = profileWith({ agent_access: 'ask' });
+  const b = await launch([s.url('/form')], { profile });
+  const mcp = bridge(profile);
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { clientInfo: { name: 'asker' } });
+    const button = (await mcp.call('get_interactive_elements')).value.find((e) => e.label === 'Say hello');
+    const pending = mcp.call('click', { element_index: button.i });
+    await b.waitFor(`!!${AG}.getElementById('ask')`);
+    const page = await b.page(s.url('/form'));
+    await page.eval(`void (location.href = ${JSON.stringify(s.url('/'))})`).catch(() => {});
+    page.close();
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'Home')`);
+    await sleep(700);
+    await b.click(`${AG}.getElementById('allow')`);
+    assert.match((await pending).error, /page changed/);
   } finally { mcp.close(); await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
 
