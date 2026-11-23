@@ -31,7 +31,7 @@ function repo() {
 
 test('an ordinary repository works; settings of its own that start a program keep git from running', async () => {
   const dir = repo();
-  const marker = path.join(dir, 'ran');
+  const marker = path.join(dir, 'ran').split(path.sep).join('/');
   const s = await open(dir);
   try {
     const plain = await s.wb.eval(`wb.git(['status', '--porcelain'])`);
