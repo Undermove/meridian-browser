@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Mon, 23 Nov 2026 16:54:45 +0400
+Subject: [PATCH 233/235] Meridian: Context Insights knows what the session
+ cost over time
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/workbench/context_insights.cc    | 59 +++++++++++++++++++
+ .../meridian/workbench/context_insights.h     |  3 +
+ 2 files changed, 62 insertions(+)
+
+diff --git a/chrome/browser/meridian/workbench/context_insights.cc b/chrome/browser/meridian/workbench/context_insights.cc
+index 2d42c35feb..999c7ed79a 100644
+--- a/chrome/browser/meridian/workbench/context_insights.cc
++++ b/chrome/browser/meridian/workbench/context_insights.cc
+@@ -285,6 +285,9 @@ void ContextInsights::FeedAssistant(const base::DictValue& entry,
+       subagents_.cache_write_1h += r.cache_write_1h;
+       subagents_.output += r.output;
+       subagent_requests_++;
++      subagent_spend_.emplace_back(
++          r.ts, Weighted(r.input, r.cache_read, r.cache_write - r.cache_write_1h,
++                         r.cache_write_1h, r.output));
+     } else {
+       requests_.push_back(r);
+       if (const std::string* model = message->FindString("model")) {
+@@ -570,6 +573,62 @@ base::DictValue ContextInsights::Result(
+                        .Set("output", total.output * kOutput / all_w)
+                        .Set("subagents", sub_w / all_w)));
+ 
++  // The same breakdown over time, in dollars. Claude Code's own total is
++  // shared out by weight, so the bars add up to it and no price list can go
++  // stale. Empty when the transcript has no total.
++  if (total_cost_ > 0) {
++    constexpr int kBars = 40;
++    double from = 0, to = 0;
++    auto widen = [&](double ts) {
++      if (ts > 0) {
++        from = from ? std::min(from, ts) : ts;
++        to = std::max(to, ts);
++      }
++    };
++    for (const Request& r : requests_) {
++      widen(r.ts);
++    }
++    for (const auto& [ts, w] : subagent_spend_) {
++      widen(ts);
++    }
++    struct Bar {
++      double read = 0, write = 0, input = 0, output = 0, subagents = 0;
++    };
++    std::vector<Bar> bars(kBars);
++    auto bar_at = [&](double ts) -> Bar& {
++      if (to <= from || ts <= from) {
++        return bars[to <= from ? kBars - 1 : 0];
++      }
++      return bars[std::min(kBars - 1,
++                           static_cast<int>((ts - from) / (to - from) * kBars))];
++    };
++    const double usd = total_cost_ / all_w;
++    for (const Request& r : requests_) {
++      Bar& b = bar_at(r.ts);
++      b.read += r.cache_read * kRead * usd;
++      b.write += ((r.cache_write - r.cache_write_1h) * kWrite5m +
++                  r.cache_write_1h * kWrite1h) *
++                 usd;
++      b.input += r.input * usd;
++      b.output += r.output * kOutput * usd;
++    }
++    for (const auto& [ts, w] : subagent_spend_) {
++      bar_at(ts).subagents += w * usd;
++    }
++    base::ListValue list;
++    for (int i = 0; i < kBars; ++i) {
++      const Bar& b = bars[i];
++      list.Append(base::DictValue()
++                      .Set("ts", from + (to - from) * i / kBars)
++                      .Set("cacheRead", b.read)
++                      .Set("cacheWrite", b.write)
++                      .Set("input", b.input)
++                      .Set("output", b.output)
++                      .Set("subagents", b.subagents));
++    }
++    out.Set("moneySeries", std::move(list));
++  }
++
+   // Each tool result: written to the cache once, then read with every
+   // request after it until a compaction drops it.
+   struct Carried {
+diff --git a/chrome/browser/meridian/workbench/context_insights.h b/chrome/browser/meridian/workbench/context_insights.h
+index 7c0d96688e..046cca35b6 100644
+--- a/chrome/browser/meridian/workbench/context_insights.h
++++ b/chrome/browser/meridian/workbench/context_insights.h
+@@ -10,6 +10,7 @@
+ #include <set>
+ #include <string>
+ #include <string_view>
++#include <utility>
+ #include <vector>
+ 
+ #include "base/files/file_path.h"
+@@ -81,6 +82,8 @@ class ContextInsights {
+   std::vector<Request> requests_;
+   Request subagents_;
+   int subagent_requests_ = 0;
++  // When each subagent request happened and what it weighed, for the chart.
++  std::vector<std::pair<double, double>> subagent_spend_;
+   std::set<std::string> seen_requests_;
+   std::map<std::string, ToolCall> calls_;
+   std::vector<std::string> call_order_;
