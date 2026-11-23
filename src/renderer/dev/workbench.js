@@ -1146,6 +1146,31 @@ async function restartTerm(t) {
   launch(kind);
 }
 
+// The same Claude Code session again, without permission prompts, in the same place on the tab bar.
+// Asked first; the old process is gone before the new one opens the session.
+async function restartWithBypass(t) {
+  if (t.kind !== 'claude' || !t.sessionId) return;
+  const ok = await confirmBox('Restart with bypass permissions?',
+    'This Claude Code session continues, but it stops asking before it runs commands or changes files. Anything it is doing now is interrupted.',
+    'Restart without asking', true);
+  if (!ok) return;
+  const { id, sessionId, custom } = t;
+  const at = S.terms.indexOf(t);
+  await killTerm(t, { quiet: true });
+  for (let i = 0; i < 30; i++) {
+    const list = await wb.ptyList().catch(() => []);
+    const old = list.find((x) => x.id === id);
+    if (!old || old.exited) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  const next = await launch('claude', { resumeId: sessionId, resumeMode: 'bypassPermissions', name: custom || '' });
+  if (!next) return;
+  S.terms.splice(S.terms.indexOf(next), 1);
+  S.terms.splice(Math.min(at, S.terms.length), 0, next);
+  renderTermTabs();
+  saveClaudeSessions();
+}
+
 async function killTerm(t, { quiet = false } = {}) {
   if (!quiet && !t.exited && t.kind !== 'shell') {
     if (!(await confirmBox(`Stop ${termName(t)}?`, 'The agent session in this terminal will end.', 'Stop', true))) return;
@@ -1281,6 +1306,19 @@ function renderTermTabs() {
     // Workbench Pro: sandbox and vault indicators (secret NAMES only)
     if (t.sandbox) { const p = document.createElement('span'); p.className = 'plug sbx'; p.title = 'Runs in a Docker sandbox: only this project is visible'; p.innerHTML = icon('shield', 11); el.appendChild(p); }
     if (t.secrets?.length) { const p = document.createElement('span'); p.className = 'plug keys'; p.title = `Vault secrets in this session’s environment:\n${t.secrets.join('\n')}`; p.innerHTML = icon('lock', 11) + `<span>${t.secrets.length}</span>`; el.appendChild(p); }
+    if (t.kind === 'claude' && t.permissionMode === 'bypassPermissions') {
+      const p = document.createElement('span');
+      p.className = 'bypass-on';
+      p.textContent = 'Bypass';
+      p.title = 'This session runs without permission prompts';
+      el.appendChild(p);
+    } else if (t === S.activeTerm && t.kind === 'claude' && t.sessionId) {
+      const b = document.createElement('button');
+      b.className = 'tab-bypass';
+      b.textContent = 'Bypass';
+      b.title = 'Restart this session with bypass permissions';
+      el.appendChild(b);
+    }
     const x = document.createElement('button');
     x.className = 'tab-close'; x.title = t.exited ? 'Close' : 'Stop and close'; x.innerHTML = icon('x', 12);
     el.appendChild(x);
@@ -1290,6 +1328,7 @@ function renderTermTabs() {
       // The click that ends a drag isn't one.
       if (Date.now() - (S.termDraggedAt || 0) < 300) return;
       if (e.target.closest('.tab-close')) killTerm(t);
+      else if (e.target.closest('.tab-bypass')) restartWithBypass(t);
       else if (e.detail === 2 && !e.target.closest('.ctx-badge')) renameTerm(t);
       else if (e.detail < 2) activateTerm(t);
     });
@@ -1387,7 +1426,7 @@ function noteClaudeSessions(usage) {
     // Claude Code quit in a shell tab: the shell stays, nothing to bring back.
     if (t.kind === 'shell' && t.sessionId && !usage?.[t.id]) { t.sessionId = ''; t.permissionMode = ''; changed = true; }
   }
-  if (changed) saveClaudeSessions();
+  if (changed) { saveClaudeSessions(); renderTermTabs(); }
 }
 
 async function restoreClaudeSessions(root) {
