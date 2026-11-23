@@ -101,10 +101,11 @@ test('Boost editor, as Arc’s: a colour on the pad, a font, size, case, dark, c
     assert.equal(await b.eval(`${BE}.getElementById('name').value`), 'My Boost');
 
     // A colour on the pad, as Arc's: the hue is the angle from the middle (red at the top, clockwise),
-    // the amount how far out. Right of the middle, 3/5 of the way out: a yellow-green, over the whole
-    // page as a colour layer; the knob glides there, the small dark one opposite.
+    // the amount how far out. Right of the middle, 3/5 of the way out: a yellow-green: the site's accent
+    // turns to it; the knob glides there, the small dark one opposite.
     await clickPad(b, 0.8, 0.5);
-    await page.waitFor(`getComputedStyle(document.documentElement, '::after').mixBlendMode === 'color'`, 5000);
+    await page.waitFor(`!!document.getElementById('meridian-boost-turn') && getComputedStyle(document.documentElement, '::before').mixBlendMode === 'multiply'`, 5000);
+    assert.notEqual(await page.eval(`getComputedStyle(document.documentElement, '::after').mixBlendMode`), 'color', 'no colour layer over the whole page');
     const { state } = await b.eval(`${H}.getBoost()`);
     assert.ok(state.boost.tint >= 85 && state.boost.tint <= 95, `tint ${state.boost.tint}`);
     assert.ok(state.boost.tintStrength >= 55 && state.boost.tintStrength <= 65, `strength ${state.boost.tintStrength}`);
@@ -423,4 +424,31 @@ test('Arc’s boosts come over with Arc’s data and work on their sites', async
     assert.equal(await shown(page, '#promo'), 'none');
     page.close();
   } finally { await b.close(); s.server.close(); fs.rmSync(arcDir, { recursive: true, force: true }); }
+});
+
+test('a colour turns the site’s accent to it: white stays white, text stays, a picture keeps its colours', async () => {
+  const PAGE = `<!doctype html><title>Accent</title><style>body{margin:0;background:#fff;color:#222;font:16px system-ui}header{height:90px;background:#1565c0;color:#fff}a{color:#1565c0}img{width:90px;height:90px;display:block}</style><header>Site</header><p>Plain text <a href="#x">a link</a></p><img id="pic" src="data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="90" height="90"><rect width="90" height="90" fill="#e53935"/></svg>')}">`;
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(PAGE); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}/`;
+  const b = await launch([url]);
+  try {
+    const page = await b.page(url);
+    await page.waitFor(`document.readyState === 'complete'`);
+    await openControls(b);
+    await b.click(`${SC}.getElementById('boostRow')`);
+    await b.waitFor(`app.$.boostEditor.open && !!${BE}.getElementById('pad')`);
+    await clickPad(b, 1, 0.5);  // the right edge: hue 90, full colour
+    await page.waitFor(`!!document.getElementById('meridian-boost-turn')`, 5000);
+    const turn = await page.eval(`parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--meridian-boost-turn'))`);
+    // #1565c0 is at hue 212: to 90 the short way is -122.
+    assert.ok(Math.abs(turn + 122) < 8, `turn ${turn}`);
+    assert.match(await page.eval(`getComputedStyle(document.documentElement).filter`), /hue-rotate/);
+    assert.match(await page.eval(`getComputedStyle(document.getElementById('pic')).filter`), /hue-rotate/);
+    if (process.env.MERIDIAN_SHOT) {
+      const { data } = await page.cdp.send('Page.captureScreenshot', { format: 'png' });
+      fs.writeFileSync(process.env.MERIDIAN_SHOT, Buffer.from(data, 'base64'));
+    }
+    page.close();
+  } finally { await b.close(); server.close(); }
 });

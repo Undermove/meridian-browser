@@ -1,0 +1,814 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Mon, 23 Nov 2026 13:43:07 +0400
+Subject: [PATCH 231/231] Meridian: the tab on air is marked and can move;
+ Boost colours turn the accent; 0.6.26
+
+During a call the shared tab wears a ring and a monitor, and a monitor on
+another tab moves the share there. A Boost colour now turns the site's own
+accent to the picked hue instead of laying a filter over the whole page.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/meridian/boosts/boost_service.cc  | 29 ++++--
+ .../meridian/boosts/boost_tab_helper.cc       | 52 +++++++++-
+ chrome/browser/meridian/sidebar.mojom         |  4 +
+ chrome/browser/meridian/sidebar_handler.cc    | 14 +++
+ chrome/browser/meridian/sidebar_handler.h     |  3 +
+ chrome/browser/meridian/update_check.h        |  2 +-
+ .../browser/resources/webui_browser/app.css   |  6 ++
+ .../resources/webui_browser/app.html.ts       |  1 +
+ chrome/browser/resources/webui_browser/app.ts |  6 ++
+ .../webui_browser/meridian/fav.html.ts        | 12 ++-
+ .../resources/webui_browser/meridian/fav.ts   | 17 ++++
+ .../resources/webui_browser/meridian/icons.ts |  3 +
+ .../webui_browser/meridian/item.html.ts       | 12 ++-
+ .../resources/webui_browser/meridian/item.ts  | 17 ++++
+ .../resources/webui_browser/meridian/rows.css | 39 ++++++++
+ .../webui_browser/meridian/sidebar.ts         | 24 +++++
+ .../webui_browser/meridian/tab_row.html.ts    | 10 +-
+ .../webui_browser/meridian/tab_row.ts         | 17 ++++
+ .../views/tab_sharing/tab_sharing_ui_views.cc | 94 ++++++++++++++-----
+ .../views/tab_sharing/tab_sharing_ui_views.h  |  7 ++
+ 20 files changed, 326 insertions(+), 43 deletions(-)
+
+diff --git a/chrome/browser/meridian/boosts/boost_service.cc b/chrome/browser/meridian/boosts/boost_service.cc
+index 27e84b9a3a..c4abb575d1 100644
+--- a/chrome/browser/meridian/boosts/boost_service.cc
++++ b/chrome/browser/meridian/boosts/boost_service.cc
+@@ -181,6 +181,19 @@ std::string Boost::PageCss() const {
+     page_filter += " hue-rotate(" + turn + "deg)";
+     media_filter = " hue-rotate(-" + turn + "deg)" + media_filter;
+   }
++  const bool tinted = tint >= 0 && tint_strength > 0;
++  if (tinted) {
++    // The site's own accent turns to the picked colour (the tab helper works
++    // out the turn from the page), so white stays white and text stays text;
++    // pictures and video are turned back.
++    page_filter += " hue-rotate(var(--meridian-boost-turn, 0deg))";
++    media_filter =
++        " hue-rotate(calc(-1 * var(--meridian-boost-turn, 0deg)))" +
++        media_filter;
++    out += "\nhtml { --meridian-boost-tint: " + base::NumberToString(tint) +
++           "; --meridian-boost-strength: " +
++           base::NumberToString(tint_strength) + "; }";
++  }
+   auto adjust = [&](const char* name, int percent) {
+     if (percent != 100) {
+       page_filter += std::string(" ") + name + "(" +
+@@ -198,19 +211,15 @@ std::string Boost::PageCss() const {
+            "[style*=\"background-image\"] { filter:" +
+            media_filter + " !important; }";
+   }
+-  if (tint >= 0 && tint_strength > 0) {
+-    // The colour over everything, keeping each part's lightness.
+-    out += "\nhtml::after { content: \"\"; position: fixed; inset: 0; "
+-           "pointer-events: none; z-index: 2147483647; background: hsl(" +
+-           base::NumberToString(tint) +
+-           " 85% 50%); mix-blend-mode: color; opacity: " +
+-           base::NumberToString(tint_strength / 100.0) + " !important; }";
+-    // A little of it on white too, as Arc's tint has.
++  if (tinted) {
++    // A breath of the colour on the page's background.
+     out += "\nhtml::before { content: \"\"; position: fixed; inset: 0; "
+            "pointer-events: none; z-index: 2147483647; background: hsl(" +
+            base::NumberToString(tint) +
+-           " 70% 55%); mix-blend-mode: multiply; opacity: " +
+-           base::NumberToString(tint_strength / 100.0 * 0.14) +
++           " 70% 72%); filter: hue-rotate(calc(-1 * "
++           "var(--meridian-boost-turn, 0deg))); mix-blend-mode: multiply; "
++           "opacity: " +
++           base::NumberToString(tint_strength / 100.0 * 0.1) +
+            " !important; }";
+   }
+   if (size != 100) {
+diff --git a/chrome/browser/meridian/boosts/boost_tab_helper.cc b/chrome/browser/meridian/boosts/boost_tab_helper.cc
+index f456642d9b..122149a87d 100644
+--- a/chrome/browser/meridian/boosts/boost_tab_helper.cc
++++ b/chrome/browser/meridian/boosts/boost_tab_helper.cc
+@@ -35,10 +35,60 @@ constexpr char kApplyCss[] = R"((css) => {
+   const root = document.documentElement;
+   if (!root) return false;
+   let s = document.getElementById('meridian-boost-style');
+-  if (!css) { s?.remove(); return true; }
++  if (!css) { s?.remove(); document.getElementById('meridian-boost-turn')?.remove(); return true; }
+   if (!s) { s = document.createElement('style'); s.id = 'meridian-boost-style'; }
+   if (s.textContent !== css) s.textContent = css;
+   if (s.parentNode !== root || s.nextSibling) root.appendChild(s);
++  // The colour: how far to turn this site's main accent to reach it.
++  const style = getComputedStyle(root);
++  const tint = parseFloat(style.getPropertyValue('--meridian-boost-tint'));
++  const strength = parseFloat(style.getPropertyValue('--meridian-boost-strength'));
++  const accent = () => {
++    if (window.__meridianBoostAccent !== undefined) return window.__meridianBoostAccent;
++    const hsl = (c) => {
++      const m = c.match(/[\d.]+/g)?.map(Number);
++      if (!m || m.length < 3 || (m.length > 3 && m[3] < 0.5)) return null;
++      const [r, g, b] = m.map((v) => v / 255), hi = Math.max(r, g, b), lo = Math.min(r, g, b), d = hi - lo;
++      const l = (hi + lo) / 2;
++      if (!d) return null;
++      const sat = d / (1 - Math.abs(2 * l - 1));
++      const h = hi === r ? ((g - b) / d + 6) % 6 : hi === g ? (b - r) / d + 2 : (r - g) / d + 4;
++      return { h: h * 60, s: sat, l };
++    };
++    const buckets = new Array(36).fill(0), hues = new Array(36).fill(0);
++    const add = (c, weight, minS) => {
++      const x = hsl(c);
++      if (!x || x.s < minS || x.l < 0.14 || x.l > 0.88) return;
++      const n = Math.floor(x.h / 10) % 36;
++      buckets[n] += weight; hues[n] += x.h * weight;
++    };
++    const screen = innerWidth * innerHeight;
++    for (const el of [...document.querySelectorAll('body, body *')].slice(0, 1500)) {
++      if (el.closest('img,video,picture,canvas,svg,iframe')) continue;
++      const r = el.getBoundingClientRect();
++      if (!r.width || !r.height || r.bottom < 0 || r.top > innerHeight) continue;
++      const cs = getComputedStyle(el);
++      add(cs.backgroundColor, Math.min(r.width * r.height, screen / 4), 0.25);
++      if ([...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim())) add(cs.color, 900, 0.35);
++    }
++    const best = buckets.indexOf(Math.max(...buckets));
++    if (!buckets[best]) return null;
++    return window.__meridianBoostAccent = hues[best] / buckets[best];
++  };
++  let turn = document.getElementById('meridian-boost-turn');
++  if (Number.isNaN(tint)) { turn?.remove(); return true; }
++  if (!turn) { turn = document.createElement('style'); turn.id = 'meridian-boost-turn'; }
++  const from = accent();
++  const deg = from === null ? 0 : ((tint - from + 540) % 360 - 180) * Math.min(1, strength / 35);
++  turn.textContent = `html { --meridian-boost-turn: ${deg.toFixed(1)}deg; }`;
++  if (turn.nextSibling !== s) root.insertBefore(turn, s);
++  if (from === null && document.readyState !== 'complete' && !window.__meridianBoostLater) {
++    window.__meridianBoostLater = true;
++    addEventListener('load', () => {
++      const again = accent();
++      if (again !== null) turn.textContent = `html { --meridian-boost-turn: ${(((tint - again + 540) % 360 - 180) * Math.min(1, strength / 35)).toFixed(1)}deg; }`;
++    }, { once: true });
++  }
+   return true;
+ })";
+ 
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index ed3c756609..cd5ed443bf 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -845,6 +845,10 @@ interface SidebarHandler {
+ 
+   // Mutes or unmutes a tab (the speaker in its row, Mute Tab in its menu).
+   SetTabMuted(tabs_api.mojom.NodeId tab_id, bool muted);
++  // A tab is being shared in a call: share this one instead.
++  ShareTabInstead(tabs_api.mojom.NodeId tab_id);
++  // Whether Chromium would let the share move to this tab.
++  CanShareTabInstead(tabs_api.mojom.NodeId tab_id) => (bool can);
+ 
+   // The mini player: what plays (or was paused) in another tab, if anything,
+   // and its buttons: "play", "pause", "next", "previous" or "pip".
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 1dc261b328..4bbf4ea6e5 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -79,6 +79,7 @@
+ #include "chrome/browser/meridian/private_file.h"
+ #include "chrome/browser/meridian/setup_profile.h"
+ #include "chrome/browser/meridian/space_profiles.h"
++#include "chrome/browser/ui/views/tab_sharing/tab_sharing_ui_views.h"
+ #include "chrome/browser/meridian/sidebar_service_factory.h"
+ #include "chrome/browser/profiles/keep_alive/profile_keep_alive_types.h"
+ #include "chrome/browser/profiles/keep_alive/scoped_profile_keep_alive.h"
+@@ -444,6 +445,19 @@ void SidebarHandler::SetTabMuted(const tabs_api::NodeId& tab_id, bool muted) {
+   }
+ }
+ 
++void SidebarHandler::ShareTabInstead(const tabs_api::NodeId& tab_id) {
++  if (tabs::TabInterface* tab = TabFor(tab_id)) {
++    TabSharingUIViews::ShareInstead(tab->GetContents());
++  }
++}
++
++void SidebarHandler::CanShareTabInstead(const tabs_api::NodeId& tab_id,
++                                        CanShareTabInsteadCallback callback) {
++  tabs::TabInterface* tab = TabFor(tab_id);
++  std::move(callback).Run(tab &&
++                          TabSharingUIViews::CanShareInstead(tab->GetContents()));
++}
++
+ void SidebarHandler::TestCommand(int32_t command_id) {
+   if (HasTestSwitch("meridian-test-keys")) {
+     chrome::ExecuteCommand(browser_, command_id);
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 9b3d7280bc..be445e1ba9 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -283,6 +283,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+                   RunAiSetupCallback callback) override;
+   void ExpandPeek(const tabs_api::NodeId& tab_id) override;
+   void SetTabMuted(const tabs_api::NodeId& tab_id, bool muted) override;
++  void ShareTabInstead(const tabs_api::NodeId& tab_id) override;
++  void CanShareTabInstead(const tabs_api::NodeId& tab_id,
++                          CanShareTabInsteadCallback callback) override;
+   void GetNowPlaying(GetNowPlayingCallback callback) override;
+   void ControlMedia(const tabs_api::NodeId& tab_id,
+                     const std::string& action) override;
+diff --git a/chrome/browser/meridian/update_check.h b/chrome/browser/meridian/update_check.h
+index 73752a4283..7e9affad18 100644
+--- a/chrome/browser/meridian/update_check.h
++++ b/chrome/browser/meridian/update_check.h
+@@ -18,7 +18,7 @@
+ namespace meridian::update {
+ 
+ // This build's version (the release tag without "v").
+-inline constexpr char kVersion[] = "0.6.25";
++inline constexpr char kVersion[] = "0.6.26";
+ 
+ // GitHub's latest release of Meridian.
+ inline constexpr char kFeed[] =
+diff --git a/chrome/browser/resources/webui_browser/app.css b/chrome/browser/resources/webui_browser/app.css
+index fd6b33ca34..9c27233c7d 100644
+--- a/chrome/browser/resources/webui_browser/app.css
++++ b/chrome/browser/resources/webui_browser/app.css
+@@ -23,6 +23,7 @@
+   --meridian-border: rgba(0, 0, 0, 0.08);
+   --meridian-row-hover: rgba(255, 255, 255, 0.35);
+   --meridian-row-active: rgba(255, 255, 255, 0.85);
++  --meridian-sharing: #e5484d;
+   --meridian-row-shadow: 0 1px 2px rgba(0, 0, 0, 0.08), 0 1px 6px rgba(0, 0, 0, 0.05);
+   --meridian-field: color-mix(in srgb, var(--meridian-space) 18%, #fff);
+   --meridian-surface: #fff;
+@@ -818,6 +819,11 @@ cr-icon-button[hidden] {
+   }
+ }
+ 
++/* The tab on screen is being shown in a call. */
++:host([shared-on-page]:not([agent-on-page])) content-region {
++  box-shadow: 0 0 0 2px var(--meridian-sharing);
++}
++
+ /* An agent waits while Meridian is in front (Mission Control). */
+ #missionToast {
+   position: fixed;
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 6efb40961c..8b58e21c07 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -120,6 +120,7 @@ export function getHtml(this: WebuiBrowserAppElement) {
+         @meridian-toggle-sidebar="${this.onMeridianToggleSidebar_}"
+         @meridian-splits-changed="${this.onMeridianSplitsChanged_}"
+         @meridian-split-preview="${this.onMeridianSplitPreview_}"
++        @meridian-tab-shared="${this.onMeridianTabShared_}"
+         @meridian-show-archive="${this.onMeridianShowArchive_}"
+         @meridian-peeks-changed="${this.onMeridianPeeksChanged_}"
+         @meridian-status="${this.onMeridianStatus_}"
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 4913725c7f..d938cbf444 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -194,6 +194,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       private_: {type: Boolean, reflect: true, attribute: 'private'},
+       showHome_: {state: true, type: Boolean},
+       agentOnPage_: {type: Boolean, reflect: true, attribute: 'agent-on-page'},
++      sharedOnPage_: {type: Boolean, reflect: true, attribute: 'shared-on-page'},
+       sidebarPeek_: {type: Boolean, reflect: true, attribute: 'sidebar-peek'},
+       inactive_: {
+         type: Boolean,
+@@ -252,6 +253,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   // The active tab is a new tab: the home page shows instead.
+   protected accessor showHome_: boolean = false;
+   protected accessor agentOnPage_: boolean = false;
++  protected accessor sharedOnPage_: boolean = false;
+ 
+   constructor() {
+     super();
+@@ -708,6 +710,10 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   private splits_: Split[] = [];
+   private activeTabId_ = '';
+ 
++  protected onMeridianTabShared_(e: CustomEvent<boolean>) {
++    this.sharedOnPage_ = e.detail;
++  }
++
+   // A tab held over another: the half of the page it would take.
+   protected onMeridianSplitPreview_(
+       e: CustomEvent<{side: 'left'|'right', title: string}|null>) {
+diff --git a/chrome/browser/resources/webui_browser/meridian/fav.html.ts b/chrome/browser/resources/webui_browser/meridian/fav.html.ts
+index 34d37b16cc..b48092ad73 100644
+--- a/chrome/browser/resources/webui_browser/meridian/fav.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/fav.html.ts
+@@ -10,12 +10,20 @@ import type {MeridianFavElement} from './fav.js';
+ export function getHtml(this: MeridianFavElement) {
+   return html`<!--_html_template_start_-->
+ ${this.item ? html`
+-  <div class="fav ${this.tab_ ? 'loaded' : ''} ${
++  <div class="fav ${this.sharing_ ? 'sharing' : ''} ${
++      this.tab_ ? 'loaded' : ''} ${
+       this.tab_?.isActive ? 'active' : ''}" draggable="true"
+       data-item="${this.item.id}" data-fav="1"
+-      title="${this.item.title}" @mousedown="${this.onTileMousedown_}"
++      title="${this.item.title}" @pointerenter="${this.onRowPointerenter_}"
++      @mousedown="${this.onTileMousedown_}"
+       @contextmenu="${this.onTileContextmenu_}">
+     <img src="${this.favicon_}" width="20" height="20" alt="">
++    ${this.sharing_ || this.canShare_ ? html`
++      <button class="fav-share ${this.sharing_ ? 'on' : ''}"
++          title="${this.sharing_ ? 'Sharing this tab' : 'Share this tab instead'}"
++          @mousedown="${this.onAudioMousedown_}"
++          @click="${this.onShareClick_}">${icon('monitor', 10)}</button>
++    ` : ''}
+     ${this.audio_ ? html`
+       <button class="fav-audio" title="${this.audioTitle_}"
+           @mousedown="${this.onAudioMousedown_}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/fav.ts b/chrome/browser/resources/webui_browser/meridian/fav.ts
+index 63e2e4c1f2..537eddcf45 100644
+--- a/chrome/browser/resources/webui_browser/meridian/fav.ts
++++ b/chrome/browser/resources/webui_browser/meridian/fav.ts
+@@ -40,6 +40,8 @@ export class MeridianFavElement extends CrLitElement {
+       audio_: {state: true, type: String},
+       audioTitle_: {state: true, type: String},
+       audioIcon_: {state: true, type: String},
++      sharing_: {state: true, type: Boolean},
++      canShare_: {state: true, type: Boolean},
+     };
+   }
+ 
+@@ -52,6 +54,10 @@ export class MeridianFavElement extends CrLitElement {
+   protected accessor audio_: string = '';
+   protected accessor audioTitle_: string = '';
+   protected accessor audioIcon_: IconName = 'speaker';
++  // Shown in a call right now.
++  protected accessor sharing_: boolean = false;
++  // Chromium would move the share here (asked on hover).
++  protected accessor canShare_: boolean = false;
+ 
+   override willUpdate(changed: PropertyValues<this>) {
+     super.willUpdate(changed);
+@@ -65,6 +71,7 @@ export class MeridianFavElement extends CrLitElement {
+                                                                 '';
+     this.audioTitle_ = this.audio_ === 'muted' ? 'Unmute Tab' : 'Mute Tab';
+     this.audioIcon_ = this.audio_ === 'muted' ? 'mute' : 'speaker';
++    this.sharing_ = alerts.includes(TabAlertState.kTabCapturing);
+   }
+ 
+   // Not a press on the tile (which would open the favorite).
+@@ -72,6 +79,16 @@ export class MeridianFavElement extends CrLitElement {
+     e.stopPropagation();
+   }
+ 
++  protected async onRowPointerenter_() {
++    const tab = this.tab_;
++    this.canShare_ = !!tab && !!this.host && !this.sharing_ &&
++        await this.host.canShareInstead(tab);
++  }
++
++  protected onShareClick_(e: Event) {
++    this.host?.onShareClick(e, this.tab_!, this.sharing_);
++  }
++
+   protected onAudioClick_(e: Event) {
+     this.host?.onMuteClick(e, this.tab_!, this.audio_ !== 'muted');
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/icons.ts b/chrome/browser/resources/webui_browser/meridian/icons.ts
+index 379ec753b1..fa1d471dd6 100644
+--- a/chrome/browser/resources/webui_browser/meridian/icons.ts
++++ b/chrome/browser/resources/webui_browser/meridian/icons.ts
+@@ -26,6 +26,7 @@ export type IconName =
+     'download'|
+     'split'|
+     'speaker'|
++    'monitor'|
+     'mute'|
+     'search'|
+     'globe'|
+@@ -124,6 +125,8 @@ export function icon(name: IconName, size = 16): TemplateResult {
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4.5v10M7.5 10.5L12 15l4.5-4.5"/><path d="M5 19.5h14"/></svg>`;
+     case 'split':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M12 4v16"/></svg>`;
++    case 'monitor':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M9 20h6M12 16.5V20"/></svg>`;
+     case 'speaker':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5.5L7 9H4v6h3l4 3.5z"/><path d="M15 9a4.2 4.2 0 0 1 0 6M17.8 6.5a8 8 0 0 1 0 11"/></svg>`;
+     case 'mute':
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.html.ts b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+index 2067dcbf57..274c65af9a 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+@@ -13,7 +13,8 @@ ${this.item?.isFolder ? html`
+   <div class="folder-wrap ${this.item.open ? '' : 'collapsed'}">
+     <div class="row folder" style="--depth:${this.depth}" draggable="true"
+         data-item="${this.item.id}" data-parent="${this.parentId}"
+-        @mousedown="${this.onRowMousedown_}"
++        @pointerenter="${this.onRowPointerenter_}"
++      @mousedown="${this.onRowMousedown_}"
+         @dblclick="${this.onRowDblclick_}"
+         @contextmenu="${this.onRowContextmenu_}">
+       <span class="folder-ic">
+@@ -35,7 +36,8 @@ ${this.item?.isFolder ? html`
+   </div>
+ ` : ''}
+ ${this.item && !this.item.isFolder ? html`
+-  <div class="row pinned ${this.tab_ ? '' : 'unloaded'} ${
++  <div class="row pinned ${this.sharing_ ? 'sharing' : ''} ${
++      this.tab_ ? '' : 'unloaded'} ${
+       this.tab_?.isActive ? 'active' : ''} ${this.loading_ ? 'loading' : ''}"
+       style="--depth:${this.depth}"
+       draggable="true" data-item="${this.item.id}"
+@@ -57,6 +59,12 @@ ${this.item && !this.item.isFolder ? html`
+       <input class="rename url" .value="${this.item.url}" spellcheck="false"
+           @keydown="${this.onRenameKeydown_}" @blur="${this.onUrlBlur_}">
+     ` : html`<span class="title">${this.title_}</span>`}`}
++    ${this.sharing_ || this.canShare_ ? html`
++      <button class="row-btn share ${this.sharing_ ? 'on' : ''}"
++          title="${this.sharing_ ? 'Sharing this tab' : 'Share this tab instead'}"
++          @mousedown="${this.onAudioMousedown_}"
++          @click="${this.onShareClick_}">${icon('monitor', 13)}</button>
++    ` : ''}
+     ${this.audio_ ? html`
+       <button class="row-btn audio" title="${this.audioTitle_}"
+           @mousedown="${this.onAudioMousedown_}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.ts b/chrome/browser/resources/webui_browser/meridian/item.ts
+index e32739f211..6756f504df 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.ts
+@@ -48,6 +48,8 @@ export class MeridianItemElement extends CrLitElement {
+       audio_: {state: true, type: String},
+       audioTitle_: {state: true, type: String},
+       audioIcon_: {state: true, type: String},
++      sharing_: {state: true, type: Boolean},
++      canShare_: {state: true, type: Boolean},
+     };
+   }
+ 
+@@ -68,6 +70,10 @@ export class MeridianItemElement extends CrLitElement {
+   protected accessor audio_: string = '';
+   protected accessor audioTitle_: string = '';
+   protected accessor audioIcon_: IconName = 'speaker';
++  // Shown in a call right now.
++  protected accessor sharing_: boolean = false;
++  // Chromium would move the share here (asked on hover).
++  protected accessor canShare_: boolean = false;
+ 
+   override willUpdate(changed: PropertyValues<this>) {
+     super.willUpdate(changed);
+@@ -88,6 +94,7 @@ export class MeridianItemElement extends CrLitElement {
+                                                                 '';
+     this.audioTitle_ = this.audio_ === 'muted' ? 'Unmute Tab' : 'Mute Tab';
+     this.audioIcon_ = this.audio_ === 'muted' ? 'mute' : 'speaker';
++    this.sharing_ = alerts.includes(TabAlertState.kTabCapturing);
+     this.title_ = this.tab_ && this.away_ ?
+         this.tab_.title :
+         item.title || this.tab_?.title || item.url;
+@@ -114,6 +121,16 @@ export class MeridianItemElement extends CrLitElement {
+     e.stopPropagation();
+   }
+ 
++  protected async onRowPointerenter_() {
++    const tab = this.tab_;
++    this.canShare_ = !!tab && !!this.host && !this.sharing_ &&
++        await this.host.canShareInstead(tab);
++  }
++
++  protected onShareClick_(e: Event) {
++    this.host?.onShareClick(e, this.tab_!, this.sharing_);
++  }
++
+   protected onAudioClick_(e: Event) {
+     this.host?.onMuteClick(e, this.tab_!, this.audio_ !== 'muted');
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/rows.css b/chrome/browser/resources/webui_browser/meridian/rows.css
+index 12f2660718..5d8a6f6ef7 100644
+--- a/chrome/browser/resources/webui_browser/meridian/rows.css
++++ b/chrome/browser/resources/webui_browser/meridian/rows.css
+@@ -92,6 +92,45 @@ button {
+   opacity: 0;
+ }
+ 
++/* During a call: the tab on air wears a ring and a monitor; on any other tab
++   the monitor appears on hover and moves the share there. */
++.row .share,
++.fav-share {
++  display: none;
++}
++
++.row:hover .share,
++.fav:hover .fav-share {
++  display: inline-flex;
++}
++
++.row .share.on,
++.fav-share.on {
++  display: inline-flex;
++  color: var(--meridian-sharing);
++}
++
++.row.sharing,
++.row.sharing.active,
++.fav.sharing,
++.fav.sharing.active {
++  box-shadow: inset 0 0 0 1.5px var(--meridian-sharing);
++}
++
++.fav-share {
++  position: absolute;
++  top: 3px;
++  left: 3px;
++  width: 16px;
++  height: 16px;
++  border-radius: 8px;
++  align-items: center;
++  justify-content: center;
++  background: var(--meridian-surface);
++  color: var(--meridian-text);
++  box-shadow: 0 0 0 0.5px var(--meridian-border);
++}
++
+ /* Playing or muted: always shown, like Arc's speaker. */
+ .row .audio {
+   color: var(--meridian-text);
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 3c668afb4b..a51154c1c6 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -177,6 +177,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+ 
+   // Live tabs by id, and the order they appeared in (newest Today tab first).
+   protected accessor tabs_: Map<NodeId, Tab> = new Map();
++  private sharedOnScreen_ = false;
+   protected accessor state_: SidebarState|null = null;
+   protected accessor menu_: OpenMenu|null = null;
+   // The item / space id being renamed in place.
+@@ -1118,6 +1119,21 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.handler_.setTabMuted(tab.id, muted);
+   }
+ 
++  onShareClick(e: Event, tab: Tab, alreadyShared: boolean) {
++    e.stopPropagation();
++    if (!alreadyShared) {
++      this.handler_.shareTabInstead(tab.id);
++    }
++  }
++
++  // Asked when the pointer comes to a row, only during a share.
++  async canShareInstead(tab: Tab): Promise<boolean> {
++    if (!this.hasAttribute('tab-sharing')) {
++      return false;
++    }
++    return (await this.handler_.canShareTabInstead(tab.id)).can;
++  }
++
+   onResetClick(e: Event, item: Item) {
+     e.stopPropagation();
+     this.handler_.resetItemToHome(item.id);
+@@ -1797,6 +1813,14 @@ export class MeridianSidebarElement extends CrLitElement implements
+       this.lastActive_.set(active.id, performance.now());
+     }
+     this.plusOpen_ = !!this.menu_?.plus;
++    const shared = (t?: Tab|null) =>
++        !!t?.alertStates?.includes(TabAlertState.kTabCapturing);
++    this.toggleAttribute('tab-sharing', [...this.tabs_.values()].some(shared));
++    const onScreen = shared(active);
++    if (onScreen !== this.sharedOnScreen_) {
++      this.sharedOnScreen_ = onScreen;
++      this.fire('meridian-tab-shared', onScreen);
++    }
+     const now = this.nowPlaying_;
+     const nowTab = now ? this.tabs_.get(now.tabId) : undefined;
+     this.playerFavicon_ = nowTab ? this.faviconFor(null, nowTab) : '';
+diff --git a/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts b/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
+index 2f43ca1dd0..fbf98f2bc8 100644
+--- a/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
+@@ -10,9 +10,11 @@ import type {MeridianTabRowElement} from './tab_row.js';
+ export function getHtml(this: MeridianTabRowElement) {
+   return html`<!--_html_template_start_-->
+ ${this.tab ? html`
+-  <div class="row tab ${this.tab.isActive ? 'active' : ''} ${
++  <div class="row tab ${this.sharing_ ? 'sharing' : ''} ${
++      this.tab.isActive ? 'active' : ''} ${
+       this.loading_ ? 'loading' : ''}" draggable="true"
+       data-tab="${this.tab.id}" title="${this.tab.title}"
++      @pointerenter="${this.onRowPointerenter_}"
+       @mousedown="${this.onRowMousedown_}"
+       @dblclick="${this.onRowDblclick_}"
+       @contextmenu="${this.onRowContextmenu_}">
+@@ -24,6 +26,12 @@ ${this.tab ? html`
+           spellcheck="false" @keydown="${this.onRenameKeydown_}"
+           @blur="${this.onRenameBlur_}">
+     ` : html`<span class="title">${this.tab.title || this.tab.url}</span>`}
++    ${this.sharing_ || this.canShare_ ? html`
++      <button class="row-btn share ${this.sharing_ ? 'on' : ''}"
++          title="${this.sharing_ ? 'Sharing this tab' : 'Share this tab instead'}"
++          @mousedown="${this.onAudioMousedown_}"
++          @click="${this.onShareClick_}">${icon('monitor', 13)}</button>
++    ` : ''}
+     ${this.audio_ ? html`
+       <button class="row-btn audio" title="${this.audioTitle_}"
+           @mousedown="${this.onAudioMousedown_}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/tab_row.ts b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+index 7ba314385e..f5fe7fb0dd 100644
+--- a/chrome/browser/resources/webui_browser/meridian/tab_row.ts
++++ b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+@@ -44,6 +44,8 @@ export class MeridianTabRowElement extends CrLitElement {
+       audio_: {state: true, type: String},
+       audioTitle_: {state: true, type: String},
+       audioIcon_: {state: true, type: String},
++      sharing_: {state: true, type: Boolean},
++      canShare_: {state: true, type: Boolean},
+     };
+   }
+ 
+@@ -59,6 +61,10 @@ export class MeridianTabRowElement extends CrLitElement {
+   protected accessor audio_: string = '';
+   protected accessor audioTitle_: string = '';
+   protected accessor audioIcon_: IconName = 'speaker';
++  // Shown in a call right now.
++  protected accessor sharing_: boolean = false;
++  // Chromium would move the share here (asked on hover).
++  protected accessor canShare_: boolean = false;
+ 
+   override willUpdate(changed: PropertyValues<this>) {
+     super.willUpdate(changed);
+@@ -75,6 +81,7 @@ export class MeridianTabRowElement extends CrLitElement {
+                                                                 '';
+     this.audioTitle_ = this.audio_ === 'muted' ? 'Unmute Tab' : 'Mute Tab';
+     this.audioIcon_ = this.audio_ === 'muted' ? 'mute' : 'speaker';
++    this.sharing_ = alerts.includes(TabAlertState.kTabCapturing);
+   }
+ 
+   override updated(changed: PropertyValues<this>) {
+@@ -117,6 +124,16 @@ export class MeridianTabRowElement extends CrLitElement {
+     e.stopPropagation();
+   }
+ 
++  protected async onRowPointerenter_() {
++    const tab = this.tab;
++    this.canShare_ = !!tab && !!this.host && !this.sharing_ &&
++        await this.host.canShareInstead(tab);
++  }
++
++  protected onShareClick_(e: Event) {
++    this.host?.onShareClick(e, this.tab!, this.sharing_);
++  }
++
+   protected onAudioClick_(e: Event) {
+     this.host?.onMuteClick(e, this.tab!, this.audio_ !== 'muted');
+   }
+diff --git a/chrome/browser/ui/views/tab_sharing/tab_sharing_ui_views.cc b/chrome/browser/ui/views/tab_sharing/tab_sharing_ui_views.cc
+index 3f1e4fa9c8..6b385af02d 100644
+--- a/chrome/browser/ui/views/tab_sharing/tab_sharing_ui_views.cc
++++ b/chrome/browser/ui/views/tab_sharing/tab_sharing_ui_views.cc
+@@ -40,6 +40,7 @@
+ #include "chrome/browser/ui/tabs/tab_change_type.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "base/no_destructor.h"
+ #include "chrome/browser/ui/views/tab_sharing/tab_capture_contents_border_helper.h"
+ #include "chrome/browser/ui/views/tab_sharing/tab_sharing_status_message_view.h"
+ #include "chrome/grit/generated_resources.h"
+@@ -180,6 +181,15 @@ bool IsTabSharingBlockedByEnterprise(content::WebContents* contents) {
+ 
+ }  // namespace
+ 
++// Meridian: the sidebar's monitor button, without the infobar Meridian's window
++// doesn't show.
++namespace {
++std::vector<TabSharingUIViews*>& LiveTabSharingUIs() {
++  static base::NoDestructor<std::vector<TabSharingUIViews*>> live;
++  return *live;
++}
++}  // namespace
++
+ uint32_t TabSharingUIViews::next_capture_session_id_ = 0;
+ 
+ // static
+@@ -246,9 +256,11 @@ TabSharingUIViews::TabSharingUIViews(
+         base::BindOnce(&TabSharingUIViews::OnCapturedSurfaceControlByCapturer,
+                        base::Unretained(this)));
+   }
++  LiveTabSharingUIs().push_back(this);
+ }
+ 
+ TabSharingUIViews::~TabSharingUIViews() {
++  std::erase(LiveTabSharingUIs(), this);
+   // Unconditionally call StopSharing(), to ensure all clean-up has been
+   // performed if tasks race (e.g., OnStarted() is called after
+   // OnInfoBarRemoved()). See: https://crbug.com/40054066
+@@ -483,6 +495,61 @@ void TabSharingUIViews::CreateInfobarsForAllTabs() {
+ #endif
+ }
+ 
++// static
++TabSharingUIViews* TabSharingUIViews::ForShareInstead(WebContents* contents) {
++  auto& live = LiveTabSharingUIs();
++  for (auto it = live.rbegin(); it != live.rend(); ++it) {
++    TabSharingUIViews* ui = *it;
++    if (ui->infobars_.contains(contents) &&
++        ui->IsShareInsteadButtonPossible(contents) &&
++        ui->IsSharingAllowedByPolicy(contents)) {
++      return ui;
++    }
++  }
++  return nullptr;
++}
++
++// static
++bool TabSharingUIViews::CanShareInstead(WebContents* contents) {
++  return !!ForShareInstead(contents);
++}
++
++// static
++void TabSharingUIViews::ShareInstead(WebContents* contents) {
++  if (TabSharingUIViews* ui = ForShareInstead(contents)) {
++    ui->StartSharing(ui->infobars_[contents]);
++  }
++}
++
++bool TabSharingUIViews::IsSharingAllowedByPolicy(WebContents* contents) const {
++  bool is_sharing_allowed_by_policy =
++      !capturer_restricted_to_same_origin_ ||
++      capturer_origin_.IsSameOriginWith(
++          contents->GetPrimaryMainFrame()->GetLastCommittedOrigin());
++
++#if BUILDFLAG(IS_CHROMEOS)
++  // Check if dlp policies allow sharing.
++  // This check is skipped if sharing is already forbidden.
++  if (is_sharing_allowed_by_policy) {
++    const bool dlp_enabled =
++        g_apply_dlp_for_all_users_for_testing_ ||
++        policy::DlpRulesManagerFactory::GetForPrimaryProfile();
++    if (dlp_enabled &&
++        policy::DlpContentManager::Get()->IsScreenShareBlocked(contents)) {
++      is_sharing_allowed_by_policy = false;
++    }
++  }
++#endif
++
++#if BUILDFLAG(ENTERPRISE_SCREENSHOT_PROTECTION)
++  if (is_sharing_allowed_by_policy &&
++      IsTabSharingBlockedByEnterprise(contents)) {
++    is_sharing_allowed_by_policy = false;
++  }
++#endif
++  return is_sharing_allowed_by_policy;
++}
++
+ void TabSharingUIViews::CreateInfobarForWebContents(WebContents* contents) {
+   CHECK_CURRENTLY_ON(content::BrowserThread::UI, base::NotFatalUntil::M162);
+   CHECK(contents, base::NotFatalUntil::M162);
+@@ -531,32 +598,7 @@ void TabSharingUIViews::CreateInfobarForWebContents(WebContents* contents) {
+                             base::Unretained(this)));
+   }
+ 
+-  // Determine if we are currently allowed to share this tab by policy.
+-  bool is_sharing_allowed_by_policy =
+-      !capturer_restricted_to_same_origin_ ||
+-      capturer_origin_.IsSameOriginWith(
+-          contents->GetPrimaryMainFrame()->GetLastCommittedOrigin());
+-
+-#if BUILDFLAG(IS_CHROMEOS)
+-  // Check if dlp policies allow sharing.
+-  // This check is skipped if sharing is already forbidden.
+-  if (is_sharing_allowed_by_policy) {
+-    const bool dlp_enabled =
+-        g_apply_dlp_for_all_users_for_testing_ ||
+-        policy::DlpRulesManagerFactory::GetForPrimaryProfile();
+-    if (dlp_enabled &&
+-        policy::DlpContentManager::Get()->IsScreenShareBlocked(contents)) {
+-      is_sharing_allowed_by_policy = false;
+-    }
+-  }
+-#endif
+-
+-#if BUILDFLAG(ENTERPRISE_SCREENSHOT_PROTECTION)
+-  if (is_sharing_allowed_by_policy &&
+-      IsTabSharingBlockedByEnterprise(contents)) {
+-    is_sharing_allowed_by_policy = false;
+-  }
+-#endif
++  const bool is_sharing_allowed_by_policy = IsSharingAllowedByPolicy(contents);
+ 
+   TabSharingInfoBarDelegate::ButtonState share_this_tab_instead_button_state =
+       !is_share_instead_button_possible
+diff --git a/chrome/browser/ui/views/tab_sharing/tab_sharing_ui_views.h b/chrome/browser/ui/views/tab_sharing/tab_sharing_ui_views.h
+index dcd4c375f3..fdd086d5c9 100644
+--- a/chrome/browser/ui/views/tab_sharing/tab_sharing_ui_views.h
++++ b/chrome/browser/ui/views/tab_sharing/tab_sharing_ui_views.h
+@@ -84,6 +84,10 @@ class TabSharingUIViews : public TabSharingUI,
+   // all tabs.
+   void StopSharing(std::string_view reason) override;
+ 
++  // Meridian: whether a share may move to |contents|, and moving it there.
++  static bool CanShareInstead(content::WebContents* contents);
++  static void ShareInstead(content::WebContents* contents);
++
+   // TabSharingUI:
+   // Returns the object that coordinates UMA logging from multiple infobars,
+   // so that if the user interacts with one infobar, this would suppress
+@@ -178,6 +182,9 @@ class TabSharingUIViews : public TabSharingUI,
+   void OnScreenshotAllowedUpdated(content::WebContents* contents, bool allowed);
+ #endif
+ 
++  static TabSharingUIViews* ForShareInstead(content::WebContents* contents);
++  bool IsSharingAllowedByPolicy(content::WebContents* contents) const;
++
+   // Whether the share-this-tab-instead button may be shown for |web_contents|.
+   bool IsShareInsteadButtonPossible(content::WebContents* web_contents) const;
+ 
