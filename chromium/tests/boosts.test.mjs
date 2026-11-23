@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { launch, APP } from './harness.mjs';
+import { launch, APP, SB } from './harness.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const SC = 'app.$.siteControl.shadowRoot';
@@ -451,4 +451,34 @@ test('a colour turns the site’s accent to it: white stays white, text stays, a
     }
     page.close();
   } finally { await b.close(); server.close(); }
+});
+
+test('an agent\'s boost shows its code when asked, and its JavaScript has no reach into Meridian\'s page helpers', async () => {
+  const s = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<title>Plain</title><p>page</p>'); });
+  await new Promise((r) => s.listen(0, '127.0.0.1', r));
+  const profile = profileWith({ agent_access: 'ask', agent_allow_js: true });
+  const b = await launch([`http://127.0.0.1:${s.address().port}/`], { profile });
+  const mcp = bridge(profile);
+  const AG = 'app.$.agent.shadowRoot';
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { clientInfo: { name: 'test-client' } });
+    await mcp.call('read_page');
+    const js = "document.title = 'boost:' + typeof window.__meridianAgent";
+    const pending = mcp.call('set_boost', { js });
+    await b.waitFor(`!!${AG}.getElementById('ask')`);
+    const said = await b.eval(`${AG}.querySelector('.summary').textContent`);
+    assert.ok(said.includes(js), said);
+    assert.match(said, /subdomains/);
+    await sleep(700);
+    await b.click(`${AG}.getElementById('allow')`);
+    assert.equal((await pending).error, null);
+    const reload = mcp.call('history_nav', { action: 'reload' });
+    await b.waitFor(`!!${AG}.getElementById('ask')`);
+    await sleep(700);
+    await b.click(`${AG}.getElementById('allow')`);
+    await reload;
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'boost:undefined')`);
+  } finally { mcp.close(); await b.close(); s.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });

@@ -6,6 +6,7 @@
 // refused, and the same version is up to date. A newer release while one is ready replaces it.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -15,6 +16,13 @@ import { launch, SB } from './harness.mjs';
 
 const WINDOWS = process.platform === 'win32';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// The update's files stay open until its script has finished.
+async function letGo(file) {
+  for (let i = 0; i < 80; i++) {
+    try { fs.closeSync(fs.openSync(file, 'r+')); return; } catch (e) { if (e.code === 'ENOENT') return; await sleep(100); }
+  }
+  assert.fail(`${path.basename(file)} is still open`);
+}
 const S = { upToDate: 2, available: 3, ready: 5, failed: 6 };
 const ARCH = process.arch === 'arm64' ? 'arm64' : 'x64';
 const SETUP = `Meridian-9.9.9-win-${ARCH}-setup.exe`;
@@ -106,6 +114,7 @@ test('Updates on Windows: a newer release’s installer is downloaded and checke
     for (let i = 0; i < 100 && !fs.existsSync(target); i++) await sleep(100);
     assert.ok(fs.existsSync(target), 'the installer was handed over');
     assert.ok(fs.readFileSync(target).equals(NEW), 'and it is the release’s');
+    await letGo(path.join(b.profile, 'Meridian Update', SETUP));
   } finally {
     await b.close(); rel.s.closeAllConnections(); rel.s.close();
     fs.rmSync(home, { recursive: true, force: true });
@@ -191,9 +200,100 @@ test('Updates on Windows: a newer release while one is ready replaces it; a rest
     for (let i = 0; i < 100 && !fs.existsSync(target); i++) await sleep(100);
     assert.ok(fs.existsSync(target), 'an installer was handed over');
     assert.ok(fs.readFileSync(target).equals(NEWER), 'straight to the latest');
+    await letGo(path.join(b.profile, 'Meridian Update', SETUP.replace('9.9.9', '9.9.10')));
   } finally {
     await b.close(); proxy.close();
     for (const r of [first, second]) { r.s.closeAllConnections(); r.s.close(); }
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// The installer is checked at the restart too, however long ago it was downloaded.
+test('Updates on Windows: the installer is checked again at the restart', { skip: !WINDOWS && 'Windows only' }, async () => {
+  const rel = await release();
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-apps-')));
+  const target = path.join(home, 'handed-over.exe');
+  const { b, waitStatus } = await start(rel, target);
+  try {
+    await waitStatus(S.ready);
+    const file = path.join(b.profile, 'Meridian Update', SETUP);
+    fs.writeFileSync(file, Buffer.from('something else\n'.repeat(4000)));
+    await b.eval('app.$.tabstrip.handler_.installUpdate()');
+    const s = await waitStatus(S.failed);
+    assert.match(s.error, /couldn’t be verified/);
+    assert.equal(fs.existsSync(file), false, 'the file is gone');
+    await sleep(6000);
+    assert.equal(b.proc.exitCode, null, 'Meridian keeps running');
+    assert.equal(fs.existsSync(target), false, 'nothing was handed over');
+  } finally {
+    await b.close(); rel.s.closeAllConnections(); rel.s.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// The update's files stay open from the check until the script is done, after Meridian has quit too.
+test('Updates on Windows: the installer and its script stay open until they have run', { skip: !WINDOWS && 'Windows only' }, async () => {
+  const rel = await release();
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-apps-')));
+  const target = path.join(home, 'handed-over.exe');
+  const { b, waitStatus } = await start(rel, target);
+  try {
+    await waitStatus(S.ready);
+    const dir = path.join(b.profile, 'Meridian Update');
+    const file = path.join(dir, SETUP);
+    const script = path.join(dir, 'update.cmd');
+    await b.eval('app.$.tabstrip.handler_.installUpdate()');
+    for (let i = 0; i < 100 && b.proc.exitCode === null && b.proc.signalCode === null; i++) await sleep(50);
+    assert.ok(b.proc.exitCode !== null || b.proc.signalCode !== null, 'Meridian quit');
+    assert.equal(fs.existsSync(target), false, 'still waiting to hand it over');
+    for (const f of [file, script]) {
+      assert.throws(() => fs.writeFileSync(f, 'x'), /EBUSY|EPERM|EACCES/, `${path.basename(f)}: no writing`);
+      assert.throws(() => fs.renameSync(f, `${f}.moved`), /EBUSY|EPERM|EACCES/, `${path.basename(f)}: no renaming`);
+      assert.throws(() => fs.unlinkSync(f), /EBUSY|EPERM|EACCES/, `${path.basename(f)}: no deleting`);
+    }
+    for (let i = 0; i < 150 && !fs.existsSync(target); i++) await sleep(100);
+    assert.ok(fs.existsSync(target), 'the installer was handed over');
+    for (let i = 0; i < 30 && !fs.readFileSync(target).equals(NEW); i++) await sleep(100);
+    assert.ok(fs.readFileSync(target).equals(NEW), 'and it is the release’s');
+    // Let go when the script is done.
+    let free = false;
+    for (let i = 0; i < 80 && !free; i++) {
+      try { fs.unlinkSync(file); free = true; } catch { await sleep(100); }
+    }
+    assert.ok(free, 'the installer is let go afterwards');
+  } finally {
+    await b.close(); rel.s.closeAllConnections(); rel.s.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// The script runs the installer only while the process keeping its files open is there.
+test('Updates on Windows: the script stops without installing when its hold has ended', { skip: !WINDOWS && 'Windows only' }, async () => {
+  const rel = await release();
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-apps-')));
+  const target = path.join(home, 'handed-over.exe');
+  const { b, waitStatus } = await start(rel, target);
+  try {
+    await waitStatus(S.ready);
+    const file = path.join(b.profile, 'Meridian Update', SETUP);
+    const browser = b.proc.pid;
+    await b.eval('app.$.tabstrip.handler_.installUpdate()');
+    // Only the ping this Meridian started.
+    let holder = 0;
+    for (let i = 0; i < 10 && !holder; i++) {
+      holder = Number(execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+        `(Get-CimInstance Win32_Process -Filter "Name='PING.EXE' AND ParentProcessId=${browser}" | Where-Object { $_.CommandLine -match '-n 86400' } | Select-Object -First 1).ProcessId`],
+      { encoding: 'utf8' }).trim());
+    }
+    assert.ok(holder > 0, 'found the hold');
+    process.kill(holder);
+    for (let i = 0; i < 100 && b.proc.exitCode === null && b.proc.signalCode === null; i++) await sleep(50);
+    assert.ok(b.proc.exitCode !== null || b.proc.signalCode !== null, 'Meridian quit');
+    await sleep(7000);
+    assert.equal(fs.existsSync(target), false, 'nothing was handed over');
+    assert.ok(fs.existsSync(file), 'the installer stays for the next check');
+  } finally {
+    await b.close(); rel.s.closeAllConnections(); rel.s.close();
     fs.rmSync(home, { recursive: true, force: true });
   }
 });

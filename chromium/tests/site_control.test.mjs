@@ -2,6 +2,7 @@
 // clicks, read back from Chromium's own site settings; and the Arc-style menus of the sidebar.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -117,4 +118,20 @@ test('extensions from Arc: listed in Settings with Add…, and counted in the Si
     // (In the EU a fresh profile meets Google's consent page first, with the store page to continue to.)
     await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.url.startsWith('https://chromewebstore.google.com/') || /^https:\\/\\/consent\\.google\\.com\\/.*continue=https:\\/\\/chromewebstore\\.google\\.com\\//.test(r.tab.url))`, 15000);
   } finally { await b.close(); await site.close(); fs.rmSync(arc, { recursive: true, force: true }); }
+});
+
+test('a site permission applies only to the site the person saw', async () => {
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<title>Here</title><p>here</p>'); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}/`;
+  const b = await launch([url]);
+  const info = async () => (await b.eval(`app.$.tabstrip.handler_.getSiteInfo()`)).info;
+  const ads = async (origin, setting) => { await b.eval(`app.$.tabstrip.handler_.setSitePermission(${JSON.stringify(origin)}, 'ads', ${JSON.stringify(setting)})`); return (await info()).adblock; };
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    await b.waitFor(`app.$.tabstrip.handler_.getSiteInfo().then((r) => !!r.info.origin)`);
+    const { origin, adblock } = await info();
+    assert.equal(await ads('https://another-site.example', adblock ? 'allow' : 'ask'), adblock, 'another site: refused');
+    assert.equal(await ads(origin, adblock ? 'allow' : 'ask'), !adblock, 'the site shown: applied');
+  } finally { await b.close(); server.close(); }
 });

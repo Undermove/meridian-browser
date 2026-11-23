@@ -188,7 +188,7 @@ test('first run: Claude is found, one Yes connects it, the AI suggests a setup, 
     const config = JSON.parse(fs.readFileSync(f.config, 'utf8'));
     assert.ok(config.mcpServers.files && config.mcpServers.meridian, 'added next to what was there');
     const settings = await b.eval(`${H}.getSettings().then((r) => r.settings)`);
-    assert.equal(settings.agentAccess, 'full');
+    assert.equal(settings.agentAccess, 'ask');
     assert.equal(settings.aiProvider, 'claude-code');
     assert.ok((await b.eval(`${H}.getAllowedAi().then((r) => r.allowed.map((a) => a.id))`)).includes('claude-code'));
     // Sites, never pages.
