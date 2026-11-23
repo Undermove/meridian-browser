@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Mon, 23 Nov 2026 23:49:48 +0400
+Subject: [PATCH 240/245] Meridian: a narrower workspace for command-line
+ agents
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/ai/local_agents.cc   | 61 +++++++++++++++++++-
+ chrome/browser/meridian/ai/process_runner.cc |  9 ++-
+ chrome/browser/meridian/ai/process_runner.h  |  7 ++-
+ 3 files changed, 69 insertions(+), 8 deletions(-)
+
+diff --git a/chrome/browser/meridian/ai/local_agents.cc b/chrome/browser/meridian/ai/local_agents.cc
+index 4ab4cc9241..4776188fd8 100644
+--- a/chrome/browser/meridian/ai/local_agents.cc
++++ b/chrome/browser/meridian/ai/local_agents.cc
+@@ -190,6 +190,58 @@ std::vector<LocalAgents::Status> ListBlocking() {
+   return out;
+ }
+ 
++// What a CLI may keep using under a closed home folder: its own settings,
++// sign-in and caches.
++std::vector<base::FilePath> CliOwnFolders(
++    const std::string& id,
++    const base::FilePath& home,
++    const std::map<std::string, std::string>& env) {
++  static const base::NoDestructor<
++      std::map<std::string, std::vector<const char*>>>
++      kFolders({
++          {"codex", {".codex"}},
++          {"copilot",
++           {".copilot", ".config/github-copilot", "Library/Caches/copilot"}},
++          {"opencode",
++           {".config/opencode", ".local/share/opencode",
++            ".local/state/opencode", ".cache/opencode"}},
++          {"cursor", {".cursor", ".config/cursor"}},
++          {"qwen", {".qwen"}},
++          {"droid", {".factory"}},
++          {"goose",
++           {".config/goose", ".local/share/goose", ".local/state/goose"}},
++          {"amp", {".config/amp", ".local/share/amp", ".cache/amp"}},
++      });
++  std::vector<base::FilePath> out;
++  if (auto it = kFolders->find(id); it != kFolders->end()) {
++    for (const char* path : it->second) {
++      out.push_back(home.AppendASCII(path));
++    }
++  }
++  if (auto it = env.find("CODEX_HOME");
++      id == "codex" && it != env.end() && !it->second.empty()) {
++    out.push_back(base::FilePath::FromUTF8Unsafe(it->second));
++  }
++  return out;
++}
++
++// Where command-line tools are installed under the home folder, and the CLI
++// itself wherever it is: read only.
++std::vector<base::FilePath> CliToolFolders(const base::FilePath& home,
++                                           const std::string& bin) {
++  std::vector<base::FilePath> out;
++  for (const char* path : {".local/bin", ".local/lib", ".nvm", ".volta", ".bun",
++                           ".npm-global", ".asdf", ".fnm", ".pyenv",
++                           ".cargo/bin"}) {
++    out.push_back(home.AppendASCII(path));
++  }
++  const base::FilePath real = RealFilePath(base::FilePath::FromUTF8Unsafe(bin));
++  if (home.IsParent(real) && real.DirName() != home) {
++    out.push_back(real.DirName());
++  }
++  return out;
++}
++
+ struct CliOutcome {
+   bool found = false;
+   ProcessResult result;
+@@ -224,7 +276,9 @@ CliOutcome RunCliBlocking(std::string provider_id,
+   // The CLIs keep tools that read files, and the page in the prompt may try
+   // to steer them: credentials, other browsers' profiles and Meridian's own
+   // data are off limits, except the run's working directory.
+-  std::vector<base::FilePath> denied = SensitivePaths(base::GetHomeDir());
++  const base::FilePath home = base::GetHomeDir();
++  std::vector<base::FilePath> denied = SensitivePaths(home);
++  denied.push_back(home);
+   base::FilePath user_data;
+   if (base::PathService::Get(chrome::DIR_USER_DATA, &user_data)) {
+     denied.push_back(user_data);
+@@ -232,7 +286,10 @@ CliOutcome RunCliBlocking(std::string provider_id,
+   // The profile folder, wherever it lives.
+   denied.push_back(workdir.DirName());
+   if (p->sandboxed) {
+-    spec.argv = SandboxedArgv(spec.argv, denied, {dir});
++    std::vector<base::FilePath> allowed = CliOwnFolders(p->id, home, env);
++    allowed.push_back(dir);
++    spec.argv =
++        SandboxedArgv(spec.argv, denied, allowed, CliToolFolders(home, bin));
+   }
+   if (p->id == "claude-code") {
+     // Its own sign-in (the plan), not a key from the environment or the
+diff --git a/chrome/browser/meridian/ai/process_runner.cc b/chrome/browser/meridian/ai/process_runner.cc
+index 087b238817..a8b4aafeaa 100644
+--- a/chrome/browser/meridian/ai/process_runner.cc
++++ b/chrome/browser/meridian/ai/process_runner.cc
+@@ -360,7 +360,8 @@ std::vector<base::FilePath> SensitivePaths(const base::FilePath& home) {
+ std::vector<std::string> SandboxedArgv(
+     const std::vector<std::string>& argv,
+     const std::vector<base::FilePath>& denied,
+-    const std::vector<base::FilePath>& allowed) {
++    const std::vector<base::FilePath>& allowed,
++    const std::vector<base::FilePath>& readable) {
+ #if !BUILDFLAG(IS_MAC)
+   // sandbox-exec is macOS's. Without a sandbox that keeps a CLI out of these
+   // folders there is nothing to run: the caller gets no command.
+@@ -371,11 +372,12 @@ std::vector<std::string> SandboxedArgv(
+   // win, so `allowed` carves holes in `denied`.
+   std::vector<std::string> params;
+   auto rule = [&](const char* action, const char* prefix,
+-                  const std::vector<base::FilePath>& paths) {
++                  const std::vector<base::FilePath>& paths,
++                  const char* what = " file-read-data file-write*") {
+     if (paths.empty()) {
+       return std::string();
+     }
+-    std::string text = base::StrCat({"(", action, " file-read-data file-write*"});
++    std::string text = base::StrCat({"(", action, what});
+     for (size_t i = 0; i < paths.size(); ++i) {
+       std::string name = prefix + base::NumberToString(i);
+       params.push_back("-D");
+@@ -386,6 +388,7 @@ std::vector<std::string> SandboxedArgv(
+   };
+   std::string profile = "(version 1)(allow default)";
+   profile += rule("deny", "DENY", denied);
++  profile += rule("allow", "READ", readable, " file-read-data");
+   profile += rule("allow", "ALLOW", allowed);
+   std::vector<std::string> out = {"/usr/bin/sandbox-exec", "-p", profile};
+   out.insert(out.end(), params.begin(), params.end());
+diff --git a/chrome/browser/meridian/ai/process_runner.h b/chrome/browser/meridian/ai/process_runner.h
+index e76745a72c..8b7ddbd5eb 100644
+--- a/chrome/browser/meridian/ai/process_runner.h
++++ b/chrome/browser/meridian/ai/process_runner.h
+@@ -85,13 +85,14 @@ std::vector<base::FilePath> SensitivePaths(const base::FilePath& home);
+ 
+ // `argv` run under /usr/bin/sandbox-exec with a profile that allows
+ // everything except reading the contents of, or writing to, anything under
+-// `denied` (folders or files), apart from what lies under `allowed`. The
+-// paths are resolved through symlinks (as the sandbox sees them) and passed
++// `denied` (folders or files), apart from what lies under `allowed`, and
++// `readable` (read only). The paths are resolved through symlinks (as the sandbox sees them) and passed
+ // as -D parameters, never spliced into the profile text. Blocking.
+ std::vector<std::string> SandboxedArgv(
+     const std::vector<std::string>& argv,
+     const std::vector<base::FilePath>& denied,
+-    const std::vector<base::FilePath>& allowed);
++    const std::vector<base::FilePath>& allowed,
++    const std::vector<base::FilePath>& readable = {});
+ 
+ // The person's login-shell environment (CLAUDE_CONFIG_DIR, CODEX_HOME,
+ // proxies, PATH… that an app started from the Dock doesn't get), without
