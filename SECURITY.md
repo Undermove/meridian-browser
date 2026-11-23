@@ -17,17 +17,23 @@ Only the latest release. Meridian 0.5 and later are built on Chromium (macOS, Ap
 
 - Meridian is built on a Chromium **stable/beta branch** (the one Chrome ships), recorded in
   `chromium/CHROMIUM_VERSION`, not on Chromium's development trunk.
-- A daily GitHub Action (`chromium-watch`) compares it with Google's releases and opens an issue as soon
-  as a newer build of the branch (Chrome ships security fixes this way) or a newer stable branch is out;
-  it's marked urgent after 14 days.
+- A scheduled GitHub Action (`chromium-watch`) compares it with Google's releases and opens an issue
+  when a newer build of the branch (Chrome ships security fixes this way) or a newer stable branch is
+  out; it's marked urgent after 14 days.
 - `chromium/update_chromium.sh` moves to that Chromium, builds, runs every test, packages and drafts the
-  release. With the self-hosted runner (`chromium-update`), this starts by itself.
+  release. It is started by hand on the maintainer's Mac: this public repository has no self-hosted
+  runner.
 - Target: a release within days of a Chrome security release.
 
 ## Releases and updates
 
-- Every release is signed with the same certificate ("Meridian Signing"), with the hardened runtime and
-  the same per-process entitlements as Chrome (JIT only for renderers and GPU).
+- Every macOS release is signed with the same self-signed certificate ("Meridian Signing"), with the
+  hardened runtime. Library validation is off in its helpers until releases move to a Developer ID.
+- Windows installers are not code-signed yet, so Windows shows no verified publisher. The Windows
+  updater trusts an installer only through the Ed25519-signed `SHA256SUMS-win.txt`, and checks it again
+  right before running it.
+- The release key stays on the maintainer's Mac, in the Keychain, and each signature needs a person's
+  confirmation.
 - The in-app updater downloads only over HTTPS from GitHub releases. It trusts the release's
   `SHA256SUMS.txt` only with a valid `SHA256SUMS.txt.sig`: an Ed25519 signature by Meridian's release
   key, whose public half is built into Meridian (the private key is kept off the repo and off GitHub).
@@ -37,7 +43,8 @@ Only the latest release. Meridian 0.5 and later are built on Chromium (macOS, Ap
   `Contents/Resources/meridian-version` is the release's version and newer than the running one, so it
   never installs an older version. The signature is checked once more right before the swap. Its test
   switches only work for a profile in the temp folder.
-- `install.sh` checks the same checksum and the signature.
+- `install.sh` checks the Ed25519 signature of `SHA256SUMS.txt`, then the download against it, and
+  installs nothing if either fails.
 - Every published release is installed on a clean Mac by a GitHub Action (`release-check`) and the whole
   end-to-end suite runs against it; on failure the release goes back to pre-release.
 
@@ -55,18 +62,23 @@ without stranding them:
 ## What Meridian adds to Chromium, and how it's guarded
 
 - **MCP server for AI agents:** a per-launch unix socket in the profile, a random bearer token in a
-  0600 file, access levels (read-only / ask / full) set by the user; uploading files and other sensitive
-  tools always ask in a native dialog web pages can't answer. Agents only reach web pages (http, https,
-  about:blank, the new tab page): never `chrome://` pages, Workbench or local files. In "ask" mode the
-  Allow button takes no click for its first 600 ms.
-- **Workbench:** terminals and Docker sandboxes run code by design; files stay inside the opened
-  project; plugins run only after approval and only while their bytes match the approved SHA-256;
+  0600 file, access levels (read-only / ask / full) set by the user. A first connection gets "ask", never full
+  control; the name an app gives is its own claim and isn't verified. In "ask" mode each change is put
+  to the person, for the page it was asked about, and the Allow button takes no click for its first
+  600 ms. In "full" mode actions aren't asked about one by one. Password field contents aren't returned
+  to agents. Agent tools are limited to web pages (http, https, data, about:blank, the new tab page).
+- **CLI agents answering in Ask** run under a macOS sandbox with the home folder closed, apart from
+  their own settings and install folders. Network access stays open, since they call their providers.
+  On other systems these CLIs aren't offered.
+- **Workbench:** terminals and Docker sandboxes run code by design; the Source Control panel won't run
+  git in a repository whose own settings would start a program; files stay inside the opened project; plugins run only after approval and only while their bytes match the approved SHA-256;
   Safe Mode turns all customizations off.
 - **Secrets** (AI keys, the vault) are encrypted with the OS keychain key, never stored as plain text.
 - **Arc import** reads Arc's cookies only after saying macOS will ask for the keychain.
 
-Chromium's sandbox, site isolation, permission and certificate checks are unchanged; the patches in
-`chromium/patches/` are UI and Meridian's own services.
+Chromium's sandbox, site isolation and certificate checks are unchanged. One permission default
+differs: automatic picture-in-picture is allowed by default, as in Arc, and can be blocked per site in
+the Site Control Center. The other patches in `chromium/patches/` are UI and Meridian's own services.
 
 ## Known limitations
 
@@ -79,4 +91,6 @@ Chromium's sandbox, site isolation, permission and certificate checks are unchan
   asks to allow the first launch (System Settings → Privacy & Security → Open Anyway).
 - **Any program running as you can use the MCP server:** the token file is readable by your user, so a
   program running under your account can connect as an agent with the access level you set. Use "ask"
-  or "off" unless you need "full". Planned: approving each new agent app on its first connection.
+  or "off" unless you need "full".
+- **Windows installers have no publisher signature** until Meridian has a Windows code-signing
+  certificate.
