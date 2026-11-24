@@ -1,0 +1,2270 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 24 Nov 2026 22:13:30 +0400
+Subject: [PATCH] Meridian: Try with Claude, for designers and everyone else
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The welcome tour moves Arc in first, then "We found Claude": one Yes adds
+Meridian to Claude for Mac, a step explains its restart and its Allow
+question (with a little drawing of it), and "Try it with Claude" offers five
+cards: a new look for a site (Boost), a Pinterest moodboard, a senior
+designer's critique, tidy my tabs and what else Meridian can do. Each card
+gets the page ready and opens Claude with the request typed in (and on the
+clipboard); Claude restarts first when it started before Meridian was added.
+The same cards are on the home page and behind ⌘T's "Try with Claude…";
+without Claude, a way to get it and Ask instead.
+
+Who uses the computer is guessed from design apps and strong developer
+signs (repositories, Homebrew, coding agents): Workbench and Mission Control
+show for developers only. Tests record Claude's links
+(--meridian-test-claude-log) and never open Claude.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/agent/agent_cli.cc    |  22 ++
+ chrome/browser/meridian/agent/agent_cli.h     |  11 +
+ chrome/browser/meridian/setup_profile.cc      |  49 +++-
+ chrome/browser/meridian/setup_profile.h       |  18 +-
+ .../meridian/setup_profile_unittest.cc        |  14 ++
+ chrome/browser/meridian/sidebar.mojom         |  14 ++
+ chrome/browser/meridian/sidebar_handler.cc    |  58 ++++-
+ chrome/browser/meridian/sidebar_handler.h     |   8 +
+ .../browser/meridian/sidebar_handler_mac.mm   | 136 ++++++++++-
+ .../browser/resources/webui_browser/BUILD.gn  |   9 +
+ .../resources/webui_browser/app.html.ts       |   7 +
+ chrome/browser/resources/webui_browser/app.ts |  41 ++++
+ .../webui_browser/meridian/allow_mock.css     |  98 ++++++++
+ .../webui_browser/meridian/allow_mock.html.ts |  21 ++
+ .../webui_browser/meridian/allow_mock.ts      |  33 +++
+ .../webui_browser/meridian/command_bar.ts     |  20 +-
+ .../resources/webui_browser/meridian/home.css |  14 ++
+ .../webui_browser/meridian/home.html.ts       |  18 +-
+ .../resources/webui_browser/meridian/home.ts  |  15 ++
+ .../webui_browser/meridian/onboarding.css     |  34 +++
+ .../webui_browser/meridian/onboarding.html.ts |  50 +++-
+ .../webui_browser/meridian/onboarding.ts      |  56 ++++-
+ .../webui_browser/meridian/showcase.css       | 150 ++++++++++++
+ .../webui_browser/meridian/showcase.html.ts   |  43 ++++
+ .../webui_browser/meridian/showcase.ts        | 201 ++++++++++++++++
+ .../webui_browser/meridian/sidebar.ts         |  21 +-
+ .../webui_browser/meridian/try_claude.css     | 214 ++++++++++++++++++
+ .../webui_browser/meridian/try_claude.html.ts |  60 +++++
+ .../webui_browser/meridian/try_claude.ts      | 166 ++++++++++++++
+ 29 files changed, 1559 insertions(+), 42 deletions(-)
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/allow_mock.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/allow_mock.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/allow_mock.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/showcase.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/showcase.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/showcase.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/try_claude.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/try_claude.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/try_claude.ts
+
+diff --git a/chrome/browser/meridian/agent/agent_cli.cc b/chrome/browser/meridian/agent/agent_cli.cc
+index 3bc7802362..4467baed63 100644
+--- a/chrome/browser/meridian/agent/agent_cli.cc
++++ b/chrome/browser/meridian/agent/agent_cli.cc
+@@ -350,6 +350,24 @@ bool ConnectDesktop(std::string* output) {
+   return true;
+ }
+ 
++ClaudeDesktopState DesktopState() {
++  ClaudeDesktopState state;
++  state.installed = DesktopInstalled();
++  if (!state.installed) {
++    return state;
++  }
++  state.config = DesktopConfig();
++  std::string text;
++  if (base::ReadFileToString(state.config, &text)) {
++    std::optional<base::DictValue> root =
++        base::JSONReader::ReadDict(text, base::JSON_ALLOW_TRAILING_COMMAS);
++    const base::DictValue* servers =
++        root ? root->FindDict("mcpServers") : nullptr;
++    state.connected = servers && servers->FindDict("meridian");
++  }
++  return state;
++}
++
+ // ---- Agents set up by file
+ 
+ struct FileAgent {
+@@ -909,4 +927,8 @@ bool ConnectAgentCli(const std::string& id, std::string* output) {
+   return false;
+ }
+ 
++ClaudeDesktopState GetClaudeDesktopState() {
++  return DesktopState();
++}
++
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/agent/agent_cli.h b/chrome/browser/meridian/agent/agent_cli.h
+index e0b7804a4e..4332cd448a 100644
+--- a/chrome/browser/meridian/agent/agent_cli.h
++++ b/chrome/browser/meridian/agent/agent_cli.h
+@@ -34,6 +34,17 @@ std::vector<AgentCli> DetectAgentClis();
+ inline constexpr char kClaudeDesktopConfigSwitch[] =
+     "meridian-claude-desktop-config";
+ 
++// Claude Desktop for the "Try with Claude" cards: whether it is on this
++// computer, whether its config has Meridian, and when that config last
++// changed (Claude Desktop reads it only when it starts). Blocking (file
++// reads). In a test without the switch: not installed.
++struct ClaudeDesktopState {
++  bool installed = false;
++  bool connected = false;
++  base::FilePath config;
++};
++ClaudeDesktopState GetClaudeDesktopState();
++
+ // The agents set up by file. Each switch is the agent's config folder, so
+ // tests never see the person's real one; in a test without it the agent is
+ // never found.
+diff --git a/chrome/browser/meridian/setup_profile.cc b/chrome/browser/meridian/setup_profile.cc
+index 1906e44c56..48537cf51f 100644
+--- a/chrome/browser/meridian/setup_profile.cc
++++ b/chrome/browser/meridian/setup_profile.cc
+@@ -11,6 +11,7 @@
+ #include "base/base_paths.h"
+ #include "base/no_destructor.h"
+ #include "base/files/file_enumerator.h"
++#include "base/files/file_util.h"
+ #include "base/path_service.h"
+ #include "base/strings/string_util.h"
+ 
+@@ -131,9 +132,50 @@ std::vector<std::string> InstalledApps() {
+   return std::vector<std::string>(names.begin(), names.end());
+ }
+ 
++bool StrongDevSignals() {
++  base::FilePath home;
++  base::PathService::Get(base::DIR_HOME, &home);
++  for (const char* path :
++       {"/opt/homebrew/bin/brew", "/usr/local/bin/brew", "/usr/local/Homebrew"}) {
++    if (base::PathExists(base::FilePath(path))) {
++      return true;
++    }
++  }
++  for (const char* name : {".claude.json", ".claude/local", ".codex",
++                           ".local/bin/claude", ".gemini"}) {
++    if (base::PathExists(home.AppendASCII(name))) {
++      return true;
++    }
++  }
++  for (const char* name :
++       {"repos", "code", "Code", "projects", "Projects", "src", "dev",
++        "Developer", "git", "GitHub"}) {
++    base::FileEnumerator repos(home.AppendASCII(name), false,
++                               base::FileEnumerator::DIRECTORIES);
++    int looked = 0;
++    for (base::FilePath dir = repos.Next(); !dir.empty() && looked < 50;
++         dir = repos.Next(), ++looked) {
++      if (base::PathExists(dir.AppendASCII(".git"))) {
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++std::string GuessPersona(const std::vector<std::string>& apps,
++                         bool strong_dev) {
++  return strong_dev                    ? "developer"
++         : HasApp(apps, kDesignApps)   ? "designer"
++         : HasApp(apps, kDevApps)      ? "developer"
++         : HasApp(apps, kOfficeApps)   ? "manager"
++                                       : "everyday";
++}
++
+ SetupProposal ProposeSetup(const std::vector<std::string>& apps,
+                            std::string_view locale,
+-                           std::string_view persona) {
++                           std::string_view persona,
++                           bool strong_dev) {
+   bool ru = base::StartsWith(locale, "ru") || base::StartsWith(locale, "uk") ||
+             base::StartsWith(locale, "be") || base::StartsWith(locale, "kk");
+   auto t = [ru](const char* en, const char* ru_text) {
+@@ -142,10 +184,7 @@ SetupProposal ProposeSetup(const std::vector<std::string>& apps,
+   std::string pick(persona);
+   if (pick != "developer" && pick != "designer" && pick != "manager" &&
+       pick != "everyday") {
+-    pick = HasApp(apps, kDevApps)        ? "developer"
+-           : HasApp(apps, kDesignApps)   ? "designer"
+-           : HasApp(apps, kOfficeApps)   ? "manager"
+-                                         : "everyday";
++    pick = GuessPersona(apps, strong_dev);
+   }
+   bool slack = HasApp(apps, {"Slack"});
+   SetupProposal p;
+diff --git a/chrome/browser/meridian/setup_profile.h b/chrome/browser/meridian/setup_profile.h
+index ebb05c15b2..04a678c89e 100644
+--- a/chrome/browser/meridian/setup_profile.h
++++ b/chrome/browser/meridian/setup_profile.h
+@@ -34,10 +34,24 @@ struct SetupProposal {
+ // Names of the installed apps (blocking: reads /Applications and the like).
+ std::vector<std::string> InstalledApps();
+ 
+-// `persona` empty: guessed from `apps`. `locale` picks Russian names.
++// Strong signs that a developer uses this computer (blocking): git
++// repositories in ~/repos, ~/code, ~/projects, ~/src, ~/dev or ~/Developer,
++// Homebrew, or a coding agent's files (Claude Code, Codex). A designer with
++// VS Code installed has none of these.
++bool StrongDevSignals();
++
++// developer, designer, manager or everyday, from the installed apps: design
++// apps make a designer unless there are strong developer signals, even with
++// an editor or two installed.
++std::string GuessPersona(const std::vector<std::string>& apps,
++                         bool strong_dev);
++
++// `persona` empty: guessed from `apps` (GuessPersona). `locale` picks Russian
++// names.
+ SetupProposal ProposeSetup(const std::vector<std::string>& apps,
+                            std::string_view locale,
+-                           std::string_view persona = {});
++                           std::string_view persona = {},
++                           bool strong_dev = false);
+ 
+ }  // namespace meridian
+ 
+diff --git a/chrome/browser/meridian/setup_profile_unittest.cc b/chrome/browser/meridian/setup_profile_unittest.cc
+index 4fb6402e9a..ca6654a237 100644
+--- a/chrome/browser/meridian/setup_profile_unittest.cc
++++ b/chrome/browser/meridian/setup_profile_unittest.cc
+@@ -43,6 +43,20 @@ TEST(SetupProfileTest, EverydayInTheirLanguage) {
+   EXPECT_TRUE(p.seen.empty());
+ }
+ 
++TEST(SetupProfileTest, DesignAppsMakeADesignerWithoutStrongDevSigns) {
++  // An editor next to Figma isn't enough to be a developer…
++  EXPECT_EQ(GuessPersona({"Figma", "Visual Studio Code", "Slack"}, false),
++            "designer");
++  EXPECT_EQ(ProposeSetup({"Sketch", "Cursor"}, "en").persona, "designer");
++  EXPECT_EQ(GuessPersona({"Adobe Photoshop 2026"}, false), "designer");
++  // …repositories, Homebrew or a coding agent are.
++  EXPECT_EQ(GuessPersona({"Figma", "Visual Studio Code"}, true), "developer");
++  EXPECT_EQ(ProposeSetup({"Figma"}, "en", {}, true).persona, "developer");
++  EXPECT_EQ(GuessPersona({"Xcode"}, false), "developer");
++  EXPECT_EQ(GuessPersona({"Zoom"}, false), "manager");
++  EXPECT_EQ(GuessPersona({}, false), "everyday");
++}
++
+ TEST(SetupProfileTest, PersonaOverridesTheGuess) {
+   EXPECT_EQ(ProposeSetup({"Xcode"}, "en", "designer").persona, "designer");
+   EXPECT_EQ(ProposeSetup({"Xcode"}, "en", "bogus").persona, "developer");
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index a90f9c89bc..b2df819d15 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -748,6 +748,20 @@ interface SidebarHandler {
+   // Asks Claude Desktop to quit (it asks about unsaved work itself) and opens
+   // it again; `message` says what happened.
+   RestartClaudeDesktop() => (bool ok, string message);
++  // "Try with Claude": Claude Desktop is on this computer, has Meridian in
++  // its config, and (macOS) is running since before Meridian was added, so
++  // it must restart to use it.
++  GetClaudeDesktop() => (bool installed, bool connected, bool needs_restart);
++  // Opens Claude Desktop with `request` ready in a new chat (and on the
++  // clipboard); it only runs when the person presses Enter. Claude restarts
++  // first when it needs to (never forced: it asks about unsaved work). An
++  // empty request just gets Claude ready, in the background. Tests record it
++  // (--meridian-test-claude-log) and never open Claude.
++  OpenInClaude(string request) => (bool ok, string message);
++  // Who uses this computer, for what Meridian shows: "developer",
++  // "designer", "manager" or "everyday" (Settings' developer mode, else
++  // guessed from the apps and signs of development).
++  GetPersona() => (string persona);
+   // The pointer is on the window's close, minimize or zoom button, which
+   // the page can't see (macOS).
+   IsPointerOverWindowControls() => (bool over);
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 4cd169079a..7bfa7fdddc 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -1842,7 +1842,7 @@ void SidebarHandler::ProposeSetup(bool use_apps,
+           [](bool use_apps, std::string locale, std::string persona) {
+             return meridian::ProposeSetup(
+                 use_apps ? InstalledApps() : std::vector<std::string>(),
+-                locale, persona);
++                locale, persona, use_apps && StrongDevSignals());
+           },
+           use_apps, base::i18n::GetConfiguredLocale(), persona),
+       base::BindOnce(
+@@ -2152,7 +2152,63 @@ void SidebarHandler::TailorSetup(const std::string& provider,
+                run, finish));
+ }
+ 
++void SidebarHandler::GetClaudeDesktop(GetClaudeDesktopCallback callback) {
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce([] {
++        ClaudeDesktopState state = GetClaudeDesktopState();
++        base::File::Info info;
++        base::Time changed;
++        if (state.connected && base::GetFileInfo(state.config, &info)) {
++          changed = info.last_modified;
++        }
++        return std::make_pair(state, changed);
++      }),
++      base::BindOnce(
++          [](GetClaudeDesktopCallback callback,
++             std::pair<ClaudeDesktopState, base::Time> found) {
++            const ClaudeDesktopState& state = found.first;
++            // A test never looks at a real Claude.
++            bool restart =
++                TestSwitchesAllowed()
++                    ? HasTestSwitch("meridian-test-claude-needs-restart")
++                    : state.connected && !found.second.is_null() &&
++                          ClaudeDesktopStartedBefore(found.second);
++            std::move(callback).Run(state.installed, state.connected,
++                                    state.connected && restart);
++          },
++          std::move(callback)));
++}
++
++void SidebarHandler::GetPersona(GetPersonaCallback callback) {
++  std::string forced = TestSwitchValue("meridian-test-persona");
++  if (!forced.empty()) {
++    std::move(callback).Run(forced);
++    return;
++  }
++  if (MainProfileFor(browser_->GetProfile())
++          ->GetPrefs()
++          ->GetString(prefs::kMode) == "developer") {
++    std::move(callback).Run("developer");
++    return;
++  }
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(
++          [] { return GuessPersona(InstalledApps(), StrongDevSignals()); }),
++      std::move(callback));
++}
++
+ #if !BUILDFLAG(IS_MAC)
++bool ClaudeDesktopStartedBefore(base::Time) {
++  return false;
++}
++
++void SidebarHandler::OpenInClaude(const std::string& request,
++                                  OpenInClaudeCallback callback) {
++  std::move(callback).Run(false, "Open Claude and ask it there.");
++}
++
+ void SidebarHandler::RestartClaudeDesktop(
+     RestartClaudeDesktopCallback callback) {
+   if (HasTestSwitch("meridian-test-ai-consent")) {
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 5e5aa38ec7..8bebf8c3c4 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -36,6 +36,10 @@ namespace meridian {
+ // The person's full name from the system (the member card's default).
+ std::string SystemUserFullName();
+ 
++// Claude Desktop is running and started before `time` (so it hasn't read a
++// config changed then). macOS only; false elsewhere.
++bool ClaudeDesktopStartedBefore(base::Time time);
++
+ // Connects one window's sidebar (chrome://webui-browser) to the profile's
+ // SidebarService and to the window's tabs: new tabs join the active space,
+ // switching to a tab of another space switches the space, and each space
+@@ -231,6 +235,10 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void AllowAiProvider(const std::string& id) override;
+   void GrantAgentAccess() override;
+   void RestartClaudeDesktop(RestartClaudeDesktopCallback callback) override;
++  void GetClaudeDesktop(GetClaudeDesktopCallback callback) override;
++  void OpenInClaude(const std::string& request,
++                    OpenInClaudeCallback callback) override;
++  void GetPersona(GetPersonaCallback callback) override;
+   void IsPointerOverWindowControls(
+       IsPointerOverWindowControlsCallback callback) override;
+   void HasAiKey(HasAiKeyCallback callback) override;
+diff --git a/chrome/browser/meridian/sidebar_handler_mac.mm b/chrome/browser/meridian/sidebar_handler_mac.mm
+index f49e8ce8a3..93a69956ea 100644
+--- a/chrome/browser/meridian/sidebar_handler_mac.mm
++++ b/chrome/browser/meridian/sidebar_handler_mac.mm
+@@ -12,6 +12,9 @@
+ #include "base/strings/sys_string_conversions.h"
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/meridian/test_switches.h"
++#include "chrome/browser/meridian/agent/agent_cli.h"
++#include "base/files/file_util.h"
++#include "base/task/thread_pool.h"
+ 
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+@@ -39,36 +42,64 @@ constexpr char kRequestReady[] =
+     "Claude Desktop restarted. Your first request is ready: press Enter, then "
+     "Allow. If the box is empty, paste it with \u2318V.";
+ 
+-std::string FirstRequestUrl() {
++constexpr char kClaudeBundle[] = "com.anthropic.claudefordesktop";
++
++// Claude's link for a new chat with `request` typed in (not sent).
++std::string RequestUrl(const std::string& request) {
+   return "claude://claude.ai/new?q=" +
+-         base::EscapeQueryParamValue(kFirstRequest, /*use_plus=*/false);
++         base::EscapeQueryParamValue(request, /*use_plus=*/false);
++}
++
++std::string FirstRequestUrl() {
++  return RequestUrl(kFirstRequest);
+ }
+ 
+-void OpenClaude(NSURL* url, base::OnceCallback<void(bool, const std::string&)> done) {
++// The person's request for Claude (they press Enter there), or an empty one:
++// then Claude only starts, behind Meridian.
++struct ClaudeOpen {
++  std::string request;
++  std::string ready;  // what Meridian says once Claude is open
++};
++
++void OpenClaude(NSURL* url,
++                ClaudeOpen open,
++                base::OnceCallback<void(bool, const std::string&)> done) {
+   if (!url) {
+     std::move(done).Run(false, "Open Claude to start using Meridian there.");
+     return;
+   }
++  NSWorkspaceOpenConfiguration* configuration =
++      [NSWorkspaceOpenConfiguration configuration];
++  if (open.request.empty()) {
++    configuration.activates = NO;
++    [NSWorkspace.sharedWorkspace openApplicationAtURL:url
++                                        configuration:configuration
++                                    completionHandler:nil];
++    std::move(done).Run(true, open.ready);
++    return;
++  }
+   // The link isn't a documented part of Claude, so the request is on the
+   // clipboard too, in case the box comes up empty.
+   NSPasteboard* board = NSPasteboard.generalPasteboard;
+   [board clearContents];
+-  [board setString:base::SysUTF8ToNSString(kFirstRequest)
++  [board setString:base::SysUTF8ToNSString(open.request)
+            forType:NSPasteboardTypeString];
+-  NSURL* ask = [NSURL URLWithString:base::SysUTF8ToNSString(FirstRequestUrl())];
++  NSURL* ask =
++      [NSURL URLWithString:base::SysUTF8ToNSString(RequestUrl(open.request))];
+   [NSWorkspace.sharedWorkspace openURLs:@[ ask ]
+                    withApplicationAtURL:url
+-                          configuration:[NSWorkspaceOpenConfiguration configuration]
++                          configuration:configuration
+                       completionHandler:nil];
+-  std::move(done).Run(true, kRequestReady);
++  std::move(done).Run(true, open.ready);
+ }
+ 
+ void WaitForQuit(NSRunningApplication* app,
+                  NSURL* url,
++                 ClaudeOpen open,
+                  int checks,
+                  base::OnceCallback<void(bool, const std::string&)> done) {
+   if (app.terminated) {
+-    return OpenClaude(url, std::move(done));
++    return OpenClaude(url, std::move(open), std::move(done));
+   }
+   if (checks <= 0) {
+     // It may be asking about unsaved work: never forced.
+@@ -78,7 +109,8 @@ void WaitForQuit(NSRunningApplication* app,
+   }
+   content::GetUIThreadTaskRunner({})->PostDelayedTask(
+       FROM_HERE,
+-      base::BindOnce(&WaitForQuit, app, url, checks - 1, std::move(done)),
++      base::BindOnce(&WaitForQuit, app, url, std::move(open), checks - 1,
++                     std::move(done)),
+       base::Milliseconds(500));
+ }
+ 
+@@ -92,18 +124,98 @@ void SidebarHandler::RestartClaudeDesktop(
+         true, std::string(kRequestReady) + " [" + FirstRequestUrl() + "]");
+     return;
+   }
+-  NSString* bundle = @"com.anthropic.claudefordesktop";
++  NSString* bundle = base::SysUTF8ToNSString(kClaudeBundle);
+   NSURL* url =
+       [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:bundle];
+   NSRunningApplication* app =
+       [NSRunningApplication runningApplicationsWithBundleIdentifier:bundle]
+           .firstObject;
++  ClaudeOpen open{kFirstRequest, kRequestReady};
+   if (!app) {
+-    return OpenClaude(url, std::move(callback));
++    return OpenClaude(url, std::move(open), std::move(callback));
+   }
+   // A normal quit: Claude itself asks about anything unsaved.
+   [app terminate];
+-  WaitForQuit(app, url, kQuitChecks, std::move(callback));
++  WaitForQuit(app, url, std::move(open), kQuitChecks, std::move(callback));
++}
++
++bool ClaudeDesktopStartedBefore(base::Time time) {
++  NSRunningApplication* app = [NSRunningApplication
++      runningApplicationsWithBundleIdentifier:base::SysUTF8ToNSString(
++                                                  kClaudeBundle)]
++                                  .firstObject;
++  return app && app.launchDate &&
++         app.launchDate.timeIntervalSince1970 <
++             time.InSecondsFSinceUnixEpoch();
++}
++
++void SidebarHandler::OpenInClaude(const std::string& request,
++                                  OpenInClaudeCallback callback) {
++  constexpr char kReady[] =
++      "Claude is open with your request. Press Enter there, then Allow. If "
++      "the box is empty, paste it with \u2318V.";
++  constexpr char kStarted[] = "Claude is ready for Meridian.";
++  ClaudeOpen open{request, request.empty() ? kStarted : kReady};
++  // A test never touches a real Claude: it gets the link instead.
++  if (TestSwitchesAllowed()) {
++    std::string link = request.empty() ? "claude://" : RequestUrl(request);
++    base::FilePath log = TestSwitchPath("meridian-test-claude-log");
++    if (!log.empty()) {
++      base::ThreadPool::PostTask(
++          FROM_HERE, {base::MayBlock()},
++          base::BindOnce(
++              [](base::FilePath log, std::string line) {
++                line += "\n";
++                if (!base::PathExists(log)) {
++                  base::WriteFile(log, line);
++                } else {
++                  base::AppendToFile(log, line);
++                }
++              },
++              log, link));
++    }
++    std::move(callback).Run(true, open.ready + " [" + link + "]");
++    return;
++  }
++  NSString* bundle = base::SysUTF8ToNSString(kClaudeBundle);
++  NSURL* url =
++      [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:bundle];
++  if (!url) {
++    std::move(callback).Run(false, "Claude isn’t on this Mac yet.");
++    return;
++  }
++  // Claude reads Meridian's entry only when it starts: one that started
++  // before the entry was added quits first (asking about unsaved work
++  // itself), then opens again.
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_BLOCKING},
++      base::BindOnce([] {
++        ClaudeDesktopState state = GetClaudeDesktopState();
++        base::File::Info info;
++        return state.connected && base::GetFileInfo(state.config, &info)
++                   ? info.last_modified
++                   : base::Time();
++      }),
++      base::BindOnce(
++          [](NSURL* url, ClaudeOpen open, OpenInClaudeCallback callback,
++             base::Time changed) {
++            NSRunningApplication* app = [NSRunningApplication
++                runningApplicationsWithBundleIdentifier:
++                    base::SysUTF8ToNSString(kClaudeBundle)]
++                                            .firstObject;
++            if (app && !changed.is_null() &&
++                ClaudeDesktopStartedBefore(changed)) {
++              [app terminate];
++              return WaitForQuit(app, url, std::move(open), kQuitChecks,
++                                 std::move(callback));
++            }
++            if (app && open.request.empty()) {
++              // Already running with Meridian: nothing to do.
++              return std::move(callback).Run(true, open.ready);
++            }
++            OpenClaude(url, std::move(open), std::move(callback));
++          },
++          url, std::move(open), std::move(callback)));
+ }
+ 
+ void SidebarHandler::SetWindowControlsVisible(bool visible) {
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index 7be5ebed3d..29d3bbb087 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -72,6 +72,12 @@ build_webui("build") {
+     "meridian/settings.html.ts",
+     "meridian/settings.ts",
+     "meridian/settings_index.ts",
++    "meridian/allow_mock.html.ts",
++    "meridian/allow_mock.ts",
++    "meridian/showcase.html.ts",
++    "meridian/showcase.ts",
++    "meridian/try_claude.html.ts",
++    "meridian/try_claude.ts",
+     "meridian/sidebar.html.ts",
+     "meridian/sidebar.ts",
+     "meridian/tab_row.html.ts",
+@@ -123,6 +129,9 @@ build_webui("build") {
+     "meridian/onboarding.css",
+     "meridian/settings.css",
+     "meridian/theme_editor.css",
++    "meridian/allow_mock.css",
++    "meridian/showcase.css",
++    "meridian/try_claude.css",
+     "meridian/rows.css",
+     "meridian/sidebar.css",
+     "side_panel.css",
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 8b58e21c07..711e7da105 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -113,6 +113,7 @@ export function getHtml(this: WebuiBrowserAppElement) {
+     <meridian-boost-editor id="boostEditor" .url="${this.url_}">
+     </meridian-boost-editor>
+     <meridian-sidebar id="tabstrip" ?private="${this.private_}"
++        .developer="${this.developer_()}"
+         @tab-added="${this.onTabAdded_}"
+         @tab-closed="${this.onTabClosed_}" @tab-updated="${this.onTabUpdated_}"
+         @meridian-space-changed="${this.onMeridianSpaceChanged_}"
+@@ -160,6 +161,7 @@ export function getHtml(this: WebuiBrowserAppElement) {
+         @dblclick="${this.onSidebarResizeDblclick_}"></div>
+   </div>
+   <meridian-command-bar id="commandBar" .tabs="${this.commandBarTabs_}"
++      .developer="${this.developer_()}"
+       @command-bar-switch-tab="${this.onCommandBarSwitchTab_}"
+       @command-bar-feature="${this.onCommandBarFeature_}"
+       @command-bar-ask="${this.onCommandBarAsk_}"
+@@ -170,7 +172,10 @@ export function getHtml(this: WebuiBrowserAppElement) {
+   <meridian-archive id="archive"></meridian-archive>
+   <meridian-onboarding id="onboarding"
+       @meridian-open-url="${this.onMeridianOpenUrl_}"
++      @meridian-showcase="${this.onMeridianShowcase_}"
+       @onboarding-try="${this.onOnboardingTry_}"></meridian-onboarding>
++  <meridian-try-claude id="tryClaude"
++      @meridian-showcase="${this.onMeridianShowcase_}"></meridian-try-claude>
+   <meridian-settings id="settings"
+       @meridian-onboarding="${this.onMeridianOnboarding_}"
+       @meridian-edit-theme="${this.onMeridianEditTheme_}"
+@@ -252,6 +257,8 @@ export function getHtml(this: WebuiBrowserAppElement) {
+         @meridian-show-settings="${this.onMeridianShowSettings_}">
+     </meridian-chat>
+     <meridian-home id="home" ?shown="${this.showHome_}" ?little="${this.little_}"
++        .persona="${this.persona_}"
++        @meridian-showcase="${this.onMeridianShowcase_}"
+         @meridian-home-action="${this.onMeridianHomeAction_}"
+         @meridian-preset="${this.onMeridianPreset_}">
+     </meridian-home>
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 067c7459b9..eb13b5fa68 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -27,6 +27,7 @@ import './meridian/ai_consent.js';
+ import './meridian/update_sheet.js';
+ import './meridian/site_control.js';
+ import './meridian/boost_editor.js';
++import './meridian/try_claude.js';
+ import 'chrome://resources/cr_elements/cr_button/cr_button.js';
+ import 'chrome://resources/cr_elements/cr_icon_button/cr_icon_button.js';
+ import 'chrome://resources/cr_elements/cr_icon/cr_icon.js';
+@@ -60,6 +61,9 @@ import type {MeridianThemeEditorElement} from './meridian/theme_editor.js';
+ import type {MeridianSidebarElement} from './meridian/sidebar.js';
+ import type {MeridianBoostEditorElement} from './meridian/boost_editor.js';
+ import type {MeridianSiteControlElement} from './meridian/site_control.js';
++import type {MeridianTryClaudeElement} from './meridian/try_claude.js';
++import type {ShowcaseRun} from './meridian/showcase.js';
++import {browserProxyFactory as sidebarProxyFactory} from './sidebar.mojom-webui.js';
+ import type {IconName} from './meridian/icons.js';
+ import {Command} from './sidebar.mojom-webui.js';
+ import type {Space, Split, TidyTab, UpdateState} from './sidebar.mojom-webui.js';
+@@ -147,6 +151,7 @@ export interface WebuiBrowserAppElement {
+     contentRegion: ContentRegionElement,
+     sidePanel: SidePanelElement,
+     tabstrip: MeridianSidebarElement,
++    tryClaude: MeridianTryClaudeElement,
+   };
+ }
+ 
+@@ -185,6 +190,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       preview_: {state: true, type: Object},
+       missionSnapshot_: {state: true, type: Object},
+       missionToast_: {state: true, type: Object},
++      persona_: {state: true, type: String},
+       sidebarHidden_: {type: Boolean, reflect: true, attribute: 'sidebar-hidden'},
+       little_: {type: Boolean, reflect: true, attribute: 'little'},
+       littleSpaces_: {state: true, type: Array},
+@@ -254,6 +260,9 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   protected accessor showHome_: boolean = false;
+   protected accessor agentOnPage_: boolean = false;
+   protected accessor sharedOnPage_: boolean = false;
++  // Who uses this computer ('' until known): developer things (Workbench,
++  // Mission Control) show for developers only.
++  protected accessor persona_: string = '';
+ 
+   constructor() {
+     super();
+@@ -283,6 +292,16 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     // of the sidebar and the URL pill move into it, once; they stay the
+     // elements the rest of this class knows.
+     this.toggleAttribute('os-win', isWindows);
++    this.updateComplete.then(() => {
++      this.$.tryClaude.host = {
++        activeUrl: () => this.$.tabstrip.activeUrl(),
++        openUrl: (url: string) => this.$.tabstrip.openUrl(url),
++      };
++    });
++    sidebarProxyFactory.getInstance().handler.getPersona().then(
++        ({persona}) => {
++          this.persona_ = persona;
++        });
+     if (isWindows) {
+       this.updateComplete.then(() => {
+         const find = (id: string) => this.shadowRoot.getElementById(id)!;
+@@ -798,6 +817,25 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     this.statusText_ = e.detail;
+   }
+ 
++  // Developer things show until Meridian knows it's someone else.
++  protected developer_(): boolean {
++    return !this.persona_ || this.persona_ === 'developer';
++  }
++
++  // A "Try with Claude" card (the tour, the home page, the sheet).
++  protected onMeridianShowcase_(e: CustomEvent<ShowcaseRun>) {
++    const run = e.detail;
++    if (run.action === 'run' && run.id) {
++      this.$.tryClaude.run(run.id, run.topic || '');
++    } else if (run.action === 'get-claude') {
++      this.$.tryClaude.close();
++      this.$.tabstrip.openUrl('https://claude.ai/download');
++    } else if (run.action === 'ask') {
++      this.$.tryClaude.close();
++      this.$.tabstrip.runCommand(Command.kAsk, 0);
++    }
++  }
++
+   // The tour's last page: the real thing, not a description of it.
+   protected onOnboardingTry_(e: CustomEvent<string>) {
+     const run = (command: Command) => this.$.tabstrip.runCommand(command, 0);
+@@ -1293,6 +1331,9 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       return;
+     }
+     switch (e.detail) {
++      case 'try-claude':
++        this.$.tryClaude.showCards();
++        break;
+       case 'workbench':
+         run(Command.kWorkbench);
+         break;
+diff --git a/chrome/browser/resources/webui_browser/meridian/allow_mock.css b/chrome/browser/resources/webui_browser/meridian/allow_mock.css
+new file mode 100644
+index 0000000000..5aeca48e22
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/allow_mock.css
+@@ -0,0 +1,98 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #css_wrapper_metadata_end */
++
++/* A little drawing of Claude's "Allow" question. */
++
++:host {
++  display: block;
++  width: min(360px, 80vw);
++  color: #17171c;
++  text-align: left;
++  font-family: system-ui, -apple-system, sans-serif;
++}
++
++.win {
++  border-radius: 14px;
++  background: #faf9f5;
++  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.28),
++      inset 0 0 0 1px rgba(0, 0, 0, 0.06);
++  overflow: hidden;
++}
++
++.bar {
++  display: flex;
++  gap: 6px;
++  padding: 9px 12px;
++  background: #efede6;
++}
++
++.bar i {
++  width: 9px;
++  height: 9px;
++  border-radius: 50%;
++  background: #d6d3ca;
++}
++
++.body {
++  padding: 14px 16px 14px;
++}
++
++.who {
++  display: flex;
++  align-items: center;
++  gap: 9px;
++  font-size: 14px;
++  font-weight: 650;
++}
++
++.logo {
++  width: 22px;
++  height: 22px;
++  border-radius: 6px;
++  background: #d97757;
++  flex: none;
++}
++
++p {
++  margin: 6px 0 12px 31px;
++  font-size: 12.5px;
++  color: #66655f;
++}
++
++.acts {
++  display: flex;
++  justify-content: flex-end;
++  gap: 8px;
++}
++
++.acts span {
++  padding: 6px 12px;
++  border-radius: 8px;
++  font-size: 12.5px;
++  font-weight: 600;
++  background: #ebe9e2;
++}
++
++.acts .allow {
++  background: #17171c;
++  color: #fff;
++  animation: nudge 1.8s ease-in-out infinite;
++}
++
++@keyframes nudge {
++  50% {
++    box-shadow: 0 0 0 5px rgba(217, 119, 87, 0.45);
++  }
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .acts .allow {
++    animation: none;
++    box-shadow: 0 0 0 3px rgba(217, 119, 87, 0.45);
++  }
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/allow_mock.html.ts b/chrome/browser/resources/webui_browser/meridian/allow_mock.html.ts
+new file mode 100644
+index 0000000000..cb08a9db3c
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/allow_mock.html.ts
+@@ -0,0 +1,21 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {MeridianAllowMockElement} from './allow_mock.js';
++
++export function getHtml(this: MeridianAllowMockElement) {
++  return html`<!--_html_template_start_-->
++<div class="win" aria-hidden="true">
++  <div class="bar"><i></i><i></i><i></i></div>
++  <div class="body">
++    <div class="who"><span class="logo"></span>
++      Allow Claude to use Meridian?</div>
++    <p>Open a tab, read the page…</p>
++    <div class="acts"><span>Deny</span><span class="allow">Allow</span></div>
++  </div>
++</div>
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/allow_mock.ts b/chrome/browser/resources/webui_browser/meridian/allow_mock.ts
+new file mode 100644
+index 0000000000..768b92d843
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/allow_mock.ts
+@@ -0,0 +1,33 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// What Claude's question looks like before it uses Meridian, so it's no
++// surprise: a little drawing, not a screenshot (its exact words may change).
++
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {getCss} from './allow_mock.css.js';
++import {getHtml} from './allow_mock.html.js';
++
++export class MeridianAllowMockElement extends CrLitElement {
++  static get is() {
++    return 'meridian-allow-mock';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-allow-mock': MeridianAllowMockElement;
++  }
++}
++
++customElements.define(MeridianAllowMockElement.is, MeridianAllowMockElement);
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index 7c62cbfb54..35cfbe7f0e 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -88,6 +88,11 @@ export const FEATURES: CommandBarFeature[] = [
+    icon: 'chat', words: ['ai', 'claude', 'assistant']},
+   {id: 'ask', name: 'Ask About This Page', hint: 'Claude reads the page',
+    keys: keyText('⌘J'), icon: 'sparkles', words: ['ai', 'claude', 'summarize']},
++  {id: 'try-claude', name: 'Try with Claude…',
++   hint: 'Restyle a site, a Pinterest moodboard and more', keys: '',
++   icon: 'sparkles',
++   words: ['claude', 'try', 'demo', 'showcase', 'moodboard', 'pinterest',
++           'restyle', 'critique', 'what can meridian do']},
+   {id: 'new-space', name: 'New Space', hint: '', keys: '', icon: 'layers',
+    words: ['space', 'workspace', 'profile']},
+   {id: 'theme', name: 'Edit Space Theme', hint: '', keys: '',
+@@ -110,6 +115,9 @@ export const FEATURES: CommandBarFeature[] = [
+    icon: 'restore', words: ['arc', 'move in']},
+ ];
+ 
++// Shown to developers only.
++const DEVELOPER_FEATURES = new Set(['workbench', 'mission']);
++
+ // Settings' sections, their options and Chromium's settings pages
+ // (settings_index.ts), found the same way and listed after the features.
+ export const SETTINGS_FEATURES: CommandBarFeature[] =
+@@ -172,9 +180,13 @@ export class MeridianCommandBarElement extends CrLitElement {
+       quick_: {state: true, type: Object},
+       mode_: {state: true, type: Object},
+       copied_: {state: true, type: Boolean},
++      developer: {type: Boolean},
+     };
+   }
+ 
++  // Developer features (Workbench, Mission Control) are found.
++  accessor developer: boolean = true;
++
+   // The open tabs (favorites, pinned, Today): "Switch to Tab" while the field
+   // is empty, and the ones that match what is typed.
+   accessor tabs: CommandBarTab[] = [];
+@@ -359,7 +371,13 @@ export class MeridianCommandBarElement extends CrLitElement {
+             .filter(x => x.m > 0)
+             .sort((a, b) => b.m - a.m)
+             .slice(0, 3);
+-    const found = rank(FEATURES, false).concat(rank(SETTINGS_FEATURES, true));
++    // For everyone else "Try with Claude…" comes first.
++    const offered = this.developer ?
++        FEATURES :
++        [...FEATURES.filter(f => f.id === 'try-claude'),
++         ...FEATURES.filter(
++             f => f.id !== 'try-claude' && !DEVELOPER_FEATURES.has(f.id))];
++    const found = rank(offered, false).concat(rank(SETTINGS_FEATURES, true));
+     const features = found.filter(x => x.setting && x.m === 3)
+                          .concat(found.filter(x => !(x.setting && x.m === 3)));
+     this.featureRows_ = features.map(x => x.f);
+diff --git a/chrome/browser/resources/webui_browser/meridian/home.css b/chrome/browser/resources/webui_browser/meridian/home.css
+index 6d2d3dbbfa..5b8b6129ad 100644
+--- a/chrome/browser/resources/webui_browser/meridian/home.css
++++ b/chrome/browser/resources/webui_browser/meridian/home.css
+@@ -154,6 +154,20 @@ kbd {
+   width: 100%;
+ }
+ 
++/* "Try with Claude": right under the search field, for everyone but
++ * developers. */
++.try-claude {
++  width: min(1040px, 100%);
++  margin-top: 30px;
++  color: var(--meridian-text);
++  animation: rise 0.5s 0.1s cubic-bezier(0.2, 0.8, 0.2, 1) both;
++}
++
++.head-note {
++  font-size: 12.5px;
++  color: var(--meridian-text-muted);
++}
++
+ .head {
+   display: flex;
+   align-items: baseline;
+diff --git a/chrome/browser/resources/webui_browser/meridian/home.html.ts b/chrome/browser/resources/webui_browser/meridian/home.html.ts
+index b8e7db9953..1c705bb79c 100644
+--- a/chrome/browser/resources/webui_browser/meridian/home.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/home.html.ts
+@@ -27,15 +27,25 @@ export function getHtml(this: MeridianHomeElement) {
+         <span class="quick-ic">${icon('sparkles', 15)}</span>Ask AI
+         <kbd class="quick-keys">${keyText('⌘J')}</kbd>
+       </button>
+-      <button class="quick-act" data-action="workbench" @click="${this.onQuickClick_}">
+-        <span class="quick-ic">${icon('code', 15)}</span>Workbench
+-        <kbd class="quick-keys">${keyText('⇧⌘E')}</kbd>
+-      </button>
++      ${this.developer_() ? html`
++        <button class="quick-act" data-action="workbench" @click="${this.onQuickClick_}">
++          <span class="quick-ic">${icon('code', 15)}</span>Workbench
++          <kbd class="quick-keys">${keyText('⇧⌘E')}</kbd>
++        </button>` : ''}
+     </div>
+     ${this.compact_ ? html`
+       <button id="expand" class="link" @click="${this.onExpandClick_}">
+         What can Meridian do?</button>` : ''}
+   </div>
++  ${!this.developer_() && !this.little ? html`
++    <section id="tryClaude" class="section try-claude">
++      <div class="head">
++        <h2>Try with Claude</h2>
++        <span class="head-note">One click: Claude opens with it ready.
++          Press Enter, then Allow.</span>
++      </div>
++      <meridian-showcase></meridian-showcase>
++    </section>` : ''}
+   <div id="more" ?hidden="${this.compact_}">
+     <section class="section">
+       <div class="head">
+diff --git a/chrome/browser/resources/webui_browser/meridian/home.ts b/chrome/browser/resources/webui_browser/meridian/home.ts
+index 38d746c32c..fe81520c80 100644
+--- a/chrome/browser/resources/webui_browser/meridian/home.ts
++++ b/chrome/browser/resources/webui_browser/meridian/home.ts
+@@ -9,6 +9,8 @@
+ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ 
++import './showcase.js';
++
+ import {getCss} from './home.css.js';
+ import {getHtml} from './home.html.js';
+ import {keyCaps, keyText} from './keys.js';
+@@ -142,6 +144,7 @@ export class MeridianHomeElement extends CrLitElement {
+       tipText_: {state: true, type: String},
+       tipIndex_: {state: true, type: Number},
+       cards_: {state: true, type: Array},
++      persona: {type: String},
+     };
+   }
+ 
+@@ -153,6 +156,9 @@ export class MeridianHomeElement extends CrLitElement {
+   protected accessor tipText_: string = '';
+   protected accessor tipIndex_: number = 0;
+   protected accessor cards_: HomeCard[] = CARDS;
++  // Who uses this computer ('' until known): developers get the Workbench,
++  // everyone else "Try with Claude".
++  accessor persona: string = '';
+ 
+   private tipTimer_: number|null = null;
+ 
+@@ -166,11 +172,20 @@ export class MeridianHomeElement extends CrLitElement {
+         this.stopTips_();
+       }
+     }
++    if (changed.has('persona' as keyof MeridianHomeElement)) {
++      this.cards_ = this.developer_() ?
++          CARDS :
++          CARDS.filter(c => c.id !== 'developer');
++    }
+     const [tipKeys, tipText] = TIPS[this.tipIndex_ % TIPS.length]!;
+     this.tipKeys_ = tipKeys;
+     this.tipText_ = tipText;
+   }
+ 
++  protected developer_(): boolean {
++    return !this.persona || this.persona === 'developer';
++  }
++
+   private greet_(): string {
+     const h = new Date().getHours();
+     return h < 5 ? 'Good night' :
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.css b/chrome/browser/resources/webui_browser/meridian/onboarding.css
+index 7278306246..1388a0f9bf 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.css
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.css
+@@ -1090,3 +1090,37 @@ kbd {
+     transition: none;
+   }
+ }
++
++/* Claude for Mac: its restart and its question, then something to try. */
++.claude-step {
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++}
++
++.claude-step .whisper.top {
++  margin-bottom: 14px;
++}
++
++.whisper.tight {
++  margin: 0 0 16px;
++}
++
++.whisper.small {
++  font-size: 12.5px;
++  margin: 16px 0 22px;
++}
++
++.whisper b {
++  color: #fff;
++}
++
++.showcase {
++  width: min(760px, 88vw);
++  color: #fff;
++}
++
++.tries.one {
++  grid-template-columns: minmax(0, 360px);
++  justify-content: center;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+index 3fad4904ba..28a828afdb 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+@@ -152,6 +152,39 @@ export function getHtml(this: MeridianOnboardingElement) {
+           </div>
+           <p class="whisper">Tap anything to leave it out.</p>` : ''}
+ 
++        ${this.step_ === 'claude' ? html`
++          <div class="claude-step">
++            <h2>Claude needs a quick restart</h2>
++            <p class="whisper top">Claude closes and opens again so it can
++              use Meridian. If something there isn’t saved, Claude asks
++              first.</p>
++            <p class="whisper tight">The first time Claude works in Meridian,
++              it asks for permission. Click <b>Allow</b>:</p>
++            <meridian-allow-mock></meridian-allow-mock>
++            <p class="whisper small">Its words may differ a little. Meridian
++              may ask too before Claude changes something here: Allow that as
++              well.</p>
++            <button id="restartClaude" class="btn primary big"
++                ?disabled="${!!this.busy_}"
++                @click="${this.onRestartClaudeClick_}">
++              ${this.busy_ || 'Restart Claude'}</button>
++            <button id="restartLater" class="link" ?hidden="${!!this.busy_}"
++                @click="${this.onRestartLaterClick_}">Later</button>
++            ${this.restartNote_ ? html`
++              <p id="restartNote" class="whisper">${this.restartNote_}</p>` :
++                ''}
++          </div>` : ''}
++
++        ${this.step_ === 'try' ? html`
++          <h2>Try it with Claude</h2>
++          <p class="whisper top">Pick one. Meridian gets the page ready and
++            opens Claude with your request typed in. Press Enter there, then
++            Allow.</p>
++          <div class="showcase">
++            <meridian-showcase @meridian-showcase="${this.onMeridianShowcase_}">
++            </meridian-showcase>
++          </div>` : ''}
++
+         ${this.step_ === 'default' ? html`
+           <div class="hero">
+             <div class="mark">${icon('link', 46)}</div>
+@@ -186,7 +219,7 @@ export function getHtml(this: MeridianOnboardingElement) {
+                 <b>Two tabs side by side</b><em>Read and work at once</em>
+               </button>
+             </div>
+-            ${this.desktopConnected_ ? html`
++            ${this.desktopConnected_ && !this.canRestartClaude_ ? html`
+               <div class="ai-done">
+                 <span>${this.restartNote_ || (this.canRestartClaude_ ?
+                     'Restart Claude, then ask it to do something in Meridian.' :
+@@ -207,9 +240,16 @@ export function getHtml(this: MeridianOnboardingElement) {
+                   @click="${this.onUndoSetupClick_}">Undo this setup</button>` :
+                 ''}
+             ${!this.aiFound_.length ? html`
+-              <button id="getClaude" class="link"
+-                  @click="${this.onGetClaudeClick_}">
+-                Get Claude to set things up for you</button>` : ''}
++              <div class="tries one">
++                <button id="getClaude" class="try"
++                    @click="${this.onGetClaudeClick_}">
++                  <span class="try-ic">${icon('external', 17)}</span>
++                  <b>Get Claude for Mac</b>
++                  <em>Free to download. Then Meridian sets it up for you,
++                    and Claude can restyle sites, build moodboards and tidy
++                    your tabs.</em>
++                </button>
++              </div>` : ''}
+           </div>` : ''}
+       </div>`)}
+   </div>
+@@ -226,7 +266,7 @@ export function getHtml(this: MeridianOnboardingElement) {
+     <button id="next"
+         class="btn primary ${this.step_ === 'hello' ? 'round' : ''}
+             ${this.busy_ ? 'busy' : ''}"
+-        ?hidden="${this.step_ === 'ai'}"
++        ?hidden="${this.step_ === 'ai' || this.step_ === 'claude'}"
+         ?disabled="${!!this.busy_}" @click="${this.onNextClick_}">
+       ${this.step_ === 'hello' ? html`${icon('arrowRight', 18)}` :
+                                  html`${this.nextLabel_}`}
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+index d190643ef8..25e0a2742c 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+@@ -5,8 +5,10 @@
+ // The welcome tour, full window (in the spirit of a new Mac's first launch).
+ // It is about moving in:
+ //   Arc found:  hello → Bring everything from Arc → links → All set
+-//   an AI on this computer: one Yes after hello connects it and it suggests
+-//               the setup (nothing changes until the person agrees)
++//   an AI on this computer: one Yes (after moving in) connects it and it
++//               suggests the setup (nothing changes until the person agrees)
++//   Claude for Mac connected: what its restart and its "Allow" look like,
++//               then "Try it with Claude" (showcase.ts)
+ //   no Arc:     hello → Make it yours (from the apps on this computer, worked
+ //               out locally) → Here's your Meridian → links → All set
+ // Help > Welcome Tour runs it again; File > Import from Arc opens its Arc step.
+@@ -17,10 +19,14 @@ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ import {browserProxyFactory} from '../sidebar.mojom-webui.js';
+ import type {AgentCli, ArcPreview, Item, SetupProposal, SidebarHandlerInterface, Space} from '../sidebar.mojom-webui.js';
+ 
++import './allow_mock.js';
++import './showcase.js';
++
+ import {getCss} from './onboarding.css.js';
+ import {getHtml} from './onboarding.html.js';
+ 
+-export type StepName = 'hello'|'ai'|'arc'|'tailor'|'preview'|'default'|'done';
++export type StepName = 'hello'|'ai'|'arc'|'tailor'|'preview'|'claude'|'try'|
++    'default'|'done';
+ 
+ // Apps that read Meridian's entry only when they start.
+ const RESTART_TO_USE =
+@@ -261,17 +267,22 @@ export class MeridianOnboardingElement extends CrLitElement {
+ 
+   private tourSteps_(): StepName[] {
+     const steps: StepName[] = ['hello'];
+-    if (this.aiFound_.length) {
+-      steps.push('ai');
+-    }
++    // Moving in first: the person's own things, before anything else.
+     const arc = this.arc_ && !this.fresh_;
+     if (arc) {
+       steps.push('arc');
+     }
++    if (this.aiFound_.length) {
++      steps.push('ai');
++    }
+     // After a move the AI can suggest more from it; without one, the setup.
+     if (!arc || (this.aiYes_ && this.aiProvider_)) {
+       steps.push('tailor', 'preview');
+     }
++    // Claude for Mac: its restart explained, then something to try.
++    if (this.desktopConnected_ && this.canRestartClaude_) {
++      steps.push('claude', 'try');
++    }
+     if (!this.isDefault_) {
+       steps.push('default');
+     }
+@@ -294,6 +305,8 @@ export class MeridianOnboardingElement extends CrLitElement {
+       arc: this.arc_ ? 'Bring everything' : 'Continue',
+       tailor: 'Suggest a setup',
+       preview: 'Looks great',
++      claude: '',
++      try: 'Maybe later',
+       default: 'Not now',
+       done: 'Start browsing',
+     }[this.step_];
+@@ -325,7 +338,10 @@ export class MeridianOnboardingElement extends CrLitElement {
+     super.updated(changed);
+     if (changed.has('step_' as keyof MeridianOnboardingElement) && this.open) {
+       this.shadowRoot
+-          .querySelector<HTMLElement>(this.step_ === 'ai' ? '#aiYes' : '#next')
++          .querySelector<HTMLElement>(
++              this.step_ === 'ai'     ? '#aiYes' :
++                  this.step_ === 'claude' ? '#restartClaude' :
++                                            '#next')
+           ?.focus();
+       // Said yes: no second question, the setup comes by itself.
+       if (this.step_ === 'tailor' && this.aiYes_ && !this.thinking_) {
+@@ -535,6 +551,32 @@ export class MeridianOnboardingElement extends CrLitElement {
+     this.restartNote_ = message;
+   }
+ 
++  // The tour's Claude step: Claude restarts in the background (it asks
++  // about unsaved work itself), then the cards.
++  protected async onRestartClaudeClick_() {
++    if (this.busy_) {
++      return;
++    }
++    this.busy_ = 'Restarting Claude…';
++    this.restartNote_ = '';
++    const {ok, message} = await this.handler_.openInClaude('');
++    this.busy_ = '';
++    if (ok) {
++      this.advance_();
++    } else {
++      this.restartNote_ = message;
++    }
++  }
++
++  protected onRestartLaterClick_() {
++    this.advance_();
++  }
++
++  // A card: the tour ends, and the window does the rest (app.ts).
++  protected onMeridianShowcase_() {
++    this.finish_();
++  }
++
+   protected onUndoSetupClick_() {
+     this.handler_.undoSetup();
+     this.canUndo_ = false;
+diff --git a/chrome/browser/resources/webui_browser/meridian/showcase.css b/chrome/browser/resources/webui_browser/meridian/showcase.css
+new file mode 100644
+index 0000000000..44ec53d853
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/showcase.css
+@@ -0,0 +1,150 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #css_wrapper_metadata_end */
++
++/* "Try with Claude" cards: they take the colour of where they sit (the
++ * welcome tour's dark stage, the home page, the sheet). */
++
++:host {
++  display: block;
++  width: 100%;
++}
++
++button {
++  font: inherit;
++  color: inherit;
++  background: none;
++  border: 0;
++  padding: 0;
++  cursor: pointer;
++}
++
++.cards {
++  display: grid;
++  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
++  gap: 10px;
++}
++
++.cards.two {
++  grid-template-columns: repeat(2, minmax(0, 1fr));
++}
++
++.card {
++  display: flex;
++  flex-direction: column;
++  align-items: flex-start;
++  gap: 4px;
++  min-height: 96px;
++  padding: 14px 15px;
++  box-sizing: border-box;
++  border-radius: 14px;
++  background: color-mix(in srgb, currentColor 7%, transparent);
++  text-align: left;
++  cursor: pointer;
++  outline: none;
++  transition: transform 0.16s cubic-bezier(0.2, 0, 0, 1),
++      background 0.16s ease;
++  animation: rise 0.32s cubic-bezier(0.05, 0.7, 0.1, 1) both;
++}
++
++.card:nth-child(2) {
++  animation-delay: 40ms;
++}
++
++.card:nth-child(3) {
++  animation-delay: 80ms;
++}
++
++.card:nth-child(4) {
++  animation-delay: 120ms;
++}
++
++.card:nth-child(5) {
++  animation-delay: 160ms;
++}
++
++@keyframes rise {
++  from {
++    opacity: 0;
++    transform: translateY(8px);
++  }
++}
++
++.card:hover,
++.card:focus-visible {
++  background: color-mix(in srgb, currentColor 13%, transparent);
++  transform: translateY(-2px);
++}
++
++.card:focus-visible {
++  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 40%, transparent);
++}
++
++.ic {
++  display: grid;
++  place-items: center;
++  width: 30px;
++  height: 30px;
++  margin-bottom: 6px;
++  border-radius: 9px;
++  color: #fff;
++  background: #d97757;
++}
++
++.restyle .ic {
++  background: linear-gradient(135deg, #c471f5, #fa71cd);
++}
++
++.moodboard .ic {
++  background: #e60023;
++}
++
++.critique .ic {
++  background: linear-gradient(135deg, #4facfe, #6a7cf6);
++}
++
++.tidy .ic {
++  background: linear-gradient(135deg, #43cea2, #2f9e83);
++}
++
++b {
++  font-size: 13.5px;
++  font-weight: 650;
++  line-height: 1.3;
++}
++
++em {
++  font-size: 12px;
++  font-style: normal;
++  line-height: 1.4;
++  opacity: 0.68;
++}
++
++.topic {
++  width: 100%;
++  margin-top: 4px;
++  padding: 5px 8px;
++  box-sizing: border-box;
++  border: 0;
++  border-radius: 7px;
++  font: inherit;
++  font-size: 12px;
++  color: inherit;
++  background: color-mix(in srgb, currentColor 10%, transparent);
++  outline: none;
++}
++
++.topic:focus {
++  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 30%, transparent);
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .card {
++    animation: none;
++    transition: none;
++  }
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/showcase.html.ts b/chrome/browser/resources/webui_browser/meridian/showcase.html.ts
+new file mode 100644
+index 0000000000..04e19da858
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/showcase.html.ts
+@@ -0,0 +1,43 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {icon} from './icons.js';
++import {SHOWCASE} from './showcase.js';
++import type {MeridianShowcaseElement} from './showcase.js';
++
++export function getHtml(this: MeridianShowcaseElement) {
++  return html`<!--_html_template_start_-->
++${this.claude === 'missing' ? html`
++  <div class="cards two">
++    <button class="card" data-action="get-claude" id="getClaude"
++        @click="${this.onOtherClick_}">
++      <span class="ic">${icon('external', 17)}</span>
++      <b>Get Claude for Mac</b>
++      <em>Free to download. Meridian sets it up for you.</em>
++    </button>
++    <button class="card" data-action="ask" id="askInstead"
++        @click="${this.onOtherClick_}">
++      <span class="ic">${icon('sparkles', 17)}</span>
++      <b>Ask about this page</b>
++      <em>Meridian’s own helper, right here (⌘J).</em>
++    </button>
++  </div>` : html`
++  <div class="cards">
++    ${SHOWCASE.map(c => html`
++      <div class="card ${c.id}" data-id="${c.id}" role="button" tabindex="0"
++          @click="${this.onCardClick_}" @keydown="${this.onCardKeydown_}">
++        <span class="ic">${icon(c.icon, 17)}</span>
++        <b>${c.title}</b>
++        ${c.id === 'moodboard' ? html`
++          <input class="topic" .value="${this.topic_}"
++              aria-label="What to look for" spellcheck="false"
++              @click="${this.onTopicClick_}" @keydown="${this.onTopicKeydown_}"
++              @input="${this.onTopicInput_}">` : html`
++          <em>${c.text}</em>`}
++      </div>`)}
++  </div>`}
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/showcase.ts b/chrome/browser/resources/webui_browser/meridian/showcase.ts
+new file mode 100644
+index 0000000000..5dbbfa3155
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/showcase.ts
+@@ -0,0 +1,201 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// "Try with Claude": one-click things Claude (the Mac app) does in Meridian.
++// Each card gets the scene ready here (the right page in front), then opens
++// Claude with the request typed in; the person presses Enter there. The cards
++// show in the welcome tour, on the home page and from the command bar
++// ("Try with Claude…"). Without Claude on the computer they say where to get
++// it, and offer Meridian's own Ask (⌘J) instead.
++
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {browserProxyFactory} from '../sidebar.mojom-webui.js';
++
++import type {IconName} from './icons.js';
++import {getCss} from './showcase.css.js';
++import {getHtml} from './showcase.html.js';
++
++export type ShowcaseId = 'restyle'|'moodboard'|'critique'|'tidy'|'guide';
++
++export interface ShowcaseCard {
++  id: ShowcaseId;
++  title: string;
++  text: string;
++  icon: IconName;
++}
++
++export const SHOWCASE: ShowcaseCard[] = [
++  {id: 'restyle', title: 'Give this site a new look',
++   text: 'Claude restyles the page live. One word puts it back.',
++   icon: 'palette'},
++  {id: 'moodboard', title: 'Find design trends on Pinterest',
++   text: 'Six references, pinned in a new Moodboard folder.', icon: 'grid'},
++  {id: 'critique', title: 'Critique this page like a senior designer',
++   text: 'Five concrete suggestions, nothing changed.', icon: 'eye'},
++  {id: 'tidy', title: 'Tidy my tabs',
++   text: 'A plan first. Nothing moves until you say yes.', icon: 'wand'},
++  {id: 'guide', title: 'What else can Meridian do?',
++   text: 'A quick tour, and three things to try now.', icon: 'sparkles'},
++];
++
++export const DEFAULT_TOPIC = 'UI design trends 2026';
++
++// Plain pages that always load: the first website ever (CERN keeps it as it
++// was in 1992), and a famously bare one to critique.
++export const RESTYLE_PAGE =
++    'https://info.cern.ch/hypertext/WWW/TheProject.html';
++export const CRITIQUE_PAGE = 'https://news.ycombinator.com/';
++
++function isWebPage(url: string): boolean {
++  return /^https?:\/\//.test(url);
++}
++
++// The page to open first, or '' to keep the one in front.
++export function sceneFor(id: ShowcaseId, activeUrl: string): string {
++  if (id === 'restyle' && !isWebPage(activeUrl)) {
++    return RESTYLE_PAGE;
++  }
++  if (id === 'critique' && !isWebPage(activeUrl)) {
++    return CRITIQUE_PAGE;
++  }
++  return '';
++}
++
++// "Reply in Russian." for a person whose Meridian isn't in English.
++function replyIn(lang: string): string {
++  const code = (lang || 'en').split('-')[0]!.toLowerCase();
++  if (code === 'en') {
++    return '';
++  }
++  let name = code;
++  try {
++    name = new Intl.DisplayNames(['en'], {type: 'language'}).of(code) || code;
++  } catch {
++    // An odd tag: the code itself is still understood.
++  }
++  return ` Reply in ${name}.`;
++}
++
++// What Claude gets (typed in for the person, never sent by itself).
++export function showcaseRequest(
++    id: ShowcaseId, topic: string = DEFAULT_TOPIC,
++    lang: string = navigator.language): string {
++  const subject = topic.trim() || DEFAULT_TOPIC;
++  const requests: Record<ShowcaseId, string> = {
++    restyle:
++        'In Meridian, give the page in my current tab a fresh new look. ' +
++        'First read it and take a screenshot. Then restyle it with a ' +
++        'Meridian Boost: modern typography, a calm colour palette, generous ' +
++        'spacing and clear hierarchy. Change only how it looks, never what ' +
++        'it says. When it’s done, tell me in two lines what you changed, and ' +
++        'that I can say "undo" to put it back as it was.',
++    moodboard:
++        `In Meridian, open Pinterest in a new tab and search for "${
++            subject}". Pick 6 strong, varied references, open each one in ` +
++        'its own tab, and pin them all into a new folder called ' +
++        '"Moodboard". Then sum up the trends you saw in three short lines.',
++    critique:
++        'In Meridian, take a screenshot of the page in my current tab and ' +
++        'read it. Then critique it like a senior product designer: give me ' +
++        '5 concrete suggestions (layout, typography, colour, hierarchy, ' +
++        'accessibility), each with what to change and why. Don’t change ' +
++        'anything on the page.',
++    tidy:
++        'Look at the tabs open in Meridian and suggest how to organize them ' +
++        'into folders. Show me the plan and change nothing until I say yes.',
++    guide:
++        'Use Meridian’s guide to tell me what Meridian can do, briefly and ' +
++        'in plain words. Then suggest three things I could try right now, ' +
++        'based on the tabs I have open.',
++  };
++  return requests[id] + replyIn(lang);
++}
++
++export interface ShowcaseRun {
++  action: 'run'|'get-claude'|'ask';
++  id?: ShowcaseId;
++  topic?: string;
++}
++
++// The cards. `claude`: '' while unknown, 'ready' or 'missing'.
++export class MeridianShowcaseElement extends CrLitElement {
++  static get is() {
++    return 'meridian-showcase';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      claude: {type: String, reflect: true},
++      topic_: {state: true, type: String},
++    };
++  }
++
++  accessor claude: string = '';
++  protected accessor topic_: string = DEFAULT_TOPIC;
++
++  override connectedCallback() {
++    super.connectedCallback();
++    this.refresh();
++  }
++
++  async refresh() {
++    const {installed} =
++        await browserProxyFactory.getInstance().handler.getClaudeDesktop();
++    this.claude = installed ? 'ready' : 'missing';
++  }
++
++  private run_(id: ShowcaseId) {
++    this.fire('meridian-showcase',
++              {action: 'run', id, topic: this.topic_} as ShowcaseRun);
++  }
++
++  protected onCardClick_(e: Event) {
++    this.run_((e.currentTarget as HTMLElement).dataset['id'] as ShowcaseId);
++  }
++
++  protected onCardKeydown_(e: KeyboardEvent) {
++    if (e.key === 'Enter' || e.key === ' ') {
++      e.preventDefault();
++      this.run_((e.currentTarget as HTMLElement).dataset['id'] as ShowcaseId);
++    }
++  }
++
++  protected onTopicClick_(e: Event) {
++    e.stopPropagation();
++  }
++
++  protected onTopicKeydown_(e: KeyboardEvent) {
++    e.stopPropagation();
++    if (e.key === 'Enter') {
++      this.run_('moodboard');
++    }
++  }
++
++  protected onTopicInput_(e: Event) {
++    this.topic_ = (e.target as HTMLInputElement).value;
++  }
++
++  protected onOtherClick_(e: Event) {
++    const action = (e.currentTarget as HTMLElement).dataset['action'] as
++        ShowcaseRun['action'];
++    this.fire('meridian-showcase', {action} as ShowcaseRun);
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-showcase': MeridianShowcaseElement;
++  }
++}
++
++customElements.define(MeridianShowcaseElement.is, MeridianShowcaseElement);
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 870732a540..57ec0c775f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -149,6 +149,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+ 
+   static override get properties() {
+     return {
++      developer: {type: Boolean},
+       tabs_: {state: true, type: Object},
+       state_: {state: true, type: Object},
+       menu_: {state: true, type: Object},
+@@ -177,6 +178,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+ 
+   // Live tabs by id, and the order they appeared in (newest Today tab first).
+   protected accessor tabs_: Map<NodeId, Tab> = new Map();
++  // Developer things (Workbench, Mission Control) in the menus.
++  accessor developer: boolean = true;
+   private sharedOnScreen_ = false;
+   protected accessor state_: SidebarState|null = null;
+   protected accessor menu_: OpenMenu|null = null;
+@@ -1664,7 +1667,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+       sel: -1,
+       sub: null,
+       plus: false,
+-      entries: [
++      entries: this.forPerson_([
+         {label: 'New Tab', icon: 'plus', keys: keyText('⌘T'), action: () => this.onNewTabClick_()},
+         {label: 'New Folder', icon: 'folder', keys: keyText('⌥⇧⌘N'), action: run(Command.kNewFolder)},
+         {label: 'New Space…', icon: 'layers', action: () => this.addSpace()},
+@@ -1678,7 +1681,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+         {label: 'Import from Chrome…', icon: 'layers', action: () => this.fire('meridian-onboarding', 'chrome')},
+         {label: 'Welcome Tour', icon: 'sparkles', action: run(Command.kWelcomeTour)},
+         {label: 'Settings', icon: 'settings', keys: keyText('⌘,'), separatorBefore: true, action: run(Command.kShowSettings)},
+-      ],
++      ]),
+     };
+   }
+ 
+@@ -1696,7 +1699,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+       sel: -1,
+       sub: null,
+       plus: true,
+-      entries: [
++      entries: this.forPerson_([
+         {label: 'New Space', icon: 'layers', action: () => this.addSpace()},
+         {
+           label: 'New Folder',
+@@ -1730,7 +1733,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+           keys: keyText('⇧⌘M'),
+           action: () => this.fire('meridian-mission', ''),
+         },
+-      ],
++      ]),
+     };
+   }
+ 
+@@ -2310,7 +2313,15 @@ export class MeridianSidebarElement extends CrLitElement implements
+   private openMenu_(e: MouseEvent, entries: MenuEntry[]) {
+     e.preventDefault();
+     e.stopPropagation();
+-    this.menu_ = {x: e.clientX, y: e.clientY, entries, sel: -1, sub: null};
++    this.menu_ = {x: e.clientX, y: e.clientY, entries: this.forPerson_(entries),
++                  sel: -1, sub: null};
++  }
++
++  // Without the developer things for everyone else.
++  private forPerson_(entries: MenuEntry[]): MenuEntry[] {
++    return this.developer ?
++        entries :
++        entries.filter(e => e.icon !== 'code' && e.icon !== 'agents');
+   }
+ 
+   protected onMenuContextmenu_(e: Event) {
+diff --git a/chrome/browser/resources/webui_browser/meridian/try_claude.css b/chrome/browser/resources/webui_browser/meridian/try_claude.css
+new file mode 100644
+index 0000000000..0016c7b69e
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/try_claude.css
+@@ -0,0 +1,214 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #css_wrapper_metadata_end */
++
++/* "Try with Claude": the sheet of cards, the note before Claude restarts,
++ * and the note once Claude is open. */
++
++:host {
++  font-family: system-ui, -apple-system, sans-serif;
++}
++
++button {
++  font: inherit;
++  color: inherit;
++  background: none;
++  border: 0;
++  padding: 0;
++  cursor: pointer;
++}
++
++.scrim {
++  position: fixed;
++  inset: 0;
++  z-index: 190;
++  display: grid;
++  place-items: center;
++  background: rgba(10, 10, 16, 0.36);
++  animation: fade 0.2s ease;
++}
++
++@keyframes fade {
++  from {
++    opacity: 0;
++  }
++}
++
++.sheet,
++.card {
++  box-sizing: border-box;
++  border-radius: 18px;
++  background: var(--meridian-surface, #fff);
++  color: var(--meridian-text, #17171c);
++  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.35),
++      0 0 0 0.5px var(--meridian-border, rgba(0, 0, 0, 0.1));
++  animation: pop 0.26s cubic-bezier(0.05, 0.7, 0.1, 1);
++}
++
++@keyframes pop {
++  from {
++    opacity: 0;
++    transform: translateY(10px) scale(0.98);
++  }
++}
++
++.sheet {
++  width: min(680px, 92vw);
++  max-height: 86vh;
++  overflow-y: auto;
++  padding: 20px 22px 22px;
++}
++
++.head {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++}
++
++h3 {
++  margin: 0;
++  font-size: 18px;
++  font-weight: 700;
++  letter-spacing: -0.01em;
++}
++
++.sub {
++  margin: 6px 0 16px;
++  font-size: 13px;
++  line-height: 1.5;
++  color: var(--meridian-text-muted, #66655f);
++}
++
++.x {
++  display: grid;
++  place-items: center;
++  width: 26px;
++  height: 26px;
++  border-radius: 8px;
++  color: var(--meridian-text-muted, #66655f);
++}
++
++.x:hover {
++  background: color-mix(in srgb, currentColor 12%, transparent);
++}
++
++.card {
++  width: min(440px, 90vw);
++  padding: 22px 24px 18px;
++}
++
++.card h3 {
++  margin-bottom: 10px;
++}
++
++.card p {
++  margin: 0 0 10px;
++  font-size: 13.5px;
++  line-height: 1.5;
++  color: var(--meridian-text-muted, #44444c);
++}
++
++.card p b {
++  color: var(--meridian-text, #17171c);
++}
++
++.card meridian-allow-mock {
++  margin: 14px auto 12px;
++}
++
++.card p.small {
++  font-size: 12px;
++}
++
++.actions {
++  display: flex;
++  justify-content: flex-end;
++  gap: 8px;
++  margin-top: 14px;
++}
++
++.btn {
++  height: 36px;
++  padding: 0 16px;
++  border-radius: 10px;
++  font-size: 13.5px;
++  font-weight: 600;
++}
++
++.btn.primary {
++  background: var(--meridian-text, #17171c);
++  color: var(--meridian-surface, #fff);
++}
++
++.btn.primary:disabled {
++  opacity: 0.7;
++}
++
++.btn.ghost:hover {
++  background: color-mix(in srgb, currentColor 8%, transparent);
++}
++
++.toast {
++  position: fixed;
++  right: 16px;
++  bottom: 18px;
++  z-index: 190;
++  display: flex;
++  align-items: flex-start;
++  gap: 12px;
++  width: min(360px, 80vw);
++  box-sizing: border-box;
++  padding: 13px 12px 13px 14px;
++  border-radius: 14px;
++  background: var(--meridian-surface, #fff);
++  color: var(--meridian-text, #17171c);
++  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.28),
++      0 0 0 0.5px var(--meridian-border, rgba(0, 0, 0, 0.1));
++  font-size: 13px;
++  line-height: 1.45;
++  animation: slide 0.24s cubic-bezier(0.05, 0.7, 0.1, 1);
++}
++
++@keyframes slide {
++  from {
++    opacity: 0;
++    transform: translateY(12px);
++  }
++}
++
++.toast .mark {
++  flex: none;
++  width: 22px;
++  height: 22px;
++  margin-top: 1px;
++  border-radius: 7px;
++  background: #d97757;
++}
++
++.toast.bad .mark {
++  background: #c9a227;
++}
++
++.words {
++  display: flex;
++  flex: 1;
++  flex-direction: column;
++  gap: 2px;
++}
++
++.words span {
++  color: var(--meridian-text-muted, #66655f);
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .scrim,
++  .sheet,
++  .card,
++  .toast {
++    animation: none;
++  }
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/try_claude.html.ts b/chrome/browser/resources/webui_browser/meridian/try_claude.html.ts
+new file mode 100644
+index 0000000000..21cf1b2b8b
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/try_claude.html.ts
+@@ -0,0 +1,60 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {icon} from './icons.js';
++import type {MeridianTryClaudeElement} from './try_claude.js';
++
++export function getHtml(this: MeridianTryClaudeElement) {
++  return html`<!--_html_template_start_-->
++${this.mode === 'sheet' ? html`
++  <div class="scrim" @click="${this.onScrimClick_}"
++      @keydown="${this.onKeydown_}">
++    <div class="sheet" role="dialog" aria-modal="true"
++        aria-label="Try with Claude" @click="${this.onSheetClick_}">
++      <div class="head">
++        <h3>Try with Claude</h3>
++        <button id="close" class="x" title="Close"
++            @click="${this.onCloseClick_}">${icon('x', 14)}</button>
++      </div>
++      <p class="sub">Pick one. Meridian gets the page ready and opens
++        Claude with your request typed in: press Enter, then Allow.</p>
++      <meridian-showcase id="cards"></meridian-showcase>
++    </div>
++  </div>` : ''}
++${this.mode === 'restart' ? html`
++  <div class="scrim" @keydown="${this.onKeydown_}">
++    <div class="card" role="dialog" aria-modal="true"
++        aria-labelledby="restartTitle">
++      <h3 id="restartTitle">Claude needs a quick restart</h3>
++      <p>Claude closes and opens again so it can use Meridian. If
++        something there isn’t saved, Claude asks first.</p>
++      <p>Your request will be waiting: press <b>Enter</b>. The first
++        time, Claude asks to use Meridian. Click <b>Allow</b>.</p>
++      <meridian-allow-mock></meridian-allow-mock>
++      <p class="small">Its words may differ a little. Meridian may ask
++        too before Claude changes something here: Allow that as
++        well.</p>
++      <div class="actions">
++        <button id="restartLater" class="btn ghost"
++            @click="${this.onCloseClick_}">Not now</button>
++        <button id="restartGo" class="btn primary"
++            ?disabled="${this.busy_}" @click="${this.onRestartClick_}">
++          ${this.busy_ ? 'Restarting…' : 'Restart Claude'}</button>
++      </div>
++    </div>
++  </div>` : ''}
++${this.mode === 'sent' ? html`
++  <div id="sent" class="toast ${this.ok_ ? '' : 'bad'}" role="status">
++    <span class="mark"></span>
++    <div class="words">
++      <b>${this.ok_ ? 'Over to Claude' : 'Claude didn’t open'}</b>
++      <span id="sentText">${this.message_}</span>
++    </div>
++    <button class="x" title="Close" @click="${this.onCloseClick_}">
++      ${icon('x', 12)}</button>
++  </div>` : ''}
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/try_claude.ts b/chrome/browser/resources/webui_browser/meridian/try_claude.ts
+new file mode 100644
+index 0000000000..57415d6114
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/try_claude.ts
+@@ -0,0 +1,166 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Runs a "Try with Claude" card (showcase.ts): sets Meridian up with Claude
++// if it isn't yet, gets the scene ready, says what will happen before Claude
++// restarts, and opens Claude with the request typed in. Also the sheet of
++// cards for the command bar's "Try with Claude…".
++
++import './allow_mock.js';
++import './showcase.js';
++
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {browserProxyFactory} from '../sidebar.mojom-webui.js';
++import type {SidebarHandlerInterface} from '../sidebar.mojom-webui.js';
++
++import {sceneFor, showcaseRequest} from './showcase.js';
++import type {MeridianShowcaseElement, ShowcaseId} from './showcase.js';
++import {getCss} from './try_claude.css.js';
++import {getHtml} from './try_claude.html.js';
++
++// The window's side of it: what's in front, and opening a page.
++export interface TryClaudeHost {
++  activeUrl(): string;
++  openUrl(url: string): void;
++}
++
++export type Mode = ''|'sheet'|'restart'|'sent';
++
++// The note after Claude opens stays this long.
++const SENT_MS = 20000;
++
++export class MeridianTryClaudeElement extends CrLitElement {
++  static get is() {
++    return 'meridian-try-claude';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      mode: {type: String, reflect: true},
++      message_: {state: true, type: String},
++      ok_: {state: true, type: Boolean},
++      busy_: {state: true, type: Boolean},
++    };
++  }
++
++  accessor mode: Mode = '';
++  protected accessor message_: string = '';
++  protected accessor ok_: boolean = true;
++  protected accessor busy_: boolean = false;
++
++  host: TryClaudeHost|null = null;
++  private readonly handler_: SidebarHandlerInterface =
++      browserProxyFactory.getInstance().handler;
++  // The request waiting for Claude's restart.
++  private request_: string = '';
++  private sentTimer_: number|null = null;
++
++  // The command bar's "Try with Claude…".
++  async showCards() {
++    this.mode = 'sheet';
++    await this.updateComplete;
++    const cards =
++        this.shadowRoot.querySelector<MeridianShowcaseElement>('#cards');
++    cards?.refresh();
++    cards?.focus();
++  }
++
++  close() {
++    this.mode = '';
++    this.busy_ = false;
++    this.clearTimer_();
++  }
++
++  async run(id: ShowcaseId, topic: string) {
++    this.close();
++    let claude = await this.handler_.getClaudeDesktop();
++    if (!claude.installed) {
++      // Nothing to open: say where to get it, with Ask as the way now.
++      return this.showCards();
++    }
++    if (!claude.connected) {
++      const {ok} = await this.handler_.connectAgentCli('claude-desktop');
++      if (ok) {
++        this.handler_.grantAgentAccess();
++      }
++      claude = await this.handler_.getClaudeDesktop();
++    }
++    const scene = sceneFor(id, this.host?.activeUrl() || '');
++    if (scene) {
++      this.host?.openUrl(scene);
++    }
++    this.request_ = showcaseRequest(id, topic);
++    if (claude.needsRestart) {
++      this.mode = 'restart';
++      await this.updateComplete;
++      this.shadowRoot.querySelector<HTMLElement>('#restartGo')?.focus();
++      return;
++    }
++    return this.send_();
++  }
++
++  private async send_() {
++    this.busy_ = true;
++    const {ok, message} = await this.handler_.openInClaude(this.request_);
++    this.busy_ = false;
++    this.ok_ = ok;
++    this.message_ = message;
++    this.mode = 'sent';
++    this.clearTimer_();
++    this.sentTimer_ = setTimeout(() => {
++      if (this.mode === 'sent') {
++        this.mode = '';
++      }
++    }, SENT_MS);
++  }
++
++  private clearTimer_() {
++    if (this.sentTimer_ !== null) {
++      clearTimeout(this.sentTimer_);
++      this.sentTimer_ = null;
++    }
++  }
++
++  protected onRestartClick_() {
++    if (!this.busy_) {
++      this.send_();
++    }
++  }
++
++  protected onScrimClick_() {
++    this.close();
++  }
++
++  protected onSheetClick_(e: Event) {
++    e.stopPropagation();
++  }
++
++  protected onCloseClick_() {
++    this.close();
++  }
++
++  protected onKeydown_(e: KeyboardEvent) {
++    if (e.key === 'Escape') {
++      e.preventDefault();
++      this.close();
++    }
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-try-claude': MeridianTryClaudeElement;
++  }
++}
++
++customElements.define(MeridianTryClaudeElement.is, MeridianTryClaudeElement);

@@ -197,6 +197,15 @@ test('first run: Claude is found, one Yes connects it, the AI suggests a setup, 
     assert.ok(!sent.includes('secret-page-xyz'), 'no page address goes to the AI');
 
     await b.click(`${OB}.getElementById('next')`);
+    if (process.platform !== 'win32') {
+      // Claude Desktop reads its config when it starts: its restart and its "Allow" explained
+      // first, then things to try with it (showcase.test.mjs runs them).
+      await b.waitFor(`${step} === 'claude'`);
+      assert.match(await b.eval(`${OB}.querySelector('.claude-step').textContent`), /isn’t saved, Claude asks\s+first/);
+      await b.click(`${OB}.getElementById('restartClaude')`);
+      await b.waitFor(`${step} === 'try'`);
+      await b.click(`${OB}.getElementById('next')`); // Maybe later
+    }
     await b.waitFor(`${step} === 'default'`);
     await b.click(`${OB}.getElementById('next')`);
     await b.waitFor(`${step} === 'done'`);
@@ -208,23 +217,12 @@ test('first run: Claude is found, one Yes connects it, the AI suggests a setup, 
     await b.waitFor(`${spaces}.then((n) => JSON.stringify(n) === ${JSON.stringify(JSON.stringify(before))})`);
     await b.waitFor(`!${OB}.getElementById('undoSetup')`);
 
-    // Claude Desktop reads its config when it starts: restart, asked first.
+    // Windows: Meridian can't reopen Claude there; it says what to do and promises nothing.
     if (process.platform === 'win32') {
-      // Meridian can't reopen it there: it says what to do and promises nothing.
       assert.match(await b.eval(`${OB}.querySelector('.ai-done').textContent`), /Close Claude and open it again/);
       assert.equal(await b.eval(`!!${OB}.getElementById('restartClaude')`), false);
     } else {
-      await b.click(`${OB}.getElementById('restartClaude')`);
-      await b.waitFor(`!!${OB}.getElementById('restartGo')`);
-      assert.match(await b.eval(`${OB}.querySelector('.confirm .card').textContent`), /unsaved/);
-      await b.click(`${OB}.getElementById('restartGo')`);
-      await b.waitFor(`/restarted/i.test(${OB}.querySelector('.ai-done')?.textContent || '')`);
-      // A ready request that asks for a plan; Claude doesn't send it by itself.
-      const done = await b.eval(`${OB}.querySelector('.ai-done').textContent`);
-      assert.match(done, /press Enter, then Allow/);
-      const link = decodeURIComponent(done.match(/\[(claude:\/\/[^\]]+)\]/)[1]);
-      assert.match(link, /^claude:\/\/claude\.ai\/new\?q=Look at the tabs/);
-      assert.match(link, /change nothing until I say yes/);
+      assert.equal(await b.eval(`!!${OB}.querySelector('.ai-done')`), false, 'the restart was its own step');
     }
 
     // A hint is the real thing.
