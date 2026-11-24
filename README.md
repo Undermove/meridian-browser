@@ -17,6 +17,7 @@
   <img src="https://img.shields.io/badge/E2E%20tests-170%2B-FF7A59?style=flat-square" alt="170+ end-to-end tests">
   <img src="https://img.shields.io/badge/account-none%20needed-2ea44f?style=flat-square" alt="No account needed">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-FFB347?style=flat-square" alt="MIT license"></a>
+  <a href="https://glama.ai/mcp/servers/Undermove/meridian-browser"><img src="https://glama.ai/mcp/servers/Undermove/meridian-browser/badges/score.svg" alt="Undermove/meridian-browser MCP server" height="20"></a>
 </p>
 
 <p align="center">
@@ -101,7 +102,7 @@ Optional. Skip this section if you only came for the browser.
 
 Linux and Intel Macs aren't supported by the current version.
 
-**First launch.** The macOS build will be Apple-signed soon; until then, open it once, then **System Settings › Privacy & Security › Open Anyway**. On Windows, if SmartScreen says "Windows protected your PC", click **More info › Run anyway**. Every release has signed `SHA256SUMS.txt` to check the download.
+**First launch.** On Mac, Meridian is signed and notarized by Apple, so it opens like any other app. If macOS asks about **Meridian Safe Storage**, click **Always Allow**: that's where the key to your saved logins lives (Chrome and Arc ask the same). On Windows the installer isn't signed by Microsoft yet, so SmartScreen shows "Windows protected your PC": click **More info › Run anyway**. Every release has signed `SHA256SUMS.txt` to check the download.
 
 **Updates** come by themselves: Meridian checks every 20 minutes, shows what's new, and restarts with your tabs.
 
