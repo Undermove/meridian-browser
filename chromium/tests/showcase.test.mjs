@@ -65,7 +65,7 @@ const cardTitles = (root) => `[...${root}.querySelector('meridian-showcase').sha
 const card = (root, id) => `${root}.querySelector('meridian-showcase').shadowRoot.querySelector('.card[data-id="${id}"]')`;
 const TITLES = ['Give this site a new look', 'Find design trends on Pinterest', 'Critique this page like a senior designer', 'Tidy my tabs', 'What else can Meridian do?'];
 
-test('designer first run: Arc first, "We found Claude", its restart and Allow explained, then the cards; a card readies the page and opens Claude with the request', async () => {
+test('designer first run: Arc first, "We found Claude", its restart and Allow explained, then the cards; a card readies the page and opens Claude with the request', { skip: process.platform === 'win32' && 'Meridian can’t restart Claude on Windows, so the tour has no Claude step there' }, async () => {
   const c = computer();
   const arcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-arc-'));
   fs.copyFileSync(path.join(ARC, 'StorableSidebar.json'), path.join(arcDir, 'StorableSidebar.json'));
@@ -218,7 +218,10 @@ test('no Claude on this computer: an honest way to get it, and Ask instead, no d
     await b.waitFor(`app.$.home.shown && !!${HM}.getElementById('tryClaude')`, 15000);
     const S = `${HM}.querySelector('meridian-showcase').shadowRoot`;
     await b.waitFor(`!!${S}.getElementById('getClaude')`);
-    assert.match(await b.eval(`${S}.textContent.replace(/\\s+/g, ' ')`), /Get Claude for Mac.*Ask about this page/);
+    const app = { darwin: 'Claude for Mac', win32: 'Claude for Windows' }[process.platform] || 'Claude';
+    const shown = await b.eval(`${S}.textContent.replace(/\\s+/g, ' ')`);
+    assert.ok(shown.includes(`Get ${app} `) && /Ask about this page/.test(shown), shown);
+    assert.match(shown, process.platform === 'darwin' ? /\(⌘J\)/ : /\(Ctrl\+J\)/);
     // ⌘T's Try with Claude… says the same.
     await b.eval(`app.onCommandBarFeature_({ detail: 'try-claude' })`);
     await b.waitFor(`!!${TC}.querySelector('meridian-showcase')?.shadowRoot.getElementById('askInstead')`);
