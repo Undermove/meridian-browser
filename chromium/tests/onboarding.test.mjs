@@ -322,3 +322,41 @@ test('first run: only OpenCode on the PATH: "We found OpenCode", one Yes writes 
     assert.equal((await b.eval(`${H}.getSettings().then((r) => r.settings)`)).agentAccess, 'ask');
   } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('first run: Cursor and VS Code found: one Yes connects both, then says to restart them', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-firstrun-'));
+  const bin = path.join(dir, 'bin');
+  const empty = path.join(dir, 'none');
+  const cursor = path.join(dir, 'home', '.cursor');
+  for (const d of [bin, empty, cursor]) fs.mkdirSync(d, { recursive: true });
+  const log = path.join(dir, 'code.log');
+  standIn(bin, 'code', `require('fs').appendFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(' ') + '\\n');`);
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  const b = await launch(['about:blank'], { profile, args: ['--meridian-onboarding', `--meridian-arc-dir=${empty}`, `--meridian-chrome-dir=${empty}`, `--meridian-agents-path=${bin}`, `--meridian-cursor-config=${cursor}`, '--meridian-test-ai-consent', '--lang=en-US'] });
+  try {
+    await b.waitFor(`${step} === 'hello'`);
+    await b.click(`${OB}.getElementById('next')`);
+    await b.waitFor(`${step} === 'ai'`, 10000);
+    const said = await b.eval(`${OB}.querySelector('.step-ai').textContent`);
+    assert.match(said, /We found Cursor on your computer/);
+    assert.match(said, /Cursor[\s\S]*VS Code/);
+    assert.doesNotMatch(said, /MCP|Claude|Codex|OpenCode/);
+    assert.equal(fs.existsSync(path.join(cursor, 'mcp.json')), false, 'nothing written before Yes');
+    await b.click(`${OB}.getElementById('aiYes')`);
+    await b.waitFor(`${step} !== 'ai'`, 30000);
+    const written = JSON.parse(fs.readFileSync(path.join(cursor, 'mcp.json'), 'utf8'));
+    assert.match(written.mcpServers.meridian.command, /(Meridian|chrome)(\.exe)?$/i);
+    assert.deepEqual(written.mcpServers.meridian.args, ['--mcp-bridge']);
+    assert.match(fs.readFileSync(log, 'utf8'), /^--add-mcp \{"name":"meridian","type":"stdio","command":"[^"]+","args":\["--mcp-bridge"\]\}\n$/);
+    assert.equal((await b.eval(`${H}.getSettings().then((r) => r.settings)`)).agentAccess, 'ask');
+    await b.waitFor(`${step} === 'tailor'`);
+    await b.click(`${OB}.getElementById('next')`);
+    await b.waitFor(`${step} === 'preview'`, 15000);
+    await b.click(`${OB}.getElementById('next')`);
+    await b.waitFor(`${step} === 'default'`);
+    await b.click(`${OB}.getElementById('next')`);
+    await b.waitFor(`${step} === 'done'`);
+    const done = await b.eval(`${OB}.getElementById('restartApps').textContent.replace(/\\s+/g, ' ').trim()`);
+    assert.equal(done, 'Restart Cursor and VS Code, then ask them to do something in Meridian.');
+  } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); fs.rmSync(dir, { recursive: true, force: true }); }
+});
