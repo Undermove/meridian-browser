@@ -2,6 +2,7 @@
 // never the real Arc data.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -357,4 +358,85 @@ test('first run: Cursor and VS Code found: one Yes connects both, then says to r
     const done = await b.eval(`${OB}.getElementById('restartApps').textContent.replace(/\\s+/g, ' ').trim()`);
     assert.equal(done, 'Restart Cursor and VS Code, then ask them to do something in Meridian.');
   } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ---- Bugs from a recording of a real first run.
+const whispers = `[...${OB}.querySelectorAll('.whisper')].map((e) => e.textContent.replace(/\\s+/g, ' ')).join(' ')`;
+
+// One Arc sign-in, encrypted the way Arc does it on macOS.
+async function arcWithOneSignIn() {
+  const arcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-arc-'));
+  fs.copyFileSync(path.join(ARC, 'StorableSidebar.json'), path.join(arcDir, 'StorableSidebar.json'));
+  const net = path.join(arcDir, 'User Data', 'Default', 'Network');
+  fs.mkdirSync(net, { recursive: true });
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(path.join(net, 'Cookies'));
+  db.exec(`CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT); INSERT INTO meta VALUES('version', '24');
+    CREATE TABLE cookies(creation_utc INTEGER, host_key TEXT, top_frame_site_key TEXT, name TEXT, value TEXT,
+      encrypted_value BLOB, path TEXT, expires_utc INTEGER, is_secure INTEGER, is_httponly INTEGER,
+      last_access_utc INTEGER, has_expires INTEGER, is_persistent INTEGER, priority INTEGER, samesite INTEGER,
+      source_scheme INTEGER, source_port INTEGER)`);
+  const key = crypto.pbkdf2Sync('test-pass', 'saltysalt', 1003, 16, 'sha1');
+  const c = crypto.createCipheriv('aes-128-cbc', key, Buffer.alloc(16, 0x20));
+  const plain = Buffer.concat([crypto.createHash('sha256').update('127.0.0.1').digest(), Buffer.from('signed-in')]);
+  const enc = Buffer.concat([Buffer.from('v10'), c.update(plain), c.final()]);
+  const chrome = (ms) => BigInt(ms) * 1000n + 11644473600000000n;
+  db.prepare(`INSERT INTO cookies VALUES (?, '127.0.0.1', '', 'sid', '', ?, '/', ?, 0, 0, ?, 1, 1, 1, 1, 1, 8080)`)
+    .run(chrome(Date.now() - 1000), enc, chrome(Date.now() + 86400000), chrome(Date.now()));
+  db.close();
+  return arcDir;
+}
+
+test('first run, on this computer only: the promise is true, and a Mac says click', async () => {
+  const noArc = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-noarc-'));
+  const args = ['--meridian-onboarding', `--meridian-arc-dir=${noArc}`, `--meridian-chrome-dir=${noArc}`, `--meridian-agents-path=${noArc}`, '--lang=en-US'];
+  const b = await launch(['about:blank'], { args });
+  try {
+    await b.waitFor(`${step} === 'hello'`);
+    await b.click(`${OB}.getElementById('next')`);
+    await b.waitFor(`${step} === 'tailor'`, 10000);
+    assert.match(await b.eval(whispers), /nothing is sent anywhere/);
+    await b.click(`${OB}.getElementById('next')`);
+    await b.waitFor(`[...${OB}.querySelectorAll('.lines li')].length > 0 || ${step} === 'preview'`, 15000);
+    assert.doesNotMatch(await b.eval(`${OB}.getElementById('root').textContent`), /Asking/);
+    await b.waitFor(`${step} === 'preview'`, 15000);
+    const said = await b.eval(whispers);
+    assert.match(said, /Click anything to leave it out/);
+    assert.doesNotMatch(said, /Tap/);
+  } finally { await b.close(); fs.rmSync(noArc, { recursive: true, force: true }); }
+});
+
+test('first run with Arc and Claude: honest about what is sent, moved-in spaces stay in the preview, one sign-in reads right', async () => {
+  const f = firstRun(JSON.stringify({ title: 'Set up for reading', spaces: [{ name: 'Reading', icon: '📚', color: '#7fbf8e' }], favorites: [] }));
+  // Claude Code only (no Claude for Mac): no restart step in the way.
+  fs.rmSync(path.dirname(f.config), { recursive: true });
+  const arcDir = await arcWithOneSignIn();
+  const args = [...f.args.filter((a) => !a.startsWith('--meridian-arc-dir=')), `--meridian-arc-dir=${arcDir}`, '--meridian-arc-safe-storage=test-pass'];
+  const b = await launch(['about:blank'], { args });
+  try {
+    await b.waitFor(`${step} === 'hello'`);
+    await b.click(`${OB}.getElementById('next')`);
+    await b.waitFor(`${step} === 'arc'`, 10000);
+    await b.click(`${OB}.getElementById('next')`);
+    await b.waitFor(`!!${OB}.querySelector('.confirm')`);
+    await b.click(`${OB}.getElementById('confirmContinue')`);
+    await b.waitFor(`${step} === 'ai'`, 15000);
+    await b.click(`${OB}.getElementById('aiYes')`);
+    await b.waitFor(`${step} === 'tailor'`, 15000);
+    const asking = await b.eval(whispers);
+    assert.doesNotMatch(asking, /nothing is sent/, 'Claude is being asked');
+    assert.match(asking, /Claude gets your space names and the sites you use/);
+    assert.match(asking, /nothing changes until you say so/);
+    await b.waitFor(`${step} === 'preview'`, 30000);
+    const names = (sel) => b.eval(`[...${OB}.querySelectorAll('${sel}')].map((s) => s.textContent.trim())`).then((n) => n.map((x) => x.replace(/^[^\p{L}]*/u, '')));
+    assert.deepEqual(await names('.pv-space.kept'), ['Work', 'Home']);
+    assert.deepEqual(await names('button.pv-space'), ['Reading']);
+    assert.match(await b.eval(whispers), /Your 2 spaces stay as they are/);
+    await b.click(`${OB}.getElementById('next')`);
+    await b.waitFor(`${step} === 'default'`);
+    await b.click(`${OB}.getElementById('next')`);
+    await b.waitFor(`${step} === 'done'`);
+    assert.match(await b.eval(whispers), /\(1 sign-in brought over\)/);
+    assert.deepEqual((await b.state()).spaces.map((s) => s.name), ['Work', 'Home', 'Reading']);
+  } finally { await b.close(); fs.rmSync(arcDir, { recursive: true, force: true }); f.clean(); }
 });
