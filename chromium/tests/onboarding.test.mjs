@@ -289,3 +289,36 @@ test('first run: "Not now" connects nothing; with nothing found there is no ques
     assert.equal(await b.eval(`!!${OB}.getElementById('getClaude')`), true);
   } finally { await b.close(); fs.rmSync(profile2, { recursive: true, force: true }); none.clean(); }
 });
+
+test('first run: only OpenCode on the PATH: "We found OpenCode", one Yes writes its opencode.json', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-firstrun-'));
+  const bin = path.join(dir, 'bin');
+  const empty = path.join(dir, 'none');
+  for (const d of [bin, empty]) fs.mkdirSync(d);
+  const log = path.join(dir, 'opencode.log');
+  // Records how it is run; Connect never needs to run it.
+  standIn(bin, 'opencode', `require('fs').appendFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(' ') + '\\n');`);
+  // Its config folder isn't there yet.
+  const config = path.join(dir, 'xdg', 'opencode');
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  const b = await launch(['about:blank'], { profile, args: ['--meridian-onboarding', `--meridian-arc-dir=${empty}`, `--meridian-chrome-dir=${empty}`, `--meridian-agents-path=${bin}`, `--meridian-opencode-config=${config}`, '--meridian-test-ai-consent', '--lang=en-US'] });
+  try {
+    await b.waitFor(`${step} === 'hello'`);
+    await b.click(`${OB}.getElementById('next')`);
+    await b.waitFor(`${step} === 'ai'`, 10000);
+    const said = await b.eval(`${OB}.querySelector('.step-ai').textContent`);
+    assert.match(said, /We found OpenCode on your computer/);
+    assert.doesNotMatch(said, /Claude Code|Claude Desktop|Codex/);
+    assert.equal(fs.existsSync(config), false, 'nothing written before Yes');
+    await b.click(`${OB}.getElementById('aiYes')`);
+    await b.waitFor(`${step} !== 'ai'`, 30000);
+    const written = JSON.parse(fs.readFileSync(path.join(config, 'opencode.json'), 'utf8'));
+    assert.equal(written.$schema, 'https://opencode.ai/config.json');
+    assert.equal(written.mcp.meridian.type, 'local');
+    assert.equal(written.mcp.meridian.enabled, true);
+    assert.match(written.mcp.meridian.command[0], /(Meridian|chrome)(\.exe)?$/i);
+    assert.equal(written.mcp.meridian.command[1], '--mcp-bridge');
+    assert.equal(fs.existsSync(path.join(config, 'opencode.jsonc')), false, 'no .jsonc made');
+    assert.equal((await b.eval(`${H}.getSettings().then((r) => r.settings)`)).agentAccess, 'ask');
+  } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); fs.rmSync(dir, { recursive: true, force: true }); }
+});
