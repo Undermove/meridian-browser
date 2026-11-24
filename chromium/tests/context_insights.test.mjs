@@ -76,9 +76,9 @@ function transcript() {
   return lines.join('\n') + '\n';
 }
 
-async function setup({ ownStatusLine, ctx }) {
+async function setup({ ownStatusLine, ctx, session }) {
   const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-ci-')));
-  fs.writeFileSync(path.join(project, 'session.jsonl'), transcript());
+  fs.writeFileSync(path.join(project, 'session.jsonl'), session || transcript());
   // The context the stand-in reports.
   if (ctx) fs.writeFileSync(path.join(project, 'ctx.txt'), String(ctx));
   if (ownStatusLine) {
@@ -210,5 +210,110 @@ test('the context gauge sits on the tab\'s line, centred with its name, at every
     assert.ok(g.badge.top >= g.tab.top && g.badge.bottom <= g.tab.bottom, `inside the tab: ${JSON.stringify(g)}`);
     assert.ok(Math.abs(g.badge.mid - g.name.mid) <= 2, `centred with the name: ${JSON.stringify(g)}`);
     assert.ok(g.badge.left >= g.name.right && g.badge.right <= g.close.left, `between the name and the close button: ${JSON.stringify(g)}`);
+  } finally { await done(); }
+});
+
+// A session where each kind of spike happens once, and two that must NOT be blamed on anything: a
+// cache that collapsed with no pause (unknown) and a long pause after which the cache still answered.
+function causesTranscript() {
+  const t0 = Date.parse('2026-11-18T10:00:00Z');
+  const at = (s) => new Date(t0 + s * 1000).toISOString();
+  const lines = [];
+  const L = (o) => lines.push(JSON.stringify(o));
+  const shape = (tools) => L({ type: 'api-request-shape', shape: { system: [{ type: 'text', text: 's'.repeat(800) }], tools } });
+  const read = { name: 'Read', description: 'r'.repeat(400), input_schema: {} };
+  shape([read]);
+  L({ type: 'user', timestamp: at(0), message: { role: 'user', content: 'Fix the login page' } });
+  let n = 0;
+  const req = (s, usage, content = [], extra = {}) => L({ type: 'assistant', requestId: `r${++n}`, timestamp: at(s), isSidechain: false, ...extra,
+    message: { id: `m${n}`, model: 'claude-opus-5-5', role: 'assistant', content, usage: { input_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 100, ...usage } } });
+  req(1, { cache_creation_input_tokens: 9000 }, [{ type: 'tool_use', id: 'u1', name: 'Read', input: { file_path: '/project/src/huge.js' } }]);
+  L({ type: 'user', timestamp: at(2), message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'u1', content: 'a'.repeat(40000) }] } });
+  req(5, { cache_read_input_tokens: 9000, cache_creation_input_tokens: 10200 });
+  req(10, { cache_read_input_tokens: 19200, cache_creation_input_tokens: 300 });
+  shape([read, { name: 'mcp__bigserver__fetch', description: 'm'.repeat(40000), input_schema: {} }]);
+  req(15, { cache_read_input_tokens: 19500, cache_creation_input_tokens: 10500 });
+  req(20, { cache_read_input_tokens: 30000, cache_creation_input_tokens: 200 });
+  // The cache is gone with no pause: nothing in the transcript says why.
+  req(25, { cache_read_input_tokens: 0, cache_creation_input_tokens: 30200 });
+  req(30, { cache_read_input_tokens: 30200, cache_creation_input_tokens: 100 });
+  // Ten minutes, and the whole context written again.
+  req(630, { cache_read_input_tokens: 0, cache_creation_input_tokens: 30300 });
+  L({ type: 'system', subtype: 'compact_boundary', timestamp: at(640), compactMetadata: { trigger: 'auto', preTokens: 30300, postTokens: 6000 } });
+  req(650, { cache_creation_input_tokens: 6000 });
+  // A long pause, yet the cache answered: not a cold cache.
+  req(1300, { cache_read_input_tokens: 6000, cache_creation_input_tokens: 100 });
+  L({ type: 'assistant', requestId: 'sub1', timestamp: at(1310), isSidechain: true, message: { id: 'ms1', model: 'claude-opus-5-5', role: 'assistant', content: [], usage: { input_tokens: 5, cache_creation_input_tokens: 2000, cache_read_input_tokens: 0, output_tokens: 50 } } });
+  L({ type: 'cost-state', totalCostUSD: 2, modelUsage: { 'claude-opus-5-5': { costUSD: 2 } } });
+  return lines.join('\n') + '\n';
+}
+
+const allTurns = `CI.data.moneySeries.flatMap((b) => b.turns).sort((a, b) => a.index - b.index)`;
+async function barPoint(wb, i) {
+  return wb.eval(`(() => { const e = document.querySelectorAll('.ci-money .bar')[${i}]; e.scrollIntoView({ block: 'center' }); const r = e.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+}
+
+test('cost chart: each spike takes its cause only when the transcript proves it; click or drag shows the turns; the money still adds up', async () => {
+  const { wb, project, done } = await setup({ ownStatusLine: false, session: causesTranscript() });
+  try {
+    await wb.eval(`launch('claude').then((t) => !!t)`);
+    await wb.waitFor(`document.getElementById('limits-chip')?.textContent.includes('5h')`, 15000);
+    await click(wb, `document.getElementById('limits-chip')`);
+    await wb.waitFor(`!!document.querySelector('.ci-money .bar')`, 20000);
+
+    assert.deepEqual(await wb.eval(`${allTurns}.map((t) => t.cause)`),
+      ['cold', 'file', 'normal', 'mcp', 'normal', 'unknown', 'normal', 'cold', 'compaction', 'normal']);
+    const why = await wb.eval(`${allTurns}.map((t) => t.why)`);
+    assert.match(why[1], /huge\.js/);
+    assert.match(why[3], /bigserver/);
+    assert.match(why[5], /doesn’t say why/);
+    assert.match(why[7], /10 min/);
+
+    // Every bar adds up both ways, and all of them to Claude Code's own total.
+    const sums = await wb.eval(`CI.data.moneySeries.map((b) => [b.cacheRead + b.cacheWrite + b.input + b.output + b.subagents, Object.values(b.causes).reduce((x, y) => x + y, 0)])`);
+    for (const [kinds, causes] of sums) assert.ok(Math.abs(kinds - causes) < 1e-9, `${kinds} vs ${causes}`);
+    assert.ok(Math.abs(sums.reduce((n, [k]) => n + k, 0) - 2) < 0.001);
+
+    const panel = await wb.eval(`document.querySelector('#side-body').innerText`);
+    for (const s of ['Cold cache', 'Compaction', 'Big file read', 'MCP load', 'Unknown', 'Normal use', 'Subagents', 'API price']) assert.ok(panel.includes(s), `says “${s}”`);
+
+    // A click on the bar with the unexplained spike.
+    const bar = await wb.eval(`CI.data.moneySeries.findIndex((b) => b.turns.some((t) => t.cause === 'unknown'))`);
+    const p = await barPoint(wb, bar);
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y });
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: p.x, y: p.y, button: 'left', clickCount: 1 });
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: p.x, y: p.y, button: 'left', clickCount: 1 });
+    await wb.waitFor(`!!document.querySelector('.ci-range')`);
+    assert.match(await wb.eval(`document.querySelector('.ci-range').innerText`), /doesn’t say why/);
+
+    // A drag over the whole chart: all the turns, the whole cost. It survives the panel redrawing.
+    const a = await barPoint(wb, 0);
+    const z = await barPoint(wb, 39);
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: a.x, y: a.y });
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: a.x, y: a.y, button: 'left', clickCount: 1 });
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: (a.x + z.x) / 2, y: a.y, button: 'left', buttons: 1 });
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: z.x, y: a.y, button: 'left', buttons: 1 });
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: z.x, y: a.y, button: 'left', clickCount: 1 });
+    await wb.waitFor(`/10 turns/.test(document.querySelector('.ci-range')?.innerText || '')`);
+    assert.match(await wb.eval(`document.querySelector('.ci-range').innerText`), /\$2\.00/);
+    await wb.eval(`(renderPanel(), true)`);
+    await wb.waitFor(`/10 turns/.test(document.querySelector('.ci-range')?.innerText || '')`);
+
+    await click(wb, `document.querySelector('.ci-range-clear')`);
+    await wb.waitFor(`!document.querySelector('.ci-range')`);
+
+    // The session goes on and the bars cover a longer time: the selection stays on the same moment.
+    const cmp = await wb.eval(`CI.data.moneySeries.findIndex((b) => b.turns.some((t) => t.cause === 'compaction'))`);
+    const q = await barPoint(wb, cmp);
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: q.x, y: q.y });
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: q.x, y: q.y, button: 'left', clickCount: 1 });
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: q.x, y: q.y, button: 'left', clickCount: 1 });
+    await wb.waitFor(`/Compacted from/.test(document.querySelector('.ci-range')?.innerText || '')`);
+    fs.appendFileSync(path.join(project, 'session.jsonl'), JSON.stringify({ type: 'assistant', requestId: 'later', timestamp: new Date(Date.parse('2026-11-18T10:00:00Z') + 2700000).toISOString(), isSidechain: false,
+      message: { id: 'later', model: 'claude-opus-5-5', role: 'assistant', content: [], usage: { input_tokens: 5, cache_creation_input_tokens: 100, cache_read_input_tokens: 6000, output_tokens: 100 } } }) + '\n');
+    await wb.eval(`ciFetch().then(() => true)`);
+    await wb.waitFor(`CI.data.requests === 11`);
+    assert.notEqual(await wb.eval(`CI.data.moneySeries.findIndex((b) => b.turns.some((t) => t.cause === 'compaction'))`), cmp, 'the bars did move');
+    assert.match(await wb.eval(`document.querySelector('.ci-range').innerText`), /Compacted from/);
   } finally { await done(); }
 });

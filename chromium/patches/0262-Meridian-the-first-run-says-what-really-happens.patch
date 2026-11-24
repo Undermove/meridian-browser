@@ -1,0 +1,188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 01:14:44 +0400
+Subject: [PATCH] Meridian: the first run says what really happens
+
+The setup step tells apart local and AI suggestions, the preview keeps
+the spaces you already have in view and says click, and counts of one
+read right. Ported onto the reworked first run; its dots stay as they
+are, since its steps now change along the way.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../webui_browser/meridian/onboarding.css     |  5 ++
+ .../webui_browser/meridian/onboarding.html.ts | 17 +++++--
+ .../webui_browser/meridian/onboarding.ts      | 50 ++++++++++++++++---
+ 3 files changed, 62 insertions(+), 10 deletions(-)
+
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.css b/chrome/browser/resources/webui_browser/meridian/onboarding.css
+index c644806fdb..4566296f66 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.css
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.css
+@@ -806,6 +806,11 @@ kbd {
+   background: rgba(255, 255, 255, 0.6);
+ }
+ 
++.pv-space.kept {
++  color: rgba(23, 23, 28, 0.62);
++  cursor: default;
++}
++
+ .pv-rows {
+   display: flex;
+   flex-direction: column;
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+index 5d0390c9bb..2cf5eb4e49 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+@@ -124,9 +124,14 @@ export function getHtml(this: MeridianOnboardingElement) {
+               </ul>
+             </div>
+           </div>
+-          <p class="whisper">Meridian suggests spaces and favorites that fit
+-            you. This happens on your computer — nothing is sent anywhere, and
+-            nothing changes until you say so.</p>` : ''}
++          ${this.asksAi_() ? html`
++            <p class="whisper">To suggest spaces and favorites that fit you,
++              ${this.aiName_()} gets your space names and the sites you use,
++              never your pages, passwords or history, and nothing changes
++              until you say so.</p>` : html`
++            <p class="whisper">Meridian suggests spaces and favorites that fit
++              you. This happens on your computer: nothing is sent anywhere, and
++              nothing changes until you say so.</p>`}` : ''}
+ 
+         ${this.step_ === 'preview' ? html`
+           <div class="preview-title">
+@@ -144,6 +149,10 @@ export function getHtml(this: MeridianOnboardingElement) {
+                   </button>`)}
+               </div>
+               <div class="pv-spaces">
++                ${this.keptSpaces_.map(s => html`
++                  <div class="pv-space kept" style="--c:${s.color}">
++                    <em>${s.icon || '•'}</em>${s.name}
++                  </div>`)}
+                 ${this.chips_.map(s => html`
+                   <button class="pv-space ${s.off ? 'off' : ''}"
+                       style="--c:${s.color}" data-index="${s.index}"
+@@ -156,7 +165,7 @@ export function getHtml(this: MeridianOnboardingElement) {
+             <div class="pv-page"><i class="w60"></i><i></i><i class="w80"></i>
+             </div>
+           </div>
+-          <p class="whisper">Tap anything to leave it out.</p>` : ''}
++          <p class="whisper">${this.previewNote_()}</p>` : ''}
+ 
+         ${this.step_ === 'claude' ? html`
+           <div class="claude-step">
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+index 4ed29a9a02..f7fb122f5f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+@@ -145,6 +145,8 @@ export class MeridianOnboardingElement extends CrLitElement {
+       arcSpaces_: {state: true, type: Array},
+       tiles_: {state: true, type: Array},
+       chips_: {state: true, type: Array},
++      keptSpaces_: {state: true, type: Array},
++      existingSpaces_: {state: true, type: Array},
+       persona_: {state: true, type: String},
+       source_: {state: true, type: String},
+       sourceName_: {state: true, type: String},
+@@ -192,6 +194,10 @@ export class MeridianOnboardingElement extends CrLitElement {
+   protected accessor arcSpaces_: SpaceChip[] = [];
+   protected accessor tiles_: FavTile[] = [];
+   protected accessor chips_: SpaceChip[] = [];
++  // What the person already has (say, just moved in): the preview shows it
++  // next to what's new. Everything but an untouched first space stays.
++  protected accessor existingSpaces_: Space[] = [];
++  protected accessor keptSpaces_: SpaceChip[] = [];
+   protected accessor persona_: string = '';
+   protected accessor canStartFresh_: boolean = false;
+   // What's on this computer: agent CLIs and Claude Desktop.
+@@ -269,6 +275,7 @@ export class MeridianOnboardingElement extends CrLitElement {
+     }
+     if (start === 'preset') {
+       const {proposal} = await this.handler_.proposeSetup(false, persona);
++      await this.loadExistingSpaces_();
+       this.proposal_ = proposal;
+       this.pickedSpaces_ = proposal.spaces.map(() => true);
+       this.pickedFavorites_ = proposal.favorites.map(() => true);
+@@ -385,6 +392,37 @@ export class MeridianOnboardingElement extends CrLitElement {
+                                           color: s.color,
+                                           off: !this.pickedSpaces_[index],
+                                         }));
++    // As SidebarService::Import does it: a lone untouched space is replaced
++    // when at least one new space comes.
++    const lone = this.existingSpaces_.length === 1 &&
++        !this.existingSpaces_[0]!.pinned.length;
++    const replaced = lone && this.chips_.some(c => !c.off);
++    this.keptSpaces_ = replaced ? [] : this.existingSpaces_.map(
++        (s, index) => ({index, name: s.name, icon: s.icon,
++                        color: s.color || '#8a8fe0', off: false}));
++  }
++
++  private async loadExistingSpaces_() {
++    const {state} = await this.handler_.getState();
++    this.existingSpaces_ = state.spaces;
++  }
++
++  // The line under the preview: what stays, and that a click leaves out.
++  protected previewNote_(): string {
++    const n = this.keptSpaces_.length;
++    return n ? `Your ${count(n, 'space')} ${n === 1 ? 'stays' : 'stay'} as ${
++                   n === 1 ? 'it is' : 'they are'}. ` +
++            'Click anything new to leave it out.' :
++               'Click anything to leave it out.';
++  }
++
++  // Whether this setup is worked out by an AI, so the words can say so.
++  protected asksAi_(): boolean {
++    return this.aiYes_ && !!this.aiProvider_;
++  }
++
++  protected aiName_(): string {
++    return this.aiProvider_ === 'codex' ? 'Codex' : 'Claude';
+   }
+ 
+   override updated(changed: PropertyValues<this>) {
+@@ -661,9 +699,8 @@ export class MeridianOnboardingElement extends CrLitElement {
+       const {imported, passwords, cards, error} =
+           await this.handler_.importArcLogins(this.source_);
+       const more = [
+-        passwords ? `${passwords.toLocaleString()} passwords` : '',
+-        cards ? `${cards.toLocaleString()} ${cards === 1 ? 'card' : 'cards'}` :
+-                '',
++        passwords ? count(passwords, 'password') : '',
++        cards ? count(cards, 'card') : '',
+       ].filter(x => x);
+       const name = this.sourceName_;
+       this.note_ = error === 'denied' ?
+@@ -674,7 +711,7 @@ export class MeridianOnboardingElement extends CrLitElement {
+           `Sign-ins weren’t brought over: ${name} is open. Quit ${name}, then try again from File > Import from ${name}.` :
+           error ? `${name}’s sign-ins couldn’t be read.` :
+                   `You’re still signed in to your sites (${
+-                      [`${imported.toLocaleString()} sign-ins`, ...more].join(
++                      [count(imported, 'sign-in'), ...more].join(
+                           ', ')} brought over).`;
+     }
+     // History, permissions, sites' data and the rest: nothing to ask.
+@@ -703,10 +740,10 @@ export class MeridianOnboardingElement extends CrLitElement {
+     }
+     // The AI's own, or what was worked out here if it can't.
+     let proposal = local;
+-    if (this.aiYes_ && this.aiProvider_) {
++    if (this.asksAi_()) {
+       this.lines_ = [
+         ...this.lines_,
+-        `Asking ${this.aiProvider_ === 'codex' ? 'Codex' : 'Claude'}…`,
++        `Asking ${this.aiName_()}…`,
+       ];
+       const {proposal: tailored} =
+           await this.handler_.tailorSetup(this.aiProvider_);
+@@ -726,6 +763,7 @@ export class MeridianOnboardingElement extends CrLitElement {
+     }
+     await new Promise(r => setTimeout(r, 600));
+     this.lines_ = [...this.lines_, proposal.title];
++    await this.loadExistingSpaces_();
+     this.proposal_ = proposal;
+     this.pickedSpaces_ = proposal.spaces.map(() => true);
+     this.pickedFavorites_ = proposal.favorites.map(() => true);
