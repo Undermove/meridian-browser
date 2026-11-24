@@ -102,7 +102,7 @@ test('AI: choosing an access level starts the agent socket; Connect shows the ex
     assert.ok(fs.existsSync(endpoint), 'the socket is up');
     assert.equal((await settings(b)).agentAccess, 'ask');
     // The CLIs, with the command Connect would run (never run here).
-    await b.waitFor(`${ST}.querySelectorAll('.row-desc.mono').length === 3`);
+    await b.waitFor(`${ST}.querySelectorAll('.row-desc.mono').length === 4`);
     assert.match(await b.eval(`${ST}.querySelector('.row-desc.mono').textContent`), /mcp add -s user meridian -- .*(Meridian|chrome\.exe'?) --mcp-bridge/i);
     // An installed CLI's Connect… (the rows with a command), not the other AI buttons.
     const connect = `[...${ST}.querySelectorAll('.row-desc.mono')].map((d) => d.closest('.row').querySelector('.btn')).find((x) => !x.disabled)`;
@@ -157,6 +157,74 @@ test('AI › Connect Claude Desktop: adds "meridian" to its config, keeps the ot
     fs.writeFileSync(config, '{ "mcpServers": ');
     assert.match(await connect(), /wasn’t connected: .*isn’t valid JSON/);
     assert.equal(fs.readFileSync(config, 'utf8'), '{ "mcpServers": ');
+  } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
+test('AI › Connect OpenCode: adds "meridian" to opencode.json, never touches opencode.jsonc, refuses a commented opencode.json', async () => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  // OpenCode's config folder ($XDG_CONFIG_HOME/opencode), with the models in opencode.jsonc.
+  const dir = path.join(profile, 'xdg', 'opencode');
+  const json = path.join(dir, 'opencode.json');
+  const jsonc = path.join(dir, 'opencode.jsonc');
+  fs.mkdirSync(dir, { recursive: true });
+  const models = '{\n  "$schema": "https://opencode.ai/config.json",\n  // keys are in auth.json\n  "model": "anthropic/claude-sonnet-4-5",\n  "provider": { "anthropic": { "options": { "timeout": 600000 } } },\n}\n';
+  fs.writeFileSync(jsonc, models);
+  const b = await launch(['about:blank'], { profile, args: [`--meridian-opencode-config=${dir}`] });
+  const row = `[...${ST}.querySelectorAll('.row')].find((r) => r.querySelector('.row-label')?.textContent.trim() === 'OpenCode')`;
+  const connect = async () => {
+    await b.eval(`${row}.querySelector('.btn').click()`);
+    await b.waitFor(`!!${ST}.querySelector('.command')`);
+    assert.match(await b.eval(`${ST}.querySelector('.confirm-card').textContent`), /OpenCode's MCP\s+servers in[\s\S]*opencode\.json[\s\S]*copy of the old file/);
+    assert.match(await b.eval(`${ST}.querySelector('.command').textContent`), /"mcp": \{[\s\S]*"meridian": \{[\s\S]*"type": "local"[\s\S]*"command": \["[^"]+(Meridian|chrome\.exe)", "--mcp-bridge"\]/i);
+    await b.eval(`${ST}.getElementById('connectRun').click()`);
+    await b.waitFor(`!${ST}.querySelector('.command') && !/Connecting/.test(${ST}.querySelector('#ai .group:last-child .note').textContent)`);
+    return b.eval(`${ST}.querySelector('#ai .group:last-child .note').textContent`);
+  };
+  const meridian = (config) => {
+    assert.equal(config.mcp.meridian.type, 'local');
+    assert.equal(config.mcp.meridian.enabled, true);
+    assert.equal(config.mcp.meridian.command.length, 2);
+    assert.match(config.mcp.meridian.command[0], /(Meridian|chrome)(\.exe)?$/i);
+    assert.equal(config.mcp.meridian.command[1], '--mcp-bridge');
+  };
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    await open(b, 'ai');
+    // Found by its config folder (no opencode on this PATH).
+    await b.waitFor(`!!${row} && !${row}.querySelector('.btn').disabled`);
+    assert.match(await b.eval(`${row}.querySelector('.row-desc').textContent`), /opencode\.json$/);
+
+    // No opencode.json yet: a new one, next to the untouched .jsonc.
+    assert.match(await connect(), /OpenCode is connected \(a new config file\)[\s\S]*Restart OpenCode/);
+    await b.waitFor(`app.$.tabstrip.handler_.getSettings().then((r) => r.settings.agentAccess === 'full')`);
+    let config = JSON.parse(fs.readFileSync(json, 'utf8'));
+    assert.equal(config.$schema, 'https://opencode.ai/config.json');
+    meridian(config);
+    assert.equal(fs.readFileSync(jsonc, 'utf8'), models, 'opencode.jsonc is byte for byte the same');
+    assert.equal(fs.existsSync(`${json}.meridian-backup`), false);
+
+    // Again: nothing to change.
+    const once = fs.readFileSync(json, 'utf8');
+    assert.match(await connect(), /already connected/);
+    assert.equal(fs.readFileSync(json, 'utf8'), once);
+
+    // A plain opencode.json of the person's: merged, other keys kept, the old file backed up.
+    const before = { $schema: 'https://opencode.ai/config.json', theme: 'tokyonight', mcp: { files: { type: 'local', command: ['npx', 'fs-server'] } } };
+    fs.writeFileSync(json, JSON.stringify(before, null, 2));
+    assert.match(await connect(), /OpenCode is connected \(the old file is saved as opencode\.json\.meridian-backup\)/);
+    config = JSON.parse(fs.readFileSync(json, 'utf8'));
+    assert.equal(config.theme, 'tokyonight');
+    assert.deepEqual(config.mcp.files, before.mcp.files, 'other servers stay');
+    meridian(config);
+    assert.deepEqual(JSON.parse(fs.readFileSync(`${json}.meridian-backup`, 'utf8')), before);
+
+    // With comments it isn't rewritten: the person is told what to add.
+    const commented = '{\n  // mine\n  "theme": "tokyonight"\n}\n';
+    fs.writeFileSync(json, commented);
+    const said = await connect();
+    assert.match(said, /OpenCode wasn’t connected: .*opencode\.json isn’t plain JSON[\s\S]*"meridian"[\s\S]*--mcp-bridge/);
+    assert.equal(fs.readFileSync(json, 'utf8'), commented);
+    assert.equal(fs.readFileSync(jsonc, 'utf8'), models, 'opencode.jsonc is still the same');
   } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
 
