@@ -1,0 +1,1616 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 24 Nov 2026 21:51:48 +0400
+Subject: [PATCH 1/2] Meridian: Connect Cursor, VS Code, Windsurf, Copilot CLI,
+ Gemini CLI, Qwen Code, Goose, Amp and Factory Droid
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The same one-click Connect as Claude Code, Codex, Claude Desktop and
+OpenCode, in Settings › AI and the first run, each the agent's own
+user-level way:
+
+- by its command: VS Code `code --add-mcp '{"name":"meridian",…}'` (the
+  user profile's mcp.json; `code` from the app when it isn't on the PATH),
+  GitHub Copilot CLI `copilot mcp add meridian -- …`, Gemini CLI and Qwen
+  Code `<cli> mcp add -s user meridian <Meridian> -- --mcp-bridge`;
+- by its config file, the way OpenCode is (other keys kept, the first old
+  file kept as <file>.meridian-backup, links followed, a file that isn't
+  plain JSON left alone with the snippet to add, idempotent): Cursor
+  ~/.cursor/mcp.json and Windsurf ~/.codeium/windsurf/mcp_config.json
+  ("mcpServers"), Amp ~/.config/amp/settings.json ("amp.mcpServers"),
+  Factory Droid ~/.factory/mcp.json (a "stdio" server);
+- Goose: an extension in config.yaml ($XDG_CONFIG_HOME/goose, else
+  ~/.config/goose), added without a YAML library only to the plain block
+  style Goose writes; anything else is left alone with the snippet.
+
+One generic JSON path covers OpenCode and the new files. Each file agent
+has a test switch for its config folder (--meridian-cursor-config, …); in
+a test without it the agent is never found. Found: on the login PATH, its
+app, or its config folder. Settings lists the four as before plus any
+other agent found, and names the rest; after Connect it says which app to
+restart (or to start a new CLI session). The first run says "We found
+<first agent>" and, after Yes, which apps to restart.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   2 +-
+ chrome/browser/meridian/agent/agent_cli.cc    | 827 ++++++++++++++----
+ chrome/browser/meridian/agent/agent_cli.h     |  61 +-
+ .../meridian/agent/agent_cli_unittest.cc      | 234 +++++
+ chrome/browser/meridian/sidebar.mojom         |  14 +-
+ .../webui_browser/meridian/onboarding.html.ts |   4 +
+ .../webui_browser/meridian/onboarding.ts      |  27 +-
+ .../webui_browser/meridian/settings.html.ts   |   6 +-
+ .../webui_browser/meridian/settings.ts        |  33 +-
+ 9 files changed, 985 insertions(+), 223 deletions(-)
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 6fc293db56..4b5917cea2 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -226,7 +226,7 @@ source_set("mission_hook") {
+   ]
+ }
+ 
+-# Connect Claude Code / Codex / Claude Desktop / OpenCode (no browser deps).
++# Connect a coding agent (Claude Code, Cursor, …): no browser deps.
+ source_set("agent_cli") {
+   sources = [
+     "agent/agent_cli.cc",
+diff --git a/chrome/browser/meridian/agent/agent_cli.cc b/chrome/browser/meridian/agent/agent_cli.cc
+index ed8e9853c4..3bc7802362 100644
+--- a/chrome/browser/meridian/agent/agent_cli.cc
++++ b/chrome/browser/meridian/agent/agent_cli.cc
+@@ -4,19 +4,21 @@
+ 
+ #include "chrome/browser/meridian/agent/agent_cli.h"
+ 
++#include <utility>
++
+ #include "base/command_line.h"
+ #include "base/environment.h"
+ #include "base/files/file_util.h"
+ #include "base/files/important_file_writer.h"
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
+-#include "base/path_service.h"
+-#include "base/values.h"
+ #include "base/no_destructor.h"
++#include "base/path_service.h"
+ #include "base/process/launch.h"
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/values.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/meridian/ai/process_runner.h"
+ #include "chrome/browser/meridian/test_switches.h"
+@@ -25,25 +27,76 @@ namespace meridian {
+ 
+ namespace {
+ 
++// ---- Agents with an "mcp add" command
++
++using ArgsFn = std::vector<std::string> (*)(const std::string& program);
++
+ struct Known {
+   const char* id;
+   const char* name;
+-  // Arguments before the server command.
+-  std::vector<std::string> args;
++  const char* bin;
++  // The arguments that add `program --mcp-bridge` as "meridian".
++  ArgsFn args;
+ };
+ 
++std::string JsonString(const std::string& s) {
++  std::string out;
++  base::JSONWriter::Write(base::Value(s), &out);
++  return out;
++}
++
++// claude mcp add -s user meridian -- <program> --mcp-bridge
++std::vector<std::string> ClaudeArgs(const std::string& program) {
++  return {"mcp", "add", "-s", "user", "meridian", "--", program,
++          "--mcp-bridge"};
++}
++
++// codex / copilot mcp add meridian -- <program> --mcp-bridge
++std::vector<std::string> DashDashArgs(const std::string& program) {
++  return {"mcp", "add", "meridian", "--", program, "--mcp-bridge"};
++}
++
++// gemini / qwen mcp add -s user meridian <program> -- --mcp-bridge: their
++// <commandOrUrl> comes before "--", the server's own flags after it.
++std::vector<std::string> GeminiArgs(const std::string& program) {
++  return {"mcp", "add", "-s", "user", "meridian", program, "--",
++          "--mcp-bridge"};
++}
++
++// code --add-mcp '{"name":"meridian",…}': into the VS Code user profile's
++// mcp.json, which Copilot's agent mode reads. Same name again replaces it.
++std::vector<std::string> VsCodeArgs(const std::string& program) {
++  return {"--add-mcp", "{\"name\":\"meridian\",\"type\":\"stdio\","
++                       "\"command\":" +
++                           JsonString(program) +
++                           ",\"args\":[\"--mcp-bridge\"]}"};
++}
++
+ const std::vector<Known>& KnownClis() {
+-  static const base::NoDestructor<std::vector<Known>> clis(
+-      std::vector<Known>{
+-          {"claude", "Claude Code", {"mcp", "add", "-s", "user", "meridian", "--"}},
+-          {"codex", "Codex", {"mcp", "add", "meridian", "--"}},
+-      });
++  static const base::NoDestructor<std::vector<Known>> clis(std::vector<Known>{
++      {"claude", "Claude Code", "claude", &ClaudeArgs},
++      {"codex", "Codex", "codex", &DashDashArgs},
++      {"vscode", "VS Code", "code", &VsCodeArgs},
++      {"copilot", "GitHub Copilot CLI", "copilot", &DashDashArgs},
++      {"gemini", "Gemini CLI", "gemini", &GeminiArgs},
++      {"qwen", "Qwen Code", "qwen", &GeminiArgs},
++  });
+   return *clis;
+ }
+ 
++const Known* FindKnown(const std::string& id) {
++  for (const Known& cli : KnownClis()) {
++    if (cli.id == id) {
++      return &cli;
++    }
++  }
++  return nullptr;
++}
++
+ #if !BUILDFLAG(IS_WIN)
+ std::string Shell() {
+-  std::optional<std::string> shell = base::Environment::Create()->GetVar("SHELL");
++  std::optional<std::string> shell =
++      base::Environment::Create()->GetVar("SHELL");
+   return shell && !shell->empty() ? *shell : "/bin/zsh";
+ }
+ #endif
+@@ -78,24 +131,96 @@ std::string Which(const std::string& name, const std::string& path) {
+   return ai::FindProgram(name, path);
+ }
+ 
+-std::vector<std::string> Args(const Known& cli) {
+-  std::vector<std::string> args = cli.args;
+-  args.push_back(base::CommandLine::ForCurrentProcess()->GetProgram().AsUTF8Unsafe());
+-  args.push_back("--mcp-bridge");
+-  return args;
++// An app in /Applications or ~/Applications (never in a test).
++std::string App(const std::string& bundle, const std::string& inside = "") {
++#if BUILDFLAG(IS_MAC)
++  if (TestSwitchesAllowed()) {
++    return std::string();
++  }
++  for (const base::FilePath& dir :
++       {base::FilePath("/Applications"),
++        base::GetHomeDir().Append("Applications")}) {
++    base::FilePath app = dir.Append(bundle);
++    if (base::DirectoryExists(app) &&
++        (inside.empty() || base::PathExists(app.Append(inside)))) {
++      return app.Append(inside).AsUTF8Unsafe();
++    }
++  }
++#endif
++  return std::string();
++}
++
++// The CLI on the login PATH. VS Code's `code` is often not there (it's an
++// extra step in VS Code), but it's always inside the app.
++std::string Locate(const Known& cli, const std::string& path) {
++  std::string bin = Which(cli.bin, path);
++  if (bin.empty() && std::string_view(cli.id) == "vscode") {
++    bin = App("Visual Studio Code.app", "Contents/Resources/app/bin/code");
++  }
++  return bin;
++}
++
++std::string Program() {
++  return base::CommandLine::ForCurrentProcess()->GetProgram().AsUTF8Unsafe();
+ }
+ 
+ std::string CommandOf(const Known& cli) {
+-  std::string command = cli.id;
+-  for (const std::string& arg : Args(cli)) {
++  std::string command = cli.bin;
++  for (const std::string& arg : cli.args(Program())) {
+     bool plain = std::ranges::all_of(arg, [](char c) {
+-      return base::IsAsciiAlphaNumeric(c) || std::string_view("@%+=:,./-_").find(c) != std::string_view::npos;
++      return base::IsAsciiAlphaNumeric(c) ||
++             std::string_view("@%+=:,./-_").find(c) != std::string_view::npos;
+     });
+     command += " " + (plain ? arg : Quote(arg));
+   }
+   return command;
+ }
+ 
++bool RunCli(const Known& cli, std::string* output) {
++  std::string bin = Locate(cli, LoginPath());
++  if (bin.empty()) {
++    *output = std::string(cli.bin) + " was not found on your PATH";
++    return false;
++  }
++  const std::vector<std::string> args = cli.args(Program());
++  int exit_code = -1;
++#if BUILDFLAG(IS_WIN)
++  base::CommandLine command(base::FilePath::FromUTF8Unsafe(bin));
++  for (const std::string& arg : args) {
++    command.AppendArgNative(base::UTF8ToWide(arg));
++  }
++  base::GetAppOutputAndError(command, output);
++  // (Only the output says how it went there.)
++  exit_code =
++      base::ToLowerASCII(*output).find("error") == std::string::npos ? 0 : 1;
++#else
++  // Through the login shell, for the CLI's own PATH (node and the like).
++  std::string script = Quote(bin);
++  for (const std::string& arg : args) {
++    script += " " + Quote(arg);
++  }
++  base::GetAppOutputWithExitCode(
++      base::CommandLine({Shell(), "-lc", script + " 2>&1"}), output,
++      &exit_code);
++#endif
++  if (output->size() > 2000) {
++    output->resize(2000);
++  }
++  return exit_code == 0 ||
++         base::ToLowerASCII(*output).find("already exists") !=
++             std::string::npos;
++}
++
++// The config file as the person knows it: ~/Library/...
++std::string DisplayPath(const base::FilePath& file) {
++  const std::string home = base::GetHomeDir().AsUTF8Unsafe();
++  const std::string path = file.AsUTF8Unsafe();
++  if (!home.empty() && base::StartsWith(path, home + "/")) {
++    return "~" + path.substr(home.size());
++  }
++  return path;
++}
++
+ // ---- Claude Desktop
+ 
+ constexpr char kDesktopId[] = "claude-desktop";
+@@ -146,32 +271,16 @@ bool DesktopInstalled() {
+ 
+ base::DictValue DesktopServer() {
+   return base::DictValue()
+-      .Set("command",
+-           base::CommandLine::ForCurrentProcess()->GetProgram().AsUTF8Unsafe())
++      .Set("command", Program())
+       .Set("args", base::ListValue().Append("--mcp-bridge"));
+ }
+ 
+ // What Connect adds, the way the file will read.
+ std::string DesktopCommand() {
+-  std::string program;
+-  base::JSONWriter::Write(
+-      base::Value(
+-          base::CommandLine::ForCurrentProcess()->GetProgram().AsUTF8Unsafe()),
+-      &program);
+-  return "\"meridian\": {\n  \"command\": " + program +
++  return "\"meridian\": {\n  \"command\": " + JsonString(Program()) +
+          ",\n  \"args\": [\"--mcp-bridge\"]\n}";
+ }
+ 
+-// The config file as the person knows it: ~/Library/...
+-std::string DisplayPath(const base::FilePath& file) {
+-  const std::string home = base::GetHomeDir().AsUTF8Unsafe();
+-  const std::string path = file.AsUTF8Unsafe();
+-  if (!home.empty() && base::StartsWith(path, home + "/")) {
+-    return "~" + path.substr(home.size());
+-  }
+-  return path;
+-}
+-
+ base::FilePath DesktopBackup(const base::FilePath& config) {
+   return config.AddExtensionASCII("meridian-backup");
+ }
+@@ -189,7 +298,7 @@ bool ConnectDesktop(std::string* output) {
+   const bool existed = base::PathExists(config);
+   if (existed) {
+     if (!base::ReadFileToString(config, &text)) {
+-      *output = "couldn\u2019t read " + config.AsUTF8Unsafe();
++      *output = "couldn’t read " + config.AsUTF8Unsafe();
+       return false;
+     }
+     if (!base::TrimWhitespaceASCII(text, base::TRIM_ALL).empty()) {
+@@ -198,7 +307,7 @@ bool ConnectDesktop(std::string* output) {
+       if (!parsed) {
+         // Never overwrite a file we can't read back.
+         *output = config.AsUTF8Unsafe() +
+-                  " isn\u2019t valid JSON; fix it (or move it away) and "
++                  " isn’t valid JSON; fix it (or move it away) and "
+                   "try again";
+         return false;
+       }
+@@ -208,7 +317,7 @@ bool ConnectDesktop(std::string* output) {
+   base::Value* servers = root.Find("mcpServers");
+   if (servers && !servers->is_dict()) {
+     *output = "\"mcpServers\" in " + config.AsUTF8Unsafe() +
+-              " isn\u2019t an object; nothing was changed";
++              " isn’t an object; nothing was changed";
+     return false;
+   }
+   base::DictValue server = DesktopServer();
+@@ -220,7 +329,7 @@ bool ConnectDesktop(std::string* output) {
+     }
+   }
+   if (existed && !base::CopyFile(config, DesktopBackup(config))) {
+-    *output = "couldn\u2019t back up " + config.AsUTF8Unsafe();
++    *output = "couldn’t back up " + config.AsUTF8Unsafe();
+     return false;
+   }
+   if (!servers) {
+@@ -232,7 +341,7 @@ bool ConnectDesktop(std::string* output) {
+       root, base::JSONWriter::OPTIONS_PRETTY_PRINT, &json);
+   if (!base::CreateDirectory(config.DirName()) ||
+       !base::ImportantFileWriter::WriteFileAtomically(config, json)) {
+-    *output = "couldn\u2019t write " + config.AsUTF8Unsafe();
++    *output = "couldn’t write " + config.AsUTF8Unsafe();
+     return false;
+   }
+   *output = existed ? "the old file is saved as " +
+@@ -241,12 +350,49 @@ bool ConnectDesktop(std::string* output) {
+   return true;
+ }
+ 
+-// ---- OpenCode
++// ---- Agents set up by file
+ 
+-constexpr char kOpenCodeId[] = "opencode";
++struct FileAgent {
++  const char* id;
++  const char* name;
++  const char* config_switch;
++  // The config folder: under $XDG_CONFIG_HOME (else ~/.config) when `xdg`,
++  // else under the home folder.
++  bool xdg;
++  const char* folder;
++  const char* file;
++  // Found: one of these on the PATH, one of these apps, or the folder.
++  std::vector<const char*> bins;
++  std::vector<const char*> apps;
++};
+ 
+-std::string Program() {
+-  return base::CommandLine::ForCurrentProcess()->GetProgram().AsUTF8Unsafe();
++const std::vector<FileAgent>& FileAgents() {
++  static const base::NoDestructor<std::vector<FileAgent>> agents(
++      std::vector<FileAgent>{
++          {"opencode", "OpenCode", kOpenCodeConfigSwitch, true, "opencode",
++           "opencode.json", {"opencode"}, {}},
++          {"cursor", "Cursor", kCursorConfigSwitch, false, ".cursor",
++           "mcp.json", {"cursor", "cursor-agent"}, {"Cursor.app"}},
++          {"windsurf", "Windsurf", kWindsurfConfigSwitch, false,
++           ".codeium/windsurf", "mcp_config.json", {"windsurf"},
++           {"Windsurf.app"}},
++          {"goose", "Goose", kGooseConfigSwitch, true, "goose", "config.yaml",
++           {"goose"}, {"Goose.app"}},
++          {"amp", "Amp", kAmpConfigSwitch, false, ".config/amp",
++           "settings.json", {"amp"}, {}},
++          {"droid", "Factory Droid", kDroidConfigSwitch, false, ".factory",
++           "mcp.json", {"droid"}, {}},
++      });
++  return *agents;
++}
++
++const FileAgent* FindFileAgent(const std::string& id) {
++  for (const FileAgent& agent : FileAgents()) {
++    if (agent.id == id) {
++      return &agent;
++    }
++  }
++  return nullptr;
+ }
+ 
+ // A variable as the person's terminal has it (apps started from the Dock
+@@ -265,198 +411,501 @@ std::string LoginVar(const char* name) {
+   return out;
+ }
+ 
+-// Where OpenCode reads its global config.
+-base::FilePath OpenCodeDir() {
++// A test sees its fixture or nothing: never the person's real config.
++bool TestWithoutConfig(const FileAgent& agent) {
++  return TestSwitchesAllowed() &&
++         !base::CommandLine::ForCurrentProcess()->HasSwitch(
++             agent.config_switch);
++}
++
++// Where the agent keeps its global config. `xdg_home` is $XDG_CONFIG_HOME
++// (empty: ~/.config).
++base::FilePath ConfigDir(const FileAgent& agent, const std::string& xdg_home) {
+   const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
+-  if (cl->HasSwitch(kOpenCodeConfigSwitch)) {
+-    return cl->GetSwitchValuePath(kOpenCodeConfigSwitch);
++  if (cl->HasSwitch(agent.config_switch)) {
++    return cl->GetSwitchValuePath(agent.config_switch);
++  }
++  if (agent.xdg) {
++    base::FilePath base = xdg_home.empty()
++                              ? base::GetHomeDir().AppendASCII(".config")
++                              : base::FilePath::FromUTF8Unsafe(xdg_home);
++    return base.AppendASCII(agent.folder);
+   }
+-  const std::string xdg = LoginVar("XDG_CONFIG_HOME");
+-  if (!xdg.empty()) {
+-    return base::FilePath::FromUTF8Unsafe(xdg).AppendASCII("opencode");
++  base::FilePath dir = base::GetHomeDir();
++  for (const std::string& part :
++       base::SplitString(agent.folder, "/", base::KEEP_WHITESPACE,
++                         base::SPLIT_WANT_NONEMPTY)) {
++    dir = dir.AppendASCII(part);
+   }
+-  return base::GetHomeDir().AppendASCII(".config").AppendASCII("opencode");
++  return dir;
+ }
+ 
+-bool OpenCodeTestWithoutConfig() {
+-  return TestSwitchesAllowed() &&
+-         !base::CommandLine::ForCurrentProcess()->HasSwitch(
+-             kOpenCodeConfigSwitch);
++// The "meridian" entry of a JSON config, in the order it is shown.
++struct JsonEntry {
++  std::string key;  // the object the servers live in
++  std::vector<std::pair<std::string, base::Value>> fields;
++  base::DictValue new_file;  // what a new file starts with
++};
++
++JsonEntry EntryFor(const std::string& id, const std::string& program) {
++  JsonEntry e;
++  auto args = [] { return base::Value(base::ListValue().Append("--mcp-bridge")); };
++  if (id == "opencode") {
++    e.key = "mcp";
++    e.fields.emplace_back("type", base::Value("local"));
++    e.fields.emplace_back(
++        "command",
++        base::Value(base::ListValue().Append(program).Append("--mcp-bridge")));
++    e.fields.emplace_back("enabled", base::Value(true));
++    e.new_file.Set("$schema", "https://opencode.ai/config.json");
++    return e;
++  }
++  e.key = id == "amp" ? "amp.mcpServers" : "mcpServers";
++  if (id == "droid") {
++    e.fields.emplace_back("type", base::Value("stdio"));
++  }
++  e.fields.emplace_back("command", base::Value(program));
++  e.fields.emplace_back("args", args());
++  if (id == "droid") {
++    e.fields.emplace_back("disabled", base::Value(false));
++  }
++  return e;
+ }
+ 
+-base::DictValue OpenCodeServer(const std::string& program) {
+-  return base::DictValue()
+-      .Set("type", "local")
+-      .Set("command", base::ListValue().Append(program).Append("--mcp-bridge"))
+-      .Set("enabled", true);
++base::DictValue ServerOf(const JsonEntry& e) {
++  base::DictValue server;
++  for (const auto& [key, value] : e.fields) {
++    server.Set(key, value.Clone());
++  }
++  return server;
++}
++
++// JSON with lists on one line, the way people write it.
++std::string Render(const base::Value& value) {
++  if (!value.is_list()) {
++    std::string out;
++    base::JSONWriter::Write(value, &out);
++    return out;
++  }
++  std::vector<std::string> items;
++  for (const base::Value& item : value.GetList()) {
++    items.push_back(Render(item));
++  }
++  return "[" + base::JoinString(items, ", ") + "]";
+ }
+ 
+ // What Connect adds, the way the file will read.
+-std::string OpenCodeCommand(const std::string& program) {
+-  std::string quoted;
+-  base::JSONWriter::Write(base::Value(program), &quoted);
+-  return "\"mcp\": {\n  \"meridian\": {\n    \"type\": \"local\",\n"
+-         "    \"command\": [" +
+-         quoted +
+-         ", \"--mcp-bridge\"],\n    \"enabled\": true\n  }\n}";
++std::string JsonSnippet(const JsonEntry& e) {
++  std::string out = JsonString(e.key) + ": {\n  \"meridian\": {\n";
++  for (size_t i = 0; i < e.fields.size(); ++i) {
++    out += "    " + JsonString(e.fields[i].first) + ": " +
++           Render(e.fields[i].second) +
++           (i + 1 < e.fields.size() ? ",\n" : "\n");
++  }
++  return out + "  }\n}";
+ }
+ 
+-}  // namespace
++// Goose's extension, its fields indented by `indent` under "meridian:".
++std::vector<std::string> GooseBlock(size_t indent, const std::string& program) {
++  const std::string key(indent, ' ');
++  const std::string field(indent * 2, ' ');
++  return {key + "meridian:",
++          field + "enabled: true",
++          field + "type: stdio",
++          field + "name: meridian",
++          field + "description: Control the Meridian browser",
++          field + "cmd: " + JsonString(program),
++          field + "args: [\"--mcp-bridge\"]",
++          field + "envs: {}",
++          field + "env_keys: []",
++          field + "timeout: 300"};
++}
+ 
+-bool AddOpenCodeServer(const base::FilePath& dir,
+-                       const std::string& program,
+-                       std::string* output) {
+-  base::FilePath config = dir.AppendASCII("opencode.json");
+-  // Kept in a dotfiles repository and linked here: write where it really is.
+-  if (base::IsLink(config)) {
+-    base::FilePath real = base::MakeAbsoluteFilePath(config);
+-    if (real.empty()) {
+-      *output = config.AsUTF8Unsafe() + " links to a file that isn\u2019t "
+-                "there; nothing was changed";
+-      return false;
+-    }
+-    config = real;
++std::string GooseSnippet(const std::string& program) {
++  return "extensions:\n" + base::JoinString(GooseBlock(2, program), "\n");
++}
++
++std::string SnippetFor(const std::string& id, const std::string& program) {
++  return id == "goose" ? GooseSnippet(program)
++                       : JsonSnippet(EntryFor(id, program));
++}
++
++std::string ByHand(const std::string& id, const std::string& program) {
++  return "Add this to it yourself:\n" + SnippetFor(id, program);
++}
++
++// Kept in a dotfiles repository and linked here: write where it really is.
++bool FollowLink(base::FilePath* config, std::string* output) {
++  if (!base::IsLink(*config)) {
++    return true;
++  }
++  base::FilePath real = base::MakeAbsoluteFilePath(*config);
++  if (real.empty()) {
++    *output = config->AsUTF8Unsafe() +
++              " links to a file that isn’t there; nothing was changed";
++    return false;
++  }
++  *config = real;
++  return true;
++}
++
++// Writes `text`, keeping the first old file next to it.
++bool WriteConfig(const base::FilePath& config,
++                 bool existed,
++                 const std::string& text,
++                 std::string* output) {
++  const base::FilePath backup = config.AddExtensionASCII("meridian-backup");
++  const bool back_up = existed && !base::PathExists(backup);
++  if (back_up && !base::CopyFile(config, backup)) {
++    *output = "couldn’t back up " + config.AsUTF8Unsafe();
++    return false;
++  }
++  if (!base::CreateDirectory(config.DirName()) ||
++      !base::ImportantFileWriter::WriteFileAtomically(config, text)) {
++    *output = "couldn’t write " + config.AsUTF8Unsafe();
++    return false;
+   }
+-  const std::string by_hand = "Add this to it yourself:\n" +
+-                              OpenCodeCommand(program);
++  *output = !existed ? "a new config file"
++            : back_up
++                ? "the old file is saved as " + backup.BaseName().AsUTF8Unsafe()
++                : "updated " + config.BaseName().AsUTF8Unsafe();
++  return true;
++}
++
++bool AddJson(const std::string& id,
++             const base::FilePath& config,
++             bool existed,
++             const std::string& text,
++             const std::string& program,
++             std::string* output) {
++  JsonEntry entry = EntryFor(id, program);
+   base::DictValue root;
+-  const bool existed = base::PathExists(config);
+-  if (existed) {
+-    std::string text;
+-    if (!base::ReadFileToString(config, &text)) {
+-      *output = "couldn\u2019t read " + config.AsUTF8Unsafe();
+-      return false;
+-    }
+-    if (!base::TrimWhitespaceASCII(text, base::TRIM_ALL).empty()) {
+-      // Plain JSON only: comments would be lost on the way back.
+-      std::optional<base::DictValue> parsed =
+-          base::JSONReader::ReadDict(text, base::JSON_PARSE_RFC);
+-      if (!parsed) {
+-        *output = config.AsUTF8Unsafe() +
+-                  " isn\u2019t plain JSON (comments?), so Meridian left it "
+-                  "as it is. " + by_hand;
+-        return false;
+-      }
+-      root = std::move(*parsed);
++  if (base::TrimWhitespaceASCII(text, base::TRIM_ALL).empty()) {
++    if (!existed) {
++      root = std::move(entry.new_file);
+     }
+   } else {
+-    root.Set("$schema", "https://opencode.ai/config.json");
++    // Plain JSON only: comments would be lost on the way back.
++    std::optional<base::DictValue> parsed =
++        base::JSONReader::ReadDict(text, base::JSON_PARSE_RFC);
++    if (!parsed) {
++      *output = config.AsUTF8Unsafe() +
++                " isn’t plain JSON (comments?), so Meridian left it as "
++                "it is. " + ByHand(id, program);
++      return false;
++    }
++    root = std::move(*parsed);
+   }
+-  base::Value* mcp = root.Find("mcp");
+-  if (mcp && !mcp->is_dict()) {
+-    *output = "\"mcp\" in " + config.AsUTF8Unsafe() +
+-              " isn\u2019t an object; nothing was changed. " + by_hand;
++  base::Value* servers = root.Find(entry.key);
++  if (servers && !servers->is_dict()) {
++    *output = JsonString(entry.key) + " in " + config.AsUTF8Unsafe() +
++              " isn’t an object; nothing was changed. " +
++              ByHand(id, program);
+     return false;
+   }
+-  base::DictValue server = OpenCodeServer(program);
+-  if (mcp) {
+-    const base::DictValue* current = mcp->GetDict().FindDict("meridian");
++  base::DictValue server = ServerOf(entry);
++  if (servers) {
++    const base::DictValue* current = servers->GetDict().FindDict("meridian");
+     if (current && *current == server) {
+       *output = "already connected";
+       return true;
+     }
+   }
+-  const base::FilePath backup = config.AddExtensionASCII("meridian-backup");
+-  const bool back_up = existed && !base::PathExists(backup);
+-  if (back_up && !base::CopyFile(config, backup)) {
+-    *output = "couldn\u2019t back up " + config.AsUTF8Unsafe();
+-    return false;
+-  }
+-  if (!mcp) {
+-    mcp = root.Set("mcp", base::DictValue());
++  if (!servers) {
++    servers = root.Set(entry.key, base::DictValue());
+   }
+-  mcp->GetDict().Set("meridian", std::move(server));
++  servers->GetDict().Set("meridian", std::move(server));
+   std::string json;
+   base::JSONWriter::WriteWithOptions(
+       root, base::JSONWriter::OPTIONS_PRETTY_PRINT, &json);
+-  if (!base::CreateDirectory(config.DirName()) ||
+-      !base::ImportantFileWriter::WriteFileAtomically(config, json)) {
+-    *output = "couldn\u2019t write " + config.AsUTF8Unsafe();
++  return WriteConfig(config, existed, json, output);
++}
++
++// ---- Goose's config.yaml, without a YAML library: Meridian only adds to
++// the plain block style Goose itself writes, and leaves anything else alone.
++
++bool Blank(std::string_view line) {
++  return base::TrimWhitespaceASCII(line, base::TRIM_ALL).empty();
++}
++
++bool Comment(std::string_view line) {
++  return base::StartsWith(base::TrimWhitespaceASCII(line, base::TRIM_LEADING),
++                          "#");
++}
++
++size_t Indent(std::string_view line) {
++  size_t n = line.find_first_not_of(' ');
++  return n == std::string_view::npos ? line.size() : n;
++}
++
++// `line` (unindented) is the mapping key `key`: `key:`, `"key" :` and the
++// like. `plain` is the form Goose writes (key: …); `rest` what follows ':'.
++bool IsKey(std::string_view line,
++           std::string_view key,
++           bool* plain,
++           std::string_view* rest) {
++  std::string_view s = line;
++  char quote = 0;
++  if (!s.empty() && (s[0] == '"' || s[0] == '\'')) {
++    quote = s[0];
++    s.remove_prefix(1);
++  }
++  if (!base::StartsWith(s, key)) {
+     return false;
+   }
+-  *output = !existed ? "a new config file"
+-            : back_up ? "the old file is saved as " +
+-                            backup.BaseName().AsUTF8Unsafe()
+-                      : "updated " + config.BaseName().AsUTF8Unsafe();
++  s.remove_prefix(key.size());
++  if (quote) {
++    if (s.empty() || s[0] != quote) {
++      return false;
++    }
++    s.remove_prefix(1);
++  }
++  size_t spaces = s.find_first_not_of(' ');
++  if (spaces == std::string_view::npos || s[spaces] != ':' ||
++      (spaces + 1 < s.size() && s[spaces + 1] != ' ')) {
++    return false;
++  }
++  *plain = !quote && spaces == 0;
++  *rest = base::TrimWhitespaceASCII(s.substr(spaces + 1), base::TRIM_ALL);
+   return true;
+ }
+ 
+-std::vector<AgentCli> DetectAgentClis() {
+-  std::string path = LoginPath();
+-  std::vector<AgentCli> out;
+-  for (const Known& cli : KnownClis()) {
+-    out.push_back({cli.id, cli.name, Which(cli.id, path), CommandOf(cli), ""});
+-  }
+-  out.push_back({kDesktopId, "Claude Desktop",
+-                 DesktopInstalled() ? DesktopConfig().AsUTF8Unsafe() : "",
+-                 DesktopCommand(), DisplayPath(DesktopConfig())});
+-  // Found: on the PATH, or it made its config folder. A test sees its
+-  // fixture or nothing: never the person's real OpenCode.
+-  std::string opencode;
+-  base::FilePath opencode_dir;
+-  if (!OpenCodeTestWithoutConfig()) {
+-    opencode_dir = OpenCodeDir();
+-    opencode = Which(kOpenCodeId, path);
+-    if (opencode.empty() && base::DirectoryExists(opencode_dir)) {
+-      opencode = opencode_dir.AsUTF8Unsafe();
++bool AddGoose(const base::FilePath& config,
++              bool existed,
++              const std::string& text,
++              const std::string& program,
++              std::string* output) {
++  const std::string refused =
++      config.AsUTF8Unsafe() +
++      " is written in a way Meridian can’t safely add to, so it left "
++      "it as it is. " + ByHand("goose", program);
++  if (text.find('\t') != std::string::npos ||
++      text.find('\r') != std::string::npos) {
++    *output = refused;
++    return false;
++  }
++  std::vector<std::string> lines = base::SplitString(
++      text, "\n", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL);
++  while (!lines.empty() && Blank(lines.back())) {
++    lines.pop_back();
++  }
++  // A plain mapping at the top, with at most one "extensions".
++  size_t ext = std::string::npos;
++  std::string_view ext_rest;
++  for (size_t i = 0; i < lines.size(); ++i) {
++    const std::string& line = lines[i];
++    if (Blank(line) || Comment(line) || Indent(line) > 0) {
++      continue;
++    }
++    if (line == "---" && i == 0) {
++      continue;
++    }
++    if (std::string_view("-[{?&*!|>%@`.").find(line[0]) !=
++        std::string_view::npos) {
++      *output = refused;
++      return false;
++    }
++    bool plain = false;
++    std::string_view rest;
++    if (IsKey(line, "extensions", &plain, &rest)) {
++      if (!plain || ext != std::string::npos) {
++        *output = refused;
++        return false;
++      }
++      ext = i;
++      ext_rest = rest;
++    }
++  }
++
++  std::vector<std::string> block;
++  if (ext == std::string::npos) {
++    lines.push_back("extensions:");
++    block = GooseBlock(2, program);
++    lines.insert(lines.end(), block.begin(), block.end());
++  } else if (ext_rest == "{}") {
++    lines[ext] = "extensions:";
++    block = GooseBlock(2, program);
++    lines.insert(lines.begin() + ext + 1, block.begin(), block.end());
++  } else if (!ext_rest.empty() && ext_rest[0] != '#') {
++    *output = refused;
++    return false;
++  } else {
++    size_t end = ext + 1;
++    while (end < lines.size() &&
++           (Blank(lines[end]) || Comment(lines[end]) ||
++            Indent(lines[end]) > 0)) {
++      ++end;
++    }
++    size_t indent = 0;
++    size_t meridian = std::string::npos;
++    for (size_t j = ext + 1; j < end; ++j) {
++      const std::string& line = lines[j];
++      if (Blank(line) || Comment(line)) {
++        continue;
++      }
++      if (!indent) {
++        indent = Indent(line);
++      }
++      if (Indent(line) < indent) {
++        *output = refused;
++        return false;
++      }
++      if (Indent(line) > indent) {
++        continue;
++      }
++      std::string_view key = std::string_view(line).substr(indent);
++      if (key[0] == '-') {
++        *output = refused;
++        return false;
++      }
++      bool plain = false;
++      std::string_view rest;
++      if (IsKey(key, "meridian", &plain, &rest)) {
++        if (!plain || !rest.empty() || meridian != std::string::npos) {
++          *output = refused;
++          return false;
++        }
++        meridian = j;
++      }
++    }
++    if (!indent) {
++      indent = 2;
++    }
++    block = GooseBlock(indent, program);
++    if (meridian != std::string::npos) {
++      size_t stop = meridian + 1;
++      while (stop < end && (Blank(lines[stop]) || Comment(lines[stop]) ||
++                            Indent(lines[stop]) > indent)) {
++        ++stop;
++      }
++      while (stop > meridian + 1 &&
++             (Blank(lines[stop - 1]) || Comment(lines[stop - 1]))) {
++        --stop;
++      }
++      if (std::vector<std::string>(lines.begin() + meridian,
++                                   lines.begin() + stop) == block) {
++        *output = "already connected";
++        return true;
++      }
++      lines.erase(lines.begin() + meridian, lines.begin() + stop);
++      lines.insert(lines.begin() + meridian, block.begin(), block.end());
++    } else {
++      size_t at = end;
++      while (at > ext + 1 && (Blank(lines[at - 1]) || Comment(lines[at - 1]))) {
++        --at;
++      }
++      lines.insert(lines.begin() + at, block.begin(), block.end());
++    }
++  }
++  return WriteConfig(config, existed, base::JoinString(lines, "\n") + "\n",
++                     output);
++}
++
++AgentCli DetectFileAgent(const FileAgent& agent,
++                         const std::string& path,
++                         const std::string& xdg_home) {
++  AgentCli out{agent.id, agent.name, "", SnippetFor(agent.id, Program()), ""};
++  if (TestWithoutConfig(agent)) {
++    out.file = "~/" + std::string(agent.xdg ? ".config/" : "") +
++               agent.folder + "/" + agent.file;
++    return out;
++  }
++  const base::FilePath dir = ConfigDir(agent, xdg_home);
++  out.file = DisplayPath(dir.AppendASCII(agent.file));
++  for (const char* bin : agent.bins) {
++    if (out.path.empty()) {
++      out.path = Which(bin, path);
+     }
+   }
+-  out.push_back({kOpenCodeId, "OpenCode", opencode, OpenCodeCommand(Program()),
+-                 opencode_dir.empty()
+-                     ? std::string("~/.config/opencode/opencode.json")
+-                     : DisplayPath(opencode_dir.AppendASCII("opencode.json"))});
++  for (const char* app : agent.apps) {
++    if (out.path.empty()) {
++      out.path = App(app);
++    }
++  }
++  if (out.path.empty() && base::DirectoryExists(dir)) {
++    out.path = dir.AsUTF8Unsafe();
++  }
+   return out;
+ }
+ 
++}  // namespace
++
++bool AddAgentServer(const std::string& id,
++                    const base::FilePath& dir,
++                    const std::string& program,
++                    std::string* output) {
++  const FileAgent* agent = FindFileAgent(id);
++  if (!agent) {
++    *output = "unknown agent";
++    return false;
++  }
++  base::FilePath config = dir.AppendASCII(agent->file);
++  if (!FollowLink(&config, output)) {
++    return false;
++  }
++  const bool existed = base::PathExists(config);
++  std::string text;
++  if (existed && !base::ReadFileToString(config, &text)) {
++    *output = "couldn’t read " + config.AsUTF8Unsafe();
++    return false;
++  }
++  return id == "goose" ? AddGoose(config, existed, text, program, output)
++                       : AddJson(id, config, existed, text, program, output);
++}
++
++std::vector<AgentCli> DetectAgentClis() {
++  const std::string path = LoginPath();
++  const bool any_xdg = std::ranges::any_of(FileAgents(), [](const auto& a) {
++    return a.xdg && !TestWithoutConfig(a) &&
++           !base::CommandLine::ForCurrentProcess()->HasSwitch(a.config_switch);
++  });
++  const std::string xdg_home = any_xdg ? LoginVar("XDG_CONFIG_HOME") : "";
++  auto cli = [&](const char* id) {
++    const Known& known = *FindKnown(id);
++    return AgentCli{known.id, known.name, Locate(known, path),
++                    CommandOf(known), ""};
++  };
++  auto file = [&](const char* id) {
++    return DetectFileAgent(*FindFileAgent(id), path, xdg_home);
++  };
++  return {cli("claude"),
++          cli("codex"),
++          {kDesktopId, "Claude Desktop",
++           DesktopInstalled() ? DesktopConfig().AsUTF8Unsafe() : "",
++           DesktopCommand(), DisplayPath(DesktopConfig())},
++          file("opencode"),
++          file("cursor"),
++          cli("vscode"),
++          file("windsurf"),
++          cli("copilot"),
++          cli("gemini"),
++          cli("qwen"),
++          file("goose"),
++          file("amp"),
++          file("droid")};
++}
++
+ bool ConnectAgentCli(const std::string& id, std::string* output) {
+   if (id == kDesktopId) {
+     return ConnectDesktop(output);
+   }
+-  if (id == kOpenCodeId) {
+-    if (OpenCodeTestWithoutConfig()) {
++  if (const FileAgent* agent = FindFileAgent(id)) {
++    if (TestWithoutConfig(*agent)) {
+       *output = "no test config";
+       return false;
+     }
+-    return AddOpenCodeServer(OpenCodeDir(), Program(), output);
++    const bool needs_xdg =
++        agent->xdg &&
++        !base::CommandLine::ForCurrentProcess()->HasSwitch(
++            agent->config_switch);
++    return AddAgentServer(
++        id, ConfigDir(*agent, needs_xdg ? LoginVar("XDG_CONFIG_HOME") : ""),
++        Program(), output);
+   }
+-  for (const Known& cli : KnownClis()) {
+-    if (cli.id != id) {
+-      continue;
+-    }
+-    std::string bin = Which(cli.id, LoginPath());
+-    if (bin.empty()) {
+-      *output = std::string(cli.id) + " was not found on your PATH";
+-      return false;
+-    }
+-    int exit_code = -1;
+-#if BUILDFLAG(IS_WIN)
+-    base::CommandLine command(base::FilePath::FromUTF8Unsafe(bin));
+-    for (const std::string& arg : Args(cli)) {
+-      command.AppendArgNative(base::UTF8ToWide(arg));
+-    }
+-    base::GetAppOutputAndError(command, output);
+-    // (Only the output says how it went there.)
+-    exit_code = base::ToLowerASCII(*output).find("error") == std::string::npos
+-                    ? 0
+-                    : 1;
+-#else
+-    // Through the login shell, for the CLI's own PATH (node and the like).
+-    std::string script = Quote(bin);
+-    for (const std::string& arg : Args(cli)) {
+-      script += " " + Quote(arg);
+-    }
+-    base::GetAppOutputWithExitCode(
+-        base::CommandLine({Shell(), "-lc", script + " 2>&1"}), output,
+-        &exit_code);
+-#endif
+-    if (output->size() > 2000) {
+-      output->resize(2000);
+-    }
+-    return exit_code == 0 ||
+-           base::ToLowerASCII(*output).find("already exists") !=
+-               std::string::npos;
++  if (const Known* cli = FindKnown(id)) {
++    return RunCli(*cli, output);
+   }
+-  *output = "unknown CLI";
++  *output = "unknown agent";
+   return false;
+ }
+ 
+diff --git a/chrome/browser/meridian/agent/agent_cli.h b/chrome/browser/meridian/agent/agent_cli.h
+index 37314168b2..e0b7804a4e 100644
+--- a/chrome/browser/meridian/agent/agent_cli.h
++++ b/chrome/browser/meridian/agent/agent_cli.h
+@@ -12,16 +12,18 @@
+ 
+ namespace meridian {
+ 
+-// "Connect Claude Code / Codex": registers Meridian's MCP server with a
+-// coding-agent CLI. The CLIs are found on the login shell's PATH (apps
++// "Connect Claude Code / Codex / Cursor / …": registers Meridian's MCP server
++// (`Meridian --mcp-bridge`) with a coding agent, for the person (user level).
++// Agents with an "mcp add" command get it run; the others get "meridian"
++// added to their config file. CLIs are found on the login shell's PATH (apps
+ // started from the Dock don't inherit it); the person sees the exact command
+-// before it runs. Both functions block (they run processes).
++// or entry first. Both functions block (they run processes).
+ struct AgentCli {
+-  std::string id;       // "claude", "codex", "claude-desktop" or "opencode"
++  std::string id;       // "claude", "codex", "claude-desktop", "opencode", …
+   std::string name;     // "Claude Code"
+   std::string path;     // empty if not found
+-  std::string command;  // what Connect runs (or, for Claude Desktop, adds)
+-  std::string file;     // Claude Desktop, OpenCode: the file Connect edits
++  std::string command;  // what Connect runs, or the entry it adds to `file`
++  std::string file;     // agents set up by file: the file Connect edits
+ };
+ 
+ std::vector<AgentCli> DetectAgentClis();
+@@ -32,22 +34,47 @@ std::vector<AgentCli> DetectAgentClis();
+ inline constexpr char kClaudeDesktopConfigSwitch[] =
+     "meridian-claude-desktop-config";
+ 
++// The agents set up by file. Each switch is the agent's config folder, so
++// tests never see the person's real one; in a test without it the agent is
++// never found.
++//
+ // OpenCode merges opencode.json and opencode.jsonc from its config folder
+ // ($XDG_CONFIG_HOME/opencode, else ~/.config/opencode). Connect adds
+-// "meridian" to the "mcp" of opencode.json only, the same way; opencode.jsonc,
+-// where people keep their models (with comments), is never touched. The
+-// switch is the config folder (tests).
++// "meridian" to the "mcp" of opencode.json only; opencode.jsonc, where people
++// keep their models (with comments), is never touched.
+ inline constexpr char kOpenCodeConfigSwitch[] = "meridian-opencode-config";
++// Cursor (the app and its CLI): "mcpServers" of ~/.cursor/mcp.json.
++inline constexpr char kCursorConfigSwitch[] = "meridian-cursor-config";
++// Windsurf: "mcpServers" of ~/.codeium/windsurf/mcp_config.json.
++inline constexpr char kWindsurfConfigSwitch[] = "meridian-windsurf-config";
++// Goose: an extension in "extensions" of config.yaml ($XDG_CONFIG_HOME/goose,
++// else ~/.config/goose).
++inline constexpr char kGooseConfigSwitch[] = "meridian-goose-config";
++// Amp: "amp.mcpServers" of ~/.config/amp/settings.json.
++inline constexpr char kAmpConfigSwitch[] = "meridian-amp-config";
++// Factory Droid: "mcpServers" of ~/.factory/mcp.json.
++inline constexpr char kDroidConfigSwitch[] = "meridian-droid-config";
+ 
+-// Adds `program --mcp-bridge` as "meridian" to `dir`/opencode.json, creating
+-// it if needed. A file that isn't plain JSON is left alone and `output` says
+-// what to add by hand. Same command already there counts as connected.
+-bool AddOpenCodeServer(const base::FilePath& dir,
+-                       const std::string& program,
+-                       std::string* output);
+-
+-// Runs the CLI's "mcp add"; `output` is what it printed. Already registered
++// Adds `program --mcp-bridge` as "meridian" to the config file of agent `id`
++// (one of the file agents above) in its config folder `dir`, creating both if
++// needed. Every other key stays, the first old file is kept as
++// <file>.meridian-backup, and a linked file is written where it really is. A
++// file that isn't plain JSON (or YAML Meridian can't safely add to) is left
++// alone and `output` says what to add by hand. The same entry already there
+ // counts as connected.
++bool AddAgentServer(const std::string& id,
++                    const base::FilePath& dir,
++                    const std::string& program,
++                    std::string* output);
++
++inline bool AddOpenCodeServer(const base::FilePath& dir,
++                              const std::string& program,
++                              std::string* output) {
++  return AddAgentServer("opencode", dir, program, output);
++}
++
++// Connects agent `id`: runs its "mcp add" or edits its config file. `output`
++// is what happened. Already registered counts as connected.
+ bool ConnectAgentCli(const std::string& id, std::string* output);
+ 
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/agent/agent_cli_unittest.cc b/chrome/browser/meridian/agent/agent_cli_unittest.cc
+index 8a13740a48..eff73bbc16 100644
+--- a/chrome/browser/meridian/agent/agent_cli_unittest.cc
++++ b/chrome/browser/meridian/agent/agent_cli_unittest.cc
+@@ -156,5 +156,239 @@ TEST_F(OpenCodeConnectTest, EmptyFileCountsAsNone) {
+   ExpectMeridian(ReadConfig(json()));
+ }
+ 
++
++// ---- The other agents set up by file
++
++class AgentConfigTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    ASSERT_TRUE(temp_.CreateUniqueTempDir());
++    dir_ = temp_.GetPath().AppendASCII("config");
++  }
++  base::FilePath file(const char* name) const { return dir_.AppendASCII(name); }
++  std::string Read(const char* name) const {
++    std::string text;
++    EXPECT_TRUE(base::ReadFileToString(file(name), &text));
++    return text;
++  }
++
++  base::ScopedTempDir temp_;
++  base::FilePath dir_;
++};
++
++void ExpectCommandArgs(const base::DictValue* server,
++                       const std::string& program = kProgram) {
++  ASSERT_TRUE(server);
++  EXPECT_EQ(*server->FindString("command"), program);
++  const base::ListValue* args = server->FindList("args");
++  ASSERT_TRUE(args);
++  ASSERT_EQ(args->size(), 1u);
++  EXPECT_EQ((*args)[0].GetString(), "--mcp-bridge");
++}
++
++TEST_F(AgentConfigTest, CursorAndWindsurfUseMcpServers) {
++  for (const char* id : {"cursor", "windsurf"}) {
++    const char* name =
++        std::string_view(id) == "cursor" ? "mcp.json" : "mcp_config.json";
++    std::string output;
++    ASSERT_TRUE(AddAgentServer(id, dir_, kProgram, &output)) << output;
++    EXPECT_EQ(output, "a new config file");
++    base::DictValue root = ReadConfig(file(name));
++    ExpectCommandArgs(root.FindDictByDottedPath("mcpServers.meridian"));
++    EXPECT_EQ(root.size(), 1u) << "nothing else in a new file";
++    ASSERT_TRUE(AddAgentServer(id, dir_, kProgram, &output));
++    EXPECT_EQ(output, "already connected");
++  }
++}
++
++TEST_F(AgentConfigTest, CursorKeepsOtherServersAndKeys) {
++  ASSERT_TRUE(base::CreateDirectory(dir_));
++  const std::string before =
++      R"({"mcpServers": {"github": {"command": "docker", "args": ["run"],
++          "env": {"TOKEN": "x"}}}, "other": 1})";
++  ASSERT_TRUE(base::WriteFile(file("mcp.json"), before));
++  std::string output;
++  ASSERT_TRUE(AddAgentServer("cursor", dir_, kProgram, &output)) << output;
++  EXPECT_EQ(output, "the old file is saved as mcp.json.meridian-backup");
++  base::DictValue root = ReadConfig(file("mcp.json"));
++  EXPECT_EQ(*root.FindStringByDottedPath("mcpServers.github.env.TOKEN"), "x");
++  EXPECT_EQ(root.FindInt("other"), 1);
++  ExpectCommandArgs(root.FindDictByDottedPath("mcpServers.meridian"));
++  EXPECT_EQ(Read("mcp.json.meridian-backup"), before);
++}
++
++TEST_F(AgentConfigTest, AmpUsesItsDottedKey) {
++  ASSERT_TRUE(base::CreateDirectory(dir_));
++  ASSERT_TRUE(base::WriteFile(file("settings.json"),
++                              R"({"amp.notifications.enabled": false})"));
++  std::string output;
++  ASSERT_TRUE(AddAgentServer("amp", dir_, kProgram, &output)) << output;
++  base::DictValue root = ReadConfig(file("settings.json"));
++  EXPECT_EQ(root.FindBool("amp.notifications.enabled"), false);
++  // One key named "amp.mcpServers", not "amp" > "mcpServers".
++  EXPECT_FALSE(root.Find("amp"));
++  const base::DictValue* servers = root.FindDict("amp.mcpServers");
++  ASSERT_TRUE(servers);
++  ExpectCommandArgs(servers->FindDict("meridian"));
++}
++
++TEST_F(AgentConfigTest, DroidIsAStdioServerThatIsNotDisabled) {
++  std::string output;
++  ASSERT_TRUE(AddAgentServer("droid", dir_, kProgram, &output)) << output;
++  base::DictValue root = ReadConfig(file("mcp.json"));
++  const base::DictValue* server =
++      root.FindDictByDottedPath("mcpServers.meridian");
++  ExpectCommandArgs(server);
++  EXPECT_EQ(*server->FindString("type"), "stdio");
++  EXPECT_EQ(server->FindBool("disabled"), false);
++}
++
++TEST_F(AgentConfigTest, RefusesCommentsAndSaysWhatToAdd) {
++  ASSERT_TRUE(base::CreateDirectory(dir_));
++  const std::string before = "{\n  // mine\n  \"mcpServers\": {}\n}\n";
++  ASSERT_TRUE(base::WriteFile(file("mcp_config.json"), before));
++  std::string output;
++  EXPECT_FALSE(AddAgentServer("windsurf", dir_, kProgram, &output));
++  EXPECT_NE(output.find("isn’t plain JSON"), std::string::npos) << output;
++  EXPECT_NE(output.find("\"mcpServers\": {\n  \"meridian\": {\n"
++                        "    \"command\": \"" +
++                        std::string(kProgram) +
++                        "\",\n    \"args\": [\"--mcp-bridge\"]\n  }\n}"),
++            std::string::npos)
++      << output;
++  EXPECT_EQ(Read("mcp_config.json"), before);
++  EXPECT_FALSE(base::PathExists(file("mcp_config.json.meridian-backup")));
++}
++
++TEST_F(AgentConfigTest, FollowsALinkedFile) {
++  ASSERT_TRUE(base::CreateDirectory(dir_));
++  base::FilePath dotfiles = temp_.GetPath().AppendASCII("dotfiles");
++  ASSERT_TRUE(base::CreateDirectory(dotfiles));
++  base::FilePath real = dotfiles.AppendASCII("cursor-mcp.json");
++  ASSERT_TRUE(base::WriteFile(real, R"({"mcpServers": {}})"));
++  ASSERT_TRUE(base::CreateSymbolicLink(real, file("mcp.json")));
++  std::string output;
++  ASSERT_TRUE(AddAgentServer("cursor", dir_, kProgram, &output)) << output;
++  EXPECT_TRUE(base::IsLink(file("mcp.json"))) << "the link stays a link";
++  ExpectCommandArgs(ReadConfig(real).FindDictByDottedPath("mcpServers.meridian"));
++}
++
++// ---- Goose (YAML)
++
++std::string GooseEntry(const std::string& indent = "  ",
++                       const std::string& program = kProgram) {
++  const std::string f = indent + indent;
++  return indent + "meridian:\n" + f + "enabled: true\n" + f + "type: stdio\n" +
++         f + "name: meridian\n" + f +
++         "description: Control the Meridian browser\n" + f + "cmd: \"" +
++         program + "\"\n" + f + "args: [\"--mcp-bridge\"]\n" + f +
++         "envs: {}\n" + f + "env_keys: []\n" + f + "timeout: 300\n";
++}
++
++constexpr char kGooseConfig[] =
++    "GOOSE_PROVIDER: anthropic\n"
++    "GOOSE_MODEL: claude-sonnet-4-5\n"
++    "extensions:\n"
++    "  developer:\n"
++    "    available_tools: []\n"
++    "    bundled: true\n"
++    "    description: null\n"
++    "    display_name: Developer\n"
++    "    enabled: true\n"
++    "    name: developer\n"
++    "    timeout: 300\n"
++    "    type: builtin\n"
++    "  github:\n"
++    "    args:\n"
++    "    - -y\n"
++    "    - github-mcp\n"
++    "    cmd: npx\n"
++    "    enabled: false\n"
++    "    envs: {}\n"
++    "    name: github\n"
++    "    type: stdio\n"
++    "GOOSE_MODE: smart_approve\n";
++
++TEST_F(AgentConfigTest, GooseNewFile) {
++  std::string output;
++  ASSERT_TRUE(AddAgentServer("goose", dir_, kProgram, &output)) << output;
++  EXPECT_EQ(Read("config.yaml"), "extensions:\n" + GooseEntry());
++}
++
++TEST_F(AgentConfigTest, GooseAddsToItsExtensionsAndKeepsTheRest) {
++  ASSERT_TRUE(base::CreateDirectory(dir_));
++  ASSERT_TRUE(base::WriteFile(file("config.yaml"), kGooseConfig));
++  std::string output;
++  ASSERT_TRUE(AddAgentServer("goose", dir_, kProgram, &output)) << output;
++  std::string expected = kGooseConfig;
++  expected.insert(expected.find("GOOSE_MODE:"), GooseEntry());
++  EXPECT_EQ(Read("config.yaml"), expected);
++  EXPECT_EQ(Read("config.yaml.meridian-backup"), kGooseConfig);
++
++  ASSERT_TRUE(AddAgentServer("goose", dir_, kProgram, &output));
++  EXPECT_EQ(output, "already connected");
++  EXPECT_EQ(Read("config.yaml"), expected);
++
++  // Meridian moved: the entry follows it, in place; the first backup stays.
++  ASSERT_TRUE(
++      AddAgentServer("goose", dir_, "/Users/x/Applications/Meridian", &output))
++      << output;
++  std::string moved = kGooseConfig;
++  moved.insert(moved.find("GOOSE_MODE:"),
++               GooseEntry("  ", "/Users/x/Applications/Meridian"));
++  EXPECT_EQ(Read("config.yaml"), moved);
++  EXPECT_EQ(Read("config.yaml.meridian-backup"), kGooseConfig);
++}
++
++TEST_F(AgentConfigTest, GooseEmptyExtensionsOrNone) {
++  ASSERT_TRUE(base::CreateDirectory(dir_));
++  ASSERT_TRUE(base::WriteFile(file("config.yaml"),
++                              "GOOSE_MODEL: x\nextensions: {}\nGOOSE_MODE: auto\n"));
++  std::string output;
++  ASSERT_TRUE(AddAgentServer("goose", dir_, kProgram, &output)) << output;
++  EXPECT_EQ(Read("config.yaml"),
++            "GOOSE_MODEL: x\nextensions:\n" + GooseEntry() + "GOOSE_MODE: auto\n");
++
++  ASSERT_TRUE(base::WriteFile(file("config.yaml"), "GOOSE_MODEL: x"));
++  ASSERT_TRUE(AddAgentServer("goose", dir_, kProgram, &output)) << output;
++  EXPECT_EQ(Read("config.yaml"), "GOOSE_MODEL: x\nextensions:\n" + GooseEntry());
++}
++
++TEST_F(AgentConfigTest, GooseFollowsTheFilesIndent) {
++  ASSERT_TRUE(base::CreateDirectory(dir_));
++  const std::string before =
++      "extensions:\n    developer:\n        enabled: true\n"
++      "        type: builtin\n        name: developer\n";
++  ASSERT_TRUE(base::WriteFile(file("config.yaml"), before));
++  std::string output;
++  ASSERT_TRUE(AddAgentServer("goose", dir_, kProgram, &output)) << output;
++  EXPECT_EQ(Read("config.yaml"), before + GooseEntry("    "));
++}
++
++TEST_F(AgentConfigTest, GooseLeavesWhatItCantReadAlone) {
++  ASSERT_TRUE(base::CreateDirectory(dir_));
++  for (const char* before : {
++           "extensions: {developer: {enabled: true}}\n",
++           "extensions:\n  \"meridian\":\n    enabled: true\n",
++           "extensions:\n  meridian: {enabled: true}\n",
++           "extensions:\n\tdeveloper:\n\t\tenabled: true\n",
++           "extensions:\n- developer\n",
++           "\"extensions\":\n  developer: {}\n",
++           "extensions: &ext\n  developer: {}\n",
++           "- a\n- b\n",
++           "a: 1\n---\nb: 2\n",
++       }) {
++    ASSERT_TRUE(base::WriteFile(file("config.yaml"), before));
++    std::string output;
++    EXPECT_FALSE(AddAgentServer("goose", dir_, kProgram, &output)) << before;
++    EXPECT_NE(output.find("can’t safely add"), std::string::npos) << output;
++    EXPECT_NE(output.find("extensions:\n  meridian:\n    enabled: true"),
++              std::string::npos)
++        << output;
++    EXPECT_EQ(Read("config.yaml"), before);
++    EXPECT_FALSE(base::PathExists(file("config.yaml.meridian-backup")));
++  }
++}
++
+ }  // namespace
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index e4e23d50f1..a90f9c89bc 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -465,18 +465,18 @@ struct SearchKeyword {
+   string name;
+ };
+ 
+-// A coding-agent CLI Meridian can register its MCP server with.
++// A coding agent Meridian can register its MCP server with.
+ struct AgentCli {
+-  // "claude", "codex", "claude-desktop" or "opencode".
++  // "claude", "codex", "claude-desktop", "opencode", "cursor", "vscode",
++  // "windsurf", "copilot", "gemini", "qwen", "goose", "amp" or "droid".
+   string id;
+   string name;
+-  // Found on the login shell's PATH.
++  // Installed: on the login shell's PATH, its app, or its config folder.
+   bool found;
+-  // The exact command "Connect" runs (shown to the person first). For
+-  // Claude Desktop and OpenCode: the "meridian" entry it adds to `file`.
++  // The exact command "Connect" runs (shown to the person first). For the
++  // agents set up by file: the "meridian" entry it adds to `file`.
+   string command;
+-  // The config file Connect edits: Claude Desktop's, OpenCode's
+-  // opencode.json (empty for the CLIs).
++  // The config file Connect edits (empty for the agents with a command).
+   string file;
+ };
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+index b7afa0436e..3fad4904ba 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+@@ -198,6 +198,10 @@ export function getHtml(this: MeridianOnboardingElement) {
+                       @click="${this.onRestartClick_}">Restart Claude</button>` :
+                     ''}
+               </div>` : ''}
++            ${this.restartApps_.length ? html`
++              <div class="ai-done" id="restartApps">
++                <span>${this.restartText_()}</span>
++              </div>` : ''}
+             ${this.canUndo_ ? html`
+               <button id="undoSetup" class="link"
+                   @click="${this.onUndoSetupClick_}">Undo this setup</button>` :
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+index 3df4517285..d190643ef8 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+@@ -22,6 +22,17 @@ import {getHtml} from './onboarding.html.js';
+ 
+ export type StepName = 'hello'|'ai'|'arc'|'tailor'|'preview'|'default'|'done';
+ 
++// Apps that read Meridian's entry only when they start.
++const RESTART_TO_USE =
++    new Set(['opencode', 'cursor', 'vscode', 'windsurf', 'goose']);
++
++// "Cursor", "Cursor and VS Code", "Cursor, VS Code and Goose".
++function namesText(names: string[]): string {
++  return names.length < 2 ?
++      names.join('') :
++      `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
++}
++
+ const HELLOS = [
+   'hello', 'привет', 'hola', 'bonjour', 'hallo', 'ciao', 'olá', 'გამარჯობა',
+   'merhaba', 'hej', 'こんにちは', '你好',
+@@ -114,6 +125,7 @@ export class MeridianOnboardingElement extends CrLitElement {
+       aiBrand_: {state: true, type: String},
+       aiProvider_: {state: true, type: String},
+       desktopConnected_: {state: true, type: Boolean},
++      restartApps_: {state: true, type: Array},
+       confirmRestart_: {state: true, type: Boolean},
+       restartNote_: {state: true, type: String},
+       canUndo_: {state: true, type: Boolean},
+@@ -159,6 +171,8 @@ export class MeridianOnboardingElement extends CrLitElement {
+   // Who suggests the setup ('': nothing that can be run from here).
+   protected accessor aiProvider_: string = '';
+   protected accessor desktopConnected_: boolean = false;
++  // Other apps connected that read it when they start: "Cursor", ….
++  protected accessor restartApps_: string[] = [];
+   protected accessor confirmRestart_: boolean = false;
+   protected accessor restartNote_: string = '';
+   // Windows: Meridian can't reopen Claude, so it says what to do instead.
+@@ -204,6 +218,7 @@ export class MeridianOnboardingElement extends CrLitElement {
+     this.aiYes_ = false;
+     this.aiProvider_ = '';
+     this.desktopConnected_ = false;
++    this.restartApps_ = [];
+     this.confirmRestart_ = false;
+     this.restartNote_ = '';
+     this.canUndo_ = false;
+@@ -235,7 +250,7 @@ export class MeridianOnboardingElement extends CrLitElement {
+     const has = (id: string) => this.aiFound_.some(c => c.id === id);
+     this.aiBrand_ = has('claude') || has('claude-desktop') ? 'Claude' :
+         has('codex')                                     ? 'Codex' :
+-                                                           'OpenCode';
++        this.aiFound_[0]?.name || '';
+     const ready = (cli: string, id: string) =>
+         this.aiFound_.some(c => c.id === cli) &&
+         providers.some(p => p.id === id && p.installed && p.signedIn !== 0);
+@@ -454,6 +469,12 @@ export class MeridianOnboardingElement extends CrLitElement {
+ 
+   // ------------------------------------------------------------ the AI
+ 
++  protected restartText_(): string {
++    return `Restart ${namesText(this.restartApps_)}, then ask ` +
++        `${this.restartApps_.length > 1 ? 'them' : 'it'} to do something ` +
++        'in Meridian.';
++  }
++
+   // One Yes: everything found is connected, with control of the browser
+   // unless the person already chose, and it may be asked from now on.
+   protected async onAiYesClick_() {
+@@ -462,12 +483,15 @@ export class MeridianOnboardingElement extends CrLitElement {
+     }
+     this.busy_ = 'Connecting…';
+     const failed: string[] = [];
++    const restart: string[] = [];
+     for (const cli of this.aiFound_) {
+       const {ok} = await this.handler_.connectAgentCli(cli.id);
+       if (!ok) {
+         failed.push(cli.name);
+       } else if (cli.id === 'claude-desktop') {
+         this.desktopConnected_ = true;
++      } else if (RESTART_TO_USE.has(cli.id)) {
++        restart.push(cli.name);
+       }
+     }
+     if (failed.length < this.aiFound_.length) {
+@@ -481,6 +505,7 @@ export class MeridianOnboardingElement extends CrLitElement {
+             {...settings, aiProvider: this.aiProvider_});
+       }
+     }
++    this.restartApps_ = restart;
+     if (failed.length) {
+       this.note_ = `${failed.join(' and ')} wasn’t connected. You can try ` +
+           'again in Settings › AI.';
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index d425f062bf..afc7f52eab 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -684,7 +684,7 @@ export function getHtml(this: MeridianSettingsElement) {
+           <div class="group">
+             <h2>Connect</h2>
+             <div class="card">
+-              ${this.clis_.map(cli => html`
++              ${this.connectRows_().map(cli => html`
+                 <div class="row">
+                   <div class="row-text">
+                     <div class="row-label">${cli.name}</div>
+@@ -696,6 +696,10 @@ export function getHtml(this: MeridianSettingsElement) {
+                 </div>`)}
+             </div>
+             <p class="note">${this.connectResult_}</p>
++            ${this.notFoundAgents_().length ? html`
++              <p class="note" id="agentsMore">Also connects
++                ${this.notFoundAgents_().join(', ')} once you install them.
++              </p>` : ''}
+           </div>
+         </section>` : ''}
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 6c9f3f8f77..b456d77009 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -20,6 +20,13 @@ import {keyText} from './keys.js';
+ 
+ export type SectionId = 'member'|'general'|'links'|'ai'|'profiles'|'advanced';
+ 
++// Connect rows shown even when the agent isn't installed.
++const ALWAYS_LISTED = new Set(['claude', 'codex', 'claude-desktop', 'opencode']);
++// Apps that read Meridian's entry only when they start (the CLIs read it at
++// each new session).
++const RESTART_TO_USE =
++    new Set(['opencode', 'cursor', 'vscode', 'windsurf', 'goose']);
++
+ const SECTION_LABELS: Record<SectionId, string> = {
+   member: '',
+   general: 'General',
+@@ -752,6 +759,17 @@ export class MeridianSettingsElement extends CrLitElement {
+     this.save_({agentAllowJs: (e.target as HTMLInputElement).checked});
+   }
+ 
++  // The first four always (each says whether it's installed); the others
++  // once they are found, so the list stays short.
++  protected connectRows_(): AgentCli[] {
++    return this.clis_.filter(c => c.found || ALWAYS_LISTED.has(c.id));
++  }
++
++  protected notFoundAgents_(): string[] {
++    return this.clis_.filter(c => !c.found && !ALWAYS_LISTED.has(c.id))
++        .map(c => c.name);
++  }
++
+   protected onConnectClick_(e: Event) {
+     const id = (e.currentTarget as HTMLElement).dataset['id'];
+     this.connecting_ = this.clis_.find(c => c.id === id) || null;
+@@ -778,17 +796,18 @@ export class MeridianSettingsElement extends CrLitElement {
+     if (this.settings_?.agentAccess === 'off') {
+       this.save_({agentAccess: 'full'});
+     }
++    const done = cli.file ? `${cli.name} is connected (${output}).` :
++                            `${cli.name} is connected.`;
+     if (cli.id === 'claude-desktop') {
+       // Claude Desktop reads its config only when it starts.
+-      this.connectResult_ = `${cli.name} is connected (${output}). Quit ` +
+-          'and reopen Claude Desktop to use Meridian.';
+-    } else if (cli.file) {
+-      // OpenCode too: a new session doesn't reread it.
+-      this.connectResult_ = `${cli.name} is connected (${output}). ` +
+-          `Restart ${cli.name} to use Meridian.`;
++      this.connectResult_ =
++          `${done} Quit and reopen Claude Desktop to use Meridian.`;
++    } else if (RESTART_TO_USE.has(cli.id)) {
++      // These read it when they start.
++      this.connectResult_ = `${done} Restart ${cli.name} to use Meridian.`;
+     } else {
+       this.connectResult_ =
+-          `${cli.name} is connected. Start a new session there to use Meridian.`;
++          `${done} Start a new ${cli.name} session to use Meridian.`;
+     }
+   }
+ 

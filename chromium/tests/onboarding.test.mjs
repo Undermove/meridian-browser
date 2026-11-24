@@ -197,6 +197,15 @@ test('first run: Claude is found, one Yes connects it, the AI suggests a setup, 
     assert.ok(!sent.includes('secret-page-xyz'), 'no page address goes to the AI');
 
     await b.click(`${OB}.getElementById('next')`);
+    if (process.platform !== 'win32') {
+      // Claude Desktop reads its config when it starts: its restart and its "Allow" explained
+      // first, then things to try with it (showcase.test.mjs runs them).
+      await b.waitFor(`${step} === 'claude'`);
+      assert.match(await b.eval(`${OB}.querySelector('.claude-step').textContent`), /isn’t saved, Claude asks\s+first/);
+      await b.click(`${OB}.getElementById('restartClaude')`);
+      await b.waitFor(`${step} === 'try'`);
+      await b.click(`${OB}.getElementById('next')`); // Maybe later
+    }
     await b.waitFor(`${step} === 'default'`);
     await b.click(`${OB}.getElementById('next')`);
     await b.waitFor(`${step} === 'done'`);
@@ -208,23 +217,12 @@ test('first run: Claude is found, one Yes connects it, the AI suggests a setup, 
     await b.waitFor(`${spaces}.then((n) => JSON.stringify(n) === ${JSON.stringify(JSON.stringify(before))})`);
     await b.waitFor(`!${OB}.getElementById('undoSetup')`);
 
-    // Claude Desktop reads its config when it starts: restart, asked first.
+    // Windows: Meridian can't reopen Claude there; it says what to do and promises nothing.
     if (process.platform === 'win32') {
-      // Meridian can't reopen it there: it says what to do and promises nothing.
       assert.match(await b.eval(`${OB}.querySelector('.ai-done').textContent`), /Close Claude and open it again/);
       assert.equal(await b.eval(`!!${OB}.getElementById('restartClaude')`), false);
     } else {
-      await b.click(`${OB}.getElementById('restartClaude')`);
-      await b.waitFor(`!!${OB}.getElementById('restartGo')`);
-      assert.match(await b.eval(`${OB}.querySelector('.confirm .card').textContent`), /unsaved/);
-      await b.click(`${OB}.getElementById('restartGo')`);
-      await b.waitFor(`/restarted/i.test(${OB}.querySelector('.ai-done')?.textContent || '')`);
-      // A ready request that asks for a plan; Claude doesn't send it by itself.
-      const done = await b.eval(`${OB}.querySelector('.ai-done').textContent`);
-      assert.match(done, /press Enter, then Allow/);
-      const link = decodeURIComponent(done.match(/\[(claude:\/\/[^\]]+)\]/)[1]);
-      assert.match(link, /^claude:\/\/claude\.ai\/new\?q=Look at the tabs/);
-      assert.match(link, /change nothing until I say yes/);
+      assert.equal(await b.eval(`!!${OB}.querySelector('.ai-done')`), false, 'the restart was its own step');
     }
 
     // A hint is the real thing.
@@ -320,5 +318,43 @@ test('first run: only OpenCode on the PATH: "We found OpenCode", one Yes writes 
     assert.equal(written.mcp.meridian.command[1], '--mcp-bridge');
     assert.equal(fs.existsSync(path.join(config, 'opencode.jsonc')), false, 'no .jsonc made');
     assert.equal((await b.eval(`${H}.getSettings().then((r) => r.settings)`)).agentAccess, 'ask');
+  } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('first run: Cursor and VS Code found: one Yes connects both, then says to restart them', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-firstrun-'));
+  const bin = path.join(dir, 'bin');
+  const empty = path.join(dir, 'none');
+  const cursor = path.join(dir, 'home', '.cursor');
+  for (const d of [bin, empty, cursor]) fs.mkdirSync(d, { recursive: true });
+  const log = path.join(dir, 'code.log');
+  standIn(bin, 'code', `require('fs').appendFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(' ') + '\\n');`);
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  const b = await launch(['about:blank'], { profile, args: ['--meridian-onboarding', `--meridian-arc-dir=${empty}`, `--meridian-chrome-dir=${empty}`, `--meridian-agents-path=${bin}`, `--meridian-cursor-config=${cursor}`, '--meridian-test-ai-consent', '--lang=en-US'] });
+  try {
+    await b.waitFor(`${step} === 'hello'`);
+    await b.click(`${OB}.getElementById('next')`);
+    await b.waitFor(`${step} === 'ai'`, 10000);
+    const said = await b.eval(`${OB}.querySelector('.step-ai').textContent`);
+    assert.match(said, /We found Cursor on your computer/);
+    assert.match(said, /Cursor[\s\S]*VS Code/);
+    assert.doesNotMatch(said, /MCP|Claude|Codex|OpenCode/);
+    assert.equal(fs.existsSync(path.join(cursor, 'mcp.json')), false, 'nothing written before Yes');
+    await b.click(`${OB}.getElementById('aiYes')`);
+    await b.waitFor(`${step} !== 'ai'`, 30000);
+    const written = JSON.parse(fs.readFileSync(path.join(cursor, 'mcp.json'), 'utf8'));
+    assert.match(written.mcpServers.meridian.command, /(Meridian|chrome)(\.exe)?$/i);
+    assert.deepEqual(written.mcpServers.meridian.args, ['--mcp-bridge']);
+    assert.match(fs.readFileSync(log, 'utf8'), /^--add-mcp \{"name":"meridian","type":"stdio","command":"[^"]+","args":\["--mcp-bridge"\]\}\n$/);
+    assert.equal((await b.eval(`${H}.getSettings().then((r) => r.settings)`)).agentAccess, 'ask');
+    await b.waitFor(`${step} === 'tailor'`);
+    await b.click(`${OB}.getElementById('next')`);
+    await b.waitFor(`${step} === 'preview'`, 15000);
+    await b.click(`${OB}.getElementById('next')`);
+    await b.waitFor(`${step} === 'default'`);
+    await b.click(`${OB}.getElementById('next')`);
+    await b.waitFor(`${step} === 'done'`);
+    const done = await b.eval(`${OB}.getElementById('restartApps').textContent.replace(/\\s+/g, ' ').trim()`);
+    assert.equal(done, 'Restart Cursor and VS Code, then ask them to do something in Meridian.');
   } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); fs.rmSync(dir, { recursive: true, force: true }); }
 });

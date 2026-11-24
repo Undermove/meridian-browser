@@ -7,9 +7,11 @@
 // It is held in memory for this one signature and is never printed or written to a file.
 // A missing key is an error: a new one would be refused by every installed Meridian.
 // MERIDIAN_RELEASE_KEY: a key file instead (tests only).
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 export const SERVICE = 'Meridian Release Key';
 export const ACCOUNT = 'release-ed25519';
@@ -19,9 +21,34 @@ function fail(message) {
   process.exit(1);
 }
 
+// Unattended signing (the owner's choice, 24.11): a copy of the key in a separate keychain, kept
+// locked except for these few seconds; its password is in the login keychain. Missing → the
+// path below, where macOS asks the person.
+const NIGHT = path.join(os.homedir(), 'Library/Keychains/meridian-release.keychain-db');
+function readNightKey() {
+  if (!fs.existsSync(NIGHT)) return null;
+  const quiet = { stdio: ['ignore', 'pipe', 'ignore'], timeout: 15000 };
+  try {
+    const pw = execFileSync('/usr/bin/security', ['find-generic-password', '-s', 'Meridian Release Keychain Password',
+      '-a', 'meridian-release-keychain', '-w'], quiet).toString().trim();
+    // Over stdin, so the password never shows in a process list.
+    const unlock = spawnSync('/usr/bin/security', ['-i'], { input: `unlock-keychain -p ${pw} ${NIGHT}\n`,
+      stdio: ['pipe', 'ignore', 'ignore'], timeout: 15000 });
+    if (unlock.status !== 0) return null;
+    return Buffer.from(execFileSync('/usr/bin/security', ['find-generic-password', '-s', SERVICE, '-a', ACCOUNT, '-w', NIGHT],
+      quiet).toString().trim(), 'base64');
+  } catch {
+    return null;
+  } finally {
+    spawnSync('/usr/bin/security', ['lock-keychain', NIGHT], { stdio: 'ignore' });
+  }
+}
+
 function readKey() {
   const file = process.env.MERIDIAN_RELEASE_KEY;
   if (file) return fs.readFileSync(file);
+  const night = readNightKey();
+  if (night) return night;
   try {
     const stored = execFileSync('/usr/bin/security', ['find-generic-password', '-s', SERVICE, '-a', ACCOUNT, '-w'],
       { stdio: ['ignore', 'pipe', 'ignore'] });
