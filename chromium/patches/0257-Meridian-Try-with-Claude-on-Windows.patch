@@ -1,0 +1,236 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Tue, 24 Nov 2026 22:50:34 +0400
+Subject: [PATCH] Meridian: Try with Claude on Windows
+
+Windows builds again: StrongDevSignals() makes its macOS paths with
+FilePath::FromASCII, and the linked-file test of Connect runs where
+symbolic links can be made (POSIX).
+
+Off macOS, OpenInClaude now does what the Mac does with Claude's link:
+claude://claude.ai/new?q=<request> (or claude:// to just start it), the
+same --meridian-test-claude-log for tests. On Windows the request is also
+put on the clipboard, and the link is opened when claude:// is registered;
+otherwise "Claude isn't on this computer yet." Linux keeps the plain stub.
+
+"Get Claude for Mac" names the app for this system (Claude for Windows
+there), and the showcase writes Ask's shortcut the system's way.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../meridian/agent/agent_cli_unittest.cc      |  3 +
+ chrome/browser/meridian/setup_profile.cc      |  2 +-
+ chrome/browser/meridian/sidebar_handler.cc    | 73 +++++++++++++++++++
+ .../resources/webui_browser/meridian/keys.ts  |  3 +
+ .../webui_browser/meridian/onboarding.html.ts |  4 +-
+ .../webui_browser/meridian/showcase.html.ts   |  5 +-
+ 6 files changed, 85 insertions(+), 5 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_cli_unittest.cc b/chrome/browser/meridian/agent/agent_cli_unittest.cc
+index eff73bbc16..24aa1d552f 100644
+--- a/chrome/browser/meridian/agent/agent_cli_unittest.cc
++++ b/chrome/browser/meridian/agent/agent_cli_unittest.cc
+@@ -8,6 +8,7 @@
+ #include "base/files/scoped_temp_dir.h"
+ #include "base/json/json_reader.h"
+ #include "base/values.h"
++#include "build/build_config.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+ namespace meridian {
+@@ -260,6 +261,7 @@ TEST_F(AgentConfigTest, RefusesCommentsAndSaysWhatToAdd) {
+   EXPECT_FALSE(base::PathExists(file("mcp_config.json.meridian-backup")));
+ }
+ 
++#if BUILDFLAG(IS_POSIX)
+ TEST_F(AgentConfigTest, FollowsALinkedFile) {
+   ASSERT_TRUE(base::CreateDirectory(dir_));
+   base::FilePath dotfiles = temp_.GetPath().AppendASCII("dotfiles");
+@@ -272,6 +274,7 @@ TEST_F(AgentConfigTest, FollowsALinkedFile) {
+   EXPECT_TRUE(base::IsLink(file("mcp.json"))) << "the link stays a link";
+   ExpectCommandArgs(ReadConfig(real).FindDictByDottedPath("mcpServers.meridian"));
+ }
++#endif
+ 
+ // ---- Goose (YAML)
+ 
+diff --git a/chrome/browser/meridian/setup_profile.cc b/chrome/browser/meridian/setup_profile.cc
+index 48537cf51f..df53187ad9 100644
+--- a/chrome/browser/meridian/setup_profile.cc
++++ b/chrome/browser/meridian/setup_profile.cc
+@@ -137,7 +137,7 @@ bool StrongDevSignals() {
+   base::PathService::Get(base::DIR_HOME, &home);
+   for (const char* path :
+        {"/opt/homebrew/bin/brew", "/usr/local/bin/brew", "/usr/local/Homebrew"}) {
+-    if (base::PathExists(base::FilePath(path))) {
++    if (base::PathExists(base::FilePath::FromASCII(path))) {
+       return true;
+     }
+   }
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 7bfa7fdddc..8925378927 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -20,6 +20,7 @@
+ #include "base/no_destructor.h"
+ #include "base/scoped_observation.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/escape.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+@@ -34,6 +35,13 @@
+ #include "base/version.h"
+ #include "components/prefs/scoped_user_pref_update.h"
+ #include "build/build_config.h"
++#if BUILDFLAG(IS_WIN)
++#include <windows.h>
++
++#include <shellapi.h>
++
++#include "base/win/registry.h"
++#endif
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/meridian/agent/agent_cli.h"
+ #include "chrome/browser/meridian/currency_rates.h"
+@@ -2206,7 +2214,72 @@ bool ClaudeDesktopStartedBefore(base::Time) {
+ 
+ void SidebarHandler::OpenInClaude(const std::string& request,
+                                   OpenInClaudeCallback callback) {
++  // Claude's link for a new chat with `request` typed in (not sent), as on
++  // macOS (sidebar_handler_mac.mm).
++  const std::string link =
++      request.empty() ? std::string("claude://")
++                      : "claude://claude.ai/new?q=" +
++                            base::EscapeQueryParamValue(request,
++                                                        /*use_plus=*/false);
++  const std::string ready =
++      request.empty()
++          ? std::string("Claude is ready for Meridian.")
++          : std::string("Claude is open with your request. Press Enter there, "
++                        "then Allow. If the box is empty, paste it with "
++                        "Ctrl+V.");
++  // A test never touches a real Claude: it gets the link instead.
++  if (TestSwitchesAllowed()) {
++    base::FilePath log = TestSwitchPath("meridian-test-claude-log");
++    if (!log.empty()) {
++      base::ThreadPool::PostTask(
++          FROM_HERE, {base::MayBlock()},
++          base::BindOnce(
++              [](base::FilePath log, std::string line) {
++                line += "\n";
++                if (!base::PathExists(log)) {
++                  base::WriteFile(log, line);
++                } else {
++                  base::AppendToFile(log, line);
++                }
++              },
++              log, link));
++    }
++    std::move(callback).Run(true, ready + " [" + link + "]");
++    return;
++  }
++#if BUILDFLAG(IS_WIN)
++  // Claude for Windows opens claude:// links. The request is on the clipboard
++  // too, in case its box comes up empty.
++  if (!request.empty()) {
++    ui::ScopedClipboardWriter(ui::ClipboardBuffer::kCopyPaste)
++        .WriteText(base::UTF8ToUTF16(request));
++  }
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_BLOCKING},
++      base::BindOnce(
++          [](std::string link) {
++            base::win::RegKey key(HKEY_CLASSES_ROOT, L"claude", KEY_READ);
++            if (!key.Valid() || !key.HasValue(L"URL Protocol")) {
++              return false;
++            }
++            std::wstring wide = base::UTF8ToWide(link);
++            SHELLEXECUTEINFOW info = {sizeof(info)};
++            info.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
++            info.lpVerb = L"open";
++            info.lpFile = wide.c_str();
++            info.nShow = SW_SHOWNORMAL;
++            return ::ShellExecuteExW(&info) != FALSE;
++          },
++          link),
++      base::BindOnce(
++          [](OpenInClaudeCallback callback, std::string ready, bool ok) {
++            std::move(callback).Run(
++                ok, ok ? ready : "Claude isn’t on this computer yet.");
++          },
++          std::move(callback), ready));
++#else
+   std::move(callback).Run(false, "Open Claude and ask it there.");
++#endif
+ }
+ 
+ void SidebarHandler::RestartClaudeDesktop(
+diff --git a/chrome/browser/resources/webui_browser/meridian/keys.ts b/chrome/browser/resources/webui_browser/meridian/keys.ts
+index c025ba0ad9..05ce2324a5 100644
+--- a/chrome/browser/resources/webui_browser/meridian/keys.ts
++++ b/chrome/browser/resources/webui_browser/meridian/keys.ts
+@@ -11,6 +11,9 @@ export const isMac = navigator.userAgent.includes('Mac');
+ // Windows has its own window layout: a top bar across the window with the
+ // caption buttons on the right (app.html.ts), as Arc has there.
+ export const isWindows = navigator.userAgent.includes('Windows');
++// The Claude app to get on this system.
++export const claudeApp =
++    isMac ? 'Claude for Mac' : isWindows ? 'Claude for Windows' : 'Claude';
+ 
+ // Shortcuts that aren't the macOS one with Ctrl for ⌘ and Alt for ⌥.
+ const OTHER: Record<string, string> = {
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+index 28a828afdb..4d3dc0a9ab 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+@@ -6,7 +6,7 @@ import {html, repeat} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+ import {icon} from './icons.js';
+ import type {MeridianOnboardingElement} from './onboarding.js';
+-import {keyCaps} from './keys.js';
++import {claudeApp, keyCaps} from './keys.js';
+ 
+ export function getHtml(this: MeridianOnboardingElement) {
+   return html`<!--_html_template_start_-->
+@@ -244,7 +244,7 @@ export function getHtml(this: MeridianOnboardingElement) {
+                 <button id="getClaude" class="try"
+                     @click="${this.onGetClaudeClick_}">
+                   <span class="try-ic">${icon('external', 17)}</span>
+-                  <b>Get Claude for Mac</b>
++                  <b>Get ${claudeApp}</b>
+                   <em>Free to download. Then Meridian sets it up for you,
+                     and Claude can restyle sites, build moodboards and tidy
+                     your tabs.</em>
+diff --git a/chrome/browser/resources/webui_browser/meridian/showcase.html.ts b/chrome/browser/resources/webui_browser/meridian/showcase.html.ts
+index 04e19da858..453c29c244 100644
+--- a/chrome/browser/resources/webui_browser/meridian/showcase.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/showcase.html.ts
+@@ -5,6 +5,7 @@
+ import {html} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+ import {icon} from './icons.js';
++import {claudeApp, keyText} from './keys.js';
+ import {SHOWCASE} from './showcase.js';
+ import type {MeridianShowcaseElement} from './showcase.js';
+ 
+@@ -15,14 +16,14 @@ ${this.claude === 'missing' ? html`
+     <button class="card" data-action="get-claude" id="getClaude"
+         @click="${this.onOtherClick_}">
+       <span class="ic">${icon('external', 17)}</span>
+-      <b>Get Claude for Mac</b>
++      <b>Get ${claudeApp}</b>
+       <em>Free to download. Meridian sets it up for you.</em>
+     </button>
+     <button class="card" data-action="ask" id="askInstead"
+         @click="${this.onOtherClick_}">
+       <span class="ic">${icon('sparkles', 17)}</span>
+       <b>Ask about this page</b>
+-      <em>Meridian’s own helper, right here (⌘J).</em>
++      <em>Meridian’s own helper, right here (${keyText('⌘J')}).</em>
+     </button>
+   </div>` : html`
+   <div class="cards">
+-- 
+2.52.0.windows.1
+
