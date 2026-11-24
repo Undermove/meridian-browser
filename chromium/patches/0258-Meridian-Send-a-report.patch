@@ -1,0 +1,2409 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 00:07:44 +0400
+Subject: [PATCH] Meridian: Send a report
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+"Send a report…" in Settings › General › Help, in ⌘T, and as a link by the
+errors of the Ask panel, Chat and the command bar's Ask. A sheet shows
+everything the report contains before anything leaves, editable: "What
+happened?", the Meridian and system versions and CPU, Settings › AI (who
+answers, agent access, consent, other agents), the AIs and coding agents
+found (names, models for local/cloud ones, each found CLI's --version), the
+agents that used Meridian this session, the updater's state, and the last
+200 lines of Meridian's own errors (Ask and provider failures with the CLI's
+exit code and stderr tail or the HTTP status and body, failed agent tools,
+update failures, and LOG(WARNING)+ from chrome/browser/meridian), kept in
+memory for this run only.
+
+Everything is scrubbed in report.cc (unit-tested): addresses become [link]
+(a server on this computer keeps scheme://host:port), keys and tokens
+(sk-, ghp_, github_pat_, AIza, xox, AKIA, JWTs, Bearer, key=…, long
+base64/hex) [hidden], e-mails [email], the account and full name [name],
+and any home folder ~. The person's words and edits are scrubbed again on
+the way out, and the boxes show what left.
+
+Nothing is sent by itself: Copy report (Markdown to the clipboard), Save
+as file… (a .md; --meridian-test-save-report for tests), and Open an
+issue on GitHub (a prefilled, short issue under 2000 characters, with the
+full report on the clipboard to paste).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |  14 +
+ .../browser/meridian/agent/agent_service.cc   |  15 +
+ chrome/browser/meridian/ai/ai_service.cc      |  18 +-
+ chrome/browser/meridian/ai/local_agents.cc    |  26 ++
+ chrome/browser/meridian/report.cc             | 412 ++++++++++++++++++
+ chrome/browser/meridian/report.h              | 111 +++++
+ chrome/browser/meridian/report_unittest.cc    | 181 ++++++++
+ chrome/browser/meridian/sidebar.mojom         |  12 +
+ chrome/browser/meridian/sidebar_handler.cc    |   3 +
+ chrome/browser/meridian/sidebar_handler.h     |   8 +
+ .../meridian/sidebar_handler_report.cc        | 377 ++++++++++++++++
+ chrome/browser/meridian/updater.cc            |   5 +
+ chrome/browser/meridian/updater_win.cc        |   5 +
+ .../browser/resources/webui_browser/BUILD.gn  |   3 +
+ .../resources/webui_browser/app.html.ts       |  10 +-
+ chrome/browser/resources/webui_browser/app.ts |  16 +
+ .../resources/webui_browser/meridian/ask.css  |  19 +
+ .../webui_browser/meridian/ask.html.ts        |   5 +-
+ .../resources/webui_browser/meridian/ask.ts   |   6 +
+ .../resources/webui_browser/meridian/chat.css |  19 +
+ .../webui_browser/meridian/chat.html.ts       |   5 +-
+ .../resources/webui_browser/meridian/chat.ts  |   6 +
+ .../webui_browser/meridian/command_bar.css    |  19 +
+ .../meridian/command_bar.html.ts              |   5 +-
+ .../webui_browser/meridian/command_bar.ts     |  10 +
+ .../webui_browser/meridian/report.css         | 254 +++++++++++
+ .../webui_browser/meridian/report.html.ts     |  71 +++
+ .../webui_browser/meridian/report.ts          | 242 ++++++++++
+ .../webui_browser/meridian/settings.html.ts   |  16 +
+ .../webui_browser/meridian/settings.ts        |   4 +
+ 30 files changed, 1889 insertions(+), 8 deletions(-)
+ create mode 100644 chrome/browser/meridian/report.cc
+ create mode 100644 chrome/browser/meridian/report.h
+ create mode 100644 chrome/browser/meridian/report_unittest.cc
+ create mode 100644 chrome/browser/meridian/sidebar_handler_report.cc
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/report.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/report.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/report.ts
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 4b5917cea2..20e1e854d6 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -98,6 +98,16 @@ source_set("model") {
+   ]
+ }
+ 
++# "Send a report": recent errors and the scrubber (no browser deps).
++source_set("report") {
++  sources = [
++    "report.cc",
++    "report.h",
++  ]
++  public_deps = [ "//base" ]
++  deps = [ "//third_party/re2" ]
++}
++
+ # Other AIs: the provider table, output parsers and the process runner (no
+ # browser deps).
+ source_set("ai_providers") {
+@@ -339,6 +349,7 @@ source_set("meridian") {
+     "currency_rates.h",
+     "sidebar_handler.cc",
+     "sidebar_handler.h",
++    "sidebar_handler_report.cc",
+     "sidebar_service_factory.cc",
+     "sidebar_service_factory.h",
+     "now_playing.cc",
+@@ -386,6 +397,7 @@ source_set("meridian") {
+   }
+   public_deps = [
+     ":agent_cli",
++    ":report",
+     ":test_switches",
+     ":mojo_bindings",
+     ":model",
+@@ -483,6 +495,7 @@ test("meridian_unittests") {
+     "boosts/boost_service_unittest.cc",
+     "atc_unittest.cc",
+     "clean_url_unittest.cc",
++    "report_unittest.cc",
+     "setup_profile_unittest.cc",
+     "sidebar_service_unittest.cc",
+     "test_links.h",
+@@ -510,6 +523,7 @@ test("meridian_unittests") {
+     ":guard_hook",
+     ":mission_hook",
+     ":model",
++    ":report",
+     ":workbench_core",
+     "//base/test:run_all_unittests",
+     "//base/test:test_support",
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index b0e7f5b32e..4ac9b8a47a 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/meridian/agent/agent_service.h"
+ 
++#include "chrome/browser/meridian/report.h"
++
+ #include "chrome/browser/meridian/mission/mission_control.h"
+ #include "chrome/browser/meridian/mission/mission_control_factory.h"
+ 
+@@ -690,6 +692,19 @@ void AgentService::Handle(base::DictValue request, Reply reply) {
+       call->client == "Meridian AI") {
+     call->client = "Meridian AI (another app)";
+   }
++  // For "Send a report": which agents used Meridian, and the tools that
++  // failed (the tool and the error; never what it was asked to do).
++  report::NoteAgent(call->client);
++  call->reply = base::BindOnce(
++      [](std::string client, std::string tool, Reply reply,
++         base::DictValue response) {
++        if (const std::string* error = response.FindString("error")) {
++          report::NoteError("agent", client + " → " + tool + ": " +
++                                         error->substr(0, 400));
++        }
++        std::move(reply).Run(std::move(response));
++      },
++      call->client, call->tool, std::move(call->reply));
+   if (base::DictValue* input = request.FindDict("input")) {
+     call->input = std::move(*input);
+   }
+diff --git a/chrome/browser/meridian/ai/ai_service.cc b/chrome/browser/meridian/ai/ai_service.cc
+index 5175465a81..60801443f1 100644
+--- a/chrome/browser/meridian/ai/ai_service.cc
++++ b/chrome/browser/meridian/ai/ai_service.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/meridian/ai/ai_service.h"
+ 
++#include "chrome/browser/meridian/report.h"
++
+ #include "url/gurl.h"
+ 
+ #include <algorithm>
+@@ -1050,10 +1052,16 @@ void AiService::Chat(Request request, EventCallback events) {
+   session->question = request.text;
+   session->answer.clear();
+   // Text and the end of the turn also go into the plain-text history.
++  // Errors are kept for "Send a report" (who answered, never the request).
++  const std::string answers_with =
++      request.provider.empty() ? CurrentProvider() : request.provider;
+   session->events = base::BindRepeating(
+       [](base::WeakPtr<AiService> self, std::string id, int turn,
+-         EventCallback events, const std::string& type,
++         std::string where, EventCallback events, const std::string& type,
+          const std::string& text) {
++        if (type == "error") {
++          report::NoteError("ask", where + ": " + text);
++        }
+         if (!self || !self->sessions_.contains(id)) {
+           return;
+         }
+@@ -1077,7 +1085,13 @@ void AiService::Chat(Request request, EventCallback events) {
+         }
+         events.Run(type, text);
+       },
+-      weak_factory_.GetWeakPtr(), id, turn, events);
++      weak_factory_.GetWeakPtr(), id, turn,
++      (request.mode == "ask" ? "Ask in the command bar" : "Ask panel") +
++          std::string(" (") +
++          (answers_with.empty() ? std::string("no AI set up")
++                                : answers_with) +
++          ")",
++      events);
+   // Mission Control sees the run (not the prompt or the answer).
+   if (mission::MissionControl* mission =
+           mission::MissionControlFactory::GetForProfile(profile_)) {
+diff --git a/chrome/browser/meridian/ai/local_agents.cc b/chrome/browser/meridian/ai/local_agents.cc
+index 81b0a30d60..0ed7d29fc5 100644
+--- a/chrome/browser/meridian/ai/local_agents.cc
++++ b/chrome/browser/meridian/ai/local_agents.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/meridian/ai/local_agents.h"
+ 
++#include "chrome/browser/meridian/report.h"
++
+ 
+ #include <cstring>
+ #include <utility>
+@@ -848,6 +850,27 @@ void LocalAgents::OnCliDone(const std::string& run_id,
+     run->text = run->final_text;
+     run->events.Run("text", run->final_text);
+   }
++  // What the CLI itself said, for "Send a report" (its error and the end of
++  // what it wrote to stderr; never the prompt or the answer).
++  if (timed_out || too_long || !run->error.empty() ||
++      (exit_code != 0 && !killed && run->text.empty())) {
++    std::string detail = p.label + " exited with code " +
++                         base::NumberToString(exit_code) +
++                         (timed_out ? " (timed out)" : "");
++    if (!run->error.empty()) {
++      detail += "; its error: " + run->error.substr(0, 1000);
++    }
++    std::vector<std::string_view> lines = base::SplitStringPiece(
++        stderr_text, "\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++    if (!lines.empty()) {
++      detail += "\nstderr (last lines):";
++      for (size_t i = lines.size() > 12 ? lines.size() - 12 : 0;
++           i < lines.size(); ++i) {
++        detail += "\n  " + std::string(lines[i].substr(0, 300));
++      }
++    }
++    report::NoteError("provider", detail);
++  }
+   if (timed_out) {
+     Finish(run_id, "error", p.label + " took too long to answer.");
+   } else if (too_long) {
+@@ -1041,6 +1064,9 @@ void LocalAgents::OnHttpDone(const std::string& run_id,
+   Run* run = it->second.get();
+   const Provider& p = *run->provider;
+   if (status != 200) {
++    report::NoteError("provider", p.label + " answered HTTP " +
++                                      base::NumberToString(status) + ": " +
++                                      body.substr(0, 600));
+     Finish(run_id, "error", HttpError(p, status, body));
+   } else if (!run->error.empty()) {
+     Finish(run_id, "error",
+diff --git a/chrome/browser/meridian/report.cc b/chrome/browser/meridian/report.cc
+new file mode 100644
+index 0000000000..be9cb5730c
+--- /dev/null
++++ b/chrome/browser/meridian/report.cc
+@@ -0,0 +1,412 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/report.h"
++
++#include <algorithm>
++#include <array>
++#include <deque>
++#include <utility>
++
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/logging.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
++#include "base/synchronization/lock.h"
++#include "base/time/time.h"
++#include "third_party/re2/src/re2/re2.h"
++
++namespace meridian::report {
++
++namespace {
++
++constexpr size_t kMaxLine = 500;
++constexpr size_t kMaxAgents = 20;
++
++struct Store {
++  base::Lock lock;
++  std::deque<std::string> lines;
++  std::vector<std::string> agents;
++};
++
++Store& GetStore() {
++  static base::NoDestructor<Store> store;
++  return *store;
++}
++
++std::string Clock() {
++  base::Time::Exploded t;
++  base::Time::Now().LocalExplode(&t);
++  return base::StringPrintf("%02d:%02d:%02d", t.hour, t.minute, t.second);
++}
++
++logging::LogMessageHandlerFunction g_previous_handler = nullptr;
++
++bool OnLogMessage(int severity,
++                  const char* file,
++                  int line,
++                  size_t message_start,
++                  const std::string& str) {
++  if (severity >= logging::LOGGING_WARNING && file) {
++    std::string_view path(file);
++    if (path.find("meridian") != std::string_view::npos) {
++      size_t slash = path.find_last_of("/\\");
++      std::string_view name =
++          slash == std::string_view::npos ? path : path.substr(slash + 1);
++      std::string_view message =
++          message_start < str.size() ? std::string_view(str).substr(message_start)
++                                     : std::string_view();
++      message = base::TrimWhitespaceASCII(message, base::TRIM_ALL);
++      NoteError(severity >= logging::LOGGING_ERROR ? "error" : "warning",
++                std::string(name) + ":" + base::NumberToString(line) + " " +
++                    std::string(message));
++    }
++  }
++  return g_previous_handler &&
++         g_previous_handler(severity, file, line, message_start, str);
++}
++
++using Groups = std::array<std::string_view, 4>;
++
++// Replaces every match of `re` in `text` with what `with` returns for it
++// (the whole match and its first group, if any).
++template <typename Fn>
++std::string ReplaceEach(std::string_view text, const RE2& re, Fn with) {
++  std::string out;
++  size_t pos = 0;
++  const int groups = std::min(re.NumberOfCapturingGroups(), 3);
++  std::array<std::string_view, 4> m;
++  while (pos <= text.size() &&
++         re.Match(text, pos, text.size(), RE2::UNANCHORED, m.data(),
++                  groups + 1)) {
++    const size_t start = m[0].data() - text.data();
++    out.append(text.substr(pos, start - pos));
++    out += with(m);
++    pos = start + m[0].size();
++    if (m[0].empty()) {
++      if (pos < text.size()) {
++        out += text[pos];
++      }
++      ++pos;
++    }
++  }
++  if (pos < text.size()) {
++    out.append(text.substr(pos));
++  }
++  return out;
++}
++
++std::string ReplaceAll(std::string_view text,
++                       const RE2& re,
++                       std::string_view with) {
++  return ReplaceEach(text, re,
++                     [&](const Groups&) { return std::string(with); });
++}
++
++bool IsLoopback(std::string_view host) {
++  std::string h = base::ToLowerASCII(host);
++  // Without user info and port.
++  if (size_t at = h.rfind('@'); at != std::string::npos) {
++    h = h.substr(at + 1);
++  }
++  if (!h.empty() && h[0] == '[') {
++    return h.starts_with("[::1]");
++  }
++  if (size_t colon = h.find(':'); colon != std::string::npos) {
++    h = h.substr(0, colon);
++  }
++  return h == "localhost" || h == "127.0.0.1" || h == "0.0.0.0";
++}
++
++bool MixedLettersAndDigits(std::string_view s) {
++  bool letter = false;
++  bool digit = false;
++  for (char c : s) {
++    letter |= base::IsAsciiAlpha(c);
++    digit |= base::IsAsciiDigit(c);
++  }
++  return letter && digit;
++}
++
++void ReplaceLiteral(std::string& text,
++                    std::string_view what,
++                    std::string_view with) {
++  if (what.empty()) {
++    return;
++  }
++  base::ReplaceSubstringsAfterOffset(&text, 0, what, with);
++}
++
++}  // namespace
++
++void NoteError(std::string_view source, std::string_view text) {
++  const std::string prefix = Clock() + " " + std::string(source) + ": ";
++  std::vector<std::string> lines;
++  for (std::string_view line : base::SplitStringPiece(
++           text, "\r\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++    std::string l = prefix + std::string(line);
++    if (l.size() > kMaxLine) {
++      base::TruncateUTF8ToByteSize(l, kMaxLine, &l);
++      l += "…";
++    }
++    lines.push_back(std::move(l));
++  }
++  Store& store = GetStore();
++  base::AutoLock lock(store.lock);
++  for (std::string& l : lines) {
++    store.lines.push_back(std::move(l));
++  }
++  while (store.lines.size() > kMaxErrorLines) {
++    store.lines.pop_front();
++  }
++}
++
++void NoteAgent(std::string_view name) {
++  std::string n(name.substr(0, 60));
++  if (n.empty()) {
++    return;
++  }
++  Store& store = GetStore();
++  base::AutoLock lock(store.lock);
++  if (!std::ranges::contains(store.agents, n) &&
++      store.agents.size() < kMaxAgents) {
++    store.agents.push_back(std::move(n));
++  }
++}
++
++std::vector<std::string> RecentErrors() {
++  Store& store = GetStore();
++  base::AutoLock lock(store.lock);
++  return {store.lines.begin(), store.lines.end()};
++}
++
++std::vector<std::string> AgentsSeen() {
++  Store& store = GetStore();
++  base::AutoLock lock(store.lock);
++  return store.agents;
++}
++
++void CaptureLogs() {
++  static bool installed = false;
++  if (installed) {
++    return;
++  }
++  installed = true;
++  g_previous_handler = logging::GetLogMessageHandler();
++  logging::SetLogMessageHandler(&OnLogMessage);
++}
++
++void ResetForTesting() {
++  Store& store = GetStore();
++  base::AutoLock lock(store.lock);
++  store.lines.clear();
++  store.agents.clear();
++}
++
++Private::Private() = default;
++Private::Private(const Private&) = default;
++Private::~Private() = default;
++
++Private ThisComputer() {
++  Private p;
++  base::FilePath home = base::GetHomeDir();
++  p.home = home.AsUTF8Unsafe();
++  std::string account = home.BaseName().AsUTF8Unsafe();
++  if (!account.empty() && account != "/" && account != "\\") {
++    p.names.push_back(account);
++  }
++  return p;
++}
++
++std::string Scrub(std::string_view input, const Private& p) {
++  // Addresses: a page's, a file's, an API's. A server on this computer
++  // keeps its scheme, host and port (useful, and nobody's browsing).
++  static const base::NoDestructor<RE2> kUrl(
++      R"((?i)\b([a-z][a-z0-9+.\-]{1,20})://([^\s/?#"'<>()\[\]{}`|\\]*)[^\s"'<>()\[\]{}`|]*)");
++  std::string text = ReplaceEach(input, *kUrl, [](const Groups& m) {
++    if (IsLoopback(m[2])) {
++      std::string host(m[2]);
++      if (size_t at = host.rfind('@'); at != std::string::npos) {
++        host = host.substr(at + 1);
++      }
++      return base::ToLowerASCII(m[1]) + "://" + host;
++    }
++    return std::string("[link]");
++  });
++
++  // The home folder, as the person's own and as anyone's.
++  if (p.home.size() > 1) {
++    std::string home = p.home;
++    while (home.size() > 1 && (home.back() == '/' || home.back() == '\\')) {
++      home.pop_back();
++    }
++    // A folder seen through /private (macOS) first.
++    ReplaceLiteral(text, "/private" + home, "~");
++    ReplaceLiteral(text, home, "~");
++    std::string other = home;
++    std::replace(other.begin(), other.end(), '\\', '/');
++    ReplaceLiteral(text, other, "~");
++    std::replace(other.begin(), other.end(), '/', '\\');
++    ReplaceLiteral(text, other, "~");
++  }
++  static const base::NoDestructor<RE2> kPosixHome(
++      R"((/private)?/(Users|home)/[^/\s:"'<>|]+)");
++  text = ReplaceAll(text, *kPosixHome, "~");
++  static const base::NoDestructor<RE2> kWindowsHome(
++      R"((?i)\b[a-z]:[\\/]+(Users|Documents and Settings)[\\/]+[^\\/\s:"'<>|]+)");
++  text = ReplaceAll(text, *kWindowsHome, "~");
++
++  static const base::NoDestructor<RE2> kEmail(
++      R"([A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,})");
++  text = ReplaceAll(text, *kEmail, "[email]");
++
++  // Keys and tokens.
++  static const base::NoDestructor<RE2> kBearer(
++      R"((?i)\b(Bearer)\s+[A-Za-z0-9._~+/=\-]{6,})");
++  text = ReplaceEach(text, *kBearer, [](const Groups& m) {
++    return std::string(m[1]) + " [hidden]";
++  });
++  static const base::NoDestructor<RE2> kNamedSecret(
++      R"((?i)((?:x-)?api[_\-]?key|secret[_\-]?key|private[_\-]?key|access[_\-]?token|auth[_\-]?token|refresh[_\-]?token|client[_\-]?secret|secret|token|password|passwd|authorization)(["']?\s*[:=]\s*["']?)([^\s"',;}&]+))");
++  text = ReplaceEach(text, *kNamedSecret, [](const Groups& m) {
++    if (m[3] == "[hidden]" || base::EqualsCaseInsensitiveASCII(m[3], "Bearer")) {
++      return std::string(m[0]);
++    }
++    return std::string(m[1]) + std::string(m[2]) + "[hidden]";
++  });
++  static const base::NoDestructor<RE2> kKnownKey(
++      R"(\b(sk-[A-Za-z0-9_\-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|AIza[0-9A-Za-z_\-]{20,}|xox[abprs]-[A-Za-z0-9\-]{10,}|glpat-[A-Za-z0-9_\-]{16,}|(AKIA|ASIA)[0-9A-Z]{16}|eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+))");
++  text = ReplaceAll(text, *kKnownKey, "[hidden]");
++  // Anything long that looks random (base64, hex, ids).
++  static const base::NoDestructor<RE2> kLong(R"([A-Za-z0-9+/=_\-]{32,})");
++  text = ReplaceEach(text, *kLong, [](const Groups& m) {
++    std::string_view run = m[0];
++    // Base64 with slashes in it.
++    if (run.size() >= 40 && MixedLettersAndDigits(run) &&
++        (run.find('+') != std::string_view::npos || run.ends_with('='))) {
++      return std::string("[hidden]");
++    }
++    std::vector<std::string> parts;
++    for (std::string_view part : base::SplitStringPiece(
++             run, "/", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL)) {
++      parts.push_back(part.size() >= 32 && MixedLettersAndDigits(part)
++                          ? std::string("[hidden]")
++                          : std::string(part));
++    }
++    return base::JoinString(parts, "/");
++  });
++
++  // Names.
++  for (const std::string& name : p.names) {
++    std::string n(base::TrimWhitespaceASCII(name, base::TRIM_ALL));
++    if (n.size() < 3 || n == "hidden" || n == "name" || n == "link" ||
++        n == "email") {
++      continue;
++    }
++    if (base::IsStringASCII(n)) {
++      RE2 word("(?i)\\b" + RE2::QuoteMeta(n) + "\\b");
++      if (word.ok()) {
++        text = ReplaceAll(text, word, "[name]");
++      }
++    } else {
++      ReplaceLiteral(text, n, "[name]");
++    }
++  }
++  return text;
++}
++
++Facts::Facts() = default;
++Facts::Facts(const Facts&) = default;
++Facts::~Facts() = default;
++
++std::string Details(const Facts& f, const Private& p) {
++  auto yes = [](bool b) { return b ? "Yes" : "No"; };
++  std::string md;
++  md += "## Meridian\n";
++  md += "- Version: Meridian " + f.version + " (Chromium " +
++        f.chromium_version + ")\n";
++  md += "- System: " + f.os + ", " + f.arch + "\n";
++
++  md += "\n## Settings › AI\n";
++  md += "- Ask and Chat answer with: " + f.ai_answers + "\n";
++  md += "- Agent access: " + f.agent_access + "\n";
++  md += "- Sending to AIs on the internet: " + f.ai_consent + "\n";
++  md += "- Other agents offered: " + std::string(yes(f.other_agents)) + "\n";
++
++  md += "\n## AIs Meridian can use\n";
++  std::vector<std::string> missing;
++  for (const Ai& ai : f.ais) {
++    if (!ai.installed && ai.unavailable.empty()) {
++      missing.push_back(ai.label);
++      continue;
++    }
++    std::string line = "- " + ai.label + " (" + ai.kind + "): ";
++    std::vector<std::string> bits;
++    if (!ai.unavailable.empty()) {
++      bits.push_back("can’t answer here: " + ai.unavailable);
++    } else {
++      bits.push_back(ai.kind == "cloud" ? "key saved" : "installed");
++      // (A model on this computer has no account.)
++      if (ai.kind == "local") {
++      } else if (ai.signed_in == 1) {
++        bits.push_back("signed in");
++      } else if (ai.signed_in == 0) {
++        bits.push_back("not signed in");
++      }
++      if (!ai.model.empty()) {
++        bits.push_back("model " + ai.model);
++      }
++    }
++    md += line + base::JoinString(bits, ", ") + "\n";
++  }
++  if (!missing.empty()) {
++    md += "- Not set up: " + base::JoinString(missing, ", ") + "\n";
++  }
++
++  md += "\n## Coding agents\n";
++  std::vector<std::string> not_found;
++  for (const Agent& a : f.agents) {
++    if (!a.found) {
++      not_found.push_back(a.name);
++      continue;
++    }
++    std::string line = "- " + a.name + ": found";
++    if (a.connected) {
++      line += ", has Meridian";
++    }
++    if (!a.version.empty()) {
++      line += ", version " + a.version;
++    }
++    md += line + "\n";
++  }
++  if (!f.agents_seen.empty()) {
++    md += "- Used Meridian this session: " +
++          base::JoinString(f.agents_seen, ", ") + "\n";
++  }
++  if (!not_found.empty()) {
++    md += "- Not found: " + base::JoinString(not_found, ", ") + "\n";
++  }
++
++  md += "\n## Updates\n- " + f.update + "\n";
++
++  md += "\n## Recent errors\n";
++  if (f.errors.empty()) {
++    md += "None this session.\n";
++  } else {
++    md += "The last " + base::NumberToString(f.errors.size()) +
++          " lines Meridian noted since it started.\n\n```text\n";
++    for (std::string line : f.errors) {
++      base::ReplaceSubstringsAfterOffset(&line, 0, "```", "'''");
++      md += line + "\n";
++    }
++    md += "```\n";
++  }
++  return Scrub(md, p);
++}
++
++}  // namespace meridian::report
+diff --git a/chrome/browser/meridian/report.h b/chrome/browser/meridian/report.h
+new file mode 100644
+index 0000000000..4f892953c0
+--- /dev/null
++++ b/chrome/browser/meridian/report.h
+@@ -0,0 +1,111 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_REPORT_H_
++#define CHROME_BROWSER_MERIDIAN_REPORT_H_
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++// "Send a report": what the person can send the developer when something
++// goes wrong, shown to them in full before anything leaves (and nothing ever
++// leaves by itself: they copy it, save it or paste it into an issue).
++//
++// Meridian keeps its recent errors here (Ask and provider failures, agent
++// tool failures, the updater, and its own LOG(WARNING) and worse lines) for
++// this run only, never on disk. Everything that goes into a report passes
++// through Scrub(): no addresses of pages, no keys or tokens, no e-mail
++// addresses, no name, and the home folder written as ~.
++namespace meridian::report {
++
++// The last lines kept.
++inline constexpr size_t kMaxErrorLines = 200;
++
++// Something went wrong: `source` is a short tag ("ask", "agent", "update",
++// "log"), `text` may span lines (each kept, with the time and the tag).
++// Any thread.
++void NoteError(std::string_view source, std::string_view text);
++// An agent (MCP client) used Meridian this run, by the name it gave.
++void NoteAgent(std::string_view name);
++// Oldest first, each line at most 500 characters. Not scrubbed yet.
++std::vector<std::string> RecentErrors();
++std::vector<std::string> AgentsSeen();
++// Keeps Meridian's own LOG(WARNING) and worse (from chrome/browser/meridian)
++// among the errors from now on; once per process.
++void CaptureLogs();
++void ResetForTesting();
++
++// What is private on this computer: the home folder, and names (the account
++// name, the person's full name, the member card's name).
++struct Private {
++  Private();
++  Private(const Private&);
++  ~Private();
++  std::string home;
++  std::vector<std::string> names;
++};
++// The home folder and the account and full name from the system.
++Private ThisComputer();
++
++// `text` without what must not leave this computer: page and other addresses
++// ([link]; a server on this computer keeps http://localhost:port), e-mail
++// addresses ([email]), API keys and tokens (sk-…, ghp_…, AIza…, Bearer …,
++// key=…, JWTs, long base64/hex: [hidden]), names ([name]), and the home
++// folder (any /Users/<name> or C:\Users\<name>) as ~. Scrubbing twice changes
++// nothing more.
++std::string Scrub(std::string_view text, const Private& p);
++
++// The facts in a report, gathered by the window (sidebar_handler.cc).
++struct Ai {
++  std::string label;
++  // "cli", "local" or "cloud".
++  std::string kind;
++  bool installed = false;
++  // 1 signed in, 0 not, -1 can't tell.
++  int signed_in = -1;
++  // A local or cloud model in use (never a CLI's account).
++  std::string model;
++  // Why it can't answer here.
++  std::string unavailable;
++};
++struct Agent {
++  std::string name;
++  bool found = false;
++  // Its config has Meridian (Claude Desktop), else unknown.
++  bool connected = false;
++  // The first line of `<cli> --version`, if it has one.
++  std::string version;
++};
++struct Facts {
++  Facts();
++  Facts(const Facts&);
++  ~Facts();
++  std::string version;
++  std::string chromium_version;
++  // "macOS 26.2", "Windows 11 (10.0.26100)".
++  std::string os;
++  // "arm64", "x86_64".
++  std::string arch;
++  // Settings > AI: who answers ("Automatic (Claude Code)"), agent access,
++  // sending to AIs on the internet, "other agents" offered.
++  std::string ai_answers;
++  std::string agent_access;
++  std::string ai_consent;
++  bool other_agents = false;
++  std::vector<Ai> ais;
++  std::vector<Agent> agents;
++  std::vector<std::string> agents_seen;
++  // "Up to date", "Failed: …".
++  std::string update;
++  std::vector<std::string> errors;
++};
++
++// The report's details (everything but the person's own words), as
++// Markdown, scrubbed.
++std::string Details(const Facts& facts, const Private& p);
++
++}  // namespace meridian::report
++
++#endif  // CHROME_BROWSER_MERIDIAN_REPORT_H_
+diff --git a/chrome/browser/meridian/report_unittest.cc b/chrome/browser/meridian/report_unittest.cc
+new file mode 100644
+index 0000000000..4dfe42b8bb
+--- /dev/null
++++ b/chrome/browser/meridian/report_unittest.cc
+@@ -0,0 +1,181 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/report.h"
++
++#include <string>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace meridian::report {
++namespace {
++
++Private Mac() {
++  Private p;
++  p.home = "/Users/sasha";
++  p.names = {"sasha", "Alexandra Petrova"};
++  return p;
++}
++
++Private Windows() {
++  Private p;
++  p.home = "C:\\Users\\Sasha";
++  p.names = {"Sasha"};
++  return p;
++}
++
++bool Has(const std::string& text, const std::string& part) {
++  return text.find(part) != std::string::npos;
++}
++
++TEST(ReportScrubTest, HomeFolderBecomesTilde) {
++  const Private p = Mac();
++  EXPECT_EQ(Scrub("couldn't read /Users/sasha/.config/opencode/opencode.json",
++                  p),
++            "couldn't read ~/.config/opencode/opencode.json");
++  EXPECT_EQ(Scrub("cwd /private/Users/sasha/x", p), "cwd ~/x");
++  // Anyone's home folder, not only this one's.
++  EXPECT_EQ(Scrub("at /Users/someone/Library/x and /home/bob/.bashrc", p),
++            "at ~/Library/x and ~/.bashrc");
++  const Private w = Windows();
++  EXPECT_EQ(Scrub("spawn C:\\Users\\Sasha\\AppData\\npm\\opencode.cmd", w),
++            "spawn ~\\AppData\\npm\\opencode.cmd");
++  EXPECT_EQ(Scrub("open c:/users/Bob/x.json failed", w), "open ~/x.json failed");
++}
++
++TEST(ReportScrubTest, NoAddresses) {
++  const Private p = Mac();
++  EXPECT_EQ(Scrub("couldn't reach https://mail.example.com/inbox?id=7#top", p),
++            "couldn't reach [link]");
++  EXPECT_EQ(Scrub("file:///Users/sasha/secret.txt (wss://x.io/s)", p),
++            "[link] ([link])");
++  EXPECT_EQ(Scrub("chrome://settings/passwords", p), "[link]");
++  // A server on this computer keeps where it is, not what it was asked.
++  EXPECT_EQ(Scrub("Ollama at http://localhost:11434/api/chat?q=page", p),
++            "Ollama at http://localhost:11434");
++  EXPECT_EQ(Scrub("http://user:pw@127.0.0.1:1234/v1", p),
++            "http://127.0.0.1:1234");
++}
++
++TEST(ReportScrubTest, NoKeysOrTokens) {
++  const Private p = Mac();
++  const char* secrets[] = {
++      "sk-ant-api03-AbCdEf0123456789_xyz-QWERTY",
++      "sk-proj-1234567890abcdef",
++      "ghp_0123456789abcdefABCDEF0123456789abcd",
++      "github_pat_11ABCDEFG0123456789_abcdefghijklmnop",
++      "AIzaSyD-0123456789abcdefghijklmnopqrstu",
++      "xoxb-1234567890-abcdefghij",
++      "AKIAIOSFODNN7EXAMPLE",
++      "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJl",
++      "0123456789abcdef0123456789abcdef0123",
++      "dGhpcyBpcyBhIHNlY3JldCBrZXkgdGhhdCBpcyBsb25n+/x9==",
++  };
++  for (const char* secret : secrets) {
++    const std::string out = Scrub(std::string("key: ") + secret + " end", p);
++    EXPECT_FALSE(Has(out, secret)) << out;
++    EXPECT_TRUE(Has(out, "[hidden]")) << out;
++    EXPECT_TRUE(Has(out, " end")) << out;
++  }
++  EXPECT_EQ(Scrub("Authorization: Bearer abc.DEF-123_456", p),
++            "Authorization: Bearer [hidden]");
++  EXPECT_EQ(Scrub("OPENAI_API_KEY=hunter2 and \"api_key\": \"short1\"", p),
++            "OPENAI_API_KEY=[hidden] and \"api_key\": \"[hidden]\"");
++  EXPECT_EQ(Scrub("password=letmein;", p), "password=[hidden];");
++}
++
++TEST(ReportScrubTest, KeepsWhatHelps) {
++  const Private p = Mac();
++  const std::string plain =
++      "OpenCode exited with code 1: Error: model qwen2.5-coder-32b-instruct "
++      "not found (Meridian 1.1.0, Chromium 147.0.7727.15). Token limit "
++      "reached; ~/node_modules/@ai-sdk/openai-compatible/dist/index.js:42";
++  EXPECT_EQ(Scrub(plain, p), plain);
++}
++
++TEST(ReportScrubTest, NoEmailsOrNames) {
++  const Private p = Mac();
++  EXPECT_EQ(Scrub("Logged in as sasha.p+dev@gmail.com", p),
++            "Logged in as [email]");
++  EXPECT_EQ(Scrub("Hi Sasha, from Alexandra Petrova (sasha)", p),
++            "Hi [name], from [name] ([name])");
++  Private ru;
++  ru.names = {"Александра"};
++  EXPECT_EQ(Scrub("Привет, Александра!", ru), "Привет, [name]!");
++}
++
++TEST(ReportScrubTest, ScrubbingTwiceChangesNothing) {
++  const Private p = Mac();
++  const std::string once = Scrub(
++      "sasha at /Users/sasha/x https://a.b/c http://localhost:3000/x "
++      "Bearer abcdefgh sk-1234567890abc a@b.co token=xyz",
++      p);
++  EXPECT_EQ(Scrub(once, p), once);
++}
++
++TEST(ReportErrorsTest, KeepsTheLastLinesWithTimeAndSource) {
++  ResetForTesting();
++  NoteError("ask", "OpenCode took too long\nsecond line\n\n");
++  std::vector<std::string> lines = RecentErrors();
++  ASSERT_EQ(lines.size(), 2u);
++  EXPECT_TRUE(Has(lines[0], " ask: OpenCode took too long"));
++  EXPECT_TRUE(Has(lines[1], " ask: second line"));
++  for (size_t i = 0; i < kMaxErrorLines + 50; ++i) {
++    NoteError("log", "line " + std::to_string(i));
++  }
++  lines = RecentErrors();
++  ASSERT_EQ(lines.size(), kMaxErrorLines);
++  EXPECT_TRUE(Has(lines.back(), "line " + std::to_string(kMaxErrorLines + 49)));
++  NoteError("ask", std::string(2000, 'a'));
++  EXPECT_LE(RecentErrors().back().size(), 520u);
++  NoteAgent("Claude Code");
++  NoteAgent("Claude Code");
++  EXPECT_EQ(AgentsSeen(), std::vector<std::string>{"Claude Code"});
++  ResetForTesting();
++}
++
++TEST(ReportDetailsTest, SaysWhatMattersAndNothingPrivate) {
++  Facts f;
++  f.version = "1.1.0";
++  f.chromium_version = "147.0.7727.15";
++  f.os = "macOS 26.2";
++  f.arch = "arm64";
++  f.ai_answers = "OpenCode";
++  f.agent_access = "Ask before each action";
++  f.ai_consent = "Ask first";
++  f.ais = {{"Claude Code", "cli", true, 1, "", ""},
++           {"OpenCode", "cli", true, -1, "", ""},
++           {"Ollama", "local", true, -1, "llama3.2", ""},
++           {"Codex", "cli", false, -1, "", ""}};
++  f.agents = {{"OpenCode", true, false, "0.15.2"},
++              {"Claude Desktop", true, true, ""},
++              {"Cursor", false, false, ""}};
++  f.agents_seen = {"opencode"};
++  f.update = "Up to date";
++  f.errors = {"10:00:00 ask: OpenCode exited with code 1 at "
++              "/Users/sasha/.config/opencode with sk-ant-1234567890abcdef "
++              "on https://bank.example/account",
++              "10:00:01 log: ``` fence"};
++  const std::string md = Details(f, Mac());
++  EXPECT_TRUE(Has(md, "- Version: Meridian 1.1.0 (Chromium 147.0.7727.15)"));
++  EXPECT_TRUE(Has(md, "- System: macOS 26.2, arm64"));
++  EXPECT_TRUE(Has(md, "- Ask and Chat answer with: OpenCode"));
++  EXPECT_TRUE(Has(md, "- Agent access: Ask before each action"));
++  EXPECT_TRUE(Has(md, "- Claude Code (cli): installed, signed in"));
++  EXPECT_TRUE(Has(md, "- Ollama (local): installed, model llama3.2"));
++  EXPECT_TRUE(Has(md, "- Not set up: Codex"));
++  EXPECT_TRUE(Has(md, "- OpenCode: found, version 0.15.2"));
++  EXPECT_TRUE(Has(md, "- Claude Desktop: found, has Meridian"));
++  EXPECT_TRUE(Has(md, "- Used Meridian this session: opencode"));
++  EXPECT_TRUE(Has(md, "- Not found: Cursor"));
++  EXPECT_TRUE(Has(md, "The last 2 lines"));
++  EXPECT_TRUE(Has(md, "at ~/.config/opencode with [hidden] on [link]"));
++  EXPECT_FALSE(Has(md, "/Users/sasha"));
++  EXPECT_FALSE(Has(md, "bank.example"));
++  EXPECT_FALSE(Has(md, "sk-ant"));
++  EXPECT_TRUE(Has(md, "log: ''' fence"));
++}
++
++}  // namespace
++}  // namespace meridian::report
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index b2df819d15..5c46952f8c 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -762,6 +762,18 @@ interface SidebarHandler {
+   // "designer", "manager" or "everyday" (Settings' developer mode, else
+   // guessed from the apps and signs of development).
+   GetPersona() => (string persona);
++  // "Send a report" (report.h): everything in it but the person's own
++  // words, as Markdown, already scrubbed (no addresses, keys, names or home
++  // folder). Runs each found agent CLI's `--version` (a few seconds at most).
++  GetReport() => (string details);
++  // The same scrubbing, for what the person typed or edited.
++  ScrubReport(string text) => (string text);
++  // Puts the report on the clipboard (scrubbed once more); what was put there.
++  CopyReport(string markdown) => (string copied);
++  // Asks where to save the report as a Markdown file and saves it there
++  // (scrubbed once more). --meridian-test-save-report=<file> saves there
++  // without asking (tests).
++  SaveReport(string markdown) => (bool saved);
+   // The pointer is on the window's close, minimize or zoom button, which
+   // the page can't see (macOS).
+   IsPointerOverWindowControls() => (bool over);
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 8925378927..e5f600fa3a 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -84,6 +84,7 @@
+ #include "chrome/common/webui_url_constants.h"
+ #include "ui/base/clipboard/scoped_clipboard_writer.h"
+ #include "chrome/browser/meridian/prefs.h"
++#include "chrome/browser/meridian/report.h"
+ #include "chrome/browser/meridian/private_file.h"
+ #include "chrome/browser/meridian/setup_profile.h"
+ #include "chrome/browser/meridian/space_profiles.h"
+@@ -308,6 +309,8 @@ SidebarHandler::SidebarHandler(
+   TabStripModel::SetSelectableAfterClose(&SidebarHandler::SelectableAfterClose);
+   Updater::Get().AddObserver(this);
+   Updater::Get().Start();
++  // Meridian's own warnings and errors, for "Send a report".
++  report::CaptureLogs();
+   downloads_ = std::make_unique<DownloadsTracker>(
+       browser->GetProfile(),
+       base::BindRepeating(
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 8bebf8c3c4..d85c5fd5a4 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -239,6 +239,14 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void OpenInClaude(const std::string& request,
+                     OpenInClaudeCallback callback) override;
+   void GetPersona(GetPersonaCallback callback) override;
++  // "Send a report" (sidebar_handler_report.cc).
++  void GetReport(GetReportCallback callback) override;
++  void ScrubReport(const std::string& text,
++                   ScrubReportCallback callback) override;
++  void CopyReport(const std::string& markdown,
++                  CopyReportCallback callback) override;
++  void SaveReport(const std::string& markdown,
++                  SaveReportCallback callback) override;
+   void IsPointerOverWindowControls(
+       IsPointerOverWindowControlsCallback callback) override;
+   void HasAiKey(HasAiKeyCallback callback) override;
+diff --git a/chrome/browser/meridian/sidebar_handler_report.cc b/chrome/browser/meridian/sidebar_handler_report.cc
+new file mode 100644
+index 0000000000..a333bd8a22
+--- /dev/null
++++ b/chrome/browser/meridian/sidebar_handler_report.cc
+@@ -0,0 +1,377 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// "Send a report": the facts for report.h, the clipboard and the save dialog.
++// Nothing is sent anywhere from here: the person copies or saves the report
++// they were shown.
++
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/barrier_callback.h"
++#include "base/environment.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/path_service.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/system/sys_info.h"
++#include "base/task/thread_pool.h"
++#include "base/time/time.h"
++#include "build/build_config.h"
++#include "chrome/browser/meridian/agent/agent_cli.h"
++#include "chrome/browser/meridian/ai/ai_service.h"
++#include "chrome/browser/meridian/ai/ai_service_factory.h"
++#include "chrome/browser/meridian/ai/local_agents.h"
++#include "chrome/browser/meridian/ai/process_runner.h"
++#include "chrome/browser/meridian/ai/providers.h"
++#include "chrome/browser/meridian/prefs.h"
++#include "chrome/browser/meridian/report.h"
++#include "chrome/browser/meridian/sidebar_handler.h"
++#include "chrome/browser/meridian/space_profiles.h"
++#include "chrome/browser/meridian/test_switches.h"
++#include "chrome/browser/meridian/update_check.h"
++#include "chrome/browser/meridian/updater.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window.h"
++#include "chrome/browser/ui/select_file_policy/chrome_select_file_policy.h"
++#include "chrome/common/chrome_paths.h"
++#include "components/prefs/pref_service.h"
++#include "components/version_info/version_info.h"
++#include "ui/base/clipboard/scoped_clipboard_writer.h"
++#include "ui/shell_dialogs/select_file_dialog.h"
++#include "ui/shell_dialogs/selected_file_info.h"
++
++namespace meridian {
++
++namespace {
++
++std::string OsName() {
++#if BUILDFLAG(IS_MAC)
++  return "macOS " + base::SysInfo::OperatingSystemVersion();
++#elif BUILDFLAG(IS_WIN)
++  return "Windows " + base::SysInfo::OperatingSystemVersion();
++#else
++  return base::SysInfo::OperatingSystemName() + " " +
++         base::SysInfo::OperatingSystemVersion();
++#endif
++}
++
++std::string AccessName(const std::string& access) {
++  if (access == "read") {
++    return "Read only";
++  }
++  if (access == "ask") {
++    return "Ask before each action";
++  }
++  if (access == "full") {
++    return "Full";
++  }
++  return "Off";
++}
++
++std::string ConsentName(const std::string& consent) {
++  if (consent == "always") {
++    return "Always send";
++  }
++  if (consent == "off") {
++    return "AI features off";
++  }
++  return "Ask first";
++}
++
++std::string UpdateText(const mojom::UpdateStatePtr& u) {
++  switch (u->status) {
++    case mojom::UpdateStatus::kChecking:
++      return "Checking for updates";
++    case mojom::UpdateStatus::kUpToDate:
++      return "Up to date";
++    case mojom::UpdateStatus::kAvailable:
++      return "Meridian " + u->version + " is available";
++    case mojom::UpdateStatus::kDownloading:
++      return "Downloading Meridian " + u->version;
++    case mojom::UpdateStatus::kReady:
++      return "Meridian " + u->version + " is ready (restart to update)";
++    case mojom::UpdateStatus::kFailed:
++      return "Update failed: " + u->error;
++    case mojom::UpdateStatus::kIdle:
++      break;
++  }
++  return "Not checked yet";
++}
++
++// The first line of `<cli> --version`, or empty. Blocking (a few seconds at
++// most). Only a program file is run: not an app or a config folder.
++std::string CliVersion(const std::string& path) {
++  base::FilePath file = base::FilePath::FromUTF8Unsafe(path);
++  if (path.empty() || base::DirectoryExists(file) || !base::PathExists(file)) {
++    return std::string();
++  }
++  std::vector<std::string> argv = {path, "--version"};
++#if BUILDFLAG(IS_WIN)
++  // A .cmd wrapper (npm's) needs the shell.
++  if (!base::EndsWith(path, ".exe", base::CompareCase::INSENSITIVE_ASCII)) {
++    std::string comspec =
++        base::Environment::Create()->GetVar("ComSpec").value_or(
++            "C:\\Windows\\System32\\cmd.exe");
++    argv = {comspec, "/d", "/c", path, "--version"};
++  }
++#endif
++  std::string out = ai::CaptureOutput(argv, ai::LoginEnvironment(),
++                                      base::GetHomeDir().AsUTF8Unsafe(),
++                                      base::Seconds(6));
++  std::vector<std::string_view> lines = base::SplitStringPiece(
++      out, "\r\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++  return lines.empty() ? std::string()
++                       : std::string(lines.front().substr(0, 100));
++}
++
++struct FoundAgents {
++  std::vector<AgentCli> clis;
++  bool desktop_connected = false;
++};
++
++FoundAgents FindAgents() {
++  return {DetectAgentClis(), GetClaudeDesktopState().connected};
++}
++
++// Saves the report where the person chose; owns itself until then.
++class ReportSaver : public ui::SelectFileDialog::Listener {
++ public:
++  ReportSaver(std::string markdown,
++              base::OnceCallback<void(bool)> done)
++      : markdown_(std::move(markdown)), done_(std::move(done)) {}
++
++  void Ask(BrowserWindowInterface* browser) {
++    base::FilePath dir;
++    base::PathService::Get(chrome::DIR_DEFAULT_DOWNLOADS, &dir);
++    base::Time::Exploded now;
++    base::Time::Now().LocalExplode(&now);
++    const std::string name =
++        base::StringPrintf("Meridian report %04d-%02d-%02d.md", now.year,
++                           now.month, now.day_of_month);
++    ui::SelectFileDialog::FileTypeInfo types;
++    types.extensions = {{FILE_PATH_LITERAL("md")}};
++    types.include_all_files = true;
++    dialog_ = ui::SelectFileDialog::Create(
++        this, std::make_unique<ChromeSelectFilePolicy>(nullptr));
++    dialog_->SelectFile(
++        ui::SelectFileDialog::SELECT_SAVEAS_FILE, u"Save the report",
++        dir.Append(base::FilePath::FromUTF8Unsafe(name)), &types, 1,
++        FILE_PATH_LITERAL("md"),
++        browser && browser->GetWindow()
++            ? browser->GetWindow()->GetNativeWindow()
++            : gfx::NativeWindow());
++  }
++
++  void FileSelected(const ui::SelectedFileInfo& file, int) override {
++    Write(file.path());
++  }
++
++  void FileSelectionCanceled() override { Finish(false); }
++
++  void Write(const base::FilePath& path) {
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_BLOCKING},
++        base::BindOnce(
++            [](base::FilePath path, std::string text) {
++              return base::WriteFile(path, text);
++            },
++            path, markdown_),
++        base::BindOnce(&ReportSaver::Finish, base::Unretained(this)));
++  }
++
++ private:
++  ~ReportSaver() override {
++    if (dialog_) {
++      dialog_->ListenerDestroyed();
++    }
++  }
++
++  void Finish(bool saved) {
++    std::move(done_).Run(saved);
++    delete this;
++  }
++
++  std::string markdown_;
++  base::OnceCallback<void(bool)> done_;
++  scoped_refptr<ui::SelectFileDialog> dialog_;
++};
++
++}  // namespace
++
++void SidebarHandler::GetReport(GetReportCallback callback) {
++  Profile* profile = browser_->GetProfile();
++  PrefService* prefs = profile->GetPrefs();
++  PrefService* main_prefs = MainProfileFor(profile)->GetPrefs();
++  report::Facts facts;
++  facts.version = update::kVersion;
++  facts.chromium_version = std::string(version_info::GetVersionNumber());
++  facts.os = OsName();
++  facts.arch = base::SysInfo::OperatingSystemArchitecture();
++  AiService* ai = AiServiceFactory::GetForProfile(profile);
++  const std::string chosen = prefs->GetString(prefs::kAiProvider);
++  const std::string label = ai ? ai->CurrentLabel() : std::string();
++  if (chosen.empty()) {
++    facts.ai_answers =
++        "Automatic (" + (label.empty() ? "nothing set up" : label) + ")";
++  } else {
++    facts.ai_answers = label.empty() ? chosen + " (not set up)" : label;
++  }
++  facts.agent_access = AccessName(main_prefs->GetString(prefs::kAgentAccess));
++  if (main_prefs->GetBoolean(prefs::kAgentAllowJs)) {
++    facts.agent_access += ", JavaScript allowed";
++  }
++  facts.ai_consent = ConsentName(prefs->GetString(prefs::kAiConsent));
++  facts.other_agents = prefs->GetBoolean(prefs::kAiOtherAgents);
++  facts.update = UpdateText(Updater::Get().State());
++  facts.agents_seen = report::AgentsSeen();
++  facts.errors = report::RecentErrors();
++  report::Private p = report::ThisComputer();
++  for (const std::string& name :
++       {prefs->GetString(prefs::kMemberName), SystemUserFullName()}) {
++    if (!name.empty()) {
++      p.names.push_back(name);
++    }
++  }
++
++  // The agents and their versions (blocking), then the AIs (Settings > AI).
++  auto with_ais = base::BindOnce(
++      [](base::WeakPtr<AiService> ai, report::Facts facts, report::Private p,
++         GetReportCallback callback, std::vector<report::Agent> agents) {
++        facts.agents = std::move(agents);
++        auto finish = base::BindOnce(
++            [](report::Facts facts, report::Private p,
++               GetReportCallback callback,
++               std::vector<ai::LocalAgents::Status> list) {
++              for (const ai::LocalAgents::Status& s : list) {
++                const ai::Provider* provider = ai::FindProvider(s.id);
++                if (!provider) {
++                  continue;
++                }
++                report::Ai a;
++                a.label = provider->label;
++                a.kind = provider->kind == ai::Kind::kCli     ? "cli"
++                         : provider->kind == ai::Kind::kCloud ? "cloud"
++                                                              : "local";
++                a.installed = s.installed;
++                a.signed_in = s.signed_in ? (*s.signed_in ? 1 : 0) : -1;
++                // A CLI's "account" is who is signed in: never in a report.
++                if (provider->kind != ai::Kind::kCli) {
++                  a.model = s.account;
++                }
++                a.unavailable = s.unavailable;
++                facts.ais.push_back(std::move(a));
++              }
++              std::move(callback).Run(report::Details(facts, p));
++            },
++            std::move(facts), std::move(p), std::move(callback));
++        if (!ai) {
++          std::move(finish).Run({});
++          return;
++        }
++        ai->local().List(/*fresh=*/false, std::move(finish));
++      },
++      ai ? ai->GetWeakPtr() : base::WeakPtr<AiService>(), std::move(facts),
++      std::move(p), std::move(callback));
++
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&FindAgents),
++      base::BindOnce(
++          [](base::OnceCallback<void(std::vector<report::Agent>)> done,
++             FoundAgents found) {
++            std::vector<report::Agent> agents;
++            for (const AgentCli& cli : found.clis) {
++              report::Agent a;
++              a.name = cli.name;
++              a.found = !cli.path.empty();
++              a.connected =
++                  cli.id == "claude-desktop" && found.desktop_connected;
++              agents.push_back(std::move(a));
++            }
++            // Each found CLI's --version at the same time.
++            auto collect = base::BarrierCallback<
++                std::pair<size_t, std::string>>(
++                found.clis.size(),
++                base::BindOnce(
++                    [](std::vector<report::Agent> agents,
++                       base::OnceCallback<void(std::vector<report::Agent>)>
++                           done,
++                       std::vector<std::pair<size_t, std::string>> versions) {
++                      for (auto& [i, version] : versions) {
++                        agents[i].version = std::move(version);
++                      }
++                      std::move(done).Run(std::move(agents));
++                    },
++                    std::move(agents), std::move(done)));
++            for (size_t i = 0; i < found.clis.size(); ++i) {
++              const AgentCli& cli = found.clis[i];
++              if (cli.path.empty() || cli.id == "claude-desktop") {
++                collect.Run({i, std::string()});
++                continue;
++              }
++              base::ThreadPool::PostTaskAndReplyWithResult(
++                  FROM_HERE,
++                  {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++                  base::BindOnce(
++                      [](size_t i, std::string path) {
++                        return std::make_pair(i, CliVersion(path));
++                      },
++                      i, cli.path),
++                  base::BindOnce(collect));
++            }
++          },
++          std::move(with_ais)));
++}
++
++void SidebarHandler::ScrubReport(const std::string& text,
++                                 ScrubReportCallback callback) {
++  report::Private p = report::ThisComputer();
++  for (const std::string& name :
++       {browser_->GetProfile()->GetPrefs()->GetString(prefs::kMemberName),
++        SystemUserFullName()}) {
++    if (!name.empty()) {
++      p.names.push_back(name);
++    }
++  }
++  std::move(callback).Run(report::Scrub(text, p));
++}
++
++void SidebarHandler::CopyReport(const std::string& markdown,
++                                CopyReportCallback callback) {
++  ScrubReport(markdown,
++              base::BindOnce(
++                  [](CopyReportCallback callback, const std::string& text) {
++                    ui::ScopedClipboardWriter(ui::ClipboardBuffer::kCopyPaste)
++                        .WriteText(base::UTF8ToUTF16(text));
++                    std::move(callback).Run(text);
++                  },
++                  std::move(callback)));
++}
++
++void SidebarHandler::SaveReport(const std::string& markdown,
++                                SaveReportCallback callback) {
++  ScrubReport(
++      markdown,
++      base::BindOnce(
++          [](base::WeakPtr<SidebarHandler> self, SaveReportCallback callback,
++             const std::string& text) {
++            auto* saver = new ReportSaver(text, std::move(callback));
++            if (HasTestSwitch("meridian-test-save-report")) {
++              saver->Write(TestSwitchPath("meridian-test-save-report"));
++              return;
++            }
++            saver->Ask(self ? self->browser_.get() : nullptr);
++          },
++          weak_factory_.GetWeakPtr(), std::move(callback)));
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/updater.cc b/chrome/browser/meridian/updater.cc
+index 92cfcbeb0d..fb844e19ea 100644
+--- a/chrome/browser/meridian/updater.cc
++++ b/chrome/browser/meridian/updater.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/meridian/updater.h"
+ 
++#include "chrome/browser/meridian/report.h"
++
+ #include <sys/stat.h>
+ 
+ #include <algorithm>
+@@ -626,6 +628,9 @@ mojom::UpdateStatePtr Updater::State() const {
+ }
+ 
+ void Updater::Set(mojom::UpdateStatus status, std::string error) {
++  if (status == mojom::UpdateStatus::kFailed) {
++    report::NoteError("update", error.empty() ? "failed" : error);
++  }
+   status_ = status;
+   error_ = std::move(error);
+   observers_.Notify(&Observer::OnUpdateStateChanged);
+diff --git a/chrome/browser/meridian/updater_win.cc b/chrome/browser/meridian/updater_win.cc
+index 7f87588e90..1165ba2528 100644
+--- a/chrome/browser/meridian/updater_win.cc
++++ b/chrome/browser/meridian/updater_win.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/meridian/updater.h"
+ 
++#include "chrome/browser/meridian/report.h"
++
+ #include <windows.h>
+ 
+ #include <algorithm>
+@@ -643,6 +645,9 @@ mojom::UpdateStatePtr Updater::State() const {
+ }
+ 
+ void Updater::Set(mojom::UpdateStatus status, std::string error) {
++  if (status == mojom::UpdateStatus::kFailed) {
++    report::NoteError("update", error.empty() ? "failed" : error);
++  }
+   status_ = status;
+   error_ = std::move(error);
+   observers_.Notify(&Observer::OnUpdateStateChanged);
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index 29d3bbb087..bb588b1c0c 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -78,6 +78,8 @@ build_webui("build") {
+     "meridian/showcase.ts",
+     "meridian/try_claude.html.ts",
+     "meridian/try_claude.ts",
++    "meridian/report.html.ts",
++    "meridian/report.ts",
+     "meridian/sidebar.html.ts",
+     "meridian/sidebar.ts",
+     "meridian/tab_row.html.ts",
+@@ -132,6 +134,7 @@ build_webui("build") {
+     "meridian/allow_mock.css",
+     "meridian/showcase.css",
+     "meridian/try_claude.css",
++    "meridian/report.css",
+     "meridian/rows.css",
+     "meridian/sidebar.css",
+     "side_panel.css",
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 711e7da105..d5089e9922 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -167,7 +167,8 @@ export function getHtml(this: WebuiBrowserAppElement) {
+       @command-bar-ask="${this.onCommandBarAsk_}"
+       @command-bar-open-url="${this.onCommandBarOpenUrl_}"
+       @command-bar-closed="${this.onCommandBarClosed_}"
+-      @command-bar-reload="${this.onCommandBarReload_}">
++      @command-bar-reload="${this.onCommandBarReload_}"
++      @meridian-report="${this.onMeridianReport_}">
+   </meridian-command-bar>
+   <meridian-archive id="archive"></meridian-archive>
+   <meridian-onboarding id="onboarding"
+@@ -176,10 +177,13 @@ export function getHtml(this: WebuiBrowserAppElement) {
+       @onboarding-try="${this.onOnboardingTry_}"></meridian-onboarding>
+   <meridian-try-claude id="tryClaude"
+       @meridian-showcase="${this.onMeridianShowcase_}"></meridian-try-claude>
++  <meridian-report id="report"
++      @meridian-open-url="${this.onMeridianOpenUrl_}"></meridian-report>
+   <meridian-settings id="settings"
+       @meridian-onboarding="${this.onMeridianOnboarding_}"
+       @meridian-edit-theme="${this.onMeridianEditTheme_}"
+       @meridian-update-confirm="${this.onMeridianUpdateConfirm_}"
++      @meridian-report="${this.onMeridianReport_}"
+       @meridian-open-url="${this.onMeridianOpenUrl_}">
+   </meridian-settings>
+   <meridian-ai-consent id="aiConsent"
+@@ -247,12 +251,14 @@ export function getHtml(this: WebuiBrowserAppElement) {
+         @meridian-show-settings="${this.onMeridianShowSettings_}"
+         @meridian-open-url="${this.onMeridianOpenUrl_}"
+         @ask-open-urls="${this.onAskOpenUrls_}"
+-        @ask-edit-boost="${this.onAskEditBoost_}"></meridian-ask>
++        @ask-edit-boost="${this.onAskEditBoost_}"
++        @meridian-report="${this.onMeridianReport_}"></meridian-ask>
+     <side-panel id="sidePanel" @side-panel-closed="${this.onSidePanelClosed_}">
+     </side-panel>
+     <meridian-agent id="agent"
+         @meridian-agent-tab="${this.onMeridianAgentTab_}"></meridian-agent>
+     <meridian-chat id="chat"
++        @meridian-report="${this.onMeridianReport_}"
+         @meridian-open-url="${this.onMeridianOpenUrl_}"
+         @meridian-show-settings="${this.onMeridianShowSettings_}">
+     </meridian-chat>
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index eb13b5fa68..e0cf377bc5 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -28,6 +28,7 @@ import './meridian/update_sheet.js';
+ import './meridian/site_control.js';
+ import './meridian/boost_editor.js';
+ import './meridian/try_claude.js';
++import './meridian/report.js';
+ import 'chrome://resources/cr_elements/cr_button/cr_button.js';
+ import 'chrome://resources/cr_elements/cr_icon_button/cr_icon_button.js';
+ import 'chrome://resources/cr_elements/cr_icon/cr_icon.js';
+@@ -62,6 +63,7 @@ import type {MeridianSidebarElement} from './meridian/sidebar.js';
+ import type {MeridianBoostEditorElement} from './meridian/boost_editor.js';
+ import type {MeridianSiteControlElement} from './meridian/site_control.js';
+ import type {MeridianTryClaudeElement} from './meridian/try_claude.js';
++import type {MeridianReportElement, ReportFrom} from './meridian/report.js';
+ import type {ShowcaseRun} from './meridian/showcase.js';
+ import {browserProxyFactory as sidebarProxyFactory} from './sidebar.mojom-webui.js';
+ import type {IconName} from './meridian/icons.js';
+@@ -152,6 +154,7 @@ export interface WebuiBrowserAppElement {
+     sidePanel: SidePanelElement,
+     tabstrip: MeridianSidebarElement,
+     tryClaude: MeridianTryClaudeElement,
++    report: MeridianReportElement,
+   };
+ }
+ 
+@@ -822,6 +825,16 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     return !this.persona_ || this.persona_ === 'developer';
+   }
+ 
++  // "Send a report…" (Settings, an AI error); the command bar's is a
++  // feature (onCommandBarFeature_).
++  protected onMeridianReport_(e: CustomEvent<ReportFrom>) {
++    e.stopPropagation();
++    if (e.detail.from === 'ask-bar') {
++      this.$.commandBar.hide();
++    }
++    this.$.report.show(e.detail);
++  }
++
+   // A "Try with Claude" card (the tour, the home page, the sheet).
+   protected onMeridianShowcase_(e: CustomEvent<ShowcaseRun>) {
+     const run = e.detail;
+@@ -1334,6 +1347,9 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       case 'try-claude':
+         this.$.tryClaude.showCards();
+         break;
++      case 'report':
++        this.$.report.show({from: 'command-bar'});
++        break;
+       case 'workbench':
+         run(Command.kWorkbench);
+         break;
+diff --git a/chrome/browser/resources/webui_browser/meridian/ask.css b/chrome/browser/resources/webui_browser/meridian/ask.css
+index d3934fbf86..fe291e7c73 100644
+--- a/chrome/browser/resources/webui_browser/meridian/ask.css
++++ b/chrome/browser/resources/webui_browser/meridian/ask.css
+@@ -433,3 +433,22 @@ button.who:hover {
+   margin-top: 3px;
+   color: var(--meridian-text-muted);
+ }
++
++.error .report-link {
++  display: inline;
++  margin-left: 6px;
++  padding: 0;
++  border: 0;
++  background: none;
++  font: inherit;
++  font-weight: 600;
++  color: inherit;
++  text-decoration: underline;
++  text-underline-offset: 2px;
++  cursor: pointer;
++  opacity: 0.85;
++}
++
++.error .report-link:hover {
++  opacity: 1;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/ask.html.ts b/chrome/browser/resources/webui_browser/meridian/ask.html.ts
+index 67ff5009f6..db819ac7da 100644
+--- a/chrome/browser/resources/webui_browser/meridian/ask.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/ask.html.ts
+@@ -74,7 +74,10 @@ export function getHtml(this: MeridianAskElement) {
+                 <button class="btn edit-boost" data-id="${m.boost.id}"
+                     @click="${this.onEditBoostClick_}">Edit</button>`}
+             </div>` : ''}
+-          ${m.error ? html`<div class="error">${m.error}</div>` : ''}`}
++          ${m.error ? html`<div class="error">${m.error}
++            <button class="report-link" data-error="${m.error}"
++                @click="${this.onReportClick_}">Send a report</button>
++          </div>` : ''}`}
+       </div>`)}
+   </div>
+   <div class="compose">
+diff --git a/chrome/browser/resources/webui_browser/meridian/ask.ts b/chrome/browser/resources/webui_browser/meridian/ask.ts
+index 53254402e8..1eb22b8427 100644
+--- a/chrome/browser/resources/webui_browser/meridian/ask.ts
++++ b/chrome/browser/resources/webui_browser/meridian/ask.ts
+@@ -503,6 +503,12 @@ export class MeridianAskElement extends CrLitElement {
+     this.open = false;
+   }
+ 
++  // "Send a report" by an error: the sheet, with the error in it.
++  protected onReportClick_(e: Event) {
++    const error = (e.currentTarget as HTMLElement).dataset['error'] || '';
++    this.fire('meridian-report', {from: 'ask', error});
++  }
++
+   protected onWithPageChange_(e: Event) {
+     this.withPage_ = (e.target as HTMLInputElement).checked;
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/chat.css b/chrome/browser/resources/webui_browser/meridian/chat.css
+index e6bd4c4a15..81b93a0f5a 100644
+--- a/chrome/browser/resources/webui_browser/meridian/chat.css
++++ b/chrome/browser/resources/webui_browser/meridian/chat.css
+@@ -308,3 +308,22 @@ textarea {
+ .btn:disabled {
+   opacity: 0.5;
+ }
++
++.error .report-link {
++  display: inline;
++  margin-left: 6px;
++  padding: 0;
++  border: 0;
++  background: none;
++  font: inherit;
++  font-weight: 600;
++  color: inherit;
++  text-decoration: underline;
++  text-underline-offset: 2px;
++  cursor: pointer;
++  opacity: 0.85;
++}
++
++.error .report-link:hover {
++  opacity: 1;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/chat.html.ts b/chrome/browser/resources/webui_browser/meridian/chat.html.ts
+index 26792d9630..1d4749d11f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/chat.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/chat.html.ts
+@@ -58,7 +58,10 @@ export function getHtml(this: MeridianChatElement) {
+             ${m.role === 'user' ? html`<div class="bubble">${m.text}</div>` : html`
+               <div class="answer">${m.body}</div>
+               ${m.pending ? html`<div class="thinking">Thinking…</div>` : ''}
+-              ${m.error ? html`<div class="error">${m.error}</div>` : ''}`}
++              ${m.error ? html`<div class="error">${m.error}
++                <button class="report-link" data-error="${m.error}"
++                    @click="${this.onReportClick_}">Send a report</button>
++              </div>` : ''}`}
+           </div>`)}
+       </div>
+     </div>
+diff --git a/chrome/browser/resources/webui_browser/meridian/chat.ts b/chrome/browser/resources/webui_browser/meridian/chat.ts
+index 7c35707e3e..6dc8708315 100644
+--- a/chrome/browser/resources/webui_browser/meridian/chat.ts
++++ b/chrome/browser/resources/webui_browser/meridian/chat.ts
+@@ -341,6 +341,12 @@ export class MeridianChatElement extends CrLitElement {
+     }
+   }
+ 
++  // "Send a report" by an error: the sheet, with the error in it.
++  protected onReportClick_(e: Event) {
++    const error = (e.currentTarget as HTMLElement).dataset['error'] || '';
++    this.fire('meridian-report', {from: 'chat', error});
++  }
++
+   protected onWithPageChange_(e: Event) {
+     this.withPage_ = (e.target as HTMLInputElement).checked;
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.css b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+index b6ceec5148..3f54748b35 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.css
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+@@ -333,3 +333,22 @@ webui-browser-searchbox::part(searchbox-dropdown) {
+ .mode-pill .mode-hint {
+   color: var(--meridian-text-muted, #888);
+ }
++
++.error .report-link {
++  display: inline;
++  margin-left: 6px;
++  padding: 0;
++  border: 0;
++  background: none;
++  font: inherit;
++  font-weight: 600;
++  color: inherit;
++  text-decoration: underline;
++  text-underline-offset: 2px;
++  cursor: pointer;
++  opacity: 0.85;
++}
++
++.error .report-link:hover {
++  opacity: 1;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+index ef5ea81812..9565159725 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+@@ -88,8 +88,9 @@ export function getHtml(this: MeridianCommandBarElement) {
+         ${this.answer_}
+         ${this.asking_ && !this.answer_.length ? html`
+           <span class="thinking">Thinking…</span>` : ''}
+-        ${this.askError_ ? html`<div class="error">${this.askError_}</div>` :
+-                           ''}
++        ${this.askError_ ? html`<div class="error">${this.askError_}
++          <button class="report-link" @click="${this.onReportClick_}">
++            Send a report</button></div>` : ''}
+       </div>` : ''}
+   </div>
+ </div>
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index 35cfbe7f0e..11727a6880 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -113,6 +113,10 @@ export const FEATURES: CommandBarFeature[] = [
+    words: ['logins', 'keychain']},
+   {id: 'import-arc', name: 'Import from Arc', hint: '', keys: '',
+    icon: 'restore', words: ['arc', 'move in']},
++  {id: 'report', name: 'Send a report…',
++   hint: 'Tell the developer what went wrong', keys: '', icon: 'info',
++   words: ['bug', 'report', 'feedback', 'problem', 'error', 'issue',
++           'diagnostics', 'logs', 'not working', 'help', 'support']},
+ ];
+ 
+ // Shown to developers only.
+@@ -576,6 +580,12 @@ export class MeridianCommandBarElement extends CrLitElement {
+         this.askSession_, text, 'ask', /*withPage=*/ false);
+   }
+ 
++  // "Send a report" by Ask's error: the sheet, with the error in it.
++  protected onReportClick_(e: Event) {
++    e.stopPropagation();
++    this.fire('meridian-report', {from: 'ask-bar', error: this.askError_});
++  }
++
+   protected onAskClick_() {
+     this.ask_();
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/report.css b/chrome/browser/resources/webui_browser/meridian/report.css
+new file mode 100644
+index 0000000000..4f20201b9e
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/report.css
+@@ -0,0 +1,254 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #css_wrapper_metadata_end */
++
++/* "Send a report": the sheet with everything the report contains. */
++
++:host {
++  font-family: system-ui, -apple-system, sans-serif;
++}
++
++button {
++  font: inherit;
++  color: inherit;
++  background: none;
++  border: 0;
++  padding: 0;
++  cursor: pointer;
++}
++
++.scrim {
++  position: fixed;
++  inset: 0;
++  z-index: 190;
++  display: grid;
++  place-items: center;
++  background: rgba(10, 10, 16, 0.36);
++  animation: fade 0.2s ease;
++}
++
++@keyframes fade {
++  from {
++    opacity: 0;
++  }
++}
++
++.sheet {
++  box-sizing: border-box;
++  display: flex;
++  flex-direction: column;
++  width: min(640px, 92vw);
++  max-height: 88vh;
++  overflow-y: auto;
++  padding: 20px 22px 18px;
++  border-radius: 18px;
++  background: var(--meridian-surface, #fff);
++  color: var(--meridian-text, #17171c);
++  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.35),
++      0 0 0 0.5px var(--meridian-border, rgba(0, 0, 0, 0.1));
++  animation: pop 0.26s cubic-bezier(0.05, 0.7, 0.1, 1);
++}
++
++@keyframes pop {
++  from {
++    opacity: 0;
++    transform: translateY(10px) scale(0.98);
++  }
++}
++
++.head {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++}
++
++h3 {
++  margin: 0;
++  font-size: 18px;
++  font-weight: 700;
++  letter-spacing: -0.01em;
++}
++
++.sub {
++  margin: 6px 0 14px;
++  font-size: 13px;
++  line-height: 1.5;
++  color: var(--meridian-text-muted, #66655f);
++}
++
++.x {
++  display: grid;
++  place-items: center;
++  width: 26px;
++  height: 26px;
++  border-radius: 8px;
++  color: var(--meridian-text-muted, #66655f);
++}
++
++.x:hover {
++  background: color-mix(in srgb, currentColor 12%, transparent);
++}
++
++.label {
++  margin: 4px 0 6px;
++  font-size: 12.5px;
++  font-weight: 600;
++}
++
++textarea {
++  box-sizing: border-box;
++  width: 100%;
++  margin-bottom: 12px;
++  padding: 9px 11px;
++  border: 0;
++  border-radius: 10px;
++  outline: none;
++  resize: vertical;
++  font: inherit;
++  font-size: 13px;
++  line-height: 1.45;
++  color: inherit;
++  background: color-mix(in srgb, currentColor 6%, transparent);
++  box-shadow: inset 0 0 0 0.5px var(--meridian-border, rgba(0, 0, 0, 0.12));
++}
++
++textarea:focus {
++  box-shadow: inset 0 0 0 1.5px
++      color-mix(in srgb, currentColor 45%, transparent);
++}
++
++textarea.details {
++  min-height: 180px;
++  font-size: 12px;
++  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
++  white-space: pre;
++  overflow-wrap: normal;
++}
++
++.loading {
++  display: flex;
++  align-items: center;
++  gap: 4px;
++  height: 180px;
++  margin-bottom: 12px;
++  padding: 0 12px;
++  border-radius: 10px;
++  font-size: 13px;
++  color: var(--meridian-text-muted, #66655f);
++  background: color-mix(in srgb, currentColor 4%, transparent);
++}
++
++.loading i {
++  width: 5px;
++  height: 5px;
++  border-radius: 50%;
++  background: currentColor;
++  animation: blink 1.2s infinite ease-in-out;
++}
++
++.loading i:nth-child(2) {
++  animation-delay: 0.15s;
++}
++
++.loading i:nth-child(3) {
++  animation-delay: 0.3s;
++}
++
++.loading span {
++  margin-left: 8px;
++}
++
++@keyframes blink {
++  50% {
++    opacity: 0.25;
++  }
++}
++
++.privacy {
++  padding: 10px 12px;
++  border-radius: 10px;
++  font-size: 12px;
++  line-height: 1.5;
++  color: var(--meridian-text-muted, #55554f);
++  background: color-mix(in srgb, currentColor 4%, transparent);
++}
++
++.privacy p {
++  margin: 0 0 4px;
++}
++
++.privacy p:last-child {
++  margin: 0;
++}
++
++.privacy b {
++  color: var(--meridian-text, #17171c);
++}
++
++.actions {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: 8px;
++  margin-top: 14px;
++}
++
++.grow {
++  flex: 1;
++}
++
++.btn {
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  height: 34px;
++  padding: 0 14px;
++  border-radius: 10px;
++  font-size: 13px;
++  font-weight: 600;
++  background: color-mix(in srgb, currentColor 8%, transparent);
++}
++
++.btn:hover {
++  background: color-mix(in srgb, currentColor 13%, transparent);
++}
++
++.btn.ghost {
++  background: none;
++  padding: 0 8px;
++}
++
++.btn.ghost:hover {
++  background: color-mix(in srgb, currentColor 8%, transparent);
++}
++
++.btn.primary {
++  background: var(--meridian-text, #17171c);
++  color: var(--meridian-surface, #fff);
++}
++
++.btn:disabled {
++  opacity: 0.55;
++  cursor: default;
++}
++
++.done {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  margin: 10px 0 0;
++  font-size: 12.5px;
++  color: var(--meridian-text-muted, #55554f);
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .scrim,
++  .sheet,
++  .loading i {
++    animation: none;
++  }
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/report.html.ts b/chrome/browser/resources/webui_browser/meridian/report.html.ts
+new file mode 100644
+index 0000000000..d883fe3747
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/report.html.ts
+@@ -0,0 +1,71 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {icon} from './icons.js';
++import type {MeridianReportElement} from './report.js';
++
++export function getHtml(this: MeridianReportElement) {
++  return html`<!--_html_template_start_-->
++${this.open ? html`
++  <div class="scrim" @click="${this.onScrimClick_}"
++      @keydown="${this.onKeydown_}">
++    <div class="sheet" role="dialog" aria-modal="true"
++        aria-labelledby="reportTitle" @click="${this.onSheetClick_}">
++      <div class="head">
++        <h3 id="reportTitle">Send a report</h3>
++        <button id="close" class="x" title="Close"
++            @click="${this.onCloseClick_}">${icon('x', 14)}</button>
++      </div>
++      <p class="sub">Something went wrong? This helps the developer see why.
++        Below is everything the report contains. Read it, change anything,
++        then copy it, save it, or open an issue on GitHub.</p>
++
++      <label class="label" for="happened">What happened?</label>
++      <textarea id="happened" rows="3"
++          placeholder="For example: I asked about a page and OpenCode showed an error."
++          .value="${this.happened_}"
++          @input="${this.onHappenedInput_}"></textarea>
++
++      <label class="label" for="details">What else is in the report</label>
++      ${this.loading_ ? html`
++        <div id="loading" class="loading" role="status">
++          <i></i><i></i><i></i><span>Gathering versions and recent
++            errors…</span></div>` : html`
++        <textarea id="details" class="details" rows="12" spellcheck="false"
++            .value="${this.details_}"
++            @input="${this.onDetailsInput_}"></textarea>`}
++
++      <div id="privacy" class="privacy">
++        <p><b>Included:</b> your words, the Meridian and system versions,
++          your Settings › AI choices, the names and versions of the AIs and
++          coding agents Meridian found, and Meridian’s recent errors.</p>
++        <p><b>Never included:</b> your tabs or their addresses, page
++          contents, history, cookies, passwords, API keys or tokens, file
++          contents, or your name and email. Your home folder shows as ~.</p>
++        <p>Nothing is sent by itself.</p>
++      </div>
++
++      <div class="actions">
++        <button id="issue" class="btn ghost"
++            ?disabled="${this.loading_ || this.busy_}"
++            @click="${this.onIssueClick_}">
++          ${icon('external', 14)} Open an issue on GitHub</button>
++        <div class="grow"></div>
++        <button id="save" class="btn"
++            ?disabled="${this.loading_ || this.busy_}"
++            @click="${this.onSaveClick_}">Save as file…</button>
++        <button id="copy" class="btn primary"
++            ?disabled="${this.loading_ || this.busy_}"
++            @click="${this.onCopyClick_}">
++          ${icon('copy', 14)} Copy report</button>
++      </div>
++      ${this.done_ ? html`
++        <p id="done" class="done" role="status">${icon('check', 14)}
++          ${this.done_}</p>` : ''}
++    </div>
++  </div>` : ''}
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/report.ts b/chrome/browser/resources/webui_browser/meridian/report.ts
+new file mode 100644
+index 0000000000..d85199e501
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/report.ts
+@@ -0,0 +1,242 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// "Send a report": a sheet that shows everything a report would contain
++// (the person's own words, versions, Settings › AI, the AIs and agents found,
++// Meridian's recent errors), editable, before anything leaves. Nothing is
++// sent by itself: the person copies it, saves it as a file or opens a
++// GitHub issue and pastes it there. Meridian scrubs it (report.h) when it's
++// gathered and again on the way out.
++
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {browserProxyFactory} from '../sidebar.mojom-webui.js';
++import type {SidebarHandlerInterface} from '../sidebar.mojom-webui.js';
++
++import {getCss} from './report.css.js';
++import {getHtml} from './report.html.js';
++
++// Where the sheet was opened from, and the error shown there (if any).
++export interface ReportFrom {
++  from: 'settings'|'command-bar'|'ask'|'chat'|'ask-bar';
++  error?: string;
++}
++
++const ISSUES = 'https://github.com/Undermove/meridian-browser/issues/new';
++// GitHub and browsers take longer addresses, but not every one: well under.
++export const MAX_ISSUE_URL = 2000;
++
++const PLACES: {[from: string]: string} = {
++  'settings': 'Settings',
++  'command-bar': 'the command bar',
++  'ask': 'an error in the Ask panel',
++  'chat': 'an error in Chat',
++  'ask-bar': 'an error in the command bar’s Ask',
++};
++
++// The issue's title from the person's words.
++export function issueTitle(happened: string, version: string): string {
++  const first = happened.trim().split('\n')[0]!.trim();
++  if (!first) {
++    return `Report from Meridian ${version}`.trim();
++  }
++  return first.length > 70 ? `${first.slice(0, 69).trimEnd()}…` : first;
++}
++
++// A new issue with a short body; the whole report is on the clipboard.
++export function issueUrl(
++    happened: string, version: string, system: string): string {
++  const title = issueTitle(happened, version);
++  const make = (words: string) => {
++    const body = [
++      '**What happened**',
++      words.trim() || '(not filled in)',
++      '',
++      [version && `Meridian ${version}`, system].filter(Boolean).join(' · '),
++      '',
++      '**Full report:** it’s on your clipboard. Paste it below.',
++      '',
++      '',
++    ].join('\n');
++    return `${ISSUES}?title=${encodeURIComponent(title)}&body=${
++        encodeURIComponent(body)}`;
++  };
++  let words = happened.trim();
++  let url = make(words);
++  while (url.length > MAX_ISSUE_URL && words.length > 0) {
++    words = words.slice(0, Math.max(0, Math.floor(words.length * 0.8) - 1));
++    url = make(words ? `${words.trimEnd()}…` : '');
++  }
++  return url;
++}
++
++export class MeridianReportElement extends CrLitElement {
++  static get is() {
++    return 'meridian-report';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      open: {type: Boolean, reflect: true},
++      loading_: {state: true, type: Boolean},
++      happened_: {state: true, type: String},
++      details_: {state: true, type: String},
++      done_: {state: true, type: String},
++      busy_: {state: true, type: Boolean},
++    };
++  }
++
++  accessor open: boolean = false;
++  protected accessor loading_: boolean = false;
++  protected accessor happened_: string = '';
++  protected accessor details_: string = '';
++  // What just happened ("Copied…"), under the buttons.
++  protected accessor done_: string = '';
++  protected accessor busy_: boolean = false;
++  // The last report that left the sheet, and the issue address (tests).
++  lastReport: string = '';
++  lastIssueUrl: string = '';
++
++  private readonly handler_: SidebarHandlerInterface =
++      browserProxyFactory.getInstance().handler;
++  private opened_ = 0;
++
++  async show(from: ReportFrom) {
++    const run = ++this.opened_;
++    this.open = true;
++    this.loading_ = true;
++    this.done_ = '';
++    this.details_ = '';
++    await this.updateComplete;
++    this.shadowRoot.querySelector<HTMLTextAreaElement>('#happened')?.focus();
++    const {details} = await this.handler_.getReport();
++    let where = `## Where it was sent from\n- ${PLACES[from.from] || 'Meridian'}`;
++    if (from.error) {
++      where += `\n- The error shown: ${from.error.replace(/\s+/g, ' ').trim()}`;
++    }
++    const {text} = await this.handler_.scrubReport(where);
++    if (run !== this.opened_ || !this.open) {
++      return;
++    }
++    this.details_ = `${text}\n\n${details}`;
++    this.loading_ = false;
++  }
++
++  close() {
++    this.open = false;
++    this.busy_ = false;
++  }
++
++  // The report as it will leave: what the person sees, scrubbed (the boxes
++  // show the scrubbed text, so nothing differs from what was shown).
++  private async final_(): Promise<string> {
++    const [happened, details] = await Promise.all([
++      this.handler_.scrubReport(this.happened_),
++      this.handler_.scrubReport(this.details_),
++    ]);
++    this.happened_ = happened.text;
++    this.details_ = details.text;
++    return [
++      '# Meridian report',
++      '',
++      '## What happened',
++      this.happened_.trim() || '(not filled in)',
++      '',
++      this.details_.trim(),
++      '',
++    ].join('\n');
++  }
++
++  private version_(): {version: string, system: string} {
++    const line = (label: string) =>
++        this.details_.match(new RegExp(`^- ${label}: (.*)$`, 'm'))?.[1] || '';
++    return {
++      version: line('Version').replace(/^Meridian /, '').replace(/ \(.*$/, ''),
++      system: line('System'),
++    };
++  }
++
++  protected async onCopyClick_() {
++    if (this.busy_ || this.loading_) {
++      return;
++    }
++    this.busy_ = true;
++    const {copied} = await this.handler_.copyReport(await this.final_());
++    this.lastReport = copied;
++    this.busy_ = false;
++    this.done_ = 'Copied. Paste it into a chat or an email to the developer.';
++  }
++
++  protected async onSaveClick_() {
++    if (this.busy_ || this.loading_) {
++      return;
++    }
++    this.busy_ = true;
++    const report = await this.final_();
++    const {saved} = await this.handler_.saveReport(report);
++    this.busy_ = false;
++    if (saved) {
++      this.lastReport = report;
++      this.done_ = 'Saved. Send the file to the developer in any chat.';
++    }
++  }
++
++  protected async onIssueClick_() {
++    if (this.busy_ || this.loading_) {
++      return;
++    }
++    this.busy_ = true;
++    const {copied} = await this.handler_.copyReport(await this.final_());
++    this.lastReport = copied;
++    const {version, system} = this.version_();
++    this.lastIssueUrl = issueUrl(this.happened_, version, system);
++    this.busy_ = false;
++    this.done_ = 'The full report is on your clipboard: paste it into the ' +
++        'issue, below the short note.';
++    this.fire('meridian-open-url', this.lastIssueUrl);
++  }
++
++  protected onHappenedInput_(e: Event) {
++    this.happened_ = (e.target as HTMLTextAreaElement).value;
++  }
++
++  protected onDetailsInput_(e: Event) {
++    this.details_ = (e.target as HTMLTextAreaElement).value;
++  }
++
++  protected onScrimClick_() {
++    this.close();
++  }
++
++  protected onSheetClick_(e: Event) {
++    e.stopPropagation();
++  }
++
++  protected onCloseClick_() {
++    this.close();
++  }
++
++  protected onKeydown_(e: KeyboardEvent) {
++    if (e.key === 'Escape') {
++      e.preventDefault();
++      this.close();
++    }
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-report': MeridianReportElement;
++  }
++}
++
++customElements.define(MeridianReportElement.is, MeridianReportElement);
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index afc7f52eab..9af35ca64f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -257,6 +257,22 @@ export function getHtml(this: MeridianSettingsElement) {
+               </div>
+             </div>
+           </div>
++          <div class="group">
++            <h2>Help</h2>
++            <div class="card">
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Something not working?</div>
++                  <div class="row-desc">Send the developer a report. You see
++                    everything in it first, and nothing is sent by
++                    itself.</div>
++                </div>
++                <button id="sendReport" class="btn"
++                    @click="${this.onSendReportClick_}">
++                  Send a report…</button>
++              </div>
++            </div>
++          </div>
+           <div class="group">
+             <h2>Chromium</h2>
+             <div class="card">
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index b456d77009..df15cbd2a7 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -1061,6 +1061,10 @@ export class MeridianSettingsElement extends CrLitElement {
+     this.fire('meridian-onboarding', 'arc');
+   }
+ 
++  protected onSendReportClick_() {
++    this.fire('meridian-report', {from: 'settings'});
++  }
++
+   protected onEditThemeClick_() {
+     this.hide();
+     this.fire('meridian-edit-theme', null);
