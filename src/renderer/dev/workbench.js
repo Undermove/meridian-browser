@@ -1187,9 +1187,12 @@ async function killTerm(t, { quiet = false } = {}) {
 }
 
 function activateTerm(t) {
+  const before = S.activeTerm;
   S.activeTerm = t;
   for (const o of S.terms) o.el.classList.toggle('hidden', o !== t);
   renderTermTabs();
+  // Context Insights follows the agent tab picked.
+  if (before !== t && typeof PRO !== 'undefined' && PRO.activePanel === 'insights' && typeof ciRedraw === 'function') ciRedraw();
   requestAnimationFrame(() => { fitActive(); t.xterm.focus(); });
 }
 
