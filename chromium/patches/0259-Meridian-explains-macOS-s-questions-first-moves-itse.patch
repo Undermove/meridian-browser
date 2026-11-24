@@ -1,0 +1,2723 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 00:52:50 +0400
+Subject: [PATCH] Meridian: explains macOS's questions first, moves itself into
+ Applications, moves in from Chrome
+
+- Before macOS asks about the camera, the microphone, the location,
+  notifications or recording the screen for the first time, Meridian's
+  own sheet says what will appear and which button to press (a drawing
+  of it), and where to change it if the wrong one got pressed (opens that
+  System Settings pane). Once per kind. --meridian-test-system-asks fakes
+  macOS for tests.
+- "Restart to update" from 0.x to 1.x says macOS may ask about "Meridian
+  Safe Storage": press Always Allow.
+- Started from Downloads (or unzipped elsewhere after downloading) it
+  offers to move itself into Applications; an older Meridian there is
+  replaced (to the Trash; the profile is never touched). Test switches
+  point everything at temp folders.
+- The welcome tour moves in from Chrome with real counts (profiles, open
+  tabs, bookmarks, passwords), and lets the person pick when Arc and
+  Chrome are both here; the keychain question is drawn, Allow glowing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/mac/BUILD.gn                   |   2 +
+ chrome/browser/mac/install_from_dmg.mm        | 321 +++++++++++++++---
+ chrome/browser/media/webrtc/BUILD.gn          |   1 +
+ .../webrtc/display_media_access_handler.cc    |  35 ++
+ .../webrtc/display_media_access_handler.h     |   3 +
+ chrome/browser/meridian/BUILD.gn              |  25 ++
+ chrome/browser/meridian/arc_logins.cc         |  23 ++
+ chrome/browser/meridian/arc_logins.h          |   3 +
+ chrome/browser/meridian/prefs.cc              |   1 +
+ chrome/browser/meridian/prefs.h               |   3 +
+ chrome/browser/meridian/self_install.cc       |  79 +++++
+ chrome/browser/meridian/self_install.h        |  71 ++++
+ .../browser/meridian/self_install_unittest.cc |  85 +++++
+ chrome/browser/meridian/sidebar.mojom         |  11 +
+ chrome/browser/meridian/sidebar_handler.cc    |  96 +++++-
+ chrome/browser/meridian/sidebar_handler.h     |   9 +
+ .../browser/meridian/sidebar_handler_mac.mm   |   9 +
+ chrome/browser/meridian/system_asks.cc        |  53 +++
+ chrome/browser/meridian/system_asks.h         |  44 +++
+ chrome/browser/notifications/BUILD.gn         |   1 +
+ .../notification_permission_context.cc        |   9 +
+ chrome/browser/permissions/system/BUILD.gn    |   1 +
+ .../system_media_capture_permissions_mac.mm   |  37 +-
+ .../browser/resources/webui_browser/BUILD.gn  |   7 +
+ .../resources/webui_browser/app.html.ts       |   1 +
+ chrome/browser/resources/webui_browser/app.ts |   3 +
+ .../webui_browser/meridian/mac_ask.css        | 199 +++++++++++
+ .../webui_browser/meridian/mac_ask.html.ts    |  26 ++
+ .../webui_browser/meridian/mac_ask.ts         | 136 ++++++++
+ .../webui_browser/meridian/mac_ask_glyphs.ts  |  22 ++
+ .../webui_browser/meridian/onboarding.css     |  43 +++
+ .../webui_browser/meridian/onboarding.html.ts |  30 +-
+ .../webui_browser/meridian/onboarding.ts      |  73 +++-
+ .../webui_browser/meridian/system_ask.css     | 109 ++++++
+ .../webui_browser/meridian/system_ask.html.ts |  32 ++
+ .../webui_browser/meridian/system_ask.ts      | 204 +++++++++++
+ .../webui_browser/meridian/update_sheet.css   |  19 ++
+ .../meridian/update_sheet.html.ts             |   4 +
+ .../webui_browser/meridian/update_sheet.ts    |  10 +
+ .../system_geolocation_source_apple.h         |   7 +
+ .../system_geolocation_source_apple.mm        |  33 ++
+ 41 files changed, 1807 insertions(+), 73 deletions(-)
+ create mode 100644 chrome/browser/meridian/self_install.cc
+ create mode 100644 chrome/browser/meridian/self_install.h
+ create mode 100644 chrome/browser/meridian/self_install_unittest.cc
+ create mode 100644 chrome/browser/meridian/system_asks.cc
+ create mode 100644 chrome/browser/meridian/system_asks.h
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/mac_ask.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/mac_ask.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/mac_ask.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/mac_ask_glyphs.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/system_ask.css
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/system_ask.html.ts
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/system_ask.ts
+
+diff --git a/chrome/browser/mac/BUILD.gn b/chrome/browser/mac/BUILD.gn
+index 031f1606ca..1b95b04507 100644
+--- a/chrome/browser/mac/BUILD.gn
++++ b/chrome/browser/mac/BUILD.gn
+@@ -91,6 +91,8 @@ source_set("impl") {
+   deps = [
+     ":mac",
+     "//base",
++    "//chrome/browser/meridian:self_install",
++    "//chrome/browser/meridian:test_switches",
+     "//chrome/browser/prefs",
+     "//chrome/browser/profiles:profile",
+     "//chrome/browser/ui:browser_tabstrip",
+diff --git a/chrome/browser/mac/install_from_dmg.mm b/chrome/browser/mac/install_from_dmg.mm
+index b822ec667f..6178d47646 100644
+--- a/chrome/browser/mac/install_from_dmg.mm
++++ b/chrome/browser/mac/install_from_dmg.mm
+@@ -15,6 +15,8 @@
+ #include <string.h>
+ #include <sys/mount.h>
+ #include <sys/param.h>
++#include <sys/xattr.h>
++#include <dlfcn.h>
+ #include <unistd.h>
+ 
+ #include <algorithm>
+@@ -29,6 +31,7 @@
+ #include "base/auto_reset.h"
+ #include "base/command_line.h"
+ #include "base/files/file_path.h"
++#include "base/files/file_util.h"
+ #include "base/logging.h"
+ #include "base/mac/authorization_util.h"
+ #include "base/mac/mac_util.h"
+@@ -40,6 +43,8 @@
+ #include "base/strings/sys_string_conversions.h"
+ #import "chrome/browser/mac/dock.h"
+ #include "chrome/browser/mac/relauncher.h"
++#include "chrome/browser/meridian/self_install.h"
++#include "chrome/browser/meridian/test_switches.h"
+ #include "chrome/common/chrome_constants.h"
+ #include "chrome/common/chrome_switches.h"
+ #include "chrome/grit/branded_strings.h"
+@@ -229,24 +234,36 @@ RunningFromDiskImageResult IsPathOnReadOnlyDiskImage(const char path[]) {
+   return {.status = DiskImageStatus::kNotRunningFromDiskImage};
+ }
+ 
+-// Shows a dialog asking the user whether or not to install from the disk
+-// image.  Returns true if the user approves installation.
+-bool ShouldInstallDialog() {
+-  NSString* title = l10n_util::GetNSStringFWithFixup(
+-      IDS_INSTALL_FROM_DMG_TITLE, l10n_util::GetStringUTF16(IDS_PRODUCT_NAME));
+-  NSString* prompt = l10n_util::GetNSStringFWithFixup(
+-      IDS_INSTALL_FROM_DMG_PROMPT, l10n_util::GetStringUTF16(IDS_PRODUCT_NAME));
+-  NSString* yes = l10n_util::GetNSStringWithFixup(IDS_INSTALL_FROM_DMG_YES);
+-  NSString* no = l10n_util::GetNSStringWithFixup(IDS_INSTALL_FROM_DMG_NO);
++// Tests: what happened, one line each (--meridian-test-install-log).
++void TestLog(const std::string& line) {
++  if (!meridian::HasTestSwitch("meridian-test-install-log")) {
++    return;
++  }
++  base::FilePath log = meridian::TestSwitchPath("meridian-test-install-log");
++  if (!base::PathExists(log)) {
++    base::WriteFile(log, "");
++  }
++  base::AppendToFile(log, line + "\n");
++}
+ 
++// Shows a dialog asking the user whether or not to install (Meridian: from
++// where it runs, or over the older one). Returns true if the user approves
++// installation. Tests answer with --meridian-test-install-answer=yes|no.
++bool ShouldInstallDialog(const meridian::SelfInstallTexts& texts) {
++  if (meridian::HasTestSwitch("meridian-test-install-answer")) {
++    TestLog(base::StrCat({"asked: ", texts.title, " | ", texts.body, " | ",
++                          texts.yes, " | ", texts.no}));
++    return meridian::TestSwitchValue("meridian-test-install-answer") == "yes";
++  }
+   NSAlert* alert = [[NSAlert alloc] init];
+ 
+   alert.alertStyle = NSAlertStyleInformational;
+-  alert.messageText = title;
+-  alert.informativeText = prompt;
++  alert.messageText = base::SysUTF8ToNSString(texts.title);
++  alert.informativeText = base::SysUTF8ToNSString(texts.body);
+ 
+-  [alert addButtonWithTitle:yes];
+-  NSButton* cancel_button = [alert addButtonWithTitle:no];
++  [alert addButtonWithTitle:base::SysUTF8ToNSString(texts.yes)];
++  NSButton* cancel_button =
++      [alert addButtonWithTitle:base::SysUTF8ToNSString(texts.no)];
+   cancel_button.keyEquivalent = @"\e";
+ 
+   NSInteger result = [alert runModal];
+@@ -254,6 +271,90 @@ bool ShouldInstallDialog() {
+   return result == NSAlertFirstButtonReturn;
+ }
+ 
++// Where a translocated app really is (macOS runs a downloaded app from a
++// read-only copy until it's moved); `path` itself otherwise. Security's SPI,
++// looked up at run time.
++NSString* OriginalPathOf(NSString* path) {
++  using IsTranslocatedFn = Boolean (*)(CFURLRef, bool*, CFErrorRef*);
++  using OriginalFn = CFURLRef (*)(CFURLRef, CFErrorRef*);
++  static auto is_translocated = reinterpret_cast<IsTranslocatedFn>(
++      dlsym(RTLD_DEFAULT, "SecTranslocateIsTranslocatedURL"));
++  static auto original = reinterpret_cast<OriginalFn>(
++      dlsym(RTLD_DEFAULT, "SecTranslocateCreateOriginalPathForURL"));
++  if (!is_translocated || !original) {
++    return path;
++  }
++  NSURL* url = [NSURL fileURLWithPath:path];
++  bool translocated = false;
++  if (!is_translocated(base::apple::NSToCFPtrCast(url), &translocated,
++                       nullptr) ||
++      !translocated) {
++    return path;
++  }
++  base::apple::ScopedCFTypeRef<CFURLRef> real(
++      original(base::apple::NSToCFPtrCast(url), nullptr));
++  return real ? base::apple::CFToNSPtrCast(real.get()).path : path;
++}
++
++// macOS marked it as downloaded from the internet.
++bool IsQuarantined(NSString* path) {
++  return getxattr(path.fileSystemRepresentation, "com.apple.quarantine",
++                  nullptr, 0, 0, 0) >= 0;
++}
++
++// A Meridian started from `path` is open right now.
++bool IsAppRunningAt(NSString* path, NSDictionary* info) {
++  NSString* bundle_id = base::apple::ObjCCast<NSString>(info[@"CFBundleIdentifier"]);
++  if (!bundle_id) {
++    return false;
++  }
++  NSString* wanted = path.stringByStandardizingPath;
++  for (NSRunningApplication* app in [NSRunningApplication
++           runningApplicationsWithBundleIdentifier:bundle_id]) {
++    if ([app.bundleURL.path.stringByStandardizingPath isEqualToString:wanted]) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// Puts `path` in the Trash; its place there, or nil. Tests: a "Trash" folder
++// next to their Applications folder.
++NSURL* MoveToTrash(NSString* path) {
++  NSFileManager* file_manager = NSFileManager.defaultManager;
++  NSError* error = nil;
++  if (meridian::HasTestSwitch("meridian-test-applications-dir")) {
++    base::FilePath trash =
++        meridian::TestSwitchPath("meridian-test-applications-dir")
++            .DirName()
++            .AppendASCII("Trash");
++    base::CreateDirectory(trash);
++    NSString* to = [base::apple::FilePathToNSString(trash)
++        stringByAppendingPathComponent:path.lastPathComponent];
++    for (int n = 2; [file_manager fileExistsAtPath:to]; ++n) {
++      to = [base::apple::FilePathToNSString(trash)
++          stringByAppendingPathComponent:
++              [NSString stringWithFormat:@"%@ %d.app",
++                                         path.lastPathComponent
++                                             .stringByDeletingPathExtension,
++                                         n]];
++    }
++    if (![file_manager moveItemAtPath:path toPath:to error:&error]) {
++      return nil;
++    }
++    TestLog(base::StrCat({"trashed ", base::SysNSStringToUTF8(path)}));
++    return [NSURL fileURLWithPath:to];
++  }
++  NSURL* resulting = nil;
++  if (![file_manager trashItemAtURL:[NSURL fileURLWithPath:path]
++                   resultingItemURL:&resulting
++                              error:&error]) {
++    LOG(ERROR) << base::SysNSStringToUTF8(error.localizedDescription);
++    return nil;
++  }
++  return resulting;
++}
++
+ // Potentially shows an authorization dialog to request authentication to copy.
+ // If application_directory appears to be unwritable, attempts to obtain
+ // authorization, which may result in the display of the dialog. Returns null if
+@@ -356,11 +457,15 @@ bool LaunchInstalledApp(NSString* installed_path,
+ }
+ 
+ void ShowErrorDialog() {
++  if (meridian::HasTestSwitch("meridian-test-install-answer")) {
++    TestLog("failed");
++    return;
++  }
+   NSString* title =
+       l10n_util::GetNSStringWithFixup(IDS_INSTALL_FROM_DMG_ERROR_TITLE);
+-  NSString* error = l10n_util::GetNSStringFWithFixup(
+-      IDS_INSTALL_FROM_DMG_ERROR, l10n_util::GetStringUTF16(IDS_PRODUCT_NAME));
+-  NSString* ok = l10n_util::GetNSStringWithFixup(IDS_OK);
++  // Meridian: also when it didn't run from a disk image.
++  NSString* error = @"Meridian couldn’t move itself to your Applications "
++                    @"folder and keeps running from where it is.";
+ 
+   NSAlert* alert = [[NSAlert alloc] init];
+ 
+@@ -368,7 +473,7 @@ void ShowErrorDialog() {
+   alert.messageText = title;
+   alert.informativeText = error;
+ 
+-  [alert addButtonWithTitle:ok];
++  [alert addButtonWithTitle:l10n_util::GetNSStringWithFixup(IDS_OK)];
+ 
+   [alert runModal];
+ }
+@@ -382,24 +487,55 @@ RunningFromDiskImageResult IsAppRunningFromReadOnlyDiskImage() {
+ 
+ bool MaybeInstallFromDiskImage() {
+   @autoreleasepool {
+-    RunningFromDiskImageResult result = IsAppRunningFromReadOnlyDiskImage();
+-    if (result.status != DiskImageStatus::kRunningFromDiskImage) {
+-      return false;
+-    }
++    // Meridian: not only from a disk image. Started from the Downloads folder
++    // (or wherever it was unzipped after downloading) it offers to move
++    // itself into Applications, and an older Meridian already there is
++    // replaced (it goes to the Trash; the profile is never touched). Tests
++    // point everything at temp folders and answer the question themselves,
++    // so they never touch the real Applications folder.
++    const bool test =
++        meridian::HasTestSwitch("meridian-test-applications-dir");
++    NSFileManager* file_manager = NSFileManager.defaultManager;
+ 
+-    NSArray* application_directories = NSSearchPathForDirectoriesInDomains(
+-        NSApplicationDirectory, NSLocalDomainMask, YES);
+-    if (!application_directories.count) {
+-      LOG(ERROR) << "NSSearchPathForDirectoriesInDomains: "
+-                 << "no local application directories";
++    NSString* source_path = base::apple::OuterBundle().bundlePath;
++    if (test && meridian::HasTestSwitch("meridian-test-install-source")) {
++      source_path = base::SysUTF8ToNSString(
++          meridian::TestSwitchPath("meridian-test-install-source")
++              .AsUTF8Unsafe());
++    }
++    RunningFromDiskImageResult result =
++        test ? RunningFromDiskImageResult{.status = DiskImageStatus::
++                                              kNotRunningFromDiskImage}
++             : IsAppRunningFromReadOnlyDiskImage();
++    if (result.status == DiskImageStatus::kFailure) {
+       return false;
+     }
+-    NSString* application_directory = application_directories.firstObject;
+-
+-    NSFileManager* file_manager = NSFileManager.defaultManager;
++    const bool on_disk_image =
++        result.status == DiskImageStatus::kRunningFromDiskImage;
++    // macOS runs a downloaded app from a read-only copy elsewhere until it is
++    // moved (App Translocation): where it really is.
++    NSString* original_path =
++        on_disk_image ? source_path : OriginalPathOf(source_path);
++
++    NSString* application_directory = nil;
++    if (test) {
++      application_directory = base::SysUTF8ToNSString(
++          meridian::TestSwitchPath("meridian-test-applications-dir")
++              .AsUTF8Unsafe());
++    } else {
++      NSArray* application_directories = NSSearchPathForDirectoriesInDomains(
++          NSApplicationDirectory, NSLocalDomainMask, YES);
++      if (!application_directories.count) {
++        LOG(ERROR) << "NSSearchPathForDirectoriesInDomains: "
++                   << "no local application directories";
++        return false;
++      }
++      application_directory = application_directories.firstObject;
++    }
+ 
+     BOOL is_directory;
+-    if (![file_manager fileExistsAtPath:application_directory
++    if (!application_directory ||
++        ![file_manager fileExistsAtPath:application_directory
+                             isDirectory:&is_directory] ||
+         !is_directory) {
+       VLOG(1) << "No application directory at "
+@@ -407,53 +543,136 @@ bool MaybeInstallFromDiskImage() {
+       return false;
+     }
+ 
+-    NSString* source_path = base::apple::OuterBundle().bundlePath;
+-    NSString* application_name = source_path.lastPathComponent;
++    NSString* application_name = original_path.lastPathComponent;
+     NSString* target_path =
+         [application_directory stringByAppendingPathComponent:application_name];
+ 
++    meridian::SelfInstallFacts facts;
++    facts.app = base::apple::NSStringToFilePath(original_path);
++    facts.on_disk_image = on_disk_image;
++    facts.quarantined = !test && IsQuarantined(original_path);
++    facts.forced = test;
++    facts.applications = base::apple::NSStringToFilePath(application_directory);
++    if (test) {
++      // A test's stand-in in a folder named Downloads is "from Downloads".
++      base::FilePath parent = facts.app.DirName();
++      if (parent.BaseName().value() == "Downloads") {
++        facts.downloads = parent;
++      }
++    } else {
++      facts.downloads = base::apple::NSStringToFilePath(
++          NSSearchPathForDirectoriesInDomains(NSDownloadsDirectory,
++                                              NSUserDomainMask, YES)
++              .firstObject);
++      facts.user_applications = base::apple::NSStringToFilePath(
++          NSSearchPathForDirectoriesInDomains(NSApplicationDirectory,
++                                              NSUserDomainMask, YES)
++              .firstObject);
++    }
++    NSDictionary* own_info = [NSDictionary
++        dictionaryWithContentsOfFile:
++            [source_path stringByAppendingPathComponent:@"Contents/Info.plist"]];
++    facts.bundle_id = base::SysNSStringToUTF8(
++        base::apple::ObjCCast<NSString>(own_info[@"CFBundleIdentifier"]));
++    facts.version = base::SysNSStringToUTF8(base::apple::ObjCCast<NSString>(
++        own_info[@"CFBundleShortVersionString"]));
+     if ([file_manager fileExistsAtPath:target_path]) {
+-      VLOG(1) << "Something already exists at "
+-              << base::SysNSStringToUTF8(target_path);
++      facts.target_exists = true;
++      NSDictionary* info = [NSDictionary
++          dictionaryWithContentsOfFile:
++              [target_path
++                  stringByAppendingPathComponent:@"Contents/Info.plist"]];
++      facts.target_bundle_id = base::SysNSStringToUTF8(
++          base::apple::ObjCCast<NSString>(info[@"CFBundleIdentifier"]));
++      facts.target_version = base::SysNSStringToUTF8(
++          base::apple::ObjCCast<NSString>(info[@"CFBundleShortVersionString"]));
++      facts.target_running = IsAppRunningAt(target_path, info);
++    }
++    const meridian::SelfInstallOffer offer =
++        meridian::DecideSelfInstall(facts);
++    if (offer == meridian::SelfInstallOffer::kNone) {
++      if (facts.target_exists) {
++        VLOG(1) << "Something already exists at "
++                << base::SysNSStringToUTF8(target_path);
++      }
+       return false;
+     }
+ 
+     NSURL* installer_url =
+         [base::apple::FrameworkBundle() URLForResource:@"install"
+                                          withExtension:@"sh"];
+-    if (!installer_url) {
++    if (!installer_url && !test) {
+       VLOG(1) << "Could not locate install.sh";
+       return false;
+     }
+ 
+-    if (!ShouldInstallDialog()) {
++    const bool from_downloads =
++        !facts.downloads.empty() && facts.downloads.IsParent(facts.app);
++    if (!ShouldInstallDialog(meridian::SelfInstallQuestion(
++            offer, on_disk_image, from_downloads))) {
++      TestLog("declined");
+       return false;
+     }
+ 
+-    base::mac::ScopedAuthorizationRef authorization =
+-        MaybeShowAuthorizationDialog(application_directory);
+-    // `authorization` will be null if it's deemed unnecessary or if
+-    // authentication fails.  In either case, try to install without privilege
+-    // escalation.
++    // The older Meridian goes to the Trash (it can be put back from there).
++    NSURL* trashed_target = nil;
++    if (offer == meridian::SelfInstallOffer::kReplace) {
++      trashed_target = MoveToTrash(target_path);
++      if (!trashed_target) {
++        ShowErrorDialog();
++        return false;
++      }
++    }
+ 
+-    if (!InstallFromDiskImage(std::move(authorization), installer_url,
+-                              source_path, target_path)) {
++    bool installed = false;
++    if (test) {
++      NSError* error = nil;
++      installed = [file_manager copyItemAtPath:source_path
++                                        toPath:target_path
++                                         error:&error];
++    } else {
++      base::mac::ScopedAuthorizationRef authorization =
++          MaybeShowAuthorizationDialog(application_directory);
++      // `authorization` will be null if it's deemed unnecessary or if
++      // authentication fails.  In either case, try to install without
++      // privilege escalation.
++      installed = InstallFromDiskImage(std::move(authorization), installer_url,
++                                       source_path, target_path);
++    }
++    if (!installed) {
++      // The old one back where it was.
++      if (trashed_target) {
++        [file_manager moveItemAtURL:trashed_target
++                              toURL:[NSURL fileURLWithPath:target_path]
++                              error:nil];
++      }
+       ShowErrorDialog();
+       return false;
+     }
++    TestLog(base::StrCat({"installed ", base::SysNSStringToUTF8(target_path)}));
+ 
+-    dock::AddIcon(target_path, source_path);
++    if (test) {
++      // Not started for real: the copy is a stand-in.
++      TestLog("relaunch");
++    } else {
++      dock::AddIcon(target_path, original_path);
+ 
+-    if (result.dmg_bsd_device_name.empty()) {
+-      // Not fatal, just diagnostic.
+-      LOG(ERROR) << "Could not determine disk image BSD device name";
+-    }
++      if (on_disk_image && result.dmg_bsd_device_name.empty()) {
++        // Not fatal, just diagnostic.
++        LOG(ERROR) << "Could not determine disk image BSD device name";
++      }
+ 
+-    if (!LaunchInstalledApp(target_path, result.dmg_bsd_device_name)) {
+-      ShowErrorDialog();
+-      return false;
++      if (!LaunchInstalledApp(target_path, result.dmg_bsd_device_name)) {
++        ShowErrorDialog();
++        return false;
++      }
+     }
+ 
++    // Moved, not copied: the downloaded one goes to the Trash (a disk image
++    // is ejected and trashed by the relauncher).
++    if (!on_disk_image && MoveToTrash(original_path)) {
++      TestLog("trashed the downloaded copy");
++    }
+     return true;
+   }
+ }
+diff --git a/chrome/browser/media/webrtc/BUILD.gn b/chrome/browser/media/webrtc/BUILD.gn
+index 7e90d3b787..2d446fc93c 100644
+--- a/chrome/browser/media/webrtc/BUILD.gn
++++ b/chrome/browser/media/webrtc/BUILD.gn
+@@ -148,6 +148,7 @@ source_set("webrtc") {
+     "//chrome/browser/content_settings:content_settings_util",
+     "//chrome/browser/media",
+     "//chrome/browser/media:access_handler",
++    "//chrome/browser/meridian:system_asks",
+     "//chrome/browser/media/prefs",
+     "//chrome/browser/permissions/system",
+     "//chrome/browser/picture_in_picture",
+diff --git a/chrome/browser/media/webrtc/display_media_access_handler.cc b/chrome/browser/media/webrtc/display_media_access_handler.cc
+index addfa22ae6..2e59ad1082 100644
+--- a/chrome/browser/media/webrtc/display_media_access_handler.cc
++++ b/chrome/browser/media/webrtc/display_media_access_handler.cc
+@@ -23,6 +23,7 @@
+ #include "chrome/browser/media/webrtc/desktop_media_picker_factory_impl.h"
+ #include "chrome/browser/media/webrtc/native_desktop_media_list.h"
+ #include "chrome/browser/media/webrtc/tab_desktop_media_list.h"
++#include "chrome/browser/meridian/system_asks.h"
+ #include "chrome/browser/picture_in_picture/picture_in_picture_window_manager.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/url_identity.h"
+@@ -474,6 +475,28 @@ void DisplayMediaAccessHandler::ProcessQueuedAccessRequest(
+     return;
+   }
+ 
++#if BUILDFLAG(IS_MAC)
++  // Meridian: sharing the whole screen or another app's window needs macOS's
++  // permission, which it asks for in its own way (System Settings, then Quit
++  // & Reopen): Meridian's sheet says so before the picker, once.
++  static bool explained = false;
++  if (!explained &&
++      pending_request.request.request_type != blink::MEDIA_DEVICE_UPDATE &&
++      !pending_request.request.exclude_monitor_type_surfaces &&
++      (meridian::FakeSystemAsks() ||
++       (system_media_permissions::ScreenCaptureNeedsSystemLevelPermissions() &&
++        system_media_permissions::CheckSystemScreenCapturePermission() !=
++            system_permission_settings::SystemPermission::kAllowed))) {
++    explained = true;
++    meridian::ExplainSystemAsk(
++        "screen",
++        base::BindOnce(&DisplayMediaAccessHandler::ResumeAfterExplaining,
++                       weak_factory_.GetWeakPtr(),
++                       web_contents->GetWeakPtr()));
++    return;
++  }
++#endif  // BUILDFLAG(IS_MAC)
++
+   UpdateTrusted(pending_request.request, false /* is_trusted */);
+ 
+   const GURL& request_origin = pending_request.request.security_origin;
+@@ -495,6 +518,18 @@ void DisplayMediaAccessHandler::ProcessQueuedAccessRequest(
+   }
+ }
+ 
++void DisplayMediaAccessHandler::ResumeAfterExplaining(
++    base::WeakPtr<WebContents> web_contents) {
++  if (!web_contents) {
++    return;
++  }
++  auto it = pending_requests_.find(web_contents.get());
++  if (it == pending_requests_.end() || it->second.empty()) {
++    return;
++  }
++  ProcessQueuedAccessRequest(it->second, web_contents.get());
++}
++
+ void DisplayMediaAccessHandler::ProcessQueuedPickerRequest(
+     const PendingAccessRequest& pending_request,
+     WebContents* web_contents,
+diff --git a/chrome/browser/media/webrtc/display_media_access_handler.h b/chrome/browser/media/webrtc/display_media_access_handler.h
+index c57ca2eb4d..b81afa68f1 100644
+--- a/chrome/browser/media/webrtc/display_media_access_handler.h
++++ b/chrome/browser/media/webrtc/display_media_access_handler.h
+@@ -82,6 +82,9 @@ class DisplayMediaAccessHandler : public CaptureAccessHandlerBase,
+   void ProcessQueuedAccessRequest(const RequestsQueue& queue,
+                                   content::WebContents* web_contents);
+ 
++  // Meridian: after its sheet about recording the screen, the picker.
++  void ResumeAfterExplaining(base::WeakPtr<content::WebContents> web_contents);
++
+   void ProcessQueuedPickerRequest(const PendingAccessRequest& pending_request,
+                                   content::WebContents* web_contents,
+                                   AllowedScreenCaptureLevel capture_level,
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 20e1e854d6..bfb017426b 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -47,6 +47,27 @@ source_set("test_switches") {
+   ]
+ }
+ 
++# Meridian's own sheet before macOS asks something (system_asks.h): no
++# browser deps, so Chromium's permission code can call it.
++source_set("system_asks") {
++  sources = [
++    "system_asks.cc",
++    "system_asks.h",
++  ]
++  public_deps = [ "//base" ]
++  deps = [ ":test_switches" ]
++}
++
++# Moving itself into Applications (chrome/browser/mac/install_from_dmg.mm):
++# the decision alone.
++source_set("self_install") {
++  sources = [
++    "self_install.cc",
++    "self_install.h",
++  ]
++  public_deps = [ "//base" ]
++}
++
+ # Moves sites' databases brought from Arc into a profile before it opens
+ # (chrome/browser/profiles/profile_impl.cc): no browser deps.
+ source_set("arc_staged") {
+@@ -398,6 +419,7 @@ source_set("meridian") {
+   public_deps = [
+     ":agent_cli",
+     ":report",
++    ":system_asks",
+     ":test_switches",
+     ":mojo_bindings",
+     ":model",
+@@ -428,6 +450,7 @@ source_set("meridian") {
+     "//ui/compositor",
+     "//ui/gfx/codec",
+     "//ui/base/clipboard",
++    "//services/device/public/cpp/geolocation",
+     "//services/media_session/public/cpp",
+     "//services/media_session/public/mojom",
+     "//third_party/re2",
+@@ -496,6 +519,7 @@ test("meridian_unittests") {
+     "atc_unittest.cc",
+     "clean_url_unittest.cc",
+     "report_unittest.cc",
++    "self_install_unittest.cc",
+     "setup_profile_unittest.cc",
+     "sidebar_service_unittest.cc",
+     "test_links.h",
+@@ -524,6 +548,7 @@ test("meridian_unittests") {
+     ":mission_hook",
+     ":model",
+     ":report",
++    ":self_install",
+     ":workbench_core",
+     "//base/test:run_all_unittests",
+     "//base/test:test_support",
+diff --git a/chrome/browser/meridian/arc_logins.cc b/chrome/browser/meridian/arc_logins.cc
+index 9cb08ecfd5..b7debd260b 100644
+--- a/chrome/browser/meridian/arc_logins.cc
++++ b/chrome/browser/meridian/arc_logins.cc
+@@ -889,6 +889,29 @@ bool ArcPasswordsAvailable(const ImportSource& source) {
+   });
+ }
+ 
++int CountSavedPasswords(const ImportSource& source) {
++  // Usernames per site, so the same password in "Login Data" and "Login Data
++  // For Account" counts once. Nothing is decrypted.
++  std::set<std::pair<std::string, std::string>> seen;
++  for (const ArcProfile& p : FindArcProfiles(source)) {
++    for (const base::FilePath& file : p.logins) {
++      base::ScopedTempDir tmp;
++      sql::Database db(sql::Database::Tag("Passwords"));
++      if (!internal::OpenCopy(file, tmp, db) ||
++          !db.DoesTableExist("logins")) {
++        continue;
++      }
++      sql::Statement s(db.GetUniqueStatement(
++          "SELECT signon_realm, username_value FROM logins "
++          "WHERE blacklisted_by_user = 0"));
++      while (s.Step()) {
++        seen.emplace(p.dir + " " + s.ColumnString(0), s.ColumnString(1));
++      }
++    }
++  }
++  return static_cast<int>(seen.size());
++}
++
+ bool ArcLoginsAvailable() {
+   return ArcLoginsAvailable(ArcSource());
+ }
+diff --git a/chrome/browser/meridian/arc_logins.h b/chrome/browser/meridian/arc_logins.h
+index 58314effac..73fc3e64a6 100644
+--- a/chrome/browser/meridian/arc_logins.h
++++ b/chrome/browser/meridian/arc_logins.h
+@@ -70,6 +70,9 @@ struct ImportSource;
+ bool ArcLoginsAvailable();
+ bool ArcLoginsAvailable(const ImportSource& source);
+ bool ArcPasswordsAvailable(const ImportSource& source);
++// How many saved passwords `source` has, counted without reading them
++// (blocking: file IO).
++int CountSavedPasswords(const ImportSource& source);
+ // The sign-ins (cookies, when `with_cookies`), passwords and cards of
+ // `source`'s profiles.
+ void ImportLogins(Profile* profile,
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index 03752c2a29..9cace191a4 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -37,6 +37,7 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterStringPref(kAiCustomBase, std::string());
+   registry->RegisterDictionaryPref(kAiModels);
+   registry->RegisterBooleanPref(kAiOtherAgents, false);
++  registry->RegisterListPref(kExplainedSystemAsks);
+   registry->RegisterBooleanPref(kAiTidy, true);
+   registry->RegisterBooleanPref(kAiLinkPreview, false);
+   registry->RegisterBooleanPref(kMissionNotify, true);
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index 1660e56a77..2fef7065d7 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -90,6 +90,9 @@ inline constexpr char kArcExtensionsAdded[] = "meridian.arc_extensions_added";
+ // Whether the sidebar came from Arc (its extensions follow).
+ inline constexpr char kArcImported[] = "meridian.arc_imported";
+ inline constexpr char kAiOtherAgents[] = "meridian.ai_other_agents";
++// The macOS questions Meridian's own sheet explained already ("camera",
++// "microphone", …; system_asks.h): each only once.
++inline constexpr char kExplainedSystemAsks[] = "meridian.explained_system_asks";
+ 
+ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
+ 
+diff --git a/chrome/browser/meridian/self_install.cc b/chrome/browser/meridian/self_install.cc
+new file mode 100644
+index 0000000000..04908c71cc
+--- /dev/null
++++ b/chrome/browser/meridian/self_install.cc
+@@ -0,0 +1,79 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/self_install.h"
++
++#include "base/version.h"
++
++namespace meridian {
++
++namespace {
++
++bool Within(const base::FilePath& parent, const base::FilePath& path) {
++  return !parent.empty() && (parent == path || parent.IsParent(path));
++}
++
++}  // namespace
++
++SelfInstallOffer DecideSelfInstall(const SelfInstallFacts& f) {
++  if (f.app.empty() || f.applications.empty()) {
++    return SelfInstallOffer::kNone;
++  }
++  // Already installed (or the person keeps it in their own Applications).
++  if (Within(f.applications, f.app) || Within(f.user_applications, f.app)) {
++    return SelfInstallOffer::kNone;
++  }
++  // From a disk image, or a copy that came from the internet (Downloads, or
++  // unzipped elsewhere); never a build someone made on this Mac.
++  if (!f.on_disk_image && !f.forced && !f.quarantined &&
++      !Within(f.downloads, f.app)) {
++    return SelfInstallOffer::kNone;
++  }
++  if (!f.target_exists) {
++    return SelfInstallOffer::kInstall;
++  }
++  // Something else of the same name, or a Meridian that's open right now:
++  // left alone.
++  if (f.bundle_id.empty() || f.target_bundle_id != f.bundle_id ||
++      f.target_running) {
++    return SelfInstallOffer::kNone;
++  }
++  // Never an older Meridian over a newer one (its profile may be newer too).
++  base::Version mine(f.version);
++  base::Version theirs(f.target_version);
++  if (mine.IsValid() && theirs.IsValid() && theirs > mine) {
++    return SelfInstallOffer::kNone;
++  }
++  return SelfInstallOffer::kReplace;
++}
++
++SelfInstallTexts SelfInstallQuestion(SelfInstallOffer offer,
++                                     bool on_disk_image,
++                                     bool from_downloads) {
++  if (offer == SelfInstallOffer::kReplace) {
++    return {"Replace the Meridian in Applications?",
++            "There’s already a Meridian in your Applications folder. It goes "
++            "to the Trash and this one takes its place. Your tabs, spaces and "
++            "sign-ins stay as they are.",
++            "Replace", "Not Now"};
++  }
++  if (on_disk_image) {
++    return {"Install Meridian?",
++            "Meridian is running from the disk image. It copies itself to "
++            "your Applications folder, opens from there and keeps itself up "
++            "to date.",
++            "Install", "Not Now"};
++  }
++  return {"Move Meridian to Applications?",
++          from_downloads
++              ? "Meridian is running from your Downloads folder. It moves "
++                "itself to your Applications folder, opens from there and "
++                "keeps itself up to date."
++              : "Meridian is running from a folder outside Applications. It "
++                "moves itself to your Applications folder, opens from there "
++                "and keeps itself up to date.",
++          "Move to Applications", "Not Now"};
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/self_install.h b/chrome/browser/meridian/self_install.h
+new file mode 100644
+index 0000000000..f410e52d18
+--- /dev/null
++++ b/chrome/browser/meridian/self_install.h
+@@ -0,0 +1,71 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_SELF_INSTALL_H_
++#define CHROME_BROWSER_MERIDIAN_SELF_INSTALL_H_
++
++#include <string>
++
++#include "base/files/file_path.h"
++
++namespace meridian {
++
++// "The person clicks and it installs": Meridian started from somewhere other
++// than Applications (a disk image, the Downloads folder, a folder it was
++// unzipped in) offers to move itself there (chrome/browser/mac/
++// install_from_dmg.mm). The decision alone, no system calls, so it can be
++// tested.
++struct SelfInstallFacts {
++  // Where this Meridian.app is (the original place when macOS runs it from a
++  // translocated copy).
++  base::FilePath app;
++  // It runs from a mounted disk image.
++  bool on_disk_image = false;
++  // macOS marked it as downloaded (com.apple.quarantine).
++  bool quarantined = false;
++  // ~/Downloads.
++  base::FilePath downloads;
++  // The Applications folders: where it's installed (/Applications, or the
++  // test folder) and the person's own ~/Applications.
++  base::FilePath applications;
++  base::FilePath user_applications;
++  // What is already at applications/<app name>, if anything: its bundle id and
++  // version ("" when nothing is there).
++  bool target_exists = false;
++  std::string target_bundle_id;
++  std::string target_version;
++  bool target_running = false;
++  // This Meridian's.
++  std::string bundle_id;
++  std::string version;
++  // Tests: offer even when the app isn't quarantined or in Downloads.
++  bool forced = false;
++};
++
++enum class SelfInstallOffer {
++  // Stay where it is.
++  kNone,
++  // Copy into Applications (from a disk image: Chromium's own question).
++  kInstall,
++  // Applications has an older (or the same) Meridian: it goes to the Trash
++  // and this one takes its place. The profile is never touched.
++  kReplace,
++};
++
++SelfInstallOffer DecideSelfInstall(const SelfInstallFacts& facts);
++
++// The question, for people. `from_downloads`: it's in the Downloads folder.
++struct SelfInstallTexts {
++  std::string title;
++  std::string body;
++  std::string yes;
++  std::string no;
++};
++SelfInstallTexts SelfInstallQuestion(SelfInstallOffer offer,
++                                     bool on_disk_image,
++                                     bool from_downloads);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_SELF_INSTALL_H_
+diff --git a/chrome/browser/meridian/self_install_unittest.cc b/chrome/browser/meridian/self_install_unittest.cc
+new file mode 100644
+index 0000000000..5ef3f15fcd
+--- /dev/null
++++ b/chrome/browser/meridian/self_install_unittest.cc
+@@ -0,0 +1,85 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/self_install.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace meridian {
++namespace {
++
++SelfInstallFacts FromDownloads() {
++  SelfInstallFacts f;
++  f.app = base::FilePath("/Users/ada/Downloads/Meridian.app");
++  f.downloads = base::FilePath("/Users/ada/Downloads");
++  f.applications = base::FilePath("/Applications");
++  f.user_applications = base::FilePath("/Users/ada/Applications");
++  f.bundle_id = "dev.meridian.browser";
++  f.version = "158.0.8127.42";
++  return f;
++}
++
++TEST(SelfInstallTest, FromDownloadsOffersToMove) {
++  EXPECT_EQ(DecideSelfInstall(FromDownloads()), SelfInstallOffer::kInstall);
++}
++
++TEST(SelfInstallTest, UnzippedElsewhereOnlyWhenDownloaded) {
++  SelfInstallFacts f = FromDownloads();
++  f.app = base::FilePath("/Users/ada/Desktop/Meridian.app");
++  // A build made on this Mac (no quarantine): stays where it is.
++  EXPECT_EQ(DecideSelfInstall(f), SelfInstallOffer::kNone);
++  f.quarantined = true;
++  EXPECT_EQ(DecideSelfInstall(f), SelfInstallOffer::kInstall);
++}
++
++TEST(SelfInstallTest, DiskImage) {
++  SelfInstallFacts f = FromDownloads();
++  f.app = base::FilePath("/Volumes/Meridian/Meridian.app");
++  f.on_disk_image = true;
++  EXPECT_EQ(DecideSelfInstall(f), SelfInstallOffer::kInstall);
++}
++
++TEST(SelfInstallTest, AlreadyInApplications) {
++  SelfInstallFacts f = FromDownloads();
++  f.quarantined = true;
++  f.app = base::FilePath("/Applications/Meridian.app");
++  EXPECT_EQ(DecideSelfInstall(f), SelfInstallOffer::kNone);
++  f.app = base::FilePath("/Users/ada/Applications/Meridian.app");
++  EXPECT_EQ(DecideSelfInstall(f), SelfInstallOffer::kNone);
++}
++
++TEST(SelfInstallTest, ReplacesAnOlderMeridian) {
++  SelfInstallFacts f = FromDownloads();
++  f.target_exists = true;
++  f.target_bundle_id = "dev.meridian.browser";
++  f.target_version = "157.0.1.1";
++  EXPECT_EQ(DecideSelfInstall(f), SelfInstallOffer::kReplace);
++  f.target_version = f.version;
++  EXPECT_EQ(DecideSelfInstall(f), SelfInstallOffer::kReplace);
++}
++
++TEST(SelfInstallTest, LeavesOtherAppsAndNewerOrOpenMeridianAlone) {
++  SelfInstallFacts f = FromDownloads();
++  f.target_exists = true;
++  f.target_bundle_id = "com.example.other";
++  EXPECT_EQ(DecideSelfInstall(f), SelfInstallOffer::kNone);
++  f.target_bundle_id = "dev.meridian.browser";
++  f.target_version = "159.0.0.0";
++  EXPECT_EQ(DecideSelfInstall(f), SelfInstallOffer::kNone);
++  f.target_version = "157.0.0.0";
++  f.target_running = true;
++  EXPECT_EQ(DecideSelfInstall(f), SelfInstallOffer::kNone);
++}
++
++TEST(SelfInstallTest, Texts) {
++  EXPECT_EQ(SelfInstallQuestion(SelfInstallOffer::kInstall, false, true).yes,
++            "Move to Applications");
++  EXPECT_EQ(SelfInstallQuestion(SelfInstallOffer::kReplace, false, true).yes,
++            "Replace");
++  EXPECT_EQ(SelfInstallQuestion(SelfInstallOffer::kInstall, true, false).title,
++            "Install Meridian?");
++}
++
++}  // namespace
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 5c46952f8c..e2da8e2619 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -153,6 +153,9 @@ struct ArcPreview {
+   bool logins_available;
+   // Arc has saved passwords or cards (ImportArcPasswords).
+   bool passwords_available;
++  // How many saved passwords there are (counted, never decrypted), for the
++  // moving-in step.
++  int32 password_count;
+   // Arc's history and the rest are there (ImportArcData).
+   bool data_available;
+ };
+@@ -541,6 +544,11 @@ interface SidebarPage {
+   // (`to`: "Anthropic (Claude)"): "send", "always", "other", "off" or
+   // "cancel".
+   AskAiConsent(string to) => (string choice);
++  // Before macOS asks about Meridian for the first time ("camera",
++  // "microphone", "screen", "notifications", "location"; system_asks.h):
++  // what will appear and which button to press. Answers when the person has
++  // read it (or the window closes).
++  ExplainSystemAsk(string kind) => ();
+   // The built-in AI streams: "text" (a delta), "tool", "done" or "error".
+   OnAiEvent(string session_id, string type, string text);
+   // Mission Control (mission_control.h): its snapshot as JSON on every
+@@ -711,6 +719,9 @@ interface SidebarHandler {
+   // Moving in from another browser: `source` is "arc" or "chrome" (Google
+   // Chrome: a space per profile, bookmarks as pinned tabs, its open tabs).
+   // Its sidebar on this computer (null if there is none).
++  // macOS's System Settings at the pane for `kind` (system_asks.h), to change
++  // an answer given there ("pressed the wrong button?").
++  OpenSystemSettingsFor(string kind);
+   GetArcPreview(string source) => (ArcPreview? preview);
+   // Brings Arc's spaces, pinned tabs, folders and favorites in; Arc's open
+   // tabs come in as Today tabs that load when first opened.
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index e5f600fa3a..9e4c457f48 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -4,6 +4,13 @@
+ 
+ #include "chrome/browser/meridian/sidebar_handler.h"
+ 
++#include "chrome/browser/meridian/system_asks.h"
++
++#if BUILDFLAG(IS_MAC)
++#include "base/apple/bundle_locations.h"
++#include "base/mac/mac_util.h"
++#endif
++
+ #include <memory>
+ 
+ #include "base/json/json_reader.h"
+@@ -274,6 +281,7 @@ mojom::ItemPtr ToMojo(const Item& item) {
+ void AskAiConsentIn(Profile* profile,
+                     const std::string& to,
+                     AiService::ConsentAnswer answer);
++void ExplainSystemAskIn(const std::string& kind, base::OnceClosure done);
+ 
+ }  // namespace
+ 
+@@ -306,6 +314,10 @@ SidebarHandler::SidebarHandler(
+   model()->AddObserver(this);
+   Handlers()[browser_] = this;
+   AiService::SetConsentAsker(base::BindRepeating(&AskAiConsentIn));
++  SetSystemAskExplainer(base::BindRepeating(&ExplainSystemAskIn));
++#if BUILDFLAG(IS_MAC)
++  ExplainLocationAsks();
++#endif
+   TabStripModel::SetSelectableAfterClose(&SidebarHandler::SelectableAfterClose);
+   Updater::Get().AddObserver(this);
+   Updater::Get().Start();
+@@ -1017,8 +1029,87 @@ void AskAiConsentIn(Profile* profile,
+   best->AskAiConsent(to, std::move(answer));
+ }
+ 
++// macOS's question about Meridian: explained in the frontmost Meridian
++// window (whichever profile), at once when there is none.
++void ExplainSystemAskIn(const std::string& kind, base::OnceClosure done) {
++  SidebarHandler* best = nullptr;
++  for (auto& [browser, handler] : Handlers()) {
++    if (!handler->page_connected()) {
++      continue;
++    }
++    if (!best || browser->IsActive()) {
++      best = handler;
++    }
++  }
++  if (!best) {
++    std::move(done).Run();
++    return;
++  }
++  best->ExplainSystemAsk(kind, std::move(done));
++}
++
+ }  // namespace
+ 
++void SidebarHandler::ExplainSystemAsk(const std::string& kind,
++                                      base::OnceClosure done) {
++  // Once per kind: macOS asks only once too.
++  PrefService* prefs = MainProfileFor(browser_->GetProfile())->GetPrefs();
++  const base::ListValue& explained =
++      prefs->GetList(prefs::kExplainedSystemAsks);
++  if (std::ranges::find(explained, base::Value(kind)) != explained.end()) {
++    std::move(done).Run();
++    return;
++  }
++  base::ListValue updated = explained.Clone();
++  updated.Append(kind);
++  prefs->SetList(prefs::kExplainedSystemAsks, std::move(updated));
++  page_->ExplainSystemAsk(
++      kind, mojo::WrapCallbackWithDefaultInvokeIfNotRun(std::move(done)));
++}
++
++void SidebarHandler::OpenSystemSettingsFor(const std::string& kind) {
++#if BUILDFLAG(IS_MAC)
++  // Tests: said, never opened.
++  if (FakeSystemAsks()) {
++    base::FilePath log = TestSwitchPath("meridian-test-system-asks");
++    if (!log.empty()) {
++      base::ThreadPool::PostTask(
++          FROM_HERE, {base::MayBlock()},
++          base::BindOnce(
++              [](base::FilePath log, std::string line) {
++                if (!base::PathExists(log)) {
++                  base::WriteFile(log, "");
++                }
++                base::AppendToFile(log, line);
++              },
++              log, "settings " + kind + "\n"));
++    }
++    return;
++  }
++  using Pane = base::mac::SystemSettingsPane;
++  if (kind == "notifications") {
++    base::mac::OpenSystemSettingsPane(Pane::kNotifications,
++                                      base::apple::MainBundleIdentifier());
++    return;
++  }
++  static constexpr struct {
++    const char* kind;
++    Pane pane;
++  } kPanes[] = {
++      {"camera", Pane::kPrivacySecurity_Camera},
++      {"microphone", Pane::kPrivacySecurity_Microphone},
++      {"screen", Pane::kPrivacySecurity_ScreenRecording},
++      {"location", Pane::kPrivacySecurity_LocationServices},
++  };
++  for (const auto& p : kPanes) {
++    if (kind == p.kind) {
++      base::mac::OpenSystemSettingsPane(p.pane);
++      return;
++    }
++  }
++#endif
++}
++
+ void SidebarHandler::AskAiConsent(const std::string& to,
+                                   AiService::ConsentAnswer answer) {
+   page_->AskAiConsent(to, mojo::WrapCallbackWithDefaultInvokeIfNotRun(
+@@ -1723,6 +1814,7 @@ struct ArcRead {
+   bool logins = false;
+   bool passwords = false;
+   bool data = false;
++  int password_count = 0;
+ };
+ }  // namespace
+ 
+@@ -1737,7 +1829,8 @@ void SidebarHandler::GetArcPreview(const std::string& kind,
+                                             : ReadArcSidebar(),
+                            ArcLoginsAvailable(source),
+                            ArcPasswordsAvailable(source),
+-                           DataAvailable(source)};
++                           DataAvailable(source),
++                           CountSavedPasswords(source)};
+           },
+           kind),
+       base::BindOnce(
+@@ -1757,6 +1850,7 @@ void SidebarHandler::GetArcPreview(const std::string& kind,
+             preview->logins_available = read.logins;
+             preview->passwords_available = read.passwords;
+             preview->data_available = read.data;
++            preview->password_count = read.password_count;
+             std::function<int(const std::vector<Item>&)> count =
+                 [&](const std::vector<Item>& items) {
+                   int n = 0;
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index d85c5fd5a4..af33184b38 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -13,6 +13,7 @@
+ #include "base/memory/weak_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "base/timer/timer.h"
++#include "build/build_config.h"
+ #include "components/prefs/pref_change_registrar.h"
+ #include "chrome/browser/meridian/ai/ai_service.h"
+ #include "chrome/browser/meridian/archive_service.h"
+@@ -40,6 +41,11 @@ std::string SystemUserFullName();
+ // config changed then). macOS only; false elsewhere.
+ bool ClaudeDesktopStartedBefore(base::Time time);
+ 
++#if BUILDFLAG(IS_MAC)
++// Before macOS asks about the location: Meridian's sheet (system_asks.h).
++void ExplainLocationAsks();
++#endif
++
+ // Connects one window's sidebar (chrome://webui-browser) to the profile's
+ // SidebarService and to the window's tabs: new tabs join the active space,
+ // switching to a tab of another space switches the space, and each space
+@@ -198,6 +204,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void ClearToday() override;
+   void OpenInMeridian() override;
+   void SetLittleSpace(const std::string& space_id) override;
++  void OpenSystemSettingsFor(const std::string& kind) override;
+   void GetArcPreview(const std::string& source,
+                      GetArcPreviewCallback callback) override;
+   void ImportArc(const std::string& source,
+@@ -332,6 +339,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+                             bool paused);
+   // The AI features' consent question, in this window.
+   void AskAiConsent(const std::string& to, AiService::ConsentAnswer answer);
++  // Meridian's sheet before macOS asks about `kind` (system_asks.h), once.
++  void ExplainSystemAsk(const std::string& kind, base::OnceClosure done);
+   bool page_connected() const { return page_.is_connected(); }
+   static void AskAgent(BrowserWindowInterface* browser,
+                        const std::string& client,
+diff --git a/chrome/browser/meridian/sidebar_handler_mac.mm b/chrome/browser/meridian/sidebar_handler_mac.mm
+index 93a69956ea..995d21ec3e 100644
+--- a/chrome/browser/meridian/sidebar_handler_mac.mm
++++ b/chrome/browser/meridian/sidebar_handler_mac.mm
+@@ -11,7 +11,9 @@
+ #include "base/strings/escape.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/meridian/system_asks.h"
+ #include "chrome/browser/meridian/test_switches.h"
++#include "services/device/public/cpp/geolocation/system_geolocation_source_apple.h"
+ #include "chrome/browser/meridian/agent/agent_cli.h"
+ #include "base/files/file_util.h"
+ #include "base/task/thread_pool.h"
+@@ -478,4 +480,11 @@ void SidebarHandler::SetDefaultBrowser(SetDefaultBrowserCallback callback) {
+               }];
+ }
+ 
++void ExplainLocationAsks() {
++  device::SystemGeolocationSourceApple::SetBeforeAskHook(
++      base::BindRepeating([](base::OnceClosure then) {
++        ExplainSystemAsk("location", std::move(then));
++      }));
++}
++
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/system_asks.cc b/chrome/browser/meridian/system_asks.cc
+new file mode 100644
+index 0000000000..0704abea2a
+--- /dev/null
++++ b/chrome/browser/meridian/system_asks.cc
+@@ -0,0 +1,53 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/system_asks.h"
++
++#include <set>
++#include <utility>
++
++#include "base/no_destructor.h"
++#include "chrome/browser/meridian/test_switches.h"
++
++namespace meridian {
++
++namespace {
++
++SystemAskExplainer& Explainer() {
++  static base::NoDestructor<SystemAskExplainer> explainer;
++  return *explainer;
++}
++
++std::set<std::string>& FakeDone() {
++  static base::NoDestructor<std::set<std::string>> done;
++  return *done;
++}
++
++}  // namespace
++
++void SetSystemAskExplainer(SystemAskExplainer explainer) {
++  Explainer() = std::move(explainer);
++}
++
++void ExplainSystemAsk(const std::string& kind, base::OnceClosure then) {
++  if (!Explainer()) {
++    std::move(then).Run();
++    return;
++  }
++  Explainer().Run(kind, std::move(then));
++}
++
++bool FakeSystemAsks() {
++  return HasTestSwitch("meridian-test-system-asks");
++}
++
++bool FakeSystemAskDone(const std::string& kind) {
++  return FakeDone().contains(kind);
++}
++
++void SetFakeSystemAskDone(const std::string& kind) {
++  FakeDone().insert(kind);
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/system_asks.h b/chrome/browser/meridian/system_asks.h
+new file mode 100644
+index 0000000000..54dffa9750
+--- /dev/null
++++ b/chrome/browser/meridian/system_asks.h
+@@ -0,0 +1,44 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_SYSTEM_ASKS_H_
++#define CHROME_BROWSER_MERIDIAN_SYSTEM_ASKS_H_
++
++#include <string>
++
++#include "base/functional/callback.h"
++
++namespace meridian {
++
++// Before macOS asks the person something about Meridian for the first time
++// (the camera, the microphone, recording the screen, notifications, the
++// location), Meridian shows its own short sheet first: what will appear, why,
++// and which button to press, so nobody is scared of the system's window.
++//
++// No browser deps: Chromium's own code calls ExplainSystemAsk() right before
++// it makes macOS ask, and the sidebar (sidebar_handler.cc) sets the explainer
++// that shows the sheet in the frontmost window, once per kind.
++
++// Kinds: "camera", "microphone", "screen", "notifications", "location".
++using SystemAskExplainer =
++    base::RepeatingCallback<void(const std::string& kind,
++                                 base::OnceClosure done)>;
++
++void SetSystemAskExplainer(SystemAskExplainer explainer);
++
++// Explains `kind` (once ever, the explainer remembers), then runs `then`.
++// Runs `then` at once when nothing can explain it (no window yet).
++void ExplainSystemAsk(const std::string& kind, base::OnceClosure then);
++
++// Tests (--meridian-test-system-asks, test profiles only): macOS is never
++// asked. Every kind starts "not decided yet", and a request is answered
++// "allowed" at once, as if the person had clicked Allow.
++bool FakeSystemAsks();
++// Whether `kind` was asked in this run (fake asks only).
++bool FakeSystemAskDone(const std::string& kind);
++void SetFakeSystemAskDone(const std::string& kind);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_SYSTEM_ASKS_H_
+diff --git a/chrome/browser/notifications/BUILD.gn b/chrome/browser/notifications/BUILD.gn
+index a6430a8920..11eef76fe1 100644
+--- a/chrome/browser/notifications/BUILD.gn
++++ b/chrome/browser/notifications/BUILD.gn
+@@ -189,6 +189,7 @@ source_set("impl") {
+   public_deps = [ ":notifications" ]
+ 
+   deps = [
++    "//chrome/browser/meridian:system_asks",
+     "//chrome/app:generated_resources",
+     "//chrome/browser:browser_features",
+     "//chrome/browser/content_settings:content_settings_factory",
+diff --git a/chrome/browser/notifications/notification_permission_context.cc b/chrome/browser/notifications/notification_permission_context.cc
+index a2b8508b7e..dc540903b6 100644
+--- a/chrome/browser/notifications/notification_permission_context.cc
++++ b/chrome/browser/notifications/notification_permission_context.cc
+@@ -4,6 +4,9 @@
+ 
+ #include "chrome/browser/notifications/notification_permission_context.h"
+ 
++#include "base/functional/callback_helpers.h"
++#include "chrome/browser/meridian/system_asks.h"
++
+ #include <optional>
+ #include <variant>
+ 
+@@ -288,6 +291,12 @@ void NotificationPermissionContext::UserMadePermissionDecision(
+   permissions::ContentSettingPermissionContextBase::UserMadePermissionDecision(
+       id, requesting_origin, embedding_origin, decision);
+ 
++  // Meridian: a site may now send notifications; macOS asks about Meridian's
++  // the first time one comes. Its sheet says which button to press, once.
++  if (decision == PermissionDecision::kAllow) {
++    meridian::ExplainSystemAsk("notifications", base::DoNothing());
++  }
++
+   if (!web_app::UseNotificationAttributionForWebAppShims()) {
+     return;
+   }
+diff --git a/chrome/browser/permissions/system/BUILD.gn b/chrome/browser/permissions/system/BUILD.gn
+index ae97d6144d..2621e2ae15 100644
+--- a/chrome/browser/permissions/system/BUILD.gn
++++ b/chrome/browser/permissions/system/BUILD.gn
+@@ -51,6 +51,7 @@ source_set("system") {
+     ]
+     deps += [
+       "//chrome/browser:after_startup_task_utils",
++      "//chrome/browser/meridian:system_asks",
+       "//chrome/browser/web_applications",
+     ]
+   } else if (is_chromeos) {
+diff --git a/chrome/browser/permissions/system/system_media_capture_permissions_mac.mm b/chrome/browser/permissions/system/system_media_capture_permissions_mac.mm
+index 71bfc30a77..2db792627e 100644
+--- a/chrome/browser/permissions/system/system_media_capture_permissions_mac.mm
++++ b/chrome/browser/permissions/system/system_media_capture_permissions_mac.mm
+@@ -16,6 +16,7 @@
+ #include "base/no_destructor.h"
+ #import "base/task/sequenced_task_runner.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/meridian/system_asks.h"
+ #include "chrome/browser/permissions/system/media_authorization_wrapper_mac.h"
+ #include "chrome/browser/permissions/system/system_permission_common.h"
+ #include "media/base/media_switches.h"
+@@ -79,7 +80,18 @@ AVAuthorizationStatus MediaAuthorizationStatus(AVMediaType media_type) {
+       media_type);
+ }
+ 
++// Meridian: "camera" or "microphone".
++std::string AskKind(AVMediaType media_type) {
++  return media_type == AVMediaTypeVideo ? "camera" : "microphone";
++}
++
+ SystemPermission CheckSystemMediaCapturePermission(AVMediaType media_type) {
++  // Meridian's tests: macOS hasn't decided yet until the (fake) ask.
++  if (meridian::FakeSystemAsks()) {
++    return meridian::FakeSystemAskDone(AskKind(media_type))
++               ? SystemPermission::kAllowed
++               : SystemPermission::kNotDetermined;
++  }
+   if (UsingFakeMediaDevices()) {
+     return SystemPermission::kAllowed;
+   }
+@@ -99,8 +111,15 @@ SystemPermission CheckSystemMediaCapturePermission(AVMediaType media_type) {
+   }
+ }
+ 
+-void RequestSystemMediaCapturePermission(AVMediaType media_type,
+-                                         base::OnceClosure callback) {
++void RequestSystemMediaCapturePermissionNow(bool video,
++                                            base::OnceClosure callback) {
++  AVMediaType media_type = video ? AVMediaTypeVideo : AVMediaTypeAudio;
++  if (meridian::FakeSystemAsks()) {
++    meridian::SetFakeSystemAskDone(AskKind(media_type));
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, std::move(callback));
++    return;
++  }
+   if (UsingFakeMediaDevices()) {
+     base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+         FROM_HERE, std::move(callback));
+@@ -111,6 +130,20 @@ void RequestSystemMediaCapturePermission(AVMediaType media_type,
+                                                            std::move(callback));
+ }
+ 
++// Meridian: its own sheet first (once), then macOS asks.
++void RequestSystemMediaCapturePermission(AVMediaType media_type,
++                                         base::OnceClosure callback) {
++  if (UsingFakeMediaDevices() && !meridian::FakeSystemAsks()) {
++    RequestSystemMediaCapturePermissionNow(media_type == AVMediaTypeVideo,
++                                           std::move(callback));
++    return;
++  }
++  meridian::ExplainSystemAsk(
++      AskKind(media_type),
++      base::BindOnce(&RequestSystemMediaCapturePermissionNow,
++                     media_type == AVMediaTypeVideo, std::move(callback)));
++}
++
+ bool IsScreenCaptureAllowed() {
+   if (g_is_screen_capture_allowed_for_testing) {
+     return g_is_screen_capture_allowed_for_testing.value();
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index bb588b1c0c..0d11869110 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -74,6 +74,11 @@ build_webui("build") {
+     "meridian/settings_index.ts",
+     "meridian/allow_mock.html.ts",
+     "meridian/allow_mock.ts",
++    "meridian/mac_ask.html.ts",
++    "meridian/mac_ask.ts",
++    "meridian/mac_ask_glyphs.ts",
++    "meridian/system_ask.html.ts",
++    "meridian/system_ask.ts",
+     "meridian/showcase.html.ts",
+     "meridian/showcase.ts",
+     "meridian/try_claude.html.ts",
+@@ -132,6 +137,8 @@ build_webui("build") {
+     "meridian/settings.css",
+     "meridian/theme_editor.css",
+     "meridian/allow_mock.css",
++    "meridian/mac_ask.css",
++    "meridian/system_ask.css",
+     "meridian/showcase.css",
+     "meridian/try_claude.css",
+     "meridian/report.css",
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index d5089e9922..6f89343a67 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -189,6 +189,7 @@ export function getHtml(this: WebuiBrowserAppElement) {
+   <meridian-ai-consent id="aiConsent"
+       @meridian-show-settings="${this.onMeridianShowSettings_}">
+   </meridian-ai-consent>
++  <meridian-system-ask id="systemAsk"></meridian-system-ask>
+   <meridian-update-sheet id="updateSheet"
+       @meridian-open-url="${this.onMeridianOpenUrl_}">
+   </meridian-update-sheet>
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index e0cf377bc5..a0a659abd3 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -25,6 +25,7 @@ import './meridian/mission.js';
+ import './meridian/agent_asks.js';
+ import './meridian/ai_consent.js';
+ import './meridian/update_sheet.js';
++import './meridian/system_ask.js';
+ import './meridian/site_control.js';
+ import './meridian/boost_editor.js';
+ import './meridian/try_claude.js';
+@@ -53,6 +54,7 @@ import type {MeridianTidyElement, TidyApply} from './meridian/tidy.js';
+ import type {MeridianChatElement} from './meridian/chat.js';
+ import type {MeridianMissionElement, MissionSnapshot} from './meridian/mission.js';
+ import type {MeridianUpdateSheetElement} from './meridian/update_sheet.js';
++import type {MeridianSystemAskElement} from './meridian/system_ask.js';
+ import type {CommandBarTab, MeridianCommandBarElement} from './meridian/command_bar.js';
+ import type {MeridianOnboardingElement} from './meridian/onboarding.js';
+ import type {MeridianAskElement} from './meridian/ask.js';
+@@ -137,6 +139,7 @@ export interface WebuiBrowserAppElement {
+     chat: MeridianChatElement,
+     mission: MeridianMissionElement,
+     updateSheet: MeridianUpdateSheetElement,
++    systemAsk: MeridianSystemAskElement,
+     commandBar: MeridianCommandBarElement,
+     onboarding: MeridianOnboardingElement,
+     settings: MeridianSettingsElement,
+diff --git a/chrome/browser/resources/webui_browser/meridian/mac_ask.css b/chrome/browser/resources/webui_browser/meridian/mac_ask.css
+new file mode 100644
+index 0000000000..f3843b7bc5
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/mac_ask.css
+@@ -0,0 +1,199 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #css_wrapper_metadata_end */
++
++/* A little drawing of a macOS question, in macOS's own light look (it's what
++ * the person will see, whatever Meridian's theme). */
++
++:host {
++  display: block;
++  width: min(300px, 76vw);
++  color: #1d1d1f;
++  font-family: system-ui, -apple-system, sans-serif;
++  text-align: center;
++}
++
++.win {
++  position: relative;
++  padding: 16px 16px 14px;
++  border-radius: 14px;
++  background: #ececec;
++  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.28),
++      inset 0 0 0 0.5px rgba(0, 0, 0, 0.12);
++}
++
++.icon {
++  position: relative;
++  width: 44px;
++  height: 44px;
++  margin: 0 auto 8px;
++}
++
++/* Meridian's icon, with what it's about in a corner. */
++.app {
++  position: absolute;
++  inset: 0;
++  border-radius: 11px;
++  background: linear-gradient(160deg, #4c55c9, #2b2f7a);
++}
++
++.app::after {
++  content: '';
++  position: absolute;
++  left: 10px;
++  right: 10px;
++  top: 14px;
++  height: 18px;
++  border: 3.5px solid #fff;
++  border-bottom: 0;
++  border-radius: 20px 20px 0 0;
++}
++
++.glyph {
++  position: absolute;
++  right: -8px;
++  bottom: -6px;
++  width: 24px;
++  height: 24px;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  border-radius: 50%;
++  background: #fff;
++  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
++}
++
++.glyph svg {
++  width: 15px;
++  height: 15px;
++  fill: none;
++  stroke: #1d1d1f;
++  stroke-width: 2;
++  stroke-linecap: round;
++  stroke-linejoin: round;
++}
++
++.title {
++  font-size: 12.5px;
++  font-weight: 700;
++  line-height: 1.35;
++  overflow-wrap: anywhere;
++}
++
++p {
++  margin: 5px 0 0;
++  font-size: 11px;
++  line-height: 1.35;
++  color: #3a3a3c;
++}
++
++.field {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  margin: 9px 0 0;
++  font-size: 11px;
++  text-align: left;
++}
++
++.field i {
++  flex: 1;
++  padding: 3px 7px;
++  border-radius: 5px;
++  background: #fff;
++  font-style: normal;
++  letter-spacing: 1px;
++  box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.2);
++}
++
++.acts {
++  display: flex;
++  gap: 7px;
++  margin-top: 12px;
++}
++
++.acts span {
++  flex: 1;
++  padding: 5px 6px;
++  border-radius: 7px;
++  font-size: 11.5px;
++  font-weight: 500;
++  background: #fff;
++  box-shadow: 0 0.5px 1.5px rgba(0, 0, 0, 0.2);
++  white-space: nowrap;
++}
++
++.acts .press {
++  color: #fff;
++  background: #0a7aff;
++  animation: nudge 1.8s ease-in-out infinite;
++}
++
++/* A notification's question: a banner at the top right of the screen. */
++.banner {
++  display: grid;
++  grid-template-columns: auto 1fr;
++  gap: 4px 10px;
++  text-align: left;
++  border-radius: 16px;
++  padding: 12px 12px 10px;
++}
++
++.banner .icon {
++  width: 34px;
++  height: 34px;
++  margin: 0;
++  grid-row: span 1;
++}
++
++.banner .app {
++  border-radius: 8px;
++}
++
++.banner .app::after {
++  left: 8px;
++  right: 8px;
++  top: 11px;
++  height: 13px;
++  border-width: 3px;
++}
++
++.banner .glyph {
++  width: 18px;
++  height: 18px;
++  right: -5px;
++  bottom: -4px;
++}
++
++.banner .glyph svg {
++  width: 11px;
++  height: 11px;
++}
++
++.banner .acts {
++  grid-column: 1 / -1;
++  margin-top: 6px;
++  text-align: center;
++}
++
++/* The keychain's: no rounded alert, three buttons. */
++.keychain .acts span {
++  font-size: 11px;
++}
++
++@keyframes nudge {
++  50% {
++    box-shadow: 0 0 0 5px rgba(10, 122, 255, 0.35);
++  }
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .acts .press {
++    animation: none;
++    box-shadow: 0 0 0 3px rgba(10, 122, 255, 0.35);
++  }
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/mac_ask.html.ts b/chrome/browser/resources/webui_browser/meridian/mac_ask.html.ts
+new file mode 100644
+index 0000000000..7c1e12f57f
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/mac_ask.html.ts
+@@ -0,0 +1,26 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {MeridianMacAskElement} from './mac_ask.js';
++
++export function getHtml(this: MeridianMacAskElement) {
++  return html`<!--_html_template_start_-->
++<div class="win ${this.look_.style}" aria-hidden="true">
++  <div class="icon"><span class="app"></span><span class="glyph">${this.glyph_()}</span>
++  </div>
++  <div class="words">
++    <div class="title">${this.look_.title}</div>
++    ${this.look_.text ? html`<p>${this.look_.text}</p>` : ''}
++    ${this.look_.style === 'keychain' ? html`
++      <div class="field"><span>Password:</span><i>••••••••</i></div>` : ''}
++  </div>
++  <div class="acts">
++    ${this.look_.buttons.map(b => html`
++      <span class="${b === this.look_.press ? 'press' : ''}">${b}</span>`)}
++  </div>
++</div>
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/mac_ask.ts b/chrome/browser/resources/webui_browser/meridian/mac_ask.ts
+new file mode 100644
+index 0000000000..5a1174d7f4
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/mac_ask.ts
+@@ -0,0 +1,136 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// A little drawing of the window macOS shows when it asks about Meridian
++// (the camera, the keychain, …), with the button to press glowing: what the
++// person will see, so it's no surprise. A drawing, not a screenshot (macOS's
++// exact words change between versions).
++
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++import type {PropertyValues, TemplateResult} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {getCss} from './mac_ask.css.js';
++import {macAskGlyph} from './mac_ask_glyphs.js';
++import {getHtml} from './mac_ask.html.js';
++
++export interface MacAskLook {
++  // 'alert': macOS's centered question; 'banner': a notification's;
++  // 'keychain': the keychain's, with a password field.
++  style: 'alert'|'banner'|'keychain';
++  icon: 'camera'|'mic'|'location'|'bell'|'screen'|'key';
++  title: string;
++  text: string;
++  // Left to right; `press` is the one to press.
++  buttons: string[];
++  press: string;
++}
++
++// What macOS shows for each kind. `app`: the browser whose keychain item it
++// is ("Chrome", "Arc").
++export function macAskLook(kind: string, app = 'Chrome'): MacAskLook {
++  const why =
++      'Once Meridian has access, websites will be able to ask you for access.';
++  switch (kind) {
++    case 'camera':
++      return {
++        style: 'alert',
++        icon: 'camera',
++        title: '“Meridian” would like to access the camera.',
++        text: why,
++        buttons: ['Don’t Allow', 'Allow'],
++        press: 'Allow',
++      };
++    case 'microphone':
++      return {
++        style: 'alert',
++        icon: 'mic',
++        title: '“Meridian” would like to access the microphone.',
++        text: why,
++        buttons: ['Don’t Allow', 'Allow'],
++        press: 'Allow',
++      };
++    case 'location':
++      return {
++        style: 'alert',
++        icon: 'location',
++        title: '“Meridian” would like to use your current location.',
++        text: why,
++        buttons: ['Don’t Allow', 'Allow'],
++        press: 'Allow',
++      };
++    case 'notifications':
++      return {
++        style: 'banner',
++        icon: 'bell',
++        title: '“Meridian” Notifications',
++        text: 'Notifications may include alerts, sounds and icon badges.',
++        buttons: ['Don’t Allow', 'Allow'],
++        press: 'Allow',
++      };
++    case 'screen':
++      return {
++        style: 'alert',
++        icon: 'screen',
++        title: '“Meridian” will not be able to record the contents of your ' +
++            'screen until it is quit.',
++        text: '',
++        buttons: ['Later', 'Quit & Reopen'],
++        press: 'Quit & Reopen',
++      };
++    case 'keychain':
++    default:
++      return {
++        style: 'keychain',
++        icon: 'key',
++        title: `Meridian wants to use your confidential information stored ` +
++            `in “${app} Safe Storage” in your keychain.`,
++        text: 'To allow this, enter the “login” keychain password.',
++        buttons: ['Always Allow', 'Deny', 'Allow'],
++        press: 'Allow',
++      };
++  }
++}
++
++export class MeridianMacAskElement extends CrLitElement {
++  static get is() {
++    return 'meridian-mac-ask';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      kind: {type: String},
++      app: {type: String},
++      look_: {state: true, type: Object},
++    };
++  }
++
++  accessor kind: string = 'camera';
++  accessor app: string = 'Chrome';
++  protected accessor look_: MacAskLook = macAskLook('camera');
++
++  override willUpdate(changed: PropertyValues<this>) {
++    super.willUpdate(changed);
++    this.look_ = macAskLook(this.kind, this.app);
++  }
++
++  protected glyph_(): TemplateResult {
++    return macAskGlyph(this.look_.icon);
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-mac-ask': MeridianMacAskElement;
++  }
++}
++
++customElements.define(MeridianMacAskElement.is, MeridianMacAskElement);
+diff --git a/chrome/browser/resources/webui_browser/meridian/mac_ask_glyphs.ts b/chrome/browser/resources/webui_browser/meridian/mac_ask_glyphs.ts
+new file mode 100644
+index 0000000000..bd91091ccb
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/mac_ask_glyphs.ts
+@@ -0,0 +1,22 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The little signs in a corner of Meridian's icon in mac_ask's drawings. Each
++// a whole <svg> (Lit parses SVG children only inside an <svg> of the same
++// template).
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++import type {TemplateResult} from '//resources/lit/v3_0/lit.rollup.js';
++
++export function macAskGlyph(name: string): TemplateResult {
++  const glyphs: Record<string, TemplateResult> = {
++    camera: html`<svg viewBox="0 0 24 24"><rect x="3" y="7" width="13" height="11" rx="2.5"/><path d="M16 11l5-3v9l-5-3z"/></svg>`,
++    mic: html`<svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>`,
++    location: html`<svg viewBox="0 0 24 24"><path d="M12 21s-6.5-6.2-6.5-11a6.5 6.5 0 0 1 13 0c0 4.8-6.5 11-6.5 11z"/><circle cx="12" cy="10" r="2.3"/></svg>`,
++    bell: html`<svg viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15zM10 20.5h4"/></svg>`,
++    screen: html`<svg viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="12.5" rx="2"/><path d="M9 20.5h6M12 17v3.5"/><circle cx="12" cy="10.7" r="2.2"/></svg>`,
++    key: html`<svg viewBox="0 0 24 24"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3M15.5 12v2"/></svg>`,
++  };
++  return glyphs[name] || glyphs['key']!;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.css b/chrome/browser/resources/webui_browser/meridian/onboarding.css
+index 1388a0f9bf..c644806fdb 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.css
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.css
+@@ -880,6 +880,7 @@ kbd {
+   place-items: center;
+   background: rgba(10, 10, 16, 0.4);
+   animation: fade 0.2s ease;
++  overflow-y: auto;
+ }
+ 
+ .card {
+@@ -1124,3 +1125,45 @@ kbd {
+   grid-template-columns: minmax(0, 360px);
+   justify-content: center;
+ }
++
++/* ------------------------------------------------------------ sources */
++
++/* Both Arc and Chrome are here: where to move in from. */
++.sources {
++  display: inline-flex;
++  gap: 4px;
++  padding: 4px;
++  margin-bottom: 14px;
++  border-radius: 999px;
++  background: rgba(255, 255, 255, 0.12);
++  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16);
++}
++
++.source {
++  padding: 6px 16px;
++  border: 0;
++  border-radius: 999px;
++  font: inherit;
++  font-size: 13.5px;
++  font-weight: 600;
++  color: rgba(255, 255, 255, 0.78);
++  background: none;
++  cursor: pointer;
++}
++
++.source.on {
++  color: #17171c;
++  background: #fff;
++}
++
++/* The keychain's question, drawn in the "your Mac will ask" card. */
++.card .mac-ask {
++  display: flex;
++  justify-content: center;
++  padding: 6px 0 16px;
++}
++
++.card p.small {
++  font-size: 12.5px;
++  color: #66655f;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+index 4d3dc0a9ab..5d0390c9bb 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+@@ -60,6 +60,15 @@ export function getHtml(this: MeridianOnboardingElement) {
+           </div>` : ''}
+ 
+         ${this.step_ === 'arc' && this.arc_ ? html`
++          ${this.sources_.length ? html`
++            <div class="sources" role="radiogroup"
++                aria-label="Where to move in from">
++              ${this.sources_.map(k => html`
++                <button class="source ${k === this.source_ ? 'on' : ''}"
++                    role="radio" aria-checked="${k === this.source_}"
++                    data-source="${k}" @click="${this.onSourceClick_}">
++                  From ${k === 'chrome' ? 'Chrome' : 'Arc'}</button>`)}
++            </div>` : ''}
+           <h2>Bring everything from ${this.sourceName_}</h2>
+           <p class="whisper top">${this.source_ === 'chrome' ?
+               'Each Chrome profile becomes a space: its bookmarks as pinned ' +
+@@ -68,10 +77,7 @@ export function getHtml(this: MeridianOnboardingElement) {
+                   'Arc stays untouched.'}</p>
+           <div class="arc-move">
+             <div class="arc-stats">
+-              <b>${this.arc_.spaceCount} spaces</b>
+-              <b>${this.arcTabs_} tabs</b>
+-              ${this.arc_.favoriteCount ? html`
+-                <b>${this.arc_.favoriteCount} favorites</b>` : ''}
++              ${this.stats_.map(x => html`<b>${x}</b>`)}
+             </div>
+             <div class="arc-spaces">
+               ${this.arcSpaces_.map(s => html`
+@@ -278,11 +284,17 @@ export function getHtml(this: MeridianOnboardingElement) {
+         <h3>Your Mac will ask for permission</h3>
+         <p>To keep you signed in to your sites, Meridian copies
+           ${this.sourceName_}’s sign-ins, saved passwords and cards.
+-          Your Mac will ask whether Meridian may read them: click
+-          <b>Allow</b> (and type your Mac password if asked). Meridian needs
+-          this only now, so there’s no need for Always Allow.</p>
+-        <p>Nothing leaves your computer, and ${this.sourceName_} stays as it
+-          is.</p>
++          Your Mac will ask whether Meridian may read them: type the password
++          you unlock your Mac with and click <b>Allow</b>. Meridian needs this
++          only now, so there’s no need for Always Allow.</p>
++        <div class="mac-ask">
++          <meridian-mac-ask kind="keychain" .app="${this.sourceName_}">
++          </meridian-mac-ask>
++        </div>
++        <p class="small">Nothing leaves your computer, and ${this.sourceName_}
++          stays as it is. Pressed Deny? Your tabs and bookmarks still come
++          over; bring the sign-ins later from File › Import from
++          ${this.sourceName_}.</p>
+         <div class="card-actions">
+           <button id="confirmCancel" class="btn ghost"
+               @click="${this.onConfirmCancelClick_}">Cancel</button>
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+index 25e0a2742c..4ed29a9a02 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+@@ -20,6 +20,7 @@ import {browserProxyFactory} from '../sidebar.mojom-webui.js';
+ import type {AgentCli, ArcPreview, Item, SetupProposal, SidebarHandlerInterface, Space} from '../sidebar.mojom-webui.js';
+ 
+ import './allow_mock.js';
++import './mac_ask.js';
+ import './showcase.js';
+ 
+ import {getCss} from './onboarding.css.js';
+@@ -64,6 +65,29 @@ const FAV_COLORS: Record<string, string> = {
+   'Microsoft Teams': '#6264a7',
+ };
+ 
++// "1 profile", "12 open tabs": a count and its word.
++function count(n: number, one: string, many = `${one}s`): string {
++  return `${n.toLocaleString()} ${n === 1 ? one : many}`;
++}
++
++// The moving-in step's counts. Chrome: its profiles, the tabs it has open,
++// bookmarks and saved passwords; Arc: spaces, tabs and favorites.
++export function statsOf(kind: string, p: ArcPreview): string[] {
++  if (kind === 'chrome') {
++    return [
++      count(p.spaceCount, 'profile'),
++      p.todayCount ? count(p.todayCount, 'open tab') : '',
++      p.pinnedCount ? count(p.pinnedCount, 'bookmark') : '',
++      p.passwordCount ? count(p.passwordCount, 'password') : '',
++    ].filter(x => x);
++  }
++  return [
++    count(p.spaceCount, 'space'),
++    count(p.pinnedCount + p.todayCount, 'tab'),
++    p.favoriteCount ? count(p.favoriteCount, 'favorite') : '',
++  ].filter(x => x);
++}
++
+ export interface Dot {
+   index: number;
+   cls: string;
+@@ -122,7 +146,6 @@ export class MeridianOnboardingElement extends CrLitElement {
+       tiles_: {state: true, type: Array},
+       chips_: {state: true, type: Array},
+       persona_: {state: true, type: String},
+-      arcTabs_: {state: true, type: Number},
+       source_: {state: true, type: String},
+       sourceName_: {state: true, type: String},
+       canStartFresh_: {state: true, type: Boolean},
+@@ -135,6 +158,8 @@ export class MeridianOnboardingElement extends CrLitElement {
+       confirmRestart_: {state: true, type: Boolean},
+       restartNote_: {state: true, type: String},
+       canUndo_: {state: true, type: Boolean},
++      sources_: {state: true, type: Array},
++      stats_: {state: true, type: Array},
+     };
+   }
+ 
+@@ -168,7 +193,6 @@ export class MeridianOnboardingElement extends CrLitElement {
+   protected accessor tiles_: FavTile[] = [];
+   protected accessor chips_: SpaceChip[] = [];
+   protected accessor persona_: string = '';
+-  protected accessor arcTabs_: number = 0;
+   protected accessor canStartFresh_: boolean = false;
+   // What's on this computer: agent CLIs and Claude Desktop.
+   protected accessor aiFound_: AgentCli[] = [];
+@@ -185,6 +209,13 @@ export class MeridianOnboardingElement extends CrLitElement {
+   protected readonly canRestartClaude_: boolean =
+       !navigator.userAgent.includes('Windows');
+   protected accessor canUndo_: boolean = false;
++  // Both Arc and Chrome are here: the moving-in step lets the person pick
++  // ('arc', 'chrome'); empty when there's one or none.
++  protected accessor sources_: string[] = [];
++  // The moving-in step's real counts ("2 spaces", "84 bookmarks", …).
++  protected accessor stats_: string[] = [];
++  // Each source's preview, as read when the tour opened.
++  private previews_: Record<string, ArcPreview|null> = {};
+ 
+   private readonly handler_: SidebarHandlerInterface =
+       browserProxyFactory.getInstance().handler;
+@@ -200,19 +231,24 @@ export class MeridianOnboardingElement extends CrLitElement {
+       return;
+     }
+     this.source_ = start === 'chrome' ? 'chrome' : 'arc';
+-    let [{preview}, {isDefault}] = await Promise.all([
+-      this.handler_.getArcPreview(this.source_),
++    // The tour reads both: Arc first, else Chrome, and a choice when both are
++    // here.
++    const kinds = start === 'tour' ? ['arc', 'chrome'] : [this.source_];
++    const [previews, {isDefault}] = await Promise.all([
++      Promise.all(kinds.map(k => this.handler_.getArcPreview(k))),
+       this.handler_.isDefaultBrowser(),
+     ]);
+-    if (!preview && start === 'tour') {
++    this.previews_ = {};
++    kinds.forEach((k, i) => this.previews_[k] = previews[i]!.preview);
++    if (!this.previews_[this.source_] && this.previews_['chrome']) {
+       this.source_ = 'chrome';
+-      preview = (await this.handler_.getArcPreview('chrome')).preview;
+     }
+-    this.sourceName_ = this.source_ === 'chrome' ? 'Chrome' : 'Arc';
+-    this.arc_ = preview;
++    this.sources_ = kinds.length > 1 && kinds.every(k => this.previews_[k]) ?
++        kinds :
++        [];
++    this.useSource_(this.source_);
+     this.isDefault_ = isDefault;
+     this.fresh_ = false;
+-    this.withLogins_ = !!preview?.loginsAvailable;
+     this.confirmLogins_ = false;
+     this.proposal_ = null;
+     this.lines_ = [];
+@@ -246,6 +282,24 @@ export class MeridianOnboardingElement extends CrLitElement {
+     this.startHello_();
+   }
+ 
++  // Moving in from `kind` ('arc' or 'chrome'): its preview and counts.
++  private useSource_(kind: string) {
++    const preview = this.previews_[kind] || null;
++    this.source_ = kind;
++    this.sourceName_ = kind === 'chrome' ? 'Chrome' : 'Arc';
++    this.arc_ = preview;
++    this.withLogins_ = !!preview?.loginsAvailable;
++    this.stats_ = preview ? statsOf(kind, preview) : [];
++  }
++
++  protected onSourceClick_(e: Event) {
++    const kind = (e.currentTarget as HTMLElement).dataset['source']!;
++    if (!this.busy_ && kind !== this.source_) {
++      this.useSource_(kind);
++      this.note_ = '';
++    }
++  }
++
+   // What can be connected; the first CLI that's signed in suggests the setup.
+   private async findAi_() {
+     const [{clis}, {providers}] = await Promise.all([
+@@ -310,7 +364,6 @@ export class MeridianOnboardingElement extends CrLitElement {
+       default: 'Not now',
+       done: 'Start browsing',
+     }[this.step_];
+-    this.arcTabs_ = (this.arc_?.pinnedCount || 0) + (this.arc_?.todayCount || 0);
+     this.canStartFresh_ = this.steps_.includes('hello');
+     this.arcSpaces_ = (this.arc_?.spaces || []).map(
+         (s, index) => ({index, name: s.name, icon: s.icon,
+diff --git a/chrome/browser/resources/webui_browser/meridian/system_ask.css b/chrome/browser/resources/webui_browser/meridian/system_ask.css
+new file mode 100644
+index 0000000000..f0e63aeea6
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/system_ask.css
+@@ -0,0 +1,109 @@
++/* Copyright 2026 The Meridian Authors
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file. */
++
++/* #css_wrapper_metadata_start
++ * #type=style-lit
++ * #scheme=relative
++ * #css_wrapper_metadata_end */
++
++:host {
++  position: fixed;
++  inset: 0;
++  z-index: 72;
++  display: none;
++  color: var(--meridian-text);
++  font-size: 13px;
++}
++
++:host([open]) {
++  display: block;
++}
++
++#overlay {
++  position: absolute;
++  inset: 0;
++  display: flex;
++  justify-content: center;
++  align-items: center;
++  background: var(--meridian-overlay);
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
++}
++
++#card {
++  width: min(460px, 92vw);
++  max-height: 92vh;
++  overflow-y: auto;
++  box-sizing: border-box;
++  padding: 20px 22px 16px;
++  border-radius: 14px;
++  background: var(--meridian-surface);
++  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35),
++    0 0 0 0.5px var(--meridian-border);
++  outline: none;
++}
++
++#title {
++  font-size: 16px;
++  font-weight: 650;
++  margin-bottom: 8px;
++}
++
++p {
++  margin: 6px 0;
++  line-height: 1.5;
++}
++
++ol {
++  margin: 8px 0;
++  padding-left: 20px;
++  line-height: 1.5;
++}
++
++li + li {
++  margin-top: 3px;
++}
++
++.drawing {
++  display: flex;
++  justify-content: center;
++  padding: 14px 0 18px;
++}
++
++.wrong {
++  font-size: 12px;
++  color: var(--meridian-text-muted);
++}
++
++.link {
++  padding: 0;
++  border: 0;
++  background: none;
++  font: inherit;
++  color: var(--meridian-space);
++  cursor: pointer;
++  text-decoration: underline;
++  text-underline-offset: 2px;
++}
++
++footer {
++  display: flex;
++  justify-content: flex-end;
++  margin-top: 12px;
++}
++
++.btn {
++  height: 30px;
++  padding: 0 16px;
++  border: 0;
++  border-radius: 8px;
++  font: inherit;
++  font-weight: 600;
++  cursor: pointer;
++}
++
++.btn.primary {
++  color: white;
++  background: var(--meridian-space);
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/system_ask.html.ts b/chrome/browser/resources/webui_browser/meridian/system_ask.html.ts
+new file mode 100644
+index 0000000000..27c1f89fcf
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/system_ask.html.ts
+@@ -0,0 +1,32 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++import type {MeridianSystemAskElement} from './system_ask.js';
++
++export function getHtml(this: MeridianSystemAskElement) {
++  return html`<!--_html_template_start_-->
++<div id="overlay" @keydown="${this.onKeydown_}">
++  <div id="card" role="dialog" aria-labelledby="title" tabindex="-1"
++      data-kind="${this.kind_}">
++    <div id="title">${this.text_.title}</div>
++    ${this.text_.lines.map(l => html`<p>${l}</p>`)}
++    ${this.text_.steps.length ? html`
++      <ol>${this.text_.steps.map(s => html`<li>${s}</li>`)}</ol>` : ''}
++    <div class="drawing">
++      <meridian-mac-ask .kind="${this.kind_}"></meridian-mac-ask>
++    </div>
++    <p class="wrong">${this.text_.wrong}
++      <button id="settings" class="link" @click="${this.onSettingsClick_}">
++        ${this.text_.settings}</button>
++    </p>
++    <footer>
++      <button id="ok" class="btn primary" @click="${this.onOkClick_}">
++        ${this.text_.ok}</button>
++    </footer>
++  </div>
++</div>
++<!--_html_template_end_-->`;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/system_ask.ts b/chrome/browser/resources/webui_browser/meridian/system_ask.ts
+new file mode 100644
+index 0000000000..678758a46a
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/system_ask.ts
+@@ -0,0 +1,204 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Before macOS asks about Meridian for the first time (the camera, the
++// microphone, recording the screen, notifications, the location), one short
++// sheet: what will appear, why, which button to press, with a drawing of it,
++// and where to change it if the wrong button got pressed. Once per kind
++// (sidebar_handler.cc remembers); macOS asks only after "Continue".
++
++import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
++import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
++
++import {browserProxyFactory} from '../sidebar.mojom-webui.js';
++
++import './mac_ask.js';
++
++import {getCss} from './system_ask.css.js';
++import {getHtml} from './system_ask.html.js';
++
++export interface SystemAskText {
++  title: string;
++  // Paragraphs; the last one names the button.
++  lines: string[];
++  // Numbered steps, when there's more than one button to press.
++  steps: string[];
++  // "Pressed the wrong button?" and the button to the right pane.
++  wrong: string;
++  settings: string;
++  // The main button: macOS asks right after it ("Continue"), or later
++  // ("Got it").
++  ok: string;
++}
++
++const PRIVACY = 'System Settings › Privacy & Security';
++
++export function systemAskText(kind: string): SystemAskText {
++  const device = (what: string, pane: string): SystemAskText => ({
++    title: `Your Mac will ask about the ${what}`,
++    lines: [
++      `This site can use your ${what} now. The first time, macOS also asks ` +
++          `whether Meridian may use it.`,
++      'Press Allow (on older Macs it says OK):',
++    ],
++    steps: [],
++    wrong: `Pressed Don’t Allow? Turn on Meridian in ${PRIVACY} › ${pane}.`,
++    settings: `Open ${pane} settings`,
++    ok: 'Continue',
++  });
++  switch (kind) {
++    case 'camera':
++      return device('camera', 'Camera');
++    case 'microphone':
++      return device('microphone', 'Microphone');
++    case 'location':
++      return {
++        ...device('location', 'Location Services'),
++        lines: [
++          'This site can see where you are now. The first time, macOS also ' +
++              'asks whether Meridian may use your location.',
++          'Press Allow (on older Macs it says OK):',
++        ],
++      };
++    case 'notifications':
++      return {
++        title: 'Your Mac will ask about notifications',
++        lines: [
++          'This site can send you notifications now. When the first one ' +
++              'comes, macOS asks whether Meridian may show them.',
++          'Press Allow:',
++        ],
++        steps: [],
++        wrong: 'Pressed Don’t Allow? Turn on Allow notifications for ' +
++            'Meridian in System Settings › Notifications.',
++        settings: 'Open Notifications settings',
++        ok: 'Got it',
++      };
++    case 'screen':
++    default:
++      return {
++        title: 'Sharing your screen takes one switch on your Mac',
++        lines: [
++          'Sharing a tab works right away. To share your whole screen or ' +
++              'another app’s window, macOS has to let Meridian record the ' +
++              'screen.',
++        ],
++        steps: [
++          'In the sharing window, pick Entire Screen or Window, then Open ' +
++              'System Settings.',
++          'Turn on Meridian in Screen & System Audio Recording.',
++          'macOS offers to quit and reopen Meridian: press Quit & Reopen. ' +
++              'Your tabs come back.',
++        ],
++        wrong: 'Pressed Later? The switch works the next time Meridian ' +
++            'opens. Or turn it on in ' + PRIVACY + ' › Screen & System Audio ' +
++            'Recording.',
++        settings: 'Open Screen Recording settings',
++        ok: 'Continue',
++      };
++  }
++}
++
++export class MeridianSystemAskElement extends CrLitElement {
++  static get is() {
++    return 'meridian-system-ask';
++  }
++
++  static override get styles() {
++    return getCss();
++  }
++
++  override render() {
++    return getHtml.bind(this)();
++  }
++
++  static override get properties() {
++    return {
++      open: {type: Boolean, reflect: true},
++      kind_: {state: true, type: String},
++      text_: {state: true, type: Object},
++    };
++  }
++
++  accessor open: boolean = false;
++  protected accessor kind_: string = '';
++  protected accessor text_: SystemAskText = systemAskText('');
++
++  // Explanations waiting their turn (two kinds at once: camera and
++  // microphone), each with what runs once it's read.
++  private queue_: Array<{kind: string, done: () => void}> = [];
++  private listener_: number|null = null;
++
++  override connectedCallback() {
++    super.connectedCallback();
++    const router = browserProxyFactory.getInstance().callbackRouter;
++    this.listener_ = router.explainSystemAsk.addListener(
++        (kind: string) =>
++            new Promise<void>(resolve => this.show(kind, resolve)));
++  }
++
++  override disconnectedCallback() {
++    super.disconnectedCallback();
++    if (this.listener_ !== null) {
++      browserProxyFactory.getInstance().callbackRouter.removeListener(
++          this.listener_);
++      this.listener_ = null;
++    }
++  }
++
++  // Also for tests and screenshots: the sheet for `kind`.
++  show(kind: string, done: () => void = () => {}) {
++    this.queue_.push({kind, done});
++    if (!this.open) {
++      this.next_();
++    }
++  }
++
++  override willUpdate(changed: PropertyValues<this>) {
++    super.willUpdate(changed);
++    this.text_ = systemAskText(this.kind_);
++  }
++
++  private next_() {
++    const first = this.queue_[0];
++    if (!first) {
++      this.open = false;
++      return;
++    }
++    this.kind_ = first.kind;
++    this.open = true;
++    this.updateComplete.then(
++        () => this.shadowRoot.querySelector<HTMLElement>('#ok')?.focus());
++  }
++
++  private close_() {
++    const first = this.queue_.shift();
++    first?.done();
++    this.next_();
++  }
++
++  protected onOkClick_() {
++    this.close_();
++  }
++
++  protected onSettingsClick_() {
++    browserProxyFactory.getInstance().handler.openSystemSettingsFor(
++        this.kind_);
++  }
++
++  protected onKeydown_(e: KeyboardEvent) {
++    if (e.key === 'Escape') {
++      e.preventDefault();
++      this.close_();
++    }
++  }
++}
++
++declare global {
++  interface HTMLElementTagNameMap {
++    'meridian-system-ask': MeridianSystemAskElement;
++  }
++}
++
++customElements.define(MeridianSystemAskElement.is, MeridianSystemAskElement);
+diff --git a/chrome/browser/resources/webui_browser/meridian/update_sheet.css b/chrome/browser/resources/webui_browser/meridian/update_sheet.css
+index ae9f6a1402..812c7732b2 100644
+--- a/chrome/browser/resources/webui_browser/meridian/update_sheet.css
++++ b/chrome/browser/resources/webui_browser/meridian/update_sheet.css
+@@ -145,3 +145,22 @@ a:hover {
+   opacity: 0.6;
+   cursor: default;
+ }
++
++/* Before a restart macOS will ask about Meridian's keychain item. */
++.keychain {
++  display: flex;
++  gap: 8px;
++  align-items: flex-start;
++  margin: 4px 20px 2px;
++  padding: 8px 10px;
++  border-radius: 8px;
++  font-size: 12px;
++  line-height: 1.45;
++  background: color-mix(in srgb, var(--meridian-space) 10%, transparent);
++}
++
++.keychain svg {
++  flex: none;
++  margin-top: 2px;
++  color: var(--meridian-space);
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/update_sheet.html.ts b/chrome/browser/resources/webui_browser/meridian/update_sheet.html.ts
+index a3821d4396..791317bb16 100644
+--- a/chrome/browser/resources/webui_browser/meridian/update_sheet.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/update_sheet.html.ts
+@@ -21,6 +21,10 @@ export function getHtml(this: MeridianUpdateSheetElement) {
+           opens again with your tabs.</div>
+       </div>
+     </header>
++    ${this.safeStorageNote_() ? html`
++      <p id="safeStorage" class="keychain">${icon('lock', 14)}
++        <span>After the restart macOS may ask about “Meridian Safe
++          Storage”: press <b>Always Allow</b>.</span></p>` : ''}
+     <div id="notes" class="notes">
+       ${!this.notes_() ? html`
+         <p class="muted">Fixes and improvements.</p>` :
+diff --git a/chrome/browser/resources/webui_browser/meridian/update_sheet.ts b/chrome/browser/resources/webui_browser/meridian/update_sheet.ts
+index 8100476e3d..604c06b2a4 100644
+--- a/chrome/browser/resources/webui_browser/meridian/update_sheet.ts
++++ b/chrome/browser/resources/webui_browser/meridian/update_sheet.ts
+@@ -54,6 +54,16 @@ export class MeridianUpdateSheetElement extends CrLitElement {
+     this.open = false;
+   }
+ 
++  // macOS asks about "Meridian Safe Storage" after the restart when the new
++  // version is signed differently: from 0.x (signed by Meridian itself) to 1.x
++  // (Apple's Developer ID). macOS only; nothing in the app can explain it
++  // then (it asks before any window), so it's said here.
++  protected safeStorageNote_(): boolean {
++    const major = (v: string|undefined) => Number((v || '').split('.')[0]);
++    return navigator.userAgent.includes('Mac') &&
++        major(this.state_?.current) === 0 && major(this.state_?.version) >= 1;
++  }
++
+   protected notes_(): string {
+     // GitHub's release notes; the first heading repeats the version.
+     return (this.state_?.notes || '')
+diff --git a/services/device/public/cpp/geolocation/system_geolocation_source_apple.h b/services/device/public/cpp/geolocation/system_geolocation_source_apple.h
+index 11d9e10fa1..39ee281d55 100644
+--- a/services/device/public/cpp/geolocation/system_geolocation_source_apple.h
++++ b/services/device/public/cpp/geolocation/system_geolocation_source_apple.h
+@@ -41,6 +41,11 @@ class COMPONENT_EXPORT(GEOLOCATION) SystemGeolocationSourceApple
+   // triggering a timeout.
+   static constexpr unsigned int kNetworkChangeTimeoutMs = 1000;
+ 
++  // Meridian: before macOS asks about the location for the first time, the
++  // embedder explains it (its own sheet), then runs the closure it's given.
++  using BeforeAskHook = base::RepeatingCallback<void(base::OnceClosure)>;
++  static void SetBeforeAskHook(BeforeAskHook hook);
++
+   SystemGeolocationSourceApple();
+   ~SystemGeolocationSourceApple() override;
+ 
+@@ -127,6 +132,8 @@ class COMPONENT_EXPORT(GEOLOCATION) SystemGeolocationSourceApple
+   const scoped_refptr<base::SingleThreadTaskRunner> main_task_runner_;
+   // Caches the initial Wi-Fi status at the beginning of watching position.
+   bool was_wifi_enabled_ = false;
++  // Meridian: the embedder's explanation came once (SetBeforeAskHook).
++  bool explained_ = false;
+   // Indicates whether any position updates have been received.
+   bool position_received_ = false;
+   // Stores the result of the CoreLocation session. This will hold the first
+diff --git a/services/device/public/cpp/geolocation/system_geolocation_source_apple.mm b/services/device/public/cpp/geolocation/system_geolocation_source_apple.mm
+index 1b71f49414..0ee27608de 100644
+--- a/services/device/public/cpp/geolocation/system_geolocation_source_apple.mm
++++ b/services/device/public/cpp/geolocation/system_geolocation_source_apple.mm
+@@ -4,6 +4,8 @@
+ 
+ #include "services/device/public/cpp/geolocation/system_geolocation_source_apple.h"
+ 
++#include "base/no_destructor.h"
++
+ #include <memory>
+ 
+ #include "base/functional/callback_helpers.h"
+@@ -115,9 +117,33 @@ void SystemGeolocationSourceApple::OnRequestLocationThrottleTimerFiring() {
+ }
+ #endif
+ 
++namespace {
++
++SystemGeolocationSourceApple::BeforeAskHook& BeforeAsk() {
++  static base::NoDestructor<SystemGeolocationSourceApple::BeforeAskHook> hook;
++  return *hook;
++}
++
++}  // namespace
++
++// static
++void SystemGeolocationSourceApple::SetBeforeAskHook(BeforeAskHook hook) {
++  BeforeAsk() = std::move(hook);
++}
++
+ void SystemGeolocationSourceApple::StartWatchingPositionInternal(
+     bool high_accuracy) {
+   CHECK(main_task_runner_->BelongsToCurrentThread());
++  // Meridian: macOS asks when watching starts and it hasn't decided yet.
++  if (BeforeAsk() &&
++      GetSystemPermission() == LocationSystemPermissionStatus::kNotDetermined &&
++      !explained_) {
++    explained_ = true;
++    BeforeAsk().Run(base::BindOnce(
++        &SystemGeolocationSourceApple::StartWatchingPositionInternal,
++        weak_ptr_factory_.GetWeakPtr(), high_accuracy));
++    return;
++  }
+   watch_start_time_ = base::TimeTicks::Now();
+   if (high_accuracy) {
+     location_manager_.desiredAccuracy = kCLLocationAccuracyBest;
+@@ -209,6 +235,13 @@ void SystemGeolocationSourceApple::OpenSystemPermissionSetting() {
+ }
+ 
+ void SystemGeolocationSourceApple::RequestPermission() {
++  if (BeforeAsk() && !explained_) {
++    explained_ = true;
++    BeforeAsk().Run(
++        base::BindOnce(&SystemGeolocationSourceApple::RequestPermission,
++                       weak_ptr_factory_.GetWeakPtr()));
++    return;
++  }
+   [location_manager_ requestWhenInUseAuthorization];
+ }
+ 

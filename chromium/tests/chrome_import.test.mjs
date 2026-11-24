@@ -95,10 +95,17 @@ test('Chrome import: a space per profile with its bookmarks and open tabs, anoth
     // File > Import from Chrome: the moving-in step, said for Chrome.
     await b.eval(`app.$.onboarding.show('chrome')`);
     await b.waitFor(`app.$.onboarding.open && ${OB}.querySelector('h2')?.textContent.includes('Bring everything from Chrome')`);
-    assert.deepEqual(await b.eval(`[...${OB}.querySelectorAll('.arc-stats b')].map((e) => e.textContent.trim())`), ['2 spaces', '6 tabs']);
+    // Real counts: Chrome's profiles, the tabs it has open, its bookmarks.
+    assert.deepEqual(await b.eval(`[...${OB}.querySelectorAll('.arc-stats b')].map((e) => e.textContent.trim())`), ['2 profiles', '2 open tabs', '4 bookmarks']);
     await b.click(`${OB}.getElementById('next')`);
     await b.waitFor(`!!${OB}.querySelector('.confirm')`);
     assert.match(await b.eval(`${OB}.querySelector('.confirm').textContent`), /copies\s+Chrome’s sign-ins/);
+    // What macOS will show for Chrome's keychain item, and the button to press: Allow (Meridian
+    // reads it once), not Always Allow.
+    const mock = `${OB}.querySelector('.confirm meridian-mac-ask').shadowRoot`;
+    assert.match(await b.eval(`${mock}.querySelector('.title').textContent`), /“Chrome Safe Storage”/);
+    assert.equal(await b.eval(`${mock}.querySelector('.press').textContent.trim()`), 'Allow');
+    assert.match(await b.eval(`${OB}.querySelector('.confirm').textContent.replace(/\\s+/g, ' ')`), /Pressed Deny\? Your tabs and bookmarks still come over/);
     await b.click(`${OB}.getElementById('confirmContinue')`);
     await b.waitFor(`app.$.tabstrip.state_.spaces.map((s) => s.name).join() === 'Personal,Work'`, 15000);
 
@@ -143,6 +150,34 @@ test('the welcome tour moves in from Chrome when there is no Arc', async () => {
     await b.click(`${OB}.getElementById('next')`);
     await b.waitFor(`app.$.tabstrip.state_.spaces.map((s) => s.name).join() === 'Personal,Work'`, 15000);
   } finally { await b.close(); server.close(); fs.rmSync(chrome, { recursive: true, force: true }); fs.rmSync(empty, { recursive: true, force: true }); }
+});
+
+test('both Arc and Chrome here: the tour moves in from Arc, Chrome is one click away, with its real counts', async () => {
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(`<title>page ${req.url}</title>`); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = (p) => `http://127.0.0.1:${server.address().port}${p}`;
+  const chrome = await fakeChrome(url);
+  writePasswords(path.join(chrome, 'Default'), 'test-pass', [
+    { url: 'https://accounts.example.com/login', username: 'ada', password: 'hunter2' },
+    { url: 'https://mail.example.com/', username: 'ada', password: 'x' },
+  ]);
+  const arc = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-arc-'));
+  fs.copyFileSync(path.join(path.dirname(new URL(import.meta.url).pathname), 'fixtures/arc/StorableSidebar.json'), path.join(arc, 'StorableSidebar.json'));
+  const b = await launch(['about:blank'], { args: ['--meridian-onboarding', `--meridian-arc-dir=${arc}`, `--meridian-chrome-dir=${chrome}`, '--meridian-chrome-safe-storage=test-pass', '--lang=en-US'] });
+  try {
+    await b.waitFor(`${step} === 'hello'`, 15000);
+    await b.click(`${OB}.getElementById('next')`);
+    await b.waitFor(`${step} === 'arc'`);
+    assert.deepEqual(await b.eval(`[...${OB}.querySelectorAll('.source')].map((e) => [e.textContent.trim(), e.classList.contains('on')])`), [['From Arc', true], ['From Chrome', false]]);
+    assert.match(await b.eval(`${OB}.querySelector('h2').textContent`), /Bring everything from Arc/);
+    await b.click(`[...${OB}.querySelectorAll('.source')][1]`);
+    await b.waitFor(`${OB}.querySelector('h2').textContent.includes('Bring everything from Chrome')`);
+    assert.deepEqual(await b.eval(`[...${OB}.querySelectorAll('.arc-stats b')].map((e) => e.textContent.trim())`), ['2 profiles', '2 open tabs', '4 bookmarks', '2 passwords']);
+    await b.click(`${OB}.getElementById('next')`);
+    await b.waitFor(`!!${OB}.querySelector('.confirm')`);
+    await b.click(`${OB}.getElementById('confirmContinue')`);
+    await b.waitFor(`app.$.tabstrip.state_.spaces.map((s) => s.name).join() === 'Personal,Work'`, 15000);
+  } finally { await b.close(); server.close(); fs.rmSync(chrome, { recursive: true, force: true }); fs.rmSync(arc, { recursive: true, force: true }); }
 });
 
 test('Chrome’s extensions, saved passwords and history come over too', async () => {
