@@ -99,6 +99,8 @@ rm -rf "$OUT/stage"
 # Notarized (Developer ID only): MERIDIAN_NOTARY_PROFILE names a profile saved with
 #   xcrun notarytool store-credentials <name> --apple-id … --team-id … --password <app-specific>
 if [ -n "$TEAM" ] && [ -n "${MERIDIAN_NOTARY_PROFILE:-}" ]; then
+  # The disk image carries its own signature, so Gatekeeper checks it before mounting.
+  codesign --force --timestamp -s "$ID" "$OUT/$NAME.dmg"
   echo "Notarizing (a few minutes)…"
   xcrun notarytool submit "$OUT/$NAME.dmg" --keychain-profile "$MERIDIAN_NOTARY_PROFILE" --wait
   xcrun stapler staple "$OUT/$NAME.dmg"
