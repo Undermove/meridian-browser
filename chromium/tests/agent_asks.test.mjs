@@ -74,7 +74,7 @@ print('ALL DONE', flush=True)
 sys.stdin.readline()
 `;
 
-test('an agent’s permission question: a card over any space’s page; Allow, Always, Deny, the terminal first, Open', async () => {
+test('an agent’s permission question: a card over any space’s page; Allow, Always, Deny, the terminal first, Open', { skip: process.platform === 'win32' && 'the stand-in Claude Code is a Python script' }, async () => {
   const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-aa-')));
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
   fs.writeFileSync(path.join(bin, 'claude'), FAKE_CLAUDE, { mode: 0o755 });

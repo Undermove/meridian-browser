@@ -51,7 +51,7 @@ print('DONE', flush=True)
 sys.stdin.readline()
 `;
 
-test('Mission Control: a Workbench session with a subagent, a wait, browser tools and history', async () => {
+test('Mission Control: a Workbench session with a subagent, a wait, browser tools and history', { skip: process.platform === 'win32' && 'the stand-in Claude Code is a Python script' }, async () => {
   const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-mc-')));
   fs.mkdirSync(path.join(project, 'src'));
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
@@ -157,7 +157,7 @@ print('WORKING', flush=True)
 sys.stdin.readline()
 `;
 
-test('closing the Workbench tab stops its sessions in Mission Control; a closed session can be resumed', async () => {
+test('closing the Workbench tab stops its sessions in Mission Control; a closed session can be resumed', { skip: process.platform === 'win32' && 'the stand-in Claude Code is a Python script' }, async () => {
   const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-mc-')));
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
   const argvFile = path.join(bin, 'argv.jsonl');
