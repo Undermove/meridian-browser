@@ -53,7 +53,9 @@ function setUp() {
 // by itself: after moving, it hands over to the copy in Applications.
 async function runToExit(args) {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
-  const proc = spawn(APP, [`--user-data-dir=${profile}`, '--use-mock-keychain', '--meridian-test-background', '--no-default-browser-check', ...args], { stdio: 'ignore' });
+  // Never the real browsers' folders, should the first run look for them.
+  const none = ['arc', 'chrome', 'brave', 'edge', 'vivaldi', 'opera', 'firefox', 'safari'].map((k) => `--meridian-${k}-dir=${path.join(profile, 'none')}`);
+  const proc = spawn(APP, [`--user-data-dir=${profile}`, '--use-mock-keychain', '--meridian-test-background', '--no-default-browser-check', ...none, ...args], { stdio: 'ignore' });
   const code = await Promise.race([
     new Promise((r) => proc.once('exit', (c) => r(c))),
     sleep(30000).then(() => 'still running'),
