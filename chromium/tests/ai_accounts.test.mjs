@@ -203,7 +203,7 @@ test('Two Claude accounts: Meridian offers Work in Work and Personal in Personal
     const client = path.join(home, '.claude-client-a');
     await b.waitFor(`[...${ST}.querySelectorAll('#accounts-claude .acc b')].some((e) => e.textContent === 'Client A')`);
     assert.ok(fs.statSync(client).isDirectory());
-    assert.equal(fs.statSync(client).mode & 0o777, 0o700);
+    if (process.platform !== 'win32') assert.equal(fs.statSync(client).mode & 0o777, 0o700); // no POSIX modes on Windows
     await b.waitFor(`!!${ST}.querySelector('.account-edit')`);
     assert.match(await b.eval(`${ST}.querySelector('.account-edit').textContent`), /~\/\.claude-client-a/);
     await shot(b, 'acc-settings-add');
