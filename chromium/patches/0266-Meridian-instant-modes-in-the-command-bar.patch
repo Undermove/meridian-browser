@@ -1,0 +1,1963 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 05:40:12 +0400
+Subject: [PATCH] Meridian: instant modes in the command bar
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+As in Arc and Raycast, the answer is the first row while typing and
+Return copies it or acts:
+- Calculator: functions (sqrt, sin, log, ln, abs…), constants (pi, e),
+  "200 + 10%", 5!, 30°, "3 x 4", shown as "= 8".
+- Currencies: the National Bank of Georgia's rates join the ECB's
+  (GEL, RUB, AMD…), currency names and signs ("50€ in gel", "10 dollars
+  in lari"), kept 12 hours and on disk for when offline (with their
+  day), "Rates unavailable" otherwise.
+- Time: "tokyo time", "3pm in tokyo", more cities.
+- Translate: "translate hello to georgian", "tr привет" open Google
+  Translate with the text.
+- Site search by name then Tab ("youtube ⇥ cats"): Chromium's engine
+  when there is one for the site, otherwise Meridian's table; a
+  "Search YouTube ⇥" row offers it.
+- Commands by name: Split View, Little Window, Boost This Site, Pin,
+  New Folder, Welcome Tour (appended); "settings ai" opens Settings at AI.
+
+Fixes "the command bar finds Settings": picking a place in Settings no
+longer hands the keys back to the page, which raced Settings for focus.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |  13 +
+ chrome/browser/meridian/currency_parse.cc     | 150 ++++++
+ chrome/browser/meridian/currency_parse.h      |  57 ++
+ .../meridian/currency_parse_unittest.cc       |  82 +++
+ chrome/browser/meridian/currency_rates.cc     | 216 ++++++--
+ chrome/browser/meridian/currency_rates.h      |  22 +-
+ chrome/browser/meridian/sidebar.mojom         |  10 +-
+ chrome/browser/meridian/sidebar_handler.cc    |  15 +-
+ chrome/browser/meridian/sidebar_handler.h     |   1 +
+ .../browser/resources/webui_browser/BUILD.gn  |   1 +
+ chrome/browser/resources/webui_browser/app.ts |  26 +-
+ .../webui_browser/meridian/command_bar.css    |  30 ++
+ .../meridian/command_bar.html.ts              |  31 +-
+ .../webui_browser/meridian/command_bar.ts     | 157 +++++-
+ .../webui_browser/meridian/quick_answers.ts   | 485 ++++++++++++++----
+ .../webui_browser/meridian/site_searches.ts   |  68 +++
+ 16 files changed, 1170 insertions(+), 194 deletions(-)
+ create mode 100644 chrome/browser/meridian/currency_parse.cc
+ create mode 100644 chrome/browser/meridian/currency_parse.h
+ create mode 100644 chrome/browser/meridian/currency_parse_unittest.cc
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/site_searches.ts
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index ac686f0abc..5e7a8d1df5 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -129,6 +129,16 @@ source_set("model") {
+   ]
+ }
+ 
++# The command bar's currency rates, read and merged (no browser deps).
++source_set("currency_parse") {
++  sources = [
++    "currency_parse.cc",
++    "currency_parse.h",
++  ]
++  public_deps = [ "//base" ]
++  deps = [ "//third_party/re2" ]
++}
++
+ # "Send a report": recent errors and the scrubber (no browser deps).
+ source_set("report") {
+   sources = [
+@@ -433,6 +443,7 @@ source_set("meridian") {
+     ]
+   }
+   public_deps = [
++    ":currency_parse",
+     ":agent_cli",
+     ":report",
+     ":system_asks",
+@@ -535,6 +546,7 @@ test("meridian_unittests") {
+     "boosts/boost_service_unittest.cc",
+     "atc_unittest.cc",
+     "clean_url_unittest.cc",
++    "currency_parse_unittest.cc",
+     "report_unittest.cc",
+     "self_install_unittest.cc",
+     "setup_profile_unittest.cc",
+@@ -564,6 +576,7 @@ test("meridian_unittests") {
+     ":agent_cli",
+     ":agent_input",
+     ":ai_providers",
++    ":currency_parse",
+     ":guard_hook",
+     ":mission_hook",
+     ":model",
+diff --git a/chrome/browser/meridian/currency_parse.cc b/chrome/browser/meridian/currency_parse.cc
+new file mode 100644
+index 0000000000..44cd724c84
+--- /dev/null
++++ b/chrome/browser/meridian/currency_parse.cc
+@@ -0,0 +1,150 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/currency_parse.h"
++
++#include "base/json/json_reader.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
++#include "third_party/re2/src/re2/re2.h"
++
++namespace meridian {
++
++CurrencyRates::CurrencyRates() = default;
++CurrencyRates::CurrencyRates(const CurrencyRates&) = default;
++CurrencyRates& CurrencyRates::operator=(const CurrencyRates&) = default;
++CurrencyRates::~CurrencyRates() = default;
++
++std::map<std::string, double> ParseEcbRates(const std::string& xml,
++                                            std::string* date) {
++  std::map<std::string, double> out;
++  std::string_view input(xml);
++  std::string code;
++  std::string rate;
++  static const base::NoDestructor<re2::RE2> kRate(
++      R"(currency\s*=\s*['"]([A-Z]{3})['"]\s+rate\s*=\s*['"]([0-9.]+)['"])");
++  while (re2::RE2::FindAndConsume(&input, *kRate, &code, &rate)) {
++    double value = 0;
++    if (base::StringToDouble(rate, &value) && value > 0) {
++      out[code] = value;
++    }
++  }
++  std::string day;
++  if (re2::RE2::PartialMatch(xml, R"(time\s*=\s*['"](\d{4}-\d{2}-\d{2})['"])",
++                             &day)) {
++    *date = day;
++  }
++  return out;
++}
++
++std::map<std::string, double> ParseNbgRates(const std::string& json,
++                                            std::string* date) {
++  std::map<std::string, double> out;
++  std::optional<base::Value> root = base::JSONReader::Read(json, 0);
++  if (!root || !root->is_list() || root->GetList().empty() ||
++      !root->GetList()[0].is_dict()) {
++    return out;
++  }
++  const base::DictValue& day = root->GetList()[0].GetDict();
++  const base::ListValue* currencies = day.FindList("currencies");
++  if (!currencies) {
++    return out;
++  }
++  for (const base::Value& c : *currencies) {
++    if (!c.is_dict()) {
++      continue;
++    }
++    const std::string* code = c.GetDict().FindString("code");
++    std::optional<double> rate = c.GetDict().FindDouble("rate");
++    std::optional<double> quantity = c.GetDict().FindDouble("quantity");
++    if (!code || code->size() != 3 || !rate || *rate <= 0) {
++      continue;
++    }
++    out[*code] = *rate / (quantity && *quantity > 0 ? *quantity : 1);
++  }
++  if (out.empty()) {
++    return out;
++  }
++  out["GEL"] = 1;
++  if (const std::string* d = day.FindString("date"); d && d->size() >= 10) {
++    *date = d->substr(0, 10);
++  }
++  return out;
++}
++
++CurrencyRates MergeRates(const std::map<std::string, double>& ecb,
++                         const std::string& ecb_date,
++                         const std::map<std::string, double>& nbg_gel,
++                         const std::string& nbg_date) {
++  CurrencyRates out;
++  out.rates = ecb;
++  out.date = ecb_date;
++  auto eur = nbg_gel.find("EUR");
++  if (eur == nbg_gel.end() || eur->second <= 0) {
++    return out;
++  }
++  // Lari per euro over lari per unit: units per euro.
++  for (const auto& [code, gel] : nbg_gel) {
++    if (code == "EUR" || gel <= 0 || out.rates.contains(code)) {
++      continue;
++    }
++    out.rates[code] = eur->second / gel;
++    out.nbg_codes.push_back(code);
++  }
++  if (!out.nbg_codes.empty()) {
++    out.nbg_date = nbg_date;
++  }
++  return out;
++}
++
++base::DictValue RatesToDict(const CurrencyRates& rates) {
++  base::DictValue values;
++  for (const auto& [code, rate] : rates.rates) {
++    values.Set(code, rate);
++  }
++  base::ListValue nbg;
++  for (const std::string& code : rates.nbg_codes) {
++    nbg.Append(code);
++  }
++  return base::DictValue()
++      .Set("rates", std::move(values))
++      .Set("date", rates.date)
++      .Set("nbg_codes", std::move(nbg))
++      .Set("nbg_date", rates.nbg_date)
++      .Set("fetched", rates.fetched.InSecondsFSinceUnixEpoch());
++}
++
++std::optional<CurrencyRates> RatesFromDict(const base::DictValue& dict) {
++  const base::DictValue* values = dict.FindDict("rates");
++  if (!values || values->empty()) {
++    return std::nullopt;
++  }
++  CurrencyRates out;
++  for (const auto [code, rate] : *values) {
++    if (rate.is_double() || rate.is_int()) {
++      out.rates[code] = rate.GetDouble();
++    }
++  }
++  if (out.rates.empty()) {
++    return std::nullopt;
++  }
++  if (const std::string* d = dict.FindString("date")) {
++    out.date = *d;
++  }
++  if (const std::string* d = dict.FindString("nbg_date")) {
++    out.nbg_date = *d;
++  }
++  if (const base::ListValue* nbg = dict.FindList("nbg_codes")) {
++    for (const base::Value& code : *nbg) {
++      if (code.is_string()) {
++        out.nbg_codes.push_back(code.GetString());
++      }
++    }
++  }
++  out.fetched = base::Time::FromSecondsSinceUnixEpoch(
++      dict.FindDouble("fetched").value_or(0));
++  return out;
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/currency_parse.h b/chrome/browser/meridian/currency_parse.h
+new file mode 100644
+index 0000000000..e288744cf2
+--- /dev/null
++++ b/chrome/browser/meridian/currency_parse.h
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_CURRENCY_PARSE_H_
++#define CHROME_BROWSER_MERIDIAN_CURRENCY_PARSE_H_
++
++#include <map>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/time/time.h"
++#include "base/values.h"
++
++namespace meridian {
++
++// The command bar's currency rates, per euro (EUR itself is left out).
++struct CurrencyRates {
++  CurrencyRates();
++  CurrencyRates(const CurrencyRates&);
++  CurrencyRates& operator=(const CurrencyRates&);
++  ~CurrencyRates();
++
++  std::map<std::string, double> rates;
++  // The ECB's day ("2026-11-20").
++  std::string date;
++  // The codes that came from the National Bank of Georgia, and its day.
++  std::vector<std::string> nbg_codes;
++  std::string nbg_date;
++  // When they were fetched (kept with them on disk).
++  base::Time fetched;
++};
++
++// The ECB file's rates (`<Cube currency='USD' rate='1.08'/>`) and day.
++std::map<std::string, double> ParseEcbRates(const std::string& xml,
++                                            std::string* date);
++
++// The National Bank of Georgia's JSON (lari for `quantity` units of each
++// currency) as lari per one unit, GEL itself 1, and its day.
++std::map<std::string, double> ParseNbgRates(const std::string& json,
++                                            std::string* date);
++
++// The ECB's rates, with what the NBG adds turned into rates per euro (all of
++// the NBG's when the ECB's are missing). Empty when neither has any.
++CurrencyRates MergeRates(const std::map<std::string, double>& ecb,
++                         const std::string& ecb_date,
++                         const std::map<std::string, double>& nbg_gel,
++                         const std::string& nbg_date);
++
++// Kept on disk between runs: the last rates, for when there's no connection.
++base::DictValue RatesToDict(const CurrencyRates& rates);
++std::optional<CurrencyRates> RatesFromDict(const base::DictValue& dict);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_CURRENCY_PARSE_H_
+diff --git a/chrome/browser/meridian/currency_parse_unittest.cc b/chrome/browser/meridian/currency_parse_unittest.cc
+new file mode 100644
+index 0000000000..afc44d08e8
+--- /dev/null
++++ b/chrome/browser/meridian/currency_parse_unittest.cc
+@@ -0,0 +1,82 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/currency_parse.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace meridian {
++namespace {
++
++constexpr char kEcb[] =
++    "<gesmes:Envelope><Cube><Cube time='2026-11-20'>"
++    "<Cube currency='USD' rate='1.25'/><Cube currency='GBP' rate='0.85'/>"
++    "</Cube></Cube></gesmes:Envelope>";
++
++constexpr char kNbg[] = R"([{"date":"2026-11-25T00:00:00.000Z","currencies":[
++  {"code":"EUR","quantity":1,"rate":3.0},
++  {"code":"USD","quantity":1,"rate":2.5},
++  {"code":"RUB","quantity":100,"rate":3.2},
++  {"code":"AMD","quantity":1000,"rate":7.5}]}])";
++
++TEST(CurrencyParseTest, ReadsTheEcbFile) {
++  std::string date;
++  auto rates = ParseEcbRates(kEcb, &date);
++  EXPECT_EQ(date, "2026-11-20");
++  EXPECT_EQ(rates.size(), 2u);
++  EXPECT_DOUBLE_EQ(rates["USD"], 1.25);
++}
++
++TEST(CurrencyParseTest, ReadsTheNbgJsonPerUnit) {
++  std::string date;
++  auto gel = ParseNbgRates(kNbg, &date);
++  EXPECT_EQ(date, "2026-11-25");
++  EXPECT_DOUBLE_EQ(gel["GEL"], 1);
++  EXPECT_DOUBLE_EQ(gel["RUB"], 0.032);
++  EXPECT_DOUBLE_EQ(gel["AMD"], 0.0075);
++  EXPECT_TRUE(ParseNbgRates("not json", &date).empty());
++  EXPECT_TRUE(ParseNbgRates("[]", &date).empty());
++}
++
++TEST(CurrencyParseTest, TheNbgAddsWhatTheEcbLacks) {
++  std::string ecb_date, nbg_date;
++  auto ecb = ParseEcbRates(kEcb, &ecb_date);
++  auto gel = ParseNbgRates(kNbg, &nbg_date);
++  CurrencyRates merged = MergeRates(ecb, ecb_date, gel, nbg_date);
++  // The ECB's own stay.
++  EXPECT_DOUBLE_EQ(merged.rates["USD"], 1.25);
++  // 3 lari a euro.
++  EXPECT_DOUBLE_EQ(merged.rates["GEL"], 3);
++  EXPECT_DOUBLE_EQ(merged.rates["RUB"], 3 / 0.032);
++  EXPECT_EQ(merged.nbg_codes,
++            (std::vector<std::string>{"AMD", "GEL", "RUB"}));
++  EXPECT_EQ(merged.date, "2026-11-20");
++  EXPECT_EQ(merged.nbg_date, "2026-11-25");
++
++  // Without the ECB, all from the NBG.
++  CurrencyRates nbg_only = MergeRates({}, "", gel, nbg_date);
++  EXPECT_DOUBLE_EQ(nbg_only.rates["USD"], 3 / 2.5);
++  EXPECT_EQ(nbg_only.nbg_codes.size(), 4u);
++  EXPECT_TRUE(MergeRates({}, "", {}, "").rates.empty());
++}
++
++TEST(CurrencyParseTest, KeptOnDiskAndBack) {
++  CurrencyRates rates;
++  rates.rates = {{"USD", 1.25}, {"GEL", 3}};
++  rates.date = "2026-11-20";
++  rates.nbg_codes = {"GEL"};
++  rates.nbg_date = "2026-11-25";
++  rates.fetched = base::Time::FromSecondsSinceUnixEpoch(1800000000);
++  std::optional<CurrencyRates> back = RatesFromDict(RatesToDict(rates));
++  ASSERT_TRUE(back);
++  EXPECT_EQ(back->rates, rates.rates);
++  EXPECT_EQ(back->date, rates.date);
++  EXPECT_EQ(back->nbg_codes, rates.nbg_codes);
++  EXPECT_EQ(back->nbg_date, rates.nbg_date);
++  EXPECT_EQ(back->fetched, rates.fetched);
++  EXPECT_FALSE(RatesFromDict(base::DictValue()));
++}
++
++}  // namespace
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/currency_rates.cc b/chrome/browser/meridian/currency_rates.cc
+index 464f48ed89..d4ed801250 100644
+--- a/chrome/browser/meridian/currency_rates.cc
++++ b/chrome/browser/meridian/currency_rates.cc
+@@ -8,18 +8,24 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/files/important_file_writer.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
+ #include "base/no_destructor.h"
+-#include "base/strings/string_number_conversions.h"
++#include "base/path_service.h"
++#include "base/task/thread_pool.h"
+ #include "base/time/time.h"
+ #include "chrome/browser/meridian/test_switches.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/common/chrome_paths.h"
+ #include "content/public/browser/storage_partition.h"
+ #include "net/base/load_flags.h"
+ #include "net/traffic_annotation/network_traffic_annotation.h"
+ #include "services/network/public/cpp/resource_request.h"
+ #include "services/network/public/cpp/shared_url_loader_factory.h"
+ #include "services/network/public/cpp/simple_url_loader.h"
+-#include "third_party/re2/src/re2/re2.h"
+ #include "url/gurl.h"
+ 
+ namespace meridian {
+@@ -28,14 +34,20 @@ namespace {
+ 
+ constexpr char kEcbUrl[] =
+     "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml";
++constexpr char kNbgUrl[] =
++    "https://nbg.gov.ge/gw/api/ct/monetarypolicy/currencies/en/json/";
++constexpr char kFileName[] = "Meridian Currency Rates.json";
++constexpr base::TimeDelta kFresh = base::Hours(12);
+ 
+ constexpr net::NetworkTrafficAnnotationTag kAnnotation =
+     net::DefineNetworkTrafficAnnotation("meridian_currency_rates", R"(
+       semantics {
+         sender: "Meridian command bar"
+-        description: "The European Central Bank's daily currency reference "
+-          "rates, to answer a conversion typed in the command bar."
+-        trigger: "The person types a currency conversion, at most once a day."
++        description: "The European Central Bank's and the National Bank of "
++          "Georgia's daily currency reference rates, to answer a conversion "
++          "typed in the command bar."
++        trigger: "The person types a currency conversion, at most every 12 "
++          "hours."
+         data: "None."
+         destination: OTHER
+       }
+@@ -46,12 +58,18 @@ constexpr net::NetworkTrafficAnnotationTag kAnnotation =
+       })");
+ 
+ struct Cache {
+-  std::map<std::string, double> rates;
+-  std::string date;
+-  base::Time fetched;
++  CurrencyRates rates;
++  bool read_disk = false;
+   base::Time failed;
+-  std::unique_ptr<network::SimpleURLLoader> loader;
++  std::unique_ptr<network::SimpleURLLoader> ecb_loader;
++  std::unique_ptr<network::SimpleURLLoader> nbg_loader;
++  int pending = 0;
++  std::map<std::string, double> ecb;
++  std::string ecb_date;
++  std::map<std::string, double> nbg;
++  std::string nbg_date;
+   std::vector<CurrencyRatesCallback> waiting;
++  raw_ptr<Profile> profile = nullptr;
+ };
+ 
+ Cache& TheCache() {
+@@ -59,82 +77,168 @@ Cache& TheCache() {
+   return *cache;
+ }
+ 
++base::FilePath RatesFile() {
++  base::FilePath dir;
++  return base::PathService::Get(chrome::DIR_USER_DATA, &dir)
++             ? dir.AppendASCII(kFileName)
++             : base::FilePath();
++}
++
++std::optional<CurrencyRates> ReadRates(base::FilePath file) {
++  std::string json;
++  if (file.empty() || !base::ReadFileToStringWithMaxSize(file, &json, 64 * 1024)) {
++    return std::nullopt;
++  }
++  std::optional<base::Value> value = base::JSONReader::Read(json, 0);
++  return value && value->is_dict() ? RatesFromDict(value->GetDict())
++                                   : std::nullopt;
++}
++
++void WriteRates(base::FilePath file, std::string json) {
++  if (!file.empty()) {
++    base::ImportantFileWriter::WriteFileAtomically(file, json);
++  }
++}
++
+ void Answer() {
+   Cache& c = TheCache();
+   std::vector<CurrencyRatesCallback> waiting = std::move(c.waiting);
+   c.waiting.clear();
+   for (CurrencyRatesCallback& cb : waiting) {
+-    std::move(cb).Run(c.rates, c.date);
++    std::move(cb).Run(c.rates);
+   }
+ }
+ 
+-void OnLoaded(std::optional<std::string> body) {
++void BothLoaded() {
+   Cache& c = TheCache();
+-  c.loader.reset();
+-  std::string date;
+-  std::map<std::string, double> rates =
+-      body ? ParseEcbRates(*body, &date) : std::map<std::string, double>();
+-  if (rates.empty()) {
++  CurrencyRates merged = MergeRates(c.ecb, c.ecb_date, c.nbg, c.nbg_date);
++  if (merged.rates.empty()) {
++    // Offline or broken: the last ones stay (with their own day).
+     c.failed = base::Time::Now();
+   } else {
+-    c.rates = std::move(rates);
+-    c.date = date;
+-    c.fetched = base::Time::Now();
++    merged.fetched = base::Time::Now();
++    c.rates = std::move(merged);
++    std::string json;
++    base::JSONWriter::Write(RatesToDict(c.rates), &json);
++    base::ThreadPool::PostTask(
++        FROM_HERE,
++        {base::MayBlock(), base::TaskPriority::BEST_EFFORT,
++         base::TaskShutdownBehavior::BLOCK_SHUTDOWN},
++        base::BindOnce(&WriteRates, RatesFile(), std::move(json)));
+   }
+   Answer();
+ }
+ 
+-}  // namespace
++void OnEcb(std::optional<std::string> body) {
++  Cache& c = TheCache();
++  c.ecb_loader.reset();
++  c.ecb = body ? ParseEcbRates(*body, &c.ecb_date)
++               : std::map<std::string, double>();
++  if (--c.pending == 0) {
++    BothLoaded();
++  }
++}
++
++void OnNbg(std::optional<std::string> body) {
++  Cache& c = TheCache();
++  c.nbg_loader.reset();
++  c.nbg = body ? ParseNbgRates(*body, &c.nbg_date)
++               : std::map<std::string, double>();
++  if (--c.pending == 0) {
++    BothLoaded();
++  }
++}
+ 
+-std::map<std::string, double> ParseEcbRates(const std::string& xml,
+-                                            std::string* date) {
+-  std::map<std::string, double> out;
+-  re2::StringPiece input(xml);
+-  std::string code;
+-  std::string rate;
+-  static const base::NoDestructor<re2::RE2> kRate(
+-      R"(currency\s*=\s*['"]([A-Z]{3})['"]\s+rate\s*=\s*['"]([0-9.]+)['"])");
+-  while (re2::RE2::FindAndConsume(&input, *kRate, &code, &rate)) {
+-    double value = 0;
+-    if (base::StringToDouble(rate, &value) && value > 0) {
+-      out[code] = value;
+-    }
++std::unique_ptr<network::SimpleURLLoader> Load(
++    Profile* profile,
++    const std::string& url,
++    base::OnceCallback<void(std::optional<std::string>)> done) {
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = GURL(url);
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  request->load_flags = net::LOAD_DISABLE_CACHE;
++  auto loader =
++      network::SimpleURLLoader::Create(std::move(request), kAnnotation);
++  loader->SetTimeoutDuration(base::Seconds(10));
++  loader->DownloadToString(profile->GetDefaultStoragePartition()
++                               ->GetURLLoaderFactoryForBrowserProcess()
++                               .get(),
++                           std::move(done), 256 * 1024);
++  return loader;
++}
++
++void Fetch(Profile* profile) {
++  Cache& c = TheCache();
++  // Tests point them at their own servers (never the real ones: a source a
++  // test doesn't name isn't fetched).
++  std::string ecb_test = TestSwitchValue("meridian-test-ecb-url");
++  std::string nbg_test = TestSwitchValue("meridian-test-nbg-url");
++  const bool testing = !ecb_test.empty() || !nbg_test.empty();
++  std::string ecb = testing ? ecb_test : kEcbUrl;
++  std::string nbg = testing ? nbg_test : kNbgUrl;
++  c.ecb.clear();
++  c.nbg.clear();
++  c.pending = (ecb.empty() ? 0 : 1) + (nbg.empty() ? 0 : 1);
++  if (!c.pending) {
++    BothLoaded();
++    return;
++  }
++  if (!ecb.empty()) {
++    c.ecb_loader = Load(profile, ecb, base::BindOnce(&OnEcb));
+   }
+-  std::string day;
+-  if (re2::RE2::PartialMatch(xml, R"(time\s*=\s*['"](\d{4}-\d{2}-\d{2})['"])",
+-                             &day)) {
+-    *date = day;
++  if (!nbg.empty()) {
++    c.nbg_loader = Load(profile, nbg, base::BindOnce(&OnNbg));
+   }
+-  return out;
+ }
+ 
+-void GetCurrencyRates(Profile* profile, CurrencyRatesCallback callback) {
++bool Fetching() {
++  Cache& c = TheCache();
++  return c.pending > 0;
++}
++
++void Decide(Profile* profile) {
+   Cache& c = TheCache();
+   const base::Time now = base::Time::Now();
+-  const bool fresh = !c.rates.empty() && now - c.fetched < base::Hours(24);
++  const bool fresh = !c.rates.rates.empty() && now - c.rates.fetched < kFresh &&
++                     now >= c.rates.fetched;
+   const bool resting = !c.failed.is_null() && now - c.failed < base::Hours(1);
+   if (fresh || resting || !profile) {
+-    std::move(callback).Run(c.rates, c.date);
++    Answer();
+     return;
+   }
++  if (!Fetching()) {
++    Fetch(profile);
++  }
++}
++
++void OnDiskRead(std::optional<CurrencyRates> kept) {
++  Cache& c = TheCache();
++  if (kept && c.rates.rates.empty()) {
++    c.rates = std::move(*kept);
++  }
++  Decide(c.profile);
++  c.profile = nullptr;
++}
++
++}  // namespace
++
++void GetCurrencyRates(Profile* profile, CurrencyRatesCallback callback) {
++  Cache& c = TheCache();
++  const bool busy = !c.waiting.empty();
+   c.waiting.push_back(std::move(callback));
+-  if (c.loader) {
++  if (busy) {
+     return;
+   }
+-  // Tests point it at their own server.
+-  std::string test_url = TestSwitchValue("meridian-test-ecb-url");
+-  auto request = std::make_unique<network::ResourceRequest>();
+-  request->url = GURL(test_url.empty() ? kEcbUrl : test_url);
+-  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
+-  request->load_flags = net::LOAD_DISABLE_CACHE;
+-  c.loader = network::SimpleURLLoader::Create(std::move(request), kAnnotation);
+-  c.loader->SetTimeoutDuration(base::Seconds(10));
+-  c.loader->DownloadToString(
+-      profile->GetDefaultStoragePartition()
+-          ->GetURLLoaderFactoryForBrowserProcess()
+-          .get(),
+-      base::BindOnce(&OnLoaded),
+-      256 * 1024);
++  // The first time: the ones kept from before, then fetch if they're old.
++  if (!c.read_disk) {
++    c.read_disk = true;
++    c.profile = profile;
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++        base::BindOnce(&ReadRates, RatesFile()), base::BindOnce(&OnDiskRead));
++    return;
++  }
++  Decide(profile);
+ }
+ 
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/currency_rates.h b/chrome/browser/meridian/currency_rates.h
+index 9048740f1c..015c6b2d06 100644
+--- a/chrome/browser/meridian/currency_rates.h
++++ b/chrome/browser/meridian/currency_rates.h
+@@ -5,28 +5,22 @@
+ #ifndef CHROME_BROWSER_MERIDIAN_CURRENCY_RATES_H_
+ #define CHROME_BROWSER_MERIDIAN_CURRENCY_RATES_H_
+ 
+-#include <map>
+-#include <string>
+-
+ #include "base/functional/callback.h"
++#include "chrome/browser/meridian/currency_parse.h"
+ 
+ class Profile;
+ 
+ namespace meridian {
+ 
+-// The European Central Bank's daily reference rates (per euro), for the
+-// command bar's "100 usd in eur". Fetched when someone first asks, at most
+-// once a day (after a failure: the last ones kept, again after an hour),
+-// without cookies. `date` is the rates' own day; empty rates: none yet.
+-using CurrencyRatesCallback =
+-    base::OnceCallback<void(std::map<std::string, double> rates,
+-                            std::string date)>;
++// The European Central Bank's daily reference rates (per euro), with the
++// National Bank of Georgia's for what the ECB doesn't have (the lari, the
++// rouble…), for the command bar's "100 usd in eur", "50€ in gel". Fetched
++// when someone first asks, again after 12 hours (after a failure: the last
++// ones kept, again after an hour), without cookies or keys. The last ones are
++// kept on disk for when there's no connection; empty rates: none at all.
++using CurrencyRatesCallback = base::OnceCallback<void(const CurrencyRates&)>;
+ void GetCurrencyRates(Profile* profile, CurrencyRatesCallback callback);
+ 
+-// The ECB file's rates (`<Cube currency='USD' rate='1.08'/>`) and day.
+-std::map<std::string, double> ParseEcbRates(const std::string& xml,
+-                                            std::string* date);
+-
+ }  // namespace meridian
+ 
+ #endif  // CHROME_BROWSER_MERIDIAN_CURRENCY_RATES_H_
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index aa20d2d5d8..70c2c3d5e7 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -824,8 +824,11 @@ interface SidebarHandler {
+   // Settings > AI: the CLIs, and registering Meridian's MCP server with one.
+   GetAgentClis() => (array<AgentCli> clis);
+   // The ECB's daily rates per euro, for the command bar's conversions (empty
+-  // while none could be fetched); `date` is their day.
+-  GetCurrencyRates() => (map<string, double> rates, string date);
++  // while none could be fetched, and none were kept); `date` is their day.
++  // `nbg_codes` came from the National Bank of Georgia (GEL, RUB…, turned
++  // into rates per euro), of `nbg_date`.
++  GetCurrencyRates() => (map<string, double> rates, string date,
++                         array<string> nbg_codes, string nbg_date);
+   ConnectAgentCli(string id) => (bool ok, string output);
+ 
+   // The built-in AI (⌘J, Ask in the command bar), with the person's
+@@ -918,4 +921,7 @@ interface SidebarHandler {
+   // Copies the active tab's address without tracking parameters (⇧⌘C and the
+   // link button by the address).
+   CopyLink();
++
++  // The command bar's "Little Window": a new one (⌥⌘N).
++  OpenLittleWindow();
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 890af3d6e7..204a781dbe 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -800,7 +800,7 @@ bool SidebarHandler::HandleCommand(BrowserWindowInterface* browser,
+   }
+   // ⌥⌘N: a Little Window (Arc's Little Arc) on a new tab page.
+   if (id == IDC_MERIDIAN_LITTLE_WINDOW) {
+-    OpenLittleWindow(browser->GetProfile(), GURL(chrome::kChromeUINewTabURL));
++    meridian::OpenLittleWindow(browser->GetProfile(), GURL(chrome::kChromeUINewTabURL));
+     return true;
+   }
+   mojom::Command command;
+@@ -1155,10 +1155,11 @@ void SidebarHandler::GetCurrencyRates(GetCurrencyRatesCallback callback) {
+       ActiveSpaceProfile(),
+       base::BindOnce(
+           [](GetCurrencyRatesCallback callback,
+-             std::map<std::string, double> rates, std::string date) {
+-            base::flat_map<std::string, double> out(rates.begin(),
+-                                                    rates.end());
+-            std::move(callback).Run(std::move(out), date);
++             const meridian::CurrencyRates& rates) {
++            base::flat_map<std::string, double> out(rates.rates.begin(),
++                                                    rates.rates.end());
++            std::move(callback).Run(std::move(out), rates.date,
++                                    rates.nbg_codes, rates.nbg_date);
+           },
+           std::move(callback)));
+ }
+@@ -1830,6 +1831,10 @@ void SidebarHandler::OpenInMeridian() {
+   target->GetWindow()->Show();
+ }
+ 
++void SidebarHandler::OpenLittleWindow() {
++  chrome::ExecuteCommand(browser_, IDC_MERIDIAN_LITTLE_WINDOW);
++}
++
+ void SidebarHandler::SetLittleSpace(const std::string& space_id) {
+   meridian::SetLittleSpace(browser_, space_id);
+   ScheduleNotify();
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 3fe5b25aee..d125533176 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -204,6 +204,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void ClearToday() override;
+   void OpenInMeridian() override;
+   void SetLittleSpace(const std::string& space_id) override;
++  void OpenLittleWindow() override;
+   void OpenSystemSettingsFor(const std::string& kind) override;
+   void FindImportSources(FindImportSourcesCallback callback) override;
+   void GetArcPreview(const std::string& source,
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index 6ca231649e..e7bd87ac5b 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -73,6 +73,7 @@ build_webui("build") {
+     "meridian/settings.html.ts",
+     "meridian/settings.ts",
+     "meridian/settings_index.ts",
++    "meridian/site_searches.ts",
+     "meridian/allow_mock.html.ts",
+     "meridian/allow_mock.ts",
+     "meridian/mac_ask.html.ts",
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index f857933764..0342bcf6fd 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -1309,7 +1309,10 @@ export class WebuiBrowserAppElement extends CrLitElement {
+ 
+   // The keys back to the page, through its element here, so this page and
+   // the browser agree on who has the focus (the next ⌘T's field takes it).
+-  protected onCommandBarClosed_() {
++  protected onCommandBarClosed_(e: CustomEvent<{handBack: boolean}>) {
++    if (e.detail?.handBack === false) {
++      return;
++    }
+     this.$.contentRegion.activeWebview?.focusContent();
+   }
+ 
+@@ -1402,6 +1405,27 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       case 'import-other':
+         run(Command.kImportOther);
+         break;
++      case 'split':
++        run(Command.kSplit);
++        break;
++      case 'little':
++        sidebarProxyFactory.getInstance().handler.openLittleWindow();
++        break;
++      case 'boost':
++        // This site's boost in the editor (a new one if it has none; nothing
++        // on a page that isn't a website).
++        sidebarProxyFactory.getInstance().handler.getBoost().then(
++            ({state}) => this.$.boostEditor.show(state.boost?.id || ''));
++        break;
++      case 'pin':
++        run(Command.kTogglePin);
++        break;
++      case 'new-folder':
++        run(Command.kNewFolder);
++        break;
++      case 'welcome-tour':
++        run(Command.kWelcomeTour);
++        break;
+     }
+   }
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.css b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+index 3f54748b35..7a17531df1 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.css
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.css
+@@ -306,6 +306,36 @@ webui-browser-searchbox::part(searchbox-dropdown) {
+   user-select: text;
+ }
+ 
++.tab-row.quick .eq {
++  margin-inline-end: -4px;
++  font-size: 15px;
++  font-weight: 600;
++  opacity: 0.5;
++}
++
++/* A translation: the words, not a figure. */
++.tab-row.quick[data-kind='translate'] .quick-value {
++  font-variant-numeric: normal;
++  max-width: 60%;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++/* "Rates unavailable": a note, nothing to pick. */
++.tab-row.quick[data-action='none'] {
++  cursor: default;
++}
++
++.tab-row.quick[data-action='none'] .quick-value {
++  font-size: 13px;
++  opacity: 0.75;
++}
++
++.tab-row.site-hint .tab-title {
++  font-weight: 600;
++}
++
+ .tab-row.quick .hint {
+   flex: 1;
+   margin-inline-start: 10px;
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+index 9565159725..df64ff03db 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+@@ -14,9 +14,11 @@ export function getHtml(this: MeridianCommandBarElement) {
+   <div id="bar">
+     ${this.mode_ ? html`
+       <div id="mode" class="mode-pill" data-provider="${this.mode_.provider ?? ''}"
+-          data-keyword="${this.mode_.keyword ?? ''}">
+-        <span class="tab-icon">${icon(this.mode_.keyword !== undefined ?
+-                                      'search' : 'sparkles', 14)}</span>
++          data-keyword="${this.mode_.keyword ?? ''}"
++          data-site="${this.mode_.site?.host ?? ''}">
++        <span class="tab-icon">${icon(this.mode_.keyword !== undefined ||
++                                      this.mode_.site ? 'search' : 'sparkles',
++                                      14)}</span>
+         <span class="mode-label">${this.mode_.label}</span>
+         <span class="mode-hint">${this.mode_.placeholder}</span>
+       </div>` : ''}
+@@ -27,16 +29,29 @@ export function getHtml(this: MeridianCommandBarElement) {
+         @keyup="${this.onAddressKeyup_}"
+         @searchbox-navigated="${this.onAddressSearchboxNavigated_}">
+       ${this.quick_ ? html`
+-        <button id="quick" class="tab-row quick ${this.tabSel_ < 0 ? 'sel' : ''}"
++        <button id="quick" class="tab-row quick ${this.tabSel_ < 0 &&
++                this.quick_.action !== 'none' ? 'sel' : ''}"
+             slot="before-matches" data-kind="${this.quick_.kind}"
++            data-action="${this.quick_.action || 'copy'}"
+             @mousedown="${this.onTabRowMousedown_}"
+             @click="${this.onQuickClick_}">
+-          <span class="tab-icon">${icon(this.quick_.kind === 'time' ? 'clock' :
+-                                        'calculator', 16)}</span>
++          <span class="tab-icon">${icon(this.quickIcon_(), 16)}</span>
++          ${this.quick_.kind === 'calc' ? html`<span class="eq">=</span>` : ''}
+           <span class="quick-value">${this.quick_.value}</span>
+           <span class="hint">${this.quick_.detail}</span>
+-          <span class="switch">${this.copied_ ? 'Copied' : 'Copy'}</span>
+-          <span class="go">↵</span>
++          ${this.quick_.action !== 'none' ? html`
++            <span class="switch">${this.quick_.action === 'open' ? 'Open' :
++                                   this.copied_ ? 'Copied' : 'Copy'}</span>
++            <span class="go">↵</span>` : ''}
++        </button>` : ''}
++      ${this.siteHint_ && !this.mode_ ? html`
++        <button id="siteHint" class="tab-row site-hint" slot="before-matches"
++            @mousedown="${this.onTabRowMousedown_}"
++            @click="${this.onSiteHintClick_}">
++          <span class="tab-icon">${icon('search', 16)}</span>
++          <span class="tab-title">${this.siteHint_}</span>
++          <span class="switch">Press Tab</span>
++          <span class="go">⇥</span>
+         </button>` : ''}
+       ${this.layoutFix_ ? html`
+         <button id="layoutFix" class="tab-row fix" slot="before-matches"
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index 026bf8e9bf..763079ac4a 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -12,7 +12,7 @@ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {TemplateResult} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+-import {quickAnswer, wantsCurrency} from './quick_answers.js';
++import {quickAnswer, translateQuery, translateUrl, wantsCurrency} from './quick_answers.js';
+ import type {CurrencyRates, QuickAnswer} from './quick_answers.js';
+ import {SearchboxBrowserProxy} from '//resources/cr_components/searchbox/searchbox_browser_proxy.js';
+ 
+@@ -27,6 +27,8 @@ import {fixLayout} from './layout_fix.js';
+ import {renderMarkdown} from './markdown.js';
+ import {isMac, keyText} from './keys.js';
+ import {SETTINGS_INDEX} from './settings_index.js';
++import {siteSearchFor, siteSearchUrl} from './site_searches.js';
++import type {SiteSearch} from './site_searches.js';
+ 
+ // An open tab, for "Switch to Tab".
+ export interface CommandBarTab {
+@@ -54,7 +56,10 @@ export interface CommandBarMode {
+   label: string;
+   // An AI ("" = the one picked in Settings > AI), or a site search.
+   provider?: string;
++  // A site search: Chromium's engine by its keyword, or Meridian's own
++  // (site_searches.ts) when the person has none for that site.
+   keyword?: string;
++  site?: SiteSearch;
+   withPage: boolean;
+   // Sent when nothing is typed ("summarize ⇥ ↵").
+   empty?: string;
+@@ -121,6 +126,23 @@ export const FEATURES: CommandBarFeature[] = [
+    hint: 'Tell the developer what went wrong', keys: '', icon: 'info',
+    words: ['bug', 'report', 'feedback', 'problem', 'error', 'issue',
+            'diagnostics', 'logs', 'not working', 'help', 'support']},
++  // (New ones go last: tests pick rows by name, the commands by number.)
++  {id: 'split', name: 'Split View', hint: 'This tab and the next side by side',
++   keys: keyText('⌃⇧='), icon: 'split',
++   words: ['split', 'side by side', 'two tabs', 'tile']},
++  {id: 'little', name: 'Little Window', hint: 'A quick window without the sidebar',
++   keys: keyText('⌥⌘N'), icon: 'littleWindow',
++   words: ['little arc', 'mini window', 'quick window', 'small window']},
++  {id: 'boost', name: 'Boost This Site', hint: 'Restyle it, hide what you don’t want',
++   keys: '', icon: 'bolt',
++   words: ['boost', 'boosts', 'restyle', 'customize site', 'zap', 'css',
++           'hide elements']},
++  {id: 'pin', name: 'Pin or Unpin Tab', hint: '', keys: keyText('⌘D'),
++   icon: 'pin', words: ['pin tab', 'unpin', 'keep']},
++  {id: 'new-folder', name: 'New Folder', hint: '', keys: keyText('⌥⇧⌘N'),
++   icon: 'folder', words: ['folder', 'group tabs']},
++  {id: 'welcome-tour', name: 'Welcome Tour', hint: '', keys: '',
++   icon: 'sparkles', words: ['tour', 'onboarding', 'getting started', 'help']},
+ ];
+ 
+ // Shown to developers only.
+@@ -186,6 +208,7 @@ export class MeridianCommandBarElement extends CrLitElement {
+       tabsFirst_: {state: true, type: Boolean},
+       searchboxShown_: {state: true, type: Boolean},
+       quick_: {state: true, type: Object},
++      siteHint_: {state: true, type: String},
+       mode_: {state: true, type: Object},
+       copied_: {state: true, type: Boolean},
+       developer: {type: Boolean},
+@@ -218,6 +241,9 @@ export class MeridianCommandBarElement extends CrLitElement {
+   protected accessor quick_: QuickAnswer|null = null;
+   protected accessor copied_: boolean = false;
+   private rates_: CurrencyRates|null = null;
++  private ratesUnavailable_ = false;
++  // "Search YouTube ⇥": what Tab would search, for what is typed.
++  protected accessor siteHint_: string = '';
+   // "word ⇥" picked: what Return does with the text.
+   protected accessor mode_: CommandBarMode|null = null;
+   private keywords_: Map<string, string> = new Map();
+@@ -265,6 +291,56 @@ export class MeridianCommandBarElement extends CrLitElement {
+     }
+   }
+ 
++  protected quickIcon_(): IconName {
++    switch (this.quick_?.kind) {
++      case 'time':
++        return 'clock';
++      case 'translate':
++        return 'globe';
++      case 'currency':
++      case 'unit':
++        return 'sliders';
++      default:
++        return 'calculator';
++    }
++  }
++
++  private answerFor_(text: string): QuickAnswer|null {
++    return quickAnswer(text, new Date(), this.rates_, {
++      ratesUnavailable: this.ratesUnavailable_,
++      languages: navigator.languages,
++    });
++  }
++
++  // The site search `word` names: Chromium's (a keyword, or an engine for
++  // that site), else Meridian's own; null when it names none.
++  private siteFor_(word: string): CommandBarMode|null {
++    if (!word) {
++      return null;
++    }
++    const chromium = this.keywords_.get(word);
++    if (chromium !== undefined) {
++      return {label: `Search ${chromium || word}`, keyword: word,
++              withPage: false, placeholder: 'Type what to find…'};
++    }
++    const site = siteSearchFor(word);
++    if (!site) {
++      return null;
++    }
++    // The person's own engine for the site, if Chromium has one.
++    const host = [...this.keywords_.keys()].find(
++        k => k === site.host || k === 'www.' + site.host);
++    return {label: `Search ${site.name}`, keyword: host, site,
++            withPage: false, placeholder: 'Type what to find…'};
++  }
++
++  protected onSiteHintClick_() {
++    const mode = this.siteFor_(this.inputValue_().trim().toLowerCase());
++    if (mode) {
++      this.enterMode_(mode);
++    }
++  }
++
+   protected onLayoutFixClick_() {
+     this.applyLayoutFix_();
+   }
+@@ -301,7 +377,11 @@ export class MeridianCommandBarElement extends CrLitElement {
+   }
+ 
+   private runFeature_(id: string) {
+-    this.hide();
++    // Settings takes the keys itself: handing them back to the page as the
++    // bar closes would race it (and Escape would then go to the page).
++    const opensSettings = id === 'settings' ||
++        SETTINGS_FEATURES.some(f => f.id === id && !f.hint.startsWith('Chromium'));
++    this.hide(/*handBack=*/ !opensSettings);
+     this.fire('command-bar-feature', id);
+   }
+ 
+@@ -385,26 +465,41 @@ export class MeridianCommandBarElement extends CrLitElement {
+         [...FEATURES.filter(f => f.id === 'try-claude'),
+          ...FEATURES.filter(
+              f => f.id !== 'try-claude' && !DEVELOPER_FEATURES.has(f.id))];
+-    const found = rank(offered, false).concat(rank(SETTINGS_FEATURES, true));
++    // "settings ai", "preferences passwords": a place in Settings, named.
++    const inSettings = /^(?:settings?|preferences|prefs)\s+(.+)$/.exec(q);
++    const found = inSettings ?
++        SETTINGS_FEATURES
++            .map(f => ({f, m: Math.min(3, featureMatch(f, inSettings[1]!) +
++                                          (f.hint === 'Settings' ? 1 : 0)),
++                        setting: true}))
++            .filter(x => x.m > 1)
++            .sort((a, b) => b.m - a.m)
++            .slice(0, 4) :
++        rank(offered, false).concat(rank(SETTINGS_FEATURES, true));
+     const features = found.filter(x => x.setting && x.m === 3)
+                          .concat(found.filter(x => !(x.setting && x.m === 3)));
+     this.featureRows_ = features.map(x => x.f);
+     if (changed.has('query_' as keyof MeridianCommandBarElement)) {
+       this.copied_ = false;
+-      this.quick_ = quickAnswer(this.query_, new Date(), this.rates_);
+-      // The rates come once someone asks for a currency (then once a day).
++      this.quick_ = this.answerFor_(this.query_);
++      // The rates come once someone asks for a currency (the browser keeps
++      // them 12 hours, and the last ones when offline).
+       if (!this.ratesAsked_ && wantsCurrency(this.query_)) {
+         this.ratesAsked_ = true;
+         browserProxyFactory.getInstance().handler.getCurrencyRates().then(
+-            ({rates, date}) => {
++            ({rates, date, nbgCodes, nbgDate}) => {
+               if (Object.keys(rates).length) {
+-                this.rates_ = {rates, date};
+-                this.quick_ = quickAnswer(this.query_, new Date(), this.rates_);
++                this.rates_ = {rates, date, nbgCodes, nbgDate};
++                this.ratesUnavailable_ = false;
+               } else {
+                 this.ratesAsked_ = false;
++                this.ratesUnavailable_ = true;
+               }
++              this.quick_ = this.answerFor_(this.query_);
+             });
+       }
++      const site = this.siteFor_(this.query_.trim().toLowerCase());
++      this.siteHint_ = site ? site.label : '';
+     }
+     const first = q !== '' && !!rows[0] && starts(rows[0]);
+     if (changed.has('query_' as keyof MeridianCommandBarElement)) {
+@@ -485,16 +580,19 @@ export class MeridianCommandBarElement extends CrLitElement {
+     box.selectAll();
+   }
+ 
+-  hide() {
++  // `handBack`: the keys go back to the page (not when what was picked
++  // takes them, such as Settings).
++  hide(handBack: boolean = true) {
+     if (!this.open) {
+       return;
+     }
+     this.open = false;
+     this.mode_ = null;
+     this.query_ = '';
++    this.siteHint_ = '';
+     this.address_.reset('');
+     this.clearAnswer_();
+-    this.fire('command-bar-closed');
++    this.fire('command-bar-closed', {handBack});
+   }
+ 
+   protected onOverlayMousedown_(e: MouseEvent) {
+@@ -534,7 +632,15 @@ export class MeridianCommandBarElement extends CrLitElement {
+     if (!text) {
+       return;
+     }
+-    if (mode.keyword !== undefined) {
++    if (mode.site && mode.keyword === undefined) {
++      // "translate ⇥ hello to georgian" as well.
++      const tr = mode.site.host === 'translate.google.com' ?
++          translateQuery(`translate ${text}`, navigator.languages) :
++          null;
++      this.fire('command-bar-open-url',
++                tr ? translateUrl(tr.text, tr.code) :
++                     siteSearchUrl(mode.site, text));
++    } else if (mode.keyword !== undefined) {
+       browserProxyFactory.getInstance()
+           .handler.searchUrl(mode.keyword, text)
+           .then(({url}) => {
+@@ -555,15 +661,23 @@ export class MeridianCommandBarElement extends CrLitElement {
+   }
+ 
+   protected onQuickClick_() {
+-    this.copyQuick_();
++    this.actOnQuick_();
+   }
+ 
+-  private copyQuick_() {
+-    if (!this.quick_) {
++  // Return on the answer: copies it, or opens it (a translation).
++  private actOnQuick_() {
++    const quick = this.quick_;
++    if (!quick || quick.action === 'none') {
++      return;
++    }
++    if (quick.action === 'open' && quick.url) {
++      const url = quick.url;
++      this.hide();
++      this.fire('command-bar-open-url', url);
+       return;
+     }
+     // Only the number with its unit ("3.10686 mi" copies "3.10686 mi").
+-    navigator.clipboard.writeText(this.quick_.value).catch(() => {});
++    navigator.clipboard.writeText(quick.value).catch(() => {});
+     this.copied_ = true;
+     setTimeout(() => {
+       if (this.copied_) {
+@@ -620,10 +734,8 @@ export class MeridianCommandBarElement extends CrLitElement {
+     // keyword comes first. Backspace in an empty field leaves it.
+     if (e.key === 'Tab' && !e.shiftKey && !this.mode_) {
+       const word = this.inputValue_().trim().toLowerCase();
+-      const site = this.keywords_.get(word);
+-      const mode = site !== undefined ?
+-          {label: site || word, keyword: word, withPage: false,
+-           placeholder: `Search ${site || word}…`} :
++      // A site's keyword or name comes first ("yt", "youtube", "wiki").
++      const mode = this.siteFor_(word) ||
+           (Object.hasOwn(MODES, word) ? MODES[word]! :
+                                         this.aiModes_.get(word) ?? null);
+       if (mode) {
+@@ -667,10 +779,11 @@ export class MeridianCommandBarElement extends CrLitElement {
+     }
+     // Return with an answer in the bar copies it (unless a row below was
+     // picked with the arrows).
+-    if (e.key === 'Enter' && this.quick_ && this.tabSel_ < 0 &&
+-        this.address_?.selectedLine() <= 0 && !e.shiftKey && !e.altKey) {
++    if (e.key === 'Enter' && this.quick_ && this.quick_.action !== 'none' &&
++        this.tabSel_ < 0 && this.address_?.selectedLine() <= 0 &&
++        !e.shiftKey && !e.altKey) {
+       own();
+-      this.copyQuick_();
++      this.actOnQuick_();
+       return;
+     }
+     const features = this.featureRows_.length;
+diff --git a/chrome/browser/resources/webui_browser/meridian/quick_answers.ts b/chrome/browser/resources/webui_browser/meridian/quick_answers.ts
+index aed2be5f12..7d9e71779b 100644
+--- a/chrome/browser/resources/webui_browser/meridian/quick_answers.ts
++++ b/chrome/browser/resources/webui_browser/meridian/quick_answers.ts
+@@ -9,17 +9,25 @@
+ // new york"). Return copies the answer.
+ 
+ export interface QuickAnswer {
+-  kind: 'calc'|'unit'|'currency'|'time';
++  kind: 'calc'|'unit'|'currency'|'time'|'translate';
+   // What is shown and copied.
+   value: string;
+   // A line under it: what was understood, where a rate is from.
+   detail: string;
++  // What Return does: copies the value (the default), opens `url`, or
++  // nothing (a note such as "Rates unavailable").
++  action?: 'copy'|'open'|'none';
++  url?: string;
+ }
+ 
+ export interface CurrencyRates {
+   // Per euro, e.g. {USD: 1.08}; EUR itself is 1.
+   rates: {[code: string]: number};
++  // The ECB's day.
+   date: string;
++  // The ones from the National Bank of Georgia (GEL, RUB…), and its day.
++  nbgCodes?: string[];
++  nbgDate?: string;
+ }
+ 
+ const MAX_LENGTH = 160;
+@@ -39,109 +47,235 @@ function format(n: number): string {
+ 
+ // ------------------------------------------------------------- arithmetic
+ 
+-// A recursive-descent reader: + - * / × ÷ ^ % ( ), unary minus, sqrt.
+-function evaluate(text: string): number|null {
+-  const src = text.replace(/×/g, '*').replace(/÷/g, '/').replace(/,/g, '')
+-                  .replace(/\s+/g, '');
++// The functions and constants a sum can use, by name ("sqrt 2", "sin(pi/2)",
++// "2pi"). Angles are radians; "30°" is in degrees.
++const FUNCTIONS: {[name: string]: (x: number) => number} = {
++  sqrt: Math.sqrt, cbrt: Math.cbrt, abs: Math.abs, round: Math.round,
++  floor: Math.floor, ceil: Math.ceil, sin: Math.sin, cos: Math.cos,
++  tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan,
++  sinh: Math.sinh, cosh: Math.cosh, tanh: Math.tanh, ln: Math.log,
++  log: Math.log10, lg: Math.log10, log10: Math.log10, log2: Math.log2,
++  exp: Math.exp,
++};
++const CONSTANTS: {[name: string]: number} = {
++  pi: Math.PI, 'π': Math.PI, e: Math.E, tau: 2 * Math.PI, 'τ': 2 * Math.PI,
++};
++// Longest first: "sinh" before "sin", "log10" before "log".
++const NAMES = [...Object.keys(FUNCTIONS), ...Object.keys(CONSTANTS)]
++                  .sort((a, b) => b.length - a.length);
++
++type Token = {t: 'num', v: number}|{t: 'op', v: string}|{t: 'fn', v: string}|
++             {t: 'const', v: number};
++
++// The text as numbers, operators and names; null if anything else is in it
++// (a word: then it is a search).
++function tokenize(text: string): Token[]|null {
++  const src = text.toLowerCase().replace(/×/g, '*').replace(/÷/g, '/')
++                  .replace(/−/g, '-').replace(/(\d),(?=\d{3}\b)/g, '$1');
++  const out: Token[] = [];
+   let at = 0;
+-  const peek = () => src[at];
+-  const number = (): number|null => {
+-    const m = /^\d*\.?\d+(e[+-]?\d+)?/i.exec(src.slice(at));
+-    if (!m) {
++  while (at < src.length) {
++    const rest = src.slice(at);
++    const space = /^\s+/.exec(rest);
++    if (space) {
++      at += space[0].length;
++      continue;
++    }
++    const num = /^(\d+\.?\d*|\.\d+)(e[+-]?\d+)?/.exec(rest);
++    if (num) {
++      out.push({t: 'num', v: Number(num[0])});
++      at += num[0].length;
++      continue;
++    }
++    if ('+-*/^%()!°'.includes(rest[0]!)) {
++      out.push({t: 'op', v: rest[0]!});
++      at++;
++      continue;
++    }
++    // "x" between two numbers multiplies ("3 x 4").
++    if (rest[0] === 'x' && !/^x[a-z]/.test(rest)) {
++      out.push({t: 'op', v: '*'});
++      at++;
++      continue;
++    }
++    // A whole name only ("pie" is a word, not pi times e).
++    const name = NAMES.find(n => rest.startsWith(n) &&
++                                 !/^[a-zπτ]/.test(rest.slice(n.length)));
++    if (!name) {
+       return null;
+     }
+-    at += m[0].length;
+-    return Number(m[0]);
++    out.push(Object.hasOwn(FUNCTIONS, name) ? {t: 'fn', v: name} :
++                                              {t: 'const', v: CONSTANTS[name]!});
++    at += name.length;
++  }
++  return out;
++}
++
++// A recursive-descent reader over the tokens: + - * / ^ % ! ° ( ), unary
++// minus, functions, "2pi" and "2(3+4)" (multiplied). `worked` is whether
++// anything was worked out (a number alone is not a sum).
++function evaluate(text: string): {value: number, worked: boolean}|null {
++  const tokens = tokenize(text);
++  if (!tokens || !tokens.length) {
++    return null;
++  }
++  let at = 0;
++  let worked = false;
++  const peek = () => tokens[at];
++  const isOp = (v: string) => {
++    const t = peek();
++    return !!t && t.t === 'op' && t.v === v;
+   };
+-  const factor = (): number|null => {
+-    if (peek() === '-') {
+-      at++;
+-      const v = factor();
+-      return v === null ? null : -v;
++  // Whether the next token starts a value (for "2pi", "2(1+1)", "2 sqrt 9").
++  const startsValue = () => {
++    const t = peek();
++    return !!t && (t.t === 'fn' || t.t === 'const' ||
++                   (t.t === 'op' && t.v === '('));
++  };
++  // `pct`: the value was "N%" (so "200 + 10%" is 220).
++  type V = {v: number, pct: boolean}|null;
++  const primary = (): V => {
++    const t = peek();
++    if (!t) {
++      return null;
+     }
+-    if (peek() === '+') {
++    if (t.t === 'num' || t.t === 'const') {
+       at++;
+-      return factor();
++      return {v: t.v, pct: false};
+     }
+-    if (src.slice(at, at + 4).toLowerCase() === 'sqrt') {
+-      at += 4;
+-      const v = factor();
+-      return v === null ? null : Math.sqrt(v);
++    if (t.t === 'fn') {
++      at++;
++      const arg = unary();
++      if (!arg) {
++        return null;
++      }
++      worked = true;
++      return {v: FUNCTIONS[t.v]!(arg.v), pct: false};
+     }
+-    let v: number|null;
+-    if (peek() === '(') {
++    if (t.v === '(') {
+       at++;
+-      v = sum();
+-      if (peek() !== ')') {
++      const v = sum();
++      if (!v || !isOp(')')) {
+         return null;
+       }
+       at++;
+-    } else {
+-      v = number();
++      return {v: v.v, pct: false};
+     }
+-    if (v === null) {
+-      return null;
++    return null;
++  };
++  const postfix = (): V => {
++    let x = primary();
++    while (x) {
++      const t = peek();
++      if (!t || t.t !== 'op') {
++        break;
++      }
++      const next = tokens[at + 1];
++      // A % before a number or "(" is the remainder ("10 % 3").
++      if (t.v === '%' &&
++          !(next && (next.t !== 'op' || next.v === '('))) {
++        at++;
++        x = {v: x.v / 100, pct: true};
++      } else if (t.v === '!') {
++        at++;
++        if (!Number.isInteger(x.v) || x.v < 0 || x.v > 170) {
++          return null;
++        }
++        let f = 1;
++        for (let i = 2; i <= x.v; i++) {
++          f *= i;
++        }
++        x = {v: f, pct: false};
++      } else if (t.v === '°') {
++        at++;
++        x = {v: x.v * Math.PI / 180, pct: false};
++      } else {
++        break;
++      }
++      worked = true;
+     }
+-    // A trailing % is a hundredth (in "200 * 15%").
+-    while (peek() === '%' && !/[\d(]/.test(src[at + 1] || '')) {
++    return x;
++  };
++  const power = (): V => {
++    const base = postfix();
++    if (base && isOp('^')) {
+       at++;
+-      v /= 100;
++      const e = unary();
++      worked = true;
++      return e ? {v: Math.pow(base.v, e.v), pct: false} : null;
+     }
+-    if (peek() === '^') {
++    return base;
++  };
++  const unary = (): V => {
++    if (isOp('-') || isOp('+')) {
++      const minus = isOp('-');
+       at++;
+-      const e = factor();
+-      return e === null ? null : Math.pow(v, e);
++      const v = unary();
++      return v ? {v: minus ? -v.v : v.v, pct: v.pct} : null;
+     }
+-    return v;
++    return power();
+   };
+-  const product = (): number|null => {
+-    let v = factor();
+-    while (v !== null && (peek() === '*' || peek() === '/' || peek() === '%')) {
+-      const op = src[at++];
+-      const r = factor();
+-      if (r === null) {
++  const product = (): V => {
++    let x = unary();
++    while (x) {
++      const t = peek();
++      let op: string;
++      if (t && t.t === 'op' && (t.v === '*' || t.v === '/' || t.v === '%')) {
++        op = t.v;
++        at++;
++      } else if (startsValue()) {
++        // "2pi", "2(3+4)", "2 sqrt 9".
++        op = '*';
++      } else {
++        break;
++      }
++      const r = unary();
++      if (!r) {
+         return null;
+       }
+-      v = op === '*' ? v * r : op === '/' ? v / r : v % r;
++      worked = true;
++      x = {v: op === '*' ? x.v * r.v : op === '/' ? x.v / r.v : x.v % r.v,
++           pct: false};
+     }
+-    return v;
++    return x;
+   };
+-  const sum = (): number|null => {
+-    let v = product();
+-    while (v !== null && (peek() === '+' || peek() === '-')) {
+-      const op = src[at++];
++  const sum = (): V => {
++    let x = product();
++    while (x && (isOp('+') || isOp('-'))) {
++      const plus = isOp('+');
++      at++;
+       const r = product();
+-      if (r === null) {
++      if (!r) {
+         return null;
+       }
+-      v = op === '+' ? v + r : v - r;
++      worked = true;
++      // "200 + 10%": a tenth more, as on a calculator.
++      const by = r.pct ? x.v * r.v : r.v;
++      x = {v: plus ? x.v + by : x.v - by, pct: false};
+     }
+-    return v;
++    return x;
+   };
+   const v = sum();
+-  return v !== null && at === src.length && isFinite(v) ? v : null;
++  return v && at === tokens.length && isFinite(v.v) ?
++      {value: v.v, worked} :
++      null;
+ }
+ 
+ function calc(text: string): QuickAnswer|null {
+-  let m = /^(-?[\d.,]+)\s*(%|percent)\s+of\s+(-?[\d.,]+)$/i.exec(text);
++  const m = /^(-?[\d.,]+)\s*(%|percent)\s+of\s+(-?[\d.,]+)$/i.exec(text);
+   if (m) {
+     const v = Number(m[1]!.replace(/,/g, '')) / 100 *
+         Number(m[3]!.replace(/,/g, ''));
+     return isFinite(v) ? {kind: 'calc', value: format(v), detail: text} : null;
+   }
+-  m = /^(?:square root of|sqrt)\s*\(?\s*([\d.,]+)\s*\)?$/i.exec(text);
+-  if (m) {
+-    const v = Math.sqrt(Number(m[1]!.replace(/,/g, '')));
+-    return isFinite(v) ? {kind: 'calc', value: format(v), detail: text} : null;
+-  }
+-  // Only something with an operator between two numbers is a sum ("2024"
+-  // or "-5" alone are searches).
+-  if (!/^[\d\s.,+\-*/×÷^%()]+$/i.test(text) ||
+-      !/[\d)]\s*[+\-*/×÷^%]\s*[\d(.-]/.test(text)) {
++  // A date is a search ("2026-11-25").
++  if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(text)) {
+     return null;
+   }
+-  const v = evaluate(text);
+-  return v === null ? null : {kind: 'calc', value: format(v), detail: text};
++  const r = evaluate(text.replace(/^square root of\b/i, 'sqrt'));
++  // Only a sum is answered ("2024", "-5" or "pi" alone are searches).
++  return r && r.worked ? {kind: 'calc', value: format(r.value), detail: text} :
++                         null;
+ }
+ 
+ // ------------------------------------------------------------------ units
+@@ -264,53 +398,90 @@ function unit(text: string): QuickAnswer|null {
+ // -------------------------------------------------------------- currency
+ 
+ // The ECB's daily reference rates (and the euro).
+-const CURRENCIES = new Set([
++const ECB_CURRENCIES = new Set([
+   'EUR', 'USD', 'JPY', 'BGN', 'CZK', 'DKK', 'GBP', 'HUF', 'PLN', 'RON', 'SEK',
+   'CHF', 'ISK', 'NOK', 'TRY', 'AUD', 'BRL', 'CAD', 'CNY', 'HKD', 'IDR', 'ILS',
+   'INR', 'KRW', 'MXN', 'MYR', 'NZD', 'PHP', 'SGD', 'THB', 'ZAR',
+ ]);
+-const SIGNS: {[sign: string]: string} =
+-    {'$': 'USD', '€': 'EUR', '£': 'GBP', '¥': 'JPY', '₹': 'INR'};
++// The National Bank of Georgia's (the lari and its neighbours' money).
++const NBG_CURRENCIES = new Set([
++  'GEL', 'AED', 'AMD', 'AZN', 'BYN', 'EGP', 'IRR', 'KGS', 'KWD', 'KZT', 'MDL',
++  'QAR', 'RSD', 'RUB', 'TJS', 'TMT', 'UAH', 'UZS',
++]);
++const SIGNS: {[sign: string]: string} = {
++  '$': 'USD', '€': 'EUR', '£': 'GBP', '¥': 'JPY', '₹': 'INR', '₾': 'GEL',
++  '₽': 'RUB', '₴': 'UAH', '₺': 'TRY', '₩': 'KRW', '₪': 'ILS', '֏': 'AMD',
++  '₸': 'KZT', '₼': 'AZN', 'zł': 'PLN',
++};
++const CURRENCY_NAMES: {[name: string]: string} = {
++  dollar: 'USD', dollars: 'USD', bucks: 'USD', euro: 'EUR', euros: 'EUR',
++  pound: 'GBP', pounds: 'GBP', yen: 'JPY', yuan: 'CNY', rmb: 'CNY',
++  rupee: 'INR', rupees: 'INR', lari: 'GEL', laris: 'GEL', ruble: 'RUB',
++  rubles: 'RUB', rouble: 'RUB', roubles: 'RUB', hryvnia: 'UAH',
++  hryvnias: 'UAH', lira: 'TRY', liras: 'TRY', dram: 'AMD', drams: 'AMD',
++  tenge: 'KZT', manat: 'AZN', zloty: 'PLN', franc: 'CHF', francs: 'CHF',
++  won: 'KRW', shekel: 'ILS', shekels: 'ILS', dirham: 'AED', dirhams: 'AED',
++  baht: 'THB',
++};
++
++function currencyCode(s: string|undefined): string {
++  if (!s) {
++    return '';
++  }
++  const lower = s.toLowerCase();
++  const code = SIGNS[s] || CURRENCY_NAMES[lower] || s.toUpperCase();
++  return ECB_CURRENCIES.has(code) || NBG_CURRENCIES.has(code) ? code : '';
++}
+ 
+ // Whether the text asks for a currency (the bar fetches the rates then).
+ export function wantsCurrency(text: string): boolean {
+   return currencyQuery(text) !== null;
+ }
+ 
++const SIGN = '[$€£¥₹₾₽₴₺₩₪֏₸₼]|zł';
++
+ function currencyQuery(text: string):
+     {amount: number, from: string, to: string}|null {
+-  const m = /^([$€£¥₹])?\s*([\d.,]+)\s*([a-z]{3}|[$€£¥₹])?\s+(?:in|to|as|into|=)\s+([a-z]{3}|[$€£¥₹])$/i
++  const m = new RegExp(`^(${SIGN})?\\s*([\\d.,]+)\\s*(${SIGN}|[a-z]+)?\\s+` +
++                       `(?:in|to|as|into|=)\\s+(${SIGN}|[a-z]+)$`, 'i')
+                 .exec(text.trim());
+-  if (!m) {
++  if (!m || (m[1] && m[3])) {
+     return null;
+   }
+-  const code = (s: string|undefined) =>
+-      s ? (SIGNS[s] || s.toUpperCase()) : '';
+-  const from = code(m[1]) || code(m[3]);
+-  const to = code(m[4]);
++  const from = currencyCode(m[1]) || currencyCode(m[3]);
++  const to = currencyCode(m[4]);
+   const amount = Number(m[2]!.replace(/,/g, ''));
+-  if (!CURRENCIES.has(from) || !CURRENCIES.has(to) || from === to ||
+-      !isFinite(amount)) {
++  if (!from || !to || from === to || !isFinite(amount)) {
+     return null;
+   }
+   return {amount, from, to};
+ }
+ 
+-function currency(text: string, rates: CurrencyRates|null): QuickAnswer|null {
++function currency(text: string, rates: CurrencyRates|null,
++                  unavailable: boolean): QuickAnswer|null {
+   const q = currencyQuery(text);
+-  if (!q || !rates) {
++  if (!q) {
+     return null;
+   }
+-  const per = (c: string) => c === 'EUR' ? 1 : rates.rates[c];
++  const per = (c: string) => c === 'EUR' ? 1 : rates?.rates[c];
+   const a = per(q.from);
+   const b = per(q.to);
+   if (!a || !b) {
+-    return null;
++    // Asked for, and none could be had (offline, nothing kept from before).
++    return unavailable ? {kind: 'currency', value: 'Rates unavailable',
++                          detail: `${format(q.amount)} ${q.from} to ${q.to}` +
++                              ' · no connection to the central bank',
++                          action: 'none'} :
++                         null;
+   }
+   const v = q.amount / a * b;
++  const nbg = rates!.nbgCodes || [];
++  const fromNbg = nbg.includes(q.from) || nbg.includes(q.to);
++  const source = fromNbg ? `National Bank of Georgia rate of ${rates!.nbgDate}` :
++                           `ECB rate of ${rates!.date}`;
+   return {kind: 'currency', value: `${v.toLocaleString('en-US', {
+             minimumFractionDigits: 2, maximumFractionDigits: 2})} ${q.to}`,
+-          detail: `${format(q.amount)} ${q.from} · ECB rate of ${rates.date}`};
++          detail: `${format(q.amount)} ${q.from} · ${source}`};
+ }
+ 
+ // ------------------------------------------------------------------ time
+@@ -342,6 +513,18 @@ const ZONES: {[name: string]: string} = {
+   'mexico city': 'America/Mexico_City', 'sao paulo': 'America/Sao_Paulo',
+   'buenos aires': 'America/Argentina/Buenos_Aires',
+   'utc': 'UTC', 'gmt': 'UTC',
++  'kutaisi': 'Asia/Tbilisi', 'baku': 'Asia/Baku', 'tashkent': 'Asia/Tashkent',
++  'minsk': 'Europe/Minsk', 'warsaw': 'Europe/Warsaw', 'prague': 'Europe/Prague',
++  'vienna': 'Europe/Vienna', 'zurich': 'Europe/Zurich',
++  'stockholm': 'Europe/Stockholm', 'helsinki': 'Europe/Helsinki',
++  'athens': 'Europe/Athens', 'dublin': 'Europe/Dublin',
++  'barcelona': 'Europe/Madrid', 'munich': 'Europe/Berlin',
++  'tel aviv': 'Asia/Jerusalem', 'cairo': 'Africa/Cairo',
++  'riyadh': 'Asia/Riyadh', 'bangalore': 'Asia/Kolkata',
++  'jakarta': 'Asia/Jakarta', 'manila': 'Asia/Manila', 'taipei': 'Asia/Taipei',
++  'washington': 'America/New_York', 'dc': 'America/New_York',
++  'pst': 'America/Los_Angeles', 'est': 'America/New_York',
++  'cet': 'Europe/Paris', 'tbs': 'Asia/Tbilisi',
+ };
+ 
+ function zoneOf(name: string): string|null {
+@@ -349,11 +532,16 @@ function zoneOf(name: string): string|null {
+   if (ZONES[key]) {
+     return ZONES[key];
+   }
++  if (!/^[a-z][a-z _\/-]*$/.test(key)) {
++    return null;
++  }
+   // Any zone by its city ("asia/kathmandu" → "kathmandu").
+   const all = (Intl as unknown as {supportedValuesOf?: (k: string) => string[]})
+                   .supportedValuesOf?.('timeZone') || [];
+-  return all.find(z => z.split('/').pop()!.replace(/_/g, ' ').toLowerCase() ===
+-                       key) || null;
++  return all.find(z => z.toLowerCase() === key ||
++                       z.split('/').pop()!.replace(/_/g, ' ').toLowerCase() ===
++                           key) ||
++      null;
+ }
+ 
+ function clock(date: Date, zone: string): string {
+@@ -376,13 +564,24 @@ function offsetOf(date: Date, zone: string): number {
+ }
+ 
+ function time(text: string, now: Date): QuickAnswer|null {
+-  let m = /^(?:time|now|what time is it)\s+in\s+(.+)$/i.exec(text);
++  // "time in tokyo", "now in nyc", "time tokyo", "tokyo time".
++  let m = /^(?:time|now|what time is it|current time)\s+(?:in\s+)?(.+)$/i
++              .exec(text) ||
++      /^(.+?)\s+time(?:\s+now)?$/i.exec(text);
+   if (m) {
+     const zone = zoneOf(m[1]!);
+     return zone ? {kind: 'time', value: clock(now, zone),
+                    detail: `Now in ${m[1]!.trim()} (${zone})`} :
+                   null;
+   }
++  // "3pm in tokyo": that time here, there.
++  m = /^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s+(?:in|to)\s+(.+)$/i.exec(text);
++  if (m && (m[2] || m[3]) && zoneOf(m[4]!)) {
++    const here = Intl.DateTimeFormat().resolvedOptions().timeZone;
++    return time(`${m[1]}${m[2] ? ':' + m[2] : ''}${m[3] || ''} ${here} to ${
++                    m[4]}`,
++                now);
++  }
+   // "5pm london in new york", "17:30 tokyo to sf".
+   m = /^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s+(.+?)\s+(?:in|to)\s+(.+)$/i.exec(text);
+   if (!m || (!m[2] && !m[3])) {
+@@ -410,13 +609,127 @@ function time(text: string, now: Date): QuickAnswer|null {
+           detail: `${clock(instant, from)} in ${m[4]!.trim()}`};
+ }
+ 
++// ------------------------------------------------------------- translate
++
++// Google Translate's codes, by the language's name (and Russian name).
++const LANGUAGES: {[name: string]: [string, string]} = {};
++for (const [code, label, ...names] of [
++         ['en', 'English', 'english', 'английский', 'англ'],
++         ['ka', 'Georgian', 'georgian', 'грузинский', 'груз', 'kartuli'],
++         ['ru', 'Russian', 'russian', 'русский', 'рус'],
++         ['uk', 'Ukrainian', 'ukrainian', 'украинский'],
++         ['de', 'German', 'german', 'немецкий'],
++         ['fr', 'French', 'french', 'французский'],
++         ['es', 'Spanish', 'spanish', 'испанский'],
++         ['it', 'Italian', 'italian', 'итальянский'],
++         ['pt', 'Portuguese', 'portuguese', 'португальский'],
++         ['tr', 'Turkish', 'turkish', 'турецкий'],
++         ['hy', 'Armenian', 'armenian', 'армянский'],
++         ['az', 'Azerbaijani', 'azerbaijani', 'азербайджанский'],
++         ['kk', 'Kazakh', 'kazakh', 'казахский'],
++         ['pl', 'Polish', 'polish', 'польский'],
++         ['cs', 'Czech', 'czech', 'чешский'],
++         ['nl', 'Dutch', 'dutch', 'нидерландский'],
++         ['sv', 'Swedish', 'swedish', 'шведский'],
++         ['el', 'Greek', 'greek', 'греческий'],
++         ['he', 'Hebrew', 'hebrew', 'иврит'],
++         ['ar', 'Arabic', 'arabic', 'арабский'],
++         ['hi', 'Hindi', 'hindi', 'хинди'],
++         ['zh-CN', 'Chinese', 'chinese', 'китайский'],
++         ['ja', 'Japanese', 'japanese', 'японский'],
++         ['ko', 'Korean', 'korean', 'корейский'],
++       ]) {
++  for (const n of [code!.toLowerCase(), ...names]) {
++    LANGUAGES[n] = [code!, label!];
++  }
++}
++
++// Where a translation goes when no language is named: English for text not
++// in Latin letters, otherwise the person's first language that isn't.
++function defaultTarget(text: string, languages: readonly string[]):
++    [string, string] {
++  if (/[^\p{Script=Latin}\p{P}\p{N}\s]/u.test(text)) {
++    return LANGUAGES['en']!;
++  }
++  for (const l of languages) {
++    const code = l.split('-')[0]!.toLowerCase();
++    const found = LANGUAGES[code];
++    if (code !== 'en' && found) {
++      return found;
++    }
++  }
++  return LANGUAGES['en']!;
++}
++
++// "translate hello to georgian", "tr hello ka", "tr привет",
++// "переведи привет на грузинский": Google Translate with the text (no API:
++// Return opens the page).
++export function translateQuery(text: string,
++                               languages: readonly string[] = []):
++    {text: string, code: string, label: string}|null {
++  const m = /^(?:translate|tr|переведи|перевести|перевод)\s+(.+)$/iu.exec(text);
++  if (!m) {
++    return null;
++  }
++  let body = m[1]!.trim();
++  let target: [string, string]|undefined;
++  const to = /^(.+?)\s+(?:to|into|in|на)\s+(\S+)$/iu.exec(body);
++  if (to && LANGUAGES[to[2]!.toLowerCase()]) {
++    body = to[1]!;
++    target = LANGUAGES[to[2]!.toLowerCase()];
++  } else {
++    // "tr hello georgian": a language's full name last (a code only after
++    // "to": "translate do it" stays English).
++    const last = /^(.+?)\s+(\S{3,})$/u.exec(body);
++    const named = last ? LANGUAGES[last[2]!.toLowerCase()] : undefined;
++    if (last && named) {
++      body = last[1]!;
++      target = named;
++    }
++  }
++  body = body.replace(/^["'«“]|["'»”]$/g, '').trim();
++  if (!body) {
++    return null;
++  }
++  const [code, label] = target || defaultTarget(body, languages);
++  return {text: body, code, label};
++}
++
++export function translateUrl(text: string, code: string): string {
++  return 'https://translate.google.com/?sl=auto&tl=' +
++      encodeURIComponent(code) + '&text=' + encodeURIComponent(text) +
++      '&op=translate';
++}
++
++function translate(text: string, languages: readonly string[]):
++    QuickAnswer|null {
++  const q = translateQuery(text, languages);
++  if (!q) {
++    return null;
++  }
++  return {kind: 'translate', value: `“${q.text}” → ${q.label}`,
++          detail: 'Google Translate', action: 'open',
++          url: translateUrl(q.text, q.code)};
++}
++
+ // ---------------------------------------------------------------- answer
+ 
++export interface QuickAnswerOptions {
++  // The rates were asked for and none could be had.
++  ratesUnavailable?: boolean;
++  // The person's languages (navigator.languages), for "translate".
++  languages?: readonly string[];
++}
++
+ export function quickAnswer(typed: string, now: Date,
+-                            rates: CurrencyRates|null): QuickAnswer|null {
++                            rates: CurrencyRates|null,
++                            options: QuickAnswerOptions = {}):
++    QuickAnswer|null {
+   const text = typed.trim();
+   if (!text || text.length > MAX_LENGTH || /^[a-z][\w+.-]*:\/\//i.test(text)) {
+     return null;
+   }
+-  return currency(text, rates) || unit(text) || time(text, now) || calc(text);
++  return translate(text, options.languages || []) ||
++      currency(text, rates, !!options.ratesUnavailable) || unit(text) ||
++      time(text, now) || calc(text);
+ }
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_searches.ts b/chrome/browser/resources/webui_browser/meridian/site_searches.ts
+new file mode 100644
+index 0000000000..9aeadc4a4b
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/site_searches.ts
+@@ -0,0 +1,68 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// "youtube ⇥ cats" in the command bar, as in Arc and Raycast: a site by its
++// name, then Tab, searches that site. Chromium's own search engine for the
++// site is used when the person has one (its keyword is the site's address);
++// otherwise the search page below.
++
++export interface SiteSearch {
++  name: string;
++  // The site's address, as Chromium's keyword for it would be.
++  host: string;
++  // What can be typed for it.
++  words: string[];
++  // The search page, %s for the words.
++  url: string;
++}
++
++export const SITE_SEARCHES: SiteSearch[] = [
++  {name: 'YouTube', host: 'youtube.com', words: ['youtube', 'yt'],
++   url: 'https://www.youtube.com/results?search_query=%s'},
++  {name: 'GitHub', host: 'github.com', words: ['github', 'gh'],
++   url: 'https://github.com/search?q=%s'},
++  {name: 'Wikipedia', host: 'wikipedia.org',
++   words: ['wikipedia', 'wiki'],
++   url: 'https://en.wikipedia.org/w/index.php?search=%s'},
++  {name: 'Google Maps', host: 'maps.google.com',
++   words: ['maps', 'map', 'google maps', 'gmaps'],
++   url: 'https://www.google.com/maps/search/%s'},
++  {name: 'X', host: 'x.com', words: ['x', 'twitter'],
++   url: 'https://x.com/search?q=%s'},
++  {name: 'Reddit', host: 'reddit.com', words: ['reddit'],
++   url: 'https://www.reddit.com/search/?q=%s'},
++  {name: 'Amazon', host: 'amazon.com', words: ['amazon', 'amz'],
++   url: 'https://www.amazon.com/s?k=%s'},
++  {name: 'Figma', host: 'figma.com', words: ['figma'],
++   url: 'https://www.figma.com/community/search?resource_type=mixed&query=%s'},
++  {name: 'Pinterest', host: 'pinterest.com', words: ['pinterest'],
++   url: 'https://www.pinterest.com/search/pins/?q=%s'},
++  {name: 'Google', host: 'google.com', words: ['google'],
++   url: 'https://www.google.com/search?q=%s'},
++  {name: 'DuckDuckGo', host: 'duckduckgo.com', words: ['duckduckgo', 'ddg'],
++   url: 'https://duckduckgo.com/?q=%s'},
++  {name: 'Stack Overflow', host: 'stackoverflow.com',
++   words: ['stackoverflow', 'stack overflow'],
++   url: 'https://stackoverflow.com/search?q=%s'},
++  {name: 'npm', host: 'npmjs.com', words: ['npm'],
++   url: 'https://www.npmjs.com/search?q=%s'},
++  {name: 'MDN', host: 'developer.mozilla.org', words: ['mdn'],
++   url: 'https://developer.mozilla.org/search?q=%s'},
++  {name: 'Google Images', host: 'images.google.com',
++   words: ['images', 'image'],
++   url: 'https://www.google.com/search?tbm=isch&q=%s'},
++  {name: 'Google Translate', host: 'translate.google.com',
++   words: ['translate', 'tr'],
++   url: 'https://translate.google.com/?sl=auto&tl=en&text=%s&op=translate'},
++];
++
++// The site named by `word` ("youtube", "wiki"), if any.
++export function siteSearchFor(word: string): SiteSearch|null {
++  const w = word.trim().toLowerCase();
++  return w ? SITE_SEARCHES.find(s => s.words.includes(w)) || null : null;
++}
++
++export function siteSearchUrl(site: SiteSearch, terms: string): string {
++  return site.url.replace('%s', encodeURIComponent(terms));
++}
