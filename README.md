@@ -100,6 +100,7 @@ Optional. Skip this section if you only came for the browser.
 | | |
 |---|---|
 | **macOS** (Apple silicon) | [Meridian-mac-arm64.dmg](https://github.com/Undermove/meridian-browser/releases/latest/download/Meridian-mac-arm64.dmg), or in Terminal: `curl -fsSL https://meridianbrowser.app/install.sh \| bash` |
+| **Homebrew** (Apple silicon) | `brew install --cask undermove/tap/meridian` |
 | **Windows 10 and 11** (x64) | [Meridian-win.exe](https://github.com/Undermove/meridian-browser/releases/latest/download/Meridian-win.exe) |
 
 Linux and Intel Macs aren't supported by the current version.
