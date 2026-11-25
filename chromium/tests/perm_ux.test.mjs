@@ -2,7 +2,7 @@
 // files a command really reads (a heredoc or a quoted string that mentions .env is text), its
 // "Allow for this session" covers the session's subagents and ends with the session, and Mission
 // Control's rows answer both kinds of question in place (Allow once / Allow for this session /
-// Block / Show). Subagents stopped by their parent, or interrupted, stop showing as working.
+// Don't ask again in this project / Block / Show). Subagents stopped by their parent, or interrupted, stop showing as working.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -143,7 +143,7 @@ test('permission questions: real reads only, a session’s allowance, answers in
     await b.eval('app.$.tabstrip.runCommand(17, 0)');
     await b.waitFor(`!!${row('.ask-session')}`);
     assert.deepEqual(await b.eval(`[...${MC}.querySelectorAll('#tree .row .ask button')].map((x) => x.textContent.trim())`),
-      ['Allow once', 'Allow for this session', 'Block', 'Show']);
+      ['Allow once', 'Allow for this session', 'Don’t ask again in this project', 'Block', 'Show']);
     await shot('mission-secret-ask.png');
     await sleep(700);
     await b.click(row('.ask-session'));
