@@ -1,0 +1,528 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 23:00:12 +0400
+Subject: [PATCH] Meridian: the call is marked too, and the tab on air can stop
+ sharing
+
+During a share the tab of the call that shares wears its own on-air mark
+and a softer red wash, apart from the shared tab's ring and monitor. The
+monitor on the tab on air opens a menu: back to the call, or Stop sharing;
+the on-air mark on the call shows which tab is on air and stops it too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar.mojom         |  5 ++
+ chrome/browser/meridian/sidebar_handler.cc    | 17 ++++
+ chrome/browser/meridian/sidebar_handler.h     |  2 +
+ .../webui_browser/meridian/fav.html.ts        |  6 ++
+ .../resources/webui_browser/meridian/fav.ts   |  8 ++
+ .../resources/webui_browser/meridian/icons.ts |  3 +
+ .../webui_browser/meridian/item.html.ts       |  6 ++
+ .../resources/webui_browser/meridian/item.ts  |  8 ++
+ .../resources/webui_browser/meridian/rows.css | 32 ++++++++
+ .../webui_browser/meridian/sidebar.html.ts    |  3 +
+ .../webui_browser/meridian/sidebar.ts         | 81 +++++++++++++++++++
+ .../webui_browser/meridian/tab_row.html.ts    |  6 ++
+ .../webui_browser/meridian/tab_row.ts         |  7 ++
+ .../views/tab_sharing/tab_sharing_ui_views.cc | 30 +++++++
+ .../views/tab_sharing/tab_sharing_ui_views.h  |  4 +
+ 15 files changed, 218 insertions(+)
+
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 87dbd1894f..82c2a4a387 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -1004,6 +1004,11 @@ interface SidebarHandler {
+   // "Different subscriptions in different spaces?": "apply" (the
+   // suggestion) or "dismiss".
+   AnswerAiAccountsHint(string answer) => ();
++
++  // During a share: the tabs that share another tab (the call, marked in
++  // the sidebar), and "Stop sharing" on the shared tab or on the call.
++  CallTabs() => (array<tabs_api.mojom.NodeId> tab_ids);
++  StopTabSharing(tabs_api.mojom.NodeId tab_id);
+ };
+ 
+ // A secret file agents may read without asking in one project.
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 30af781d99..d74b7a8bc1 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -718,6 +718,23 @@ void SidebarHandler::CanShareTabInstead(const tabs_api::NodeId& tab_id,
+                           TabSharingUIViews::CanShareInstead(tab->GetContents()));
+ }
+ 
++void SidebarHandler::CallTabs(CallTabsCallback callback) {
++  std::vector<tabs_api::NodeId> ids;
++  for (content::WebContents* contents : TabSharingUIViews::Capturers()) {
++    if (tabs::TabInterface* tab =
++            tabs::TabInterface::MaybeGetFromContents(contents)) {
++      ids.push_back(tabs_api::NodeId::FromTabHandle(tab->GetHandle()));
++    }
++  }
++  std::move(callback).Run(std::move(ids));
++}
++
++void SidebarHandler::StopTabSharing(const tabs_api::NodeId& tab_id) {
++  if (tabs::TabInterface* tab = TabFor(tab_id)) {
++    TabSharingUIViews::StopSharingOf(tab->GetContents());
++  }
++}
++
+ void SidebarHandler::TestCommand(int32_t command_id) {
+   if (HasTestSwitch("meridian-test-keys")) {
+     chrome::ExecuteCommand(browser_, command_id);
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index ad69f6b774..0f1d82794d 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -353,6 +353,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void ShareTabInstead(const tabs_api::NodeId& tab_id) override;
+   void CanShareTabInstead(const tabs_api::NodeId& tab_id,
+                           CanShareTabInsteadCallback callback) override;
++  void CallTabs(CallTabsCallback callback) override;
++  void StopTabSharing(const tabs_api::NodeId& tab_id) override;
+   void GetNowPlaying(GetNowPlayingCallback callback) override;
+   void ControlMedia(const tabs_api::NodeId& tab_id,
+                     const std::string& action) override;
+diff --git a/chrome/browser/resources/webui_browser/meridian/fav.html.ts b/chrome/browser/resources/webui_browser/meridian/fav.html.ts
+index b48092ad73..2583e503dd 100644
+--- a/chrome/browser/resources/webui_browser/meridian/fav.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/fav.html.ts
+@@ -11,6 +11,7 @@ export function getHtml(this: MeridianFavElement) {
+   return html`<!--_html_template_start_-->
+ ${this.item ? html`
+   <div class="fav ${this.sharing_ ? 'sharing' : ''} ${
++      this.call_ ? 'calling' : ''} ${
+       this.tab_ ? 'loaded' : ''} ${
+       this.tab_?.isActive ? 'active' : ''}" draggable="true"
+       data-item="${this.item.id}" data-fav="1"
+@@ -18,6 +19,11 @@ ${this.item ? html`
+       @mousedown="${this.onTileMousedown_}"
+       @contextmenu="${this.onTileContextmenu_}">
+     <img src="${this.favicon_}" width="20" height="20" alt="">
++    ${this.call_ ? html`
++      <button class="fav-call" title="This call is sharing a tab"
++          @mousedown="${this.onAudioMousedown_}"
++          @click="${this.onCallClick_}">${icon('onAir', 10)}</button>
++    ` : ''}
+     ${this.sharing_ || this.canShare_ ? html`
+       <button class="fav-share ${this.sharing_ ? 'on' : ''}"
+           title="${this.sharing_ ? 'Sharing this tab' : 'Share this tab instead'}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/fav.ts b/chrome/browser/resources/webui_browser/meridian/fav.ts
+index 537eddcf45..2bec142f0c 100644
+--- a/chrome/browser/resources/webui_browser/meridian/fav.ts
++++ b/chrome/browser/resources/webui_browser/meridian/fav.ts
+@@ -42,6 +42,7 @@ export class MeridianFavElement extends CrLitElement {
+       audioIcon_: {state: true, type: String},
+       sharing_: {state: true, type: Boolean},
+       canShare_: {state: true, type: Boolean},
++      call_: {state: true, type: Boolean},
+     };
+   }
+ 
+@@ -58,6 +59,8 @@ export class MeridianFavElement extends CrLitElement {
+   protected accessor sharing_: boolean = false;
+   // Chromium would move the share here (asked on hover).
+   protected accessor canShare_: boolean = false;
++  // The tab of a call that shares another tab.
++  protected accessor call_: boolean = false;
+ 
+   override willUpdate(changed: PropertyValues<this>) {
+     super.willUpdate(changed);
+@@ -72,6 +75,7 @@ export class MeridianFavElement extends CrLitElement {
+     this.audioTitle_ = this.audio_ === 'muted' ? 'Unmute Tab' : 'Mute Tab';
+     this.audioIcon_ = this.audio_ === 'muted' ? 'mute' : 'speaker';
+     this.sharing_ = alerts.includes(TabAlertState.kTabCapturing);
++    this.call_ = !!this.host?.isCallTab(this.tab_);
+   }
+ 
+   // Not a press on the tile (which would open the favorite).
+@@ -89,6 +93,10 @@ export class MeridianFavElement extends CrLitElement {
+     this.host?.onShareClick(e, this.tab_!, this.sharing_);
+   }
+ 
++  protected onCallClick_(e: Event) {
++    this.host?.onCallClick(e, this.tab_!);
++  }
++
+   protected onAudioClick_(e: Event) {
+     this.host?.onMuteClick(e, this.tab_!, this.audio_ !== 'muted');
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/icons.ts b/chrome/browser/resources/webui_browser/meridian/icons.ts
+index 95e543d5f2..87d8c00e25 100644
+--- a/chrome/browser/resources/webui_browser/meridian/icons.ts
++++ b/chrome/browser/resources/webui_browser/meridian/icons.ts
+@@ -27,6 +27,7 @@ export type IconName =
+     'split'|
+     'speaker'|
+     'monitor'|
++    'onAir'|
+     'mute'|
+     'search'|
+     'globe'|
+@@ -128,6 +129,8 @@ export function icon(name: IconName, size = 16): TemplateResult {
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M12 4v16"/></svg>`;
+     case 'monitor':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M9 20h6M12 16.5V20"/></svg>`;
++    case 'onAir':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="2"/><path d="M8.2 8.2a5.4 5.4 0 0 0 0 7.6M15.8 8.2a5.4 5.4 0 0 1 0 7.6M5.2 5.2a9.6 9.6 0 0 0 0 13.6M18.8 5.2a9.6 9.6 0 0 1 0 13.6"/></svg>`;
+     case 'speaker':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5.5L7 9H4v6h3l4 3.5z"/><path d="M15 9a4.2 4.2 0 0 1 0 6M17.8 6.5a8 8 0 0 1 0 11"/></svg>`;
+     case 'mute':
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.html.ts b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+index 4877d89d7b..e90ed9720b 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+@@ -45,6 +45,7 @@ ${this.item?.isFolder ? html`
+ ` : ''}
+ ${this.item && !this.item.isFolder ? html`
+   <div class="row pinned ${this.sharing_ ? 'sharing' : ''} ${
++      this.call_ ? 'calling' : ''} ${
+       this.tab_ ? '' : 'unloaded'} ${
+       this.tab_?.isActive ? 'active' : ''} ${this.loading_ ? 'loading' : ''} ${
+       this.asleep_ ? 'asleep' : ''}"
+@@ -69,6 +70,11 @@ ${this.item && !this.item.isFolder ? html`
+       <input class="rename url" .value="${this.item.url}" spellcheck="false"
+           @keydown="${this.onRenameKeydown_}" @blur="${this.onUrlBlur_}">
+     ` : html`<span class="title">${this.title_}</span>`}`}
++    ${this.call_ ? html`
++      <button class="row-btn call" title="This call is sharing a tab"
++          @mousedown="${this.onAudioMousedown_}"
++          @click="${this.onCallClick_}">${icon('onAir', 13)}</button>
++    ` : ''}
+     ${this.sharing_ || this.canShare_ ? html`
+       <button class="row-btn share ${this.sharing_ ? 'on' : ''}"
+           title="${this.sharing_ ? 'Sharing this tab' : 'Share this tab instead'}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.ts b/chrome/browser/resources/webui_browser/meridian/item.ts
+index d5cf3df838..79f1cab362 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.ts
+@@ -51,6 +51,7 @@ export class MeridianItemElement extends CrLitElement {
+       audioIcon_: {state: true, type: String},
+       sharing_: {state: true, type: Boolean},
+       canShare_: {state: true, type: Boolean},
++      call_: {state: true, type: Boolean},
+     };
+   }
+ 
+@@ -77,6 +78,8 @@ export class MeridianItemElement extends CrLitElement {
+   protected accessor sharing_: boolean = false;
+   // Chromium would move the share here (asked on hover).
+   protected accessor canShare_: boolean = false;
++  // The tab of a call that shares another tab.
++  protected accessor call_: boolean = false;
+ 
+   override willUpdate(changed: PropertyValues<this>) {
+     super.willUpdate(changed);
+@@ -99,6 +102,7 @@ export class MeridianItemElement extends CrLitElement {
+     this.audioTitle_ = this.audio_ === 'muted' ? 'Unmute Tab' : 'Mute Tab';
+     this.audioIcon_ = this.audio_ === 'muted' ? 'mute' : 'speaker';
+     this.sharing_ = alerts.includes(TabAlertState.kTabCapturing);
++    this.call_ = !!this.host?.isCallTab(this.tab_);
+     this.title_ = this.tab_ && this.away_ ?
+         this.tab_.title :
+         item.title || this.tab_?.title || item.url;
+@@ -135,6 +139,10 @@ export class MeridianItemElement extends CrLitElement {
+     this.host?.onShareClick(e, this.tab_!, this.sharing_);
+   }
+ 
++  protected onCallClick_(e: Event) {
++    this.host?.onCallClick(e, this.tab_!);
++  }
++
+   protected onAudioClick_(e: Event) {
+     this.host?.onMuteClick(e, this.tab_!, this.audio_ !== 'muted');
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/rows.css b/chrome/browser/resources/webui_browser/meridian/rows.css
+index eb6c2b97d0..a7cf64df3d 100644
+--- a/chrome/browser/resources/webui_browser/meridian/rows.css
++++ b/chrome/browser/resources/webui_browser/meridian/rows.css
+@@ -125,6 +125,38 @@ button {
+   box-shadow: inset 0 0 0 1.5px var(--meridian-sharing);
+ }
+ 
++/* The call that shares a tab: an on-air mark, a softer ring and a
++   wash of the same red, so the two ends of the share read apart. */
++.row .call {
++  display: inline-flex;
++  color: var(--meridian-sharing);
++}
++
++.row.calling,
++.row.calling.active,
++.fav.calling,
++.fav.calling.active {
++  box-shadow: inset 0 0 0 1px
++      color-mix(in srgb, var(--meridian-sharing) 55%, transparent);
++  background-image: linear-gradient(90deg,
++      color-mix(in srgb, var(--meridian-sharing) 14%, transparent), transparent 70%);
++}
++
++.fav-call {
++  position: absolute;
++  bottom: 3px;
++  left: 3px;
++  width: 16px;
++  height: 16px;
++  border-radius: 8px;
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  background: var(--meridian-surface);
++  color: var(--meridian-sharing);
++  box-shadow: 0 0 0 0.5px var(--meridian-border);
++}
++
+ .fav-share {
+   position: absolute;
+   top: 3px;
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+index f43c88853b..e7c63baef7 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+@@ -57,17 +57,20 @@ export function getHtml(this: MeridianSidebarElement) {
+           <meridian-tab-row half .tab="${r.start}" .host="${this}"
+               .agentTab="${this.agentTab_}" .renaming="${this.renaming_}"
+               ?asleep="${this.isAsleep(r.start)}"
++              ?call="${this.isCallTab(r.start)}"
+               ?selected="${this.selected_.includes(r.start.id)}">
+           </meridian-tab-row>
+           <meridian-tab-row half .tab="${r.end}" .host="${this}"
+               .agentTab="${this.agentTab_}" .renaming="${this.renaming_}"
+               ?asleep="${this.isAsleep(r.end)}"
++              ?call="${this.isCallTab(r.end)}"
+               ?selected="${this.selected_.includes(r.end.id)}">
+           </meridian-tab-row>
+         </div>` : html`
+         <meridian-tab-row .tab="${r.start}" .host="${this}"
+             .agentTab="${this.agentTab_}" .renaming="${this.renaming_}"
+             ?asleep="${this.isAsleep(r.start)}"
++              ?call="${this.isCallTab(r.start)}"
+             ?selected="${this.selected_.includes(r.start.id)}">
+         </meridian-tab-row>`}`)}
+     </div>
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 6425518894..6b54d3349c 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -250,6 +250,9 @@ export class MeridianSidebarElement extends CrLitElement implements
+   private swipe_ = {acc: 0, tracking: false, locked: false, idle: 0};
+ 
+   private order_ = new Map<NodeId, number>();
++  // During a share: the calls' tabs, and which tabs were on air when asked.
++  private callTabs_ = new Set<NodeId>();
++  private shareKey_ = '';
+   // When each tab was last the active one (the command bar's latest tabs).
+   private lastActive_ = new Map<NodeId, number>();
+   // Shorter titles for Today tabs (Tidy Today), until the tab closes.
+@@ -1275,11 +1278,83 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.handler_.setTabMuted(tab.id, muted);
+   }
+ 
++  // The monitor on the tab on air: what's shared and a way to stop; on any
++  // other tab it moves the share there (Chromium's "Share this tab instead").
+   onShareClick(e: Event, tab: Tab, alreadyShared: boolean) {
+     e.stopPropagation();
+     if (!alreadyShared) {
+       this.handler_.shareTabInstead(tab.id);
++      return;
++    }
++    this.openShareMenu_(e as MouseEvent, [
++      {label: 'Sharing this tab', header: true},
++      ...this.goToCallEntries_(),
++      {label: 'Stop sharing', icon: 'x', danger: true,
++       action: () => this.handler_.stopTabSharing(tab.id)},
++    ]);
++  }
++
++  // The call that shares a tab: which tab is on air, and a way to stop.
++  onCallClick(e: Event, tab: Tab) {
++    e.stopPropagation();
++    const shared = [...this.tabs_.values()].filter(
++        t => t.alertStates?.includes(TabAlertState.kTabCapturing));
++    this.openShareMenu_(e as MouseEvent, [
++      {label: 'Sharing a tab from this call', header: true},
++      ...shared.map(t => ({
++        label: `Show ${t.title || t.url}`,
++        icon: 'monitor' as const,
++        action: () => this.tabStripService_.activateTab(t.id),
++      })),
++      {label: 'Stop sharing', icon: 'x', danger: true,
++       action: () => this.handler_.stopTabSharing(tab.id)},
++    ]);
++  }
++
++  private goToCallEntries_(): MenuEntry[] {
++    return [...this.callTabs_].map(id => this.tabs_.get(id))
++        .filter((t): t is Tab => !!t)
++        .map(t => ({
++          label: `Back to ${t.title || t.url}`,
++          icon: 'onAir' as const,
++          action: () => this.tabStripService_.activateTab(t.id),
++        }));
++  }
++
++  // Opened under the button, like a row's own menu.
++  private openShareMenu_(e: MouseEvent, entries: MenuEntry[]) {
++    const r = (e.currentTarget as HTMLElement|null)?.getBoundingClientRect();
++    e.preventDefault();
++    this.menu_ = {x: r ? r.left : e.clientX, y: r ? r.bottom + 4 : e.clientY,
++                  entries, sel: -1, sub: null};
++  }
++
++  // The tab of a call that shares another tab right now.
++  isCallTab(tab: Tab|null): boolean {
++    return !!tab && this.callTabs_.has(tab.id);
++  }
++
++  // Which tabs share another one: asked when the tab on air changes (the
++  // call's own capture can land a moment after the shared tab's alert).
++  private refreshCallTabs_(key: string, tries = 4) {
++    if (!key) {
++      if (this.callTabs_.size) {
++        this.callTabs_ = new Set();
++        this.rev_++;
++      }
++      return;
+     }
++    this.handler_.callTabs().then(({tabIds}) => {
++      if (key !== this.shareKey_) {
++        return;
++      }
++      if (!tabIds.length && tries > 1) {
++        setTimeout(() => this.refreshCallTabs_(key, tries - 1), 400);
++        return;
++      }
++      this.callTabs_ = new Set(tabIds);
++      this.rev_++;
++    });
+   }
+ 
+   // Asked when the pointer comes to a row, only during a share.
+@@ -2008,6 +2083,12 @@ export class MeridianSidebarElement extends CrLitElement implements
+     const shared = (t?: Tab|null) =>
+         !!t?.alertStates?.includes(TabAlertState.kTabCapturing);
+     this.toggleAttribute('tab-sharing', [...this.tabs_.values()].some(shared));
++    const shareKey = [...this.tabs_.values()].filter(shared).map(t => t.id)
++                         .sort().join(',');
++    if (shareKey !== this.shareKey_) {
++      this.shareKey_ = shareKey;
++      this.refreshCallTabs_(shareKey);
++    }
+     const onScreen = shared(active);
+     if (onScreen !== this.sharedOnScreen_) {
+       this.sharedOnScreen_ = onScreen;
+diff --git a/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts b/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
+index 87fe8eab2e..4979bf000d 100644
+--- a/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
+@@ -11,6 +11,7 @@ export function getHtml(this: MeridianTabRowElement) {
+   return html`<!--_html_template_start_-->
+ ${this.tab ? html`
+   <div class="row tab ${this.sharing_ ? 'sharing' : ''} ${
++      this.call ? 'calling' : ''} ${
+       this.tab.isActive ? 'active' : ''} ${
+       this.loading_ ? 'loading' : ''} ${
+       this.asleep ? 'asleep' : ''}" draggable="true"
+@@ -28,6 +29,11 @@ ${this.tab ? html`
+           spellcheck="false" @keydown="${this.onRenameKeydown_}"
+           @blur="${this.onRenameBlur_}">
+     ` : html`<span class="title">${this.tab.title || this.tab.url}</span>`}
++    ${this.call ? html`
++      <button class="row-btn call" title="This call is sharing a tab"
++          @mousedown="${this.onAudioMousedown_}"
++          @click="${this.onCallClick_}">${icon('onAir', 13)}</button>
++    ` : ''}
+     ${this.sharing_ || this.canShare_ ? html`
+       <button class="row-btn share ${this.sharing_ ? 'on' : ''}"
+           title="${this.sharing_ ? 'Sharing this tab' : 'Share this tab instead'}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/tab_row.ts b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+index 2f7e82abcd..77d142c6d1 100644
+--- a/chrome/browser/resources/webui_browser/meridian/tab_row.ts
++++ b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+@@ -41,6 +41,7 @@ export class MeridianTabRowElement extends CrLitElement {
+       selected: {type: Boolean, reflect: true},
+       // Put to sleep, not loaded again yet.
+       asleep: {type: Boolean, reflect: true},
++      call: {type: Boolean},
+       // What the sidebar is renaming in place ('tab:<id>' when it's this).
+       renaming: {type: String},
+       favicon_: {state: true, type: String},
+@@ -59,6 +60,8 @@ export class MeridianTabRowElement extends CrLitElement {
+   accessor half: boolean = false;
+   accessor selected: boolean = false;
+   accessor asleep: boolean = false;
++  // The tab of a call that shares another tab.
++  accessor call: boolean = false;
+   accessor renaming: string = '';
+   accessor host: MeridianSidebarElement|null = null;
+   protected accessor favicon_: string = '';
+@@ -140,6 +143,10 @@ export class MeridianTabRowElement extends CrLitElement {
+     this.host?.onShareClick(e, this.tab!, this.sharing_);
+   }
+ 
++  protected onCallClick_(e: Event) {
++    this.host?.onCallClick(e, this.tab!);
++  }
++
+   protected onAudioClick_(e: Event) {
+     this.host?.onMuteClick(e, this.tab!, this.audio_ !== 'muted');
+   }
+diff --git a/chrome/browser/ui/views/tab_sharing/tab_sharing_ui_views.cc b/chrome/browser/ui/views/tab_sharing/tab_sharing_ui_views.cc
+index 6b385af02d..ffe4994c40 100644
+--- a/chrome/browser/ui/views/tab_sharing/tab_sharing_ui_views.cc
++++ b/chrome/browser/ui/views/tab_sharing/tab_sharing_ui_views.cc
+@@ -521,6 +521,36 @@ void TabSharingUIViews::ShareInstead(WebContents* contents) {
+   }
+ }
+ 
++// static
++std::vector<WebContents*> TabSharingUIViews::Capturers() {
++  std::vector<WebContents*> out;
++  for (TabSharingUIViews* ui : LiveTabSharingUIs()) {
++    WebContents* capturer = WebContentsFromId(ui->capturer_);
++    if (capturer && ui->shared_tab_ && !ui->stop_callback_.is_null() &&
++        !std::ranges::contains(out, capturer)) {
++      out.push_back(capturer);
++    }
++  }
++  return out;
++}
++
++// static
++bool TabSharingUIViews::StopSharingOf(WebContents* contents) {
++  std::vector<base::WeakPtr<TabSharingUIViews>> hits;
++  for (TabSharingUIViews* ui : LiveTabSharingUIs()) {
++    if (ui->shared_tab_ == contents ||
++        WebContentsFromId(ui->capturer_) == contents) {
++      hits.push_back(ui->weak_factory_.GetWeakPtr());
++    }
++  }
++  for (const auto& ui : hits) {
++    if (ui) {
++      ui->StopSharing("Meridian sidebar: Stop sharing");
++    }
++  }
++  return !hits.empty();
++}
++
+ bool TabSharingUIViews::IsSharingAllowedByPolicy(WebContents* contents) const {
+   bool is_sharing_allowed_by_policy =
+       !capturer_restricted_to_same_origin_ ||
+diff --git a/chrome/browser/ui/views/tab_sharing/tab_sharing_ui_views.h b/chrome/browser/ui/views/tab_sharing/tab_sharing_ui_views.h
+index fdd086d5c9..2b3bc3a11e 100644
+--- a/chrome/browser/ui/views/tab_sharing/tab_sharing_ui_views.h
++++ b/chrome/browser/ui/views/tab_sharing/tab_sharing_ui_views.h
+@@ -87,6 +87,10 @@ class TabSharingUIViews : public TabSharingUI,
+   // Meridian: whether a share may move to |contents|, and moving it there.
+   static bool CanShareInstead(content::WebContents* contents);
+   static void ShareInstead(content::WebContents* contents);
++  // Meridian: the tabs that share another tab (the call), and ending every
++  // share |contents| is part of, as the shared tab or as the call.
++  static std::vector<content::WebContents*> Capturers();
++  static bool StopSharingOf(content::WebContents* contents);
+ 
+   // TabSharingUI:
+   // Returns the object that coordinates UMA logging from multiple infobars,
