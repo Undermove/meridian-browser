@@ -8,4 +8,4 @@ meridianbrowser.app is served from `docs/` (GitHub Pages). Most of its pages are
 - `guides/<slug>.html`: English guides, each starting with a JSON comment (title, description, h1…). Each becomes `docs/<slug>/index.html` in `guide_template.html`. A Russian version in `guides/ru/<slug>.html` becomes `docs/ru/<slug>/index.html`, and the two link to each other.
 - `docs/sitemap.xml` lists all of them.
 
-Edit the files here and run the build; don't edit the built pages in `docs/`. `docs/privacy.html`, the images and `install.sh` are hand-written in `docs/`.
+Edit the files here and run the build; don't edit the built pages in `docs/`. `docs/privacy.html`, the images and `install.sh` are hand-written in `docs/`. So is `docs/demo/plain.html`: a deliberately plain page (browser-default styles, `noindex`, not in the sitemap) that the browser's "Give this site a new look" card opens. Keep it plain and keep its address.
