@@ -1,0 +1,295 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 13:56:08 +0400
+Subject: [PATCH] Meridian: a sleeping tab looks asleep in the sidebar
+
+A tab put to sleep (discarded) shows a dimmed favicon with a small moon in
+its corner, in Today and as a pinned tab, until it loads again. The state
+comes with the sidebar's tab info (TabInfo.asleep, appended), sent again
+when a tab is put to sleep or starts loading.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar.mojom         |  2 ++
+ chrome/browser/meridian/sidebar_handler.cc    | 32 +++++++++++++++++--
+ chrome/browser/meridian/sidebar_handler.h     |  5 +++
+ .../webui_browser/meridian/item.html.ts       |  4 ++-
+ .../resources/webui_browser/meridian/item.ts  |  4 +++
+ .../resources/webui_browser/meridian/rows.css | 26 +++++++++++++++
+ .../webui_browser/meridian/sidebar.html.ts    |  3 ++
+ .../webui_browser/meridian/sidebar.ts         |  5 +++
+ .../webui_browser/meridian/tab_row.html.ts    |  4 ++-
+ .../webui_browser/meridian/tab_row.ts         |  3 ++
+ 10 files changed, 83 insertions(+), 5 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index c44a160c4b..10c82edb88 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -97,6 +97,8 @@ struct TabInfo {
+   // A Peek card over `opener_id` (see TabData::peek()).
+   bool peek;
+   tabs_api.mojom.NodeId? opener_id;
++  // Put to sleep (discarded) and not loaded again yet: the sidebar dims it.
++  bool asleep;
+ };
+ 
+ // Two tabs side by side (Chromium split tabs), `start` on the left.
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 6fc5c6e0da..6b0be2ce2b 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -463,6 +463,22 @@ void SidebarHandler::OnTabChangedAt(tabs::TabInterface* tab,
+   if (!peek_candidates_.empty()) {
+     MaybePeek(tab);
+   }
++  // Put to sleep, or loading again: the sidebar's sleeping look.
++  if (IsAsleep(tab) != asleep_.contains(tab->GetHandle().raw_value())) {
++    ScheduleNotify();
++  }
++}
++
++// static
++bool SidebarHandler::IsAsleep(tabs::TabInterface* tab) {
++  content::WebContents* contents = tab->GetContents();
++  if (!contents || contents->IsLoading()) {
++    return false;
++  }
++  auto* unit =
++      resource_coordinator::TabLifecycleUnitExternal::FromWebContents(contents);
++  return (unit && unit->GetTabState() == ::mojom::LifecycleUnitState::DISCARDED) ||
++         contents->WasDiscarded();
+ }
+ 
+ void SidebarHandler::ExpandPeek(const tabs_api::NodeId& tab_id) {
+@@ -534,9 +550,13 @@ void SidebarHandler::PutTabToSleep(const tabs_api::NodeId& tab_id,
+     std::move(callback).Run("form");
+     return;
+   }
+-  std::move(callback).Run(
+-      unit->DiscardTab(::mojom::LifecycleUnitDiscardReason::EXTERNAL) ?
+-          "" : "failed");
++  const bool slept =
++      unit->DiscardTab(::mojom::LifecycleUnitDiscardReason::EXTERNAL);
++  // Its sleeping look in the sidebar (a discard may not change the row).
++  if (slept) {
++    ScheduleNotify();
++  }
++  std::move(callback).Run(slept ? "" : "failed");
+ }
+ 
+ void SidebarHandler::ToggleReader(ToggleReaderCallback callback) {
+@@ -3124,6 +3144,12 @@ mojom::SidebarStatePtr SidebarHandler::BuildState() {
+     if (tabs::TabInterface* opener = model()->GetOpenerOfTabAt(i)) {
+       info->opener_id = tabs_api::NodeId::FromTabHandle(opener->GetHandle());
+     }
++    info->asleep = IsAsleep(tab);
++    if (info->asleep) {
++      asleep_.insert(tab->GetHandle().raw_value());
++    } else {
++      asleep_.erase(tab->GetHandle().raw_value());
++    }
+     state->tabs.push_back(std::move(info));
+     // Each split once, from its first tab.
+     std::optional<split_tabs::SplitTabId> split_id = tab->GetSplit();
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 04055b3b6a..b98574095c 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -7,6 +7,7 @@
+ 
+ #include <map>
+ #include <memory>
++#include <set>
+ #include <string>
+ 
+ #include "base/memory/raw_ptr.h"
+@@ -382,6 +383,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void OnSplitTabChanged(const SplitTabChange& change) override;
+   void OnTabChangedAt(tabs::TabInterface* tab,
+                       TabChangeType change_type) override;
++  // Put to sleep (discarded) and not loading again.
++  static bool IsAsleep(tabs::TabInterface* tab);
+ 
+  private:
+   // What the last ApplySetup replaced.
+@@ -395,6 +398,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+     std::string mode;
+   };
+   std::optional<SetupUndo> setup_undo_;
++  // The tabs the last state sent showed asleep (TabHandle raw values).
++  std::set<int32_t> asleep_;
+ 
+   // mission::MissionControl::Observer:
+   void OnMissionChanged(const base::DictValue& snapshot) override;
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.html.ts b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+index 274c65af9a..b6591269f1 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+@@ -38,7 +38,8 @@ ${this.item?.isFolder ? html`
+ ${this.item && !this.item.isFolder ? html`
+   <div class="row pinned ${this.sharing_ ? 'sharing' : ''} ${
+       this.tab_ ? '' : 'unloaded'} ${
+-      this.tab_?.isActive ? 'active' : ''} ${this.loading_ ? 'loading' : ''}"
++      this.tab_?.isActive ? 'active' : ''} ${this.loading_ ? 'loading' : ''} ${
++      this.asleep_ ? 'asleep' : ''}"
+       style="--depth:${this.depth}"
+       draggable="true" data-item="${this.item.id}"
+       data-parent="${this.parentId}" title="${this.title_}"
+@@ -51,6 +52,7 @@ ${this.item && !this.item.isFolder ? html`
+     ` : ''}
+     <span class="favicon">
+       <img src="${this.favicon_}" width="16" height="16" alt="">
++      ${this.asleep_ ? html`<span class="moon" title="Asleep: it reloads when you open it">${icon('moon', 9)}</span>` : ''}
+     </span>
+     ${this.renaming === this.item.id ? html`
+       <input class="rename" .value="${this.item.title}" spellcheck="false"
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.ts b/chrome/browser/resources/webui_browser/meridian/item.ts
+index 6756f504df..4bf5346bd9 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.ts
+@@ -43,6 +43,7 @@ export class MeridianItemElement extends CrLitElement {
+       tab_: {state: true, type: Object},
+       away_: {state: true, type: Boolean},
+       favicon_: {state: true, type: String},
++      asleep_: {state: true, type: Boolean},
+       title_: {state: true, type: String},
+       loading_: {state: true, type: Boolean},
+       audio_: {state: true, type: String},
+@@ -66,6 +67,8 @@ export class MeridianItemElement extends CrLitElement {
+   protected accessor favicon_: string = '';
+   protected accessor title_: string = '';
+   protected accessor loading_: boolean = false;
++  // Its tab is asleep (put to sleep, not loaded again).
++  protected accessor asleep_: boolean = false;
+   // The speaker of its open tab: '' (silent), 'playing' or 'muted'.
+   protected accessor audio_: string = '';
+   protected accessor audioTitle_: string = '';
+@@ -85,6 +88,7 @@ export class MeridianItemElement extends CrLitElement {
+     this.tab_ = host.liveTab(item.id);
+     this.away_ = host.awayFromHome(item, this.tab_);
+     this.favicon_ = host.faviconFor(item, this.tab_);
++    this.asleep_ = host.isAsleep(this.tab_);
+     this.loading_ = !!this.tab_ &&
+         (this.tab_.networkState === TabNetworkState.kLoading ||
+          this.tab_.networkState === TabNetworkState.kWaiting);
+diff --git a/chrome/browser/resources/webui_browser/meridian/rows.css b/chrome/browser/resources/webui_browser/meridian/rows.css
+index e25cc28c31..f71a87baf9 100644
+--- a/chrome/browser/resources/webui_browser/meridian/rows.css
++++ b/chrome/browser/resources/webui_browser/meridian/rows.css
+@@ -323,6 +323,32 @@ input.rename {
+   box-shadow: 3px 0 0 var(--meridian-space);
+ }
+ 
++/* Put to sleep: the favicon dims, with a small moon at its corner, until
++   the tab loads again. */
++.row.asleep .favicon {
++  position: relative;
++  overflow: visible;
++}
++
++.row.asleep .favicon img {
++  opacity: 0.45;
++  filter: grayscale(0.7);
++}
++
++.row.asleep .moon {
++  position: absolute;
++  right: -3px;
++  bottom: -3px;
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  width: 11px;
++  height: 11px;
++  border-radius: 50%;
++  background: var(--meridian-surface);
++  color: var(--meridian-text-muted);
++}
++
+ /* Loading: the favicon pulses (Electron: .row.loading .favicon). */
+ .row.loading .favicon {
+   animation: pulse 1s ease-in-out infinite;
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+index 112bf77366..f43c88853b 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+@@ -56,15 +56,18 @@ export function getHtml(this: MeridianSidebarElement) {
+             data-split="${r.key}">
+           <meridian-tab-row half .tab="${r.start}" .host="${this}"
+               .agentTab="${this.agentTab_}" .renaming="${this.renaming_}"
++              ?asleep="${this.isAsleep(r.start)}"
+               ?selected="${this.selected_.includes(r.start.id)}">
+           </meridian-tab-row>
+           <meridian-tab-row half .tab="${r.end}" .host="${this}"
+               .agentTab="${this.agentTab_}" .renaming="${this.renaming_}"
++              ?asleep="${this.isAsleep(r.end)}"
+               ?selected="${this.selected_.includes(r.end.id)}">
+           </meridian-tab-row>
+         </div>` : html`
+         <meridian-tab-row .tab="${r.start}" .host="${this}"
+             .agentTab="${this.agentTab_}" .renaming="${this.renaming_}"
++            ?asleep="${this.isAsleep(r.start)}"
+             ?selected="${this.selected_.includes(r.start.id)}">
+         </meridian-tab-row>`}`)}
+     </div>
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index feac27314c..1b65020ba0 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -552,6 +552,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+     }
+   }
+ 
++  // Put to sleep and not loaded again: the row looks asleep.
++  isAsleep(tab: Tab|null): boolean {
++    return !!tab && !!this.state_?.tabs.find(t => t.tabId === tab.id)?.asleep;
++  }
++
+   faviconFor(item: Item|null, tab: Tab|null): string {
+     if (tab && tab.favicon.dataUrl) {
+       return tab.favicon.dataUrl;
+diff --git a/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts b/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
+index fbf98f2bc8..87fe8eab2e 100644
+--- a/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
+@@ -12,7 +12,8 @@ export function getHtml(this: MeridianTabRowElement) {
+ ${this.tab ? html`
+   <div class="row tab ${this.sharing_ ? 'sharing' : ''} ${
+       this.tab.isActive ? 'active' : ''} ${
+-      this.loading_ ? 'loading' : ''}" draggable="true"
++      this.loading_ ? 'loading' : ''} ${
++      this.asleep ? 'asleep' : ''}" draggable="true"
+       data-tab="${this.tab.id}" title="${this.tab.title}"
+       @pointerenter="${this.onRowPointerenter_}"
+       @mousedown="${this.onRowMousedown_}"
+@@ -20,6 +21,7 @@ ${this.tab ? html`
+       @contextmenu="${this.onRowContextmenu_}">
+     <span class="favicon">
+       <img src="${this.favicon_}" width="16" height="16" alt="">
++      ${this.asleep ? html`<span class="moon" title="Asleep: it reloads when you open it">${icon('moon', 9)}</span>` : ''}
+     </span>
+     ${this.renaming_() ? html`
+       <input class="rename" .value="${this.tab.title || this.tab.url}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/tab_row.ts b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+index e924cf4f27..2f7e82abcd 100644
+--- a/chrome/browser/resources/webui_browser/meridian/tab_row.ts
++++ b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+@@ -39,6 +39,8 @@ export class MeridianTabRowElement extends CrLitElement {
+       half: {type: Boolean, reflect: true},
+       // Picked with ⌘-click / ⇧-click, with others.
+       selected: {type: Boolean, reflect: true},
++      // Put to sleep, not loaded again yet.
++      asleep: {type: Boolean, reflect: true},
+       // What the sidebar is renaming in place ('tab:<id>' when it's this).
+       renaming: {type: String},
+       favicon_: {state: true, type: String},
+@@ -56,6 +58,7 @@ export class MeridianTabRowElement extends CrLitElement {
+   accessor agent: boolean = false;
+   accessor half: boolean = false;
+   accessor selected: boolean = false;
++  accessor asleep: boolean = false;
+   accessor renaming: string = '';
+   accessor host: MeridianSidebarElement|null = null;
+   protected accessor favicon_: string = '';

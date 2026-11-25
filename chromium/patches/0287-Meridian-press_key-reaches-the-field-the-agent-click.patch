@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 13:48:55 +0400
+Subject: [PATCH] Meridian: press_key reaches the field the agent clicked even
+ when the click left nothing focused
+
+On Windows a click by an agent in a window in the background could leave
+no element focused, so press_key's chords reached nothing. A left or double
+click (and type_text) now remembers the focusable element it hit; before
+press_key, when nothing has focus (or that element still has it), the page
+focuses it again. Focus the page itself moved elsewhere is left alone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/agent/agent_page.js   | 27 +++++++++++
+ .../browser/meridian/agent/agent_service.cc   | 45 ++++++++++++++-----
+ 2 files changed, 61 insertions(+), 11 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_page.js b/chrome/browser/meridian/agent/agent_page.js
+index 9d426f83bf..86a533f4f5 100644
+--- a/chrome/browser/meridian/agent/agent_page.js
++++ b/chrome/browser/meridian/agent/agent_page.js
+@@ -261,10 +261,37 @@
+       return 'value' in el && typeof el.value === 'string' ? el.value : (el.innerText || '').replace(/\n$/, '');
+     },
+ 
++    // press_key goes to the element the agent's last click or type_text
++    // left focused in this tab. A click in a window in the background (seen
++    // on Windows) may not move focus at all: the keys then went nowhere.
++    rememberKeyTarget() {
++      let el = window.__meridianTarget;
++      const focusable = (e) => e && e.nodeType === 1 && (e.isContentEditable || e.tabIndex >= 0 ||
++          /^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(e.tagName) || (e.tagName === 'A' && e.hasAttribute('href')));
++      while (el && !focusable(el)) el = el.parentElement || (el.getRootNode && el.getRootNode().host) || null;
++      window.__meridianKeyTarget = el || null;
++      return !!el;
++    },
++
++    // Before press_key: that element again when nothing has focus (or it
++    // still has); never away from where the page itself moved focus.
++    focusForKeys() {
++      const el = window.__meridianKeyTarget;
++      if (!el || !el.isConnected) return 'none';
++      let a = document.activeElement;
++      while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
++      if (a === el || !a || a === document.body || a === document.documentElement) {
++        el.focus({preventScroll: true});
++        return 'focused';
++      }
++      return 'page';
++    },
++
+     focusForTyping(clear) {
+       const el = window.__meridianTarget;
+       if (!el) return false;
+       el.focus();
++      this.rememberKeyTarget();
+       if (clear) {
+         if ('value' in el) {
+           el.select?.();
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index 331ae12763..11de7c5739 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -1990,6 +1990,13 @@ void AgentService::Pointer(std::unique_ptr<Call> call, std::string kind) {
+                                           ")",
+                                       base::DoNothing());
+                                 }
++                                // Where press_key's keys go next.
++                                if (kind == "left" || kind == "double") {
++                                  self->RunInPage(
++                                      contents.get(),
++                                      "__meridianAgent.rememberKeyTarget()",
++                                      base::DoNothing());
++                                }
+                                 std::string done_key =
+                                     kind == "hover"    ? "hovered"
+                                     : kind == "right"  ? "right_clicked"
+@@ -2260,21 +2267,37 @@ void AgentService::PressKey(std::unique_ptr<Call> call) {
+                 if (!AgentCanUse(tab->GetContents())) {
+                   return call->Fail("Agents only work on web pages.");
+                 }
+-                std::string name = chord.name;
+                 // To the page's focused element, never the browser's
+-                // shortcuts (Meta+W doesn't close the tab).
+-                PageInput::Run(
+-                    tab->GetContents(), KeyCommands(chord),
++                // shortcuts (Meta+W doesn't close the tab). First the element
++                // the agent's last click or type_text in this tab left
++                // focused, if nothing has focus now: a click in a window in
++                // the background may not have moved focus (Windows).
++                content::WebContents* contents = tab->GetContents();
++                self->RunInPage(
++                    contents, "__meridianAgent.focusForKeys()",
+                     base::BindOnce(
+-                        [](std::unique_ptr<Call> call, std::string name,
+-                           std::string error) {
+-                          if (!error.empty()) {
+-                            return call->Fail(error);
++                        [](base::WeakPtr<content::WebContents> contents,
++                           agent_input::Chord chord,
++                           std::unique_ptr<Call> call, base::Value) {
++                          if (!contents) {
++                            return call->Fail("the tab is gone");
+                           }
+-                          call->Ok(base::Value(
+-                              base::DictValue().Set("pressed", name)));
++                          std::string name = chord.name;
++                          PageInput::Run(
++                              contents.get(), KeyCommands(chord),
++                              base::BindOnce(
++                                  [](std::unique_ptr<Call> call,
++                                     std::string name, std::string error) {
++                                    if (!error.empty()) {
++                                      return call->Fail(error);
++                                    }
++                                    call->Ok(base::Value(
++                                        base::DictValue().Set("pressed", name)));
++                                  },
++                                  std::move(call), name));
+                         },
+-                        std::move(call), name));
++                        contents->GetWeakPtr(), std::move(chord),
++                        std::move(call)));
+               },
+               weak_factory_.GetWeakPtr(), handle, std::move(*chord)));
+ }

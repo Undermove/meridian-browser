@@ -67,3 +67,27 @@ test('Reader from the site controls and the command bar: the article alone, then
     await b.eval(`app.$.tabstrip.handler_.toggleReader().then((r) => r.state)`).then((s) => assert.equal(s, 'none'));
   } finally { await b.close(); server.close(); }
 });
+
+// Once in a full run Exit Reader stayed in the reading view: in and out several times, each exit
+// lands on the page itself (history back, else the page loaded again within a second).
+test('Reader in and out again and again: every exit lands on the page', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(req.url === '/article' ? ARTICLE : '<!doctype html><title>Empty</title>');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const page = `http://127.0.0.1:${server.address().port}/article`;
+  const b = await launch([page]);
+  const active = `[...app.$.tabstrip.tabs_.values()].find((t) => t.isActive)?.url || ''`;
+  try {
+    await b.waitFor(`app.shadowRoot.querySelector('#urlPill .host')?.textContent === '127.0.0.1'`, 15000);
+    for (let i = 0; i < 4; i++) {
+      assert.equal(await b.eval(`app.$.tabstrip.handler_.toggleReader().then((r) => r.state)`), 'on', `in, round ${i + 1}`);
+      await b.waitFor(`(${active}).startsWith('chrome-distiller://')`, 20000, active);
+      // Out at once, as a person clicking twice quickly does on some rounds.
+      if (i % 2) await sleep(1500);
+      assert.equal(await b.eval(`app.$.tabstrip.handler_.toggleReader().then((r) => r.state)`), 'off', `out, round ${i + 1}`);
+      await b.waitFor(`(${active}) === ${JSON.stringify(page)}`, 15000, active);
+    }
+  } finally { await b.close(); server.close(); }
+});

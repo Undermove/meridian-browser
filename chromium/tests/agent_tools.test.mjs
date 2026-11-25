@@ -121,6 +121,7 @@ test('Enter sends a chat message in a tab in the background (contenteditable and
 // that opens only on hover.
 const INPUTS = `<title>Inputs</title>
 <input id=field aria-label="Field" value="abc">
+<input id=other aria-label="Other">
 <button id=target style="width:120px;height:40px">Target</button>
 <div id=menu style="width:120px;height:40px;border:1px solid">Menu<ul id=items hidden><li>Item</li></ul></div>
 <script>
@@ -130,6 +131,7 @@ const INPUTS = `<title>Inputs</title>
   t.addEventListener('dblclick', () => events.push('dblclick'));
   t.addEventListener('contextmenu', (e) => { e.preventDefault(); events.push('contextmenu:' + e.button); });
   document.getElementById('field').addEventListener('keydown', (e) => events.push('key:' + [e.metaKey && 'Meta', e.ctrlKey && 'Control', e.altKey && 'Alt', e.shiftKey && 'Shift', e.key].filter(Boolean).join('+') + (e.isTrusted ? '' : ':untrusted')));
+  document.getElementById('other').addEventListener('keydown', (e) => events.push('other:' + e.key));
   const m = document.getElementById('menu');
   m.addEventListener('mouseenter', () => { document.getElementById('items').hidden = false; events.push('hover'); });
 </script>`;
@@ -152,6 +154,15 @@ test('key chords reach the page, right and double clicks reach its handlers, hov
     }
     r = await mcp.call('press_key', { tab_id, key: 'Meta+Nope' });
     assert.ok(r.error, 'an unknown key is an error');
+    // A click that left nothing focused (a window in the background on Windows): the keys still
+    // go to the field the agent clicked.
+    await page.eval(`document.activeElement.blur()`);
+    r = await mcp.call('press_key', { tab_id, key: 'Alt+ArrowRight' });
+    assert.ok(!r.error, r.error);
+    // Where the page itself moved focus, they go there.
+    await page.eval(`document.getElementById('other').focus()`);
+    r = await mcp.call('press_key', { tab_id, key: 'Escape' });
+    assert.ok(!r.error, r.error);
     r = await mcp.call('click', { tab_id, selector: '#target', button: 'right' });
     assert.ok(!r.error, r.error);
     r = await mcp.call('click', { tab_id, selector: '#target', double: true });
@@ -162,9 +173,10 @@ test('key chords reach the page, right and double clicks reach its handlers, hov
     assert.ok(!r.error, r.error);
     await page.waitFor(`!document.getElementById('items').hidden`, 3000);
     const ev = await events();
-    for (const want of ['key:Meta+a', 'key:Control+Shift+Tab', 'key:Alt+ArrowLeft', 'key:Shift+Enter', 'contextmenu:2', 'dblclick', 'hover']) {
+    for (const want of ['key:Meta+a', 'key:Control+Shift+Tab', 'key:Alt+ArrowLeft', 'key:Shift+Enter', 'key:Alt+ArrowRight', 'other:Escape', 'contextmenu:2', 'dblclick', 'hover']) {
       assert.ok(ev.some((e) => e.toLowerCase() === want.toLowerCase()), `${want} in ${JSON.stringify(ev)}`);
     }
     assert.ok(!ev.some((e) => e.endsWith(':untrusted')), `all input is real: ${JSON.stringify(ev)}`);
+    assert.ok(!ev.includes('key:Escape'), `focus the page moved stays: ${JSON.stringify(ev)}`);
   } finally { await done(); s.server.close(); }
 });

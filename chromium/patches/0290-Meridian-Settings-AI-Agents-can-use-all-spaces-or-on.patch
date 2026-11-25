@@ -1,0 +1,405 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 14:01:58 +0400
+Subject: [PATCH] Meridian: Settings > AI > Agents can use: all spaces or only
+ some
+
+"All spaces" (the default) or "Only these", with a switch per space
+("Only these" starts with the space on screen). Agents don't see the
+others: list_spaces, list_tabs and search_tabs leave them out (favorites,
+in every space, stay), and a tool given one of their tabs or pinned items,
+or working on the current tab there, is refused with a message naming the
+space and the setting. open_tab into a refused space fails; with no space
+named it opens in one agents may use. Prefs meridian.agent_spaces and
+meridian.agent_space_ids on the main profile; Settings fields appended.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/meridian/agent/agent_service.cc   | 112 +++++++++++++++++-
+ chrome/browser/meridian/agent/agent_service.h |   8 ++
+ chrome/browser/meridian/prefs.cc              |   2 +
+ chrome/browser/meridian/prefs.h               |   4 +
+ chrome/browser/meridian/sidebar.mojom         |   3 +
+ chrome/browser/meridian/sidebar_handler.cc    |  16 +++
+ .../webui_browser/meridian/settings.html.ts   |  30 +++++
+ .../webui_browser/meridian/settings.ts        |  22 ++++
+ .../webui_browser/meridian/settings_index.ts  |   2 +
+ 9 files changed, 194 insertions(+), 5 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index 11de7c5739..c0a4524ca0 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -719,6 +719,9 @@ struct AgentService::Call {
+   // The document this call started on: an approval holds for it alone.
+   mutable base::WeakPtr<content::WebContents> page;
+   mutable std::optional<content::WeakDocumentPtr> document;
++  // The tab it named is in a space agents can't use (its name): "no such
++  // tab" says so.
++  mutable std::string space_refused;
+ 
+   bool StillOnSameDocument() const {
+     if (!document) {
+@@ -749,7 +752,14 @@ struct AgentService::Call {
+   }
+   void Fail(const std::string& error) {
+     base::DictValue response;
+-    response.Set("error", error);
++    response.Set("error",
++                 !space_refused.empty() && error.starts_with("no such tab")
++                     ? "That tab is in the space “" + space_refused +
++                           "”, which agents can't use: the person allows "
++                           "only some spaces (Meridian Settings > AI > "
++                           "Agents can use). Work in the tabs list_tabs "
++                           "shows."
++                     : error);
+     std::move(reply).Run(std::move(response));
+   }
+ };
+@@ -1038,7 +1048,69 @@ tabs::TabInterface* AgentService::TabFor(const Call& call) {
+   return tab && AgentCanUse(tab->GetContents()) ? tab : nullptr;
+ }
+ 
++bool AgentService::SpaceAllowed(const std::string& space_id) {
++  PrefService* prefs = profile_->GetPrefs();
++  return space_id.empty() || prefs->GetString(prefs::kAgentSpaces) != "only" ||
++         prefs->GetList(prefs::kAgentSpaceIds).contains(space_id);
++}
++
++std::string AgentService::SpaceOfTab(tabs::TabInterface* tab) {
++  SidebarService* service = SidebarServiceFactory::GetForProfile(profile_);
++  const TabData* data = TabData::Get(tab->GetContents());
++  if (data && !data->item_id().empty()) {
++    // A favorite is in every space.
++    std::function<bool(const std::vector<Item>&)> has =
++        [&](const std::vector<Item>& items) {
++          for (const Item& item : items) {
++            if (item.id == data->item_id() ||
++                (item.is_folder && has(item.children))) {
++              return true;
++            }
++          }
++          return false;
++        };
++    if (has(service->favorites())) {
++      return std::string();
++    }
++  }
++  return data && !data->space_id().empty() ? data->space_id()
++                                           : service->active_space_id();
++}
++
++std::string AgentService::SpaceOfItem(const std::string& item_id) {
++  SidebarService* service = SidebarServiceFactory::GetForProfile(profile_);
++  std::function<bool(const std::vector<Item>&)> has =
++      [&](const std::vector<Item>& items) {
++        for (const Item& item : items) {
++          if (item.id == item_id || (item.is_folder && has(item.children))) {
++            return true;
++          }
++        }
++        return false;
++      };
++  for (const Space& space : service->spaces()) {
++    if (has(space.pinned)) {
++      return space.id;
++    }
++  }
++  return std::string();
++}
++
+ tabs::TabInterface* AgentService::AnyTabFor(const Call& call) {
++  tabs::TabInterface* tab = AnyTabInAnySpace(call);
++  if (tab) {
++    std::string space = SpaceOfTab(tab);
++    if (!SpaceAllowed(space)) {
++      const Space* s =
++          SidebarServiceFactory::GetForProfile(profile_)->FindSpace(space);
++      call.space_refused = s && !s->name.empty() ? s->name : "another space";
++      return nullptr;
++    }
++  }
++  return tab;
++}
++
++tabs::TabInterface* AgentService::AnyTabInAnySpace(const Call& call) {
+   BrowserWindowInterface* window = Window();
+   if (!window) {
+     return nullptr;
+@@ -1061,6 +1133,12 @@ tabs::TabInterface* AgentService::AnyTabFor(const Call& call) {
+       // Opening it is a change: not for read-only access, and only web
+       // pages.
+       SidebarService* service = SidebarServiceFactory::GetForProfile(profile_);
++      if (std::string space = SpaceOfItem(item); !SpaceAllowed(space)) {
++        const Space* s = service->FindSpace(space);
++        call.space_refused =
++            s && !s->name.empty() ? s->name : "another space";
++        return nullptr;
++      }
+       const Item* found = service ? service->FindItem(item) : nullptr;
+       if (!found || !(found->url.SchemeIsHTTPOrHTTPS()) ||
+           profile_->GetPrefs()->GetString(prefs::kAgentAccess) == "read") {
+@@ -1355,6 +1433,9 @@ void AgentService::ListSpaces(std::unique_ptr<Call> call) {
+   SidebarService* service = SidebarServiceFactory::GetForProfile(profile_);
+   base::ListValue out;
+   for (const Space& space : service->spaces()) {
++    if (!SpaceAllowed(space.id)) {
++      continue;
++    }
+     out.Append(base::DictValue()
+                    .Set("id", space.id)
+                    .Set("name", space.name)
+@@ -1419,7 +1500,7 @@ void AgentService::ListTabs(std::unique_ptr<Call> call) {
+   const std::string* only = call->Str("space_id");
+   walk(service->favorites(), std::string(), "favorite", std::string());
+   for (const Space& space : service->spaces()) {
+-    if (only && *only != space.id) {
++    if ((only && *only != space.id) || !SpaceAllowed(space.id)) {
+       continue;
+     }
+     walk(space.pinned, std::string(), "pinned", space.id);
+@@ -1460,7 +1541,8 @@ void AgentService::SearchTabs(std::unique_ptr<Call> call) {
+       content::WebContents* c = model->GetWebContentsAt(i);
+       std::string title = base::UTF16ToUTF8(c->GetTitle());
+       std::string url = c->GetLastCommittedURL().spec();
+-      if (matches(title, url)) {
++      if (matches(title, url) &&
++          SpaceAllowed(SpaceOfTab(model->GetTabAtIndex(i)))) {
+         out.Append(base::DictValue()
+                        .Set("id", TabId(model->GetTabAtIndex(i)))
+                        .Set("title", title)
+@@ -1486,14 +1568,16 @@ void AgentService::SearchTabs(std::unique_ptr<Call> call) {
+   SidebarService* service = SidebarServiceFactory::GetForProfile(profile_);
+   walk(service->favorites());
+   for (const Space& space : service->spaces()) {
+-    walk(space.pinned);
++    if (SpaceAllowed(space.id)) {
++      walk(space.pinned);
++    }
+   }
+   for (const ArchivedTab& tab :
+        ArchiveServiceFactory::GetForProfile(profile_)->entries()) {
+     if (out.size() >= 100) {
+       break;
+     }
+-    if (matches(tab.title, tab.url.spec())) {
++    if (matches(tab.title, tab.url.spec()) && SpaceAllowed(tab.space_id)) {
+       out.Append(base::DictValue()
+                      .Set("title", tab.title)
+                      .Set("url", tab.url.spec())
+@@ -1703,7 +1787,25 @@ void AgentService::OpenTab(std::unique_ptr<Call> call) {
+                 SidebarServiceFactory::GetForProfile(self->profile_);
+             const std::string* space = call->Str("space_id");
+             if (space && service->FindSpace(*space)) {
++              if (!self->SpaceAllowed(*space)) {
++                return call->Fail(
++                    "agents can't use that space (Meridian Settings > AI > "
++                    "Agents can use); list_spaces shows the ones they can");
++              }
+               service->SetActiveSpace(*space);
++            } else if (!self->SpaceAllowed(service->active_space_id())) {
++              // Opened in a space agents may use, not the one on screen.
++              for (const Space& s : service->spaces()) {
++                if (self->SpaceAllowed(s.id)) {
++                  service->SetActiveSpace(s.id);
++                  break;
++                }
++              }
++              if (!self->SpaceAllowed(service->active_space_id())) {
++                return call->Fail(
++                    "agents can't use any space: the person allows none "
++                    "(Meridian Settings > AI > Agents can use)");
++              }
+             }
+             bool activate = call->input.FindBool("activate").value_or(false);
+             NavigateParams params(window, url, ui::PAGE_TRANSITION_LINK);
+diff --git a/chrome/browser/meridian/agent/agent_service.h b/chrome/browser/meridian/agent/agent_service.h
+index 39aa2e7e04..abaae7e5a1 100644
+--- a/chrome/browser/meridian/agent/agent_service.h
++++ b/chrome/browser/meridian/agent/agent_service.h
+@@ -81,6 +81,14 @@ class AgentService : public KeyedService {
+   tabs::TabInterface* TabFor(const Call& call);
+   // TabFor without the web-pages-only rule (listing, activating, closing).
+   tabs::TabInterface* AnyTabFor(const Call& call);
++  // AnyTabFor whatever space the tab is in.
++  tabs::TabInterface* AnyTabInAnySpace(const Call& call);
++  // Settings > AI > Agents can use: all spaces, or only some ("" — no
++  // space, a favorite — is always fine).
++  bool SpaceAllowed(const std::string& space_id);
++  std::string SpaceOfTab(tabs::TabInterface* tab);
++  // The space whose pinned tabs hold `item_id` ("" for a favorite).
++  std::string SpaceOfItem(const std::string& item_id);
+   void Run(std::unique_ptr<Call> call);
+   // Asks the person in the window when the access level is "ask".
+   void Confirm(std::unique_ptr<Call> call,
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index 12bdf2c2d1..2f22ae0d60 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -29,6 +29,8 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterBooleanPref(kAgentAllowJs, false);
+   registry->RegisterStringPref(kAgentUploads, "ask");
+   registry->RegisterListPref(kAgentUploadSites);
++  registry->RegisterStringPref(kAgentSpaces, "all");
++  registry->RegisterListPref(kAgentSpaceIds);
+   registry->RegisterStringPref(kAiKey, std::string());
+   registry->RegisterStringPref(kAiProvider, std::string());
+   registry->RegisterStringPref(kAiConsent, std::string());
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index 2fef7065d7..379a33a1fa 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -51,6 +51,10 @@ inline constexpr char kAgentAllowJs[] = "meridian.agent_allow_js";
+ inline constexpr char kAgentUploads[] = "meridian.agent_uploads";
+ // Sites (hosts) whose uploads the person allowed for good.
+ inline constexpr char kAgentUploadSites[] = "meridian.agent_upload_sites";
++// Spaces agents can use: "all" or "only" (those in kAgentSpaceIds); tabs in
++// the others are neither listed nor used.
++inline constexpr char kAgentSpaces[] = "meridian.agent_spaces";
++inline constexpr char kAgentSpaceIds[] = "meridian.agent_space_ids";
+ // The Anthropic API key, encrypted with OSCrypt (base64).
+ inline constexpr char kAiKey[] = "meridian.ai_key";
+ // Who answers Ask and the ⌘J panel: "" (automatic), "api" (Claude on the key
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 10c82edb88..5c53b94b7a 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -391,6 +391,9 @@ struct Settings {
+   string member_default_name;
+   // Milliseconds since the epoch.
+   double member_since;
++  // Spaces agents can use: "all" or "only" (`agent_space_ids`).
++  string agent_spaces;
++  array<string> agent_space_ids;
+ };
+ 
+ // Chat view conversations (ai/chats.h).
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 6b0be2ce2b..546d2f0b0b 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -2690,6 +2690,12 @@ void SidebarHandler::GetSettings(GetSettingsCallback callback) {
+   settings->agent_access = main_prefs->GetString(prefs::kAgentAccess);
+   settings->ai_consent = prefs->GetString(prefs::kAiConsent);
+   settings->agent_allow_js = main_prefs->GetBoolean(prefs::kAgentAllowJs);
++  settings->agent_spaces = main_prefs->GetString(prefs::kAgentSpaces);
++  for (const base::Value& id : main_prefs->GetList(prefs::kAgentSpaceIds)) {
++    if (id.is_string()) {
++      settings->agent_space_ids.push_back(id.GetString());
++    }
++  }
+   settings->agent_uploads = prefs->GetString(prefs::kAgentUploads);
+   for (const base::Value& site : prefs->GetList(prefs::kAgentUploadSites)) {
+     if (site.is_string()) {
+@@ -2759,6 +2765,16 @@ void SidebarHandler::SetSettings(mojom::SettingsPtr settings) {
+     }
+   }
+   agent_prefs->SetBoolean(prefs::kAgentAllowJs, settings->agent_allow_js);
++  if (settings->agent_spaces == "all" || settings->agent_spaces == "only") {
++    agent_prefs->SetString(prefs::kAgentSpaces, settings->agent_spaces);
++    base::ListValue ids;
++    for (const std::string& id : settings->agent_space_ids) {
++      if (service_->FindSpace(id) && !ids.contains(id)) {
++        ids.Append(id);
++      }
++    }
++    agent_prefs->SetList(prefs::kAgentSpaceIds, std::move(ids));
++  }
+   const std::string& consent = settings->ai_consent;
+   if (consent.empty() || consent == "always" || consent == "off") {
+     prefs->SetString(prefs::kAiConsent, consent);
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index ec768db0ce..a14ce70d2f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -660,6 +660,36 @@ export function getHtml(this: MeridianSettingsElement) {
+                       @click="${this.onSegmentClick_}">Full</button>
+                 </div>
+               </div>
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Agents can use</div>
++                  <div class="row-desc">Tabs in the other spaces stay out of
++                    their sight: not listed, not opened, not touched.</div>
++                </div>
++                <div class="segmented">
++                  <button class="seg ${this.settings_.agentSpaces !== 'only' ? 'on' : ''}"
++                      id="agentSpaces-all" data-name="agentSpaces" data-value="all"
++                      @click="${this.onSegmentClick_}">All spaces</button>
++                  <button class="seg ${this.settings_.agentSpaces === 'only' ? 'on' : ''}"
++                      id="agentSpaces-only" data-name="agentSpaces" data-value="only"
++                      @click="${this.onSegmentClick_}">Only these</button>
++                </div>
++              </div>
++              ${this.settings_.agentSpaces === 'only' ? html`
++                ${this.spaces_.map(s => html`
++                  <div class="row agent-space">
++                    <div class="row-text">
++                      <div class="row-label">${s.name || 'Space'}</div>
++                    </div>
++                    <label class="switch"><input type="checkbox"
++                        data-space="${s.id}"
++                        .checked="${this.settings_!.agentSpaceIds.includes(s.id)}"
++                        @change="${this.onAgentSpaceChange_}"><span></span></label>
++                  </div>`)}
++                ${!this.settings_.agentSpaceIds.length ? html`
++                  <p class="note" id="agentSpacesNone">No space checked:
++                    agents see no tabs at all.</p>` : ''}
++              ` : ''}
+               <div class="row">
+                 <div class="row-text">
+                   <div class="row-label">Run JavaScript in pages</div>
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 67fb992062..af95369386 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -746,6 +746,8 @@ export class MeridianSettingsElement extends CrLitElement {
+       this.save_({agentAccess: value});
+     } else if (name === 'uploads') {
+       this.save_({agentUploads: value});
++    } else if (name === 'agentSpaces') {
++      this.chooseAgentSpaces_(value);
+     } else if (name === 'aiConsent') {
+       this.save_({aiConsent: value});
+     }
+@@ -759,6 +761,26 @@ export class MeridianSettingsElement extends CrLitElement {
+     });
+   }
+ 
++  // "Only these" starts from the space on screen.
++  private async chooseAgentSpaces_(value: string) {
++    if (value !== 'only' || this.settings_!.agentSpaceIds.length) {
++      this.save_({agentSpaces: value});
++      return;
++    }
++    const {state} = await this.handler_.getState();
++    this.save_({
++      agentSpaces: value,
++      agentSpaceIds: state.activeSpaceId ? [state.activeSpaceId] : [],
++    });
++  }
++
++  protected onAgentSpaceChange_(e: Event) {
++    const input = e.target as HTMLInputElement;
++    const id = input.dataset['space']!;
++    const ids = this.settings_!.agentSpaceIds.filter(s => s !== id);
++    this.save_({agentSpaceIds: input.checked ? [...ids, id] : ids});
++  }
++
+   protected onAllowJsChange_(e: Event) {
+     this.save_({agentAllowJs: (e.target as HTMLInputElement).checked});
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings_index.ts b/chrome/browser/resources/webui_browser/meridian/settings_index.ts
+index 28a6b433ab..6d97e4dbe7 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings_index.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings_index.ts
+@@ -71,6 +71,8 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
+          'Notify me when an agent', ['mission control', 'notify']),
+   option('ai-access', 'ai', 'AI', 'What Agents May Do', 'What agents may do',
+          ['agent access', 'mcp', 'permissions', 'read-only', 'full access']),
++  option('ai-spaces', 'ai', 'AI', 'Spaces Agents Can Use', 'Agents can use',
++         ['agent spaces', 'hide spaces from agents', 'private space']),
+   option('ai-js', 'ai', 'AI', 'Run JavaScript in Pages',
+          'Run JavaScript in pages', ['scripts', 'agents']),
+   option('ai-connect', 'ai', 'AI', 'Connect an Agent', 'Connect',
