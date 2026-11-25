@@ -1067,7 +1067,9 @@ function mountTerm(info) {
   const { xterm, fit } = newXterm();
   xterm.open(el);
   const t = { id: info.id, kind: info.kind, title: info.title, xterm, fit, el, exited: info.exited, browserTools: info.browserTools,
-    secrets: info.secrets || [], guard: !!info.guard, sandbox: !!info.sandbox, then: info.then || null, root: S.project?.root || '' };
+    secrets: info.secrets || [], guard: !!info.guard, sandbox: !!info.sandbox, then: info.then || null, root: S.project?.root || '',
+    // The space's AI account it runs as (Settings › AI); '' = the agent's default.
+    account: info.account || '' };
   if (typeof proGuardPaste === 'function') proGuardPaste(t); // Workbench Pro: secret paste guard
   t.custom = savedTermNames()[t.id] || '';
   // Back from a Workbench tab that was closed: what that page knew about it.
@@ -1326,6 +1328,7 @@ function renderTermTabs() {
     if (t.browserTools) { const p = document.createElement('span'); p.className = 'plug'; p.title = 'Meridian browser tools connected'; p.innerHTML = icon('globe', 11); el.appendChild(p); }
     // Workbench Pro: sandbox and vault indicators (secret NAMES only)
     if (t.sandbox) { const p = document.createElement('span'); p.className = 'plug sbx'; p.title = 'Runs in a Docker sandbox: only this project is visible'; p.innerHTML = icon('shield', 11); el.appendChild(p); }
+    if (t.account) { const p = document.createElement('span'); p.className = 'acct'; p.textContent = t.account; p.title = `Runs as your ${t.account} account (this space’s choice in Settings › AI)`; el.appendChild(p); }
     if (t.secrets?.length) { const p = document.createElement('span'); p.className = 'plug keys'; p.title = `Vault secrets in this session’s environment:\n${t.secrets.join('\n')}`; p.innerHTML = icon('lock', 11) + `<span>${t.secrets.length}</span>`; el.appendChild(p); }
     if (t.kind === 'claude' && t.permissionMode === 'bypassPermissions') {
       const p = document.createElement('span');

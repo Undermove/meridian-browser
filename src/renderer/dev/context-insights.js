@@ -11,7 +11,7 @@
  * agent's session. All of it stays on this computer.
  */
 
-const CI = { usage: {}, ctx: {}, termId: null, data: null, error: '', loading: false, timer: 0, lastFetch: 0, openSections: new Set(), unit: 'usd' };
+const CI = { usage: {}, ctx: {}, termId: null, data: null, error: '', loading: false, timer: 0, lastFetch: 0, openSections: new Set(), unit: 'usd', account: '' };
 
 // Agents read from their own session records (Claude Code comes through its status line).
 const CI_RECORDS = new Set(['codex', 'qwen', 'gemini', 'copilot', 'opencode']);
@@ -57,9 +57,18 @@ function ciIn(seconds) {
 function ciLevel(pct) { return pct >= 90 ? 'bad' : pct >= 70 ? 'warn' : 'ok'; }
 
 // The usage limits are the account's, so any session's latest numbers do; the freshest one wins.
+// The AI account a terminal runs as (several subscriptions: Settings › AI); 'Default' when the space didn't choose.
+const ciAccount = (t) => t?.account || 'Default';
+// The accounts among this Workbench's agent sessions (a filter once there are two).
+function ciAccounts() { return [...new Set(S.terms.filter(ciIsAgent).map(ciAccount))]; }
+
 function ciLimits() {
   let best = null;
-  for (const u of Object.values(CI.usage)) {
+  // Limits belong to one subscription: the shown session's account only.
+  const shown = ciTerm();
+  const mine = (id) => !shown || ciAccounts().length < 2 || ciAccount(S.terms.find((t) => t.id === id)) === ciAccount(shown);
+  for (const [id, u] of Object.entries(CI.usage)) {
+    if (!mine(id)) continue;
     if (u.five_hour_pct == null && u.seven_day_pct == null && u.spend_pct == null) continue;
     if (!best || (u.five_hour_reset || 0) >= (best.five_hour_reset || 0)) best = u;
   }
@@ -68,7 +77,7 @@ function ciLimits() {
 
 // The terminal the panel is about: the active one if it's an agent's session, else the last one.
 function ciTerm() {
-  const agents = S.terms.filter(ciIsAgent);
+  const agents = S.terms.filter(ciIsAgent).filter((t) => !CI.account || ciAccount(t) === CI.account);
   if (S.activeTerm && agents.includes(S.activeTerm)) return S.activeTerm;
   return agents.find((t) => t.id === CI.termId) || agents[agents.length - 1] || null;
 }
@@ -185,7 +194,11 @@ function renderInsightsPanel(el) {
 
   parts.push(`<div class="panel-head"><h2>Context Insights</h2>${t ? `<button class="icon-btn small" id="ci-refresh" title="Read the session again">${icon('reload', 13)}</button>` : ''}</div>`);
   const model = u.model || d?.model;
-  if (t) parts.push(`<p class="muted ci-session">${ciEsc(termName(t))}${claude || termName(t).startsWith(agent) ? '' : ` · ${ciEsc(agent)}`}${model ? ` · ${ciEsc(model)}` : ''}</p>`);
+  const accounts = ciAccounts();
+  if (accounts.length > 1) {
+    parts.push(`<div class="ci-accounts" role="group" aria-label="Account">${['', ...accounts].map((a) => `<button class="chip small${CI.account === a ? ' on' : ''}" data-account="${ciEscRaw(a)}">${a ? ciEscRaw(a) : 'All accounts'}</button>`).join('')}</div>`);
+  }
+  if (t) parts.push(`<p class="muted ci-session">${ciEsc(termName(t))}${claude || termName(t).startsWith(agent) ? '' : ` · ${ciEsc(agent)}`}${t.account ? ` · <span class="ci-account">${ciEscRaw(t.account)} account</span>` : ''}${model ? ` · ${ciEsc(model)}` : ''}</p>`);
 
   // Usage limits: Claude Code's from its status line; Codex's plan limits from its record.
   if (claude) {
@@ -449,4 +462,13 @@ BUILTIN_PANELS.insights = { title: 'Insights', icon: 'clock', render: renderInsi
 document.addEventListener('DOMContentLoaded', () => {
   renderLimitsChip();
   setInterval(ciPoll, 15000);
+});
+
+// "All accounts · Work · Personal": which subscription's sessions (and limits) the panel shows.
+document.addEventListener('click', (e) => {
+  const b = e.target.closest?.('.ci-accounts [data-account]');
+  if (!b) return;
+  CI.account = b.dataset.account || '';
+  CI.range = null;
+  ciRedraw();
 });

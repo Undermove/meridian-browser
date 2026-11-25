@@ -46,6 +46,8 @@ test('your own OpenAI-compatible server: address and key checked, a model picked
     await b.waitFor(`app.$.settings.open && !!${ST}.querySelector('[data-id="ai"]')`);
     await b.click(`${ST}.querySelector('[data-id="ai"]')`);
     await b.waitFor(`!!${ST}.getElementById('customBase')`);
+    // Folded under "Your own server" until one is connected.
+    await b.eval(`${ST}.getElementById('customFold').open = true`);
   };
   const connect = async (base, key) => {
     await b.eval(`(() => { ${ST}.getElementById('customBase').value = ${JSON.stringify(base)}; ${ST}.getElementById('customKey').value = ${JSON.stringify(key)}; return true; })()`);
