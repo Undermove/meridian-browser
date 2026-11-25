@@ -95,7 +95,7 @@ Not there yet outside macOS:
 - [ ] Swipe (Arc disc; needs a check on a real trackpad)
 - [x] MCP server in C++ (`Meridian --mcp-bridge`, 20 browser tools, off/read/ask/full, JS opt-in, activity bar + Stop, Connect Claude Code/Codex)
 - [x] AI: Claude API key (encrypted), Ask panel ⌘J with page context and browser tools, quick answers in ⌘T
-- [x] Other AIs for Ask: Ollama, LM Studio, API keys (OpenAI, Gemini, OpenRouter, xAI, Mistral, DeepSeek, Groq) with a model picker, and agent CLIs (Codex, Copilot, Cursor, OpenCode, Qwen Code, Amp, Goose, Droid) behind "Other agents"
+- [x] Other AIs for Ask: Ollama, LM Studio, API keys (OpenAI, Gemini, OpenRouter, xAI, Mistral, DeepSeek, Groq) with a model picker, and agent CLIs (Codex, Copilot, Cursor, OpenCode, Pi, Qwen Code, Amp, Goose, Droid) behind "Other agents"
 - [x] Tidy Today, link previews (⇧ over a link), Chat view (⌥⌘J) with saved chats
 - [x] Workbench (⇧⌘E, chrome://workbench): project files, Monaco, terminals on a pty, coding agents with Meridian's browser tools
 - [x] Mission Control (⇧⌘M): Workbench agent sessions and subagents (hooks via `Meridian --mission-hook`, no Node needed), MCP clients, ⌘J runs; redacted summaries, history, notifications

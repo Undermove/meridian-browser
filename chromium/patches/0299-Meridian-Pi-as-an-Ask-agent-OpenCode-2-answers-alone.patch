@@ -1,0 +1,792 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=D0=90=D0=BB=D0=B5=D0=BA=D1=81=D0=B0=D0=BD=D0=B4=D1=80=20?=
+ =?UTF-8?q?=D0=A2=D1=83=D0=BC=D0=B0=D0=B9=D0=BA=D0=B8=D0=BD?=
+ <AATumaykin@tsum.ru>
+Date: Mon, 23 Nov 2026 21:27:12 +0300
+Subject: [PATCH] Meridian: Pi as an Ask agent; OpenCode 2 answers
+ alone
+
+Pi (the person's own, with the providers they set up in it) answers Ask
+behind "Other agents": no tools, no extensions, no session; the model is
+picked in Settings from what "pi --list-models" names, and the answer is
+read from its JSON mode (a failed attempt that Pi retries isn't an error).
+
+OpenCode 2 answers through a background service of its own, outside
+Meridian's sandbox and without its configuration, so Ask got "Agent not
+found: meridian". Which OpenCode is installed is asked once in a while
+(--version); 2 runs with --standalone and gets its agent and permission
+rules under the keys it reads. Before 2, everything as ever.
+---
+ chrome/browser/meridian/ai/local_agents.cc         | 125 ++++++++++-----
+ chrome/browser/meridian/ai/local_agents.h          |   2 +
+ chrome/browser/meridian/ai/providers.cc            | 171 +++++++++++++++++++--
+ chrome/browser/meridian/ai/providers.h             |  16 +-
+ chrome/browser/meridian/ai/providers_unittest.cc   | 170 ++++++++++++++++++++
+ chrome/browser/meridian/sidebar_handler.cc         |   7 +-
+ .../webui_browser/meridian/settings.html.ts        |   9 +-
+ .../resources/webui_browser/meridian/settings.ts   |  12 +-
+ 8 files changed, 446 insertions(+), 66 deletions(-)
+
+diff --git a/chrome/browser/meridian/ai/local_agents.cc b/chrome/browser/meridian/ai/local_agents.cc
+index c0dafffb70..a281d19bd7 100644
+--- a/chrome/browser/meridian/ai/local_agents.cc
++++ b/chrome/browser/meridian/ai/local_agents.cc
+@@ -59,6 +59,8 @@ namespace {
+ constexpr base::TimeDelta kRunTimeout = base::Minutes(5);
+ constexpr base::TimeDelta kListCacheAge = base::Minutes(1);
+ constexpr base::TimeDelta kModelsCacheAge = base::Hours(1);
++// OpenCode updates itself: which one answers is asked again now and then.
++constexpr base::TimeDelta kVersionAge = base::Minutes(10);
+ 
+ constexpr net::NetworkTrafficAnnotationTag kAnnotation =
+     net::DefineNetworkTrafficAnnotation("meridian_ai_providers", R"(
+@@ -383,12 +385,35 @@ std::vector<base::FilePath> CliToolFolders(const base::FilePath& home,
+ 
+ struct CliOutcome {
+   bool found = false;
++  // Set when this run learnt which OpenCode is installed.
++  std::optional<bool> opencode_v2;
+   ProcessResult result;
+ };
+ 
++// Blocking: the models a CLI that lists them has, for the providers the
++// person signed in to there; nullopt = it isn't installed.
++std::optional<std::vector<std::string>> ListCliModelsBlocking(
++    std::string provider_id) {
++  const Provider* p = FindProvider(provider_id);
++  std::map<std::string, std::string> env = ChildEnv();
++  std::optional<AuthCheck> check = p ? AuthCheckFor(*p) : std::nullopt;
++  if (!p || !check) {
++    return std::nullopt;
++  }
++  std::string bin = FindBin(*p, env["PATH"]);
++  if (bin.empty()) {
++    return std::nullopt;
++  }
++  std::vector<std::string> argv = {bin};
++  argv.insert(argv.end(), check->args.begin(), check->args.end());
++  return CliListedModels(
++      p->id, CaptureOutput(argv, env, env["HOME"], base::Seconds(20)));
++}
++
+ CliOutcome RunCliBlocking(std::string provider_id,
+                           Turn turn,
+                           base::FilePath workdir,
++                          std::optional<bool> opencode_v2,
+                           scoped_refptr<CancelFlag> cancel,
+                           base::RepeatingCallback<void(std::string)> output) {
+   CliOutcome outcome;
+@@ -399,55 +424,24 @@ CliOutcome RunCliBlocking(std::string provider_id,
+     return outcome;
+   }
+   outcome.found = true;
++  if (p->id == "opencode" && !opencode_v2.has_value()) {
++    // Outside the sandbox, like the sign-in checks: only the version is
++    // asked for.
++    opencode_v2 = OpenCodeIsV2(
++        CaptureOutput({bin, "--version"}, env, env["HOME"], base::Seconds(5)));
++    outcome.opencode_v2 = opencode_v2;
++  }
+   // A stable, private, empty working directory per provider.
+   base::FilePath dir = workdir.AppendUTF8(p->id);
+   base::CreateDirectory(dir);
+   MakePrivate(dir, 0700);
+-  // The CLIs keep tools that read files, and the page in the prompt may try
+-  // to steer them: credentials, other browsers' profiles and Meridian's own
+-  // data are off limits, except the run's working directory.
+-  const base::FilePath test_home = TestSwitchPath("meridian-test-home");
+-  const base::FilePath home =
+-      test_home.empty() ? base::GetHomeDir() : test_home;
+-  if (!test_home.empty()) {
+-    env["HOME"] = test_home.AsUTF8Unsafe();
+-  }
+-  // The space's account: the CLI's own variable naming its config folder.
+-  ApplyAccountEnv(turn.account_env, env);
+-  std::vector<base::FilePath> protected_paths = SensitivePaths(home);
+-  base::FilePath user_data;
+-  if (base::PathService::Get(chrome::DIR_USER_DATA, &user_data)) {
+-    protected_paths.push_back(user_data);
+-  }
+-  // The profile folder, wherever it lives.
+-  protected_paths.push_back(workdir.DirName());
+-  std::vector<base::FilePath> denied = protected_paths;
+-  denied.push_back(home);
+-  std::vector<base::FilePath> allowed = CliOwnFolders(p->id, home, env);
+-  std::vector<base::FilePath> readable = CliToolFolders(home, bin);
+-  if (p->id == "opencode") {
+-    for (base::FilePath& f : OpenCodeMovedFolders(home, env, protected_paths)) {
+-      allowed.push_back(std::move(f));
+-    }
+-    for (base::FilePath& f : OpenCodeConfigFiles(home, env, protected_paths)) {
+-      readable.push_back(std::move(f));
+-    }
+-    // Inside the closed home it can't make the parents of its own folders
+-    // (~/.local on a Mac that has none yet), and stops at start.
+-    for (const base::FilePath& f : allowed) {
+-      base::CreateDirectory(f);
+-    }
+-  }
+-  allowed.push_back(dir);
+-  const auto contained = [&](std::vector<std::string> argv) {
+-    return p->sandboxed ? SandboxedArgv(argv, denied, allowed, readable) : argv;
+-  };
+   Turn prepared = std::move(turn);
+   if (p->id == "opencode") {
+     prepared.private_server = OpenCodeWantsPrivateServer(
+         bin, contained({bin, "run", "--help"}), env, dir.AsUTF8Unsafe(), cancel);
+   }
+-  CommandSpec command = BuildCommand(*p, prepared, dir.AsUTF8Unsafe());
++  CommandSpec command =
++      BuildCommand(*p, prepared, dir.AsUTF8Unsafe(), opencode_v2.value_or(false));
+   for (const auto& [name, content] : command.files) {
+     base::FilePath file = dir.AppendUTF8(name);
+     base::WriteFile(file, content);
+@@ -765,6 +759,17 @@ void LocalAgents::Chat(const std::string& run_id,
+   Run* r = runs_[run_id].get();
+   r->cancel = base::MakeRefCounted<CancelFlag>();
+   r->parser = MakeParser(*p);
++  // The model picked in Settings, for the CLIs that list theirs (pi).
++  if (p->id == "pi" && turn.model.empty()) {
++    if (const std::string* chosen =
++            profile_->GetPrefs()->GetDict(prefs::kAiModels).FindString(p->id)) {
++      turn.model = *chosen;
++    }
++  }
++  std::optional<bool> opencode_v2;
++  if (opencode_ && base::TimeTicks::Now() - opencode_->first < kVersionAge) {
++    opencode_v2 = opencode_->second;
++  }
+   auto output = base::BindPostTaskToCurrentDefault(base::BindRepeating(
+       &LocalAgents::OnCliOutput, weak_factory_.GetWeakPtr(), run_id));
+   base::ThreadPool::PostTaskAndReplyWithResult(
+@@ -772,11 +777,15 @@ void LocalAgents::Chat(const std::string& run_id,
+       {base::MayBlock(), base::WithBaseSyncPrimitives(),
+        base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
+       base::BindOnce(&RunCliBlocking, provider_id, std::move(turn), workdir_,
+-                     r->cancel, output),
++                     opencode_v2, r->cancel, output),
+       base::BindOnce(
+           [](base::WeakPtr<LocalAgents> self, std::string run_id,
+              CliOutcome outcome) {
+             if (self) {
++              if (outcome.opencode_v2) {
++                self->opencode_ = std::make_pair(base::TimeTicks::Now(),
++                                                 *outcome.opencode_v2);
++              }
+               self->OnCliDone(run_id, outcome.found, outcome.result.started,
+                               outcome.result.exit_code, outcome.result.killed,
+                               outcome.result.timed_out,
+@@ -1229,6 +1238,40 @@ void LocalAgents::CloudModels(
+     std::move(done).Run(it->second.second, std::string());
+     return;
+   }
++  const Provider* listed = FindProvider(id);
++  if (listed && listed->id == "pi") {
++    // pi names the models of the providers signed in to there.
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE,
++        {base::MayBlock(), base::WithBaseSyncPrimitives(),
++         base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
++        base::BindOnce(&ListCliModelsBlocking, id),
++        base::BindOnce(
++            [](base::WeakPtr<LocalAgents> self, std::string id,
++               base::OnceCallback<void(std::vector<std::string>, std::string)>
++                   done,
++               std::optional<std::vector<std::string>> models) {
++              if (!self) {
++                return;
++              }
++              const std::string label = FindProvider(id)->label;
++              if (!models) {
++                std::move(done).Run(
++                    {}, label + " isn’t installed. Set it up in Settings > AI.");
++                return;
++              }
++              if (models->empty()) {
++                std::move(done).Run(
++                    {}, label +
++                          " lists no models: sign in to a provider there first.");
++                return;
++              }
++              self->models_[id] = {base::TimeTicks::Now(), *models};
++              std::move(done).Run(std::move(*models), std::string());
++            },
++            weak_factory_.GetWeakPtr(), id, std::move(done)));
++    return;
++  }
+   WithCloudKey(
+       id,
+       base::BindOnce(
+diff --git a/chrome/browser/meridian/ai/local_agents.h b/chrome/browser/meridian/ai/local_agents.h
+index f8689c577b..b31f65cbf2 100644
+--- a/chrome/browser/meridian/ai/local_agents.h
++++ b/chrome/browser/meridian/ai/local_agents.h
+@@ -143,6 +143,8 @@ class LocalAgents {
+   std::optional<std::pair<base::TimeTicks, std::vector<Status>>> cache_;
+   std::map<std::string, std::pair<base::TimeTicks, std::vector<std::string>>>
+       models_;
++  // Which OpenCode answered last (2 or before), and when that was asked.
++  std::optional<std::pair<base::TimeTicks, bool>> opencode_;
+   base::WeakPtrFactory<LocalAgents> weak_factory_{this};
+ };
+ 
+diff --git a/chrome/browser/meridian/ai/providers.cc b/chrome/browser/meridian/ai/providers.cc
+index d1b627b5c9..bf31c5e948 100644
+--- a/chrome/browser/meridian/ai/providers.cc
++++ b/chrome/browser/meridian/ai/providers.cc
+@@ -11,6 +11,7 @@
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
+ #include "base/no_destructor.h"
++#include "base/strings/strcat.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
+@@ -143,6 +144,15 @@ std::vector<Provider> MakeProviders() {
+   cli("droid", "Droid", "Factory", "droid", true, "a Factory account",
+       {{"curl -fsSL https://app.factory.ai/cli | sh", ""}}, "droid",
+       "https://docs.factory.ai/cli/droid-exec/overview");
++  // The person's own Pi, with the providers they signed in to there (models
++  // and keys stay Pi's: Meridian only picks a model).
++  cli("pi", "Pi", "Earendil", "pi", false,
++      "the providers you set up in Pi (a subscription, API keys, your own "
++      "server)",
++      {{"curl -fsSL https://pi.dev/install.sh | sh", ""},
++       {"npm install -g --ignore-scripts @earendil-works/pi-coding-agent",
++        "npm"}},
++      "pi", "https://docs.pi.dev");
+ 
+   auto local = [&](std::string id, std::string label, Kind kind,
+                    std::string base, std::vector<Install> install,
+@@ -314,6 +324,46 @@ class PlainTextParser : public OutputParser {
+   void End(std::vector<Event>& out) override {}
+ };
+ 
++// Pi's JSON mode (pi --mode json), one object per line. A failed answer is
++// retried by Pi itself, so its error only counts when nothing answered after
++// it; the exit code says nothing either way.
++class PiParser : public JsonLinesParser {
++ public:
++  PiParser()
++      : JsonLinesParser([this](const base::DictValue& o,
++                               std::vector<Event>& out) { Line(o, out); }) {}
++
++  void End(std::vector<Event>& out) override {
++    JsonLinesParser::End(out);
++    if (!error_.empty()) {
++      out.push_back(
++          {Event::Type::kError, std::exchange(error_, std::string())});
++    }
++  }
++
++ private:
++  void Line(const base::DictValue& o, std::vector<Event>& out) {
++    std::string type = StringAt(o, "type");
++    if (type == "message_update" &&
++        StringAt(o, "assistantMessageEvent.type") == "text_delta") {
++      out.push_back(
++          {Event::Type::kDelta, StringAt(o, "assistantMessageEvent.delta")});
++    } else if (type == "message_end" &&
++               StringAt(o, "message.role") == "assistant") {
++      std::string stop = StringAt(o, "message.stopReason");
++      error_.clear();
++      if (stop == "error") {
++        error_ = StringAt(o, "message.errorMessage");
++      } else if (stop == "length") {
++        out.push_back({Event::Type::kDelta,
++                       "\n\n[Pi stopped at its answer length limit.]"});
++      }
++    }
++  }
++
++  std::string error_;
++};
++
+ void Codex(const base::DictValue& o, std::vector<Event>& out) {
+   std::string type = StringAt(o, "type");
+   if (type == "thread.started" && !StringAt(o, "thread_id").empty()) {
+@@ -500,6 +550,26 @@ std::optional<bool> OpenCodeAuth(const std::string& out, std::string*) {
+   if (RE2::PartialMatch(clean, "(?i)(\\d+)\\s+credentials?", &count)) {
+     return count > 0;
+   }
++  // OpenCode 2: one line per sign-in, ending in "stored" (or "environment"
++  // for a key from the shell), and "No authenticated integrations" without.
++  if (RE2::PartialMatch(clean, "(?i)no authenticated")) {
++    return false;
++  }
++  if (RE2::PartialMatch(clean, "(?i)\\b(stored|environment)\\s*(\n|$)")) {
++    return true;
++  }
++  return std::nullopt;
++}
++
++std::optional<bool> PiAuth(const std::string& out, std::string*) {
++  // Only the models of providers signed in to are listed; without any, Pi
++  // says how to sign in.
++  if (!CliListedModels("pi", out).empty()) {
++    return true;
++  }
++  if (RE2::PartialMatch(out, "(?i)no models available")) {
++    return false;
++  }
+   return std::nullopt;
+ }
+ 
+@@ -532,7 +602,8 @@ bool OpenCodeNeedsPrivateServer(const std::string& run_help) {
+ 
+ CommandSpec BuildCommand(const Provider& p,
+                          const Turn& turn,
+-                         const std::string& cwd) {
++                         const std::string& cwd,
++                         bool opencode_v2) {
+   CommandSpec spec;
+   const bool resume = p.resume && !turn.resume.empty();
+   const bool first = !resume;
+@@ -631,25 +702,49 @@ CommandSpec BuildCommand(const Provider& p,
+     model("--model");
+     spec.stdin_text = turn.prompt;
+   } else if (p.id == "opencode") {
+-    // Every permission denied; no project config, Claude Code files or
+-    // plugins.
+-    base::DictValue permission;
+-    permission.Set("*", "deny");
++    // Every permission denied; no project config or Claude Code files.
++    // OpenCode 2 answers through a background service of its own (started
++    // outside Meridian: outside its sandbox, without the configuration
++    // here) unless it runs alone, and allows everything until a rule says
++    // otherwise; before 2, the flag for that is unknown and the old keys
++    // are the ones read.
+     base::DictValue config;
+-    config.Set("permission", std::move(permission));
+-    if (!turn.system.empty()) {
+-      config.Set("agent",
+-                 base::DictValue().Set(
+-                     "meridian", base::DictValue()
+-                                     .Set("prompt", turn.system)
+-                                     .Set("mode", "primary")));
++    if (opencode_v2) {
++      base::ListValue deny_all;
++      deny_all.Append(base::DictValue()
++                          .Set("action", "*")
++                          .Set("resource", "*")
++                          .Set("effect", "deny"));
++      config.Set("permissions", deny_all.Clone());
++      if (!turn.system.empty()) {
++        config.Set("agents",
++                   base::DictValue()
++                       .Set("meridian",
++                            base::DictValue()
++                                .Set("mode", "primary")
++                                .Set("system", turn.system)
++                                .Set("permissions", std::move(deny_all))));
++      }
++    } else {
++      base::DictValue permission;
++      permission.Set("*", "deny");
++      config.Set("permission", std::move(permission));
++      if (!turn.system.empty()) {
++        config.Set("agent",
++                   base::DictValue().Set(
++                       "meridian", base::DictValue()
++                                       .Set("prompt", turn.system)
++                                       .Set("mode", "primary")));
++      }
+     }
+     // The run's directory is the process's own (no --dir: OpenCode before
+     // 1.x doesn't know it, "Unrecognized flag: --dir").
+     spec.args = {"run", "--format", "json"};
+     // OpenCode 2.x joins its background service when one is up. That service
+-    // has neither the agent nor the deny-all above.
+-    if (turn.private_server) {
++    // has neither the agent nor the deny-all above. Known from the version
++    // (opencode_v2, cached in LocalAgents) or probed right before the run
++    // (turn.private_server, OpenCodeWantsPrivateServer).
++    if (turn.private_server || opencode_v2) {
+       spec.args.push_back("--standalone");
+     }
+     if (!turn.system.empty()) {
+@@ -667,6 +762,21 @@ CommandSpec BuildCommand(const Provider& p,
+                 {"OPENCODE_DISABLE_CLAUDE_CODE", "1"},
+                 {"OPENCODE_DISABLE_EXTERNAL_SKILLS", "1"},
+                 {"OPENCODE_DISABLE_DEFAULT_PLUGINS", "1"}};
++  } else if (p.id == "pi") {
++    // Answers only: no tools, and none of the person's own extensions, MCP
++    // servers, skills, templates or context files; nothing kept as a Pi
++    // session (the conversation so far comes in the prompt). The providers
++    // and models they set up in Pi stay.
++    spec.args = {"--mode",          "json",                 "--no-session",
++                 "--no-tools",      "--no-extensions",       "--no-mcp",
++                 "--no-skills",     "--no-prompt-templates", "--no-themes",
++                 "--no-context-files", "--no-approve"};
++    if (!turn.system.empty()) {
++      spec.args.push_back("--system-prompt");
++      spec.args.push_back(turn.system);
++    }
++    model("--model");
++    spec.stdin_text = turn.prompt;
+   } else if (p.id == "qwen") {
+     // Plan mode can't write or run commands but can read files; safe mode
+     // drops MCP, hooks and extensions.
+@@ -721,6 +831,9 @@ std::unique_ptr<OutputParser> MakeParser(const Provider& p) {
+   if (p.id == "copilot") {
+     return std::make_unique<PlainTextParser>();
+   }
++  if (p.id == "pi") {
++    return std::make_unique<PiParser>();
++  }
+   static const base::NoDestructor<std::map<std::string, ObjectHandler>>
+       handlers(std::map<std::string, ObjectHandler>{
+           {"claude-code", ClaudeCode},
+@@ -783,9 +896,39 @@ std::optional<AuthCheck> AuthCheckFor(const Provider& p) {
+   if (p.id == "opencode") {
+     return AuthCheck{{"auth", "list"}, OpenCodeAuth};
+   }
++  if (p.id == "pi") {
++    return AuthCheck{{"--list-models"}, PiAuth};
++  }
+   return std::nullopt;
+ }
+ 
++bool OpenCodeIsV2(const std::string& version_output) {
++  int major = 0;
++  return RE2::PartialMatch(version_output, "v?([0-9]+)\\.[0-9]+\\.[0-9]+",
++                           &major) &&
++         major >= 2;
++}
++
++std::vector<std::string> CliListedModels(const std::string& provider_id,
++                                         const std::string& output) {
++  std::vector<std::string> out;
++  if (provider_id == "pi") {
++    // "provider  model  context  max-out  thinking  images", then a row per
++    // model of the providers signed in to.
++    for (const std::string& line :
++         base::SplitString(output, "\n", base::TRIM_WHITESPACE,
++                           base::SPLIT_WANT_NONEMPTY)) {
++      std::vector<std::string_view> fields =
++          base::SplitStringPiece(line, " \t", base::TRIM_WHITESPACE,
++                                 base::SPLIT_WANT_NONEMPTY);
++      if (fields.size() >= 2 && fields[0] != "provider") {
++        out.push_back(base::StrCat({fields[0], "/", fields[1]}));
++      }
++    }
++  }
++  return out;
++}
++
+ std::vector<std::string> DetectKey(const std::string& raw) {
+   std::string key(base::TrimWhitespaceASCII(raw, base::TRIM_ALL));
+   if (RE2::PartialMatch(key, "^sk-ant-")) {
+diff --git a/chrome/browser/meridian/ai/providers.h b/chrome/browser/meridian/ai/providers.h
+index 8776353445..a1b9f32245 100644
+--- a/chrome/browser/meridian/ai/providers.h
++++ b/chrome/browser/meridian/ai/providers.h
+@@ -101,10 +101,17 @@ struct Turn {
+ // visibly instead of risking a service without Meridian's restrictions.
+ bool OpenCodeNeedsPrivateServer(const std::string& run_help);
+ 
+-// `cwd`: the run's private working directory.
++// `cwd`: the run's private working directory. `opencode_v2`: OpenCode 2 is
++// the one answering (OpenCodeIsV2).
+ CommandSpec BuildCommand(const Provider& provider,
+                          const Turn& turn,
+-                         const std::string& cwd);
++                         const std::string& cwd,
++                         bool opencode_v2 = false);
++
++// Whether `opencode --version` announced OpenCode 2 ("opencode v2.3.2"),
++// which answers through a background service of its own unless it is started
++// alone; OpenCode before 2 fails on the flag for that.
++bool OpenCodeIsV2(const std::string& version_output);
+ 
+ // What a CLI's output turns into.
+ struct Event {
+@@ -128,6 +135,11 @@ std::string FriendlyCliError(const Provider& provider,
+                              const std::string& message,
+                              const std::string& stderr_text);
+ 
++// Models a CLI lists for the person's sign-ins (`pi --list-models`, one
++// `provider  model  …` row per model), as "provider/model".
++std::vector<std::string> CliListedModels(const std::string& provider_id,
++                                         const std::string& output);
++
+ // Signed in? From `<cli> login status` and the like. nullopt = can't tell.
+ struct AuthCheck {
+   std::vector<std::string> args;
+diff --git a/chrome/browser/meridian/ai/providers_unittest.cc b/chrome/browser/meridian/ai/providers_unittest.cc
+index 9a88f8c1e4..27f4ada5b2 100644
+--- a/chrome/browser/meridian/ai/providers_unittest.cc
++++ b/chrome/browser/meridian/ai/providers_unittest.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/meridian/ai/providers.h"
+ 
++#include <iterator>
++
+ #include "base/json/json_reader.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+@@ -102,6 +104,174 @@ TEST(ProvidersTest, PromptGoesOnStdinAndToolsStayOff) {
+             std::string::npos);
+ }
+ 
++TEST(ProvidersTest, OpenCode2AnswersAloneWithItsOwnConfiguration) {
++  EXPECT_TRUE(OpenCodeIsV2("opencode v2.3.2"));
++  EXPECT_FALSE(OpenCodeIsV2("0.1.6"));
++  EXPECT_FALSE(OpenCodeIsV2("opencode 1.9.7"));
++  EXPECT_FALSE(OpenCodeIsV2(std::string()));
++
++  Turn turn;
++  turn.prompt = "What is this page?";
++  turn.system = "Be brief.";
++  turn.resume = "ses_1";
++  const Provider& opencode = *FindProvider("opencode");
++
++  // Before 2: as ever.
++  CommandSpec v1 = BuildCommand(opencode, turn, "/tmp/x");
++  EXPECT_EQ(v1.args,
++            (std::vector<std::string>{"run", "--format", "json", "--agent",
++                                      "meridian", "--session", "ses_1"}));
++  EXPECT_NE(v1.env["OPENCODE_CONFIG_CONTENT"].find("\"permission\":"),
++            std::string::npos);
++
++  // 2: on its own (no background service outside Meridian's reach), with
++  // the keys it reads.
++  CommandSpec v2 = BuildCommand(opencode, turn, "/tmp/x", true);
++  EXPECT_EQ(v2.args, (std::vector<std::string>{
++                         "run", "--standalone", "--format", "json", "--agent",
++                         "meridian", "--session", "ses_1"}));
++  EXPECT_EQ(v2.stdin_text, turn.prompt);
++  EXPECT_EQ(v2.env.at("OPENCODE_DISABLE_PROJECT_CONFIG"), "1");
++  const std::string& config = v2.env.at("OPENCODE_CONFIG_CONTENT");
++  std::optional<base::Value> read = base::JSONReader::Read(config);
++  ASSERT_TRUE(read) << config;
++  const base::DictValue& c = read->GetDict();
++  // Denied everywhere: globally, and for Meridian's agent.
++  const base::DictValue* meridian = c.FindDictByDottedPath("agents.meridian");
++  ASSERT_NE(meridian, nullptr);
++  const base::ListValue* everywhere = c.FindList("permissions");
++  const base::ListValue* agent = meridian->FindList("permissions");
++  ASSERT_NE(everywhere, nullptr);
++  ASSERT_NE(agent, nullptr);
++  EXPECT_EQ(everywhere->size(), 1u);
++  EXPECT_EQ(agent->size(), 1u);
++  for (const base::ListValue* rules : {everywhere, agent}) {
++    const base::DictValue& rule = rules->front().GetDict();
++    EXPECT_EQ(*rule.FindString("action"), "*");
++    EXPECT_EQ(*rule.FindString("resource"), "*");
++    EXPECT_EQ(*rule.FindString("effect"), "deny");
++  }
++  EXPECT_EQ(*meridian->FindString("system"), "Be brief.");
++  EXPECT_EQ(*meridian->FindString("mode"), "primary");
++  // The keys the one before 2 reads are unknown to it.
++  EXPECT_EQ(c.Find("permission"), nullptr);
++  EXPECT_EQ(c.Find("agent"), nullptr);
++  EXPECT_EQ(meridian->Find("prompt"), nullptr);
++
++  turn.system.clear();
++  CommandSpec v2_plain = BuildCommand(opencode, turn, "/tmp/x", true);
++  EXPECT_EQ(std::ranges::find(v2_plain.args, "--agent"), v2_plain.args.end());
++  EXPECT_EQ(v2_plain.env.at("OPENCODE_CONFIG_CONTENT").find("agents"),
++            std::string::npos);
++}
++
++TEST(ProvidersTest, PiAnswersFromStdinWithTheModelPickedHere) {
++  Turn turn;
++  turn.prompt = "What is this page?";
++  turn.system = "Be brief.";
++  const Provider& pi = *FindProvider("pi");
++  CommandSpec spec = BuildCommand(pi, turn, "/tmp/x");
++  EXPECT_EQ(spec.args.front(), "--mode");
++  EXPECT_EQ(spec.args[1], "json");
++  // Answers only: nothing of the person's own Pi setup runs with it.
++  for (const char* flag :
++       {"--no-tools", "--no-extensions", "--no-mcp", "--no-skills",
++        "--no-session", "--no-context-files"}) {
++    EXPECT_NE(std::ranges::find(spec.args, flag), spec.args.end()) << flag;
++  }
++  const auto system = std::ranges::find(spec.args, "--system-prompt");
++  ASSERT_NE(system, spec.args.end());
++  EXPECT_EQ(*std::next(system), turn.system);
++  EXPECT_EQ(spec.stdin_text, turn.prompt);
++  EXPECT_TRUE(spec.env.empty());
++  // The model picked in Settings, when one is.
++  EXPECT_EQ(std::ranges::find(spec.args, "--model"), spec.args.end());
++  turn.model = "homelab/qwen3.6-35b-a3b";
++  CommandSpec with_model = BuildCommand(pi, turn, "/tmp/x");
++  const auto model = std::ranges::find(with_model.args, "--model");
++  ASSERT_NE(model, with_model.args.end());
++  EXPECT_EQ(*std::next(model), "homelab/qwen3.6-35b-a3b");
++}
++
++TEST(ProvidersTest, PiStreamGivesTextAndOnlyTheLastErrorCounts) {
++  // Pi retries a failed answer itself: only an error nothing follows is one.
++  std::vector<Event> retried = Parse(
++      "pi",
++      "{\"type\":\"session\",\"id\":\"s-1\",\"cwd\":\"/tmp/x\"}\n"
++      "{\"type\":\"message_start\",\"message\":{\"role\":\"user\"}}\n"
++      "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\","
++      "\"stopReason\":\"error\",\"errorMessage\":\"zai is down\"}}\n"
++      "{\"type\":\"message_update\",\"usage\":{},\"assistantMessageEvent\":"
++      "{\"type\":\"text_delta\",\"delta\":\"Pi \"}}\n"
++      "{\"type\":\"message_update\",\"usage\":{},\"assistantMessageEvent\":"
++      "{\"type\":\"thinking_delta\",\"delta\":\"hidden\"}}\n"
++      "{\"type\":\"message_update\",\"usage\":{},\"assistantMessageEvent\":"
++      "{\"type\":\"text_delta\",\"delta\":\"heard: blank\"}}\n"
++      "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\","
++      "\"stopReason\":\"stop\"}}\n"
++      "{\"type\":\"agent_end\",\"messages\":[{}]}\n");
++  EXPECT_EQ(Text(retried, Event::Type::kDelta), "Pi heard: blank");
++  EXPECT_EQ(Text(retried, Event::Type::kError), "");
++  EXPECT_EQ(Text(retried, Event::Type::kSession), "");
++
++  std::vector<Event> failed = Parse(
++      "pi",
++      "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\","
++      "\"stopReason\":\"error\","
++      "\"errorMessage\":\"No API key found for zai\"}}\n");
++  EXPECT_EQ(Text(failed, Event::Type::kDelta), "");
++  EXPECT_EQ(Text(failed, Event::Type::kError), "No API key found for zai");
++
++  std::vector<Event> cut = Parse(
++      "pi",
++      "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\","
++      "\"stopReason\":\"length\"}}\n");
++  EXPECT_NE(Text(cut, Event::Type::kDelta).find("length limit"),
++            std::string::npos);
++  EXPECT_EQ(Text(cut, Event::Type::kError), "");
++}
++
++TEST(ProvidersTest, PiListsTheModelsOfItsSignedInProviders) {
++  EXPECT_EQ(CliListedModels(
++                "pi",
++                "provider  model             context  max-out  thinking  "
++                "images\n"
++                "zai       glm-5.4           200K     128K     yes       no\n"
++                "homelab   qwen3.6-35b-a3b   32K      8K       no        no\n"),
++            (std::vector<std::string>{"zai/glm-5.4",
++                                      "homelab/qwen3.6-35b-a3b"}));
++  // Only the models of providers signed in to are listed.
++  EXPECT_TRUE(CliListedModels(
++                  "pi", "No models available. Run pi auth login.\n")
++                  .empty());
++  EXPECT_TRUE(CliListedModels("opencode", "provider  model\n").empty());
++}
++
++TEST(ProvidersTest, SignInChecks) {
++  std::string account;
++  const auto opencode = AuthCheckFor(*FindProvider("opencode"))->parse;
++  // OpenCode before 2 counts credentials; 2 lists them, one per line.
++  EXPECT_EQ(opencode("1 credentials\n", &account), std::optional<bool>(true));
++  EXPECT_EQ(opencode("0 credentials\n", &account),
++            std::optional<bool>(false));
++  EXPECT_EQ(opencode("OpenCode Console   Default                      stored\n",
++                    &account),
++            std::optional<bool>(true));
++  EXPECT_EQ(opencode("zai   env   environment\n", &account),
++            std::optional<bool>(true));
++  EXPECT_EQ(opencode("No authenticated integrations\n", &account),
++            std::optional<bool>(false));
++  EXPECT_EQ(opencode("garbage\n", &account), std::nullopt);
++
++  const auto pi = AuthCheckFor(*FindProvider("pi"))->parse;
++  EXPECT_EQ(pi("provider  model\nzai  glm-5.4\n", &account),
++            std::optional<bool>(true));
++  EXPECT_EQ(pi("No models available. Run pi auth login.\n", &account),
++            std::optional<bool>(false));
++  EXPECT_EQ(pi("Warning: errors loading models.json\n", &account),
++            std::nullopt);
++}
++
+ TEST(ProvidersTest, KeysAreRecognisedByShape) {
+   EXPECT_EQ(DetectKey(" sk-ant-api03-xyz "),
+             std::vector<std::string>{"anthropic"});
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index f9d73280b7..ac66b621f7 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -1708,7 +1708,10 @@ void SidebarHandler::GetCloudModels(const std::string& id,
+                                     GetCloudModelsCallback callback) {
+   AiService* ai = AiServiceFactory::GetForProfile(browser_->GetProfile());
+   const ai::Provider* p = ai::FindProvider(id);
+-  if (!ai || !p || p->kind != ai::Kind::kCloud) {
++  // Cloud providers list their models on the person's key; pi lists the
++  // models of the providers set up in it.
++  if (!ai || !p ||
++      (p->kind != ai::Kind::kCloud && p->id != "pi")) {
+     std::move(callback).Run({}, std::string(), "Unknown provider.");
+     return;
+   }
+@@ -1727,7 +1730,7 @@ void SidebarHandler::GetCloudModels(const std::string& id,
+ void SidebarHandler::SetCloudModel(const std::string& id,
+                                    const std::string& model) {
+   const ai::Provider* p = ai::FindProvider(id);
+-  if (!p || p->kind != ai::Kind::kCloud) {
++  if (!p || (p->kind != ai::Kind::kCloud && p->id != "pi")) {
+     return;
+   }
+   ScopedDictPrefUpdate update(browser_->GetProfile()->GetPrefs(),
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index 1d38b400eb..9115348d36 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -540,10 +540,11 @@ export function getHtml(this: MeridianSettingsElement) {
+                 </div>` : ''}
+               <div class="row">
+                 <div class="row-text">
+-                  <div class="row-label">Agents on other companies’ plans</div>
+-                  <div class="row-desc">Copilot, Codex, Cursor, OpenCode and
+-                    the rest use your own account in that app and follow that
+-                    company’s rules.</div>
++                  <div class="row-label">Add another agent</div>
++                  <div class="row-desc">Copilot, Codex, Cursor, OpenCode, Pi,
++                    Qwen Code, Amp, Goose, Droid. The ones on this computer are
++                    already above. They use your own account in that app and
++                    follow that company’s rules.</div>
+                 </div>
+                 <label class="switch"><input type="checkbox" id="otherAgents"
+                     .checked="${this.otherAgents_}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 67d5ed1f86..5fbfe6948a 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -196,6 +196,7 @@ const MARKS: {[id: string]: string} = {
+   amp: '#f34e3f',
+   goose: '#222222',
+   droid: '#ff6b00',
++  pi: '#f09082',
+   ollama: '#333333',
+   lmstudio: '#4f46e5',
+   api: '#d97757',
+@@ -596,7 +597,10 @@ export class MeridianSettingsElement extends CrLitElement {
+     const {providers} = await this.handler_.getAiProviders(fresh);
+     this.providers_ = providers;
+     for (const p of providers) {
+-      if (p.kind === 'cloud' && p.installed && !this.cloudModels_[p.id]) {
++      // Cloud providers list their models on the key; pi lists the models of
++      // the providers set up in it.
++      if ((p.kind === 'cloud' || p.id === 'pi') && p.installed &&
++          !this.cloudModels_[p.id]) {
+         this.handler_.getCloudModels(p.id).then(({models, chosen}) => {
+           this.cloudModels_ = {...this.cloudModels_, [p.id]: {models, chosen}};
+         });
+@@ -733,7 +737,9 @@ export class MeridianSettingsElement extends CrLitElement {
+       desc += ` · needs ${p.installMissing}`;
+     }
+     const models = this.cloudModels_[p.id];
+-    const defaultLabel = p.account ? `Default (${p.account})` : 'Default';
++    const defaultLabel = p.id === 'pi' ? 'Default (set in Pi)' :
++        p.account ? `Default (${p.account})` :
++                    'Default';
+     return {
+       id: p.id,
+       label: p.label,
+@@ -751,7 +757,7 @@ export class MeridianSettingsElement extends CrLitElement {
+         ...(models?.models || [])
+             .map(m => ({value: m, label: m, selected: m === models?.chosen})),
+       ],
+-      hasModels: cloud && installed,
++      hasModels: (cloud || p.id === 'pi') && installed,
+     };
+   }
+ 
