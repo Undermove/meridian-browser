@@ -27,7 +27,7 @@ window.ask = () => { window.got = 'waiting'; navigator.mediaDevices.getUserMedia
   .catch((e) => { window.got = 'error: ' + e.name; }); };
 </script>`;
 
-test('the camera: Meridian’s sheet first, then macOS; once, also after a restart', async () => {
+test('the camera: Meridian’s sheet first, then macOS; once, also after a restart', { skip: process.platform === 'win32' && 'macOS asks these' }, async () => {
   const server = await serve(() => CAM);
   const url = `http://127.0.0.1:${server.address().port}/call`;
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
@@ -91,7 +91,7 @@ window.share = () => { window.shared = 'waiting'; navigator.mediaDevices.getDisp
   .catch((e) => { window.shared = 'error: ' + e.name; }); };
 </script>`;
 
-test('sharing the screen: the sheet says which switch and Quit & Reopen, then the picker', async () => {
+test('sharing the screen: the sheet says which switch and Quit & Reopen, then the picker', { skip: process.platform === 'win32' && 'macOS asks these' }, async () => {
   const server = await serve((u) => u.startsWith('/slides') ? '<!doctype html><title>Slides deck</title>' : SHARE);
   const base = `http://127.0.0.1:${server.address().port}`;
   const b = await launch([`${base}/slides`, `${base}/meet`], { args: ['--meridian-test-system-asks', '--auto-select-tab-capture-source-by-title=Slides deck'] });
@@ -147,7 +147,7 @@ test('every kind has its words, its drawing and a way back from the wrong button
   } finally { await b.close(); }
 });
 
-test('Restart to update from 0.x to 1.x: macOS will ask about Meridian Safe Storage, say Always Allow', async () => {
+test('Restart to update from 0.x to 1.x: macOS will ask about Meridian Safe Storage, say Always Allow', { skip: process.platform === 'win32' && 'macOS asks these' }, async () => {
   const b = await launch(['about:blank']);
   try {
     await b.waitFor(`typeof app !== 'undefined' && !!app.$.updateSheet`);

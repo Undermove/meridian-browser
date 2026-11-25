@@ -107,7 +107,7 @@ async function panelFor(wb, label, extra) {
 }
 const has = (text, list) => { for (const s of list) assert.ok(text.includes(s), `the panel says “${s}”:\n${text}`); };
 
-test('Codex, OpenCode, Qwen Code, Gemini and Copilot sessions show in Context Insights, each its own; Amp says it isn’t available', async () => {
+test('Codex, OpenCode, Qwen Code, Gemini and Copilot sessions show in Context Insights, each its own; Amp says it isn’t available', { skip: process.platform === 'win32' && 'the stand-in agents are Python scripts, and agent CLIs are macOS only for now' }, async () => {
   const { wb, done } = await setup();
   try {
     // Codex: its rollout file. A click on the topbar's usage chip opens the panel on the active tab.
@@ -158,7 +158,7 @@ test('Codex, OpenCode, Qwen Code, Gemini and Copilot sessions show in Context In
   } finally { await done(); }
 });
 
-test('an agent whose session hasn’t begun says so, then shows it once it has', async () => {
+test('an agent whose session hasn’t begun says so, then shows it once it has', { skip: process.platform === 'win32' && 'the stand-in agents are Python scripts, and agent CLIs are macOS only for now' }, async () => {
   const { wb, project, done } = await setup();
   try {
     fs.writeFileSync(path.join(project, 'wait-codex'), '');

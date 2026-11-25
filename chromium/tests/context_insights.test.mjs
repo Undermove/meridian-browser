@@ -110,7 +110,7 @@ async function click(wb, expr, { count = 1 } = {}) {
 const termText = `S.activeTerm ? [...Array(S.activeTerm.xterm.buffer.active.length).keys()].map((i) => S.activeTerm.xterm.buffer.active.getLine(i)?.translateToString(true)).join('\\n') : ''`;
 const tabName = `document.querySelector('#term-tab-list .ttab.active .name')?.textContent`;
 
-test('a Claude Code tab takes the session\'s name and shows its context; the topbar shows the usage limits; Context Insights explains the session', async () => {
+test('a Claude Code tab takes the session\'s name and shows its context; the topbar shows the usage limits; Context Insights explains the session', { skip: process.platform === 'win32' && 'the stand-in Claude Code is a Python script' }, async () => {
   const { wb, done } = await setup({ ownStatusLine: true });
   try {
     await wb.eval(`launch('claude').then((t) => !!t)`);
@@ -171,7 +171,7 @@ test('a Claude Code tab takes the session\'s name and shows its context; the top
   } finally { await done(); }
 });
 
-test('without a status line of their own, Meridian\'s shows the context and limits; a shell tab takes its title', async () => {
+test('without a status line of their own, Meridian\'s shows the context and limits; a shell tab takes its title', { skip: process.platform === 'win32' && 'the stand-in Claude Code is a Python script' }, async () => {
   const { wb, done } = await setup({ ownStatusLine: false });
   try {
     await wb.eval(`launch('claude').then((t) => !!t)`);
@@ -187,7 +187,7 @@ test('without a status line of their own, Meridian\'s shows the context and limi
 
 // The context gauge sits on the tab's line, between the name and the icons: it slid down onto the
 // tab's bottom edge on the Mac.
-test('the context gauge sits on the tab\'s line, centred with its name, at every level', async () => {
+test('the context gauge sits on the tab\'s line, centred with its name, at every level', { skip: process.platform === 'win32' && 'the stand-in Claude Code is a Python script' }, async () => {
   // 70%: the gauge turns yellow (it took another element's margin and size then).
   const { wb, done } = await setup({ ownStatusLine: false, ctx: 70 });
   try {
@@ -253,7 +253,7 @@ async function barPoint(wb, i) {
   return wb.eval(`(() => { const e = document.querySelectorAll('.ci-money .bar')[${i}]; e.scrollIntoView({ block: 'center' }); const r = e.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
 }
 
-test('cost chart: each spike takes its cause only when the transcript proves it; click or drag shows the turns; the money still adds up', async () => {
+test('cost chart: each spike takes its cause only when the transcript proves it; click or drag shows the turns; the money still adds up', { skip: process.platform === 'win32' && 'the stand-in Claude Code is a Python script' }, async () => {
   const { wb, project, done } = await setup({ ownStatusLine: false, session: causesTranscript() });
   try {
     await wb.eval(`launch('claude').then((t) => !!t)`);
