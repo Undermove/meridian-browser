@@ -195,3 +195,54 @@ test('the sidebar toggle: after the traffic lights in a window, at the sidebar e
     await b.waitFor(`Math.abs(${left('sidebarToggle')} - ${left('urlPill')}) < 1`);
   } finally { await b.close(); }
 });
+
+// The engine that answers the address bar is picked in Chromium's own settings (the Search
+// engine row's Change… opens them). Picking another engine there must not take the browser
+// down: Chromium's handler notifies its own settings page, which in Meridian has no
+// BrowserView to notify.
+test('Search engine: Change… opens Chromium settings, and picking another engine keeps the browser up', async () => {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  const b = await launch(['about:blank'], { profile });
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    await open(b);
+    await b.eval(`${ST}.querySelector('[data-page="search"]').scrollIntoView()`);
+    await b.click(`${ST}.querySelector('[data-page="search"]')`);
+    await b.waitFor(`!app.$.settings.open`);
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.url.startsWith('chrome://settings/search'))`);
+    // The tab's page. /search shows the current engine and a picker dialog; the engine
+    // rows with their dots menus are the hidden /searchEngines subpage, not this route.
+    const p = await b.page('chrome://settings/search');
+    const SP = `document.querySelector('settings-ui')?.shadowRoot?.querySelector('settings-main')?.shadowRoot?.querySelector('settings-search-page-index')?.shadowRoot?.querySelector('settings-search-page')`;
+    const DLG = `(${SP})?.shadowRoot?.querySelector('settings-search-engine-list-dialog')`;
+    // The engine list arrives asynchronously; the dialog snapshots it when it opens.
+    await p.waitFor(`(${SP})?.searchEngines_?.length > 1`, 20000);
+    await p.waitFor(`!(${SP}).shadowRoot.querySelector('#openDialogButton').disabled`, 10000);
+    // Clicks where a person's would land: the element's centre, through the tab's CDP.
+    const click = async (expr) => {
+      const r = await p.eval(`(() => { const el = ${expr}; const b = el.getBoundingClientRect(); return { x: b.x + b.width / 2, y: b.y + b.height / 2 }; })()`);
+      for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+        await p.cdp.send('Input.dispatchMouseEvent', { type, x: r.x, y: r.y, button: type === 'mouseMoved' ? 'none' : 'left', clickCount: 1 });
+      }
+    };
+    // Pick one engine, then another, like a person changing their mind: every pick goes
+    // through SetDefaultSearchEngine, which used to take the browser down with it.
+    let lastPicked = null;
+    for (let round = 0; round < 2; round++) {
+      await click(`(${SP}).shadowRoot.querySelector('#openDialogButton')`);
+      await p.waitFor(`!!(${DLG})?.shadowRoot?.querySelector('cr-dialog')?.open`, 10000);
+      const engines = await p.eval(`(${DLG}).searchEngines.map((e) => ({ id: e.id, name: e.name, def: e.default }))`);
+      const pick = engines.find((e) => !e.def && e.name !== lastPicked);
+      assert.ok(pick, `an engine that is not the default: ${JSON.stringify(engines)}`);
+      const radio = `(${DLG}).shadowRoot.querySelector('cr-dialog').querySelector('cr-radio-group').querySelector('cr-radio-button[name=${JSON.stringify(pick.id)}]')`;
+      await p.waitFor(`!!${radio}`, 10000);
+      await click(radio);
+      await p.waitFor(`(${DLG})?.selectedEngineId_ === ${JSON.stringify(pick.id)}`, 5000);
+      await click(`(${DLG}).shadowRoot.querySelector('cr-dialog').querySelector('#setAsDefaultButton')`);
+      // The browser stays up, the dialog closes, and the row names the engine just picked.
+      await p.waitFor(`(${SP})?.shadowRoot?.querySelector('.search-engine-name')?.textContent === ${JSON.stringify(pick.name)}`, 10000);
+      lastPicked = pick.name;
+    }
+    assert.equal(b.proc.exitCode, null, 'the browser process is still up');
+  } finally { await b.close(); }
+});
