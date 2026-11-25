@@ -186,7 +186,9 @@ async function chooserRun(answer, extra, body) {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
   fs.mkdirSync(path.join(profile, 'Default'));
   fs.writeFileSync(path.join(profile, 'Default', 'Preferences'), JSON.stringify({ meridian: { agent_access: 'full' } }));
-  const files = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-upload-')));
+  // Windows: not in the temp folder, which is under AppData, where Chrome's File System Access
+  // blocklist keeps showOpenFilePicker out (a person's files are elsewhere too).
+  const files = fs.realpathSync(fs.mkdtempSync(path.join(process.platform === 'win32' ? os.homedir() : os.tmpdir(), 'meridian-upload-')));
   const photo = path.join(files, 'photo.png');
   fs.writeFileSync(photo, Buffer.alloc(1234, 7));
   const b = await launch([`${origin}/`], { profile, args: [`--meridian-test-dialog-answer=${answer}`, '--meridian-test-cancel-file-choosers', ...extra] });
