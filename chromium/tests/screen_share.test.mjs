@@ -112,3 +112,46 @@ test('the tab on air is marked; a monitor on another tab moves the share there',
     page.close();
   } finally { await b.close(); s.close(); }
 });
+
+test('the call is marked apart from the tab on air; Stop sharing ends the share', async () => {
+  const pages = { '/slides': SLIDES, '/call': CALL };
+  const s = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(pages[req.url] || ''); });
+  await new Promise((r) => s.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${s.address().port}`;
+  const b = await launch([`${base}/slides`, `${base}/call`], { args: ['--auto-select-tab-capture-source-by-title=Slides deck'] });
+  const row = (title) => `[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === ${JSON.stringify(title)})`;
+  const item = (text) => `[...${SB}.querySelector('#menu meridian-menu').shadowRoot.querySelectorAll('.menu-item')].find((m) => m.querySelector('.menu-label')?.textContent.trim() === ${JSON.stringify(text)})`;
+  try {
+    await b.waitFor(`typeof app !== 'undefined' && !!${T}?.state_`);
+    await b.waitFor(`!!${row('Call')} && !!${row('Slides deck')}`);
+    await b.click(`${row('Call')}.shadowRoot.querySelector('.row')`);
+    await b.waitFor(`[...${T}.tabs_.values()].find((t) => t.isActive)?.title === 'Call'`);
+    const page = await b.page(`${base}/call`);
+    await page.waitFor(`document.readyState === 'complete' && !!document.getElementById('b')`);
+    for (let i = 0; i < 10 && !(await page.eval('!!window.clicked')); i++) {
+      for (const type of ['mousePressed', 'mouseReleased']) {
+        await page.cdp.send('Input.dispatchMouseEvent', { type, x: 100, y: 40, button: 'left', clickCount: 1 });
+      }
+      await new Promise((res) => setTimeout(res, 300));
+    }
+    assert.equal(await page.waitFor('window.shared', 10000), 'browser');
+    // The shared tab wears the ring and monitor; the call its own on-air mark.
+    await b.waitFor(`!!${row('Slides deck')}?.shadowRoot.querySelector('.row.sharing .share.on')`, 10000);
+    await b.waitFor(`!!${row('Call')}?.shadowRoot.querySelector('.row.calling .call')`, 10000);
+    assert.equal(await b.eval(`!!${row('Slides deck')}.shadowRoot.querySelector('.row.calling')`), false);
+    assert.equal(await b.eval(`!!${row('Call')}.shadowRoot.querySelector('.row.sharing')`), false);
+    assert.equal(await b.eval(`${row('Slides deck')}.shadowRoot.querySelector('.share.on').title`), 'Sharing this tab');
+    // The monitor on the tab on air: a way back to the call, and Stop sharing.
+    await b.click(`${row('Slides deck')}.shadowRoot.querySelector('.share.on')`);
+    await b.waitFor(`!!${item('Stop sharing')}`);
+    if (process.env.MERIDIAN_SHOT_DIR) {
+      const { data } = await b.cdp.send('Page.captureScreenshot', { format: 'png' });
+      (await import('node:fs')).writeFileSync(`${process.env.MERIDIAN_SHOT_DIR}/share-menu.png`, Buffer.from(data, 'base64'));
+    }
+    assert.ok(await b.eval(`!!${item('Back to Call')}`), 'the menu leads back to the call');
+    await b.click(item('Stop sharing'));
+    await b.waitFor(`!${row('Slides deck')}.shadowRoot.querySelector('.row.sharing')`, 10000);
+    await b.waitFor(`!${row('Call')}.shadowRoot.querySelector('.row.calling')`, 10000);
+    page.close();
+  } finally { await b.close(); s.close(); }
+});
