@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 14:17:35 +0400
+Subject: [PATCH] Meridian: Exit Reader pressed right after entering it leaves
+ too
+
+The reading view still on its way in (visible but not committed, or coming
+in as a page of its own) is the reading view for Exit Reader: before, the
+toggle saw the article and tried to open Reader again ("none"). The
+one-second check follows the tab's page, whichever WebContents it is.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar_handler.cc | 31 +++++++++++++++-------
+ 1 file changed, 22 insertions(+), 9 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 9368ffa3d5..502191f4dc 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -573,7 +573,11 @@ void SidebarHandler::ToggleReader(ToggleReaderCallback callback) {
+     return;
+   }
+   content::WebContents* contents = tab->GetContents();
+-  const GURL& url = contents->GetLastCommittedURL();
++  // The reading view still on its way in (Exit pressed at once) counts too.
++  const GURL url =
++      dom_distiller::url_utils::IsDistilledPage(contents->GetVisibleURL())
++          ? contents->GetVisibleURL()
++          : contents->GetLastCommittedURL();
+   if (dom_distiller::url_utils::IsDistilledPage(url)) {
+     GURL original =
+         dom_distiller::url_utils::GetOriginalUrlFromDistillerUrl(url);
+@@ -590,9 +594,14 @@ void SidebarHandler::ToggleReader(ToggleReaderCallback callback) {
+                                           std::string());
+       }
+     };
+-    const int entry_id = controller.GetLastCommittedEntry()
+-                             ? controller.GetLastCommittedEntry()->GetUniqueID()
+-                             : 0;
++    // The reading view's entry; 0 when it hadn't come in yet (then any
++    // reading view there a second later is that one).
++    const int entry_id =
++        controller.GetLastCommittedEntry() &&
++                dom_distiller::url_utils::IsDistilledPage(
++                    controller.GetLastCommittedEntry()->GetURL())
++            ? controller.GetLastCommittedEntry()->GetUniqueID()
++            : 0;
+     if (back && original.is_valid() && back->GetURL() == original &&
+         controller.CanGoBack()) {
+       controller.GoBack();
+@@ -605,14 +614,18 @@ void SidebarHandler::ToggleReader(ToggleReaderCallback callback) {
+     base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
+         FROM_HERE,
+         base::BindOnce(
+-            [](base::WeakPtr<content::WebContents> contents, GURL original,
+-               int entry_id,
++            [](tabs::TabHandle handle, GURL original, int entry_id,
+                void (*load)(content::WebContents*, const GURL&)) {
++              // The tab's page now (the reading view may have come in as a
++              // page of its own).
++              tabs::TabInterface* tab = handle.Get();
++              content::WebContents* contents =
++                  tab ? tab->GetContents() : nullptr;
+               // Only that same reading view (not one opened again since).
+               content::NavigationEntry* now =
+                   contents ? contents->GetController().GetLastCommittedEntry()
+                            : nullptr;
+-              if (!now || now->GetUniqueID() != entry_id ||
++              if (!now || (entry_id && now->GetUniqueID() != entry_id) ||
+                   !dom_distiller::url_utils::IsDistilledPage(now->GetURL())) {
+                 return;
+               }
+@@ -622,9 +635,9 @@ void SidebarHandler::ToggleReader(ToggleReaderCallback callback) {
+               if (pending && pending->GetURL() == original) {
+                 return;
+               }
+-              load(contents.get(), original);
++              load(contents, original);
+             },
+-            contents->GetWeakPtr(), original,
++            tab->GetHandle(), original,
+             entry_id,
+             static_cast<void (*)(content::WebContents*, const GURL&)>(load)),
+         base::Seconds(1));
