@@ -70,7 +70,7 @@ test('designer first run: Arc first, "We found Claude", its restart and Allow ex
   const arcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-arc-'));
   fs.copyFileSync(path.join(ARC, 'StorableSidebar.json'), path.join(arcDir, 'StorableSidebar.json'));
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
-  const b = await launch(['about:blank'], { profile, args: ['--meridian-onboarding', `--meridian-arc-dir=${arcDir}`, ...c.args] });
+  const b = await launch(['about:blank'], { profile, args: ['--meridian-onboarding', `--meridian-arc-dir=${arcDir}`, '--meridian-reachable-urls=https://meridianbrowser.app/demo/plain.html,https://paulgraham.com/greatwork.html', ...c.args] });
   try {
     await b.waitFor(`${step} === 'hello'`);
     await b.click(`${OB}.getElementById('next')`);
@@ -109,7 +109,7 @@ test('designer first run: Arc first, "We found Claude", its restart and Allow ex
     // "Give this site a new look" on an empty tab: a plain page first, then Claude.
     await b.click(card(OB, 'restyle'));
     await b.waitFor(`!app.$.onboarding.open`);
-    assert.ok(await until(async () => (await tabUrls(b)).includes('https://info.cern.ch/hypertext/WWW/TheProject.html')), 'the page to restyle is open');
+    assert.ok(await until(async () => (await tabUrls(b)).includes('https://meridianbrowser.app/demo/plain.html')), 'our plain page to restyle is open (the first that loads)');
     assert.ok(await until(() => c.requests().length === 2), 'Claude opened with the request');
     const asked = c.requests()[1];
     assert.match(asked, /^In Meridian, give the page in my current tab a fresh new look\./);
@@ -127,7 +127,8 @@ test('designer first run: Arc first, "We found Claude", its restart and Allow ex
 test('home page and ⌘T: every card readies its scene and opens Claude with its own request', async () => {
   const c = computer({ connected: true });
   const site = await startServer();
-  const b = await launch(['chrome://newtab/'], { args: c.args });
+  // Hacker News "doesn't load" here: the next page to critique opens.
+  const b = await launch(['chrome://newtab/'], { args: [...c.args, '--meridian-reachable-urls=https://text.npr.org/'] });
   try {
     await b.waitFor(`app.$.home.shown && !!${HM}.getElementById('tryClaude')`, 15000);
     // A designer's home: Try with Claude, no Workbench, no developer card.
@@ -140,7 +141,8 @@ test('home page and ⌘T: every card readies its scene and opens Claude with its
     // Critique, from an empty tab: a page to critique first.
     await b.eval(`${card(HM, 'critique')}.scrollIntoView({ block: 'center' })`);
     await b.click(card(HM, 'critique'));
-    assert.ok(await until(async () => (await tabUrls(b)).includes('https://news.ycombinator.com/')), 'a page to critique');
+    assert.ok(await until(async () => (await tabUrls(b)).includes('https://text.npr.org/')), 'a page to critique: the first that loads');
+    assert.equal((await tabUrls(b)).includes('https://news.ycombinator.com/'), false, 'not the one that doesn’t');
     assert.ok(await until(() => c.requests().length === 1));
     assert.match(c.requests()[0], /critique it like a senior product designer: give me 5 concrete suggestions/);
     assert.match(c.requests()[0], /Don’t change anything on the page\./);

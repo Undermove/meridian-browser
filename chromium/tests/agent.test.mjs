@@ -674,3 +674,82 @@ test('a space with its own profile doesn\'t take over the agent: Settings of the
     assert.equal(fs.existsSync(info), false, 'nothing listens after Off');
   } finally { mcp?.close(); await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
+
+// A profile folder longer than a unix socket path may be (tests' temp folders, a long TMPDIR):
+// the bridge used to say "Meridian is not running". The socket now goes in a short private folder.
+test('a long profile path: the socket is short and private, and the bridge connects', { skip: process.platform === 'win32' }, async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  const profile = path.join(base, 'a-profile-folder-with-a-really-long-name-'.repeat(3));
+  fs.mkdirSync(path.join(profile, 'Default'), { recursive: true });
+  fs.writeFileSync(path.join(profile, 'Default', 'Preferences'), JSON.stringify({ meridian: { agent_access: 'full' } }));
+  assert.ok(profile.length > 120);
+  const b = await launch(['about:blank'], { profile });
+  const mcp = bridge(profile);
+  try {
+    const endpoint = path.join(profile, 'Meridian Agent.json');
+    for (let i = 0; i < 50 && !fs.existsSync(endpoint); i++) await sleep(100);
+    const socket = JSON.parse(fs.readFileSync(endpoint, 'utf8')).socket;
+    assert.ok(socket.length < 100, socket);
+    assert.equal(fs.statSync(path.dirname(socket)).mode & 0o777, 0o700, 'its folder is private');
+    assert.equal(fs.statSync(path.dirname(socket)).uid, process.getuid());
+    await mcp.request('initialize', { clientInfo: { name: 'long-path' } });
+    const tabs = await mcp.call('list_tabs');
+    assert.equal(tabs.error, null, 'the bridge reached Meridian');
+  } finally { mcp.close(); await b.close(); fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+// A moodboard (six links) used to take a dozen "Allow"s. "Allow for this task" covers this agent's
+// connection on every site, signed-in ones too (the card says so), until it disconnects, Stop, or 30 minutes.
+test('ask: Allow for this task stops the questions for this connection only; Stop and a reconnect bring them back', async () => {
+  const s = await site();
+  const profile = profileWith({ agent_access: 'ask' });
+  const b = await launch([s.url('/')], { profile });
+  const mcp = bridge(profile);
+  let other;
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { clientInfo: { name: 'Claude' } });
+    const first = mcp.call('open_tab', { url: s.url('/form') });
+    await b.waitFor(`!!${AG}.getElementById('task')`);
+    const card = await b.eval(`${AG}.querySelector('.card').textContent.replace(/\\s+/g, ' ')`);
+    assert.match(card, /Claude wants to/);
+    assert.match(card, /Allow for this task lets Claude act without asking on every site, including ones you’re signed in to, until it disconnects or for 30 minutes/);
+    assert.deepEqual(await b.eval(`[...${AG}.querySelectorAll('.actions button')].map((x) => x.textContent.trim())`), ['Always allow', 'Deny', 'Allow once', 'Allow for this task']);
+    assert.equal(await b.eval(`${AG}.activeElement?.id`), 'deny', 'the keyboard starts on Deny');
+    if (process.env.MERIDIAN_SHOTS) {
+      const { data } = await b.cdp.send('Page.captureScreenshot', { format: 'png' });
+      fs.writeFileSync(path.join(process.env.MERIDIAN_SHOTS, 'ask-card.png'), Buffer.from(data, 'base64'));
+    }
+    // Too soon: a click meant for the page doesn't answer.
+    await b.click(`${AG}.getElementById('task')`);
+    assert.equal(await b.eval(`!!${AG}.getElementById('task')`), true);
+    await sleep(700);
+    await b.click(`${AG}.getElementById('task')`);
+    assert.equal((await first).value.title, 'Form');
+    // The rest of the task: no questions, on any site.
+    for (const p of ['/', '/filter', '/login']) {
+      const r = await mcp.call('open_tab', { url: s.url(p) });
+      assert.equal(r.error, null, p);
+      assert.equal(await b.eval(`!!${AG}.getElementById('ask')`), false, `not asked for ${p}`);
+    }
+    assert.equal((await b.eval(`app.$.tabstrip.handler_.getSettings().then((r) => r.settings)`)).agentAccess, 'ask', 'access stays at ask');
+
+    // Another connection (the agent restarted, or another app with the same name) is asked.
+    other = bridge(profile);
+    await other.request('initialize', { clientInfo: { name: 'Claude' } });
+    const again = other.call('open_tab', { url: s.url('/form') });
+    await b.waitFor(`!!${AG}.getElementById('ask')`);
+    await sleep(700);
+    await b.click(`${AG}.getElementById('allow')`);
+    assert.equal((await again).error, null);
+
+    // Stop ends the task: the first connection is asked again.
+    await b.eval(`app.$.agent.onStopClick_()`);
+    await b.eval(`app.$.agent.onResumeClick_()`);
+    const after = mcp.call('open_tab', { url: s.url('/') });
+    await b.waitFor(`!!${AG}.getElementById('ask')`);
+    await b.click(`${AG}.getElementById('deny')`);
+    assert.match((await after).error, /declined/);
+  } finally { mcp.close(); other?.close(); await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
