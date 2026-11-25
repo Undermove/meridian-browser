@@ -84,10 +84,11 @@ test('Air Traffic Control: a matching rule sends the link to the main window ins
   } finally { await b.close(); await site.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
 
-// Arc: a Little window opens in the space last used, with that space's logins (its profile), and
-// its bar picks another space: the page opens again there. Open in Meridian then lands it in that
-// space. A login here was asked for in the work space and opened in the personal one.
-test('a Little window opens in the last space with its logins; the bar moves it to another space', async () => {
+// Arc: a Little window opens in the space last used, with that space's logins (its profile). Its bar
+// is one split button: "Open in Work" (that space), and ▾ for the other spaces, where the page opens
+// in the main window (again, with that space's profile). A login here was asked for in the work space
+// and opened in the personal one.
+test('a Little window opens in the last space with its logins; Open in <Space> ▾ opens it in another space', async () => {
   const http = await import('node:http');
   const server = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'text/html' });
@@ -135,24 +136,30 @@ test('a Little window opens in the last space with its logins; the bar moves it 
       else w?.close();
     }
     assert.ok(little, 'a Little window opened with a space button');
-    await waitIn(little, `app.shadowRoot.querySelector('#littleSpace .name')?.textContent.trim() === 'Work'`, 'it names Work');
+    await waitIn(little, `app.shadowRoot.querySelector('#openInMeridian .name')?.textContent.trim() === 'Open in Work'`, 'it says Open in Work');
     await waitIn(little, `${T}.state_.tabs.length === 1 && [...${T}.tabs_.values()][0]?.title === 'auth who=work'`, 'the page sees the work login');
     if (process.env.SHOT) await little.screenshot(process.env.SHOT);
 
-    // The picker: every space, Work checked; pick the personal one.
-    await click(little, `app.shadowRoot.getElementById('littleSpace')`);
-    await waitIn(little, `app.shadowRoot.querySelectorAll('#littleSpaces .little-space').length === 2`, 'both spaces listed');
-    assert.equal(await little.eval(`app.shadowRoot.querySelector('#littleSpaces [aria-checked="true"] .name').textContent.trim()`), 'Work');
-    await click(little, `[...app.shadowRoot.querySelectorAll('#littleSpaces .little-space')].find((e) => e.dataset.space === ${JSON.stringify(personal)})`);
-    await waitIn(little, `!app.shadowRoot.getElementById('littleSpaces')`, 'the picker closes');
-    await waitIn(little, `${T}.state_.littleSpaceId === ${JSON.stringify(personal)} && ${T}.state_.tabs.length === 1 && [...${T}.tabs_.values()][0]?.title === 'auth none'`, 'the page opens again without the work login');
-    assert.equal(await little.eval(`app.shadowRoot.querySelector('#littleSpace .name').textContent.trim()`), personalName);
+    if (process.env.MERIDIAN_SHOTS) await little.screenshot(path.join(process.env.MERIDIAN_SHOTS, 'little-split.png'));
 
-    // Open in Meridian: into the personal space, which the main window now shows.
-    await click(little, `app.shadowRoot.getElementById('openInMeridian')`);
+    // ▾ from the keyboard: every space, Work marked and focused; arrows move, Escape closes.
+    await little.eval(`app.shadowRoot.getElementById('littleSpace').focus()`);
+    await little.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'ArrowDown', code: 'ArrowDown', windowsVirtualKeyCode: 40 });
+    await waitIn(little, `app.shadowRoot.querySelectorAll('#littleSpaces .little-space').length === 2`, 'both spaces listed');
+    assert.equal(await little.eval(`app.shadowRoot.querySelector('#littleSpaces [aria-current="true"] .name').textContent.trim()`), 'Work');
+    assert.equal(await little.eval(`app.shadowRoot.activeElement?.dataset.space`), work, 'the keyboard is on Work');
+    if (process.env.MERIDIAN_SHOTS) await little.screenshot(path.join(process.env.MERIDIAN_SHOTS, 'little-menu.png'));
+    await little.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+    await waitIn(little, `!app.shadowRoot.getElementById('littleSpaces') && app.shadowRoot.activeElement?.id === 'littleSpace'`, 'Escape closes it, back on ▾');
+
+    // Pick the personal space: the page opens there in the main window, without the work login.
+    await click(little, `app.shadowRoot.getElementById('littleSpace')`);
+    await waitIn(little, `!!app.shadowRoot.getElementById('littleSpaces')`, 'the menu opens');
+    await click(little, `[...app.shadowRoot.querySelectorAll('#littleSpaces .little-space')].find((e) => e.dataset.space === ${JSON.stringify(personal)})`);
     await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(personal)}`);
     await b.waitFor(`[...${T}.tabs_.values()].find((t) => t.isActive)?.title === 'auth none'`);
     await b.waitFor(`${todayTitles}.includes('auth none')`);
+    assert.ok(personalName);
     little.close();
   } finally { await b.close(); server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });

@@ -1,0 +1,336 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 11:42:05 +0400
+Subject: [PATCH] Meridian: agent socket path stays short with a long profile
+ path
+
+A unix socket path must fit ~104 bytes. With a long profile folder (and a
+long TMPDIR, where the fallback went) the socket couldn't be made and
+the MCP bridge said "Meridian is not running". The socket now goes in
+the profile folder when that fits, else /tmp/meridian-<uid>/<hash of the
+profile path>.sock: a folder made 0700, checked to be this user's own
+real folder (not a planted link), closed up if it was open. Clients
+still find it in "Meridian Agent.json".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              | 16 ++++
+ chrome/browser/meridian/agent/agent_server.cc | 19 +---
+ chrome/browser/meridian/agent/socket_path.cc  | 78 +++++++++++++++
+ chrome/browser/meridian/agent/socket_path.h   | 26 +++++
+ .../meridian/agent/socket_path_unittest.cc    | 95 +++++++++++++++++++
+ 5 files changed, 217 insertions(+), 17 deletions(-)
+ create mode 100644 chrome/browser/meridian/agent/socket_path.cc
+ create mode 100644 chrome/browser/meridian/agent/socket_path.h
+ create mode 100644 chrome/browser/meridian/agent/socket_path_unittest.cc
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index ce01eadbda..59ffc39d1e 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -293,6 +293,19 @@ source_set("agent_cli") {
+   ]
+ }
+ 
++# Where the agent socket goes (agent_server.cc).
++source_set("agent_socket_path") {
++  sources = [ "agent/socket_path.h" ]
++  if (!is_win) {
++    sources += [ "agent/socket_path.cc" ]
++  }
++  public_deps = [ "//base" ]
++  deps = [
++    ":platform",
++    "//crypto",
++  ]
++}
++
+ # `Meridian --mcp-bridge` (chrome/app/chrome_main.cc): no browser deps.
+ source_set("mcp_bridge") {
+   sources = [
+@@ -457,6 +470,7 @@ source_set("meridian") {
+     "//url",
+   ]
+   deps = [
++    ":agent_socket_path",
+     "//chrome/app:command_ids",
+     "//chrome/browser:shell_integration",
+     "//components/constrained_window",
+@@ -562,6 +576,7 @@ test("meridian_unittests") {
+     "mission/secrets_unittest.cc",
+     "agent/agent_cli_unittest.cc",
+     "agent/agent_input_unittest.cc",
++    "agent/socket_path_unittest.cc",
+     "workbench/agent_insights_unittest.cc",
+     "workbench/agents_unittest.cc",
+     "workbench/customizations_unittest.cc",
+@@ -575,6 +590,7 @@ test("meridian_unittests") {
+   deps = [
+     ":agent_cli",
+     ":agent_input",
++    ":agent_socket_path",
+     ":ai_providers",
+     ":currency_parse",
+     ":guard_hook",
+diff --git a/chrome/browser/meridian/agent/agent_server.cc b/chrome/browser/meridian/agent/agent_server.cc
+index 9aa914e1ac..ba65c50c04 100644
+--- a/chrome/browser/meridian/agent/agent_server.cc
++++ b/chrome/browser/meridian/agent/agent_server.cc
+@@ -32,6 +32,7 @@
+ #else
+ #include <unistd.h>
+ 
++#include "chrome/browser/meridian/agent/socket_path.h"
+ #include "net/socket/unix_domain_server_socket_posix.h"
+ #endif
+ 
+@@ -50,22 +51,6 @@ bool SameUser(const net::UnixDomainServerSocket::Credentials& credentials) {
+   return credentials.user_id == getuid();
+ }
+ 
+-// A short socket path: in the user data folder (private, 0700) if it fits the
+-// ~104 byte limit, else in a new private temp folder.
+-base::FilePath SocketPath(const base::FilePath& user_data_dir,
+-                          base::FilePath* temp_dir) {
+-  std::string name =
+-      "agent-" + base::HexEncodeLower(base::RandBytesAsVector(4)) + ".sock";
+-  base::FilePath in_profile = user_data_dir.AppendASCII(name);
+-  if (in_profile.value().size() < 100) {
+-    return in_profile;
+-  }
+-  if (base::CreateNewTempDirectory(FILE_PATH_LITERAL("meridian-agent"), temp_dir)) {
+-    MakePrivate(*temp_dir, 0700);
+-    return temp_dir->AppendASCII("agent.sock");
+-  }
+-  return in_profile;
+-}
+ #endif  // !BUILDFLAG(IS_WIN)
+ 
+ }  // namespace
+@@ -108,7 +93,7 @@ class AgentServer::Core {
+     return {};
+ #else
+     base::FilePath temp_dir;
+-    base::FilePath socket = SocketPath(user_data_dir, &temp_dir);
++    base::FilePath socket = AgentSocketPath(user_data_dir, &temp_dir);
+     base::DeleteFile(socket);
+     return {socket, temp_dir};
+ #endif
+diff --git a/chrome/browser/meridian/agent/socket_path.cc b/chrome/browser/meridian/agent/socket_path.cc
+new file mode 100644
+index 0000000000..20879dd700
+--- /dev/null
++++ b/chrome/browser/meridian/agent/socket_path.cc
+@@ -0,0 +1,78 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/agent/socket_path.h"
++
++#include <errno.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <string>
++
++#include "base/files/file_util.h"
++#include "base/rand_util.h"
++#include "base/strings/string_number_conversions.h"
++#include "chrome/browser/meridian/private_file.h"
++#include "crypto/hash.h"
++
++namespace meridian {
++
++namespace {
++
++// Unix socket paths must fit sun_path (104 bytes on macOS, with the NUL).
++constexpr size_t kMaxSocketPath = 100;
++
++// "/tmp/meridian-<uid>": made 0700 by this user, and checked to be a real
++// folder of this user's that nobody else can open (not a link someone else
++// planted). Empty when it can't be had.
++base::FilePath ShortPrivateDir(const base::FilePath& root) {
++  base::FilePath dir =
++      root.AppendASCII("meridian-" + base::NumberToString(getuid()));
++  if (mkdir(dir.value().c_str(), 0700) != 0 && errno != EEXIST) {
++    return {};
++  }
++  struct stat st;
++  if (lstat(dir.value().c_str(), &st) != 0 || !S_ISDIR(st.st_mode) ||
++      st.st_uid != getuid()) {
++    return {};
++  }
++  if ((st.st_mode & 0777) != 0700 && !MakePrivate(dir, 0700)) {
++    return {};
++  }
++  return dir;
++}
++
++}  // namespace
++
++// A short socket path: in the user data folder (private, 0700) if it fits;
++// else "/tmp/meridian-<uid>/<hash of the folder>.sock", so a long profile
++// path (or a long TMPDIR) still works; else a new private temp folder.
++// `temp_dir` is set only for that last one (removed with the socket).
++base::FilePath AgentSocketPath(const base::FilePath& user_data_dir,
++                               base::FilePath* temp_dir,
++                               const base::FilePath& short_root) {
++  std::string name =
++      "agent-" + base::HexEncodeLower(base::RandBytesAsVector(4)) + ".sock";
++  base::FilePath in_profile = user_data_dir.AppendASCII(name);
++  if (in_profile.value().size() < kMaxSocketPath) {
++    return in_profile;
++  }
++  base::FilePath short_dir = ShortPrivateDir(short_root);
++  if (!short_dir.empty()) {
++    std::string hash = base::HexEncodeLower(
++        crypto::hash::Sha256(user_data_dir.value()));
++    return short_dir.AppendASCII(hash.substr(0, 16) + ".sock");
++  }
++  if (base::CreateNewTempDirectory(FILE_PATH_LITERAL("meridian-agent"),
++                                   temp_dir)) {
++    MakePrivate(*temp_dir, 0700);
++    base::FilePath socket = temp_dir->AppendASCII("agent.sock");
++    if (socket.value().size() < kMaxSocketPath) {
++      return socket;
++    }
++  }
++  return in_profile;
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/agent/socket_path.h b/chrome/browser/meridian/agent/socket_path.h
+new file mode 100644
+index 0000000000..effd001c37
+--- /dev/null
++++ b/chrome/browser/meridian/agent/socket_path.h
+@@ -0,0 +1,26 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_AGENT_SOCKET_PATH_H_
++#define CHROME_BROWSER_MERIDIAN_AGENT_SOCKET_PATH_H_
++
++#include "base/files/file_path.h"
++
++namespace meridian {
++
++// Where the agent socket goes (AgentServer, not on Windows). A unix socket's
++// path must stay under ~104 bytes, and profile folders (or TMPDIR) can be
++// longer: in `user_data_dir` when it fits, else
++// "<short_root>/meridian-<uid>/<hash of user_data_dir>.sock" in a folder only
++// this user can open (0700), else a new private temp folder, which is then
++// put in `temp_dir` to remove with the socket. Clients find the path in
++// "Meridian Agent.json", so it can be anything.
++base::FilePath AgentSocketPath(
++    const base::FilePath& user_data_dir,
++    base::FilePath* temp_dir,
++    const base::FilePath& short_root = base::FilePath("/tmp"));
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_AGENT_SOCKET_PATH_H_
+diff --git a/chrome/browser/meridian/agent/socket_path_unittest.cc b/chrome/browser/meridian/agent/socket_path_unittest.cc
+new file mode 100644
+index 0000000000..f35e783db7
+--- /dev/null
++++ b/chrome/browser/meridian/agent/socket_path_unittest.cc
+@@ -0,0 +1,95 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/agent/socket_path.h"
++
++#include <string>
++
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "build/build_config.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++#if !BUILDFLAG(IS_WIN)
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "base/strings/string_number_conversions.h"
++
++namespace meridian {
++namespace {
++
++// A short profile folder keeps the socket inside it.
++TEST(AgentSocketPathTest, ShortProfileKeepsItInside) {
++  base::FilePath temp_dir;
++  base::FilePath dir("/tmp/p");
++  base::FilePath path = AgentSocketPath(dir, &temp_dir);
++  EXPECT_EQ(path.DirName(), dir);
++  EXPECT_TRUE(temp_dir.empty());
++}
++
++// A long one (tests' temp profiles, a long TMPDIR) gets a short path in a
++// private folder of this user's, the same for the same profile.
++TEST(AgentSocketPathTest, LongProfileGetsShortPrivatePath) {
++  base::ScopedTempDir root;
++  ASSERT_TRUE(root.CreateUniqueTempDirUnderPath(base::FilePath("/tmp")));
++  base::FilePath profile("/Users/someone/" + std::string(150, 'x'));
++  base::FilePath temp_dir;
++  base::FilePath path = AgentSocketPath(profile, &temp_dir, root.GetPath());
++  EXPECT_LT(path.value().size(), 100u) << path.value();
++  EXPECT_TRUE(temp_dir.empty());
++  base::FilePath folder =
++      root.GetPath().AppendASCII("meridian-" + base::NumberToString(getuid()));
++  EXPECT_EQ(path.DirName(), folder);
++  EXPECT_EQ(path.Extension(), ".sock");
++  struct stat st;
++  ASSERT_EQ(lstat(folder.value().c_str(), &st), 0);
++  EXPECT_EQ(static_cast<int>(st.st_mode & 0777), 0700);
++  EXPECT_EQ(AgentSocketPath(profile, &temp_dir, root.GetPath()), path);
++  EXPECT_NE(AgentSocketPath(profile.AppendASCII("other"), &temp_dir,
++                            root.GetPath()),
++            path);
++}
++
++// An open folder of this user's is closed up before use.
++TEST(AgentSocketPathTest, ClosesAnOpenFolder) {
++  base::ScopedTempDir root;
++  ASSERT_TRUE(root.CreateUniqueTempDirUnderPath(base::FilePath("/tmp")));
++  base::FilePath folder =
++      root.GetPath().AppendASCII("meridian-" + base::NumberToString(getuid()));
++  ASSERT_TRUE(base::CreateDirectory(folder));
++  ASSERT_TRUE(base::SetPosixFilePermissions(folder, 0777));
++  base::FilePath temp_dir;
++  base::FilePath path = AgentSocketPath(
++      base::FilePath("/Users/someone/" + std::string(150, 'y')), &temp_dir,
++      root.GetPath());
++  EXPECT_EQ(path.DirName(), folder);
++  int mode = 0;
++  ASSERT_TRUE(base::GetPosixFilePermissions(folder, &mode));
++  EXPECT_EQ(mode, 0700);
++}
++
++// A link planted where the folder goes isn't followed.
++TEST(AgentSocketPathTest, IgnoresALinkInItsPlace) {
++  base::ScopedTempDir root;
++  ASSERT_TRUE(root.CreateUniqueTempDirUnderPath(base::FilePath("/tmp")));
++  base::ScopedTempDir elsewhere;
++  ASSERT_TRUE(elsewhere.CreateUniqueTempDir());
++  base::FilePath folder =
++      root.GetPath().AppendASCII("meridian-" + base::NumberToString(getuid()));
++  ASSERT_TRUE(base::CreateSymbolicLink(elsewhere.GetPath(), folder));
++  base::FilePath temp_dir;
++  base::FilePath path = AgentSocketPath(
++      base::FilePath("/Users/someone/" + std::string(150, 'z')), &temp_dir,
++      root.GetPath());
++  EXPECT_NE(path.DirName(), folder);
++  if (!temp_dir.empty()) {
++    base::DeletePathRecursively(temp_dir);
++  }
++}
++
++}  // namespace
++}  // namespace meridian
++
++#endif  // !BUILDFLAG(IS_WIN)

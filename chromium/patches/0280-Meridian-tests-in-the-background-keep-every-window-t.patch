@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 12:22:11 +0400
+Subject: [PATCH] Meridian: tests in the background keep every window there
+
+During profiles.test.mjs a window showing a Work-profile space came to
+the front on the owner's screen. Background mode made windows
+see-through on their next update or the 50 ms timer, so a new window
+was opaque for a moment, and it could still make macOS switch desktop
+Spaces. Now every window of the process (any profile, a Little window,
+a popup, one opened later) is made see-through, click-through and
+"move to the active Space" before it is ordered in (orderWindow:,
+orderFront:, makeKeyAndOrderFront:, orderFrontRegardless), when it
+becomes key or main, and whatever collection behaviour it gets (all
+Spaces stays all Spaces). TestBackgroundState (appended) reports this
+for tests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/app_controller_mac.mm          | 104 +++++++++++++++---
+ chrome/browser/meridian/sidebar.mojom         |   7 ++
+ chrome/browser/meridian/sidebar_handler.cc    |   5 +
+ chrome/browser/meridian/sidebar_handler.h     |   1 +
+ .../browser/meridian/sidebar_handler_mac.mm   |  27 +++++
+ 5 files changed, 131 insertions(+), 13 deletions(-)
+
+diff --git a/chrome/browser/app_controller_mac.mm b/chrome/browser/app_controller_mac.mm
+index 07e621b53e..af37435ff1 100644
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -946,16 +946,69 @@ class AppControllerProfileObserver : public ProfileAttributesStorage::Observer,
+     // timer, should one not).
+     // (Clicks and scrolling pass through always: a see-through window on
+     // top of the person's own apps must not take them.)
++    // Every window of the process (any profile's, a Little window, a
++    // popup, an app window, one opened later): see-through, clicks pass,
++    // and never a reason for macOS to switch to another desktop Space (it
++    // moves to the one on screen instead).
++    static void (^keep_back)(NSWindow*) = ^(NSWindow* window) {
++      if (window.alphaValue > 0) {
++        window.alphaValue = 0;
++      }
++      if (!window.ignoresMouseEvents) {
++        window.ignoresMouseEvents = YES;
++      }
++      NSWindowCollectionBehavior behavior = window.collectionBehavior;
++      if (!(behavior & (NSWindowCollectionBehaviorCanJoinAllSpaces |
++                        NSWindowCollectionBehaviorMoveToActiveSpace))) {
++        window.collectionBehavior =
++            behavior | NSWindowCollectionBehaviorMoveToActiveSpace;
++      }
++    };
+     auto hide = ^{
+       for (NSWindow* window in NSApp.windows) {
+-        if (window.alphaValue > 0) {
+-          window.alphaValue = 0;
+-        }
+-        if (!window.ignoresMouseEvents) {
+-          window.ignoresMouseEvents = YES;
+-        }
++        keep_back(window);
+       }
+     };
++    // Before a window is put on screen, not after: a new window starts
++    // opaque, and ordering it in (orderFront:, makeKeyAndOrderFront:,
++    // orderFrontRegardless) showed it until the next update.
++    {
++      Method method = class_getInstanceMethod(
++          NSWindow.class, @selector(orderWindow:relativeTo:));
++      using Order = void (*)(id, SEL, NSWindowOrderingMode, NSInteger);
++      static Order original_order =
++          reinterpret_cast<Order>(method_getImplementation(method));
++      method_setImplementation(
++          method, imp_implementationWithBlock(
++                      ^(id window, NSWindowOrderingMode mode, NSInteger other) {
++                        keep_back(window);
++                        original_order(window, @selector(orderWindow:relativeTo:),
++                                       mode, other);
++                      }));
++    }
++    {
++      Method method = class_getInstanceMethod(
++          NSWindow.class, @selector(orderFrontRegardless));
++      using Regardless = void (*)(id, SEL);
++      static Regardless original_regardless =
++          reinterpret_cast<Regardless>(method_getImplementation(method));
++      method_setImplementation(
++          method, imp_implementationWithBlock(^(id window) {
++            keep_back(window);
++            original_regardless(window, @selector(orderFrontRegardless));
++          }));
++    }
++    for (SEL selector : {@selector(orderFront:),
++                         @selector(makeKeyAndOrderFront:)}) {
++      Method method = class_getInstanceMethod(NSWindow.class, selector);
++      using Show = void (*)(id, SEL, id);
++      Show original = reinterpret_cast<Show>(method_getImplementation(method));
++      method_setImplementation(
++          method, imp_implementationWithBlock(^(id window, id sender) {
++            keep_back(window);
++            original(window, selector, sender);
++          }));
++    }
+     // Fade-ins animate the alpha back up: whatever alpha a window is given,
+     // it stays see-through.
+     {
+@@ -979,18 +1032,43 @@ class AppControllerProfileObserver : public ProfileAttributesStorage::Observer,
+             return NSWindowAnimationBehaviorNone;
+           }));
+     }
++    // Whatever collection behaviour Chrome gives a window, it keeps "move
++    // to the active Space" (exclusive with "all Spaces", which stays).
++    {
++      Method method = class_getInstanceMethod(
++          NSWindow.class, @selector(setCollectionBehavior:));
++      using SetBehavior = void (*)(id, SEL, NSWindowCollectionBehavior);
++      static SetBehavior original_set_behavior =
++          reinterpret_cast<SetBehavior>(method_getImplementation(method));
++      method_setImplementation(
++          method, imp_implementationWithBlock(^(
++                      id window, NSWindowCollectionBehavior behavior) {
++            if (behavior & NSWindowCollectionBehaviorCanJoinAllSpaces) {
++              behavior &= ~NSWindowCollectionBehaviorMoveToActiveSpace;
++            } else {
++              behavior |= NSWindowCollectionBehaviorMoveToActiveSpace;
++            }
++            original_set_behavior(window, @selector(setCollectionBehavior:),
++                                  behavior);
++          }));
++    }
++    for (NSNotificationName name :
++         {NSWindowDidBecomeKeyNotification, NSWindowDidBecomeMainNotification,
++          NSWindowDidChangeOcclusionStateNotification}) {
++      [NSNotificationCenter.defaultCenter
++          addObserverForName:name
++                      object:nil
++                       queue:nil
++                  usingBlock:^(NSNotification* note) {
++                    keep_back(note.object);
++                  }];
++    }
+     [NSNotificationCenter.defaultCenter
+         addObserverForName:NSWindowDidUpdateNotification
+                     object:nil
+                      queue:nil
+                 usingBlock:^(NSNotification* note) {
+-                  NSWindow* window = note.object;
+-                  if (window.alphaValue > 0) {
+-                    window.alphaValue = 0;
+-                  }
+-                  if (!window.ignoresMouseEvents) {
+-                    window.ignoresMouseEvents = YES;
+-                  }
++                  keep_back(note.object);
+                 }];
+     [NSTimer scheduledTimerWithTimeInterval:0.05
+                                     repeats:YES
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 4c621aa27c..c44a160c4b 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -961,4 +961,11 @@ interface SidebarHandler {
+   // (reopened if the space has another profile) and that space comes up
+   // with it.
+   MoveTabToSpaceAndShow(tabs_api.mojom.NodeId tab_id, string space_id);
++
++  // Tests in the background (--meridian-test-background, macOS): whether
++  // Meridian is the active app, and how many of its windows (any profile's)
++  // show to the person (not see-through, or taking clicks), are key, or
++  // aren't set to stay on the Space on screen.
++  TestBackgroundState() => (bool app_active, int32 shown, int32 key,
++                            int32 may_switch_space, int32 windows);
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 6f1ca45342..e5aa237b7c 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -4189,6 +4189,11 @@ void SidebarHandler::TestWindowState(TestWindowStateCallback callback) {
+   std::move(callback).Run(false, false, -1, std::string());
+ }
+ 
++void SidebarHandler::TestBackgroundState(
++    TestBackgroundStateCallback callback) {
++  std::move(callback).Run(false, 0, 0, 0, 0);
++}
++
+ // Windows and Linux: the document picture-in-picture windows (a video's is
+ // not a browser window), each "PictureInPicture onTop=0|1 top=<hit test 12px
+ // under the top edge, mid-width> page=<hit test 40% down>". Spaces of the
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 95ce8a45f8..04055b3b6a 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -325,6 +325,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+                       bool show) override;
+   void MoveTabToSpaceAndShow(const tabs_api::NodeId& tab_id,
+                              const std::string& space_id) override;
++  void TestBackgroundState(TestBackgroundStateCallback callback) override;
+   void ShareTabInstead(const tabs_api::NodeId& tab_id) override;
+   void CanShareTabInstead(const tabs_api::NodeId& tab_id,
+                           CanShareTabInsteadCallback callback) override;
+diff --git a/chrome/browser/meridian/sidebar_handler_mac.mm b/chrome/browser/meridian/sidebar_handler_mac.mm
+index 995d21ec3e..1031ab8510 100644
+--- a/chrome/browser/meridian/sidebar_handler_mac.mm
++++ b/chrome/browser/meridian/sidebar_handler_mac.mm
+@@ -266,6 +266,33 @@ void SidebarHandler::TestWindowState(TestWindowStateCallback callback) {
+           : std::string());
+ }
+ 
++void SidebarHandler::TestBackgroundState(
++    TestBackgroundStateCallback callback) {
++  if (!HasTestSwitch("meridian-test-background")) {
++    std::move(callback).Run(false, 0, 0, 0, 0);
++    return;
++  }
++  int shown = 0, key = 0, may_switch = 0, windows = 0;
++  for (NSWindow* window in NSApp.windows) {
++    if (!window.isVisible) {
++      continue;
++    }
++    ++windows;
++    if (window.alphaValue > 0 || !window.ignoresMouseEvents) {
++      ++shown;
++    }
++    if (window.isKeyWindow) {
++      ++key;
++    }
++    if (!(window.collectionBehavior &
++          (NSWindowCollectionBehaviorMoveToActiveSpace |
++           NSWindowCollectionBehaviorCanJoinAllSpaces))) {
++      ++may_switch;
++    }
++  }
++  std::move(callback).Run(NSApp.isActive, shown, key, may_switch, windows);
++}
++
+ void SidebarHandler::TestFloatingWindows(
+     TestFloatingWindowsCallback callback) {
+   std::vector<std::string> out;

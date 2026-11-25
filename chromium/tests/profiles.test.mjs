@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { launch, SB, NEEDS_SCREEN } from './harness.mjs';
+import { launch, SB, NEEDS_SCREEN, FOREGROUND } from './harness.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ST = 'app.$.settings.shadowRoot';
@@ -58,6 +58,20 @@ async function inPage(b, suffix, expr) {
   ws.close();
 }
 
+// In the background (the person works at this Mac meanwhile), every window stays so, whichever
+// profile it is for: Meridian isn't the active app, no window shows or is key, and none can make macOS
+// switch to another desktop Space. A Work-profile window once came to the front mid-test.
+async function assertBackground(b, what) {
+  if (FOREGROUND) return;
+  await sleep(300);  // anything ordered in late
+  const s = await b.eval(`${T}.handler_.testBackgroundState()`);
+  assert.ok(s.windows >= 1, `${what}: a window (${JSON.stringify(s)})`);
+  assert.equal(s.appActive, false, `${what}: Meridian isn't the active app`);
+  assert.equal(s.shown, 0, `${what}: no window shows`);
+  assert.equal(s.key, 0, `${what}: no window is key`);
+  assert.equal(s.maySwitchSpace, 0, `${what}: no window switches the desktop Space`);
+}
+
 async function workSpace(b) {
   const { profileId } = await b.eval(`${T}.handler_.addProfile('Work')`);
   const { spaceId } = await b.eval(`${T}.handler_.createSpace('Client', '', '', '')`);
@@ -91,6 +105,7 @@ test('Profiles: a space in its own profile has its own cookies, in the same wind
     await b.eval(`${T}.handler_.activateSpace(${JSON.stringify(spaceId)})`);
     await b.waitFor(`${T}.state_.activeSpaceId === ${JSON.stringify(spaceId)}`);
     assert.equal(await b.eval(`${T}.state_.profileId`), work.id, 'the window shows Work');
+    await assertBackground(b, 'switched to the Work space');
 
     // Its own cookie jar: the site doesn't know it.
     await b.eval(`${T}.openUrl(${JSON.stringify(url('/show'))})`);
@@ -155,6 +170,7 @@ test('Profiles: favorites per profile; after a restart and ⇧⌘T the tabs are 
     await b.waitFor(`${T}.state_?.activeSpaceId === ${JSON.stringify(spaceId)}`, 15000);
     await sleep(1000);
     assert.equal(await windowCount(b), 1, 'one window after the restart');
+    await assertBackground(b, 'restarted with the Work space in front');
     const targets = await (await fetch(`${b.base}/json/list`)).json();
     assert.ok(!targets.some((t) => t.url.startsWith('chrome://profile-picker')), 'no profile picker');
     assert.equal(await b.eval(`${T}.state_.favorites.map((f) => f.title).join()`), 'Jira');
@@ -191,6 +207,7 @@ test('Profiles: a window opened later stays its own (only the old model’s wind
     assert.equal(await until(async () => (await windowCount(b)) === 2 ? 2 : 0), 2, 'a second window');
     await sleep(2000);
     assert.equal(await windowCount(b), 2, 'it stays');
+    await assertBackground(b, 'a second window');
     assert.equal(await b.eval('1 + 1'), 2, 'the first one too');
   } finally { await b.close(); }
 });
@@ -219,6 +236,7 @@ async function switchAcrossProfiles(fullscreen) {
       const st = await b.eval(`${T}.handler_.testWindowState()`);
       assert.equal(await windowCount(b), 1, `one window (${space})`);
       assert.ok(st.visible && st.onActiveSpace, `the window is on screen (${space}): ${JSON.stringify(st)}`);
+      if (!fullscreen) await assertBackground(b, `⌃${key} to ${space}`);
     }
   } finally { await b.close(); }
 }
