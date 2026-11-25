@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { launch, SB } from './harness.mjs';
@@ -162,7 +163,7 @@ test('both Arc and Chrome here: the tour moves in from Arc, Chrome is one click 
     { url: 'https://mail.example.com/', username: 'ada', password: 'x' },
   ]);
   const arc = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-arc-'));
-  fs.copyFileSync(path.join(path.dirname(new URL(import.meta.url).pathname), 'fixtures/arc/StorableSidebar.json'), path.join(arc, 'StorableSidebar.json'));
+  fs.copyFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures/arc/StorableSidebar.json'), path.join(arc, 'StorableSidebar.json'));
   const b = await launch(['about:blank'], { args: ['--meridian-onboarding', `--meridian-arc-dir=${arc}`, `--meridian-chrome-dir=${chrome}`, '--meridian-chrome-safe-storage=test-pass', '--lang=en-US'] });
   try {
     await b.waitFor(`${step} === 'hello'`, 15000);

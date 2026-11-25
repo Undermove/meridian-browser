@@ -276,7 +276,7 @@ test('Firefox: bookmarks and history only, and the step says so; no keychain que
   } finally { await b.close(); s.server.close(); fs.rmSync(fx, { recursive: true, force: true }); }
 });
 
-test('Safari: favorites bar on top, the menu as a folder, its history; no keychain question', async () => {
+test('Safari: favorites bar on top, the menu as a folder, its history; no keychain question', { skip: process.platform === 'win32' && 'Safari is macOS only' }, async () => {
   const s = await serve();
   const sf = fakeSafari(s.url);
   const b = await launch(['about:blank'], { args: [`--meridian-safari-dir=${sf}`, '--lang=en-US'] });
@@ -296,7 +296,7 @@ test('Safari: favorites bar on top, the menu as a folder, its history; no keycha
   } finally { await b.close(); s.server.close(); fs.rmSync(sf, { recursive: true, force: true }); }
 });
 
-test('Safari’s files kept private by macOS: says how to allow Meridian, brings nothing', { skip: process.getuid?.() === 0 }, async () => {
+test('Safari’s files kept private by macOS: says how to allow Meridian, brings nothing', { skip: (process.platform === 'win32' && 'Safari is macOS only') || process.getuid?.() === 0 }, async () => {
   const s = await serve();
   const sf = fakeSafari(s.url);
   fs.chmodSync(path.join(sf, 'Bookmarks.plist'), 0o000);

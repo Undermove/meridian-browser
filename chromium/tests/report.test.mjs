@@ -90,7 +90,8 @@ test('Send a report: from Settings, ⌘T and an Ask error; shows versions, AI st
     assert.match(text, /ask: Ask panel \(ollama\): /);
     assert.match(text, /provider: Ollama answered HTTP 500: /);
     // What the error said, with what is private taken out.
-    assert.ok(text.includes('model crashed loading ~/models/llama.gguf with key [hidden] for [link]'), text);
+    const sep = process.platform === 'win32' ? '\\' : '/';
+    assert.ok(text.includes(`model crashed loading ~${sep}models${sep}llama.gguf with key [hidden] for [link]`), text);
     assertPrivate(text, 'details');
     assert.ok(shownError.length > 0);
     const sheet = await sheetText(b);
