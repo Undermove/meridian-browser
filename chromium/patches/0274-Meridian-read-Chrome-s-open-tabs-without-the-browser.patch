@@ -1,0 +1,362 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 07:44:39 +0400
+Subject: [PATCH] Meridian: read Chrome's open tabs without the browser's
+ session ids
+
+Importing from Chrome (and Brave, Edge, Vivaldi, Opera) crashed with
+"Check failed: HasCurrentDefault()" when Local State had no write
+pending, e.g. after the person sat on the import step for ~10 s.
+ChromeOpenTabs ran sessions::RestoreSessionFromCommands in the thread
+pool; its SessionWindow/SessionTab take ids from SessionIdGenerator,
+which writes Local State (UI-thread only) and starts its writer's timer
+on a thread without a sequenced runner.
+
+Replay just the commands open tabs need (tab window and order, closed
+tabs/windows, navigations, prunes, window type) on plain structs, so
+nothing touches the generator or prefs off the UI thread. A unit test
+checks the result and that no session id is taken.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   1 +
+ .../browser/meridian/arc_import_unittest.cc   |  94 ++++++++++
+ chrome/browser/meridian/chrome_import.cc      | 176 ++++++++++++++++--
+ 3 files changed, 257 insertions(+), 14 deletions(-)
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 5e7a8d1df5..ce01eadbda 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -585,6 +585,7 @@ test("meridian_unittests") {
+     ":workbench_core",
+     "//base/test:run_all_unittests",
+     "//base/test:test_support",
++    "//components/sessions",
+     "//net",
+     "//sql",
+     "//testing/gtest",
+diff --git a/chrome/browser/meridian/arc_import_unittest.cc b/chrome/browser/meridian/arc_import_unittest.cc
+index 07662a402b..6fed523a81 100644
+--- a/chrome/browser/meridian/arc_import_unittest.cc
++++ b/chrome/browser/meridian/arc_import_unittest.cc
+@@ -9,10 +9,17 @@
+ #include "base/json/json_reader.h"
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/string_view_util.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "base/test/task_environment.h"
+ #include "chrome/browser/meridian/chrome_import.h"
+ #include "chrome/browser/meridian/import_source.h"
+ #include "chrome/browser/meridian/sidebar_service.h"
++#include "components/sessions/core/base_session_service_commands.h"
++#include "components/sessions/core/session_command.h"
++#include "components/sessions/core/session_id.h"
++#include "components/sessions/core/session_service_commands.h"
++#include "components/sessions/core/session_types.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+ namespace meridian {
+@@ -319,5 +326,92 @@ TEST(ImportSourceTest, OperaSidebar) {
+   EXPECT_EQ(sidebar->spaces[0].pinned[0].title, "Dial");
+ }
+ 
++
++// A session file in Chrome's format (SNSS 3) of the given commands.
++std::string Snss(
++    const std::vector<std::unique_ptr<sessions::SessionCommand>>& commands) {
++  std::string out("SNSS\x03\x00\x00\x00", 8);
++  for (const auto& command : commands) {
++    uint16_t size = static_cast<uint16_t>(command->contents().size() + 1);
++    out.push_back(static_cast<char>(size & 0xff));
++    out.push_back(static_cast<char>(size >> 8));
++    out.push_back(static_cast<char>(command->id()));
++    out.append(base::as_string_view(command->contents()));
++  }
++  return out;
++}
++
++std::unique_ptr<sessions::SessionCommand> Nav(SessionID tab,
++                                              int index,
++                                              const char* url,
++                                              const char* title) {
++  sessions::SerializedNavigationEntry nav;
++  nav.set_index(index);
++  nav.set_virtual_url(GURL(url));
++  nav.set_title(base::UTF8ToUTF16(title));
++  return sessions::CreateUpdateTabNavigationCommand(/*kUpdateTabNavigation*/ 6,
++                                                    tab, nav);
++}
++
++// A Chrome session's open tabs: the current page of each, in tab order,
++// window by window; closed tabs, closed windows and app windows left out.
++// And without taking the browser's session ids: this runs in the thread pool,
++// and SessionIdGenerator writes Local State (a CHECK there in 1.2.0 RC).
++TEST(ImportSourceTest, ChromeOpenTabs) {
++  auto id = [](int n) { return SessionID::FromSerializedValue(n); };
++  SessionID w1 = id(1), w2 = id(2), app = id(3), gone = id(4);
++  std::vector<std::unique_ptr<sessions::SessionCommand>> c;
++  c.push_back(sessions::CreateSetWindowTypeCommand(
++      w1, sessions::SessionWindow::TYPE_NORMAL));
++  c.push_back(sessions::CreateSetWindowTypeCommand(
++      w2, sessions::SessionWindow::TYPE_NORMAL));
++  c.push_back(sessions::CreateSetWindowTypeCommand(
++      app, sessions::SessionWindow::TYPE_APP));
++  c.push_back(sessions::CreateSetWindowTypeCommand(
++      gone, sessions::SessionWindow::TYPE_NORMAL));
++  // Window 1: tab 11 (back at its first page), then tab 12 (shown second).
++  c.push_back(sessions::CreateSetTabWindowCommand(w1, id(12)));
++  c.push_back(sessions::CreateSetTabIndexInWindowCommand(id(12), 1));
++  c.push_back(Nav(id(12), 0, "https://b.example/", "B"));
++  c.push_back(sessions::CreateSetTabWindowCommand(w1, id(11)));
++  c.push_back(sessions::CreateSetTabIndexInWindowCommand(id(11), 0));
++  c.push_back(Nav(id(11), 0, "https://a.example/", "A"));
++  c.push_back(Nav(id(11), 1, "https://a.example/next", "A next"));
++  c.push_back(sessions::CreateSetSelectedNavigationIndexCommand(id(11), 0));
++  // A closed tab.
++  c.push_back(sessions::CreateSetTabWindowCommand(w1, id(13)));
++  c.push_back(Nav(id(13), 0, "https://closed.example/", "Closed"));
++  c.push_back(sessions::CreateTabClosedCommand(id(13)));
++  // Window 2: a page without a title, and a chrome:// page (skipped).
++  c.push_back(sessions::CreateSetTabWindowCommand(w2, id(21)));
++  c.push_back(Nav(id(21), 0, "https://c.example/", ""));
++  c.push_back(sessions::CreateSetTabWindowCommand(w2, id(22)));
++  c.push_back(sessions::CreateSetTabIndexInWindowCommand(id(22), 1));
++  c.push_back(Nav(id(22), 0, "chrome://settings/", "Settings"));
++  // An app window, and a closed window.
++  c.push_back(sessions::CreateSetTabWindowCommand(app, id(31)));
++  c.push_back(Nav(id(31), 0, "https://app.example/", "App"));
++  c.push_back(sessions::CreateSetTabWindowCommand(gone, id(41)));
++  c.push_back(Nav(id(41), 0, "https://gone.example/", "Gone"));
++  c.push_back(sessions::CreateWindowClosedCommand(gone));
++
++  SessionID before = SessionID::NewUnique();
++  std::vector<ArcSidebar::Tab> tabs = internal::ChromeOpenTabs(Snss(c));
++  EXPECT_EQ(SessionID::NewUnique().id(), before.id() + 1);
++
++  ASSERT_EQ(tabs.size(), 3u);
++  EXPECT_EQ(tabs[0].url, GURL("https://a.example/"));
++  EXPECT_EQ(tabs[0].title, "A");
++  EXPECT_EQ(tabs[1].url, GURL("https://b.example/"));
++  EXPECT_EQ(tabs[2].url, GURL("https://c.example/"));
++  EXPECT_EQ(tabs[2].title, "https://c.example/");
++
++  // Not a session file, or an encrypted one (version 5): nothing.
++  EXPECT_TRUE(internal::ChromeOpenTabs("hello").empty());
++  std::string encrypted = Snss(c);
++  encrypted[4] = 5;
++  EXPECT_TRUE(internal::ChromeOpenTabs(encrypted).empty());
++}
++
+ }  // namespace
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/chrome_import.cc b/chrome/browser/meridian/chrome_import.cc
+index 0ec7841390..3952aea723 100644
+--- a/chrome/browser/meridian/chrome_import.cc
++++ b/chrome/browser/meridian/chrome_import.cc
+@@ -5,8 +5,10 @@
+ #include "chrome/browser/meridian/chrome_import.h"
+ 
+ #include <algorithm>
++#include <map>
+ #include <memory>
+ #include <set>
++#include <utility>
+ 
+ #include "base/containers/span.h"
+ #include "base/files/file_enumerator.h"
+@@ -16,9 +18,9 @@
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "chrome/browser/meridian/import_source.h"
++#include "components/sessions/core/base_session_service_commands.h"
+ #include "components/sessions/core/session_command.h"
+ #include "components/sessions/core/session_id.h"
+-#include "components/sessions/core/session_service_commands.h"
+ #include "components/sessions/core/session_types.h"
+ 
+ namespace meridian {
+@@ -163,22 +165,168 @@ std::vector<ArcSidebar::Tab> ChromeOpenTabs(const std::string& data) {
+       commands.push_back(std::move(command));
+     }
+   }
+-  std::vector<std::unique_ptr<sessions::SessionWindow>> windows;
+-  SessionID active = SessionID::InvalidValue();
+-  std::string platform_session_id;
+-  std::set<SessionID> discarded;
+-  sessions::RestoreSessionFromCommands(commands, &windows, &active,
+-                                       &platform_session_id, &discarded);
+-  for (const auto& window : windows) {
+-    if (window->type != sessions::SessionWindow::TYPE_NORMAL) {
+-      continue;
++  // Replays the commands that matter for open tabs. Not with
++  // sessions::RestoreSessionFromCommands: its SessionWindow and SessionTab
++  // take ids from the browser's SessionIdGenerator, which writes Local State
++  // and must only be used on the UI thread; this runs in the thread pool
++  // (a CHECK in ImportantFileWriter once Local State had no write pending).
++  struct Tab {
++    SessionID::id_type window = 0;
++    int visual_index = 0;
++    int current = 0;
++    std::vector<sessions::SerializedNavigationEntry> navigations;  // by index
++  };
++  struct Window {
++    bool typed = false;  // only windows Chrome gave a type were open ones
++    int type = sessions::SessionWindow::TYPE_NORMAL;
++  };
++  std::map<SessionID::id_type, Tab> tabs;
++  std::map<SessionID::id_type, Window> windows;
++  struct IdAndIndex {
++    SessionID::id_type id;
++    int32_t index;
++  };
++  struct Closed {
++    SessionID::id_type id;
++    int64_t close_time;
++  };
++  struct Pruned {
++    SessionID::id_type id;
++    int32_t index;
++    int32_t count;
++  };
++  auto closest = [](std::vector<sessions::SerializedNavigationEntry>& navs,
++                    int index) {
++    return std::ranges::lower_bound(
++        navs, index, {}, &sessions::SerializedNavigationEntry::index);
++  };
++  auto prune = [&](Tab& tab, int index, int count) {
++    if (tab.current >= index && tab.current < index + count) {
++      tab.current = index - 1;
++    } else if (tab.current >= index + count) {
++      tab.current -= count;
+     }
+-    for (const auto& tab : window->tabs) {
+-      if (tab->navigations.empty()) {
+-        continue;
++    tab.navigations.erase(closest(tab.navigations, index),
++                          closest(tab.navigations, index + count));
++    for (auto& nav : tab.navigations) {
++      if (nav.index() >= index) {
++        nav.set_index(nav.index() - count);
++      }
++    }
++  };
++  // Chrome's command ids (session_service_commands.cc).
++  for (const auto& command : commands) {
++    bool ok = true;
++    switch (command->id()) {
++      case 0: {  // kCommandSetTabWindow: window id, tab id
++        SessionID::id_type payload[2];
++        if ((ok = command->GetContents(payload))) {
++          tabs[payload[1]].window = payload[0];
++        }
++        break;
++      }
++      case 2: {  // kCommandSetTabIndexInWindow
++        IdAndIndex payload;
++        if ((ok = command->GetContents(payload))) {
++          tabs[payload.id].visual_index = payload.index;
++        }
++        break;
++      }
++      case 16:    // kCommandTabClosed
++      case 17: {  // kCommandWindowClosed
++        Closed payload;
++        if ((ok = command->GetContents(payload))) {
++          if (command->id() == 16) {
++            tabs.erase(payload.id);
++          } else {
++            windows.erase(payload.id);
++          }
++        }
++        break;
++      }
++      case 5: {  // kCommandTabNavigationPathPrunedFromBack
++        IdAndIndex payload;
++        if ((ok = command->GetContents(payload))) {
++          Tab& tab = tabs[payload.id];
++          tab.navigations.erase(closest(tab.navigations, payload.index),
++                                tab.navigations.end());
++        }
++        break;
++      }
++      case 11: {  // kCommandTabNavigationPathPrunedFromFront
++        IdAndIndex payload;
++        if ((ok = command->GetContents(payload) && payload.index > 0)) {
++          prune(tabs[payload.id], 0, payload.index);
++        }
++        break;
++      }
++      case 24: {  // kCommandTabNavigationPathPruned
++        Pruned payload;
++        if ((ok = command->GetContents(payload) && payload.index >= 0 &&
++                  payload.count > 0)) {
++          prune(tabs[payload.id], payload.index, payload.count);
++        }
++        break;
++      }
++      case 6: {  // kCommandUpdateTabNavigation
++        sessions::SerializedNavigationEntry nav;
++        SessionID tab_id = SessionID::InvalidValue();
++        if ((ok = sessions::RestoreUpdateTabNavigationCommand(*command, &nav,
++                                                              &tab_id))) {
++          auto& navs = tabs[tab_id.id()].navigations;
++          auto it = closest(navs, nav.index());
++          if (it != navs.end() && it->index() == nav.index()) {
++            *it = nav;
++          } else {
++            navs.insert(it, nav);
++          }
++        }
++        break;
+       }
++      case 7: {  // kCommandSetSelectedNavigationIndex
++        IdAndIndex payload;
++        if ((ok = command->GetContents(payload))) {
++          tabs[payload.id].current = payload.index;
++        }
++        break;
++      }
++      case 9: {  // kCommandSetWindowType
++        IdAndIndex payload;
++        if ((ok = command->GetContents(payload))) {
++          windows[payload.id] = {true, payload.index};
++        }
++        break;
++      }
++      default:  // bounds, pinning, groups...: nothing for open tabs
++        break;
++    }
++    if (!ok) {
++      break;  // a damaged command: keep what was read before it
++    }
++  }
++  // Window by window (oldest first), the tabs in their order.
++  std::map<SessionID::id_type, std::vector<std::pair<int, SessionID::id_type>>>
++      order;
++  for (const auto& [id, tab] : tabs) {
++    if (tab.window && !tab.navigations.empty()) {
++      order[tab.window].push_back({tab.visual_index, id});
++    }
++  }
++  for (auto& [window_id, ids] : order) {
++    auto window = windows.find(window_id);
++    if (window == windows.end() || !window->second.typed ||
++        window->second.type != sessions::SessionWindow::TYPE_NORMAL) {
++      continue;
++    }
++    std::ranges::sort(ids);
++    for (const auto& [visual_index, id] : ids) {
++      const Tab& tab = tabs[id];
++      // The current page; past the end (pruned) -> the last one.
++      auto it = std::ranges::lower_bound(
++          tab.navigations, tab.current, {},
++          &sessions::SerializedNavigationEntry::index);
+       const sessions::SerializedNavigationEntry& nav =
+-          tab->navigations[tab->normalized_navigation_index()];
++          it == tab.navigations.end() ? tab.navigations.back() : *it;
+       GURL url = nav.virtual_url();
+       if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS() ||
+           out.size() >= 500) {
