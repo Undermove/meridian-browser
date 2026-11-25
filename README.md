@@ -17,6 +17,7 @@
   <img src="https://img.shields.io/badge/E2E%20tests-170%2B-FF7A59?style=flat-square" alt="170+ end-to-end tests">
   <img src="https://img.shields.io/badge/account-none%20needed-2ea44f?style=flat-square" alt="No account needed">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-FFB347?style=flat-square" alt="MIT license"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/Undermove/meridian-browser"><img src="https://api.securityscorecards.dev/projects/github.com/Undermove/meridian-browser/badge" alt="OpenSSF Scorecard" height="20"></a>
   <a href="https://glama.ai/mcp/servers/Undermove/meridian-browser"><img src="https://glama.ai/mcp/servers/Undermove/meridian-browser/badges/score.svg" alt="Undermove/meridian-browser MCP server" height="20"></a>
 </p>
 
@@ -105,6 +106,25 @@ Linux and Intel Macs aren't supported by the current version.
 **First launch.** On Mac, Meridian is signed and notarized by Apple, so it opens like any other app. If macOS asks about **Meridian Safe Storage**, click **Always Allow**: that's where the key to your saved logins lives (Chrome and Arc ask the same). On Windows the installer isn't signed by Microsoft yet, so SmartScreen shows "Windows protected your PC": click **More info › Run anyway**. Every release has signed `SHA256SUMS.txt` to check the download.
 
 **Updates** come by themselves: Meridian checks every 20 minutes, shows what's new, and restarts with your tabs.
+
+## Verifying a download
+
+Meridian's release files are built and signed on the maintainer's own machines (Mac and Windows), not in GitHub Actions. Every release has `SHA256SUMS.txt` (Mac) and `SHA256SUMS-win.txt` (Windows), each signed with the release key that Meridian's updater trusts. When a release is published, a [workflow](.github/workflows/release-attest.yml) checks every file against those signed checksums and records a GitHub attestation for exactly those files. To check a file you downloaded (with the [GitHub CLI](https://cli.github.com/)):
+
+```sh
+gh attestation verify Meridian-1.3.0-mac-arm64.dmg -R Undermove/meridian-browser \
+  --predicate-type https://meridianbrowser.app/attestations/published-release/v1
+```
+
+Or the checksum and its signature by hand, from a clone of this repository (Node 18+):
+
+```sh
+gh release download v1.3.0 -R Undermove/meridian-browser -p 'SHA256SUMS*'
+shasum -a 256 -c SHA256SUMS.txt --ignore-missing
+node chromium/tools/verify_release.mjs SHA256SUMS.txt SHA256SUMS.txt.sig Meridian-1.3.0-mac-arm64.dmg
+```
+
+**What this proves:** the file is the one published in this repository's release, and it matches checksums signed with Meridian's release key. **What it doesn't prove:** that the file was built by CI or can be rebuilt bit for bit from the source; the build happens off CI. On Mac, Apple's notarization is a separate check: macOS runs it when you open the app.
 
 ## Connect Claude Code (MCP)
 

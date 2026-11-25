@@ -1,0 +1,103 @@
+name: Release attestations
+
+# Meridian's release files are built and signed on the maintainer's own machines (Mac: Developer ID
+# and Apple notarization; every release: SHA256SUMS.txt / SHA256SUMS-win.txt signed with the
+# Ed25519 release key the updater trusts). They are NOT built here, so this workflow does not claim a
+# CI build. For a published release it downloads the files, checks each one against the
+# release-key-signed checksums (chromium/tools/verify_release.mjs) and only then records a GitHub
+# artifact attestation for those exact files: "published in this repository's release <tag>, built
+# off CI, checksums signed with the release key". Check one with:
+#   gh attestation verify <file> -R Undermove/meridian-browser \
+#     --predicate-type https://meridianbrowser.app/attestations/published-release/v1
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, e.g. v1.3.0'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  attest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: chromium/tools
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Download the release
+        run: |
+          [[ "$TAG" =~ ^v[0-9A-Za-z.+-]+$ ]] || { echo "Unexpected tag: $TAG" >&2; exit 1; }
+          mkdir -p "$RUNNER_TEMP/rel"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D "$RUNNER_TEMP/rel"
+          ls -l "$RUNNER_TEMP/rel"
+      - name: Check every file against the signed checksums
+        id: verify
+        run: |
+          cd "$RUNNER_TEMP/rel"
+          : > "$RUNNER_TEMP/subjects.txt"
+          found=0
+          for sums in SHA256SUMS*.txt; do
+            [ -f "$sums" ] || continue
+            [ -f "$sums.sig" ] || { echo "$sums has no $sums.sig" >&2; exit 1; }
+            found=1
+            while read -r _ name; do
+              name="${name#\*}"
+              [ -n "$name" ] || continue
+              # Fails unless $sums is signed with the release key and lists $name with its checksum.
+              node "$GITHUB_WORKSPACE/chromium/tools/verify_release.mjs" "$sums" "$sums.sig" "$name"
+              echo "$RUNNER_TEMP/rel/$name" >> "$RUNNER_TEMP/subjects.txt"
+            done < "$sums"
+            echo "$RUNNER_TEMP/rel/$sums" >> "$RUNNER_TEMP/subjects.txt"
+          done
+          [ "$found" = 1 ] || { echo "No signed SHA256SUMS in $TAG" >&2; exit 1; }
+          # The version-less copies (Meridian-mac-arm64.dmg, Meridian-win.exe) have the same bytes as
+          # a listed file, so that file's attestation covers them too; anything else is reported.
+          listed="$(xargs sha256sum < "$RUNNER_TEMP/subjects.txt" | cut -d' ' -f1)"
+          for f in *; do
+            grep -qxF "$RUNNER_TEMP/rel/$f" "$RUNNER_TEMP/subjects.txt" && continue
+            case "$f" in *.sig) continue ;; esac
+            if echo "$listed" | grep -qx "$(sha256sum "$f" | cut -d' ' -f1)"; then
+              echo "✔ $f: same bytes as a checked file"
+            else
+              echo "::warning::$f is not in the signed checksums; no attestation for it"
+            fi
+          done
+          {
+            echo 'paths<<EOF'
+            cat "$RUNNER_TEMP/subjects.txt"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+      - name: Describe the release
+        run: |
+          sums="$(cd "$RUNNER_TEMP/rel" && ls SHA256SUMS*.txt | jq -R . | jq -sc .)"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > "$RUNNER_TEMP/release.json"
+          jq --argjson sums "$sums" --arg workflow "$GITHUB_WORKFLOW_REF" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" '{
+            statement: "This file was published in the GitHub release below. It was built and signed off CI, on machines the maintainer controls; GitHub Actions did not build it. Before attesting, this workflow checked it against SHA256SUMS signed with the Meridian release key (Ed25519).",
+            builtOnCI: false,
+            release: {tag: .tag_name, name: .name, url: .html_url, targetCommitish: .target_commitish, publishedAt: .published_at},
+            checksums: {files: $sums, signature: "Ed25519, the release key the Meridian updater trusts", verifiedWith: "chromium/tools/verify_release.mjs"},
+            attestedBy: {workflow: $workflow, run: $run}
+          }' "$RUNNER_TEMP/release.json" > "$RUNNER_TEMP/predicate.json"
+          cat "$RUNNER_TEMP/predicate.json"
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.verify.outputs.paths }}
+          predicate-type: https://meridianbrowser.app/attestations/published-release/v1
+          predicate-path: ${{ runner.temp }}/predicate.json
