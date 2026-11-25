@@ -17,6 +17,7 @@
   <img src="https://img.shields.io/badge/E2E%20tests-170%2B-FF7A59?style=flat-square" alt="170+ end-to-end tests">
   <img src="https://img.shields.io/badge/account-none%20needed-2ea44f?style=flat-square" alt="No account needed">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-FFB347?style=flat-square" alt="MIT license"></a>
+  <a href="https://discord.gg/kuQRHfG39r"><img src="https://img.shields.io/badge/Discord-join%20the%20chat-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord"></a>
   <a href="https://scorecard.dev/viewer/?uri=github.com/Undermove/meridian-browser"><img src="https://api.securityscorecards.dev/projects/github.com/Undermove/meridian-browser/badge" alt="OpenSSF Scorecard" height="20"></a>
   <a href="https://glama.ai/mcp/servers/Undermove/meridian-browser"><img src="https://glama.ai/mcp/servers/Undermove/meridian-browser/badges/score.svg" alt="Undermove/meridian-browser MCP server" height="20"></a>
 </p>
