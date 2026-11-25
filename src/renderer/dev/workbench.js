@@ -737,7 +737,7 @@ function renderTabs() {
   const bar = $('#editor-tabs');
   bar.replaceChildren(...S.tabs.map((t) => {
     const el = document.createElement('div');
-    el.className = `etab${t === S.activeTab ? ' active' : ''}${isDirty(t) ? ' dirty' : ''}${t.state === 'deleted' ? ' deleted' : ''}`;
+    el.className = `etab wb-editor-tab${t === S.activeTab ? ' active' : ''}${isDirty(t) ? ' dirty' : ''}${t.state === 'deleted' ? ' deleted' : ''}`;
     el.setAttribute('role', 'tab');
     el.title = t.path + (t.state === 'deleted' ? ' (deleted on disk)' : '');
     el.innerHTML = `<span class="name"></span>${dupName(t) ? '<span class="hint"></span>' : ''}<button class="tab-close" title="Close">${icon('x', 12)}</button>`;
@@ -1070,6 +1070,13 @@ function mountTerm(info) {
     secrets: info.secrets || [], guard: !!info.guard, sandbox: !!info.sandbox, then: info.then || null, root: S.project?.root || '' };
   if (typeof proGuardPaste === 'function') proGuardPaste(t); // Workbench Pro: secret paste guard
   t.custom = savedTermNames()[t.id] || '';
+  // Back from a Workbench tab that was closed: what that page knew about it.
+  const meta = info.meta && typeof info.meta === 'object' ? info.meta : {};
+  if (!t.custom && typeof meta.name === 'string') t.custom = meta.name.slice(0, 80);
+  if (typeof meta.sessionId === 'string' && /^[\w-]{1,80}$/.test(meta.sessionId)) t.sessionId = meta.sessionId;
+  if (typeof meta.mode === 'string') t.permissionMode = meta.mode;
+  if (typeof meta.model === 'string') t.model = meta.model;
+  if (meta.remote === true) t.remote = true;
   // The title the program sets (OSC 0/2): Claude Code names it after the session, with a spinner or
   // ✳ in front; a shell, after the folder or the command running.
   xterm.onTitleChange((title) => {
@@ -1080,7 +1087,12 @@ function mountTerm(info) {
     t.auto = clean;
     renderTermTabs();
   });
-  xterm.onData((data) => { if (!t.exited) wb.ptyWrite(t.id, data); else if (data === '\r') restartTerm(t); });
+  xterm.onData((data) => {
+    if (t.exited) { if (data === '\r') restartTerm(t); return; }
+    wb.ptyWrite(t.id, data);
+    noteTyped(t, data);
+    if (t.restoredBar && data.length === 1 && data >= ' ') hideRestoredBar(t);
+  });
   xterm.attachCustomKeyEventHandler((e) => {
     if (e.type === 'keydown' && (IS_MAC ? e.metaKey : e.ctrlKey && e.shiftKey) && e.key.toLowerCase() === 'k') { xterm.clear(); return false; }
     // ⇧↩ is a new line in the prompt, not Enter (Claude Code, Codex): ESC ↩, as Warp and iTerm send.
@@ -1101,7 +1113,7 @@ function mountTerm(info) {
   return t;
 }
 
-async function launch(kind, { resume = false, resumeId, resumeMode, name } = {}) {
+async function launch(kind, { resume = false, resumeId, resumeMode, resumeModel, resumeRemote = false, name, restored = false } = {}) {
   if (!S.project) { toast('Open a project first'); return null; }
   if (S.info?.terminals === false) { toast(`Terminals are unavailable: ${S.info.terminalError || ''}`, 5000); return null; }
   // Where it sends what you type, said first (not for a session reopened after a restart).
@@ -1118,20 +1130,25 @@ async function launch(kind, { resume = false, resumeId, resumeMode, name } = {})
     // Size the pty right from the start so TUIs (Claude Code, Codex) draw correctly.
     const host = $('#term-host');
     const dims = estimateDims(host);
-    info = await wb.ptyCreate({ kind, cols: dims.cols, rows: dims.rows, secrets, resume, resumeId, resumeMode });
+    info = await wb.ptyCreate({ kind, cols: dims.cols, rows: dims.rows, secrets, resume, resumeId, resumeMode, resumeModel, resumeRemote });
   } catch (err) {
     toast(err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, ''), 5000);
     if (/not installed/i.test(err.message)) refreshInfo();
     return null;
   }
   const t = mountTerm(info);
-  if (resumeId) { t.sessionId = resumeId; t.permissionMode = resumeMode || ''; if (name) saveTermName(t, name); }
+  if (resumeId) {
+    t.sessionId = resumeId; t.permissionMode = resumeMode || ''; t.model = resumeModel || ''; t.remote = !!resumeRemote;
+    if (name) saveTermName(t, name);
+    syncTermMeta(t);
+  }
   for (const n of info.notes || []) t.xterm.writeln(`\x1b[2m${n}\x1b[0m`);
   if (t.secrets.length && !t.sandbox) t.xterm.writeln(`\x1b[2mVault: ${t.secrets.join(', ')} ${t.secrets.length === 1 ? 'is' : 'are'} set in this session’s environment (values hidden).\x1b[0m`);
   // (A shell tab gets them too, for Claude Code started there: no notes in a plain shell.)
   if (t.guard && kind !== 'shell') t.xterm.writeln('\x1b[2mSecret-file guard: Meridian asks before Claude Code reads .env, keys or credentials (file tools by path; shell commands only by a name match, so it is a safety net, not a wall).\x1b[0m');
   if (info.browserTools && kind !== 'shell') t.xterm.writeln(`\x1b[2mMeridian browser tools are connected for this session (access: ${ACCESS_LABEL[S.info?.agentAccess] || 'off'} — change it in Settings → AI).\x1b[0m`);
   activateTerm(t);
+  if (restored) showRestoredBar(t);
   return t;
 }
 
@@ -1154,7 +1171,7 @@ async function restartWithBypass(t) {
     'This Claude Code session continues, but it stops asking before it runs commands or changes files. Anything it is doing now is interrupted.',
     'Restart without asking', true);
   if (!ok) return;
-  const { id, sessionId, custom } = t;
+  const { id, sessionId, custom, model, remote } = t;
   const at = S.terms.indexOf(t);
   await killTerm(t, { quiet: true });
   for (let i = 0; i < 30; i++) {
@@ -1163,7 +1180,7 @@ async function restartWithBypass(t) {
     if (!old || old.exited) break;
     await new Promise((r) => setTimeout(r, 100));
   }
-  const next = await launch('claude', { resumeId: sessionId, resumeMode: 'bypassPermissions', name: custom || '' });
+  const next = await launch('claude', { resumeId: sessionId, resumeMode: 'bypassPermissions', resumeModel: model || '', resumeRemote: !!remote, name: custom || '' });
   if (!next) return;
   S.terms.splice(S.terms.indexOf(next), 1);
   S.terms.splice(Math.min(at, S.terms.length), 0, next);
@@ -1183,7 +1200,7 @@ async function killTerm(t, { quiet = false } = {}) {
   S.terms.splice(i, 1);
   if (S.activeTerm === t) S.activeTerm = S.terms[Math.min(i, S.terms.length - 1)] || null;
   if (S.activeTerm) activateTerm(S.activeTerm); else renderTermTabs();
-  if (t.kind === 'claude') saveClaudeSessions();
+  if (t.kind === 'claude' || t.kind === 'codex') saveClaudeSessions();
 }
 
 function activateTerm(t) {
@@ -1212,7 +1229,8 @@ function saveTermName(t, name) {
   const all = savedTermNames();
   if (name) all[t.id] = name; else delete all[t.id];
   try { sessionStorage.setItem('termNames', JSON.stringify(all)); } catch {}
-  if (t.kind === 'claude') saveClaudeSessions();
+  syncTermMeta(t);
+  if (t.kind === 'claude' || t.kind === 'codex') saveClaudeSessions();
 }
 
 // A name given by hand, else the session's name (Claude Code's status line), else the terminal's title.
@@ -1294,7 +1312,7 @@ function renderTermTabs() {
   const list = $('#term-tab-list');
   list.replaceChildren(...S.terms.map((t) => {
     const el = document.createElement('div');
-    el.className = `ttab${t === S.activeTerm ? ' active' : ''}${t.exited ? ' exited' : ''}`;
+    el.className = `ttab wb-term-tab${t === S.activeTerm ? ' active' : ''}${t.exited ? ' exited' : ''}`;
     el.setAttribute('role', 'tab');
     // A shell tab with Claude Code running in it looks like a Claude Code tab.
     el.appendChild(agentMark(t.kind === 'shell' && t.sessionId ? 'claude' : AGENT_UI[t.kind] ? t.kind : 'shell'));
@@ -1399,21 +1417,35 @@ async function reattachTerminals() {
   return list.length;
 }
 
-// Claude Code tabs come back after the browser restarts (an update, say): each project remembers
-// its Claude sessions (the id Claude Code's status line gives, the permission mode its hooks report,
-// and a name given by hand), and when
-// the Workbench opens the project with no terminals running, they open again with `claude --resume`,
-// in the same order. A tab closed by hand is forgotten.
+// Agent tabs come back after the browser restarts (an update, say): each project remembers its
+// Claude Code and Codex sessions — the id (Claude Code's status line, Codex's notify), the permission
+// mode its hooks report, its model, whether Remote Control was on, a name given by hand — and when
+// the Workbench opens the project with no terminals running, they open again resumed
+// (`claude --resume <id>`, `codex resume <id>`), in the same order. A tab closed by hand is forgotten.
+// Bypass comes back only for a session the person put in bypass (Meridian's "Restart with bypass",
+// or Claude Code's own mode switch, which its hooks report).
+const RESUMABLE = (t) => (t.kind === 'claude' || t.kind === 'shell' || t.kind === 'codex');
 function saveClaudeSessions() {
   const root = S.project?.root;
+  for (const t of S.terms) syncTermMeta(t);
   if (!root || S.restoringSessions || typeof wb.saveClaudeSessions !== 'function') return;
   // (Claude Code started by hand in a shell tab too, while it runs there.)
-  const list = S.terms.filter((t) => (t.kind === 'claude' || t.kind === 'shell') && t.root === root && t.sessionId && !t.closed)
-    .map((t) => ({ id: t.sessionId, name: t.custom || '', mode: t.permissionMode || '' }));
+  const list = S.terms.filter((t) => RESUMABLE(t) && t.root === root && t.sessionId && !t.closed)
+    .map((t) => ({ id: t.sessionId, name: t.custom || '', mode: t.kind === 'codex' ? '' : t.permissionMode || '', kind: t.kind === 'codex' ? 'codex' : 'claude', model: t.model || '', remote: !!t.remote }));
   const key = JSON.stringify(list);
   if (S.savedSessions === key) return;
   S.savedSessions = key;
   wb.saveClaudeSessions(list).catch(() => { S.savedSessions = null; });
+}
+
+// What this page knows about a terminal goes with it while the Workbench tab is closed.
+function syncTermMeta(t) {
+  if (typeof wb.ptyMeta !== 'function' || t.closed) return;
+  const meta = { name: t.custom || '', sessionId: t.sessionId || '', mode: t.permissionMode || '', model: t.model || '', remote: !!t.remote };
+  const key = JSON.stringify(meta);
+  if (t.metaKey === key) return;
+  t.metaKey = key;
+  wb.ptyMeta(t.id, meta).catch(() => { t.metaKey = ''; });
 }
 
 // The status line told us a terminal's session id (it changes on /clear, so keep following it).
@@ -1421,15 +1453,35 @@ function noteClaudeSessions(usage) {
   let changed = false;
   for (const t of S.terms) {
     const claude = t.kind === 'claude' || t.kind === 'shell';
-    const id = usage?.[t.id]?.session_id;
-    if (claude && typeof id === 'string' && id && id !== t.sessionId) { t.sessionId = id; changed = true; }
+    const u = usage?.[t.id];
+    const id = u?.session_id;
+    if ((claude || t.kind === 'codex') && typeof id === 'string' && id && id !== t.sessionId) { t.sessionId = id; changed = true; }
     // The permission mode it's in (bypass, auto, accept edits…), to resume it in the same one.
-    const mode = usage?.[t.id]?.permission_mode;
+    const mode = u?.permission_mode;
     if (claude && typeof mode === 'string' && mode && mode !== t.permissionMode) { t.permissionMode = mode; changed = true; }
+    // Its model, to resume it with the same one.
+    const model = u?.model_id;
+    if (claude && typeof model === 'string' && model && model !== t.model) { t.model = model; changed = true; }
     // Claude Code quit in a shell tab: the shell stays, nothing to bring back.
-    if (t.kind === 'shell' && t.sessionId && !usage?.[t.id]) { t.sessionId = ''; t.permissionMode = ''; changed = true; }
+    if (t.kind === 'shell' && t.sessionId && !u) { t.sessionId = ''; t.permissionMode = ''; t.model = ''; t.remote = false; changed = true; }
   }
   if (changed) { saveClaudeSessions(); renderTermTabs(); }
+}
+
+// Remote Control switched on in a Claude Code session (/remote-control, /rc): it comes back with it on.
+// (Only what was typed here tells; Claude Code reports nothing about it.)
+function noteTyped(t, data) {
+  if (!(t.kind === 'claude' || (t.kind === 'shell' && t.sessionId))) return;
+  if (data.startsWith('\x1b')) return;
+  for (const ch of data) {
+    if (ch === '\r') {
+      const line = (t.typed || '').trim();
+      t.typed = '';
+      if (/^\/(remote-control|remote|rc)\b/.test(line) && !t.remote) { t.remote = true; saveClaudeSessions(); }
+    } else if (ch === '\x7f') t.typed = (t.typed || '').slice(0, -1);
+    else if (ch === '\x03' || ch === '\x15') t.typed = '';
+    else if (ch >= ' ' && (t.typed || '').length < 200) t.typed = (t.typed || '') + ch;
+  }
 }
 
 async function restoreClaudeSessions(root) {
@@ -1437,15 +1489,70 @@ async function restoreClaudeSessions(root) {
   try { list = (await wb.claudeSessions()) || []; } catch { return; }
   list = list.filter((s) => s && /^[\w-]{1,80}$/.test(String(s.id)));
   S.savedSessions = JSON.stringify(list);
-  if (!list.length || S.info?.agents?.claude?.installed === false) return;
+  if (!list.length) return;
   S.restoringSessions = true;
   try {
     for (const s of list) {
       if (S.project?.root !== root) break;
-      await launch('claude', { resumeId: String(s.id), resumeMode: typeof s.mode === 'string' ? s.mode : '', name: typeof s.name === 'string' ? s.name.slice(0, 80) : '' });
+      const kind = s.kind === 'codex' ? 'codex' : 'claude';
+      if (S.info?.agents?.[kind]?.installed === false) continue;
+      await launch(kind, {
+        resumeId: String(s.id), resumeMode: typeof s.mode === 'string' ? s.mode : '', resumeModel: typeof s.model === 'string' ? s.model : '',
+        resumeRemote: s.remote === true, name: typeof s.name === 'string' ? s.name.slice(0, 80) : '', restored: true,
+      });
     }
   } finally { S.restoringSessions = false; }
   saveClaudeSessions();
+}
+
+// A session reopened after a restart waits for the person: "Restored — continue?". Never sends the
+// last prompt again; "Continue" types "continue". agents.autoContinue (settings) or "Always" here
+// does that by itself.
+function autoContinue() {
+  return (typeof PRO !== 'undefined' && PRO.settings?.agents?.autoContinue === true) || load('autoContinue') === '1';
+}
+function continueAgent(t) {
+  hideRestoredBar(t);
+  if (typeof typeRequest === 'function') typeRequest(t, 'continue');
+  else { wb.ptyWrite(t.id, 'continue'); setTimeout(() => wb.ptyWrite(t.id, '\r'), 150); }
+}
+function showRestoredBar(t) {
+  if (autoContinue()) {
+    t.xterm.writeln('\x1b[2mRestored after Meridian restarted — continuing (turn this off in Customize › Advanced).\x1b[0m');
+    continueAgent(t);
+    return;
+  }
+  const bar = document.createElement('div');
+  bar.className = 'restored-bar';
+  const msg = document.createElement('span');
+  msg.className = 'msg';
+  msg.textContent = `Restored — continue?${t.permissionMode === 'bypassPermissions' ? ' (bypass, as before)' : ''}`;
+  msg.title = 'Meridian restarted and reopened this session where it was. Nothing was sent to it.';
+  const auto = document.createElement('label');
+  auto.className = 'auto small';
+  auto.title = 'Continue restored sessions by themselves from now on';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.addEventListener('change', () => store('autoContinue', cb.checked ? '1' : ''));
+  auto.append(cb, document.createTextNode('Always'));
+  const go = document.createElement('button');
+  go.className = 'btn small accent';
+  go.dataset.a = 'continue';
+  go.textContent = 'Continue';
+  go.addEventListener('click', () => continueAgent(t));
+  const x = document.createElement('button');
+  x.className = 'icon-btn small';
+  x.dataset.a = 'dismiss';
+  x.title = 'Dismiss';
+  x.innerHTML = icon('x', 12);
+  x.addEventListener('click', () => { hideRestoredBar(t); t.xterm.focus(); });
+  bar.append(msg, auto, go, x);
+  t.el.appendChild(bar);
+  t.restoredBar = bar;
+}
+function hideRestoredBar(t) {
+  t.restoredBar?.remove();
+  t.restoredBar = null;
 }
 
 function initTerminals() {

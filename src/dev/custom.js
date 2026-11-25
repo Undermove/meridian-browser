@@ -29,8 +29,9 @@ const PLUGIN_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.js$/;
 const DEFAULT_SETTINGS = {
   editor: { fontSize: 13, fontFamily: '', lineHeight: 20, minimap: false, wordWrap: 'off', tabSize: 2, theme: 'auto' },
   terminal: { fontSize: 12.5, fontFamily: '', lineHeight: 1.15 },
-  layout: { treeWidth: 240, terminalHeight: '38%', sidePanelWidth: 320, showTree: true },
-  ui: { accent: '' },
+  layout: { treeWidth: 240, terminalHeight: '38%', sidePanelWidth: 320, showTree: true, showStatusBar: true, terminalTabs: 'top', editorTabs: 'top' },
+  ui: { accent: '', look: 'default' },
+  agents: { autoContinue: false },
 };
 
 const USER_CSS = `/* Workbench user styles — loaded after the built-in styles, hot-reloaded on save.
@@ -98,13 +99,39 @@ ${JSON.stringify(DEFAULT_SETTINGS, null, 2)}
 
 - \`editor.theme\`: \`"auto"\` (follows the system), \`"light"\`, \`"dark"\`, \`"hc-black"\`, \`"hc-light"\`.
 - \`layout.terminalHeight\`: CSS length (\`"40%"\`, \`"320px"\`). \`layout.showTree\`: hide the file tree.
+- \`layout.showStatusBar\`: \`false\` hides the status bar at the bottom.
+- \`layout.terminalTabs\`: \`"top"\` (a row above the terminal) or \`"left"\` (a vertical list left of it).
+  \`layout.editorTabs\`: the same for the open files' tabs. This is the supported way to move the tab
+  bars; don't rebuild them with CSS.
 - \`ui.accent\`: hex colour to override the space colour (\`"#d97757"\`), empty = follow the space.
+- \`ui.look\`: \`"default"\` or \`"soft"\` (light, warm colours and rounder corners).
+- \`agents.autoContinue\`: after Meridian restarts, agent sessions come back resumed and wait with a
+  "Restored — continue?" bar; \`true\` sends "continue" to each one by itself.
+
+The Customize panel's one-click looks (Designer mode, Minimal) are laid over this file without
+changing it; Reset there takes them off.
 
 ## user.css
 
 Loaded after the built-in styles. Main regions: \`#topbar\`, \`#tree-pane\`, \`#editor-area\`,
 \`#term-area\`, \`#side-pane\`, \`#statusbar\`. Variables: \`--space\`, \`--surface\`, \`--surface-2\`,
-\`--text\`, \`--text-muted\`, \`--border\`, \`--mono\`, \`--font\`.
+\`--text\`, \`--text-muted\`, \`--border\`, \`--mono\`, \`--font\`, \`--term-tabs-w\` and \`--editor-tabs-w\`
+(the width of a tab list on the left, \`190px\`).
+
+Stable selectors (kept across updates; anything else may change):
+
+| Selector | What it is |
+| --- | --- |
+| \`.wb-term-area\` | The terminal area (tab bar + terminals). |
+| \`.wb-term-tabs\` | The terminals' tab bar (the list, the + button and the hide button). |
+| \`.wb-term-tab-list\` | The terminal tabs themselves, in order. |
+| \`.wb-term-tab\` | One terminal tab; \`.wb-term-tab.active\` is the one shown, \`.wb-term-tab.exited\` one whose program ended. |
+| \`.wb-term-tab .name\` | Its name. |
+| \`.wb-editor-area\` | The editor area (tab bar + editor). |
+| \`.wb-editor-tabs\` | The open files' tab bar. |
+| \`.wb-editor-tab\` | One file tab; \`.active\`, \`.dirty\` (unsaved) and \`.deleted\` as above. |
+| \`body[data-term-tabs="left"]\`, \`body[data-editor-tabs="left"]\` | Set while a tab bar is on the left. |
+| \`body[data-look="soft"]\` | Set while the soft look is on. |
 
 ## Safety
 
@@ -126,7 +153,8 @@ Read **API.md** first: it is the exact, current plugin API and settings referenc
 
 ## Where to change what
 
-- Font, sizes, theme, layout → \`settings.json\` (keep it valid JSON; unknown keys are ignored).
+- Font, sizes, theme, layout (including where the tab bars go) → \`settings.json\` (keep it valid
+  JSON; unknown keys are ignored).
 - Colours, spacing, hiding things → \`user.css\`.
 - New buttons, commands, keybindings, panels, launchers → a plugin in \`plugins/<name>.js\`.
   One feature per file, named after the feature (\`plugins/deploy-button.js\`).
