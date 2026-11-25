@@ -83,7 +83,7 @@ print('ALL DONE', flush=True)
 sys.stdin.readline()
 `;
 
-test('permission questions: real reads only, a session’s allowance, answers in Mission Control rows, stopped subagents', async () => {
+test('permission questions: real reads only, a session’s allowance, answers in Mission Control rows, stopped subagents', { skip: process.platform === 'win32' && 'the stand-in Claude Code is a Python script' }, async () => {
   const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-pu-')));
   fs.mkdirSync(path.join(project, '.git'));
   fs.mkdirSync(path.join(project, 'sub'));

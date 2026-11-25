@@ -26,7 +26,7 @@ async function openFromOtherApp(b, url) {
 }
 const todayTitles = `[...${SB}.querySelectorAll('meridian-tab-row')].map((r) => r.tab.title)`;
 
-test('a link from another app opens in a Little window; Open in Meridian moves it to the main window', async () => {
+test('a link from another app opens in a Little window; Open in Meridian moves it to the main window', { skip: process.platform === 'win32' && 'a link from another app comes as a macOS Apple event (tools/open_url.swift)' }, async () => {
   const site = await startServer();
   const b = await launch([site.url('/p/Main')]);
   try {
@@ -60,7 +60,7 @@ test('a link from another app opens in a Little window; Open in Meridian moves i
   } finally { await b.close(); await site.close(); }
 });
 
-test('Air Traffic Control: a matching rule sends the link to the main window instead', async () => {
+test('Air Traffic Control: a matching rule sends the link to the main window instead', { skip: process.platform === 'win32' && 'a link from another app comes as a macOS Apple event (tools/open_url.swift)' }, async () => {
   const site = await startServer();
   // Settings → Links writes this pref; here it's seeded into a new profile.
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
@@ -88,7 +88,7 @@ test('Air Traffic Control: a matching rule sends the link to the main window ins
 // is one split button: "Open in Work" (that space), and ▾ for the other spaces, where the page opens
 // in the main window (again, with that space's profile). A login here was asked for in the work space
 // and opened in the personal one.
-test('a Little window opens in the last space with its logins; Open in <Space> ▾ opens it in another space', async () => {
+test('a Little window opens in the last space with its logins; Open in <Space> ▾ opens it in another space', { skip: process.platform === 'win32' && 'a link from another app comes as a macOS Apple event (tools/open_url.swift)' }, async () => {
   const http = await import('node:http');
   const server = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'text/html' });
