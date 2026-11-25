@@ -136,6 +136,12 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
   for (const sw of ['arc', 'chrome', 'brave', 'edge', 'vivaldi', 'opera', 'firefox', 'safari'].map((k) => `--meridian-${k}-dir`)) {
     if (!args.some((a) => a.startsWith(sw + '='))) args = [...args, `${sw}=${empty}`];
   }
+  // No cookie banner list from the internet: an empty one unless a test gives its own.
+  if (!args.some((a) => a.startsWith('--meridian-cookie-list='))) {
+    const none = path.join(os.tmpdir(), 'meridian-empty-cookie-list.txt');
+    if (!fs.existsSync(none)) fs.writeFileSync(none, '');
+    args = [...args, `--meridian-cookie-list=${none}`];
+  }
   const started = Date.now();
   const proc = spawn(app, [
     `--user-data-dir=${profile}`, `--remote-debugging-port=${port}`, '--use-mock-keychain',
