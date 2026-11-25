@@ -205,7 +205,10 @@ test('other AIs: Ollama, a cloud key with a model picker, and Codex (sessions, S
 test('OpenCode answers Ask without --dir; what Ask shows can be selected and copied', { skip: NO_CLI }, async () => {
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
   standIn(bin, 'opencode', `const args = process.argv.slice(2);
-if (args[0] === 'auth') {
+  // Before 2 (asked with --version): the flags of 2 aren't sent to it.
+if (args[0] === '--version') {
+  console.log('0.1.0');
+} else if (args[0] === 'auth') {
   console.log('1 credentials');
 } else if (args.includes('--dir')) {
   console.error('Unrecognized flag: --dir in command opencode run');
@@ -268,7 +271,8 @@ const args = process.argv.slice(2); const home = process.env.HOME;
 const can = (...p) => { try { return fs.readFileSync(path.join(home, ...p), 'utf8').includes('model') ? 'read' : 'read'; } catch { return 'blocked'; } };
 // A Mac with no ~/.local yet: OpenCode makes its folders at start.
 const canWrite = () => { try { const d = path.join(home, '.local/state/opencode'); fs.mkdirSync(d, { recursive: true }); fs.writeFileSync(path.join(d, 'x'), '1'); return 'written'; } catch { return 'blocked'; } };
-if (args[0] === 'auth') { console.log('1 credentials'); }
+if (args[0] === '--version') { console.log('opencode v${version}.4.1'); }
+else if (args[0] === 'auth') { console.log('1 credentials'); }
 else if (args.includes('--help')) { console.log('opencode run [message..]\\n  --format\\n  --agent\\n  --session${v2 ? '\\n  --standalone  Run with a private server' : ''}'); }
 else {
   fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + '\\n');
@@ -313,6 +317,150 @@ for (const version of [1, 2]) {
     assert.equal(runs[0].includes('--standalone'), version === 2);
   });
 }
+
+// A report (23.11.2026): with OpenCode 2 installed, Ask answered "Agent not found: meridian". 2 runs
+// through a background service of its own (outside Meridian's sandbox, without Meridian's
+// configuration) unless it runs alone, and reads its agent and permissions from new keys. The
+// stand-in is a 2 that fails as that one did unless `run` gets --standalone and the configuration
+// has those keys; the next turn resumes its session as ever.
+test('OpenCode 2 answers Ask alone (--standalone), with the keys it reads', { skip: NO_CLI }, async () => {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
+  const log = path.join(bin, 'log');
+  fs.mkdirSync(log);
+  standIn(bin, 'opencode', `const fs = require('fs'), path = require('path');
+const log = ${JSON.stringify(log)};
+const args = process.argv.slice(2);
+if (args[0] === '--version') {
+  console.log('opencode v2.3.2');
+} else if (args[0] === 'auth') {
+  console.log('OpenCode Console   Default                      stored');
+} else if (args.includes('--help')) {
+  console.log('opencode run [message..]\\n  --format\\n  --agent\\n  --session\\n  --standalone  Run with a private server');
+} else {
+  const n = fs.readdirSync(log).filter((f) => f.includes('args')).length;
+  fs.writeFileSync(path.join(log, n + '.args'), args.map((a) => a + '\\n').join(''));
+  fs.writeFileSync(path.join(log, n + '.config'), process.env.OPENCODE_CONFIG_CONTENT || '');
+  let stdin = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (d) => { stdin += d; });
+  process.stdin.on('end', () => {
+    fs.writeFileSync(path.join(log, n + '.stdin'), stdin);
+    if (!args.includes('--standalone') || !(process.env.OPENCODE_CONFIG_CONTENT || '').includes('"agents"')) {
+      console.log(JSON.stringify({ type: 'error', sessionID: '', error: { type: 'unknown', message: 'Agent not found: "meridian"' } }));
+      process.exitCode = 1;
+      return;
+    }
+    console.log(JSON.stringify({ type: 'text', sessionID: 'ses_2', part: { text: 'OpenCode 2 says the page is blank' } }));
+  });
+}
+`);
+  const b = await launch(['about:blank'], { args: [`--meridian-agents-path=${bin}`] });
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    await b.eval('app.$.tabstrip.runCommand(13, 0)');
+    await b.waitFor(`app.$.settings.open && !!${ST}.querySelector('[data-id="ai"]')`);
+    await b.click(`${ST}.querySelector('[data-id="ai"]')`);
+    await b.waitFor(`!!${ST}.getElementById('aiRows')`);
+    await b.click(`${ST}.getElementById('otherAgents')`);
+    await b.waitFor(`${ST}.getElementById('ai-opencode')?.textContent.includes('Ready')`, 15000);
+    await b.eval(`${ST}.getElementById('ai-opencode').click()`);
+    await b.waitFor(`${ST}.getElementById('ai-opencode').classList.contains('on')`);
+    await b.eval('app.$.settings.hide()');
+    const ask = async (text) => {
+      if (!(await b.eval('app.$.ask.open'))) await b.eval('app.$.tabstrip.runCommand(14, 0)');
+      await b.waitFor(`app.$.ask.open && !!${AK}.getElementById('input')`);
+      const before = await b.eval(`${AK}.querySelectorAll('.msg.assistant').length`);
+      await b.eval(`(() => { const i = ${AK}.getElementById('input'); i.value = ${JSON.stringify(text)}; ${AK}.getElementById('send').click(); })()`);
+      await b.waitFor(`${AK}.querySelectorAll('.msg.assistant').length > ${before} && [...${AK}.querySelectorAll('.msg.assistant')].pop().textContent.includes('OpenCode 2 says the page is blank')`, 15000);
+    };
+    await ask('What is this page?');
+    const args = fs.readFileSync(path.join(log, '0.args'), 'utf8').split('\n');
+    // BuildCommand's order: run's own flags first, --standalone joining them
+    // once the --version or --help probe says 2.
+    assert.deepEqual(args.slice(0, 3), ['run', '--format', 'json']);
+    assert.ok(args.includes('--standalone'), args.join(' '));
+    assert.ok(args.includes('--agent') && args.includes('meridian'), args.join(' '));
+    // Alone, everything is denied: everywhere, and for Meridian's agent.
+    const config = fs.readFileSync(path.join(log, '0.config'), 'utf8');
+    assert.match(config, /"permissions":\[\{"action":"\*"/);
+    assert.match(config, /"agents":\{"meridian":\{/);
+    assert.match(config, /"system":"You are the AI built into Meridian/);
+    assert.equal((config.match(/"effect":"deny"/g) || []).length, 2, config);
+    assert.doesNotMatch(config, /"permission":|"prompt"/);
+    // The next turn continues its session, the same way.
+    await ask('And the title?');
+    const again = fs.readFileSync(path.join(log, '1.args'), 'utf8').split('\n');
+    assert.deepEqual(again.slice(0, 3), ['run', '--format', 'json']);
+    assert.ok(again.includes('--standalone'), again.join(' '));
+    assert.ok(again.includes('--session') && again.includes('ses_2'), again.join(' '));
+    assert.match(fs.readFileSync(path.join(log, '1.stdin'), 'utf8'), /And the title\?$/);
+  } finally { await b.close(); fs.rmSync(bin, { recursive: true, force: true }); }
+});
+
+// Pi answers Ask with the providers the person set up in it: Meridian only picks the model, from
+// what `pi --list-models` names, and the answer comes in Pi's JSON mode with every tool off.
+test('Pi answers Ask with the model picked in Settings', { skip: NO_CLI }, async () => {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
+  const log = path.join(bin, 'log');
+  fs.mkdirSync(log);
+  standIn(bin, 'pi', `const fs = require('fs'), path = require('path');
+const log = ${JSON.stringify(log)};
+const args = process.argv.slice(2);
+if (args[0] === '--list-models') {
+  console.log('provider  model             context  max-out  thinking  images');
+  console.log('zai       glm-5.4           200K     128K     yes       no');
+  console.log('homelab   qwen3.6-35b-a3b   32K      8K       no        no');
+} else {
+  const n = fs.readdirSync(log).filter((f) => f.includes('args')).length;
+  fs.writeFileSync(path.join(log, n + '.args'), args.map((a) => a + '\\n').join(''));
+  let stdin = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (d) => { stdin += d; });
+  process.stdin.on('end', () => {
+    fs.writeFileSync(path.join(log, n + '.stdin'), stdin);
+    const model = args[args.indexOf('--model') + 1];
+    for (const event of [
+      { type: 'session', id: 's-1', cwd: process.cwd() },
+      { type: 'message_start', message: { role: 'user' } },
+      { type: 'message_update', usage: {}, assistantMessageEvent: { type: 'thinking_delta', delta: 'hidden' } },
+      { type: 'message_update', usage: {}, assistantMessageEvent: { type: 'text_delta', delta: 'Pi (' + model + ') heard: ' } },
+      { type: 'message_update', usage: {}, assistantMessageEvent: { type: 'text_delta', delta: stdin.split('\\n').pop() } },
+      { type: 'message_end', message: { role: 'assistant', stopReason: 'stop' } },
+      { type: 'agent_end', messages: [] },
+    ]) console.log(JSON.stringify(event));
+  });
+}
+`);
+  const b = await launch(['about:blank'], { args: [`--meridian-agents-path=${bin}`] });
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    await b.eval('app.$.tabstrip.runCommand(13, 0)');
+    await b.waitFor(`app.$.settings.open && !!${ST}.querySelector('[data-id="ai"]')`);
+    await b.click(`${ST}.querySelector('[data-id="ai"]')`);
+    await b.waitFor(`!!${ST}.getElementById('aiRows')`);
+    await b.click(`${ST}.getElementById('otherAgents')`);
+    // Ready once `pi --list-models` names a model; they are what the picker offers.
+    await b.waitFor(`${ST}.getElementById('ai-pi')?.textContent.includes('Ready')`, 15000);
+    await b.waitFor(`${ST}.querySelector('select.model[data-id="pi"]')?.options.length === 3`);
+    const options = await b.eval(`[...${ST}.querySelector('select.model[data-id="pi"]').options].map((o) => o.textContent.trim())`);
+    assert.deepEqual(options, ['Default (set in Pi)', 'zai/glm-5.4', 'homelab/qwen3.6-35b-a3b']);
+    await b.eval(`(() => { const s = ${ST}.querySelector('select.model[data-id="pi"]'); s.value = 'homelab/qwen3.6-35b-a3b'; s.dispatchEvent(new Event('change')); })()`);
+    await b.eval(`${ST}.getElementById('ai-pi').click()`);
+    await b.waitFor(`${ST}.getElementById('ai-pi').classList.contains('on')`);
+    await b.eval('app.$.settings.hide()');
+    await b.eval('app.$.tabstrip.runCommand(14, 0)');
+    await b.waitFor(`app.$.ask.open && !!${AK}.getElementById('input')`);
+    await b.eval(`(() => { const i = ${AK}.getElementById('input'); i.value = 'hello pi'; ${AK}.getElementById('send').click(); })()`);
+    await b.waitFor(`[...${AK}.querySelectorAll('.msg.assistant')].pop()?.textContent.includes('Pi (homelab/qwen3.6-35b-a3b) heard: hello pi')`, 15000);
+    assert.equal(await b.eval(`${AK}.getElementById('who').textContent`), 'Pi');
+    const args = fs.readFileSync(path.join(log, '0.args'), 'utf8').split('\n');
+    assert.deepEqual(args.slice(0, 2), ['--mode', 'json']);
+    for (const flag of ['--no-tools', '--no-extensions', '--no-mcp', '--no-skills', '--no-session']) assert.ok(args.includes(flag), flag);
+    assert.equal(args.includes('--agent'), false);
+    assert.equal(args[args.indexOf('--model') + 1], 'homelab/qwen3.6-35b-a3b', args.join(' '));
+    assert.match(fs.readFileSync(path.join(log, '0.stdin'), 'utf8'), /hello pi$/);
+  } finally { await b.close(); fs.rmSync(bin, { recursive: true, force: true }); }
+});
 
 test('LM Studio installed but off: Start server turns it on, then it answers', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-lms-'));
@@ -370,7 +518,7 @@ test('agent CLIs where they can’t run: “macOS only for now”, can’t be pi
     await b.click(`${ST}.querySelector('[data-id="ai"]')`);
     await b.waitFor(`!!${ST}.getElementById('aiRows')`);
     await b.click(`${ST}.getElementById('otherAgents')`);
-    for (const id of ['codex', 'opencode', 'cursor', 'qwen', 'amp', 'goose', 'droid', 'copilot']) {
+    for (const id of ['codex', 'opencode', 'cursor', 'qwen', 'amp', 'goose', 'droid', 'copilot', 'pi']) {
       await b.waitFor(`${ST}.getElementById('ai-${id}')?.textContent.includes('macOS only for now')`, 15000);
       assert.equal(await b.eval(`${ST}.getElementById('ai-${id}').hasAttribute('disabled')`), true, `${id} can't be picked`);
     }
