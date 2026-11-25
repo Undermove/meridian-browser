@@ -61,10 +61,18 @@ test('Put to Sleep discards a quiet tab and says why it keeps a typed-in, playin
     assert.ok(toasts.includes('Not put to sleep: it is playing sound or video'), toasts.join(' | '));
     assert.ok(toasts.includes('Not put to sleep: something typed on the page would be lost'));
     assert.ok(toasts.includes('Not put to sleep: an agent is working in this tab'));
-    // Opened again: it loads.
+    // Asleep in the sidebar: a dimmed favicon with a small moon; the others look as before.
+    await b.waitFor(`${row('quiet')}.asleep && !!${row('quiet')}.shadowRoot.querySelector('.row.asleep .moon')`, 5000);
+    await b.waitFor(`${row('agent')}.asleep`, 5000);
+    assert.equal(await b.eval(`${row('Tone')}.asleep || !!${row('Tone')}.shadowRoot.querySelector('.moon')`), false);
+    assert.equal(await b.eval(`getComputedStyle(${row('quiet')}.shadowRoot.querySelector('.favicon img')).opacity`), '0.45');
+    if (SHOTS) { await new Promise((r) => setTimeout(r, 300)); await b.screenshot(path.join(SHOTS, 'sleep-mark.png')); }
+    // Opened again: it loads, and the mark goes.
     await b.eval(`${T}.activateTab(${JSON.stringify(await idOf('quiet'))})`);
     const back = await b.page(url('/quiet'), 15000);
     assert.equal(await back.eval('document.title'), 'quiet');
     back.close();
+    await b.waitFor(`!${row('quiet')}.asleep && !${row('quiet')}.shadowRoot.querySelector('.moon')`, 10000);
+    assert.ok(await b.eval(`${row('agent')}.asleep`), 'the other sleeping tab stays asleep');
   } finally { await b.close(); server.close(); }
 });
