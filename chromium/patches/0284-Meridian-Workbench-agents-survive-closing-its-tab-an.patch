@@ -1,0 +1,779 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 13:15:39 +0400
+Subject: [PATCH] Meridian: Workbench agents survive closing its tab and come
+ back after a restart with the same flags
+
+Closing the Workbench tab no longer ends its terminals: they are kept by the
+profile's Workbench service (output and exit buffered through a TermSink,
+guard questions held until a Workbench takes the session back, Mission
+Control keeps the session) and the next Workbench that opens the project
+takes them back. After a restart, Codex sessions resume too (codex resume
+<id>, its thread id from notify), and Claude Code keeps its model
+(--model, from the status line's model.id) and Remote Control
+(--remote-control).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/mission/mission_control.cc       |  40 ++++
+ .../meridian/mission/mission_control.h        |   8 +
+ .../browser/meridian/mission/mission_hook.cc  |   1 +
+ .../meridian/mission/mission_hook_unittest.cc |  11 +
+ .../meridian/workbench/workbench_handler.cc   | 202 ++++++++++++++++--
+ .../meridian/workbench/workbench_handler.h    |  12 ++
+ .../meridian/workbench/workbench_service.cc   | 101 +++++++++
+ .../meridian/workbench/workbench_service.h    |  59 +++++
+ 8 files changed, 420 insertions(+), 14 deletions(-)
+
+diff --git a/chrome/browser/meridian/mission/mission_control.cc b/chrome/browser/meridian/mission/mission_control.cc
+index 2b0163baa4..4eff38851e 100644
+--- a/chrome/browser/meridian/mission/mission_control.cc
++++ b/chrome/browser/meridian/mission/mission_control.cc
+@@ -198,6 +198,19 @@ bool IsResumablePermissionMode(std::string_view mode) {
+          mode == "dontAsk" || mode == "bypassPermissions";
+ }
+ 
++bool IsModelId(std::string_view id) {
++  if (id.empty() || id.size() > 80 || id[0] == '-') {
++    return false;
++  }
++  for (char c : id) {
++    if (!base::IsAsciiAlphaNumeric(c) && c != '-' && c != '_' && c != '.' &&
++        c != ':' && c != '[' && c != ']' && c != '/' && c != '@') {
++      return false;
++    }
++  }
++  return true;
++}
++
+ bool IsSessionId(std::string_view id) {
+   if (id.empty() || id.size() > 80) {
+     return false;
+@@ -484,6 +497,18 @@ std::vector<std::string> MissionControl::TranscriptsOf(int owner_tab) const {
+   return out;
+ }
+ 
++void MissionControl::MoveTerminal(const std::string& node_id,
++                                  int owner_tab,
++                                  const std::string& term_id) {
++  Node* node = Get(node_id);
++  if (!node) {
++    return;
++  }
++  node->owner_tab = owner_tab;
++  node->term_id = term_id;
++  Changed();
++}
++
+ void MissionControl::AttachTerminal(const std::string& node_id,
+                                     const std::string& term_id) {
+   Node* node = Get(node_id);
+@@ -639,6 +664,16 @@ void MissionControl::OnHookEvent(const std::string& node_id,
+     Changed();
+   }
+   if (kind && *kind == "codex") {
++    // Its thread id, so the Workbench can resume it (`codex resume <id>`)
++    // after a restart.
++    if (const std::string* sid = raw.FindString("session_id");
++        sid && IsSessionId(*sid)) {
++      const std::string* had = root->usage.dict.FindString("session_id");
++      if (!had || *had != *sid) {
++        root->usage.dict.Set("session_id", *sid);
++        Changed();
++      }
++    }
+     if (event == "TurnComplete") {
+       root->tool_calls++;
+       root->turns++;
+@@ -673,6 +708,11 @@ void MissionControl::OnHookEvent(const std::string& node_id,
+     if (!model.empty()) {
+       usage.Set("model", model);
+     }
++    // The model's id too: a session resumed after a restart keeps it.
++    if (std::string model_id = id("model_id");
++        !model_id.empty() && IsModelId(model_id)) {
++      usage.Set("model_id", model_id);
++    }
+     if (const std::string* path = raw.FindString("transcript_path")) {
+       root->transcript = path->substr(0, 1024);
+     }
+diff --git a/chrome/browser/meridian/mission/mission_control.h b/chrome/browser/meridian/mission/mission_control.h
+index 536da0e4fc..37508c2acd 100644
+--- a/chrome/browser/meridian/mission/mission_control.h
++++ b/chrome/browser/meridian/mission/mission_control.h
+@@ -37,6 +37,9 @@ bool IsSessionId(std::string_view id);
+ // A permission mode `claude --permission-mode` takes back on a resume: one
+ // the session was in, other than plan (a step, not a way of working).
+ bool IsResumablePermissionMode(std::string_view mode);
++// A model's id as Claude Code takes it after --model ("claude-opus-5-5",
++// "opus[1m]"…): letters, digits and - _ . : [ ] / @, not starting with -.
++bool IsModelId(std::string_view id);
+ 
+ class EventChannel;
+ struct NamedSecret;
+@@ -117,6 +120,11 @@ class MissionControl : public KeyedService,
+   // Codex's `-c notify=[…]` value.
+   std::string CodexNotifyArg() const;
+   void AttachTerminal(const std::string& node_id, const std::string& term_id);
++  // The session's Workbench tab closed while it runs (`owner_tab` 0, no
++  // terminal), or another Workbench took it back.
++  void MoveTerminal(const std::string& node_id,
++                    int owner_tab,
++                    const std::string& term_id);
+   // The names the Workbench in tab `owner_tab` shows on its terminals' tabs
+   // (terminal id -> name).
+   // How many background commands each session of the Workbench in
+diff --git a/chrome/browser/meridian/mission/mission_hook.cc b/chrome/browser/meridian/mission/mission_hook.cc
+index e0a70d2240..7fc21feb56 100644
+--- a/chrome/browser/meridian/mission/mission_hook.cc
++++ b/chrome/browser/meridian/mission/mission_hook.cc
+@@ -353,6 +353,7 @@ base::DictValue FromStatusLine(const base::DictValue& in) {
+   SetIf(out, "session_id", Str(in.Find("session_id"), 80));
+   SetIf(out, "session_name", Str(in.Find("session_name"), 80));
+   SetIf(out, "model", Str(in.FindByDottedPath("model.display_name"), 60));
++  SetIf(out, "model_id", Str(in.FindByDottedPath("model.id"), 80));
+   SetIf(out, "version", Str(in.Find("version"), 30));
+   // Its own transcript: read by Meridian for Context Insights, on this
+   // computer; never shown.
+diff --git a/chrome/browser/meridian/mission/mission_hook_unittest.cc b/chrome/browser/meridian/mission/mission_hook_unittest.cc
+index fb8abc772a..f0fe94de3a 100644
+--- a/chrome/browser/meridian/mission/mission_hook_unittest.cc
++++ b/chrome/browser/meridian/mission/mission_hook_unittest.cc
+@@ -50,6 +50,17 @@ TEST(MissionHookTest, SummarizesWithoutInputs) {
+   EXPECT_EQ(*line.FindString("summary"), "meridian › navigate · example.com");
+ }
+ 
++TEST(MissionHookTest, StatusLineKeepsTheModelsId) {
++  base::DictValue status;
++  status.Set("session_id", "s1");
++  status.Set("model", base::DictValue()
++                          .Set("id", "claude-opus-5-5")
++                          .Set("display_name", "Opus 5.5"));
++  base::DictValue line = FromStatusLine(status);
++  EXPECT_EQ(*line.FindString("model"), "Opus 5.5");
++  EXPECT_EQ(*line.FindString("model_id"), "claude-opus-5-5");
++}
++
+ TEST(MissionHookTest, CodexTurns) {
+   base::DictValue line = FromCodexEvent(
+       R"({"type": "agent-turn-complete", "thread-id": "t9", "cwd": "/x/site"})");
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 8283904270..67b8efad92 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -264,6 +264,25 @@ WorkbenchHandler::Term::Term(Term&&) = default;
+ WorkbenchHandler::Term& WorkbenchHandler::Term::operator=(Term&&) = default;
+ WorkbenchHandler::Term::~Term() = default;
+ 
++// A terminal kept running after its Workbench tab closed. Should the browser
++// end with it still unclaimed (a quit), the terminal host lets it go too, as
++// for a terminal closed in the page.
++struct WorkbenchHandler::Parked : ParkedTerminal {
++  Parked(Term t, std::string dir) : term(std::move(t)), user_data_dir(dir) {}
++  ~Parked() override {
++#if BUILDFLAG(IS_POSIX)
++    if (!term.host_key.empty()) {
++      base::ThreadPool::PostTask(
++          FROM_HERE,
++          {base::MayBlock(), base::TaskShutdownBehavior::BLOCK_SHUTDOWN},
++          base::BindOnce(&DropTerminal, user_data_dir, term.host_key));
++    }
++#endif
++  }
++  Term term;
++  std::string user_data_dir;
++};
++
+ WorkbenchHandler::WorkbenchHandler(Profile* profile)
+     : profile_(profile),
+       files_(base::ThreadPool::CreateSequencedTaskRunner(
+@@ -313,6 +332,31 @@ WorkbenchHandler::~WorkbenchHandler() {
+   std::vector<base::FilePath> cleanup;
+   mission::MissionControl* mission =
+       mission::MissionControlFactory::GetForProfile(profile_);
++  // Closing the Workbench's tab doesn't stop what runs in its terminals
++  // (agents mid-work): they go on, kept by the profile's Workbench service,
++  // and the next Workbench that opens their project shows them again.
++  // Docker sandboxes still stop with the page.
++  WorkbenchService* service = WorkbenchServiceFactory::GetForProfile(profile_);
++  for (auto it = terms_.begin(); service && it != terms_.end();) {
++    Term& term = it->second;
++    if (!term.terminal || !term.sink || term.root.empty() ||
++        !term.container.empty() || term.kind.starts_with("sandbox-")) {
++      ++it;
++      continue;
++    }
++    term.sink->Detach();
++    if (!term.guard_token.empty()) {
++      service->ParkGuard(term.guard_token);
++    }
++    if (mission && !term.mission_node.empty()) {
++      mission->MoveTerminal(term.mission_node, 0, std::string());
++    }
++    std::string root = term.root;
++    service->ParkTerminal(
++        root, std::make_unique<Parked>(
++                  std::move(term), profile_->GetPath().DirName().AsUTF8Unsafe()));
++    it = terms_.erase(it);
++  }
+   for (auto& [id, term] : terms_) {
+     DropFromHost(term);
+     cleanup.insert(cleanup.end(), term.cleanup.begin(), term.cleanup.end());
+@@ -803,6 +847,8 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+         }
+         const std::string* mode = v.GetDict().FindString("mode");
+         const std::string* name = v.GetDict().FindString("name");
++        const std::string* kind = v.GetDict().FindString("kind");
++        const std::string* model = v.GetDict().FindString("model");
+         std::string short_name;
+         if (name) {
+           base::TruncateUTF8ToByteSize(*name, 240, &short_name);
+@@ -810,9 +856,17 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+         base::DictValue entry;
+         entry.Set("id", *id);
+         entry.Set("name", short_name);
++        // Claude Code (also started in a shell tab) or Codex.
++        entry.Set("kind", kind && *kind == "codex" ? "codex" : "claude");
+         if (mode && mission::IsResumablePermissionMode(*mode)) {
+           entry.Set("mode", *mode);
+         }
++        if (model && mission::IsModelId(*model)) {
++          entry.Set("model", *model);
++        }
++        if (v.GetDict().FindBool("remote").value_or(false)) {
++          entry.Set("remote", true);
++        }
+         list.Append(std::move(entry));
+       }
+     }
+@@ -868,6 +922,7 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+     return std::move(reply).Run(base::Value(true));
+   }
+   if (method == "ptyList") {
++    TakeParked();
+ #if BUILDFLAG(IS_POSIX)
+     if (project_ && UseTermHost() &&
+         adopted_roots_.insert(project_->root().AsUTF8Unsafe()).second) {
+@@ -887,6 +942,27 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+     }
+     return std::move(reply).Run(base::Value(std::move(list)));
+   }
++  if (method == "ptyMeta") {
++    auto it = terms_.find(a);
++    if (it == terms_.end() || params.size() < 2 || !params[1].is_dict()) {
++      return std::move(reply).Run(base::Value(false));
++    }
++    base::DictValue meta;
++    for (auto [key, value] : params[1].GetDict()) {
++      if (meta.size() >= 12 || key.size() > 30) {
++        continue;
++      }
++      if (value.is_bool()) {
++        meta.Set(key, value.GetBool());
++      } else if (value.is_string()) {
++        std::string v;
++        base::TruncateUTF8ToByteSize(value.GetString(), 240, &v);
++        meta.Set(key, v);
++      }
++    }
++    it->second.meta = std::move(meta);
++    return std::move(reply).Run(base::Value(true));
++  }
+   if (method == "ptyKill") {
+     auto it = terms_.find(a);
+     if (it == terms_.end()) {
+@@ -2366,17 +2442,29 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+   bool resume = kind == "claude" && opts.FindBool("resume").value_or(false);
+   // Or one session by its id: the Workbench reopening its Claude tabs after
+   // the browser restarted.
++  // (Codex too: `codex resume <id>`.)
+   std::string resume_id;
+   if (const std::string* sid = opts.FindString("resumeId");
+-      kind == "claude" && sid && mission::IsSessionId(*sid)) {
++      (kind == "claude" || kind == "codex") && sid &&
++      mission::IsSessionId(*sid)) {
+     resume_id = *sid;
+   }
++  // Claude Code's: the permission mode it was in, its model, and whether
++  // Remote Control was on.
+   std::string resume_mode;
+   if (const std::string* mode = opts.FindString("resumeMode");
+-      !resume_id.empty() && mode &&
++      !resume_id.empty() && kind == "claude" && mode &&
+       mission::IsResumablePermissionMode(*mode) && *mode != "default") {
+     resume_mode = *mode;
+   }
++  std::string resume_model;
++  if (const std::string* model = opts.FindString("resumeModel");
++      !resume_id.empty() && kind == "claude" && model &&
++      mission::IsModelId(*model)) {
++    resume_model = *model;
++  }
++  const bool resume_remote = !resume_id.empty() && kind == "claude" &&
++                             opts.FindBool("resumeRemote").value_or(false);
+   // Host terminals and agents get the project's vault secrets in their
+   // environment (names are shown, values never).
+   std::map<std::string, std::string> secrets =
+@@ -2446,7 +2534,8 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+       FROM_HERE,
+       base::BindOnce(
+           [](std::string kind, McpBridge bridge, bool resume,
+-             std::string resume_id, std::string resume_mode)
++             std::string resume_id, std::string resume_mode,
++             std::string resume_model, bool resume_remote)
+               -> std::pair<base::expected<LaunchSpec, std::string>,
+                            std::map<std::string, std::string>> {
+             std::map<std::string, std::string> env = TerminalEnv();
+@@ -2479,13 +2568,24 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+               spec->env["MERIDIAN_USER_ZDOTDIR"] = env["ZDOTDIR"];
+             }
+             if (spec.has_value() && !resume_id.empty() &&
+-                !spec->argv.empty()) {
++                !spec->argv.empty() && kind == "codex") {
++              spec->argv.insert(spec->argv.begin() + 1, resume_id);
++              spec->argv.insert(spec->argv.begin() + 1, "resume");
++            } else if (spec.has_value() && !resume_id.empty() &&
++                       !spec->argv.empty()) {
+               spec->argv.insert(spec->argv.begin() + 1, resume_id);
+               spec->argv.insert(spec->argv.begin() + 1, "--resume");
+               if (!resume_mode.empty()) {
+                 spec->argv.insert(spec->argv.begin() + 1, resume_mode);
+                 spec->argv.insert(spec->argv.begin() + 1, "--permission-mode");
+               }
++              if (!resume_model.empty()) {
++                spec->argv.insert(spec->argv.begin() + 1, resume_model);
++                spec->argv.insert(spec->argv.begin() + 1, "--model");
++              }
++              if (resume_remote) {
++                spec->argv.insert(spec->argv.begin() + 1, "--remote-control");
++              }
+             } else if (spec.has_value() && resume && !spec->argv.empty()) {
+               spec->argv.insert(spec->argv.begin() + 1, "--resume");
+               spec->title += " (resumed)";
+@@ -2493,7 +2593,7 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+             return {std::move(spec), env};
+           },
+           kind, std::move(bridge), resume, std::move(resume_id),
+-          std::move(resume_mode)),
++          std::move(resume_mode), std::move(resume_model), resume_remote),
+       base::BindOnce(
+           [](base::WeakPtr<WorkbenchHandler> self, std::string kind, int cols,
+              int rows, mission::MissionControl::Registration registration,
+@@ -2537,12 +2637,14 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+             run.cwd = self->project_->root().AsUTF8Unsafe();
+             run.cols = cols;
+             run.rows = rows;
++            // Through a sink: the terminal may outlive this page.
++            auto sink = base::MakeRefCounted<TermSink>();
+             std::unique_ptr<Terminal> terminal = Terminal::Start(
+                 run,
+-                base::BindPostTaskToCurrentDefault(base::BindRepeating(
+-                    &WorkbenchHandler::OnTerminalData, self, id)),
+-                base::BindPostTaskToCurrentDefault(base::BindOnce(
+-                    &WorkbenchHandler::OnTerminalExit, self, id)));
++                base::BindPostTaskToCurrentDefault(
++                    base::BindRepeating(&TermSink::Data, sink)),
++                base::BindPostTaskToCurrentDefault(
++                    base::BindOnce(&TermSink::Exit, sink)));
+             if (!terminal) {
+               ended(1);
+               return std::move(reply).Run(
+@@ -2550,6 +2652,8 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+             }
+             Term term;
+             term.terminal = std::move(terminal);
++            term.sink = sink;
++            term.root = run.cwd;
+             term.kind = kind;
+             term.started = base::Time::Now();
+             term.title = spec->title;
+@@ -2571,6 +2675,7 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+             info.Set("notes", std::move(notes));
+             info.Set("browserTools", spec->browser_tools);
+             self->terms_[id] = std::move(term);
++            self->AttachSink(id);
+             self->KeepInHost(id);
+             std::move(reply).Run(base::Value(std::move(info)));
+           },
+@@ -2677,7 +2782,8 @@ base::DictValue WorkbenchHandler::TermInfo(const std::string& id,
+       .Set("then", term.then.empty() ? base::Value() : base::Value(term.then))
+       .Set("missionNode", term.mission_node.empty()
+                               ? base::Value()
+-                              : base::Value(term.mission_node));
++                              : base::Value(term.mission_node))
++      .Set("meta", term.meta.Clone());
+ }
+ 
+ bool WorkbenchHandler::UseTermHost() const {
+@@ -2751,12 +2857,13 @@ void WorkbenchHandler::OnAdopted(
+       tabs::TabInterface::MaybeGetFromContents(web_ui()->GetWebContents());
+   for (OrphanTerminal& o : orphans) {
+     std::string id = "t" + base::NumberToString(++term_seq_);
++    auto sink = base::MakeRefCounted<TermSink>();
+     std::unique_ptr<Terminal> terminal = Terminal::Adopt(
+         o.pid, o.master,
+-        base::BindPostTaskToCurrentDefault(base::BindRepeating(
+-            &WorkbenchHandler::OnTerminalData, weak_factory_.GetWeakPtr(), id)),
+-        base::BindPostTaskToCurrentDefault(base::BindOnce(
+-            &WorkbenchHandler::OnTerminalExit, weak_factory_.GetWeakPtr(), id)));
++        base::BindPostTaskToCurrentDefault(
++            base::BindRepeating(&TermSink::Data, sink)),
++        base::BindPostTaskToCurrentDefault(
++            base::BindOnce(&TermSink::Exit, sink)));
+     if (!terminal) {
+       continue;
+     }
+@@ -2769,6 +2876,8 @@ void WorkbenchHandler::OnAdopted(
+     };
+     Term term;
+     term.terminal = std::move(terminal);
++    term.sink = sink;
++    term.root = project_->root().AsUTF8Unsafe();
+     term.kind = str("kind").empty() ? "shell" : str("kind");
+     term.title = str("title");
+     term.mission_kind = str("mission_kind");
+@@ -2796,6 +2905,7 @@ void WorkbenchHandler::OnAdopted(
+     }
+     Terminal* adopted = term.terminal.get();
+     terms_[id] = std::move(term);
++    AttachSink(id);
+     KeepInHost(id);
+     // A full-screen program (Claude Code) draws itself again.
+     adopted->Redraw();
+@@ -2808,6 +2918,70 @@ void WorkbenchHandler::OnAdopted(
+   std::move(reply).Run(base::Value(std::move(list)));
+ }
+ 
++void WorkbenchHandler::AttachSink(const std::string& id) {
++  auto it = terms_.find(id);
++  if (it == terms_.end() || !it->second.sink) {
++    return;
++  }
++  it->second.sink->Attach(
++      base::BindRepeating(&WorkbenchHandler::OnTerminalData,
++                          weak_factory_.GetWeakPtr(), id),
++      base::BindOnce(&WorkbenchHandler::OnTerminalExit,
++                     weak_factory_.GetWeakPtr(), id));
++}
++
++void WorkbenchHandler::TakeParked() {
++  if (!project_) {
++    return;
++  }
++  std::vector<std::unique_ptr<ParkedTerminal>> parked =
++      WorkbenchServiceFactory::GetForProfile(profile_)->TakeParkedTerminals(
++          project_->root().AsUTF8Unsafe());
++  if (parked.empty()) {
++    return;
++  }
++  mission::MissionControl* mission =
++      mission::MissionControlFactory::GetForProfile(profile_);
++  tabs::TabInterface* tab =
++      tabs::TabInterface::MaybeGetFromContents(web_ui()->GetWebContents());
++  for (std::unique_ptr<ParkedTerminal>& p : parked) {
++    Term term = std::move(static_cast<Parked*>(p.get())->term);
++    p.reset();  // (its host key moved on with the term: nothing to drop)
++    std::string id = "t" + base::NumberToString(++term_seq_);
++    term.scrollback += term.sink->TakeKept();
++    term.scrollback +=
++        "\r\n\x1b[2m[This session kept running while the Workbench was "
++        "closed]\x1b[0m\r\n";
++    if (term.scrollback.size() > kScrollbackBytes) {
++      size_t cut = term.scrollback.size() - kScrollbackBytes;
++      while (cut < term.scrollback.size() &&
++             (term.scrollback[cut] & 0xc0) == 0x80) {
++        ++cut;
++      }
++      term.scrollback.erase(0, cut);
++    }
++    if (!term.guard_token.empty()) {
++      auto token = std::make_shared<std::string>(term.guard_token);
++      WorkbenchServiceFactory::GetForProfile(profile_)->RebindGuard(
++          term.guard_token,
++          base::BindRepeating(&WorkbenchHandler::GuardDecision,
++                              weak_factory_.GetWeakPtr(), token, term.root,
++                              std::make_shared<std::set<std::string>>()));
++    }
++    if (mission && !term.mission_node.empty()) {
++      mission->MoveTerminal(term.mission_node,
++                            tab ? tab->GetHandle().raw_value() : 0, id);
++    }
++    Terminal* terminal = term.terminal.get();
++    terms_[id] = std::move(term);
++    AttachSink(id);
++    // A full-screen program (Claude Code) draws itself again.
++    if (terminal && terms_.contains(id) && terms_[id].terminal) {
++      terminal->Redraw();
++    }
++  }
++}
++
+ void WorkbenchHandler::OnTerminalData(std::string id, std::string data) {
+   auto it = terms_.find(id);
+   if (it == terms_.end()) {
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.h b/chrome/browser/meridian/workbench/workbench_handler.h
+index 05f5eb98dd..a152c16663 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.h
++++ b/chrome/browser/meridian/workbench/workbench_handler.h
+@@ -26,6 +26,7 @@
+ #include "chrome/browser/meridian/workbench/guard_server.h"
+ #include "chrome/browser/meridian/workbench/project_fs.h"
+ #include "chrome/browser/meridian/workbench/term_host.h"
++#include "chrome/browser/meridian/workbench/workbench_service.h"
+ #include "content/public/browser/web_ui_message_handler.h"
+ #include "ui/shell_dialogs/select_file_dialog.h"
+ 
+@@ -105,6 +106,12 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+     // When it started (null: adopted after a restart), to tell which of an
+     // agent's sessions in the project is this terminal's.
+     base::Time started;
++    // Where its output and end go (this page, or kept while no page shows
++    // it), the project it runs in, and what the page knows about it (its
++    // name, its agent's session), kept with it while its tab is closed.
++    scoped_refptr<TermSink> sink;
++    std::string root;
++    base::DictValue meta;
+   };
+ 
+   void HandleInvoke(const base::ListValue& args);
+@@ -208,6 +215,11 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+   // The terminal host (term_host.h): hands a terminal over, lets it go, and
+   // takes back the ones a crashed browser left for a project.
+   void KeepInHost(const std::string& id);
++  // Terminals left running by a Workbench tab that closed: taken back.
++  void TakeParked();
++  struct Parked;
++  // Output and end of terminal `id` to this page, through its sink.
++  void AttachSink(const std::string& id);
+   void DropFromHost(Term& term);
+   bool UseTermHost() const;
+   void OnAdopted(Reply reply,
+diff --git a/chrome/browser/meridian/workbench/workbench_service.cc b/chrome/browser/meridian/workbench/workbench_service.cc
+index e653d545f0..0d76244572 100644
+--- a/chrome/browser/meridian/workbench/workbench_service.cc
++++ b/chrome/browser/meridian/workbench/workbench_service.cc
+@@ -57,6 +57,70 @@ WorkbenchService::WorkbenchService(Profile* profile)
+ 
+ WorkbenchService::~WorkbenchService() = default;
+ 
++TermSink::TermSink() = default;
++TermSink::~TermSink() = default;
++
++void TermSink::Data(std::string data) {
++  if (on_data_) {
++    on_data_.Run(std::move(data));
++    return;
++  }
++  // The last 256 KiB, cut at a character's start.
++  constexpr size_t kKeep = 256 * 1024;
++  kept_ += data;
++  if (kept_.size() > kKeep) {
++    size_t cut = kept_.size() - kKeep;
++    while (cut < kept_.size() && (kept_[cut] & 0xc0) == 0x80) {
++      ++cut;
++    }
++    kept_.erase(0, cut);
++  }
++}
++
++void TermSink::Exit(int code, int signal) {
++  if (on_exit_) {
++    std::move(on_exit_).Run(code, signal);
++    return;
++  }
++  exited_ = true;
++  code_ = code;
++  signal_ = signal;
++}
++
++void TermSink::Attach(DataCallback on_data, ExitCallback on_exit) {
++  on_data_ = std::move(on_data);
++  on_exit_ = std::move(on_exit);
++  if (exited_ && on_exit_) {
++    exited_ = false;
++    std::move(on_exit_).Run(code_, signal_);
++  }
++}
++
++void TermSink::Detach() {
++  on_data_.Reset();
++  on_exit_.Reset();
++}
++
++std::string TermSink::TakeKept() {
++  return std::exchange(kept_, std::string());
++}
++
++void WorkbenchService::ParkTerminal(const std::string& root,
++                                    std::unique_ptr<ParkedTerminal> terminal) {
++  parked_[root].push_back(std::move(terminal));
++}
++
++std::vector<std::unique_ptr<ParkedTerminal>>
++WorkbenchService::TakeParkedTerminals(const std::string& root) {
++  auto it = parked_.find(root);
++  if (it == parked_.end()) {
++    return {};
++  }
++  std::vector<std::unique_ptr<ParkedTerminal>> out = std::move(it->second);
++  parked_.erase(it);
++  return out;
++}
++
+ void WorkbenchService::OnCustomFileChanged(const base::FilePath& path,
+                                            bool error) {
+   base::FilePath rel;
+@@ -170,10 +234,37 @@ void WorkbenchService::UnregisterGuard(const std::string& token) {
+   auto it = tokens_.find(token);
+   if (it != tokens_.end()) {
+     deciders_.erase(it->second);
++    if (auto asks = parked_asks_.extract(it->second); !asks.empty()) {
++      for (auto& [request, answer] : asks.mapped()) {
++        std::move(answer).Run("deny", "The session ended.");
++      }
++    }
+     tokens_.erase(it);
+   }
+ }
+ 
++void WorkbenchService::ParkGuard(const std::string& token) {
++  auto it = tokens_.find(token);
++  if (it != tokens_.end()) {
++    deciders_[it->second] = GuardDecider();
++  }
++}
++
++void WorkbenchService::RebindGuard(const std::string& token,
++                                   GuardDecider decider) {
++  auto it = tokens_.find(token);
++  if (it == tokens_.end()) {
++    return;
++  }
++  deciders_[it->second] = decider;
++  auto asks = parked_asks_.extract(it->second);
++  if (!asks.empty()) {
++    for (auto& [request, answer] : asks.mapped()) {
++      decider.Run(std::move(request), std::move(answer));
++    }
++  }
++}
++
+ void WorkbenchService::SandboxStarting(const std::string& root) {
+   ++sandboxes_[root];
+ }
+@@ -198,6 +289,16 @@ void WorkbenchService::Decide(const std::string& session,
+                           "The Meridian Workbench for this session is gone.");
+     return;
+   }
++  // Its Workbench tab is closed: asked again in the one that takes it back.
++  if (it->second.is_null()) {
++    auto& waiting = parked_asks_[session];
++    if (waiting.size() >= 20) {
++      std::move(answer).Run("deny", "Too many questions while the Workbench was closed.");
++      return;
++    }
++    waiting.emplace_back(std::move(request), std::move(answer));
++    return;
++  }
+   it->second.Run(std::move(request), std::move(answer));
+ }
+ 
+diff --git a/chrome/browser/meridian/workbench/workbench_service.h b/chrome/browser/meridian/workbench/workbench_service.h
+index 742edfe3d8..1e2b9169db 100644
+--- a/chrome/browser/meridian/workbench/workbench_service.h
++++ b/chrome/browser/meridian/workbench/workbench_service.h
+@@ -9,6 +9,7 @@
+ #include <memory>
+ #include <set>
+ #include <string>
++#include <vector>
+ 
+ #include "base/callback_list.h"
+ #include "base/files/file_path.h"
+@@ -16,6 +17,7 @@
+ #include "base/threading/sequence_bound.h"
+ #include "base/timer/timer.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/ref_counted.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "chrome/browser/meridian/workbench/guard_server.h"
+@@ -27,6 +29,46 @@ namespace meridian::workbench {
+ 
+ class Vault;
+ 
++// A terminal's output and its end go through its sink: to the Workbench page
++// that shows it or, while none does (the Workbench tab was closed and the
++// program goes on), kept for the page that takes the terminal back.
++class TermSink : public base::RefCounted<TermSink> {
++ public:
++  using DataCallback = base::RepeatingCallback<void(std::string)>;
++  using ExitCallback = base::OnceCallback<void(int code, int signal)>;
++
++  TermSink();
++  TermSink(const TermSink&) = delete;
++  TermSink& operator=(const TermSink&) = delete;
++
++  void Data(std::string data);
++  void Exit(int code, int signal);
++  // From now on to these (an end that came meanwhile right away).
++  void Attach(DataCallback on_data, ExitCallback on_exit);
++  // Kept from now on.
++  void Detach();
++  // What it printed while kept.
++  std::string TakeKept();
++
++ private:
++  friend class base::RefCounted<TermSink>;
++  ~TermSink();
++
++  DataCallback on_data_;
++  ExitCallback on_exit_;
++  std::string kept_;
++  bool exited_ = false;
++  int code_ = 0;
++  int signal_ = 0;
++};
++
++// A terminal whose Workbench tab closed while it ran (WorkbenchHandler's own
++// record of it), kept until a Workbench opens its project again.
++class ParkedTerminal {
++ public:
++  virtual ~ParkedTerminal() = default;
++};
++
+ // What every Workbench tab of a profile shares: the secrets vault and the
+ // secret-file guard's socket.
+ class WorkbenchService : public KeyedService {
+@@ -63,6 +105,18 @@ class WorkbenchService : public KeyedService {
+   // A guarded Claude Code session; returns its token.
+   std::string RegisterGuard(GuardDecider decider);
+   void UnregisterGuard(const std::string& token);
++  // Its Workbench tab closed while it runs: what it asks waits for the
++  // Workbench that takes it back (RebindGuard).
++  void ParkGuard(const std::string& token);
++  void RebindGuard(const std::string& token, GuardDecider decider);
++
++  // Terminals of `root` whose Workbench tab closed while they ran; the next
++  // Workbench that opens the project takes them back. They end with the
++  // browser.
++  void ParkTerminal(const std::string& root,
++                    std::unique_ptr<ParkedTerminal> terminal);
++  std::vector<std::unique_ptr<ParkedTerminal>> TakeParkedTerminals(
++      const std::string& root);
+ 
+   // Docker sandboxes per project root, across every Workbench page of the
+   // profile: counted from before the container can start until it is gone
+@@ -102,6 +156,11 @@ class WorkbenchService : public KeyedService {
+   // session id -> who decides.
+   std::map<std::string, GuardDecider> deciders_;
+   std::map<std::string, std::string> tokens_;
++  // session id -> the questions waiting while its Workbench tab is closed.
++  std::map<std::string,
++           std::vector<std::pair<GuardServer::Request, GuardServer::Answer>>>
++      parked_asks_;
++  std::map<std::string, std::vector<std::unique_ptr<ParkedTerminal>>> parked_;
+   int next_session_ = 0;
+   std::map<std::string, int> sandboxes_;
+   base::WeakPtrFactory<WorkbenchService> weak_factory_{this};
