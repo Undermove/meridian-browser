@@ -366,3 +366,53 @@ test('currency rates: "Rates unavailable" with no connection; the last ones kept
     await ui.shot('currency-unavailable');
   } finally { await b.close(); down.close(); }
 });
+
+test('!bangs: "!yt lofi", "lofi !yt" and "!yt" alone, from the same site table as "youtube ⇥"', async () => {
+  const b = await launch(['about:blank']);
+  const { typeIn, shot, catchOpens, opened } = bar(b);
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    const r = await b.eval(`(async () => {
+      const { parseBang } = await import('./meridian/site_searches.js');
+      const u = (t) => parseBang(t)?.url ?? null;
+      return Object.fromEntries(['!g kiwi', '!yt lofi beats', '!w Batumi', '!gh meridian', '!maps tbilisi', '!r dotnet',
+        '!a usb c', '!x news', '!figma icons', '!pin cats', 'lofi !yt', 'kiwi pear !G', '!yt', '!wiki kiwi',
+        '!nope kiwi', 'hello!', 'kiwi ! yt', 'a!yt'].map((t) => [t, u(t)]));
+    })()`);
+    assert.deepEqual(r, {
+      '!g kiwi': 'https://www.google.com/search?q=kiwi',
+      '!yt lofi beats': 'https://www.youtube.com/results?search_query=lofi%20beats',
+      '!w Batumi': 'https://en.wikipedia.org/w/index.php?search=Batumi',
+      '!gh meridian': 'https://github.com/search?q=meridian',
+      '!maps tbilisi': 'https://www.google.com/maps/search/tbilisi',
+      '!r dotnet': 'https://www.reddit.com/search/?q=dotnet',
+      '!a usb c': 'https://www.amazon.com/s?k=usb%20c',
+      '!x news': 'https://x.com/search?q=news',
+      '!figma icons': 'https://www.figma.com/community/search?resource_type=mixed&query=icons',
+      '!pin cats': 'https://www.pinterest.com/search/pins/?q=cats',
+      'lofi !yt': 'https://www.youtube.com/results?search_query=lofi',
+      'kiwi pear !G': 'https://www.google.com/search?q=kiwi%20pear',
+      '!yt': 'https://youtube.com',
+      '!wiki kiwi': 'https://en.wikipedia.org/w/index.php?search=kiwi',
+      '!nope kiwi': null, 'hello!': null, 'kiwi ! yt': null, 'a!yt': null,
+    });
+    // Typed in the bar: a row says where it goes, Return opens it.
+    await catchOpens();
+    await typeIn('!yt lofi');
+    await b.waitFor(`${CB}.getElementById('bangHint')?.querySelector('.tab-title').textContent.includes('YouTube')`);
+    await shot('bang');
+    await b.key('Enter', 'Enter', 13);
+    await b.waitFor(`!${open}`);
+    assert.deepEqual(await opened(), ['https://www.youtube.com/results?search_query=lofi']);
+    // The suffix form.
+    await catchOpens();
+    await typeIn('kiwi !w');
+    await b.waitFor(`!!${CB}.getElementById('bangHint')`);
+    await b.key('Enter', 'Enter', 13);
+    await b.waitFor(`!${open}`);
+    assert.deepEqual(await opened(), ['https://en.wikipedia.org/w/index.php?search=kiwi']);
+    // An unknown bang is just a search: no row.
+    await typeIn('!nope kiwi');
+    assert.equal(await b.eval(`!!${CB}.getElementById('bangHint')`), false);
+  } finally { await b.close(); }
+});

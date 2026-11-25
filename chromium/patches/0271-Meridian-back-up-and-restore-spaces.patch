@@ -1,0 +1,449 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 06:40:57 +0400
+Subject: [PATCH] Meridian: back up and restore spaces
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A space's name, colour, icon, grain, pinned tabs and folders as a JSON file
+in Downloads, from its menu (Back Up Space…), every space from Settings >
+Advanced (Back Up); Restore from Settings or the sidebar's menu adds each
+as a new space without opening its tabs. No cookies, passwords or history.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar.mojom         |   5 +
+ chrome/browser/meridian/sidebar_handler.cc    |  18 ++
+ chrome/browser/meridian/sidebar_handler.h     |   4 +
+ .../browser/resources/webui_browser/BUILD.gn  |   1 +
+ .../webui_browser/meridian/settings.html.ts   |  12 ++
+ .../webui_browser/meridian/settings.ts        |  29 +++
+ .../webui_browser/meridian/sidebar.ts         |  44 +++++
+ .../webui_browser/meridian/space_backup.ts    | 186 ++++++++++++++++++
+ 8 files changed, 299 insertions(+)
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/space_backup.ts
+
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 26ad61aa22..5170eb44f6 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -936,4 +936,9 @@ interface SidebarHandler {
+   // Distiller), or back to the page from it. `state` is "on", "off" or
+   // "none" (nothing to read on this page).
+   ToggleReader() => (string state);
++
++  // Space backup (restoring a file): a pinned link at `position`, not
++  // opened. http(s) only; "" when it can't be added.
++  AddPinnedLink(ItemPosition position, string title, url.mojom.Url url)
++      => (string item_id);
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 8f76dab94d..25c66238c1 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -3567,6 +3567,24 @@ void SidebarHandler::AddFolder(mojom::ItemPositionPtr position,
+       position->container, position->parent_id, position->index, folder));
+ }
+ 
++void SidebarHandler::AddPinnedLink(mojom::ItemPositionPtr position,
++                                   const std::string& title,
++                                   const GURL& url,
++                                   AddPinnedLinkCallback callback) {
++  if (!url.SchemeIsHTTPOrHTTPS()) {
++    std::move(callback).Run(std::string());
++    return;
++  }
++  if (position->container == kFavorites) {
++    position->container = Favorites();
++  }
++  Item link;
++  link.title = title.empty() ? url.host() : title;
++  link.url = url;
++  std::move(callback).Run(service_->AddItem(
++      position->container, position->parent_id, position->index, link));
++}
++
+ void SidebarHandler::MoveItem(const std::string& item_id,
+                               mojom::ItemPositionPtr position) {
+   if (position->container == kFavorites) {
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index aa536b9ed9..d368a6055b 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -314,6 +314,10 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void PutTabToSleep(const tabs_api::NodeId& tab_id,
+                      PutTabToSleepCallback callback) override;
+   void ToggleReader(ToggleReaderCallback callback) override;
++  void AddPinnedLink(mojom::ItemPositionPtr position,
++                     const std::string& title,
++                     const GURL& url,
++                     AddPinnedLinkCallback callback) override;
+   void ShareTabInstead(const tabs_api::NodeId& tab_id) override;
+   void CanShareTabInstead(const tabs_api::NodeId& tab_id,
+                           CanShareTabInsteadCallback callback) override;
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index e7bd87ac5b..e7e51224ab 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -74,6 +74,7 @@ build_webui("build") {
+     "meridian/settings.ts",
+     "meridian/settings_index.ts",
+     "meridian/site_searches.ts",
++    "meridian/space_backup.ts",
+     "meridian/allow_mock.html.ts",
+     "meridian/allow_mock.ts",
+     "meridian/mac_ask.html.ts",
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index 9af35ca64f..ec768db0ce 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -783,6 +783,18 @@ export function getHtml(this: MeridianSettingsElement) {
+                 <button id="clearArchive" class="btn"
+                     @click="${this.onClearArchiveClick_}">Clear Archive…</button>
+               </div>
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Back up all spaces</div>
++                  <div id="backupNote" class="row-desc">${this.backupNote_ ||
++                      'Names, colours, icons, pinned tabs and folders, as a ' +
++                      'file in Downloads. No cookies or passwords.'}</div>
++                </div>
++                <button id="restoreSpaces" class="btn"
++                    @click="${this.onRestoreSpacesClick_}">Restore…</button>
++                <button id="backupSpaces" class="btn"
++                    @click="${this.onBackupSpacesClick_}">Back Up</button>
++              </div>
+             </div>
+           </div>
+           <div class="group">
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index df15cbd2a7..67fb992062 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -10,6 +10,7 @@ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+ import {browserProxyFactory, UpdateStatus} from '../sidebar.mojom-webui.js';
++import {backupFileName, backupOf, parseBackup, pickBackupFile, restoreBackup, saveBackup} from './space_backup.js';
+ import type {AgentCli, AiProvider, AllowedAi, ArcExtension, Atc, Settings, SidebarHandlerInterface, Space, UpdateState} from '../sidebar.mojom-webui.js';
+ 
+ import {arcDataSummary} from './arc_summary.js';
+@@ -203,6 +204,7 @@ export class MeridianSettingsElement extends CrLitElement {
+       otherAgents_: {state: true, type: Boolean},
+       setup_: {state: true, type: Object},
+       aiMessage_: {state: true, type: String},
++      backupNote_: {state: true, type: String},
+       update_: {state: true, type: Object},
+     };
+   }
+@@ -255,6 +257,8 @@ export class MeridianSettingsElement extends CrLitElement {
+   protected accessor otherAgents_: boolean = false;
+   protected accessor setup_: SetupRequest|null = null;
+   protected accessor aiMessage_: string = '';
++  // What Back Up or Restore did (Settings > Advanced > Data).
++  protected accessor backupNote_: string = '';
+   protected accessor update_: UpdateState|null = null;
+   private setupPoll_: number|null = null;
+ 
+@@ -1056,6 +1060,31 @@ export class MeridianSettingsElement extends CrLitElement {
+     this.hide();
+   }
+ 
++  protected async onBackupSpacesClick_() {
++    const {state} = await this.handler_.getState();
++    const spaces = state.spaces;
++    saveBackup(backupOf(spaces), backupFileName(spaces));
++    this.backupNote_ = `Saved ${spaces.length} ${
++        spaces.length === 1 ? 'space' : 'spaces'} to Downloads.`;
++  }
++
++  protected async onRestoreSpacesClick_() {
++    const text = await pickBackupFile();
++    if (text !== null) {
++      this.backupNote_ = await this.restoreSpaces(text);
++    }
++  }
++
++  // Restores the backup in `text` as new spaces; what happened, in words.
++  async restoreSpaces(text: string): Promise<string> {
++    const backup = parseBackup(text);
++    if (typeof backup === 'string') {
++      return backup;
++    }
++    const ids = await restoreBackup(this.handler_, backup);
++    return `Restored ${ids.length} ${ids.length === 1 ? 'space' : 'spaces'}.`;
++  }
++
+   protected onImportArcClick_() {
+     this.hide();
+     this.fire('meridian-onboarding', 'arc');
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index b499d4af0d..e74506dea8 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -39,6 +39,7 @@ import {getCss} from './sidebar.css.js';
+ import {getHtml} from './sidebar.html.js';
+ import {sourceName} from './import_sources.js';
+ import {isMac, keyText} from './keys.js';
++import {backupFileName, backupOf, parseBackup, pickBackupFile, restoreBackup, saveBackup} from './space_backup.js';
+ 
+ export const FAVORITES = 'favorites';
+ 
+@@ -2271,6 +2272,38 @@ export class MeridianSidebarElement extends CrLitElement implements
+     return reason;
+   }
+ 
++  // Space backup: the spaces' look, pinned tabs and folders as a file in
++  // Downloads (no cookies or passwords).
++  backUpSpaces(spaces: Space[]) {
++    saveBackup(backupOf(spaces), backupFileName(spaces));
++    this.fire('meridian-mission-toast', {
++      nodeId: '',
++      title: spaces.length === 1 ? `“${spaces[0]!.name}” saved to Downloads` :
++                                   'Spaces saved to Downloads',
++    });
++  }
++
++  async restoreSpacesFromFile() {
++    const text = await pickBackupFile();
++    if (text !== null) {
++      await this.restoreSpaces(text);
++    }
++  }
++
++  // Each space of the backup as a new one, and shows the first.
++  async restoreSpaces(text: string): Promise<string[]> {
++    const backup = parseBackup(text);
++    if (typeof backup === 'string') {
++      this.fire('meridian-mission-toast', {nodeId: '', title: backup});
++      return [];
++    }
++    const ids = await restoreBackup(this.handler_, backup);
++    if (ids[0]) {
++      this.handler_.activateSpace(ids[0]);
++    }
++    return ids;
++  }
++
+   // Mute Tab / Unmute Tab, for a tab that plays sound or is muted.
+   private muteMenu_(tab: Tab): MenuEntry[] {
+     const alerts = tab.alertStates || [];
+@@ -2453,6 +2486,12 @@ export class MeridianSidebarElement extends CrLitElement implements
+         keys: keyText('⌥⇧⌘N'),
+         action: () => this.addFolder_(space.id, ''),
+       },
++      {
++        label: 'Back Up Space…',
++        icon: 'download',
++        separatorBefore: true,
++        action: () => this.backUpSpaces([space]),
++      },
+       {
+         label: 'Move Left',
+         icon: 'arrowLeft',
+@@ -2501,6 +2540,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+         action: () => this.addFolder_(space.id, ''),
+       },
+       {label: 'New Space…', icon: 'layers', action: () => this.addSpace()},
++      {
++        label: 'Restore Space from Backup…',
++        icon: 'restore',
++        action: () => this.restoreSpacesFromFile(),
++      },
+       {
+         label: 'Edit Space Theme…',
+         icon: 'palette',
+diff --git a/chrome/browser/resources/webui_browser/meridian/space_backup.ts b/chrome/browser/resources/webui_browser/meridian/space_backup.ts
+new file mode 100644
+index 0000000000..0d9a3d640f
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/space_backup.ts
+@@ -0,0 +1,186 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Space backup: a space's look and its pinned tabs and folders as a file, and
++// back. Only what the sidebar shows: no cookies, passwords or history.
++
++import type {Item, SidebarHandlerInterface, Space} from '../sidebar.mojom-webui.js';
++
++export const BACKUP_KIND = 'meridian-spaces';
++export const BACKUP_VERSION = 1;
++
++export interface BackupItem {
++  title: string;
++  // A link's home address; none for a folder.
++  url?: string;
++  folder?: boolean;
++  open?: boolean;
++  children?: BackupItem[];
++}
++
++export interface BackupSpace {
++  name: string;
++  icon: string;
++  color: string;
++  color2: string;
++  grain: boolean;
++  pinned: BackupItem[];
++}
++
++export interface Backup {
++  kind: string;
++  version: number;
++  savedAt: string;
++  spaces: BackupSpace[];
++}
++
++function itemOf(item: Item): BackupItem {
++  if (item.isFolder) {
++    return {title: item.title, folder: true, open: item.open,
++            children: item.children.map(itemOf)};
++  }
++  return {title: item.title, url: item.url};
++}
++
++export function backupOf(spaces: Space[], now = new Date()): Backup {
++  return {
++    kind: BACKUP_KIND,
++    version: BACKUP_VERSION,
++    savedAt: now.toISOString(),
++    spaces: spaces.map(s => ({
++                         name: s.name,
++                         icon: s.icon,
++                         color: s.color,
++                         color2: s.color2,
++                         grain: s.grain,
++                         pinned: s.pinned.map(itemOf),
++                       })),
++  };
++}
++
++// "Work.meridian-space.json", "Meridian Spaces 2026-11-25.json".
++export function backupFileName(spaces: Space[], now = new Date()): string {
++  if (spaces.length === 1) {
++    const name = spaces[0]!.name.replace(/[\\/:*?"<>|]+/g, '').trim();
++    return `${name || 'Space'}.meridian-space.json`;
++  }
++  return `Meridian Spaces ${now.toISOString().slice(0, 10)}.json`;
++}
++
++// The backup in `text`, or why it isn't one.
++export function parseBackup(text: string): Backup|string {
++  let data: unknown;
++  try {
++    data = JSON.parse(text);
++  } catch {
++    return 'This file is not a Meridian space backup';
++  }
++  const b = data as Partial<Backup>;
++  if (!b || b.kind !== BACKUP_KIND || !Array.isArray(b.spaces)) {
++    return 'This file is not a Meridian space backup';
++  }
++  if ((b.version || 0) > BACKUP_VERSION) {
++    return 'This backup is from a newer Meridian: update to restore it';
++  }
++  const str = (v: unknown, max = 2048) =>
++      typeof v === 'string' ? v.slice(0, max) : '';
++  const items = (list: unknown, depth: number): BackupItem[] =>
++      !Array.isArray(list) || depth > 8 ?
++      [] :
++      list.slice(0, 2000).flatMap((x): BackupItem[] => {
++        if (!x || typeof x !== 'object') {
++          return [];
++        }
++        const i = x as BackupItem;
++        if (i.folder) {
++          return [{title: str(i.title, 200) || 'Folder', folder: true,
++                   open: i.open !== false,
++                   children: items(i.children, depth + 1)}];
++        }
++        const url = str(i.url);
++        return /^https?:\/\//i.test(url) ? [{title: str(i.title, 200), url}] :
++                                           [];
++      });
++  return {
++    kind: BACKUP_KIND,
++    version: BACKUP_VERSION,
++    savedAt: str(b.savedAt, 64),
++    spaces: b.spaces.slice(0, 100).map((s: Partial<BackupSpace>) => ({
++      name: str(s?.name, 100) || 'Space',
++      icon: str(s?.icon, 32),
++      color: str(s?.color, 64),
++      color2: str(s?.color2, 64),
++      grain: !!s?.grain,
++      pinned: items(s?.pinned, 0),
++    })),
++  };
++}
++
++// Each space of the backup as a new space (an existing one is never
++// touched), with its pinned tabs and folders unopened. Its id for each.
++export async function restoreBackup(
++    handler: SidebarHandlerInterface, backup: Backup): Promise<string[]> {
++  const ids: string[] = [];
++  for (const s of backup.spaces) {
++    const {spaceId} =
++        await handler.createSpace(s.name, s.icon, s.color, s.color2);
++    if (!spaceId) {
++      continue;
++    }
++    if (s.grain) {
++      handler.setSpaceGrain(spaceId, true);
++    }
++    const add = async (list: BackupItem[], parentId: string) => {
++      for (const [index, item] of list.entries()) {
++        const position = {container: spaceId, parentId, index};
++        if (item.folder) {
++          const {itemId} = await handler.addFolder(position, item.title);
++          if (itemId) {
++            await add(item.children || [], itemId);
++            if (item.open === false) {
++              handler.setFolderOpen(itemId, false);
++            }
++          }
++        } else if (item.url) {
++          await handler.addPinnedLink(position, item.title, item.url);
++        }
++      }
++    };
++    await add(s.pinned, '');
++    ids.push(spaceId);
++  }
++  return ids;
++}
++
++// Saves `backup` as a file in Downloads.
++export function saveBackup(backup: Backup, fileName: string) {
++  const blob = new Blob([JSON.stringify(backup, null, 2)],
++                        {type: 'application/json'});
++  const a = document.createElement('a');
++  a.href = URL.createObjectURL(blob);
++  a.download = fileName;
++  document.body.appendChild(a);
++  a.click();
++  a.remove();
++  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
++}
++
++// The text of a backup file the person picks, or null.
++export function pickBackupFile(): Promise<string|null> {
++  return new Promise(resolve => {
++    const input = document.createElement('input');
++    input.type = 'file';
++    input.accept = '.json,application/json';
++    input.addEventListener('change', () => {
++      const file = input.files?.[0];
++      if (!file) {
++        resolve(null);
++        return;
++      }
++      file.text().then(resolve, () => resolve(null));
++    });
++    input.addEventListener('cancel', () => resolve(null));
++    input.click();
++  });
++}

@@ -1,0 +1,193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 06:33:12 +0400
+Subject: [PATCH] Meridian: Put to Sleep in a tab's menu
+
+Discards the tab with Chromium's lifecycle unit to free its memory (it
+reloads when opened), after Meridian's own check: never the open tab, a
+page typed into, one playing sound or video, one using the camera,
+microphone or a share, the Workbench, or a tab an agent works in. A toast
+says what happened.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar.mojom         |  7 ++
+ chrome/browser/meridian/sidebar_handler.cc    | 66 +++++++++++++++++++
+ chrome/browser/meridian/sidebar_handler.h     |  2 +
+ .../webui_browser/meridian/sidebar.ts         | 35 ++++++++++
+ 4 files changed, 110 insertions(+)
+
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 70c2c3d5e7..449b7762b1 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -924,4 +924,11 @@ interface SidebarHandler {
+ 
+   // The command bar's "Little Window": a new one (⌥⌘N).
+   OpenLittleWindow();
++
++  // "Put to Sleep": discards the tab to free its memory (it reloads when
++  // opened), unless something would be lost. `reason` is "" when it slept,
++  // else why not: "active", "form" (typed into), "media" (plays sound or
++  // video), "capture" (camera, microphone or a share), "workbench",
++  // "asleep" (already) or "failed".
++  PutTabToSleep(tabs_api.mojom.NodeId tab_id) => (string reason);
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 204a781dbe..b3162bd37a 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -139,6 +139,12 @@
+ #include "components/sessions/content/content_serialized_navigation_builder.h"
+ #include "components/sessions/core/serialized_navigation_entry.h"
+ #include "content/public/browser/navigation_entry.h"
++#include "chrome/browser/resource_coordinator/tab_lifecycle_unit_external.h"
++#include "chrome/browser/resource_coordinator/lifecycle_unit_state.mojom.h"
++#include "chrome/browser/media/webrtc/media_capture_devices_dispatcher.h"
++#include "chrome/browser/media/webrtc/media_stream_capture_indicator.h"
++#include "components/performance_manager/public/graph/page_node.h"
++#include "components/performance_manager/public/performance_manager.h"
+ #include "components/sessions/core/serialized_user_agent_override.h"
+ #include "components/split_tabs/split_tab_id.h"
+ #include "components/split_tabs/split_tab_visual_data.h"
+@@ -470,6 +476,66 @@ void SidebarHandler::SetTabMuted(const tabs_api::NodeId& tab_id, bool muted) {
+   }
+ }
+ 
++void SidebarHandler::PutTabToSleep(const tabs_api::NodeId& tab_id,
++                                   PutTabToSleepCallback callback) {
++  tabs::TabInterface* tab = TabFor(tab_id);
++  if (!tab) {
++    std::move(callback).Run("failed");
++    return;
++  }
++  content::WebContents* contents = tab->GetContents();
++  auto* unit =
++      resource_coordinator::TabLifecycleUnitExternal::FromWebContents(contents);
++  if (!unit) {
++    std::move(callback).Run("failed");
++    return;
++  }
++  if (unit->GetTabState() ==
++          ::mojom::LifecycleUnitState::DISCARDED ||
++      contents->WasDiscarded()) {
++    std::move(callback).Run("asleep");
++    return;
++  }
++  if (tab == model()->GetActiveTab() || tab->GetSplit()) {
++    std::move(callback).Run("active");
++    return;
++  }
++  // The Workbench runs agent sessions.
++  const GURL& url = contents->GetLastCommittedURL();
++  if (url.SchemeIs(content::kChromeUIScheme) && url.host() == "workbench") {
++    std::move(callback).Run("workbench");
++    return;
++  }
++  // Meridian's own check, stricter than Chromium's: nothing typed is lost,
++  // nothing playing stops, no call or recording is cut.
++  scoped_refptr<MediaStreamCaptureIndicator> capture =
++      MediaCaptureDevicesDispatcher::GetInstance()
++          ->GetMediaStreamCaptureIndicator();
++  if (contents->IsBeingCaptured() ||
++      (capture && (capture->IsCapturingUserMedia(contents) ||
++                   capture->IsBeingMirrored(contents) ||
++                   capture->IsCapturingDisplay(contents)))) {
++    std::move(callback).Run("capture");
++    return;
++  }
++  if (contents->IsCurrentlyAudible() ||
++      contents->GetCurrentlyPlayingVideoCount() > 0 ||
++      contents->HasPictureInPictureVideo()) {
++    std::move(callback).Run("media");
++    return;
++  }
++  base::WeakPtr<performance_manager::PageNode> page =
++      performance_manager::PerformanceManager::
++          GetPrimaryPageNodeForWebContents(contents);
++  if (page && (page->HadFormInteraction() || page->HadUserEdits())) {
++    std::move(callback).Run("form");
++    return;
++  }
++  std::move(callback).Run(
++      unit->DiscardTab(::mojom::LifecycleUnitDiscardReason::EXTERNAL) ?
++          "" : "failed");
++}
++
+ void SidebarHandler::ShareTabInstead(const tabs_api::NodeId& tab_id) {
+   if (tabs::TabInterface* tab = TabFor(tab_id)) {
+     TabSharingUIViews::ShareInstead(tab->GetContents());
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index d125533176..e83a9cc9ac 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -311,6 +311,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+                   RunAiSetupCallback callback) override;
+   void ExpandPeek(const tabs_api::NodeId& tab_id) override;
+   void SetTabMuted(const tabs_api::NodeId& tab_id, bool muted) override;
++  void PutTabToSleep(const tabs_api::NodeId& tab_id,
++                     PutTabToSleepCallback callback) override;
+   void ShareTabInstead(const tabs_api::NodeId& tab_id) override;
+   void CanShareTabInstead(const tabs_api::NodeId& tab_id,
+                           CanShareTabInsteadCallback callback) override;
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 6d3a99924f..b499d4af0d 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -2115,6 +2115,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+         action: () => this.handler_.splitWith(tab.id),
+       },
+       ...this.muteMenu_(tab),
++      ...this.sleepMenu_(tab),
+       {
+         label: 'Add to Favorites',
+         icon: 'star',
+@@ -2237,6 +2238,39 @@ export class MeridianSidebarElement extends CrLitElement implements
+     ];
+   }
+ 
++  // "Put to Sleep": Chromium discards the tab (it reloads when opened),
++  // after Meridian's own check; a toast says why when it won't.
++  private sleepMenu_(tab: Tab): MenuEntry[] {
++    return [{
++      label: 'Put to Sleep',
++      icon: 'moon',
++      enabled: !tab.isActive,
++      action: () => this.putToSleep(tab.id),
++    }];
++  }
++
++  async putToSleep(id: NodeId): Promise<string> {
++    const toast = (title: string) =>
++        this.fire('meridian-mission-toast', {nodeId: '', title});
++    if (id === this.agentTab_) {
++      toast('Not put to sleep: an agent is working in this tab');
++      return 'agent';
++    }
++    const {reason} = await this.handler_.putTabToSleep(id);
++    const why: Record<string, string> = {
++      'active': 'Not put to sleep: it is the open tab',
++      'form': 'Not put to sleep: something typed on the page would be lost',
++      'media': 'Not put to sleep: it is playing sound or video',
++      'capture': 'Not put to sleep: it uses the camera, microphone or a screen share',
++      'workbench': 'Not put to sleep: the Workbench runs agent sessions',
++      'asleep': 'Already asleep',
++      'failed': 'Chromium could not put this tab to sleep',
++    };
++    toast(reason ? why[reason] || why['failed']! :
++                   'Put to sleep: it reloads when you open it');
++    return reason;
++  }
++
+   // Mute Tab / Unmute Tab, for a tab that plays sound or is muted.
+   private muteMenu_(tab: Tab): MenuEntry[] {
+     const alerts = tab.alertStates || [];
+@@ -2305,6 +2339,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+         action: () => this.handler_.splitWith(tab.id),
+       }] : []),
+       ...(tab ? this.muteMenu_(tab) : []),
++      ...(tab ? this.sleepMenu_(tab) : []),
+       fav ? {
+         label: 'Remove from Favorites',
+         icon: 'star',
