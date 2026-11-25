@@ -62,7 +62,7 @@ test('a loading page pulses its row and runs a bar along the URL pill', async ()
   const b = await launch([`${base}/fast`]);
   try {
     await b.waitFor(count(1));
-    await b.eval(`app.$.tabstrip.tabStripService_.createTabAt(null, ${JSON.stringify(`${base}/slow`)})`);
+    await b.eval(`app.$.tabstrip.tabStripService_.createTabAt(null, ${JSON.stringify(`${base}/slow`)}).then(() => true)`);
     await b.waitFor(`!!${tabEl(0)}.shadowRoot.querySelector('.row.loading')`);
     await b.waitFor(`app.shadowRoot.getElementById('urlPill').classList.contains('loading')`);
     await b.waitFor(`${tabEl(0)}.tab.title === 'Slow' && !${tabEl(0)}.shadowRoot.querySelector('.row.loading')`);

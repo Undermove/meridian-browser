@@ -100,7 +100,7 @@ test('Arc logins: cookies come over, so sites stay signed in; Deny imports nothi
     try {
       await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
       assert.deepEqual(await b.eval(`${H}.importArcLogins('arc')`), { imported: 2, passwords: 0, cards: 0, error: '' });
-      await b.eval(`app.$.tabstrip.tabStripService_.createTabAt(null, 'http://127.0.0.1:${port}/')`);
+      await b.eval(`app.$.tabstrip.tabStripService_.createTabAt(null, 'http://127.0.0.1:${port}/').then(() => true)`);
       await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'cookie:sid=signed-in')`);
       // The sidebar after the sign-ins: Home (Arc's Profile 2) has that profile's cookie.
       assert.equal((await b.eval(`${H}.importArc('arc')`)).ok, true);
