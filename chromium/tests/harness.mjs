@@ -5,6 +5,11 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { installGuard } from './isolation.mjs';
+
+// Every test file: the owner's login environment out of every process it starts, and his real AI
+// configs hashed before and after (isolation.mjs).
+installGuard();
 
 const DIR = process.env.CHROMIUM_DIR || path.join(os.homedir(), 'repos/chromium');
 // MERIDIAN_APP: another Meridian binary, such as an installed release (CI checks every release).
@@ -127,8 +132,9 @@ const running = new Set();
 process.on('exit', () => { for (const p of running) { try { p.kill('SIGKILL'); } catch {} } });
 
 // `firstRun`: start like the very first launch (without --no-first-run). `app`: another binary
-// for this launch (an older release, to test updating from it).
-export async function launch(urls = [], { profile: keep, args = [], firstRun = false, app = APP } = {}) {
+// for this launch (an older release, to test updating from it). `env`: variables over the test
+// process's own (already without the owner's, isolation.mjs), such as a fixture's HOME.
+export async function launch(urls = [], { profile: keep, args = [], firstRun = false, app = APP, env } = {}) {
   const profile = keep || fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
   const port = 9400 + Math.floor(Math.random() * 500);
   // Never the real Arc, Chrome or any other browser: an empty folder unless a test gives its own.
@@ -166,7 +172,8 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
     ...args, ...urls,
     // MERIDIAN_LOG=<file>: the browser's log there (debugging).
   ].concat(process.env.MERIDIAN_LOG ? ['--enable-logging=stderr'] : []),
-  { stdio: process.env.MERIDIAN_LOG ? ['ignore', 'ignore', fs.openSync(process.env.MERIDIAN_LOG, 'a')] : 'ignore' });
+  { stdio: process.env.MERIDIAN_LOG ? ['ignore', 'ignore', fs.openSync(process.env.MERIDIAN_LOG, 'a')] : 'ignore',
+    ...(env ? { env: { ...process.env, ...env } } : {}) });
   running.add(proc);
   proc.once('exit', () => running.delete(proc));
   const base = `http://127.0.0.1:${port}`;

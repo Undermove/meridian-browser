@@ -588,7 +588,7 @@ function editSecret(existing = null, preset = {}) {
     <label class="field"><span>Available in</span><select id="sec-scope"><option value="project">This project only</option><option value="global">All projects</option></select></label>
     <label class="field"><span>Note — where it’s used</span><input id="sec-note" spellcheck="false" placeholder="e.g. deploy script, Claude in sandbox"></label>
     <label class="check"><input type="checkbox" id="sec-sandbox"> Pass to sandboxed agents in this project by default <span class="muted small">(project secrets only)</span></label>
-    <p class="muted small">Encrypted with your system keychain. It reaches terminals and agents that Meridian starts on this computer as the environment variable of this name — never as text in files or chat. Sandboxes only get the secrets you pick when you start one.</p>
+    <p class="muted small">Encrypted with your system’s secure storage. It reaches terminals and agents that Meridian starts on this computer as the environment variable of this name — never as text in files or chat. Sandboxes only get the secrets you pick when you start one.</p>
     <div class="modal-actions"><button class="btn" data-a="cancel">Cancel</button><button class="btn accent" data-a="ok">${existing ? 'Save' : 'Add to vault'}</button></div>`, (m, close) => {
     const name = $('#sec-name', m), value = $('#sec-value', m), scope = $('#sec-scope', m), note = $('#sec-note', m);
     name.value = existing?.name || preset.name || '';
@@ -622,7 +622,7 @@ function renderSecretsPanel(el) {
   const head = h('div', 'panel-head');
   head.append(h('h2', '', 'Secrets vault'), btn('Add…', 'accent', () => editSecret()));
   el.appendChild(head);
-  el.appendChild(h('p', 'muted small', 'API keys and tokens, encrypted with your system keychain. Terminals and agents started here get them as environment variables; agents never see them as text.'));
+  el.appendChild(h('p', 'muted small', 'API keys and tokens, encrypted with your system’s secure storage. Terminals and agents started here get them as environment variables; agents never see them as text.'));
   if (v.unavailable) el.appendChild(h('p', 'warn-box', v.unavailable));
   const list = h('div', 'sec-list');
   if (!v.items?.length && !v.unavailable) list.appendChild(h('div', 'empty muted', 'No secrets yet. Paste a key into a terminal and Meridian will offer to store it, or click Add.'));

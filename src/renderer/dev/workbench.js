@@ -10,6 +10,8 @@
 const wb = window.workbench;
 const $ = (s, root = document) => root.querySelector(s);
 const IS_MAC = wb.platform === 'darwin';
+// The ⌘ the page's own text shows (the editor's "⌘ S save"): Ctrl off the Mac.
+for (const k of document.querySelectorAll('.mod-key')) k.textContent = IS_MAC ? '⌘' : 'Ctrl';
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const basename = (p) => String(p).split('/').pop() || String(p);
 const dirname = (p) => { const i = String(p).lastIndexOf('/'); return i < 0 ? '' : p.slice(0, i); };
@@ -276,7 +278,9 @@ function renderWelcome() {
     row.querySelector('.mark-wrap').appendChild(agentMark(id));
     row.querySelector('.label').textContent = AGENT_UI[id].label;
     const st = row.querySelector('.state');
-    st.textContent = a?.installed ? 'Installed' : `Not installed — ${a?.install || ''}`;
+    // Only what was really found: until the handler has looked, it says so.
+    st.textContent = !info.agents ? 'Checking…' : a?.installed ? 'Installed'
+      : a?.install ? `Not installed — ${a.install}` : 'Not installed';
     st.classList.toggle('ok', !!a?.installed);
     if (!a?.installed) st.title = st.textContent;
     list.appendChild(row);
