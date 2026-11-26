@@ -19,6 +19,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-FFB347?style=flat-square" alt="MIT license"></a>
   <a href="https://discord.gg/kuQRHfG39r"><img src="https://img.shields.io/badge/Discord-join%20the%20chat-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord"></a>
   <a href="https://scorecard.dev/viewer/?uri=github.com/Undermove/meridian-browser"><img src="https://api.securityscorecards.dev/projects/github.com/Undermove/meridian-browser/badge" alt="OpenSSF Scorecard" height="20"></a>
+  <a href="https://www.bestpractices.dev/projects/17135"><img src="https://www.bestpractices.dev/projects/17135/badge" alt="OpenSSF Best Practices" height="20"></a>
   <a href="https://glama.ai/mcp/servers/Undermove/meridian-browser"><img src="https://glama.ai/mcp/servers/Undermove/meridian-browser/badges/score.svg" alt="Undermove/meridian-browser MCP server" height="20"></a>
 </p>
 
@@ -157,7 +158,7 @@ Found a vulnerability? Please report it privately, as [SECURITY.md](SECURITY.md)
 
 ### How the repository is checked
 
-- **What runs:** [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/Undermove/meridian-browser) weekly (the badge above), CodeQL code scanning, OSV-Scanner and npm audit, Dependabot alerts and security updates, dependency review on every PR (new vulnerable dependencies and disallowed licenses fail), zizmor and actionlint on the workflows, ShellCheck, GitHub secret scanning with push protection plus gitleaks, and signed release checksums with build attestations (see [Verifying a download](#verifying-a-download)).
+- **What runs:** [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/Undermove/meridian-browser) weekly (the badge above), the [OpenSSF Best Practices](https://www.bestpractices.dev/projects/17135) passing badge, CodeQL code scanning, OSV-Scanner and npm audit, Dependabot alerts and security updates, dependency review on every PR (new vulnerable dependencies and disallowed licenses fail), zizmor and actionlint on the workflows, ShellCheck, GitHub secret scanning with push protection plus gitleaks, and signed release checksums with build attestations (see [Verifying a download](#verifying-a-download)).
 - **Findings:** reviewed weekly; each one is fixed, or dismissed with a written reason.
 
 Scorecard checks that stay low by design:
