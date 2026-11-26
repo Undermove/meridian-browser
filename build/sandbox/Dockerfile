@@ -6,7 +6,7 @@
 # session, e.g. ANTHROPIC_API_KEY) arrive in a read-only file mounted at /run/meridian/env — not as
 # container environment, so they don't show up in `docker inspect`. The entrypoint below exports them
 # into the agent's environment and then runs the command.
-FROM node:22-bookworm-slim
+FROM node:22-bookworm-slim@sha256:be979e5523c76fa4d5ca4ebd3099078f220aa47ec39c48ad5b5df9314debd6eb
 
 ARG CLAUDE_CODE_VERSION=latest
 ARG CODEX_VERSION=latest
