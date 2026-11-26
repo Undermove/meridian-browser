@@ -75,6 +75,7 @@ async function studioBoot() {
   if (!info?.enabled) return;
   ST.on = true;
   if (['designer', 'manager', 'developer', 'everyday'].includes(info.persona)) ST.persona = info.persona;
+  try { ST.board = localStorage.getItem('wb.studioBoard') === '1'; } catch {}
   document.body.classList.add('studio-on');
   stBuild();
   stSwitchInTopbar();
@@ -196,12 +197,17 @@ function stBuild() {
     <header class="st-head">
       <div class="st-titles"><span class="st-ttl" id="st-title"></span><span class="st-sub" id="st-sub"></span></div>
       <div class="grow"></div>
+      <div class="st-viewseg" role="tablist" aria-label="${esc(w.tasks)}">
+        <button role="tab" data-mode="board">${icon('grid', 13)}<span>${esc(w.cards)}</span></button>
+        <button role="tab" data-mode="list">${icon('chat', 13)}<span>${esc(w.chat)}</span></button></div>
       <button class="st-role-btn" id="st-role" title="${esc(w.roleChange)}">${icon('user', 14)}<span></span></button>
       ${stSwitchHtml()}
     </header>
+    <div class="st-board" id="st-board" hidden></div>
     <div class="st-body">
       <aside class="st-tasks" aria-label="${esc(w.tasks)}">
         <button class="st-new" id="st-new">${icon('plus', 14)}<span>${esc(w.newTask)}</span></button>
+        <button class="st-new st-allcards" id="st-allcards">${icon('grid', 14)}<span>${esc(w.allTasks)}</span></button>
         <div class="st-task-list" id="st-task-list" role="list"></div>
       </aside>
       <div class="st-chat">
@@ -223,7 +229,13 @@ function stBuild() {
   ST.el = el;
   $('.st-switch', el).addEventListener('click', stOnSwitch);
   $('#st-role', el).addEventListener('click', () => stPersonaPicker({ current: ST.persona }));
+  $('.st-viewseg', el).addEventListener('click', (e) => {
+    const m = e.target.closest('[data-mode]')?.dataset.mode;
+    if (m) stSetBoard(m === 'board');
+  });
+  $('#st-board', el).addEventListener('click', stOnBoardClick);
   $('#st-new', el).addEventListener('click', () => { ST.current = ''; ST.preview = null; stRender(); $('#st-input').focus(); });
+  $('#st-allcards', el).addEventListener('click', () => stSetBoard(true));
   $('#st-task-list', el).addEventListener('click', (e) => {
     const row = e.target.closest('[data-term]');
     if (!row) return;
@@ -276,8 +288,20 @@ function stRender() {
   const w = STW();
   if (!S.project) return stRenderPick();
   $('#st-pick').hidden = true;
-  $('.st-body', ST.el).hidden = false;
   const terms = stTerms();
+  // The board: every task as a card. It is where Studio starts when there are tasks and none is open.
+  $('.st-body', ST.el).hidden = ST.board;
+  $('#st-board').hidden = !ST.board;
+  for (const b of ST.el.querySelectorAll('.st-viewseg button')) b.classList.toggle('on', (b.dataset.mode === 'board') === ST.board);
+  if (ST.board) {
+    $('#st-title').textContent = w.studio;
+    $('#st-sub').textContent = `${S.project.name} · ${w.taskCount(terms.length)}`;
+    $('#st-role span').textContent = w.personas[ST.persona]?.name || '';
+    document.title = w.studio;
+    stRenderBoard(terms);
+    stReport();
+    return;
+  }
   if (ST.current && !terms.some((t) => t.id === ST.current)) ST.current = '';
   const t = stCurrent();
   $('#st-title').textContent = t ? stTitle(t) : w.newTask;
@@ -826,6 +850,138 @@ function stFlush(t) {
   const k = stTask(t);
   const q = k.queue.shift();
   if (q) stType(t, q.text);
+}
+
+// ---------------------------------------------------------------- the board (tasks as cards)
+
+function stSetBoard(on) {
+  ST.board = !!on;
+  try { localStorage.setItem('wb.studioBoard', ST.board ? '1' : '0'); } catch {}
+  stRender();
+}
+
+// The picture a task's card shows: its latest snapshot, else its latest picture file.
+function stCardPicture(k) {
+  const shots = k.model.shots;
+  if (shots.length) return { after: stShotKey(shots[shots.length - 1]), before: shots.length > 1 ? stShotKey(shots[0]) : '' };
+  const img = [...k.model.files.values()].filter((f) => f.image).sort((a, b) => b.at - a.at)[0];
+  const th = img && k.thumbs.get(img.rel);
+  if (th?.src) return { after: th.src, before: '' };
+  return null;
+}
+
+function stCardLine(t, k, status) {
+  const w = STW();
+  const ask = ST.mission[t.id]?.asks?.[0];
+  if (status === 'needs' && ask) return `<b>${esc(w.waiting)}:</b> ${esc(StudioWords.askWords(ask.tool, ask.summary, ST.lang)[0])}`;
+  if (status === 'work') {
+    const p = StudioTranscript.planProgress(k.model.plan);
+    const turn = k.model.turns[k.model.turns.length - 1];
+    const step = turn?.items.filter((x) => x.type === 'steps').flatMap((x) => x.steps).filter((s) => s.tool !== 'TodoWrite').pop();
+    const words = step ? StudioWords.stepWords(step.tool, step.input, ST.lang)[2] : w.working;
+    return esc(p?.now || words) + (p && p.total > 1 ? ` · ${esc(w.step(p.index, p.total))}` : '');
+  }
+  const text = k.model.turns.flatMap((x) => x.items).filter((x) => x.type === 'text').pop()?.text || '';
+  const first = text.replace(/\[\[pin:[^\]]*\]\]/g, '').split('\n').find((l) => l.trim()) || '';
+  const files = k.model.files.size;
+  return esc(first.length > 110 ? `${first.slice(0, 109)}…` : first) || esc(files ? w.filesCount(files) : '');
+}
+
+function stRenderBoard(terms) {
+  const w = STW();
+  const board = $('#st-board');
+  const counts = { needs: 0, work: 0, done: 0 };
+  const items = terms.map((t) => {
+    const k = stTask(t);
+    if (!k.loaded) stRead(t, k);
+    const status = stStatus(t);
+    if (counts[status] !== undefined) counts[status]++;
+    return { t, k, status };
+  });
+  // Needs you first, then working, then the rest, newest first.
+  const order = { needs: 0, work: 1, done: 2, idle: 3 };
+  items.sort((a, b) => order[a.status] - order[b.status] || (b.k.model.turns.at(-1)?.at || 0) - (a.k.model.turns.at(-1)?.at || 0));
+  const filter = ST.boardFilter || 'all';
+  const shown = items.filter((x) => filter === 'all' || x.status === filter || (filter === 'done' && x.status === 'idle'));
+  const chips = w.chips[ST.persona in w.chips ? ST.persona : 'designer'];
+  const newCard = `<div class="st-card st-newcard" data-key="new"><div class="st-nc-ttl"><span class="st-nc-pl">${icon('plus', 15)}</span>${esc(w.newTask)}</div>
+    ${chips.map((c) => `<button class="st-chip" data-newchip="${esc(c)}">${esc(c)}</button>`).join('')}
+    <button class="st-nc-blank" data-new>${esc(w.ownWords)}</button></div>`;
+  const cards = shown.map(({ t, k, status }) => {
+    const pic = stCardPicture(k);
+    const ask = ST.mission[t.id]?.asks?.[0];
+    const when = stAgo(k.model.turns.at(-1)?.at);
+    const pv = pic
+      ? `<div class="st-cpv">${stImg(pic.after)}${pic.before ? `<span class="st-cpv-before">${stImg(pic.before)}</span><span class="st-cba"><button data-ba="before">${esc(w.before)}</button><button data-ba="after" class="on">${esc(w.after)}</button></span>` : ''}</div>`
+      : `<div class="st-cpv empty">${k.site ? icon('globe', 22) : icon('file', 22)}${k.site ? `<span>${esc(StudioWords.host(k.site))}</span>` : ''}</div>`;
+    const acts = status === 'needs' && ask && ask.answerable !== false
+      ? `<div class="st-cacts"><button class="st-btn pri" data-answer="${ask.canAlways ? 'session' : 'allow'}" data-ask="${esc(ask.id)}">${esc(w.allow)}</button>${ask.canAlways ? `<button class="st-btn" data-answer="allow" data-ask="${esc(ask.id)}">${esc(w.once)}</button>` : ''}<button class="st-btn" data-answer="deny" data-ask="${esc(ask.id)}">${esc(w.no)}</button></div>`
+      : (status === 'done' || status === 'idle') && (k.model.files.size || k.boost?.changed)
+        ? `<div class="st-cacts"><button class="st-btn" data-open>${icon('eye', 13)}<span>${esc(w.look)}</span></button><button class="st-btn" data-handoff>${icon('arrowRight', 13)}<span>${esc(w.handoff)}</span></button></div>`
+        : '';
+    return `<div class="st-card ${status}" data-term="${esc(t.id)}" data-key="c${esc(t.id)}" tabindex="0">${pv}
+      <div class="st-cbody"><div class="st-ct1">${stDot(status)}<span class="st-cttl">${esc(stTitle(t))}</span><span class="st-cwhen">${esc(when)}</span></div>
+      <div class="st-ct2">${stCardLine(t, k, status)}</div>${acts}</div></div>`;
+  });
+  const f = (id, label, n) => `<button class="st-filter${filter === id ? ' on' : ''}" data-filter="${id}">${id !== 'all' ? stDot(id === 'done' ? 'done' : id) : ''}${esc(label)}${n !== undefined ? ` · ${n}` : ''}</button>`;
+  const html = `<div class="st-bhead"><h2>${esc(w.tasks)}</h2>${counts.needs ? `<span class="st-bcount">${esc(w.needsCount(counts.needs))}</span>` : ''}
+    <div class="st-filters">${f('all', w.all)}${counts.needs ? f('needs', w.waiting, counts.needs) : ''}${counts.work ? f('work', w.inWork, counts.work) : ''}${f('done', w.done)}</div></div>
+    <div class="st-grid">${newCard}${cards.join('')}</div>`;
+  if (board.dataset.html === html) return;
+  const first = !board.dataset.html;
+  board.innerHTML = html;
+  board.dataset.html = html;
+  if (first) board.querySelectorAll('.st-card').forEach((c, i) => { c.classList.add('st-in'); c.style.animationDelay = `${Math.min(i, 8) * 30}ms`; });
+  stFillImages(board);
+}
+
+async function stOnBoardClick(e) {
+  const w = STW();
+  const flt = e.target.closest('[data-filter]');
+  if (flt) { ST.boardFilter = flt.dataset.filter; return stRender(); }
+  const chip = e.target.closest('[data-newchip]');
+  if (chip || e.target.closest('[data-new]')) {
+    ST.current = '';
+    ST.preview = null;
+    stSetBoard(false);
+    $('#st-input').value = chip ? chip.dataset.newchip : '';
+    $('#st-input').focus();
+    return;
+  }
+  const card = e.target.closest('.st-card[data-term]');
+  if (!card) return;
+  const t = stTerms().find((x) => x.id === card.dataset.term);
+  if (!t) return;
+  const ba = e.target.closest('[data-ba]');
+  if (ba) {
+    // До/После on the card: the first snapshot over the latest one, crossfaded.
+    card.classList.toggle('show-before', ba.dataset.ba === 'before');
+    for (const b of card.querySelectorAll('[data-ba]')) b.classList.toggle('on', b === ba);
+    return;
+  }
+  const ans = e.target.closest('[data-answer]');
+  if (ans) {
+    for (const b of card.querySelectorAll('[data-answer]')) b.disabled = true;
+    try {
+      if (await wb.studioAnswer(ans.dataset.ask, ans.dataset.answer)) {
+        const k = stTask(t);
+        const ti = Math.max(0, k.model.turns.length - 1);
+        const ask = ST.mission[t.id]?.asks?.find((x) => x.id === ans.dataset.ask);
+        const what = ask ? StudioWords.askWords(ask.tool, ask.summary, ST.lang)[0].replace(/^(Разрешить|Allow)\s+/, '').replace(/\?$/, '') : '';
+        k.answered.push({ id: ans.dataset.ask, choice: ans.dataset.answer, title: what, turn: ti, after: k.model.turns[ti]?.items.length || 0 });
+        if (ST.mission[t.id]?.asks) ST.mission[t.id].asks = ST.mission[t.id].asks.filter((x) => x.id !== ans.dataset.ask);
+        card.classList.add('st-answered-card');
+      }
+    } catch {}
+    setTimeout(stRender, stReduced() ? 0 : 200);
+    return;
+  }
+  if (e.target.closest('[data-handoff]')) { stSend(t, w.handoffPrompt); }
+  // Anything else on the card opens the task.
+  ST.current = t.id;
+  ST.preview = null;
+  stTask(t).seen = true;
+  stSetBoard(false);
 }
 
 // ---------------------------------------------------------------- "Кто вы?" (the persona picker)
