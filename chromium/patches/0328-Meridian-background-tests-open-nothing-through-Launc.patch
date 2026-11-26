@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 16:19:35 +0400
+Subject: [PATCH 328/330] Meridian: background tests open nothing through
+ Launch Services
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A test run must never reach past its own browser. With
+--meridian-test-background, every NSWorkspace call that would open an
+app, a link or a file, or bring Finder forward (openURL…, openURLs…,
+openApplicationAtURL…, openFile…, launchApplication:, selectFile…,
+activateFileViewerSelectingURLs:) is logged and answered "not opened",
+and a setup command never opens Terminal. Without it, a link handed to
+the system goes to the default browser by bundle id, which can be any
+registered copy of Meridian (the owner's backups included).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/app_controller_mac.mm       | 71 ++++++++++++++++++++++
+ chrome/browser/meridian/sidebar_handler.cc |  7 +++
+ 2 files changed, 78 insertions(+)
+
+diff --git a/chrome/browser/app_controller_mac.mm b/chrome/browser/app_controller_mac.mm
+index ac25a91a27..7878f641e1 100644
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -20,6 +20,7 @@
+ #include "base/apple/scoped_cftyperef.h"
+ #include "base/auto_reset.h"
+ #include "base/check_is_test.h"
++#include "base/logging.h"
+ #include "base/check_op.h"
+ #include "base/command_line.h"
+ #include "base/containers/flat_map.h"
+@@ -1026,6 +1027,76 @@ class AppControllerProfileObserver : public ProfileAttributesStorage::Observer,
+       method_setImplementation(method,
+                                imp_implementationWithBlock(^(id, id) {}));
+     }
++    // Nothing goes through Launch Services: no other app is opened or
++    // brought forward (Finder, Terminal, Claude, the default browser, or a
++    // copy of Meridian itself picked by bundle id), and no link or file is
++    // handed to the system. Each call is logged and answered "not opened".
++    {
++      Class workspace = NSWorkspace.class;
++      auto refuse = ^(NSString* what) {
++        LOG(WARNING) << "Meridian test background: not opening "
++                     << base::SysNSStringToUTF8(what);
++      };
++      using Done = void (^)(NSRunningApplication*, NSError*);
++      NSError* (^refused)(void) = ^{
++        return [NSError errorWithDomain:NSCocoaErrorDomain
++                                   code:NSUserCancelledError
++                               userInfo:nil];
++      };
++      auto set = ^(SEL selector, id block) {
++        if (Method method = class_getInstanceMethod(workspace, selector)) {
++          method_setImplementation(method, imp_implementationWithBlock(block));
++        }
++      };
++      set(@selector(openURL:), ^BOOL(id, NSURL* url) {
++        refuse(url.absoluteString);
++        return NO;
++      });
++      set(@selector(openURL:configuration:completionHandler:),
++          ^(id, NSURL* url, id, Done done) {
++            refuse(url.absoluteString);
++            if (done) {
++              done(nil, refused());
++            }
++          });
++      set(@selector(openURLs:withApplicationAtURL:configuration:
++                       completionHandler:),
++          ^(id, NSArray<NSURL*>* urls, NSURL* app, id, Done done) {
++            refuse([NSString stringWithFormat:@"%@ with %@", urls, app.path]);
++            if (done) {
++              done(nil, refused());
++            }
++          });
++      set(@selector(openApplicationAtURL:configuration:completionHandler:),
++          ^(id, NSURL* app, id, Done done) {
++            refuse(app.path);
++            if (done) {
++              done(nil, refused());
++            }
++          });
++      set(@selector(openFile:), ^BOOL(id, NSString* file) {
++        refuse(file);
++        return NO;
++      });
++      set(@selector(openFile:withApplication:),
++          ^BOOL(id, NSString* file, NSString* app) {
++            refuse([NSString stringWithFormat:@"%@ with %@", file, app]);
++            return NO;
++          });
++      set(@selector(launchApplication:), ^BOOL(id, NSString* app) {
++        refuse(app);
++        return NO;
++      });
++      set(@selector(selectFile:inFileViewerRootedAtPath:),
++          ^BOOL(id, NSString* file, NSString*) {
++            refuse(file);
++            return NO;
++          });
++      set(@selector(activateFileViewerSelectingURLs:),
++          ^(id, NSArray<NSURL*>* urls) {
++            refuse(urls.description);
++          });
++    }
+     auto hide = ^{
+       for (NSWindow* window in NSApp.windows) {
+         keep_back(window);
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index ddc75c991e..71a84fcb71 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -38,6 +38,7 @@
+ #include "base/containers/span.h"
+ #include "base/files/file.h"
+ #include "base/files/file_util.h"
++#include "base/logging.h"
+ #include "base/memory/ref_counted.h"
+ #include "base/process/launch.h"
+ #include "base/auto_reset.h"
+@@ -199,6 +200,12 @@ std::string ShellQuote(const std::string& s) {
+ // Opens a terminal window running `command` in the login shell, then leaves
+ // the window open. Blocking.
+ bool OpenInTerminal(const std::string& command, const std::string& title) {
++  // A test in the background never opens a window of another app.
++  if (HasTestSwitch("meridian-test-background")) {
++    LOG(WARNING) << "Meridian test background: not opening a terminal for "
++                 << title;
++    return false;
++  }
+   base::FilePath dir;
+   if (!base::CreateNewTempDirectory(FILE_PATH_LITERAL("meridian-setup-"), &dir)) {
+     return false;
