@@ -1,0 +1,620 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 22:52:47 +0400
+Subject: [PATCH] Meridian: Ask fixes an agent's refused image and spent free
+ model by itself
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- A provider that refuses a request with an image in it (HTTP 400 "Failed
+  to read HTTP message", "does not support image input", …): Ask runs the
+  turn again at once, text only (Meridian's bridge leaves screenshots out,
+  OpenCode gets no tools), what came so far is replaced, and that agent
+  and model stay text only (prefs kAiTextOnly). Nobody sets anything.
+- OpenCode on its own free model, out of it, with a model of the person's
+  set up in OpenCode: the error carries one button, "Use your model …",
+  which picks it for OpenCode (SetCliModel, prefs kAiModels) and asks
+  again. Without one: another AI from the menu; never "try again later",
+  never a file to edit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/ai/ai_service.cc      |  3 +
+ chrome/browser/meridian/ai/local_agents.cc    | 95 ++++++++++++++++++-
+ chrome/browser/meridian/ai/local_agents.h     |  2 +
+ chrome/browser/meridian/ai/providers.cc       | 60 +++++++++++-
+ chrome/browser/meridian/ai/providers.h        | 21 ++++
+ .../browser/meridian/ai/providers_unittest.cc | 52 +++++++++-
+ chrome/browser/meridian/prefs.cc              |  1 +
+ chrome/browser/meridian/prefs.h               |  3 +
+ chrome/browser/meridian/sidebar.mojom         |  3 +
+ chrome/browser/meridian/sidebar_handler.cc    | 15 +++
+ chrome/browser/meridian/sidebar_handler.h     |  1 +
+ .../resources/webui_browser/meridian/ask.css  |  6 ++
+ .../webui_browser/meridian/ask.html.ts        |  7 +-
+ .../resources/webui_browser/meridian/ask.ts   | 38 ++++++++
+ 14 files changed, 294 insertions(+), 13 deletions(-)
+
+diff --git a/chrome/browser/meridian/ai/ai_service.cc b/chrome/browser/meridian/ai/ai_service.cc
+index 72b1efa..2e5eb35 100644
+--- a/chrome/browser/meridian/ai/ai_service.cc
++++ b/chrome/browser/meridian/ai/ai_service.cc
+@@ -671,6 +671,9 @@ void AiService::Complete(Completion completion, CompletionCallback done) {
+             }
+             if (type == "text") {
+               answer->data.text += text;
++            } else if (type == "reset") {
++              // Asked again (text only): what came so far goes.
++              answer->data.text.clear();
+             } else if (type == "error") {
+               std::move(answer->data.done).Run(provider, std::string(), text);
+             } else if (type == "done") {
+diff --git a/chrome/browser/meridian/ai/local_agents.cc b/chrome/browser/meridian/ai/local_agents.cc
+index dc6d73c..c59fe62 100644
+--- a/chrome/browser/meridian/ai/local_agents.cc
++++ b/chrome/browser/meridian/ai/local_agents.cc
+@@ -414,6 +414,11 @@ std::vector<base::FilePath> CliToolFolders(const base::FilePath& home,
+ struct CliOutcome {
+   bool found = false;
+   ProcessResult result;
++  // The model it ran with ("" = the CLI's own choice), whether it ran text
++  // only, and (OpenCode) the models set up in it.
++  std::string model;
++  bool text_only = false;
++  std::vector<std::string> configured_models;
+ };
+ 
+ CliOutcome RunCliBlocking(std::string provider_id,
+@@ -459,11 +464,11 @@ CliOutcome RunCliBlocking(std::string provider_id,
+   // run` doesn't read the one last picked in OpenCode, and without a model it
+   // answers with a free one of its own.
+   std::string opencode_model;
++  std::vector<std::string> configs;
+   if (p->id == "opencode") {
+     for (base::FilePath& f : OpenCodeMovedFolders(home, env, protected_paths)) {
+       allowed.push_back(std::move(f));
+     }
+-    std::vector<std::string> configs;
+     for (base::FilePath& f : OpenCodeConfigFiles(home, env, protected_paths)) {
+       std::string text;
+       if (base::ReadFileToStringWithMaxSize(f, &text, 1 << 20)) {
+@@ -494,6 +499,11 @@ CliOutcome RunCliBlocking(std::string provider_id,
+   if (prepared.model.empty()) {
+     prepared.model = opencode_model;
+   }
++  prepared.text_only |=
++      prepared.text_only_for.contains(p->id + "|" + prepared.model);
++  outcome.model = prepared.model;
++  outcome.text_only = prepared.text_only;
++  outcome.configured_models = OpenCodeConfiguredModels(configs);
+   if (p->id == "opencode") {
+     prepared.private_server = OpenCodeWantsPrivateServer(
+         bin, contained({bin, "run", "--help"}), env, dir.AsUTF8Unsafe(), cancel);
+@@ -620,6 +630,14 @@ std::unique_ptr<network::SimpleURLLoader> Request(
+ 
+ struct LocalAgents::Run {
+   raw_ptr<const Provider> provider;
++  std::string provider_id;
++  // A CLI's turn, kept for one more go (text only, after an image was
++  // refused), and what the last go ran with.
++  Turn turn;
++  bool retried = false;
++  std::string model;
++  bool text_only = false;
++  std::vector<std::string> configured_models;
+   EventCallback events;
+   scoped_refptr<CancelFlag> cancel;
+   std::unique_ptr<OutputParser> parser;
+@@ -880,6 +898,27 @@ void LocalAgents::Chat(const std::string& run_id,
+     return;
+   }
+   Run* r = runs_[run_id].get();
++  r->provider_id = provider_id;
++  PrefService* prefs = profile_->GetPrefs();
++  // The model the person chose for this agent (Ask's "Use your model"), when
++  // the turn names none.
++  if (const std::string* chosen =
++          prefs->GetDict(prefs::kAiModels).FindString(provider_id);
++      chosen && turn.model.empty()) {
++    turn.model = *chosen;
++  }
++  for (const base::Value& key : prefs->GetList(prefs::kAiTextOnly)) {
++    if (key.is_string()) {
++      turn.text_only_for.insert(key.GetString());
++    }
++  }
++  r->turn = std::move(turn);
++  StartCli(run_id);
++}
++
++void LocalAgents::StartCli(const std::string& run_id) {
++  Run* r = runs_[run_id].get();
++  const Provider* p = r->provider;
+   r->cancel = base::MakeRefCounted<CancelFlag>();
+   r->parser = MakeParser(*p);
+   auto output = base::BindPostTaskToCurrentDefault(base::BindRepeating(
+@@ -888,12 +927,21 @@ void LocalAgents::Chat(const std::string& run_id,
+       FROM_HERE,
+       {base::MayBlock(), base::WithBaseSyncPrimitives(),
+        base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
+-      base::BindOnce(&RunCliBlocking, provider_id, std::move(turn), workdir_,
++      base::BindOnce(&RunCliBlocking, r->provider_id, r->turn, workdir_,
+                      r->cancel, output),
+       base::BindOnce(
+           [](base::WeakPtr<LocalAgents> self, std::string run_id,
+              CliOutcome outcome) {
+-            if (self) {
++            if (!self) {
++              return;
++            }
++            if (auto it = self->runs_.find(run_id); it != self->runs_.end()) {
++              it->second->model = outcome.model;
++              it->second->text_only = outcome.text_only;
++              it->second->configured_models =
++                  std::move(outcome.configured_models);
++            }
++            {
+               self->OnCliDone(run_id, outcome.found, outcome.result.started,
+                               outcome.result.exit_code, outcome.result.killed,
+                               outcome.result.timed_out,
+@@ -995,6 +1043,47 @@ void LocalAgents::OnCliDone(const std::string& run_id,
+     }
+     report::NoteError("provider", detail);
+   }
++  const std::string said = run->error + "\n" + stderr_text;
++  const bool failed = !timed_out && !too_long && !killed &&
++                      (!run->error.empty() || exit_code != 0);
++  // The provider refused an image (a screenshot from an MCP server, say):
++  // once more without any, remembered for this agent and model.
++  if (failed && !run->text_only && !run->retried &&
++      LooksLikeImageRefused(said)) {
++    const std::string key = run->provider_id + "|" + run->model;
++    ScopedListPrefUpdate update(profile_->GetPrefs(), prefs::kAiTextOnly);
++    if (std::ranges::find(*update, base::Value(key)) == update->end()) {
++      update->Append(key);
++    }
++    run->retried = true;
++    run->turn.text_only = true;
++    run->text.clear();
++    run->final_text.clear();
++    run->error.clear();
++    run->events.Run("reset", std::string());
++    StartCli(run_id);
++    return;
++  }
++  // OpenCode on its own free model, out of it, with a model of the person's
++  // set up: one button switches to it and asks again.
++  if (failed && p.id == "opencode" && IsOpenCodeFreeLimit(said)) {
++    for (const std::string& model : run->configured_models) {
++      if (model == run->model) {
++        continue;
++      }
++      run->events.Run(
++          "fix", base::WriteJson(base::Value(
++                                     base::DictValue()
++                                         .Set("label", "Use your model " + model)
++                                         .Set("provider", p.id)
++                                         .Set("model", model)))
++                     .value_or("{}"));
++      Finish(run_id, "error",
++             "OpenCode answered with its own free model, and that has "
++             "reached its limit.");
++      return;
++    }
++  }
+   if (timed_out) {
+     Finish(run_id, "error", p.label + " took too long to answer.");
+   } else if (too_long) {
+diff --git a/chrome/browser/meridian/ai/local_agents.h b/chrome/browser/meridian/ai/local_agents.h
+index ffe43a7..a5fc326 100644
+--- a/chrome/browser/meridian/ai/local_agents.h
++++ b/chrome/browser/meridian/ai/local_agents.h
+@@ -131,6 +131,8 @@ class LocalAgents {
+   struct Run;
+   class LineStream;
+ 
++  // Runs the CLI with the run's turn (again, for a text-only retry).
++  void StartCli(const std::string& run_id);
+   void OnCliOutput(const std::string& run_id, std::string chunk);
+   void OnCliDone(const std::string& run_id,
+                  bool found,
+diff --git a/chrome/browser/meridian/ai/providers.cc b/chrome/browser/meridian/ai/providers.cc
+index abc16fd..342c78b 100644
+--- a/chrome/browser/meridian/ai/providers.cc
++++ b/chrome/browser/meridian/ai/providers.cc
+@@ -648,6 +648,49 @@ bool OpenCodeModelTakesNoImages(const std::vector<std::string>& configs,
+   return no_images.value_or(false);
+ }
+ 
++std::vector<std::string> OpenCodeConfiguredModels(
++    const std::vector<std::string>& configs) {
++  std::vector<std::string> out;
++  for (const std::string& text : configs) {
++    std::optional<base::DictValue> root = ReadJsonc(text);
++    const base::DictValue* providers =
++        root ? root->FindDict("provider") : nullptr;
++    if (!providers) {
++      continue;
++    }
++    for (const auto [provider_id, provider] : *providers) {
++      const base::DictValue* models =
++          provider.is_dict() ? provider.GetDict().FindDict("models") : nullptr;
++      if (!models || provider_id == "opencode") {
++        continue;
++      }
++      for (const auto [model_id, model] : *models) {
++        const std::string ref = provider_id + "/" + model_id;
++        if (IsModelRef(ref) && std::ranges::find(out, ref) == out.end()) {
++          out.push_back(ref);
++        }
++      }
++    }
++  }
++  return out;
++}
++
++bool LooksLikeImageRefused(const std::string& error) {
++  return RE2::PartialMatch(
++      error,
++      "(?i)failed to read http message|"
++      "(?:does not|doesn.t|cannot|can.t) (?:support|accept|read|process) "
++      "(?:image|vision)|"
++      "image(?: input| content| parts?|s)? (?:is |are )?(?:not supported|"
++      "unsupported|not allowed)|"
++      "unsupported (?:content type|image|media)|invalid (?:image|content "
++      "type)|unknown variant .?image_url");
++}
++
++bool IsOpenCodeFreeLimit(const std::string& error) {
++  return RE2::PartialMatch(error, "(?i)free usage limit");
++}
++
+ CommandSpec BuildCommand(const Provider& p,
+                          const Turn& turn,
+                          const std::string& cwd) {
+@@ -779,6 +822,10 @@ CommandSpec BuildCommand(const Provider& p,
+     permission.Set("*", "deny");
+     base::DictValue config;
+     config.Set("permission", std::move(permission));
++    if (turn.text_only) {
++      // No tools at all: nothing that could bring an image in.
++      config.Set("tools", base::DictValue().Set("*", false));
++    }
+     if (!turn.system.empty()) {
+       config.Set("agent",
+                  base::DictValue().Set(
+@@ -856,6 +903,10 @@ CommandSpec BuildCommand(const Provider& p,
+     model("-m");
+     spec.stdin_text = turn.prompt;
+   }
++  if (turn.text_only) {
++    // Meridian's bridge, started by the CLI with this environment.
++    spec.env["MERIDIAN_MCP_TEXT_ONLY"] = "1";
++  }
+   return spec;
+ }
+ 
+@@ -898,11 +949,10 @@ std::string FriendlyCliError(const Provider& p,
+   }
+   // No model named anywhere (OpenCodeChosenModel): OpenCode took its own
+   // free one.
+-  if (p.id == "opencode" && RE2::PartialMatch(all, "(?i)free usage limit")) {
+-    return "OpenCode answered with its own free model, which has reached "
+-           "its limit: no model is set for OpenCode. Pick one in OpenCode, or "
+-           "put \"model\": \"provider/model\" in "
+-           "~/.config/opencode/opencode.json, then try again.";
++  if (p.id == "opencode" && IsOpenCodeFreeLimit(all)) {
++    return "OpenCode answered with its own free model, and that has reached "
++           "its limit; OpenCode has no other model set up. Ask another AI "
++           "from the menu at the top of Ask.";
+   }
+   if (RE2::PartialMatch(all, "(?i)rate.?limit|429|usage limit|quota")) {
+     return p.label +
+diff --git a/chrome/browser/meridian/ai/providers.h b/chrome/browser/meridian/ai/providers.h
+index 316199e..24d229f 100644
+--- a/chrome/browser/meridian/ai/providers.h
++++ b/chrome/browser/meridian/ai/providers.h
+@@ -8,6 +8,7 @@
+ #include <map>
+ #include <memory>
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <vector>
+ 
+@@ -119,6 +120,13 @@ struct Turn {
+   // JPEG screenshots (base64) with the prompt: Claude Code only (as a
+   // stream-json message on stdin); the other CLIs don't get them.
+   std::vector<std::string> images;
++  // No images anywhere in the run: Meridian's MCP bridge, if the CLI starts
++  // it, leaves screenshots out (MERIDIAN_MCP_TEXT_ONLY), and OpenCode gets
++  // no tools. For a provider that refused a request with an image in it.
++  bool text_only = false;
++  // "<provider id>|<model>" that refused one before (prefs kAiTextOnly):
++  // text_only once the run's model is known.
++  std::set<std::string> text_only_for;
+ };
+ 
+ // From the output of `opencode run --help`: whether this OpenCode needs
+@@ -142,6 +150,19 @@ std::string OpenCodeChosenModel(const std::vector<std::string>& configs,
+ bool OpenCodeModelTakesNoImages(const std::vector<std::string>& configs,
+                                 const std::string& model);
+ 
++// Every model ("provider/model") of the providers set up in OpenCode's
++// `configs`, in order, without OpenCode's own (its free ones).
++std::vector<std::string> OpenCodeConfiguredModels(
++    const std::vector<std::string>& configs);
++
++// Whether an AI's error says it refused the request for an image in it (an
++// OpenAI-compatible endpoint that takes text only: HTTP 400 "Failed to read
++// HTTP message", "does not support image input", …).
++bool LooksLikeImageRefused(const std::string& error);
++
++// OpenCode answered with its own free model and that hit its limit.
++bool IsOpenCodeFreeLimit(const std::string& error);
++
+ // `cwd`: the run's private working directory.
+ CommandSpec BuildCommand(const Provider& provider,
+                          const Turn& turn,
+diff --git a/chrome/browser/meridian/ai/providers_unittest.cc b/chrome/browser/meridian/ai/providers_unittest.cc
+index 1d72900..5d554e6 100644
+--- a/chrome/browser/meridian/ai/providers_unittest.cc
++++ b/chrome/browser/meridian/ai/providers_unittest.cc
+@@ -91,9 +91,13 @@ TEST(ProvidersTest, OpenCodeOnItsFreeModelSaysNoModelIsSet) {
+       "Free usage limit reached. Connect a provider or subscribe to "
+       "OpenCode Go",
+       "");
+-  EXPECT_NE(error.find("no model is set for OpenCode"), std::string::npos)
+-      << error;
+-  EXPECT_NE(error.find("~/.config/opencode/opencode.json"), std::string::npos);
++  EXPECT_NE(error.find("its own free model"), std::string::npos) << error;
++  // Never a file to edit by hand, never "try again later".
++  EXPECT_EQ(error.find("opencode.json"), std::string::npos) << error;
++  EXPECT_EQ(error.find("later"), std::string::npos) << error;
++  EXPECT_TRUE(IsOpenCodeFreeLimit(
++      "Free usage limit reached. Connect a provider or subscribe"));
++  EXPECT_FALSE(IsOpenCodeFreeLimit("rate limit"));
+   // Another agent's limit stays a limit.
+   EXPECT_NE(FriendlyCliError(*FindProvider("codex"), "usage limit reached", "")
+                 .find("hit a usage limit"),
+@@ -114,6 +118,48 @@ TEST(ProvidersTest, OpenCodeRunsWithTheModelItIsGiven) {
+       << "no model is made up";
+ }
+ 
++TEST(ProvidersTest, OpenCodeConfiguredModels) {
++  EXPECT_EQ(OpenCodeConfiguredModels(
++                {"{\n // the bank\n \"provider\": {\"alfagen\": {\"npm\": "
++                 "\"@ai-sdk/openai-compatible\", \"models\": {\"EVC\": {}, "
++                 "\"Mini\": {}}}},\n}",
++                 R"({"provider": {"opencode": {"models": {"big-pickle": {}}},
++                     "alfagen": {"models": {"EVC": {}}},
++                     "ollama": {"models": {"qwen3": {}}}}})"}),
++            (std::vector<std::string>{"alfagen/EVC", "alfagen/Mini",
++                                      "ollama/qwen3"}));
++  EXPECT_TRUE(OpenCodeConfiguredModels({"{}", "not json"}).empty());
++}
++
++TEST(ProvidersTest, ImageRefusalsAreRecognised) {
++  // The report: a Spring gateway in front of an OpenAI-compatible model.
++  EXPECT_TRUE(LooksLikeImageRefused(
++      "Provider request failed with HTTP 400: {\"source\":\"CLIENT\","
++      "\"type\":\"VALIDATION\",\"internalMessage\":\"400 BAD_REQUEST "
++      "\\\"Failed to read HTTP message\\\"\"}"));
++  EXPECT_TRUE(LooksLikeImageRefused("This model does not support image input"));
++  EXPECT_TRUE(LooksLikeImageRefused("Image content is not supported"));
++  EXPECT_TRUE(LooksLikeImageRefused("unknown variant `image_url`, expected `text`"));
++  EXPECT_FALSE(LooksLikeImageRefused("HTTP 401 unauthorized"));
++  EXPECT_FALSE(LooksLikeImageRefused("Free usage limit reached"));
++  EXPECT_FALSE(LooksLikeImageRefused(""));
++}
++
++TEST(ProvidersTest, TextOnlyRunsHaveNoImagesAnywhere) {
++  Turn turn;
++  turn.prompt = "hi";
++  turn.text_only = true;
++  CommandSpec spec = BuildCommand(*FindProvider("opencode"), turn, "/tmp/x");
++  EXPECT_EQ(spec.env["MERIDIAN_MCP_TEXT_ONLY"], "1");
++  std::optional<base::DictValue> config = base::JSONReader::ReadDict(
++      spec.env["OPENCODE_CONFIG_CONTENT"], base::JSON_PARSE_RFC);
++  ASSERT_TRUE(config);
++  EXPECT_EQ(config->FindBoolByDottedPath("tools.*"), false);
++  turn.text_only = false;
++  spec = BuildCommand(*FindProvider("opencode"), turn, "/tmp/x");
++  EXPECT_FALSE(spec.env.contains("MERIDIAN_MCP_TEXT_ONLY"));
++}
++
+ TEST(ProvidersTest, CodexStreamGivesTextAndSession) {
+   std::vector<Event> events = Parse(
+       "codex",
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index ddc0c6e..1f894b7 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -39,6 +39,7 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterDictionaryPref(kAiCloudKeys);
+   registry->RegisterStringPref(kAiCustomBase, std::string());
+   registry->RegisterDictionaryPref(kAiModels);
++  registry->RegisterListPref(kAiTextOnly);
+   registry->RegisterBooleanPref(kAiOtherAgents, false);
+   registry->RegisterListPref(kExplainedSystemAsks);
+   registry->RegisterBooleanPref(kAiTidy, true);
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index 3f96419..f4a581c 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -76,6 +76,9 @@ inline constexpr char kAiCustomBase[] = "meridian.ai_custom_base";
+ // The model picked per cloud provider (provider id -> model); missing = the
+ // default.
+ inline constexpr char kAiModels[] = "meridian.ai_models";
++// "<provider id>|<model>" of agent CLIs whose provider refused a request with
++// an image in it: their runs are text only from then on (ai::Turn).
++inline constexpr char kAiTextOnly[] = "meridian.ai_text_only";
+ // Tidy Today is offered (needs the Claude key).
+ inline constexpr char kAiTidy[] = "meridian.ai_tidy";
+ // Holding Shift over a link shows a summary of the page (needs the Claude
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 6027e1d..50e11ac 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -955,6 +955,9 @@ interface SidebarHandler {
+   GetCloudModels(string id)
+       => (array<string> models, string chosen, string error);
+   SetCloudModel(string id, string model);
++  // The model an agent CLI answers Ask with ("provider/model" for OpenCode),
++  // chosen by the person (Ask's "Use your model …"); "" = the CLI's own.
++  SetCliModel(string id, string model);
+   // Mission Control: the current snapshot (JSON), forgetting a finished
+   // session, clearing the history.
+   GetMissionState() => (string snapshot_json);
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index e2bcf72..7378c49 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -1918,6 +1918,21 @@ void SidebarHandler::GetCloudModels(const std::string& id,
+               std::move(callback), chosen ? *chosen : std::string()));
+ }
+ 
++void SidebarHandler::SetCliModel(const std::string& id,
++                                 const std::string& model) {
++  const ai::Provider* p = ai::FindProvider(id);
++  if (!p || p->kind != ai::Kind::kCli || model.size() > 200) {
++    return;
++  }
++  ScopedDictPrefUpdate update(browser_->GetProfile()->GetPrefs(),
++                              prefs::kAiModels);
++  if (model.empty()) {
++    update->Remove(id);
++  } else {
++    update->Set(id, model);
++  }
++}
++
+ void SidebarHandler::SetCloudModel(const std::string& id,
+                                    const std::string& model) {
+   const ai::Provider* p = ai::FindProvider(id);
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 3c31df6..09f19ac 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -305,6 +305,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void GetCloudModels(const std::string& id,
+                       GetCloudModelsCallback callback) override;
+   void SetCloudModel(const std::string& id, const std::string& model) override;
++  void SetCliModel(const std::string& id, const std::string& model) override;
+   void ListChats(ListChatsCallback callback) override;
+   void GetChat(const std::string& id, GetChatCallback callback) override;
+   void SaveChat(mojom::ChatPtr chat) override;
+diff --git a/chrome/browser/resources/webui_browser/meridian/ask.css b/chrome/browser/resources/webui_browser/meridian/ask.css
+index 48d5e24..7738aa8 100644
+--- a/chrome/browser/resources/webui_browser/meridian/ask.css
++++ b/chrome/browser/resources/webui_browser/meridian/ask.css
+@@ -453,6 +453,12 @@ button.who:hover {
+   opacity: 1;
+ }
+ 
++/* The error's own fix: one button, under its words. */
++.error .fix {
++  display: block;
++  margin-top: 8px;
++}
++
+ .setup-card {
+   margin-top: 8px;
+   padding: 10px 12px;
+diff --git a/chrome/browser/resources/webui_browser/meridian/ask.html.ts b/chrome/browser/resources/webui_browser/meridian/ask.html.ts
+index 9086d82..749599f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/ask.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/ask.html.ts
+@@ -102,8 +102,11 @@ export function getHtml(this: MeridianAskElement) {
+               </div>
+             </div>` : ''}
+           ${m.error ? html`<div class="error">${m.error}
+-            <button class="report-link" data-error="${m.error}"
+-                @click="${this.onReportClick_}">Send a report</button>
++            ${m.fix ? html`
++              <button class="btn fix" data-index="${m.index}"
++                  @click="${this.onFixClick_}">${m.fix.label}</button>` :
++              html`<button class="report-link" data-error="${m.error}"
++                  @click="${this.onReportClick_}">Send a report</button>`}
+           </div>` : ''}`}
+       </div>`)}
+   </div>
+diff --git a/chrome/browser/resources/webui_browser/meridian/ask.ts b/chrome/browser/resources/webui_browser/meridian/ask.ts
+index 3ef3810..c456777 100644
+--- a/chrome/browser/resources/webui_browser/meridian/ask.ts
++++ b/chrome/browser/resources/webui_browser/meridian/ask.ts
+@@ -27,6 +27,15 @@ export interface Message {
+   // Asked for a setup: the changes the answer offers to make.
+   wantsSetup?: boolean;
+   setup?: SetupOffer;
++  // With an error: one button that fixes it and asks again (an agent's own
++  // model in place of its spent free one).
++  fix?: AskFix;
++}
++
++export interface AskFix {
++  label: string;
++  provider: string;
++  model: string;
+ }
+ 
+ export interface SetupOffer {
+@@ -73,6 +82,7 @@ export interface RenderedMessage {
+   boost?: BoostResult;
+   setup?: SetupOffer;
+   working?: string;
++  fix?: AskFix;
+   index: number;
+ }
+ 
+@@ -212,6 +222,7 @@ export class MeridianAskElement extends CrLitElement {
+                                             tools: m.tools.join(', ')
+                                                        .replace(/_/g, ' '),
+                                             error: m.error,
++                                            fix: m.fix,
+                                           }));
+     }
+   }
+@@ -233,6 +244,16 @@ export class MeridianAskElement extends CrLitElement {
+     const updated = {...last, tools: [...last.tools]};
+     if (type === 'text') {
+       updated.text += text;
++    } else if (type === 'reset') {
++      // Asked again without images: the answer starts over.
++      updated.text = '';
++      updated.tools = [];
++    } else if (type === 'fix') {
++      try {
++        updated.fix = JSON.parse(text) as AskFix;
++      } catch {
++        // Nothing to offer.
++      }
+     } else if (type === 'tool') {
+       updated.tools.push(text);
+     } else if (type === 'error') {
+@@ -718,6 +739,23 @@ export class MeridianAskElement extends CrLitElement {
+     this.open = false;
+   }
+ 
++  // The error's button: the fix, then the same question again.
++  protected onFixClick_(e: Event) {
++    const index = Number((e.currentTarget as HTMLElement).dataset['index']);
++    const fix = this.messages_[index]?.fix;
++    const question = this.messages_[index - 1];
++    if (!fix || this.busy_ || question?.role !== 'user') {
++      return;
++    }
++    this.handler_.setCliModel(fix.provider, fix.model);
++    const messages = [...this.messages_];
++    messages[index] = {role: 'assistant', text: '', tools: [], error: ''};
++    this.messages_ = messages;
++    this.busy_ = true;
++    this.handler_.aiChatWith(this.sessionId_, question.text, 'chat',
++                             this.withPage_, this.picked_);
++  }
++
+   // "Send a report" by an error: the sheet, with the error in it.
+   protected onReportClick_(e: Event) {
+     const error = (e.currentTarget as HTMLElement).dataset['error'] || '';
