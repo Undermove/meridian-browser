@@ -101,24 +101,26 @@ test('Boost editor, as Arc’s: a colour on the pad, a font, size, case, dark, c
     await b.waitFor(`app.$.boostEditor.open && !!${BE}.getElementById('pad')`);
     assert.equal(await b.eval(`${BE}.getElementById('name').value`), 'My Boost');
 
-    // A colour on the pad, as Arc's: the hue is the angle from the middle (red at the top, clockwise),
-    // the amount how far out. Right of the middle, 3/5 of the way out: a yellow-green: the page is
-    // painted in it; the knob glides there, the small one (the second colour) opposite.
+    // A colour on the pad, as Arc's: the hue is the rim's colour at the angle from the middle (magenta
+    // at the top, red at the right, clockwise), the amount how far out. Right of the middle, 3/5 of
+    // the way out: a red: the page is painted in it; the knob glides there, the small one (the second
+    // colour, for the dark parts) opposite, on the cyan side.
     await clickPad(b, 0.8, 0.5);
     await page.waitFor(`!!document.getElementById('meridian-boost-paint') && document.body.hasAttribute('data-mb-fg')`, 5000);
     assert.equal(await page.eval(`getComputedStyle(document.documentElement).filter`), 'none', 'no filter over the page');
     assert.notEqual(await page.eval(`getComputedStyle(document.documentElement, '::after').mixBlendMode`), 'color', 'no colour layer over the whole page');
     const { state } = await b.eval(`${H}.getBoost()`);
-    assert.ok(state.boost.tint >= 85 && state.boost.tint <= 95, `tint ${state.boost.tint}`);
+    assert.ok(state.boost.tint >= 355 || state.boost.tint <= 5, `tint ${state.boost.tint}`);
+    assert.ok(state.boost.tint2 >= 170 && state.boost.tint2 <= 190, `tint2 ${state.boost.tint2}`);
     assert.ok(state.boost.tintStrength >= 55 && state.boost.tintStrength <= 65, `strength ${state.boost.tintStrength}`);
     await b.waitFor(`(() => { const f = ${BE}.querySelector('#pad .field').getBoundingClientRect(); const at = (id) => { const r = ${BE}.getElementById(id).getBoundingClientRect(); return [(r.x + r.width / 2 - f.x) / f.width, (r.y + r.height / 2 - f.y) / f.height]; }; const [kx, ky] = at('knob'), [sx, sy] = at('shade'); return Math.abs(kx - 0.8) < 0.03 && Math.abs(ky - 0.5) < 0.03 && Math.abs(sx - 0.2) < 0.03 && Math.abs(sy - 0.5) < 0.03; })()`, 3000);
-    // A font from the grid, the size up, lower case, dark.
+    // A font from the grid, the size up, upper case (Arc's order: AA, then aa), dark.
     await clickEditor(b, `${BE}.querySelector('.font[data-font="Georgia"]')`);
     await page.waitFor(`getComputedStyle(document.querySelector('p')).fontFamily.startsWith('Georgia')`, 5000);
     await clickEditor(b, `${BE}.getElementById('size')`);
     await page.waitFor(`getComputedStyle(document.body).zoom === '1.1'`, 5000);
     await clickEditor(b, `${BE}.getElementById('case')`);
-    await page.waitFor(`getComputedStyle(document.querySelector('p')).textTransform === 'lowercase'`, 5000);
+    await page.waitFor(`getComputedStyle(document.querySelector('p')).textTransform === 'uppercase'`, 5000);
     await clickEditor(b, `${BE}.getElementById('dark')`);
     await page.waitFor(`getComputedStyle(document.documentElement).filter.includes('invert(1)')`, 5000);
     // Quick changes, one boost.
@@ -763,8 +765,8 @@ const CONTRAST = `(() => {
 const HUE = (expr, prop) => `(() => { const m = getComputedStyle(${expr}).${prop}.match(/[\\d.]+/g).map((v) => v / 255); const [r, g, b] = m, hi = Math.max(r, g, b), lo = Math.min(r, g, b), d = hi - lo; if (!d) return -1; const h = hi === r ? ((g - b) / d + 6) % 6 : hi === g ? (b - r) / d + 2 : (r - g) / d + 4; return Math.round(h * 60); })()`;
 const near = (a, b, tol) => Math.abs((((a - b) % 360) + 540) % 360 - 180) <= tol;
 
-test('a colour paints the page, Arc’s way: a tinted background, the accent turned, text still readable, a picture untouched; undone at once', async () => {
-  const PAGE = `<!doctype html><title>Accent</title><style>body{margin:0;background:#fff;color:#222;font:16px system-ui}header{height:90px;background:#1565c0;color:#fff}a{color:#1565c0}button{background:#1565c0;color:#fff;border:0;padding:6px}img{width:90px;height:90px;display:block}</style><header>Site</header><p>Plain text <a href="#x">a link</a> <button>Go</button></p><img id="pic" src="data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="90" height="90"><rect width="90" height="90" fill="#e53935"/></svg>')}">`;
+test('a colour paints the page, Arc’s way: a tinted background and accents in the main colour, the dark top bar in the second, text still readable, a picture untouched; undone at once', async () => {
+  const PAGE = `<!doctype html><title>Accent</title><style>body{margin:0;background:#fff;color:#222;font:16px system-ui}header{height:90px;background:#123a6b;color:#fff}a{color:#1565c0}button{background:#1565c0;color:#fff;border:0;padding:6px}img{width:90px;height:90px;display:block}</style><header>Site</header><p>Plain text <a href="#x">a link</a> <button>Go</button></p><img id="pic" src="data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="90" height="90"><rect width="90" height="90" fill="#e53935"/></svg>')}">`;
   const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(PAGE); });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const url = `http://127.0.0.1:${server.address().port}/`;
@@ -775,22 +777,25 @@ test('a colour paints the page, Arc’s way: a tinted background, the accent tur
     await openControls(b);
     await b.click(`${SC}.getElementById('boostRow')`);
     await b.waitFor(`app.$.boostEditor.open && !!${BE}.getElementById('pad')`);
-    await clickPad(b, 1, 0.5);  // the right edge: hue 90, full colour
+    await clickPad(b, 1, 0.5);  // the right edge: red (hue 0), full colour; the second colour cyan
     await page.waitFor(`!!document.getElementById('meridian-boost-paint') && document.querySelector('header').hasAttribute('data-mb-bg')`, 5000);
     // No filter: not on the page, not on the picture; the picture is as it was.
     assert.equal(await page.eval(`getComputedStyle(document.documentElement).filter`), 'none');
     assert.equal(await page.eval(`getComputedStyle(document.getElementById('pic')).filter`), 'none');
-    // The white page takes a tint of the colour (still light); the blue header turns to it.
+    // The white page takes a tint of the colour (still light), the link and the button the colour;
+    // the dark blue top bar the second colour (still dark).
     const bodyBg = await page.eval(`getComputedStyle(document.documentElement).backgroundColor`);
     assert.notEqual(bodyBg, 'rgb(255, 255, 255)');
-    assert.ok(near(await page.eval(HUE('document.documentElement', 'backgroundColor')), 90, 30), bodyBg);
-    assert.ok(near(await page.eval(HUE(`document.querySelector('header')`, 'backgroundColor')), 90, 30));
-    assert.ok(near(await page.eval(HUE(`document.querySelector('a')`, 'color')), 90, 30), 'the link takes the colour');
+    assert.ok(near(await page.eval(HUE('document.documentElement', 'backgroundColor')), 0, 30), bodyBg);
+    assert.ok(near(await page.eval(HUE(`document.querySelector('a')`, 'color')), 0, 30), 'the link takes the colour');
+    assert.ok(near(await page.eval(HUE(`document.querySelector('button')`, 'backgroundColor')), 0, 30), 'the button takes the colour');
+    assert.ok(near(await page.eval(HUE(`document.querySelector('header')`, 'backgroundColor')), 180, 30), 'the top bar takes the second colour');
     // Readable everywhere: AA (4.5:1, 3:1 for large text).
     const { worst, at } = await page.eval(CONTRAST);
     assert.ok(worst >= 1, `contrast ${worst} at ${at}`);
 
-    // The second colour: the small knob dragged round to the bottom (hue 180) paints the accents.
+    // The second colour: the small knob dragged round to the bottom (yellow, hue 60) paints the dark
+    // top bar; the button keeps the main colour.
     const from = await b.eval(`(() => { const r = ${BE}.getElementById('shade').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
     const to = await b.eval(`(() => { const r = ${BE}.querySelector('#pad .field').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height * 0.95 }; })()`);
     await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y, button: 'none' });
@@ -800,10 +805,9 @@ test('a colour paints the page, Arc’s way: a tinted background, the accent tur
       await sleep(30);
     }
     await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', clickCount: 1 });
-    await b.waitFor(`(async () => { const { state } = await ${H}.getBoost(); return state.boost.tint2 >= 170 && state.boost.tint2 <= 190 && state.boost.tint === 90; })()`, 5000);
-    await page.waitFor(`${HUE(`document.querySelector('button')`, 'backgroundColor')} > 150`, 5000);
-    assert.ok(near(await page.eval(HUE(`document.querySelector('button')`, 'backgroundColor')), 180, 30), 'the button takes the second colour');
-    assert.ok(near(await page.eval(HUE(`document.querySelector('header')`, 'backgroundColor')), 90, 30), 'the header keeps the main one');
+    await b.waitFor(`(async () => { const { state } = await ${H}.getBoost(); return state.boost.tint2 >= 55 && state.boost.tint2 <= 65 && state.boost.tint === 0; })()`, 5000);
+    await page.waitFor(`(() => { const h = ${HUE(`document.querySelector('header')`, 'backgroundColor')}; return h >= 30 && h <= 90; })()`, 5000);
+    assert.ok(near(await page.eval(HUE(`document.querySelector('button')`, 'backgroundColor')), 0, 30), 'the button keeps the main colour');
     assert.ok((await page.eval(CONTRAST)).worst >= 1);
     if (process.env.MERIDIAN_SHOT) {
       const { data } = await page.cdp.send('Page.captureScreenshot', { format: 'png' });
@@ -812,7 +816,7 @@ test('a colour paints the page, Arc’s way: a tinted background, the accent tur
     // "No colour": back to the site's own colours at once, nothing of ours left in the page.
     await clickEditor(b, `${BE}.getElementById('noColour')`);
     await page.waitFor(`!document.getElementById('meridian-boost-paint') && !document.querySelector('[data-mb-bg],[data-mb-fg]')`, 5000);
-    assert.equal(await page.eval(`getComputedStyle(document.querySelector('header')).backgroundColor`), 'rgb(21, 101, 192)');
+    assert.equal(await page.eval(`getComputedStyle(document.querySelector('header')).backgroundColor`), 'rgb(18, 58, 107)');
     page.close();
   } finally { await b.close(); server.close(); }
 });
@@ -898,6 +902,315 @@ test('an agent\'s boost shows its code when asked, and its JavaScript has no rea
     await reload;
     await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'boost:undefined')`);
   } finally { mcp.close(); await b.close(); s.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
+// A team messenger as heavy as the real ones: a theme in CSS custom properties (Mattermost's names),
+// a dark team bar and channel sidebar, ~20k elements, a web component with its own shadow DOM per
+// post, and the page changing all the time (new posts, typing, unread marks).
+const HEAVY = `<!doctype html><html><head><meta charset="utf-8"><title>Team</title><style>
+:root{--sidebar-bg:#1e325c;--sidebar-bg-rgb:30,50,92;--sidebar-text:#ffffff;--sidebar-text-rgb:255,255,255;--sidebar-header-bg:#192a4d;--sidebar-teambar-bg:#14213e;--sidebar-text-active-border:#5d89ea;--sidebar-text-active-color:#ffffff;--sidebar-text-hover-bg:#28427b;--center-channel-bg:#ffffff;--center-channel-bg-rgb:255,255,255;--center-channel-color:#3f4350;--center-channel-color-rgb:63,67,80;--button-bg:#1c58d9;--button-color:#ffffff;--link-color:#386fe5;--mention-bg:#ffffff;--mention-highlight-bg:#ffd470;--online-indicator:#06d6a0;--error-text:#d24b4e}
+*{box-sizing:border-box}body{margin:0;font:14px/1.4 system-ui;background:var(--center-channel-bg);color:var(--center-channel-color);display:grid;grid-template:44px 1fr/56px 240px 1fr;height:100vh;overflow:hidden}
+#top{grid-column:1/4;background:var(--sidebar-header-bg);color:var(--sidebar-text);display:flex;align-items:center;padding:0 12px;gap:12px}
+#top input{background:rgba(var(--sidebar-text-rgb),.12);border:0;border-radius:6px;color:var(--sidebar-text);padding:6px 10px;width:340px}
+#teams{background:var(--sidebar-teambar-bg);display:flex;flex-direction:column;align-items:center;gap:8px;padding-top:10px}
+#teams b{width:36px;height:36px;border-radius:8px;display:grid;place-items:center;background:rgba(var(--sidebar-text-rgb),.16);color:var(--sidebar-text)}
+#side{background:var(--sidebar-bg);color:rgba(var(--sidebar-text-rgb),.72);overflow:auto;padding:8px 0}
+#side .ch{display:flex;gap:8px;align-items:center;padding:5px 16px;cursor:pointer}
+#side .ch:hover{background:var(--sidebar-text-hover-bg)}
+#side .ch.unread{color:var(--sidebar-text);font-weight:600}
+#side .ch.active{background:rgba(var(--sidebar-text-rgb),.16);color:var(--sidebar-text-active-color);border-left:3px solid var(--sidebar-text-active-border)}
+#side .ch i{width:8px;height:8px;border-radius:50%;background:var(--online-indicator)}
+#side h6{margin:12px 16px 4px;font-size:12px;color:rgba(var(--sidebar-text-rgb),.6);text-transform:uppercase}
+#center{display:flex;flex-direction:column;min-width:0}
+#head{height:48px;border-bottom:1px solid rgba(var(--center-channel-color-rgb),.12);display:flex;align-items:center;padding:0 16px;font-weight:700}
+#posts{flex:1;overflow:auto;padding:8px 0}
+.post{display:grid;grid-template-columns:40px 1fr;gap:8px;padding:6px 16px}
+.post:hover{background:rgba(var(--center-channel-color-rgb),.04)}
+.post .av{width:36px;height:36px;border-radius:50%;background:#c4c9d6}
+.post .who{font-weight:700;color:var(--center-channel-color)}.post .when{color:rgba(var(--center-channel-color-rgb),.56);font-size:12px;margin-left:6px}
+.post p{margin:2px 0}.post a{color:var(--link-color)}.post .mention{background:var(--mention-highlight-bg);border-radius:3px;padding:0 2px}
+.post ul{margin:2px 0;padding-left:18px}.post .meta{display:flex;gap:6px;color:rgba(var(--center-channel-color-rgb),.64);font-size:12px}
+.post .meta span{border:1px solid rgba(var(--center-channel-color-rgb),.16);border-radius:10px;padding:0 6px}
+#box{margin:8px 16px 16px;border:1px solid rgba(var(--center-channel-color-rgb),.24);border-radius:8px;padding:10px;color:rgba(var(--center-channel-color-rgb),.64)}
+#box button{background:var(--button-bg);color:var(--button-color);border:0;border-radius:4px;padding:6px 14px;float:right}
+#typing{font-size:12px;color:rgba(var(--center-channel-color-rgb),.64);padding:0 16px;height:16px}
+</style></head><body>
+<div id="top"><b>Team</b><input placeholder="Search"></div>
+<div id="teams"><b>DO</b><b>DB</b><b>AI</b></div>
+<div id="side"></div>
+<div id="center"><div id="head">town-square</div><div id="posts"></div><div id="typing"></div><div id="box">Write to town-square <button id="send">Send</button></div></div>
+<script>
+customElements.define('post-reactions', class extends HTMLElement {
+  constructor() { super(); const r = this.attachShadow({ mode: 'open' });
+    r.innerHTML = '<style>:host{display:flex;gap:4px;margin-top:2px}span{border-radius:10px;padding:0 6px;font-size:12px;background:rgba(var(--button-bg-rgb,28,88,217),.08);color:var(--link-color);border:1px solid rgba(28,88,217,.3)}span.me{background:var(--button-bg);color:var(--button-color)}</style><span>👍 3</span><span class="me">🎉 1</span><span>👀 2</span>'; }
+});
+const side = document.getElementById('side'), posts = document.getElementById('posts');
+let html = '';
+for (let g = 0; g < 6; g++) {
+  html += '<h6>Group ' + g + '</h6>';
+  for (let i = 0; i < 45; i++) html += '<div class="ch' + (g === 1 && i === 2 ? ' active' : i % 7 === 0 ? ' unread' : '') + '" data-i="' + (g * 45 + i) + '"><i></i><span>channel-' + g + '-' + i + '</span></div>';
+}
+side.innerHTML = html;
+const post = (n) => '<div class="post" data-n="' + n + '"><div class="av"></div><div><div><span class="who">User ' + (n % 17) + '</span><span class="when">5:' + String(n % 60).padStart(2, '0') + ' PM</span></div>' +
+  '<p>Message ' + n + ' about <a href="#">a link</a> and <span class="mention">@someone</span>, with <b>bold</b> and <code>code</code>.</p>' +
+  '<ul><li>first point ' + n + '</li><li>second <em>point</em></li><li>third point</li></ul>' +
+  '<div class="meta"><span>' + (n % 9) + ' replies</span><span>last reply 2h ago</span><span>thread</span></div>' + (n % 4 === 0 ? '<post-reactions></post-reactions>' : '') + '</div></div>';
+let n = 0, chunk = '';
+while (n < 880) chunk += post(n++);
+posts.innerHTML = chunk;
+// Live: a new post, typing and unread marks, a few times a second.
+window.liveTicks = 0;
+setInterval(() => {
+  window.liveTicks++;
+  posts.insertAdjacentHTML('beforeend', post(n++));
+  if (posts.children.length > 920) posts.firstElementChild.remove();
+  document.getElementById('typing').textContent = window.liveTicks % 2 ? 'User ' + (n % 17) + ' is typing…' : '';
+  side.children[1 + (window.liveTicks * 7) % 280]?.classList.toggle('unread');
+}, 250);
+</script></body></html>`;
+
+// The page's main thread over the DevTools protocol: script, style and layout, in ms.
+async function mainThread(page) {
+  const { metrics } = await page.cdp.send('Performance.getMetrics');
+  const m = Object.fromEntries(metrics.map((x) => [x.name, x.value]));
+  return { script: m.ScriptDuration * 1000, style: m.RecalcStyleDuration * 1000, layout: m.LayoutDuration * 1000 };
+}
+
+// The pad's knobs and orbit, in the browser's pixels: where each knob's middle is, the field's
+// middle, the track circle's radius, the arc's ends and middle.
+const PAD_GEOMETRY = `(() => {
+  const root = app.$.boostEditor.shadowRoot;
+  const f = root.querySelector('#pad .field').getBoundingClientRect();
+  const mid = (id) => { const r = root.getElementById(id).getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; };
+  const c = { x: f.x + f.width / 2, y: f.y + f.height / 2 };
+  const orbit = root.getElementById('orbit');
+  const toPx = (p) => ({ x: f.x + p.x / 100 * f.width, y: f.y + p.y / 100 * f.height });
+  let arc = null, track = null;
+  if (orbit) {
+    const path = root.getElementById('arc');
+    const len = path.getTotalLength();
+    arc = { from: toPx(path.getPointAtLength(0)), mid: toPx(path.getPointAtLength(len / 2)), to: toPx(path.getPointAtLength(len)) };
+    track = Number(orbit.querySelector('.track').getAttribute('r')) / 100 * f.width;
+  }
+  return { c, knob: mid('knob'), shade: mid('shade'), arc, track, opacity: orbit ? getComputedStyle(orbit).opacity : '0', width: f.width };
+})()`;
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+// "rgb(r, g, b)" as OKLCH {L, C, h}.
+const oklch = (c) => {
+  const [r, g, b] = c.match(/[\d.]+/g).slice(0, 3).map((v) => { v /= 255; return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; });
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  const A = 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s, B = 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s;
+  return { L: +(0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s).toFixed(3), C: +Math.hypot(A, B).toFixed(3), h: Math.round((Math.atan2(B, A) * 180 / Math.PI + 360) % 360) };
+};
+
+// A team messenger as big and live as the real ones, its theme in CSS custom properties (Mattermost's
+// names) with a dark sidebar: a drag on the pad repaints it within a frame's budget (the colours of
+// the page's thousands of elements are read once, a drag only rewrites a few hundred colours), the
+// dark sidebar and the main area both change and agree, new posts come in painted, a component's
+// shadow DOM too; the Boost editor stays as it is (nothing of the page's paint reaches it).
+// MERIDIAN_SHOT_DIR keeps before and after.
+test('a heavy live app (custom-property theme, dark sidebar, 18k elements, shadow DOM, posts coming in): a drag stays within budget and the whole page follows; the editor keeps full opacity', async () => {
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(HEAVY); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}/team`;
+  const b = await launch([url]);
+  const dir = process.env.MERIDIAN_SHOT_DIR;
+  const shot = async (page, name) => {
+    if (!dir) return;
+    const { data } = await page.cdp.send('Page.captureScreenshot', { format: 'png' });
+    fs.writeFileSync(path.join(dir, `${name}.png`), Buffer.from(data, 'base64'));
+  };
+  const BG = (sel) => `getComputedStyle(document.querySelector(${JSON.stringify(sel)})).backgroundColor`;
+  try {
+    const page = await b.page(url);
+    await page.waitFor(`document.readyState === 'complete' && window.liveTicks > 2`);
+    assert.ok(await page.eval(`document.querySelectorAll('*').length`) > 15000, 'a big page');
+    const sideBefore = await page.eval(BG('#side'));
+    assert.equal(sideBefore, 'rgb(30, 50, 92)');
+    await shot(page, 'heavy-before');
+    await openEditor(b);
+    // The first colour: the whole page read once.
+    await clickPad(b, 1, 0.5);
+    await page.waitFor(`!!document.getElementById('meridian-boost-paint') && document.body.hasAttribute('data-mb-fg')`, 8000);
+    await page.waitFor(`${BG('#side')} !== ${JSON.stringify(sideBefore)}`, 8000);
+    await sleep(1500);
+
+    // The setBoost calls the editor makes: one per update.
+    await b.eval(`(() => { const h = app.$.boostEditor.handler_; if (!h.__counted) { const set = h.setBoost.bind(h); h.setBoost = (x) => { window.__sets = (window.__sets || 0) + 1; return set(x); }; h.__counted = true; } window.__sets = 0; })()`);
+    await page.cdp.send('Performance.enable');
+    const m0 = await mainThread(page);
+    // A drag round the pad: the main knob held and taken round half the rim, 40 steps a frame apart.
+    const f = await b.eval(`(() => { const r = ${BE}.querySelector('#pad .field').getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; })()`);
+    const at = (deg, k = 0.42) => ({ x: f.x + f.w / 2 + Math.sin(deg * Math.PI / 180) * f.w * k, y: f.y + f.h / 2 - Math.cos(deg * Math.PI / 180) * f.h * k });
+    let p = at(90, 0.5);
+    await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x - 2, y: p.y, button: 'none' });
+    await b.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: p.x - 2, y: p.y, button: 'left', clickCount: 1 });
+    let midDrag = null;
+    for (let i = 1; i <= 40; i++) {
+      p = at(90 + i * 4.5);
+      await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y, button: 'left', buttons: 1 });
+      await sleep(16);
+      if (i === 20) {
+        // Mid-drag: the editor as it is, nothing of the page's paint in Meridian's own page.
+        midDrag = await b.eval(`(() => { const card = ${BE}.getElementById('card'), pad = ${BE}.getElementById('pad'); const cs = getComputedStyle(card), ps = getComputedStyle(pad), hs = getComputedStyle(app.$.boostEditor); let seen = 1; for (let e = pad; e; e = e.parentElement || e.getRootNode().host) seen *= Number(getComputedStyle(e).opacity); return { card: cs.opacity, filter: cs.filter, pad: ps.opacity, padFilter: ps.filter, host: hs.opacity, hostFilter: hs.filter, seen: String(seen), inactive: app.hasAttribute('inactive'), drag: pad.classList.contains('drag'), leak: !!document.getElementById('meridian-boost-paint') || !!${BE}.querySelector('[data-mb-bg],[data-mb-fg]') || !!document.querySelector('[data-mb-bg],[data-mb-fg]') }; })()`);
+      }
+    }
+    await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: p.x, y: p.y, button: 'left', clickCount: 1 });
+    await sleep(600);
+    const m1 = await mainThread(page);
+    const sets = await b.eval(`window.__sets`);
+    const per = { script: (m1.script - m0.script) / sets, style: (m1.style - m0.style) / sets, layout: (m1.layout - m0.layout) / sets };
+    per.total = per.script + per.style + per.layout;
+    console.log(`# heavy app: ${sets} updates; per update in the page: script ${per.script.toFixed(2)} ms, style ${per.style.toFixed(2)} ms, layout ${per.layout.toFixed(2)} ms`);
+    assert.ok(sets >= 10, `updates ${sets}`);
+    assert.ok(per.script < 16, `script per update ${per.script.toFixed(1)} ms`);
+    assert.ok(per.total < 40, `main thread per update ${per.total.toFixed(1)} ms`);
+    // Also in a window that isn't the active one (as here, in the background, or while the person
+    // takes a screenshot): the sidebar fades then, the editor over the page must not.
+    const { inactive, ...look } = midDrag;
+    console.log(`# editor mid-drag, window ${inactive ? 'inactive' : 'active'}: ${JSON.stringify(look)}`);
+    assert.deepEqual(look, { card: '1', filter: 'none', pad: '1', padFilter: 'none', host: '1', hostFilter: 'none', seen: '1', drag: true, leak: false });
+
+    // The page follows, all of it: the dark sidebar (its colour from --sidebar-bg) takes the second
+    // colour and stays dark, the main area a tint of the main one and stays light; the site's own
+    // variables carry the colours; text stays readable on both.
+    const { state } = await b.eval(`${H}.getBoost()`);
+    const L = (c) => { const m = c.match(/[\d.]+/g).map(Number); return (0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2]) / 255; };
+    const side = await page.eval(BG('#side'));
+    assert.notEqual(side, sideBefore);
+    assert.ok(L(side) < 0.45, `the sidebar stays dark: ${side}`);
+    assert.ok(near(await page.eval(HUE(`document.getElementById('side')`, 'backgroundColor')), state.boost.tint2, 35), `the sidebar in the second colour (${state.boost.tint2}): ${side}`);
+    assert.equal(await page.eval(`getComputedStyle(document.documentElement).getPropertyValue('--sidebar-bg').trim()`), side.replace(/rgb\((\d+), (\d+), (\d+)\)/, 'rgb($1 $2 $3)'), 'the site variable carries it');
+    const main = await page.eval(`getComputedStyle(document.documentElement).backgroundColor`);
+    assert.notEqual(main, 'rgb(255, 255, 255)');
+    assert.ok(L(main) > 0.85, `the main area stays light: ${main}`);
+    assert.ok(near(await page.eval(HUE('document.documentElement', 'backgroundColor')), state.boost.tint, 35), `the main area in the main colour (${state.boost.tint}): ${main}`);
+    // As Arc's (measured on its recordings of this kind of app): the light area a quiet near-white
+    // (OKLCH L 0.90-0.97, chroma at most ~0.035), never a bright pastel; the dark sidebar deep and
+    // clearly coloured (L 0.3-0.5, chroma 0.06 or more).
+    const mainLch = oklch(main), sideLch = oklch(side);
+    assert.ok(mainLch.L >= 0.88 && mainLch.L <= 0.975 && mainLch.C <= 0.035, `the main area a faint tint: ${JSON.stringify(mainLch)}`);
+    assert.ok(sideLch.L >= 0.28 && sideLch.L <= 0.5 && sideLch.C >= 0.06, `the sidebar deep and coloured: ${JSON.stringify(sideLch)}`);
+    assert.notEqual(await page.eval(BG('#top')), 'rgb(25, 42, 77)', 'the top bar too');
+    const ratio = `((a, b) => { const p = (c) => c.match(/[\\d.]+/g).slice(0, 3).map(Number); const lin = (v) => { v /= 255; return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; }; const lum = (c) => 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]); const x = lum(p(a)), y = lum(p(b)); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); })`;
+    assert.ok(await page.eval(`${ratio}(getComputedStyle(document.querySelector('#side .ch.unread span')).color, ${BG('#side')})`) >= 4.5, 'sidebar text readable');
+    assert.ok(await page.eval(`${ratio}(getComputedStyle(document.querySelector('.post p')).color, getComputedStyle(document.documentElement).backgroundColor)`) >= 4.5, 'post text readable');
+    // Links agree everywhere, also in posts that came after the colours, and in a component's
+    // shadow DOM.
+    const ticks = await page.eval(`window.liveTicks`);
+    await page.waitFor(`window.liveTicks >= ${ticks + 4}`, 5000);
+    await sleep(400);
+    const links = await page.eval(`(() => { const a = [...document.querySelectorAll('#posts .post a')]; return [getComputedStyle(a[0]).color, getComputedStyle(a[a.length - 1]).color, a[a.length - 1].closest('.post').dataset.n]; })()`);
+    assert.equal(links[1], links[0], `a new post (#${links[2]}) painted as the others`);
+    assert.ok(near(await page.eval(HUE(`[...document.querySelectorAll('#posts .post a')].pop()`, 'color')), state.boost.tint, 35), 'links in the main colour');
+    const reaction = await page.eval(`getComputedStyle(document.querySelector('post-reactions').shadowRoot.querySelector('span.me')).backgroundColor`);
+    assert.notEqual(reaction, 'rgb(28, 88, 217)', 'inside the shadow DOM too');
+    await shot(page, 'heavy-after');
+    // The colours of Arc's own recording on this kind of app (a magenta dot, a brown-orange small
+    // one), for a side-by-side: the main area pinkish near-white, the sidebar brown.
+    const arcLike = { ...state.boost, tint: 320, tint2: 25, tintStrength: 75 };
+    await b.eval(`${H}.setBoost(${JSON.stringify(arcLike)})`);
+    await page.waitFor(`${BG('#side')} !== ${JSON.stringify(side)}`, 5000);
+    await sleep(300);
+    const pink = oklch(await page.eval(`getComputedStyle(document.documentElement).backgroundColor`));
+    console.log(`# Arc's colours: main area ${JSON.stringify(pink)}, sidebar ${JSON.stringify(oklch(await page.eval(BG('#side'))))}`);
+    assert.ok(pink.C <= 0.035 && near(pink.h, 340, 30), `pinkish near-white: ${JSON.stringify(pink)}`);
+    await shot(page, 'heavy-arc-colours');
+    page.close();
+  } finally { await b.close(); server.close(); }
+});
+
+// The pad as Arc's: while the pointer is on it, a faint circle through the main knob and an arc
+// from it clockwise to the second knob, which sits on that circle; dragging the main knob takes the
+// second round with it (as far apart as they were); dragging the second turns only its colour. The
+// buttons' icons move: the sliders' knobs slide, the no-entry sign turns, the bulb swings, the bolt
+// jolts; size and case take Arc's orange once changed.
+test('the pad’s orbit as Arc’s (circle, arc between the knobs, the second knob going round with the first) and the buttons’ icons animate', async () => {
+  const s = await site();
+  const b = await launch([s.url]);
+  const move = (x, y, buttons = 0) => b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: buttons ? 'left' : 'none', buttons });
+  try {
+    const page = await b.page(s.url);
+    await page.waitFor(`document.readyState === 'complete'`);
+    await openEditor(b);
+    // No colour yet: no orbit.
+    assert.equal(await b.eval(`!!${BE}.getElementById('orbit')`), false);
+    await clickPad(b, 1, 0.5);   // red, all the way out; the second knob opposite
+    await b.waitFor(`!!${BE}.getElementById('orbit')`, 3000);
+    // The pointer on the pad: the orbit shows.
+    let g = await b.eval(PAD_GEOMETRY);
+    await move(g.c.x, g.c.y + 4);
+    await b.waitFor(`getComputedStyle(${BE}.getElementById('orbit')).opacity === '1'`, 3000);
+    await sleep(500);   // the knobs' glide
+    g = await b.eval(PAD_GEOMETRY);
+    const r = dist(g.knob, g.c);
+    assert.ok(Math.abs(g.track - r) < 2, `the circle goes through the main knob: ${g.track} vs ${r}`);
+    assert.ok(Math.abs(dist(g.shade, g.c) - r) < 2, 'the second knob on the circle');
+    assert.ok(g.knob.x > g.c.x + r * 0.9 && g.shade.x < g.c.x - r * 0.9, 'right and left');
+    assert.ok(dist(g.arc.from, g.knob) < 3 && dist(g.arc.to, g.shade) < 3, `the arc from knob to knob: ${JSON.stringify(g.arc)}`);
+    assert.ok(g.arc.mid.y > g.c.y + r * 0.9, 'clockwise: from the right round the bottom to the left');
+
+    // The main knob dragged up to the top: the second goes round with it, from the left to the bottom.
+    await move(g.knob.x, g.knob.y);
+    await b.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: g.knob.x, y: g.knob.y, button: 'left', clickCount: 1 });
+    const top = { x: g.c.x, y: g.c.y - r };
+    for (let i = 1; i <= 12; i++) {
+      const a = (90 - i * 7.5) * Math.PI / 180;
+      await move(g.c.x + Math.sin(a) * r, g.c.y - Math.cos(a) * r, 1);
+      await sleep(20);
+    }
+    const held = await b.eval(PAD_GEOMETRY);
+    assert.equal(held.opacity, '1', 'the orbit shows while dragging');
+    assert.ok(dist(held.knob, top) < 4, `the knob under the pointer: ${JSON.stringify(held.knob)} vs ${JSON.stringify(top)}`);
+    assert.ok(Math.abs(held.shade.x - g.c.x) < 4 && held.shade.y > g.c.y + r * 0.9, `the second knob went round to the bottom: ${JSON.stringify(held.shade)}`);
+    await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: top.x, y: top.y, button: 'left', clickCount: 1 });
+    await b.waitFor(`(async () => { const { state } = await ${H}.getBoost(); return Math.abs(state.boost.tint - 300) <= 4 && Math.abs(state.boost.tint2 - 60) <= 4; })()`, 5000);
+    // The second knob dragged round to the right: only the second colour turns (red), the main stays.
+    g = await b.eval(PAD_GEOMETRY);
+    await move(g.shade.x, g.shade.y);
+    await b.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: g.shade.x, y: g.shade.y, button: 'left', clickCount: 1 });
+    for (let i = 1; i <= 12; i++) {
+      const a = (180 - i * 7.5) * Math.PI / 180;
+      await move(g.c.x + Math.sin(a) * r, g.c.y - Math.cos(a) * r, 1);
+      await sleep(20);
+    }
+    await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: g.c.x + r, y: g.c.y, button: 'left', clickCount: 1 });
+    await b.waitFor(`(async () => { const { state } = await ${H}.getBoost(); return Math.abs(state.boost.tint - 300) <= 4 && (state.boost.tint2 >= 356 || state.boost.tint2 <= 4); })()`, 5000);
+    g = await b.eval(PAD_GEOMETRY);
+    assert.ok(dist(g.knob, top) < 4, 'the main knob stayed');
+    assert.ok(g.arc.mid.x > g.c.x && g.arc.mid.y < g.c.y, 'the arc now a quarter: top round to the right');
+    // The pointer off the pad: the orbit fades.
+    const card = await b.eval(`(() => { const r = ${BE}.querySelector('.fonts').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+    await move(card.x, card.y);
+    await b.waitFor(`getComputedStyle(${BE}.getElementById('orbit')).opacity === '0'`, 3000);
+
+    // The icons move under the pointer.
+    const hover = async (id) => { const p = await b.point(`${BE}.getElementById('${id}')`); await move(p.x, p.y); };
+    const running = (sel) => `${BE}.querySelector(${JSON.stringify(sel)}).getAnimations().map((a) => a.animationName || a.transitionProperty).join()`;
+    await hover('adjust');
+    await b.waitFor(`/transform/.test(${running('#adjust .k1')}) || getComputedStyle(${BE}.querySelector('#adjust .k1')).transform !== 'none'`, 2000);
+    await b.waitFor(`getComputedStyle(${BE}.querySelector('#adjust .k1')).transform.startsWith('matrix(1, 0, 0, 1, -6')`, 2000, `getComputedStyle(${BE}.querySelector('#adjust .k1')).transform`);
+    await hover('noColour');
+    await b.waitFor(`getComputedStyle(${BE}.querySelector('#noColour .ban')).transform !== 'none'`, 2000);
+    assert.equal(await b.eval(`getComputedStyle(${BE}.querySelector('#adjust .k1')).transitionDuration`), '0.32s');
+    await hover('dark');
+    await b.waitFor(`/swing/.test(${running('#dark .swing')})`, 2000);
+    await hover('zap');
+    await b.waitFor(`/jolt/.test(${running('#zap .bolt')})`, 2000);
+    // Size, as Arc's: the value on orange once changed.
+    await clickEditor(b, `${BE}.getElementById('size')`);
+    await b.waitFor(`${BE}.getElementById('size').textContent.trim() === '110 %' && getComputedStyle(${BE}.getElementById('size')).backgroundColor === 'rgb(240, 122, 26)'`, 3000);
+    if (process.env.MERIDIAN_SHOT_DIR) {
+      await move(g.c.x, g.c.y);
+      await sleep(400);
+      const r2 = await b.eval(`(() => { const r = ${BE}.getElementById('card').getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: Math.min(r.height, 560), scale: 2 }; })()`);
+      const { data } = await b.cdp.send('Page.captureScreenshot', { format: 'png', clip: r2 });
+      fs.writeFileSync(path.join(process.env.MERIDIAN_SHOT_DIR, 'panel-ours.png'), Buffer.from(data, 'base64'));
+    }
+    page.close();
+  } finally { await b.close(); s.server.close(); }
 });
 
 // A Windows contrast theme (forced colours): the pad keeps its rim of hues and its field (the

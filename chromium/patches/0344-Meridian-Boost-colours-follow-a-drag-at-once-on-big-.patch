@@ -1,0 +1,1783 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 20:04:20 +0400
+Subject: [PATCH 344/344] Meridian: Boost colours follow a drag at once on big live
+ apps, the pad as Arc's
+
+On a heavy app (Mattermost-like Time) the colour pad lagged and the page
+changed late and only in part: every pointer move re-read the colours of
+up to 6000 elements in every tab of the profile and rewrote the whole
+paint style; the rest of the page, shadow DOM and the site's own colour
+variables were not painted, and live pages were repainted in full every
+second.
+
+Each colour the page uses is now read once (a slot) and elements are
+marked with it; a pick only rewrites the slots' values as variables. The
+site's colour variables (--sidebar-bg, --center-channel-bg, their r,g,b
+twins) are set too, open shadow roots get the rules, and elements that
+come or change are read a moment later, only they. A tab skips the
+script when its boost CSS is the same, and the picked colours no longer
+rewrite the boost's style element. On an 18.7k-element fixture: 0.2 ms
+of script per drag step (was 62), ~20 ms with style (was 78), no long
+tasks while the page changes (were ~55 ms each second).
+
+As Arc's: dark surfaces (a sidebar, a top bar, dark text) take the
+second colour (measured on Arc's recordings: L 0.35-0.5, chroma
+0.09-0.14), light ones a quiet tint of the main one (L 0.90-0.94, chroma
+0.015-0.03, never a bright pastel), accents the main one.
+The pad's rim runs magenta at the top, red, yellow, cyan, blue; while
+the pointer is on it a faint circle through the main knob and an arc to
+the second knob show; the second knob rides that circle and goes round
+with the main one. Drags update once a frame. Bigger knobs, a white font
+card, Size and Case on orange once changed, labels left and icons right,
+and the buttons' icons move (bulb, sliders, no-entry, bolt, braces).
+
+The editor looked washed out whenever the window wasn't the active one
+(another app in front, the screenshot tool open): it sits in the
+sidebar, which fades to 85% then, so the page showed through it. What
+floats over the page (site controls, the Boost editor and its glow) no
+longer fades with the sidebar.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/meridian/agent/agent_tools.json   |   2 +-
+ .../meridian/boosts/boost_tab_helper.cc       | 562 +++++++++++++-----
+ .../meridian/boosts/boost_tab_helper.h        |   7 +-
+ chrome/browser/meridian/sidebar.mojom         |   3 +-
+ .../browser/resources/webui_browser/app.css   |   7 +-
+ .../webui_browser/meridian/boost_editor.css   | 362 +++++++++--
+ .../meridian/boost_editor.html.ts             |  72 ++-
+ .../webui_browser/meridian/boost_editor.ts    | 242 ++++++--
+ 8 files changed, 980 insertions(+), 277 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_tools.json b/chrome/browser/meridian/agent/agent_tools.json
+index 815c49d201..9a29878193 100644
+--- a/chrome/browser/meridian/agent/agent_tools.json
++++ b/chrome/browser/meridian/agent/agent_tools.json
+@@ -715,7 +715,7 @@
+     },
+     "tint2": {
+      "type": "integer",
+-     "description": "The second colour's hue, 0-359, for buttons, links and accents; -1: the tint's."
++     "description": "The second colour's hue, 0-359, for the page's dark parts (a sidebar, a top bar, dark text), as Arc's small dot; -1: the tint's."
+     },
+     "dark": {
+      "type": "boolean",
+diff --git a/chrome/browser/meridian/boosts/boost_tab_helper.cc b/chrome/browser/meridian/boosts/boost_tab_helper.cc
+index 97465cc8fa..3306572063 100644
+--- a/chrome/browser/meridian/boosts/boost_tab_helper.cc
++++ b/chrome/browser/meridian/boosts/boost_tab_helper.cc
+@@ -24,13 +24,21 @@ namespace meridian {
+ 
+ namespace {
+ 
+-// Boost colours, as Arc's: a palette from the two picked colours, written as
+-// CSS for each colour the page uses (not a filter over the page). Neutral
+-// backgrounds take a tint of the main colour, big coloured blocks turn to it,
+-// buttons, badges and links to the second one; lightness stays, so light
+-// pages stay light and dark ones dark. Text is then made readable (WCAG AA,
+-// 4.5:1, 3:1 when large) on what's under it. Pictures and video are not
+-// touched. Returns {on(tint, tint2, amount), off()}, kept in the page.
++// Boost colours, as Arc's: a palette from the two picked colours, not a
++// filter over the page. Light surfaces take a tint of the main colour,
++// coloured blocks, buttons, badges and links the main colour itself; dark
++// surfaces (a sidebar, a top bar, a dark app) and dark text the second one.
++// Lightness stays, so light pages stay light and dark ones dark; text is then
++// made readable (WCAG AA, 4.5:1, 3:1 when large) on what's under it.
++// Pictures and video are not touched.
++//
++// Fast on big live apps: each colour the page uses is read once (a slot),
++// elements are marked with their slot, and a pick only rewrites the slots'
++// values (a few hundred colours, not the page's thousands of elements). The
++// site's own colour variables (Mattermost's --sidebar-bg and the like) are
++// set too, so what it paints later is in the colours at once. Elements that
++// come or change are read a moment later, only they. Returns
++// {on(tint, tint2, amount), off(), stats()}, kept in the page.
+ constexpr char kPaint[] = R"JS(() => {
+   // sRGB <-> OKLab/OKLCH, and WCAG contrast.
+   const lin = (v) => (v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
+@@ -66,23 +74,25 @@ constexpr char kPaint[] = R"JS(() => {
+   };
+   const lum = ([r, g, b]) => 0.2126 * lin(r / 255) + 0.7152 * lin(g / 255) + 0.0722 * lin(b / 255);
+   const contrast = (x, y) => { const a = lum(x), b = lum(y); return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05); };
+-  // Computed colours, whatever their syntax: through a canvas once each.
++  // Colours, whatever their syntax: through a canvas once each.
+   const ctx = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
+   const parsed = new Map();
+   const parse = (c) => {
+     if (!c || c === 'transparent') return null;
+-    if (parsed.has(c)) return parsed.get(c);
+-    let v = null;
++    let v = parsed.get(c);
++    if (v !== undefined) return v;
++    v = null;
+     const m = c.match(/^rgba?\(([\d.]+)[, ]+([\d.]+)[, ]+([\d.]+)(?:[,/ ]+([\d.]+%?))?\)$/);
+     if (m) {
+       const a = m[4] === undefined ? 1 : m[4].endsWith('%') ? parseFloat(m[4]) / 100 : +m[4];
+-      v = { rgb: [+m[1], +m[2], +m[3]], a };
+-    } else if (ctx) {
++      v = { rgb: [+m[1], +m[2], +m[3]].map(Math.round), a };
++    } else if (ctx && CSS.supports('color', c)) {
+       ctx.clearRect(0, 0, 1, 1); ctx.fillStyle = '#000'; ctx.fillStyle = c; ctx.fillRect(0, 0, 1, 1);
+       const d = ctx.getImageData(0, 0, 1, 1).data;
+       v = { rgb: [d[0], d[1], d[2]], a: d[3] / 255 };
+     }
+     if (v && v.a < 0.04) v = null;
++    if (v) v.k = v.rgb.join();
+     parsed.set(c, v);
+     return v;
+   };
+@@ -93,193 +103,425 @@ constexpr char kPaint[] = R"JS(() => {
+     return toLch([k(0), k(8), k(4)].map((v) => v * 255)).h;
+   };
+   const turn = (from, to, k) => from + ((((to - from) % 360) + 540) % 360 - 180) * k;
+-  const MEDIA = 'img,video,picture,canvas,iframe,embed,object';
+-  const ATTRS = ['data-mb-bg', 'data-mb-fg', 'data-mb-bd', 'data-mb-gi'];
+-  let pick = null, observer = null, timer = 0, last = 0;
+-  const clear = () => {
+-    document.getElementById('meridian-boost-paint')?.remove();
+-    for (const el of document.querySelectorAll('[data-mb-bg],[data-mb-fg],[data-mb-bd],[data-mb-gi]')) {
+-      for (const a of ATTRS) el.removeAttribute(a);
++  const lchOf = new Map();
++  const lch = (rgb, k) => { let v = lchOf.get(k); if (!v) { v = toLch(rgb); lchOf.set(k, v); } return v; };
++
++  // The palette, as Arc's. Dark surfaces (a sidebar, a top bar, a dark app)
++  // take the second colour, deep and lifted a little so it shows; light ones
++  // a tint of the main colour; coloured blocks, buttons, badges and links the
++  // main colour. Lightness stays: light pages stay light, dark ones dark.
++  let pick = null;
++  const mapBg = (x, big) => {
++    const { h1, h2, t } = pick;
++    // Arc's: a dark sidebar comes out L 0.35-0.5, chroma 0.09-0.14.
++    if (x.L < 0.5 && (big || x.C < 0.12)) {
++      return { L: x.L < 0.42 ? x.L + (0.42 - x.L) * 0.6 * t : x.L,
++               C: x.C * (1 - t) + t * (0.05 + 0.08 * Math.min(1, x.L / 0.35)), h: h2 };
++    }
++    // Arc's: white comes out a quiet near-white, L 0.90-0.94, chroma 0.015-0.03,
++    // never a bright pastel.
++    if (x.C < 0.035) {
++      const room = 1 - Math.abs(x.L - 0.6) / 0.6;
++      return { L: Math.min(x.L, 1 - 0.07 * t), C: x.C * (1 - t) + t * (0.014 + 0.026 * room), h: h1 };
+     }
++    return { L: x.L, C: x.C * (1 - 0.3 * t) + 0.3 * t * Math.max(x.C, 0.14), h: turn(x.h, h1, Math.min(1, t * 1.6)) };
+   };
+-  const paint = () => {
+-    if (!pick || !document.body) return;
+-    last = performance.now();
++  // Text: grey and dark text takes a whisper of the second colour (Arc's
++  // deep-toned text), coloured text and links the main one; then readable.
++  const mapFg = (x, link) => {
+     const { h1, h2, t } = pick;
+-    const old = document.getElementById('meridian-boost-paint');
+-    old?.remove();   // The site's own colours are read without ours.
+-    const pageBg = parse(getComputedStyle(document.body).backgroundColor) ||
+-        parse(getComputedStyle(document.documentElement).backgroundColor) || { rgb: [255, 255, 255], a: 1 };
+-    const dark = toLch(pageBg.rgb).L < 0.55;
+-    const screen = innerWidth * innerHeight;
+-    // A background: a neutral one takes the main colour, Arc's tint; a
+-    // big coloured block (a hero, a header) turns to it; a small coloured
+-    // one (a button, a badge) turns to the second colour. Lightness stays.
+-    const bgMemo = new Map();
+-    const mapBg = (c, big) => {
+-      const key = c.rgb.join() + (big ? 'B' : 's');
+-      if (bgMemo.has(key)) return bgMemo.get(key);
+-      const x = toLch(c.rgb);
+-      let y;
+-      if (x.C < 0.035) {
+-        const room = 1 - Math.abs(x.L - 0.6) / 0.6;
+-        y = { L: dark ? x.L + 0.03 * t : Math.min(x.L, 1 - 0.05 * t),
+-              C: x.C * (1 - t) + t * (0.04 + 0.06 * room), h: h1 };
+-      } else {
+-        y = { L: x.L, C: x.C * (1 - 0.3 * t) + 0.3 * t * Math.max(x.C, 0.13),
+-              h: turn(x.h, big ? h1 : h2, Math.min(1, t * 1.6)) };
+-      }
+-      const out = toRgb(y);
+-      bgMemo.set(key, out);
+-      return out;
+-    };
+-    // Text and borders: grey text gets a whisper of the main colour, coloured
+-    // text (links) the second one; then it's made readable on what's under it.
+-    const mapFg = (c, link) => {
+-      const x = toLch(c.rgb);
+-      return x.C < 0.035 && !link ?
+-          { L: x.L, C: x.C * (1 - t) + t * 0.025, h: h1 } :
+-          { L: x.L, C: Math.max(x.C, 0.09 * t), h: turn(x.h, h2, Math.min(1, t * 1.6)) };
+-    };
+-    const readable = (y, under, need) => {
+-      let rgb = toRgb(y);
+-      if (contrast(rgb, under) >= need) return rgb;
+-      const up = lum(under) < 0.18;
+-      // Darker text turns a deep shade of the colour rather than grey.
+-      const deep = !up && y.C < 0.05;
+-      for (let i = 0; i < 50 && contrast(rgb, under) < need; i++) {
+-        y = { L: y.L + (up ? 0.02 : -0.02),
+-              C: deep ? Math.max(y.C, 0.08 * pick.t) : y.C * 0.97, h: deep ? pick.h1 : y.h };
+-        rgb = toRgb(y);
++    if (x.C < 0.035 && !link) return { L: x.L, C: x.C * (1 - t) + t * (x.L < 0.6 ? 0.05 : 0.02), h: h2 };
++    return { L: x.L, C: Math.max(x.C, 0.09 * t), h: turn(x.h, h1, Math.min(1, t * 1.6)) };
++  };
++  const mapBd = (x) => {
++    const { h1, t } = pick;
++    if (x.C < 0.035) return { L: x.L, C: x.C * (1 - t) + t * 0.025, h: h1 };
++    return { L: x.L, C: x.C, h: turn(x.h, h1, Math.min(1, t * 1.6)) };
++  };
++  const readable = (y, under, need) => {
++    let rgb = toRgb(y);
++    if (contrast(rgb, under) >= need) return rgb;
++    const up = lum(under) < 0.18;
++    // Darker text turns a deep shade of the colour rather than grey.
++    const deep = !up && y.C < 0.05;
++    for (let i = 0; i < 50 && contrast(rgb, under) < need; i++) {
++      y = { L: y.L + (up ? 0.02 : -0.02), C: deep ? Math.max(y.C, 0.08 * pick.t) : y.C * 0.97, h: deep ? pick.h2 : y.h };
++      rgb = toRgb(y);
++    }
++    return rgb;
++  };
++
++  // The colours the page uses, each once (a slot), with what it becomes as a
++  // CSS variable on the root: an element is marked with its slot's number,
++  // and one rule per slot paints the marked ones from the variable. A new
++  // pick then only writes the variables: no element is read or marked again.
++  const PROP = { bg: 'background-color', fg: 'color', bd: 'border-color', gi: 'background-image' };
++  const ATTRS = ['data-mb-bg', 'data-mb-fg', 'data-mb-bd', 'data-mb-gi'];
++  const MARKED = '[data-mb-bg],[data-mb-fg],[data-mb-bd],[data-mb-gi]';
++  const MEDIA = new Set(['img', 'video', 'picture', 'canvas', 'iframe', 'embed', 'object']);
++  const SKIP = new Set(['script', 'style', 'link', 'meta', 'template', 'noscript', 'head', 'title', 'br', 'wbr', 'source', 'track', 'slot']);
++  let slots = [], byKey = new Map(), siteVars = [], varByColour = new Map();
++  let reverse = new Map(), page = null, pageOut = [255, 255, 255];
++  let style = null, shadowSheet = null, roots = new Set(), info = new WeakMap();
++  let observer = null, timer = 0, firstAt = 0, queue = [], working = 0, rulesAdded = 0;
++
++  const compute = (s) => {
++    if (s.kind === 'bg') {
++      s.rgb = toRgb(mapBg(s.lch, s.big));
++      s.value = css(s.rgb, s.a);
++    } else if (s.kind === 'gi') {
++      const stops = [];
++      s.value = s.text.replace(/rgba?\([^)]*\)/g, (m) => {
++        const c = parse(m);
++        if (!c) return m;
++        const now = toRgb(mapBg(lch(c.rgb, c.k), s.big));
++        if (c.a > 0.85) stops.push(now);
++        return css(now, c.a);
++      });
++      s.rgb = stops.length ? [0, 1, 2].map((i) => Math.round(stops.reduce((n, c) => n + c[i], 0) / stops.length)) : null;
++    } else if (s.kind === 'fg') {
++      const under = (s.under >= 0 && slots[s.under].rgb) || pageOut;
++      s.rgb = readable(mapFg(s.lch, s.link), under, s.need);
++      s.value = css(s.rgb, s.a);
++    } else if (s.kind === 'bd') {
++      s.rgb = toRgb(mapBd(s.lch));
++      s.value = css(s.rgb, s.a);
++    }
++    if (s.site) {
++      s.siteValue = s.triplet ? s.rgb.join(', ') : s.value;
++    }
++  };
++  const slot = (key, make) => {
++    let i = byKey.get(key);
++    if (i !== undefined) return i;
++    const s = make();
++    s.i = i = slots.length;
++    slots.push(s);
++    byKey.set(key, i);
++    compute(s);
++    if (s.rgb && s.src) reverse.set(s.rgb.join(), s.src);
++    if (!s.site) pendingRules.push(`[data-mb-${s.kind}="${i}"]{${PROP[s.kind]}:var(--mb-${i})!important}`);
++    return i;
++  };
++  let pendingRules = [];
++  // What a colour read in the page was before us: one of ours (through a
++  // site variable we set, or inherited) is turned back into the site's.
++  const source = (c) => {
++    if (!c) return c;
++    const k = reverse.get(c.k);
++    if (!k) return c;
++    return { rgb: k, a: c.a, k: k.join() };
++  };
++  const bgSlot = (c, big) => {
++    const v = varByColour.get('bg|' + c.k);
++    if (v) big = v.big;
++    return slot(`bg|${c.k}|${c.a}|${big}`, () => ({ kind: 'bg', src: c.rgb, lch: lch(c.rgb, c.k), a: c.a, big }));
++  };
++
++  // The site's own theme in custom properties (Mattermost's --sidebar-bg,
++  // --center-channel-bg, their "r, g, b" twins…): set on the root with the
++  // palette's colours, so what the site paints from them later (new rows,
++  // hovers, pseudo-elements) is in the colours at once.
++  const findSiteVars = () => {
++    const names = new Set();
++    const take = (st) => { for (let i = 0; i < st.length; i++) if (st[i].startsWith('--')) names.add(st[i]); };
++    const walk = (rules, depth) => {
++      for (const r of rules) {
++        if (r.style && r.selectorText && /(^|,)\s*(:root|html|body)\b/.test(r.selectorText)) take(r.style);
++        if (r.cssRules && depth < 3) walk(r.cssRules, depth + 1);
+       }
+-      return rgb;
+-    };
+-    const rules = new Map();
+-    const rule = (attr, prop, value) => {
+-      const key = attr + prop + value;
+-      let r = rules.get(key);
+-      if (!r) { r = { attr, n: rules.size, text: `${prop}:${value}!important` }; rules.set(key, r); }
+-      return r.n;
+     };
+-    const els = [document.body, ...document.body.querySelectorAll('*')].slice(0, 6000);
+-    const under = new Map();   // element -> the opaque background (new) behind it
+-    const pageNew = mapBg(pageBg, true);
+-    for (const el of els) {
+-      for (const a of ATTRS) el.removeAttribute(a);
+-      if (el.closest(MEDIA) || el.id === 'meridian-zap') continue;
+-      const inSvg = el instanceof SVGElement;
+-      const cs = getComputedStyle(el);
+-      const parent = el.parentElement;
+-      let behind = (parent && under.get(parent)) || pageNew;
+-      if (!inSvg) {
+-        const bg = parse(cs.backgroundColor);
+-        if (bg) {
+-          const r = el.getBoundingClientRect();
+-          const big = el === document.body || r.width * r.height > screen * 0.12 || r.width > innerWidth * 0.8;
+-          const now = mapBg(bg, big);
+-          el.setAttribute('data-mb-bg', rule('bg', 'background-color', css(now, bg.a)));
+-          if (bg.a > 0.85) behind = now;
+-        }
+-        const gi = cs.backgroundImage;
+-        if (gi && gi.includes('gradient') && !gi.includes('url(')) {
+-          const r = el.getBoundingClientRect();
+-          const big = r.width * r.height > screen * 0.12;
+-          const stops = [];
+-          const text = gi.replace(/rgba?\([^)]*\)/g, (m) => {
+-            const c = parse(m);
+-            if (!c) return m;
+-            const now = mapBg(c, big);
+-            if (c.a > 0.85) stops.push(now);
+-            return css(now, c.a);
+-          });
+-          if (text !== gi) el.setAttribute('data-mb-gi', rule('gi', 'background-image', text));
+-          // Text on a gradient is read against its stops' middle.
+-          if (stops.length) behind = [0, 1, 2].map((i) => Math.round(stops.reduce((n, c) => n + c[i], 0) / stops.length));
+-        }
++    for (const sheet of document.styleSheets) {
++      if (sheet.ownerNode?.id === 'meridian-boost-paint') continue;
++      try { walk(sheet.cssRules, 0); } catch {}
++    }
++    take(document.documentElement.style);
++    if (document.body) take(document.body.style);
++    const cs = getComputedStyle(document.body || document.documentElement);
++    const found = [];
++    for (const name of names) {
++      if (name.startsWith('--meridian-') || name.startsWith('--mb-')) continue;
++      const raw = cs.getPropertyValue(name).trim();
++      if (!raw || raw.length > 60 || raw.includes('var(')) continue;
++      const tm = raw.match(/^(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})$/);
++      const c = tm ? { rgb: [+tm[1], +tm[2], +tm[3]], a: 1, k: `${+tm[1]},${+tm[2]},${+tm[3]}` } : parse(raw);
++      if (!c) continue;
++      const base = name.toLowerCase().replace(/-rgb$/, '');
++      const role = /border|divider|outline|separator|ring/.test(base) ? 'bd' :
++          /(^|-)(text|color|fg|foreground|ink|link)(-|$)/.test(base) && !/(^|-)(bg|background|surface)(-|$)/.test(base) ? 'fg' : 'bg';
++      const small = /button|btn|badge|mention|accent|primary|online|away|dnd|indicator|highlight|error|success|warning|unread|focus|selected|link/.test(base);
++      found.push({ name, base, triplet: !!tm, c: source(c), role, big: !small });
++    }
++    // Backgrounds first: text is made readable on its own family's.
++    found.sort((a, b) => (a.role === 'bg' ? 0 : 1) - (b.role === 'bg' ? 0 : 1));
++    for (const v of found) {
++      const c = v.c;
++      let i;
++      if (v.role === 'bg') {
++        i = slot(`site|${v.name}`, () => ({ kind: 'bg', site: true, triplet: v.triplet, src: c.rgb, lch: lch(c.rgb, c.k), a: c.a, big: v.big }));
++        if (!varByColour.has('bg|' + c.k)) varByColour.set('bg|' + c.k, v);
++      } else if (v.role === 'fg') {
++        const family = v.base.replace(/-(text|color|fg|foreground|ink)(-.*)?$/, '');
++        const bg = siteVars.find((w) => w.role === 'bg' && w.base === family + '-bg') ||
++            siteVars.find((w) => w.role === 'bg' && w.base.startsWith(family + '-') && /-(bg|background)$/.test(w.base));
++        i = slot(`site|${v.name}`, () => ({ kind: 'fg', site: true, triplet: v.triplet, src: c.rgb, lch: lch(c.rgb, c.k), a: c.a,
++          link: /link/.test(v.base), need: 4.5, under: bg ? bg.slot : -1 }));
++      } else {
++        i = slot(`site|${v.name}`, () => ({ kind: 'bd', site: true, triplet: v.triplet, src: c.rgb, lch: lch(c.rgb, c.k), a: c.a }));
+       }
+-      under.set(el, behind);
+-      const fg = parse(cs.color);
+-      const pfg = parent && getComputedStyle(parent).color;
+-      const hasText = [...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim());
+-      if (fg && (hasText || cs.color !== pfg || el === document.body) && !inSvg) {
+-        const link = !!el.closest('a[href]') && toLch(fg.rgb).C >= 0.035;
++      v.slot = i;
++      slots[i].name = v.name;
++      siteVars.push(v);
++    }
++  };
++
++  // Reads an element's colours (no writes: the page's style is worked out
++  // once for the whole batch, not once per element) and what's under it.
++  const read = (el, up, screen, out) => {
++    const cs = getComputedStyle(el);
++    if (cs.display === 'none') return null;
++    const me = { under: up.under, fg: up.fg, link: up.link || (el.localName === 'a' && el.hasAttribute('href')) };
++    if (el instanceof SVGElement) return me;
++    const bg = source(parse(cs.backgroundColor));
++    if (bg) {
++      const r = el.getBoundingClientRect();
++      const big = el === document.body || r.width * r.height > screen * 0.12 || r.width > innerWidth * 0.8 || r.height > innerHeight * 0.6;
++      const i = bgSlot(bg, big);
++      out.push(el, 'data-mb-bg', i);
++      if (bg.a > 0.85) me.under = i;
++    }
++    const gi = cs.backgroundImage;
++    if (gi && gi !== 'none' && gi.includes('gradient') && !gi.includes('url(')) {
++      const r = el.getBoundingClientRect();
++      const big = r.width * r.height > screen * 0.12;
++      const i = slot(`gi|${gi}|${big}`, () => ({ kind: 'gi', text: gi, big, src: null }));
++      out.push(el, 'data-mb-gi', i);
++      if (slots[i].rgb) me.under = i;
++    }
++    const fg = source(parse(cs.color));
++    if (fg) {
++      me.fg = fg.k + fg.a;
++      let text = false;
++      for (let n = el.firstChild; n; n = n.nextSibling) if (n.nodeType === 3 && /\S/.test(n.data)) { text = true; break; }
++      if (text || me.fg !== up.fg || el === document.body) {
++        const link = me.link && lch(fg.rgb, fg.k).C >= 0.035;
+         const size = parseFloat(cs.fontSize), weight = parseInt(cs.fontWeight, 10);
+         const need = size >= 24 || (size >= 18.66 && weight >= 700) ? 3 : 4.5;
+-        el.setAttribute('data-mb-fg', rule('fg', 'color', css(readable(mapFg(fg, link), behind, need), fg.a)));
++        out.push(el, 'data-mb-fg', slot(`fg|${fg.k}|${fg.a}|${link}|${need}|${me.under}`,
++            () => ({ kind: 'fg', src: fg.rgb, lch: lch(fg.rgb, fg.k), a: fg.a, link, need, under: me.under })));
+       }
+-      for (const side of ['Top', 'Right', 'Bottom', 'Left']) {
+-        if (parseFloat(cs[`border${side}Width`]) > 0) {
+-          const bd = parse(cs[`border${side}Color`]);
+-          if (bd) el.setAttribute('data-mb-bd', rule('bd', 'border-color', css(toRgb(mapFg(bd, false)), bd.a)));
+-          break;
++    }
++    for (const side of ['Top', 'Right', 'Bottom', 'Left']) {
++      if (parseFloat(cs[`border${side}Width`]) > 0) {
++        const bd = source(parse(cs[`border${side}Color`]));
++        if (bd) out.push(el, 'data-mb-bd', slot(`bd|${bd.k}|${bd.a}`, () => ({ kind: 'bd', src: bd.rgb, lch: lch(bd.rgb, bd.k), a: bd.a })));
++        break;
++      }
++    }
++    return me;
++  };
++
++  // A shadow root gets the same rules (as one shared sheet); the variables
++  // come down from the page's root.
++  const adopt = (root) => {
++    if (roots.has(root)) return;
++    roots.add(root);
++    try { root.adoptedStyleSheets = [...root.adoptedStyleSheets, shadowSheet]; } catch {}
++    observer?.observe(root, OBSERVE);
++  };
++
++  const varsText = () => {
++    const { h1 } = pick;
++    const dark = page && lch(page.rgb, page.k).L < 0.55;
++    let text = `--mb-accent:${css(toRgb({ L: dark ? 0.72 : 0.55, C: 0.15, h: h1 }))};` +
++        `--mb-selection:${css(toRgb({ L: dark ? 0.45 : 0.85, C: 0.1, h: h1 }))};--mb-page:${css(pageOut)};`;
++    for (const s of slots) {
++      if (s.value) text += `--mb-${s.i}:${s.value};`;
++      if (s.site) text += `${s.name}:${s.siteValue}!important;`;
++    }
++    return `:root{${text}}`;
++  };
++  // The variables (rule 0) and any new rules, in one go.
++  const flush = () => {
++    if (!style?.sheet) return;
++    const sheet = style.sheet;
++    if (sheet.cssRules.length) sheet.deleteRule(0);
++    sheet.insertRule(varsText(), 0);
++    for (const r of pendingRules) {
++      try { sheet.insertRule(r, sheet.cssRules.length); shadowSheet.insertRule(r, shadowSheet.cssRules.length); } catch {}
++    }
++    rulesAdded += pendingRules.length;
++    pendingRules = [];
++  };
++
++  const OBSERVE = { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] };
++  // Walks the queued subtrees for at most ~8 ms at a time; the page stays
++  // responsive on the first paint of a huge app.
++  const work = () => {
++    working = 0;
++    if (!pick || !document.body) return;
++    const t0 = performance.now();
++    const screen = innerWidth * innerHeight;
++    const out = [];
++    while (queue.length && performance.now() - t0 < 8) {
++      for (let n = 0; n < 200 && queue.length; n++) {
++        const [el, up] = queue.pop();
++        if (!el.isConnected) continue;
++        const name = el.localName;
++        if (SKIP.has(name) || MEDIA.has(name) || el.id === 'meridian-zap' || el.id === 'meridian-boost-paint') continue;
++        const me = read(el, up, screen, out);
++        if (!me) continue;
++        info.set(el, me);
++        if (el.shadowRoot) {
++          adopt(el.shadowRoot);
++          for (let c = el.shadowRoot.lastElementChild; c; c = c.previousElementSibling) queue.push([c, me]);
+         }
++        for (let c = el.lastElementChild; c; c = c.previousElementSibling) queue.push([c, me]);
+       }
+     }
+-    const accent = css(toRgb({ L: dark ? 0.72 : 0.55, C: 0.15, h: h2 }));
+-    let text = `html { accent-color: ${accent} !important; }\n` +
+-        `::selection { background-color: ${css(toRgb({ L: dark ? 0.45 : 0.85, C: 0.1, h: h2 }))} !important; }\n` +
+-        `html { background-color: ${css(pageNew)} !important; }\n`;
+-    for (const r of rules.values()) text += `[data-mb-${r.attr}="${r.n}"]{${r.text}}\n`;
+-    const style = old || document.createElement('style');
+-    style.id = 'meridian-boost-paint';
+-    style.textContent = text;
+-    document.documentElement.appendChild(style);
++    for (let i = 0; i < out.length; i += 3) out[i].setAttribute(out[i + 1], out[i + 2]);
++    flush();
++    if (queue.length) working = setTimeout(work, 0);
++  };
++
++  // What's around an element that came or changed: the nearest one read.
++  const upOf = (el) => {
++    for (let p = el.parentNode; p; p = p.parentNode || p.host) {
++      const me = p.nodeType === 1 && info.get(p);
++      if (me) return me;
++      if (p.nodeType === 11 && p.host) { const h = info.get(p.host); if (h) return h; }
++    }
++    return { under: -1, fg: '', link: false };
++  };
++  const strip = (el) => {
++    for (const a of ATTRS) el.removeAttribute(a);
++    for (const d of el.querySelectorAll(MARKED)) for (const a of ATTRS) d.removeAttribute(a);
+   };
+-  // Pages that change (apps, feeds): painted again, at most once a second.
++  // Elements that came or changed: read again (only them) a moment later.
++  const changed = new Set();
+   const later = () => {
+     if (timer) return;
+-    timer = setTimeout(() => { timer = 0; paint(); }, Math.max(150, 1000 - (performance.now() - last)));
++    timer = setTimeout(() => {
++      timer = 0;
++      if (!pick) return;
++      const list = [...changed];
++      changed.clear();
++      const set = new Set(list);
++      const tops = list.filter((el) => {
++        for (let p = el.parentNode; p; p = p.parentNode || p.host) if (set.has(p)) return false;
++        return el.isConnected;
++      });
++      for (const el of tops) strip(el);
++      for (const el of tops) queue.push([el, upOf(el)]);
++      if (!working) work();
++    }, 60);
+   };
+   const watch = () => {
+     if (observer || !document.body) return;
+     observer = new MutationObserver((list) => {
+-      if (list.some((m) => m.type !== 'attributes' || !String(m.attributeName).startsWith('data-mb-'))) later();
++      for (const m of list) {
++        if (m.type === 'attributes') { if (m.target.nodeType === 1) changed.add(m.target); continue; }
++        for (const n of m.addedNodes) if (n.nodeType === 1) changed.add(n);
++        if (m.type === 'characterData' || (!m.addedNodes.length && m.target.nodeType === 1)) continue;
++      }
++      if (changed.size) later();
+     });
+-    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
++    observer.observe(document.body, OBSERVE);
++    for (const r of roots) observer.observe(r, OBSERVE);
++  };
++
++  const start = () => {
++    style = document.createElement('style');
++    style.id = 'meridian-boost-paint';
++    shadowSheet = new CSSStyleSheet();
++    page = parse(getComputedStyle(document.body).backgroundColor) ||
++        parse(getComputedStyle(document.documentElement).backgroundColor) || { rgb: [255, 255, 255], a: 1, k: '255,255,255' };
++    pageOut = toRgb(mapBg(lch(page.rgb, page.k), true));
++    findSiteVars();
++    pendingRules.unshift('html{accent-color:var(--mb-accent)!important;background-color:var(--mb-page)!important}',
++        '::selection{background-color:var(--mb-selection)!important}');
++    // Before the boost's own CSS: what the person wrote wins.
++    document.documentElement.insertBefore(style, document.getElementById('meridian-boost-style'));
++    style.sheet.insertRule(':root{}', 0);
++    queue.push([document.body, { under: -1, fg: '', link: false }]);
++    work();
++    watch();
++  };
++  // A new pick: every slot again (a few hundred colours, not the page's
++  // thousands of elements), written as the variables.
++  const recolour = () => {
++    lchOf.size > 4000 && lchOf.clear();
++    pageOut = toRgb(mapBg(lch(page.rgb, page.k), true));
++    reverse = new Map();
++    for (const s of slots) {
++      compute(s);
++      if (s.rgb && s.src) reverse.set(s.rgb.join(), s.src);
++    }
++    flush();
++  };
++  const clear = () => {
++    observer?.disconnect(); observer = null;
++    clearTimeout(timer); timer = 0;
++    clearTimeout(working); working = 0;
++    queue = []; changed.clear();
++    style?.remove(); style = null;
++    for (const r of roots) {
++      try { r.adoptedStyleSheets = r.adoptedStyleSheets.filter((s) => s !== shadowSheet); } catch {}
++      for (const el of r.querySelectorAll(MARKED)) for (const a of ATTRS) el.removeAttribute(a);
++    }
++    for (const el of document.querySelectorAll(MARKED)) for (const a of ATTRS) el.removeAttribute(a);
++    roots = new Set(); info = new WeakMap();
++    slots = []; byKey = new Map(); siteVars = []; varByColour = new Map(); reverse = new Map();
++    pendingRules = []; page = null;
+   };
+   return {
+     on(tint, tint2, t) {
+       const next = { h1: hueOf(tint), h2: hueOf(tint2), t: Math.max(0, Math.min(1, t)) };
+-      const same = pick && pick.h1 === next.h1 && pick.h2 === next.h2 && pick.t === next.t &&
+-          document.getElementById('meridian-boost-paint');
++      const same = pick && pick.h1 === next.h1 && pick.h2 === next.h2 && pick.t === next.t;
+       pick = next;
+       if (!document.body) {
+-        document.addEventListener('DOMContentLoaded', () => { paint(); watch(); }, { once: true });
++        document.addEventListener('DOMContentLoaded', () => { if (pick && !style) start(); }, { once: true });
+         return;
+       }
+-      if (!same) paint();
+-      watch();
+-      if (document.readyState !== 'complete') addEventListener('load', later, { once: true });
++      if (!style || !style.isConnected) {
++        if (style) clear();
++        start();
++      } else if (!same) {
++        recolour();
++      }
+     },
+     off() {
+       pick = null;
+-      observer?.disconnect(); observer = null;
+-      clearTimeout(timer); timer = 0;
+       clear();
+     },
++    stats() {
++      return { slots: slots.length, siteVars: siteVars.map((v) => v.name), roots: roots.size, rules: rulesAdded };
++    },
+   };
+ })JS";
+ 
+ // Puts `css` (a JSON string) in the page's one boost style element, at the
+ // end of the document so it comes after the site's own styles; none when
+-// it's empty.
+-constexpr char kApplyCss[] = R"((css, makePaint) => {
++// it's empty. The colours picked are taken out of it and painted by kPaint.
++constexpr char kApplyCss[] = R"JS((css, makePaint) => {
+   const root = document.documentElement;
+   if (!root) return false;
+   let s = document.getElementById('meridian-boost-style');
+   document.getElementById('meridian-boost-turn')?.remove();
+-  if (!css) { s?.remove(); window.__meridianPaint?.off(); return true; }
++  // The colours picked (the last boost's, as the cascade would have it) are
++  // taken out of the style: a drag on the pad changes only them, and the
++  // page's style sheet then stays as it is (no restyle of the whole page).
++  let pick = null;
++  css = css.replace(/\nhtml \{ --meridian-boost-tint: (\d+); --meridian-boost-tint2: (\d+); --meridian-boost-strength: (\d+); \}/g,
++      (m, a, b, c) => { pick = [+a, +b, +c]; return ''; });
++  if (!css.trim()) { s?.remove(); window.__meridianPaint?.off(); return true; }
+   if (!s) { s = document.createElement('style'); s.id = 'meridian-boost-style'; }
+   if (s.textContent !== css) s.textContent = css;
+   if (s.parentNode !== root || s.nextSibling) root.appendChild(s);
+-  const style = getComputedStyle(root);
+-  const tint = parseFloat(style.getPropertyValue('--meridian-boost-tint'));
+-  const tint2 = parseFloat(style.getPropertyValue('--meridian-boost-tint2'));
+-  const strength = parseFloat(style.getPropertyValue('--meridian-boost-strength'));
+-  if (Number.isNaN(tint) || !(strength > 0)) { window.__meridianPaint?.off(); return true; }
+-  (window.__meridianPaint ||= makePaint()).on(tint, Number.isNaN(tint2) ? tint : tint2, strength / 100);
++  if (!pick || !(pick[2] > 0)) { window.__meridianPaint?.off(); return true; }
++  (window.__meridianPaint ||= makePaint()).on(pick[0], pick[1], pick[2] / 100);
+   return true;
+-})";
++})JS";
+ 
+ // Zap: what's under the pointer is outlined; a click hides it and keeps a
+ // selector for it (in __meridianZap.picked, taken by the browser); Esc ends.
+@@ -554,7 +796,7 @@ BoostService* BoostTabHelper::service() {
+       Profile::FromBrowserContext(web_contents()->GetBrowserContext()));
+ }
+ 
+-void BoostTabHelper::ApplyCss() {
++void BoostTabHelper::ApplyCss(bool force) {
+   BoostService* s = service();
+   content::RenderFrameHost* frame = web_contents()->GetPrimaryMainFrame();
+   if (!s || !frame || !frame->IsRenderFrameLive()) {
+@@ -568,6 +810,13 @@ void BoostTabHelper::ApplyCss() {
+   if (css.empty() && BoostHostFor(url).empty()) {
+     return;
+   }
++  // A drag on the colour pad is a change a frame: every other tab would
++  // run the script for nothing.
++  if (!force && applied_ && css == applied_css_) {
++    return;
++  }
++  applied_ = true;
++  applied_css_ = css;
+   RunInFrame(frame,
+              std::string("(") + kApplyCss + ")(" +
+                  base::WriteJson(base::Value(css)).value_or("\"\"") + ", " +
+@@ -576,14 +825,14 @@ void BoostTabHelper::ApplyCss() {
+ }
+ 
+ void BoostTabHelper::PrimaryMainDocumentElementAvailable() {
+-  ApplyCss();
++  ApplyCss(/*force=*/true);
+ }
+ 
+ void BoostTabHelper::DOMContentLoaded(content::RenderFrameHost* frame) {
+   if (!frame->IsInPrimaryMainFrame()) {
+     return;
+   }
+-  ApplyCss();
++  ApplyCss(/*force=*/true);
+   BoostService* s = service();
+   if (!s) {
+     return;
+@@ -604,6 +853,7 @@ void BoostTabHelper::DOMContentLoaded(content::RenderFrameHost* frame) {
+ 
+ void BoostTabHelper::PrimaryPageChanged(content::Page& page) {
+   zap_timer_.Stop();
++  applied_ = false;
+ }
+ 
+ void BoostTabHelper::OnBoostsChanged() {
+diff --git a/chrome/browser/meridian/boosts/boost_tab_helper.h b/chrome/browser/meridian/boosts/boost_tab_helper.h
+index b2bd7f09db..a33753a4b2 100644
+--- a/chrome/browser/meridian/boosts/boost_tab_helper.h
++++ b/chrome/browser/meridian/boosts/boost_tab_helper.h
+@@ -72,7 +72,8 @@ class BoostTabHelper : public content::WebContentsObserver,
+   // The boost Zap and Improve change: the one asked for, else the site's
+   // first (nullptr: none yet).
+   const Boost* Target(BoostService* s, const std::string& host) const;
+-  void ApplyCss();
++  // `force`: also when the page already has this CSS (a new document).
++  void ApplyCss(bool force = false);
+   void PollZap();
+   void OnZapPicked(base::Value result);
+ 
+@@ -81,6 +82,10 @@ class BoostTabHelper : public content::WebContentsObserver,
+   base::RepeatingTimer zap_timer_;
+   std::string target_id_;
+   std::unique_ptr<BoostImprover> improver_;
++  // The CSS last put in the page: a change to boosts of other sites, or one
++  // that doesn't change this page's, isn't sent to it again.
++  std::string applied_css_;
++  bool applied_ = false;
+   base::WeakPtrFactory<BoostTabHelper> weak_factory_{this};
+ 
+   WEB_CONTENTS_USER_DATA_KEY_DECL();
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index d8f212ff77..6027e1dd3a 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -326,7 +326,8 @@ struct Boost {
+   int32 size;
+   // "", "lower" or "upper".
+   string text_case;
+-  // The second colour's hue (buttons, links, accents); -1: the main one's.
++  // The second colour's hue (the page's dark parts: a sidebar, a top bar,
++  // dark text); -1: the main one's.
+   int32 tint2;
+ };
+ 
+diff --git a/chrome/browser/resources/webui_browser/app.css b/chrome/browser/resources/webui_browser/app.css
+index 47a3323c85..c8628fc3d2 100644
+--- a/chrome/browser/resources/webui_browser/app.css
++++ b/chrome/browser/resources/webui_browser/app.css
+@@ -70,7 +70,12 @@
+   }
+ }
+ 
+-:host([inactive]) #sidebar {
++/* An inactive window's sidebar fades a little; what floats over the page
++ * from it (the site controls, the Boost editor and its glow) doesn't, or the
++ * page would show through the editor while the person looks at it from
++ * another app. */
++:host([inactive]) #sidebar > :not(meridian-site-control, meridian-boost-editor,
++    meridian-boost-magic) {
+   opacity: 0.85;
+ }
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/boost_editor.css b/chrome/browser/resources/webui_browser/meridian/boost_editor.css
+index 6621467ddc..18b87d4e5d 100644
+--- a/chrome/browser/resources/webui_browser/meridian/boost_editor.css
++++ b/chrome/browser/resources/webui_browser/meridian/boost_editor.css
+@@ -41,16 +41,17 @@ svg {
+ }
+ 
+ #card {
+-  width: 252px;
++  width: 214px;
+   max-height: calc(100vh - 36px);
+   overflow-y: auto;
+-  padding: 10px;
++  padding: 0 14px 14px;
+   box-sizing: border-box;
+   display: flex;
+   flex-direction: column;
+-  gap: 8px;
+-  border-radius: 16px;
+-  background: color-mix(in srgb, var(--meridian-surface) 97%, var(--meridian-space));
++  gap: 10px;
++  border-radius: 14px;
++  /* Arc's: a light grey card (dark in a dark theme) under white parts. */
++  background: color-mix(in srgb, var(--meridian-surface) 95%, var(--meridian-text));
+   backdrop-filter: blur(24px) saturate(1.6);
+   box-shadow: 0 0 0 0.5px var(--meridian-border),
+       0 16px 48px rgba(0, 0, 0, 0.22), 0 2px 8px rgba(0, 0, 0, 0.08);
+@@ -69,6 +70,10 @@ svg {
+   display: flex;
+   align-items: center;
+   gap: 4px;
++  margin: 0 -14px 4px;
++  padding: 6px 8px;
++  border-bottom: 0.5px solid var(--meridian-border);
++  background: color-mix(in srgb, var(--meridian-surface) 90%, var(--meridian-text));
+ }
+ 
+ .ic {
+@@ -86,6 +91,22 @@ svg {
+   color: var(--meridian-text);
+ }
+ 
++/* Arc's close: a grey disc with the cross cut out. */
++#close {
++  width: 20px;
++  height: 20px;
++  margin: 3px;
++  border-radius: 50%;
++  background: color-mix(in srgb, var(--meridian-text) 45%, transparent);
++  color: var(--meridian-surface);
++  transition: background 0.12s;
++}
++
++#close:hover {
++  background: color-mix(in srgb, var(--meridian-text) 65%, transparent);
++  color: var(--meridian-surface);
++}
++
+ .name {
+   flex: 1;
+   min-width: 0;
+@@ -140,10 +161,11 @@ svg {
+   transform: translateX(12px);
+ }
+ 
+-/* As Arc's: a rim of the hues (red at the top, clockwise) around a dotted
+- * field, tinted where the knob is. Its own colours also under a Windows
+- * contrast theme (forced colours), which would take the rim and the field
+- * away and leave the knobs over nothing. */
++/* As Arc's: a rim of the hues (magenta at the top, red at the right, yellow
++ * at the bottom, cyan at the left, clockwise) around a dotted field, tinted
++ * where the knobs are. Its own colours also under a Windows contrast theme
++ * (forced colours), which would take the rim and the field away and leave
++ * the knobs over nothing. */
+ .pad,
+ .pad * {
+   forced-color-adjust: none;
+@@ -151,13 +173,15 @@ svg {
+ 
+ .pad {
+   position: relative;
+-  aspect-ratio: 1 / 0.92;
+-  padding: 6px;
++  aspect-ratio: 1;
++  padding: 8px;
+   box-sizing: border-box;
+   border-radius: 20px;
+-  background: conic-gradient(hsl(0 90% 62%), hsl(45 95% 58%),
+-      hsl(90 80% 52%), hsl(150 75% 50%), hsl(195 85% 55%),
+-      hsl(240 85% 64%), hsl(285 80% 62%), hsl(330 85% 62%), hsl(360 90% 62%));
++  background: conic-gradient(hsl(300 85% 58%), hsl(330 88% 58%) 45deg,
++      hsl(0 90% 56%) 90deg, hsl(28 95% 56%) 135deg, hsl(58 95% 54%) 180deg,
++      hsl(120 80% 55%) 225deg, hsl(180 85% 55%) 270deg,
++      hsl(238 92% 58%) 315deg, hsl(300 85% 58%) 360deg);
++  box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.1);
+   cursor: pointer;
+   touch-action: none;
+ }
+@@ -165,51 +189,90 @@ svg {
+ .field {
+   position: relative;
+   height: 100%;
+-  border-radius: 14px;
++  border-radius: 13px;
+   background:
+       radial-gradient(circle,
+-          color-mix(in srgb, var(--meridian-text) 16%, transparent) 0.9px,
+-          transparent 1.3px) 0 0 / 11px 11px,
++          color-mix(in srgb, var(--meridian-text) 14%, transparent) 0.7px,
++          transparent 1.1px) 0 0 / 7px 7px,
+       var(--wash, none),
+       var(--meridian-surface);
+-  box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.08);
++  box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.08), 0 0 6px rgba(0, 0, 0, 0.12);
++}
++
++/* The circle the knobs go round on, and the arc from the first to the
++ * second (clockwise): there while the pointer is on the pad. */
++.orbit {
++  position: absolute;
++  inset: 0;
++  width: 100%;
++  height: 100%;
++  overflow: visible;
++  pointer-events: none;
++  opacity: 0;
++  transition: opacity 0.25s ease;
++}
++
++.pad:hover .orbit,
++.pad.drag .orbit {
++  opacity: 1;
++}
++
++.orbit .track {
++  fill: none;
++  stroke: color-mix(in srgb, var(--meridian-text) 9%, transparent);
++  stroke-width: 3px;
++  vector-effect: non-scaling-stroke;
++}
++
++.orbit .arc {
++  fill: none;
++  stroke-width: 2.5px;
++  stroke-linecap: round;
++  vector-effect: non-scaling-stroke;
+ }
+ 
+ .knob {
+   position: absolute;
+-  width: 32px;
+-  height: 32px;
+-  margin: -16px 0 0 -16px;
++  width: 42px;
++  height: 42px;
++  margin: -21px 0 0 -21px;
+   border-radius: 50%;
+   border: 3px solid white;
+   box-sizing: border-box;
+-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), 0 0 0 0.5px rgba(0, 0, 0, 0.12);
++  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25), 0 0 0 0.5px rgba(0, 0, 0, 0.14);
+   pointer-events: none;
+   transition: left 0.45s cubic-bezier(0.3, 1.35, 0.5, 1),
+       top 0.45s cubic-bezier(0.3, 1.35, 0.5, 1),
+-      background 0.3s, opacity 0.3s, transform 0.15s;
++      background 0.3s, opacity 0.3s, transform 0.18s;
+ }
+ 
+ .knob.shade {
+-  width: 18px;
+-  height: 18px;
+-  margin: -9px 0 0 -9px;
+-  border-width: 2px;
+-  transition-duration: 0.6s, 0.6s, 0.3s, 0.3s, 0.15s;
++  width: 28px;
++  height: 28px;
++  margin: -14px 0 0 -14px;
++  border-width: 2.5px;
++  transition-duration: 0.6s, 0.6s, 0.3s, 0.3s, 0.18s;
+ }
+ 
+ .pad.drag .knob {
+-  transition: background 0.1s, transform 0.15s;
++  transition: background 0.1s, transform 0.18s;
+ }
+ 
+ .pad.drag #knob {
+-  transform: scale(1.12);
++  transform: scale(1.06);
+ }
+ 
+ .tiles {
+   display: grid;
+   grid-template-columns: repeat(3, 1fr);
+-  gap: 6px;
++  gap: 10px;
++}
++
++/* Arc's grey buttons: a shade darker under the pointer, a little smaller
++ * while pressed. */
++.tile,
++.line {
++  transition: background 0.12s ease, transform 0.12s ease, color 0.12s;
+ }
+ 
+ .tile {
+@@ -217,11 +280,17 @@ svg {
+   display: grid;
+   place-items: center;
+   border-radius: 10px;
+-  background: color-mix(in srgb, var(--meridian-text) 7%, transparent);
++  background: color-mix(in srgb, var(--meridian-text) 8%, transparent);
++  color: color-mix(in srgb, var(--meridian-text) 85%, transparent);
+ }
+ 
+ .tile:hover {
+-  background: color-mix(in srgb, var(--meridian-text) 11%, transparent);
++  background: color-mix(in srgb, var(--meridian-text) 13%, transparent);
++}
++
++.tile:active,
++.line:active {
++  transform: scale(0.96);
+ }
+ 
+ .tile.on {
+@@ -249,49 +318,81 @@ svg {
+   accent-color: var(--meridian-space);
+ }
+ 
++/* A white card of "Aa" in each font; the one in use on a grey disc. */
+ .fonts {
+   display: grid;
+   grid-template-columns: repeat(5, 1fr);
+-  gap: 2px;
+-  padding: 6px;
++  gap: 1px 0;
++  padding: 8px 6px;
+   border-radius: 12px;
+-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--meridian-text) 9%, transparent);
++  background: var(--meridian-surface);
++  box-shadow: 0 0.5px 2px rgba(0, 0, 0, 0.1),
++      0 0 0 0.5px color-mix(in srgb, var(--meridian-text) 6%, transparent);
+ }
+ 
+ .font {
+-  height: 32px;
+-  border-radius: 8px;
++  justify-self: center;
++  width: 30px;
++  height: 30px;
++  border-radius: 50%;
+   text-align: center;
+-  font-size: 15px;
+-  color: var(--meridian-text-muted);
++  font-size: 14px;
++  color: color-mix(in srgb, var(--meridian-text) 55%, transparent);
++  transition: background 0.12s, color 0.12s, transform 0.12s;
+ }
+ 
+ .font:hover {
+-  background: color-mix(in srgb, var(--meridian-text) 7%, transparent);
+   color: var(--meridian-text);
+ }
+ 
++.font:active {
++  transform: scale(0.9);
++}
++
+ .font.on {
+-  background: color-mix(in srgb, var(--meridian-space) 22%, transparent);
++  background: color-mix(in srgb, var(--meridian-text) 16%, transparent);
+   color: var(--meridian-text);
+ }
+ 
+ .pair {
+   display: grid;
+   grid-template-columns: 1fr 1fr;
+-  gap: 6px;
++  gap: 10px;
+ }
+ 
+ .tile.wide {
+-  display: flex;
+-  justify-content: center;
+-  gap: 6px;
+   font-weight: 600;
++  font-size: 14px;
++}
++
++/* Changed, as Arc's: the value on orange, deeper with each step. */
++.tile.wide.step1,
++.tile.wide.step2,
++.tile.wide.step3 {
++  color: white;
++  animation: pop 0.28s cubic-bezier(0.3, 1.5, 0.5, 1);
++}
++
++.tile.wide.step1 {
++  background: #f07a1a;
++}
++
++.tile.wide.step2 {
++  background: #ea4b16;
++}
++
++.tile.wide.step3 {
++  background: #dc1f14;
++}
++
++@keyframes pop {
++  40% {
++    transform: scale(1.06);
++  }
+ }
+ 
+ .val {
+-  font-weight: 500;
+-  opacity: 0.75;
++  font-variant-numeric: tabular-nums;
+ }
+ 
+ .line {
+@@ -299,14 +400,15 @@ svg {
+   align-items: center;
+   gap: 8px;
+   height: 40px;
+-  padding: 0 12px;
++  padding: 0 14px;
+   border-radius: 10px;
+-  background: color-mix(in srgb, var(--meridian-text) 7%, transparent);
++  background: color-mix(in srgb, var(--meridian-text) 8%, transparent);
+   font-weight: 600;
++  font-size: 14px;
+ }
+ 
+ .line:hover {
+-  background: color-mix(in srgb, var(--meridian-text) 11%, transparent);
++  background: color-mix(in srgb, var(--meridian-text) 13%, transparent);
+ }
+ 
+ .line.on {
+@@ -322,6 +424,164 @@ svg {
+   color: var(--meridian-text-muted);
+ }
+ 
++.braces {
++  display: flex;
++  gap: 1px;
++  font: 700 15px ui-monospace, Menlo, monospace;
++}
++
++.braces i {
++  display: inline-block;
++  font-style: normal;
++  transition: transform 0.25s cubic-bezier(0.3, 1.6, 0.5, 1);
++}
++
++/* The icons move a little, as Arc's do: the bulb swings on its cap and
++ * glows when it's on, the sliders' knobs slide, the no-entry sign turns, the
++ * bolt jolts, the braces open, the reset arrow comes round. */
++.anim,
++.anim * {
++  transform-box: fill-box;
++}
++
++.bulb .swing {
++  transform-origin: 50% 0;
++}
++
++.bulb .rays {
++  opacity: 0;
++  transform-origin: 50% 100%;
++  transform: scale(0.6);
++  transition: opacity 0.2s, transform 0.3s cubic-bezier(0.3, 1.6, 0.5, 1);
++}
++
++#dark:hover .bulb .swing {
++  animation: swing 0.6s cubic-bezier(0.3, 0.9, 0.4, 1);
++}
++
++#dark.on .bulb .glass {
++  fill: currentColor;
++  fill-opacity: 0.35;
++}
++
++#dark.on .bulb .rays,
++#dark:hover .bulb .rays {
++  opacity: 1;
++  transform: none;
++}
++
++@keyframes swing {
++  25% {
++    transform: rotate(9deg);
++  }
++  55% {
++    transform: rotate(-6deg);
++  }
++  80% {
++    transform: rotate(2deg);
++  }
++}
++
++.sliders circle {
++  fill: var(--meridian-surface);
++  transition: transform 0.32s cubic-bezier(0.3, 1.5, 0.5, 1);
++}
++
++.tile.on .sliders circle {
++  fill: var(--meridian-space);
++}
++
++#adjust:hover .sliders .k1,
++#adjust.on .sliders .k1 {
++  transform: translateX(-6px);
++}
++
++#adjust:hover .sliders .k2,
++#adjust.on .sliders .k2 {
++  transform: translateX(6px);
++}
++
++#adjust:hover .sliders .k3,
++#adjust.on .sliders .k3 {
++  transform: translateX(-8px);
++}
++
++.ban {
++  transition: transform 0.4s cubic-bezier(0.3, 1.5, 0.5, 1);
++}
++
++#noColour:hover .ban {
++  transform: rotate(90deg);
++}
++
++#noColour:active .ban {
++  transform: rotate(90deg) scale(0.85);
++}
++
++#zap:hover .bolt,
++#zap.on .bolt {
++  animation: jolt 0.45s cubic-bezier(0.3, 1.3, 0.5, 1);
++}
++
++#zap.on .bolt {
++  color: #f5a623;
++  animation-iteration-count: infinite;
++  animation-duration: 0.9s;
++}
++
++@keyframes jolt {
++  20% {
++    transform: translate(-1px, -1px) scale(1.18) skewX(-8deg);
++  }
++  45% {
++    transform: translate(1px, 1px) scale(0.94);
++  }
++}
++
++#code:hover .braces i:first-child,
++#code.on .braces i:first-child {
++  transform: translateX(-2.5px);
++}
++
++#code:hover .braces i:last-child,
++#code.on .braces i:last-child {
++  transform: translateX(2.5px);
++}
++
++.spin {
++  display: grid;
++  transition: transform 0.5s cubic-bezier(0.3, 1.2, 0.5, 1);
++}
++
++#reset:hover .spin {
++  transform: rotate(-40deg);
++}
++
++#reset:active .spin {
++  transform: rotate(-360deg);
++  transition-duration: 0.35s;
++}
++
++.spark {
++  display: grid;
++  transition: transform 0.35s cubic-bezier(0.3, 1.6, 0.5, 1);
++}
++
++#improveToggle:hover .spark {
++  transform: rotate(15deg) scale(1.15);
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .anim,
++  .anim *,
++  .tile,
++  .line,
++  .font {
++    animation: none !important;
++    transition: none !important;
++  }
++}
++
+ .zap {
+   display: flex;
+   align-items: center;
+diff --git a/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts b/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts
+index 5af920f8cb..d26cde7814 100644
+--- a/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts
+@@ -22,13 +22,29 @@ ${this.boost_ ? html`
+       <span class="switch"><i></i></span>
+     </button>
+     <button id="reset" class="ic" title="Back to the site’s look"
+-        @click="${this.onResetClick_}">${icon('history', 15)}</button>
++        @click="${this.onResetClick_}"><span class="anim spin">${icon('history', 15)}</span></button>
+   </div>
+ 
+   <div id="pad" class="pad ${this.dragging_ ? 'drag' : ''}"
+-      title="Colour: the big dot tints the page, the small one buttons and links"
++      title="Colour: the big dot tints the page, the small one its dark parts"
+       @pointerdown="${this.onPadPointerdown_}">
+     <div class="field" style="${this.washStyle_()}">
++      ${this.orbitShown_() ? html`
++        <svg id="orbit" class="orbit" viewBox="0 0 100 100"
++            preserveAspectRatio="none" aria-hidden="true">
++          <defs>
++            <linearGradient id="orbitInk" gradientUnits="userSpaceOnUse"
++                x1="${this.orbitGradient_().x1}" y1="${this.orbitGradient_().y1}"
++                x2="${this.orbitGradient_().x2}" y2="${this.orbitGradient_().y2}">
++              <stop offset="0" stop-color="${this.orbitGradient_().from}"></stop>
++              <stop offset="1" stop-color="${this.orbitGradient_().to}"></stop>
++            </linearGradient>
++          </defs>
++          <circle class="track" cx="50" cy="50" r="${this.orbitRadius_()}">
++          </circle>
++          <path id="arc" class="arc" d="${this.orbitPath_()}"
++              stroke="url(#orbitInk)"></path>
++        </svg>` : ''}
+       <div id="shade" class="knob shade" style="${this.shadeStyle_()}"></div>
+       <div id="knob" class="knob" style="${this.knobStyle_()}"></div>
+     </div>
+@@ -36,12 +52,31 @@ ${this.boost_ ? html`
+   <div class="tiles">
+     <button id="dark" class="tile ${this.boost_.dark ? 'on' : ''}"
+         title="Dark or light" @click="${this.onDarkClick_}">
+-      ${icon('moon', 17)}</button>
++      <svg class="anim bulb" width="19" height="19" viewBox="0 0 24 24"
++          fill="none" stroke="currentColor" stroke-width="1.8"
++          stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
++        <g class="rays"><path d="M12 0.8v1.4M3.6 4.2l1 1M20.4 4.2l-1 1M1.2 11h1.4M21.4 11h1.4"/></g>
++        <g class="swing"><path class="glass" d="M8.4 15.6c-1.6-1.3-2.6-3.2-2.6-5.3a6.2 6.2 0 1 1 12.4 0c0 2.1-1 4-2.6 5.3-.5.4-.8 1-.8 1.6v.5H9.2v-.5c0-.6-.3-1.2-.8-1.6z"/>
++        <path d="M9.4 20h5.2M10.2 22.6h3.6"/></g>
++      </svg></button>
+     <button id="adjust" class="tile ${this.adjustOpen_ ? 'on' : ''}"
+         title="Brightness, contrast, saturation"
+-        @click="${this.onAdjustClick_}">${icon('sliders', 17)}</button>
++        @click="${this.onAdjustClick_}">
++      <svg class="anim sliders" width="19" height="19" viewBox="0 0 24 24"
++          fill="none" stroke="currentColor" stroke-width="1.8"
++          stroke-linecap="round" aria-hidden="true">
++        <path d="M3.5 6.5h17M3.5 12h17M3.5 17.5h17"/>
++        <circle class="k1" cx="15" cy="6.5" r="2.1"/>
++        <circle class="k2" cx="9" cy="12" r="2.1"/>
++        <circle class="k3" cx="16" cy="17.5" r="2.1"/>
++      </svg></button>
+     <button id="noColour" class="tile" title="No colour"
+-        @click="${this.onNoColourClick_}">${icon('ban', 17)}</button>
++        @click="${this.onNoColourClick_}">
++      <svg class="anim ban" width="19" height="19" viewBox="0 0 24 24"
++          fill="none" stroke="currentColor" stroke-width="1.9"
++          stroke-linecap="round" aria-hidden="true">
++        <circle cx="12" cy="12" r="8.4"/><path class="bar" d="M6.1 6.1l11.8 11.8"/>
++      </svg></button>
+   </div>
+   ${this.adjustOpen_ ? html`
+     <div class="adjust">
+@@ -58,7 +93,7 @@ ${this.boost_ ? html`
+           @input="${this.onAdjustInput_}"></label>
+     </div>` : ''}
+ 
+-  <div class="fonts">
++  <div class="fonts" role="group" aria-label="Font">
+     ${this.fonts_.map(f => html`
+       <button class="font ${f.on ? 'on' : ''}" data-font="${f.name}"
+           title="${f.name}" style="font-family:'${f.name}'"
+@@ -66,19 +101,23 @@ ${this.boost_ ? html`
+   </div>
+ 
+   <div class="pair">
+-    <button id="size" class="tile wide ${this.boost_.size !== 100 ? 'on' : ''}"
+-        title="Size" @click="${this.onSizeClick_}">
+-      <span>Size</span><span class="val">${this.sizeLabel_()}</span>
++    <button id="size" class="tile wide step${this.sizeStep_()}"
++        title="Change text size" @click="${this.onSizeClick_}">
++      <span class="val">${this.sizeLabel_()}</span>
+     </button>
+-    <button id="case" class="tile wide ${this.boost_.textCase ? 'on' : ''}"
++    <button id="case" class="tile wide step${this.caseStep_()}"
+         title="${this.caseTitle_()}" @click="${this.onCaseClick_}">
+-      ${this.caseLabel_()}</button>
++      <span class="val">${this.caseLabel_()}</span></button>
+   </div>
+ 
+   <button id="zap" class="line ${this.zapping_ ? 'on' : ''}"
+       @click="${this.onZapClick_}">
+-    ${icon('bolt', 15)}<span class="grow">${this.zapLabel_()}</span>
++    <span class="grow">${this.zapLabel_()}</span>
+     <span class="count">${this.zapCount_()}</span>
++    <svg class="anim bolt" width="17" height="17" viewBox="0 0 24 24"
++        fill="currentColor" aria-hidden="true">
++      <path d="M13.6 1.8L4.4 13.4h6.4l-1.2 8.8 9.2-11.6h-6.4l1.2-8.8z"/>
++    </svg>
+   </button>
+   ${this.boost_.zaps.map((z, i) => html`
+     <div class="zap">
+@@ -89,8 +128,8 @@ ${this.boost_ ? html`
+ 
+   <button id="code" class="line ${this.codeOpen_ ? 'on' : ''}"
+       @click="${this.onCodeClick_}">
+-    ${icon('code', 15)}<span class="grow">Code</span>
+-    <span class="count">{ }</span>
++    <span class="grow">Code</span>
++    <span class="braces anim" aria-hidden="true"><i>{</i><i>}</i></span>
+   </button>
+   ${this.codeOpen_ ? html`
+     <div class="code">
+@@ -106,7 +145,8 @@ ${this.boost_ ? html`
+ 
+   <button id="improveToggle" class="line ${this.improveOpen_ ? 'on' : ''}"
+       @click="${this.onImproveToggleClick_}">
+-    ${icon('sparkles', 15)}<span class="grow">Improve with AI</span>
++    <span class="grow">Improve with AI</span>
++    <span class="anim spark">${icon('sparkles', 16)}</span>
+   </button>
+   ${this.improveOpen_ ? html`
+     <div class="improve">
+@@ -126,7 +166,7 @@ ${this.boost_ ? html`
+ 
+   <button id="delete" class="line danger ${this.confirmDelete_ ? 'confirm' : ''}"
+       @click="${this.onDeleteClick_}">
+-    ${icon('trash', 15)}<span class="grow">${this.deleteLabel_()}</span>
++    <span class="grow">${this.deleteLabel_()}</span>${icon('trash', 15)}
+   </button>
+ </div>` : ''}
+ <!--_html_template_end_-->`;
+diff --git a/chrome/browser/resources/webui_browser/meridian/boost_editor.ts b/chrome/browser/resources/webui_browser/meridian/boost_editor.ts
+index 0385dde9d4..4b621a93eb 100644
+--- a/chrome/browser/resources/webui_browser/meridian/boost_editor.ts
++++ b/chrome/browser/resources/webui_browser/meridian/boost_editor.ts
+@@ -45,7 +45,50 @@ const FONTS = isWindows ? WINDOWS_FONTS : MAC_FONTS;
+ 
+ // Size goes round these (percent).
+ const SIZES = [100, 110, 125, 90];
+-const CASES = ['', 'lower', 'upper'];
++const CASES = ['', 'upper', 'lower'];
++
++// The pad's rim, as Arc's: magenta at the top, red at the right, yellow at
++// the bottom, cyan at the left, blue at the top left (clockwise). Each is
++// [angle, hue] (HSL degrees, counted on past 360 so they only grow).
++const RIM: Array<[number, number]> = [
++  [0, 300], [45, 330], [90, 360], [135, 390], [180, 420], [225, 480],
++  [270, 540], [315, 600], [360, 660],
++];
++
++// The hue at an angle on the pad (degrees from the top, clockwise).
++export function hueAt(angle: number): number {
++  const a = ((angle % 360) + 360) % 360;
++  for (let i = 1; i < RIM.length; i++) {
++    const [a1, h1] = RIM[i]!;
++    const [a0, h0] = RIM[i - 1]!;
++    if (a <= a1) {
++      return Math.round(h0 + (h1 - h0) * (a - a0) / (a1 - a0)) % 360;
++    }
++  }
++  return 300;
++}
++
++// Where a hue is on the pad: its angle.
++export function angleOf(hue: number): number {
++  const h = hue < 300 ? hue + 360 : hue;
++  for (let i = 1; i < RIM.length; i++) {
++    const [a1, h1] = RIM[i]!;
++    const [a0, h0] = RIM[i - 1]!;
++    if (h <= h1) {
++      return a0 + (a1 - a0) * (h - h0) / (h1 - h0);
++    }
++  }
++  return 0;
++}
++
++// The two knobs on the pad, in percent of its field.
++interface PadAt {
++  x: number;
++  y: number;
++  // Distance from the middle, and the angle.
++  d: number;
++  a: number;
++}
+ 
+ export class MeridianBoostEditorElement extends CrLitElement {
+   static get is() {
+@@ -251,37 +294,104 @@ export class MeridianBoostEditorElement extends CrLitElement {
+   }
+ 
+   // The pad, as Arc's: the hues around its rim, the colour's knob at the
+-  // hue's angle from the middle, further out for more colour; a small knob
+-  // opposite it shows the dark of the page in that colour.
++  // hue's angle from the middle, further out for more colour. The second
++  // colour's knob (dark surfaces and text: a sidebar, a top bar) goes round
++  // on the same circle; while the pointer is on the pad the circle shows,
++  // with an arc from the first knob to the second, clockwise.
+   protected knobStyle_(): string {
+     const b = this.boost_;
+     if (!b || b.tint < 0) {
+       return 'left:50%;top:50%;background:var(--meridian-surface)';
+     }
+-    const [x, y] = this.knobAt_(b);
+-    return `left:${x}%;top:${y}%;background:hsl(${b.tint} 85% 62%)`;
++    const {x, y} = this.knobAt_(b);
++    return `left:${x}%;top:${y}%;background:${this.mainColour_(b)}`;
+   }
+ 
+-  // The second colour (buttons, links, accents): the small knob. Until it's
+-  // dragged it sits opposite the main one and follows its hue.
+   protected shadeStyle_(): string {
+     const b = this.boost_;
+     if (!b || b.tint < 0) {
+       return 'left:50%;top:50%;opacity:0';
+     }
+-    const [x, y] = this.shadeAt_(b);
+-    const hue = b.tint2 >= 0 ? b.tint2 : b.tint;
+-    return `left:${x}%;top:${y}%;background:hsl(${hue} 75% ${
+-        b.tint2 >= 0 ? 52 : 40}%)`;
++    const {x, y} = this.shadeAt_(b);
++    return `left:${x}%;top:${y}%;background:${this.shadeColour_(b)}`;
++  }
++
++  private mainColour_(b: Boost): string {
++    return `hsl(${b.tint} 80% 56%)`;
++  }
++
++  // The dark of the page in the second colour.
++  private shadeColour_(b: Boost): string {
++    return `hsl(${this.secondHue_(b)} 45% 17%)`;
++  }
++
++  // Until it's moved the second knob sits opposite the first.
++  private secondHue_(b: Boost): number {
++    return b.tint2 >= 0 ? b.tint2 : hueAt(angleOf(b.tint) + 180);
++  }
++
++  // Where the knob is, in percent of the pad's field: the edge of the square
++  // is full colour.
++  private knobAt_(b: Boost): PadAt {
++    const a = angleOf(b.tint);
++    const r = a * Math.PI / 180;
++    const vx = Math.sin(r);
++    const vy = -Math.cos(r);
++    const d = b.tintStrength / 2 / Math.max(Math.abs(vx), Math.abs(vy));
++    return {x: 50 + vx * d, y: 50 + vy * d, d, a};
++  }
++
++  // On the first knob's circle (inside the field), at its own hue's angle.
++  private shadeAt_(b: Boost): PadAt {
++    const main = this.knobAt_(b);
++    const a = angleOf(this.secondHue_(b));
++    const r = a * Math.PI / 180;
++    const vx = Math.sin(r);
++    const vy = -Math.cos(r);
++    const d = Math.min(Math.max(main.d, 14), 50 / Math.max(Math.abs(vx), Math.abs(vy)));
++    return {x: 50 + vx * d, y: 50 + vy * d, d, a};
+   }
+ 
+-  private shadeAt_(b: Boost): [number, number] {
+-    if (b.tint2 < 0) {
+-      const [x, y] = this.knobAt_(b);
+-      return [100 - x, 100 - y];
++  protected orbitShown_(): boolean {
++    return !!this.boost_ && this.boost_.tint >= 0;
++  }
++
++  protected orbitRadius_(): number {
++    return this.boost_ ? Math.max(this.knobAt_(this.boost_).d, 0) : 0;
++  }
++
++  // The arc from the first knob clockwise round to the second, as a path in
++  // the field's percent (it bends in or out when they're not on one circle).
++  protected orbitPath_(): string {
++    const b = this.boost_;
++    if (!b || b.tint < 0) {
++      return '';
++    }
++    const p = this.knobAt_(b);
++    const q = this.shadeAt_(b);
++    const sweep = (((q.a - p.a) % 360) + 360) % 360;
++    const steps = Math.max(2, Math.ceil(sweep / 6));
++    let path = '';
++    for (let i = 0; i <= steps; i++) {
++      const a = (p.a + sweep * i / steps) * Math.PI / 180;
++      const d = p.d + (q.d - p.d) * i / steps;
++      path += `${i ? 'L' : 'M'}${(50 + Math.sin(a) * d).toFixed(2)} ${
++          (50 - Math.cos(a) * d).toFixed(2)}`;
+     }
+-    return this.knobAt_(
+-        {...b, tint: b.tint2, tintStrength: Math.max(40, b.tintStrength)});
++    return path;
++  }
++
++  // The arc's colours: the first knob's, into the second's.
++  protected orbitGradient_(): {x1: string, y1: string, x2: string, y2: string,
++                                from: string, to: string} {
++    const b = this.boost_!;
++    const p = this.knobAt_(b);
++    const q = this.shadeAt_(b);
++    return {
++      x1: p.x.toFixed(2), y1: p.y.toFixed(2), x2: q.x.toFixed(2),
++      y2: q.y.toFixed(2), from: this.mainColour_(b),
++      to: this.shadeColour_(b),
++    };
+   }
+ 
+   protected washStyle_(): string {
+@@ -289,33 +399,36 @@ export class MeridianBoostEditorElement extends CrLitElement {
+     if (!b || b.tint < 0) {
+       return '';
+     }
+-    const [x, y] = this.knobAt_(b);
++    const {x, y} = this.knobAt_(b);
++    const {x: sx, y: sy} = this.shadeAt_(b);
+     return `--wash:radial-gradient(circle at ${x}% ${y}%, ` +
+-        `hsl(${b.tint} 90% 65% / ${0.12 + b.tintStrength / 300}), ` +
+-        `transparent 75%)`;
+-  }
+-
+-  // Where the knob is, in percent of the pad's field: the edge of the square
+-  // is full colour.
+-  private knobAt_(b: Boost): [number, number] {
+-    const a = b.tint * Math.PI / 180;
+-    const vx = Math.sin(a);
+-    const vy = -Math.cos(a);
+-    const r = b.tintStrength / 2 / Math.max(Math.abs(vx), Math.abs(vy));
+-    return [50 + vx * r, 50 + vy * r];
++        `hsl(${b.tint} 90% 65% / ${0.1 + b.tintStrength / 400}), ` +
++        `transparent 70%), radial-gradient(circle at ${sx}% ${sy}%, ` +
++        `hsl(${this.secondHue_(b)} 70% 60% / 0.1), transparent 60%)`;
+   }
+ 
+   protected adjustValue_(key: 'brightness'|'contrast'|'saturation'): string {
+     return String(this.boost_?.[key] ?? 100);
+   }
+ 
++  // As Arc's: "Size" until it's changed, then the size on a colour that
++  // deepens with each step.
+   protected sizeLabel_(): string {
+-    return `${this.boost_?.size || 100}%`;
++    const size = this.boost_?.size || 100;
++    return size === 100 ? 'Size' : `${size} %`;
++  }
++
++  protected sizeStep_(): number {
++    return Math.max(0, SIZES.indexOf(this.boost_?.size || 100));
+   }
+ 
+   protected caseLabel_(): string {
+     const c = this.boost_?.textCase || '';
+-    return c === 'lower' ? 'aa' : c === 'upper' ? 'AA' : 'Aa';
++    return c === 'lower' ? 'aa' : c === 'upper' ? 'AA' : 'Case';
++  }
++
++  protected caseStep_(): number {
++    return Math.max(0, CASES.indexOf(this.boost_?.textCase || ''));
+   }
+ 
+   protected caseTitle_(): string {
+@@ -326,7 +439,7 @@ export class MeridianBoostEditorElement extends CrLitElement {
+   }
+ 
+   protected zapCount_(): string {
+-    return String(this.boost_?.zaps.length || 0);
++    return this.boost_?.zaps.length ? String(this.boost_.zaps.length) : '';
+   }
+ 
+   protected zapLabel_(): string {
+@@ -441,19 +554,44 @@ export class MeridianBoostEditorElement extends CrLitElement {
+     const field = pad.querySelector<HTMLElement>('.field')!;
+     pad.setPointerCapture(e.pointerId);
+     // On the small knob: the second colour; anywhere else the main one.
+-    const shade = pad.querySelector<HTMLElement>('#shade')!.getBoundingClientRect();
++    const shade =
++        pad.querySelector<HTMLElement>('#shade')!.getBoundingClientRect();
+     const second = !!this.boost_ && this.boost_.tint >= 0 &&
+         Math.hypot(e.clientX - (shade.left + shade.width / 2),
+-                   e.clientY - (shade.top + shade.height / 2)) <= 14;
+-    const pick = (ev: PointerEvent) => second ? this.pickSecond_(field, ev) :
+-                                                this.pickColour_(field, ev);
++                   e.clientY - (shade.top + shade.height / 2)) <=
++            Math.max(14, shade.width / 2 + 4);
++    // The second knob goes round with the first, as far apart as they were.
++    const b = this.boost_;
++    const apart = b && b.tint >= 0 ?
++        angleOf(this.secondHue_(b)) - angleOf(b.tint) : 180;
++    const pick = (ev: {clientX: number, clientY: number}) => second ?
++        this.pickSecond_(field, ev) :
++        this.pickColour_(field, ev, apart);
+     pick(e);
+-    // A click glides the knob over; a drag holds it under the pointer.
++    // A click glides the knob over; a drag holds it under the pointer, one
++    // change a frame however fast the pointer moves.
++    let frame = 0;
++    let last: {clientX: number, clientY: number}|null = null;
+     const move = (ev: PointerEvent) => {
+       this.dragging_ = true;
+-      pick(ev);
++      last = {clientX: ev.clientX, clientY: ev.clientY};
++      if (!frame) {
++        frame = requestAnimationFrame(() => {
++          frame = 0;
++          if (last) {
++            pick(last);
++          }
++        });
++      }
+     };
+     const up = () => {
++      if (frame) {
++        cancelAnimationFrame(frame);
++        frame = 0;
++        if (last) {
++          pick(last);
++        }
++      }
+       this.dragging_ = false;
+       pad.removeEventListener('pointermove', move);
+       pad.removeEventListener('pointerup', up);
+@@ -464,29 +602,33 @@ export class MeridianBoostEditorElement extends CrLitElement {
+     pad.addEventListener('pointercancel', up);
+   }
+ 
+-  // The hue is the angle from the middle (red at the top, clockwise, as the
+-  // rim), the amount of colour how far out.
+-  private pickColour_(field: HTMLElement, e: PointerEvent) {
++  // The hue is the angle from the middle (the rim's colour there), the
++  // amount of colour how far out.
++  private pickColour_(field: HTMLElement, e: {clientX: number, clientY: number},
++                      apart: number) {
+     const r = field.getBoundingClientRect();
+-    const dx = Math.min(0.5, Math.max(-0.5, (e.clientX - r.left) / r.width - 0.5));
+-    const dy = Math.min(0.5, Math.max(-0.5, (e.clientY - r.top) / r.height - 0.5));
+-    const hue = (Math.atan2(dx, -dy) * 180 / Math.PI + 360) % 360;
++    const dx =
++        Math.min(0.5, Math.max(-0.5, (e.clientX - r.left) / r.width - 0.5));
++    const dy =
++        Math.min(0.5, Math.max(-0.5, (e.clientY - r.top) / r.height - 0.5));
++    const angle = (Math.atan2(dx, -dy) * 180 / Math.PI + 360) % 360;
+     this.change_({
+-      tint: Math.round(hue) % 360,
++      tint: hueAt(angle),
+       tintStrength: Math.round(Math.max(Math.abs(dx), Math.abs(dy)) * 200),
++      tint2: hueAt(angle + apart),
+     });
+   }
+ 
+-  // The second colour: only its hue (the angle), the amount is the main one's.
+-  private pickSecond_(field: HTMLElement, e: PointerEvent) {
++  // The second colour: only its hue (the angle); it stays on the circle.
++  private pickSecond_(field: HTMLElement, e: {clientX: number, clientY: number}) {
+     const r = field.getBoundingClientRect();
+     const dx = (e.clientX - r.left) / r.width - 0.5;
+     const dy = (e.clientY - r.top) / r.height - 0.5;
+     if (Math.hypot(dx, dy) < 0.02) {
+       return;
+     }
+-    const hue = (Math.atan2(dx, -dy) * 180 / Math.PI + 360) % 360;
+-    this.change_({tint2: Math.round(hue) % 360});
++    const angle = (Math.atan2(dx, -dy) * 180 / Math.PI + 360) % 360;
++    this.change_({tint2: hueAt(angle)});
+   }
+ 
+   protected onDarkClick_() {
