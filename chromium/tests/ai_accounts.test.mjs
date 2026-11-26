@@ -209,7 +209,10 @@ test('Two Claude accounts: Meridian offers Work in Work and Personal in Personal
     await shot(b, 'acc-settings-add');
     await b.click(`[...${ST}.querySelectorAll('.account-edit .btn')].find((e) => e.textContent.includes('Sign in'))`);
     for (let i = 0; i < 50 && !fs.existsSync(signins); i++) await sleep(100);
-    assert.equal(fs.readFileSync(signins, 'utf8').trim(), `CLAUDE_CONFIG_DIR='${client}' '${path.join(bin, 'claude')}'`, 'the copy Meridian runs');
+    // In the command prompt's words on Windows (it reads no single quotes).
+    assert.equal(fs.readFileSync(signins, 'utf8').trim(), process.platform === 'win32'
+      ? `set "CLAUDE_CONFIG_DIR=${client}" && "${path.join(bin, 'claude.exe')}"`
+      : `CLAUDE_CONFIG_DIR='${client}' '${path.join(bin, 'claude')}'`, 'the copy Meridian runs');
     // Renamed.
     await b.eval(`(() => { const i = ${ST}.querySelector('.account-edit input'); i.value = 'Acme'; i.dispatchEvent(new Event('change')); })()`);
     await b.waitFor(`[...${ST}.querySelectorAll('#accounts-claude .acc b')].some((e) => e.textContent === 'Acme')`);
