@@ -9,13 +9,16 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 repo="$(cd "$here/.." && pwd)"
 dest="$1"
 cache="${MERIDIAN_VENDOR_CACHE:-$here/.vendor}"
-monaco=0.57.0; xterm=6.0.0; fit=0.11.0
+# Monaco and xterm come from tools/workbench-vendor: exact versions and a lockfile with hashes
+# (npm ci), so a build gets the same bytes every time. A changed lockfile reinstalls them.
+vendor="$here/tools/workbench-vendor"
 
-if [ ! -d "$cache/node_modules/monaco-editor/min" ] || [ ! -d "$cache/node_modules/@xterm/xterm/lib" ]; then
+if ! cmp -s "$vendor/package-lock.json" "$cache/package-lock.json" \
+   || [ ! -d "$cache/node_modules/monaco-editor/min" ] || [ ! -d "$cache/node_modules/@xterm/xterm/lib" ]; then
   mkdir -p "$cache"
-  # --prefix: otherwise npm installs into the nearest folder above with a package.json (this repo).
-  (cd "$cache" && npm install --prefix "$cache" --no-save --no-package-lock --ignore-scripts --silent \
-    "monaco-editor@$monaco" "@xterm/xterm@$xterm" "@xterm/addon-fit@$fit")
+  rm -rf "$cache/node_modules"
+  cp "$vendor/package.json" "$vendor/package-lock.json" "$cache/"
+  (cd "$cache" && npm ci --ignore-scripts --no-audit --no-fund --silent)
 fi
 
 rm -rf "$dest.tmp"
