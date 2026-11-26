@@ -20,6 +20,12 @@ const ST = 'app.$.settings.shadowRoot';
 const BE = 'app.$.boostEditor.shadowRoot';
 const SC = 'app.$.siteControl.shadowRoot';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// The stand-in Claude Code in `dir` as Meridian finds it (claude.exe on Windows) and as a command
+// names it: a shell's single quotes, the Windows command prompt's double quotes.
+const WIN = process.platform === 'win32';
+const claudeIn = (dir) => path.join(dir, WIN ? 'claude.exe' : 'claude');
+const quoted = (dir) => WIN ? `"${claudeIn(dir)}"` : `'${claudeIn(dir)}'`;
+const escaped = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const PAGE = `<!doctype html><title>News</title><body>
 <div id=promo style="height:120px;background:rgb(0,0,200)">Subscribe now!</div>
@@ -197,7 +203,7 @@ test('first run, no Claude Desktop, Claude Code signed out: the tour signs it in
     await b.waitFor(`/Waiting for you to sign in/.test(${OB}.getElementById('signIn').textContent)`);
     for (let i = 0; i < 50 && !fs.existsSync(f.signins); i++) await sleep(100);
     // The copy Meridian found (not whichever the Terminal's profile finds first).
-    assert.equal(fs.readFileSync(f.signins, 'utf8').trim(), `'${path.join(f.bin, 'claude')}'`);
+    assert.equal(fs.readFileSync(f.signins, 'utf8').trim(), quoted(f.bin));
     assert.equal(await b.eval(step), 'signin', 'it waits for the sign-in');
 
     // The person signs in in Terminal: the tour goes on by itself, and Claude suggests the setup.
@@ -240,7 +246,7 @@ test('Improve with AI, Claude Code signed out: "Sign in to Claude to use AI" sta
     await b.waitFor(`${BE}.getElementById('improve')?.textContent.trim() === 'Sign in to Claude to use AI' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve')?.textContent`);
     await b.eval(`${BE}.getElementById('improve').click()`);
     for (let i = 0; i < 50 && !fs.existsSync(f.signins); i++) await sleep(100);
-    assert.equal(fs.readFileSync(f.signins, 'utf8').trim(), `'${path.join(f.bin, 'claude')}'`);
+    assert.equal(fs.readFileSync(f.signins, 'utf8').trim(), quoted(f.bin));
     assert.match(await b.eval(`${BE}.getElementById('note').textContent`), /Finish signing in/);
     fs.writeFileSync(path.join(f.home, '.claude', 'signed-in'), '');
     await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code'`, 20000, `${BE}.getElementById('improve').textContent`);
@@ -262,15 +268,15 @@ test('two Claude Codes, the old one first on the PATH: the newest is run, signed
   claude(oldBin, path.join(dir, 'nowhere'), { version: '2.1.41' });
   claude(newBin, home, { version: '2.1.332' });
   const signins = path.join(dir, 'signins.log');
-  const b = await launch(['about:blank'], { args: [`--meridian-agents-path=${oldBin}:${newBin}`, `--meridian-accounts-home=${home}`, `--meridian-test-signin-log=${signins}`] });
+  const b = await launch(['about:blank'], { args: [`--meridian-agents-path=${oldBin}${path.delimiter}${newBin}`, `--meridian-accounts-home=${home}`, `--meridian-test-signin-log=${signins}`] });
   try {
     await b.waitFor(`!!app?.$?.tabstrip?.handler_`);
     const { providers } = await b.eval(`${H}.getAiProviders(true)`);
     const code = providers.find((p) => p.id === 'claude-code');
     assert.equal(code.signedIn, 1, 'signed in, as the newest says');
-    assert.equal(code.path, path.join(newBin, 'claude'));
+    assert.equal(code.path, claudeIn(newBin));
     assert.equal(code.copiesNote, `An older Claude Code (2.1.41) is also in ${oldBin}. Meridian uses 2.1.332 from ${newBin}.`);
-    assert.match(code.loginCommand, new RegExp(`^'${newBin}/claude'`));
+    assert.match(code.loginCommand, new RegExp(`^${escaped(quoted(newBin))}`));
 
     // Settings › AI: signed in, and the quiet note.
     await b.eval('app.$.tabstrip.runCommand(13, 0)');
@@ -287,7 +293,7 @@ test('two Claude Codes, the old one first on the PATH: the newest is run, signed
     assert.equal(states[`claude/${def.id}`].signedIn, 1, 'the account chip says signed in too');
     await b.eval(`${H}.signInAiAccount('claude', ${JSON.stringify(def.id)})`);
     for (let i = 0; i < 50 && !fs.existsSync(signins); i++) await sleep(100);
-    assert.match(fs.readFileSync(signins, 'utf8'), new RegExp(`'${newBin}/claude'`), 'its sign-in runs the newest too');
+    assert.match(fs.readFileSync(signins, 'utf8'), new RegExp(escaped(quoted(newBin))), 'its sign-in runs the newest too');
   } finally { await b.close(); fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
 });
 
