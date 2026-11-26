@@ -25,7 +25,8 @@ function repo() {
   git(dir, 'init', '-q');
   fs.writeFileSync(path.join(dir, 'a.txt'), 'one\n');
   git(dir, 'add', 'a.txt');
-  git(dir, '-c', 'user.email=t@example.com', '-c', 'user.name=t', 'commit', '-qm', 'first');
+  // Not signed, whatever the person's own git config says (gpg may be off the tests' PATH).
+  git(dir, '-c', 'user.email=t@example.com', '-c', 'user.name=t', '-c', 'commit.gpgsign=false', 'commit', '-qm', 'first');
   return dir;
 }
 

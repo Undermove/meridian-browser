@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -26,6 +27,11 @@ import zipfile
 
 # update_delta.cc reads a window of at most 2^30 bytes.
 LONG = 30
+# The zstd tool: on the PATH, else where Homebrew puts it (the tests take
+# /usr/local/bin off their PATH when the person's own AI CLIs are there).
+ZSTD = shutil.which('zstd') or next(
+    (z for z in ('/opt/homebrew/bin/zstd', '/usr/local/bin/zstd')
+     if os.access(z, os.X_OK)), 'zstd')
 
 
 def sha256(path):
@@ -87,7 +93,7 @@ def main(old, new, out):
           stats['same'] += size
           continue
       blob = os.path.join(tmp, f'{len(blobs)}.zst')
-      args = ['zstd', '-q', '-f', '-19', f'--long={LONG}']
+      args = [ZSTD, '-q', '-f', '-19', f'--long={LONG}']
       if source:
         args += ['--patch-from', os.path.join(old, source)]
         entry['source'] = 'patch'

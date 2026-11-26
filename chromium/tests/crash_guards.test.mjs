@@ -139,6 +139,8 @@ test('testKeyPress never takes the browser down: menu items the window does not 
       'the page': async () => { await b.click('app.$.contentRegion'); await page.eval(`(() => { const f = document.getElementById('field'); f.focus(); f.select(); return true; })()`); },
       'the sidebar': async () => { await b.click(`${T}.shadowRoot.querySelector('meridian-tab-row').shadowRoot.querySelector('.row')`); },
       'the Boost editor': async () => {
+        // Still open from the key before: the site controls don't open over it.
+        if (await b.eval('!!app.$.boostEditor.open')) return;
         await b.click('app.$.locationIconButton');
         await b.waitFor(`app.$.siteControl.open && !!app.$.siteControl.shadowRoot.querySelector('#boostRow')`, 10000);
         await b.click(`app.$.siteControl.shadowRoot.querySelector('#boostRow')`);
