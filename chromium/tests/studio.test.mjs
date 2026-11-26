@@ -280,3 +280,34 @@ test('Point and say: Studio\'s site tab gets the overlay; a click there names th
     cleanup(s.project, s.bin, s.profile);
   }
 });
+
+test('«Кто вы?»: shown once with a guess picked; the pick is kept and decides Studio or the Workbench first', async () => {
+  const s = await setup();
+  // No persona named for the test: the person is asked.
+  const args = s.args.filter((a) => !a.startsWith('--meridian-test-persona'));
+  const b = await launch(['about:blank'], { profile: s.profile, args: [...args, '--meridian-studio'] });
+  let wb;
+  try {
+    wb = await openWorkbench(b);
+    await wb.waitFor(`document.querySelectorAll('#st-persona .pc').length === 4`, 15000);
+    assert.equal(await wb.eval(`document.querySelectorAll('#st-persona .pc.sel').length`), 1);
+    // A developer: the Workbench first.
+    await click(wb, '#st-persona .pc[data-id="developer"]');
+    await wb.waitFor(`document.querySelector('#st-persona .btn.pri').textContent.includes('developer') || document.querySelector('#st-persona .btn.pri').textContent.includes('разработчик')`);
+    await click(wb, '#st-persona .btn.pri');
+    await wb.waitFor(`!document.querySelector('#st-persona') && document.querySelector('#studio').hidden`);
+    assert.equal((await wb.eval('window.workbench.studioInfo()')).persona, 'developer');
+    // Asked once: the reopened page doesn't ask again.
+    await wb.eval('location.reload(), true').catch(() => {});
+    wb.close();
+    wb = await b.page('chrome://workbench');
+    await wb.waitFor('!!S.project && document.body.classList.contains("studio-on")', 15000);
+    await sleep(800);
+    assert.equal(await wb.eval(`!!document.querySelector('#st-persona')`), false);
+    assert.equal((await wb.eval('window.workbench.studioInfo()')).ask, false);
+  } finally {
+    wb?.close();
+    await b.close();
+    cleanup(s.project, s.bin, s.profile);
+  }
+});
