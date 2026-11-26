@@ -345,7 +345,8 @@ for (const [name, skip] of machinesHere()) {
       note('settingsConnect', connect);
       const code = rows['claude-code'] || '';
       const t = truth().claudeCode;
-      if (!t) assert.match(code, /Not installed/, `Claude Code isn’t here: "${code}"`);
+      // Not here: no row, or one that says so (never Ready, Signed in…).
+      if (!t) assert.ok(!code || /Not installed/.test(code), `Claude Code isn’t here: "${code}"`);
       else {
         assert.doesNotMatch(code, /Not installed/, `Claude Code is here: "${code}"`);
         if (t.signedIn) assert.doesNotMatch(code, /Not signed in|Needs sign-in|Update needed/, `Claude Code is signed in: "${code}"`);
