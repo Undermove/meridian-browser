@@ -1403,7 +1403,7 @@ function renderTermTabs() {
     name.textContent = termName(t) + (t.exited ? ' (exited)' : '');
     el.title = `${termName(t)}\nDouble-click to rename`;
     el.appendChild(name);
-    // The tab says what the session is and what it has cost; how it runs (account, browser tools,
+    // The tab says what the session is and how full its context is; how it runs (account, browser tools,
     // permission mode, secrets, sandbox) is behind one button, with a dot when something risky is on.
     const badge = typeof termUsageBadge === 'function' ? termUsageBadge(t) : null;
     if (badge) el.appendChild(badge);
@@ -1514,8 +1514,7 @@ function termSettings(t, anchor) {
     if (diffs.length) rows.unshift(`<div class="ts-row ts-restore" data-row="restore"><div class="ts-main"><span class="ts-label">Last time: ${esc(diffs.map((d) => d.text).join(' · '))}</span><button class="btn small accent" data-a="restore">Restore as it was</button></div>${restoreNotes(t, t.restoreOffer).map((n) => `<div class="ts-detail">${esc(n)}</div>`).join('')}</div>`);
   }
   const insights = agent && typeof openPanel === 'function';
-  const cost = typeof termCost === 'function' ? termCost(t) : null;
-  const close = popover(anchor, `<div class="ts"><div class="ts-head"><b>${esc(termName(t))}</b><span class="muted">${esc(AGENT_UI[t.kind]?.label || 'Terminal')}${t.model ? ` · ${esc(t.model)}` : ''}${cost != null ? ` · ${esc(termCostText(cost))} so far` : ''}</span></div>
+  const close = popover(anchor, `<div class="ts"><div class="ts-head"><b>${esc(termName(t))}</b><span class="muted">${esc(AGENT_UI[t.kind]?.label || 'Terminal')}${t.model ? ` · ${esc(t.model)}` : ''}</span></div>
     ${rows.join('')}
     <div class="ts-foot">${insights ? '<button class="btn small" data-a="insights">Context Insights</button>' : ''}<button class="btn small" data-a="rename">Rename</button></div></div>`, (p, done) => {
     p.classList.add('term-settings');
@@ -1729,10 +1728,14 @@ function noteTyped(t, data) {
 
 // Claude Code's Remote Control (continue the session on the phone or at claude.ai/code) tells only
 // in the terminal whether it is connected: "/remote-control is active · Continue here, on your
-// phone, or at …" when it is, "Remote Control disconnected." and the like when not (Claude Code
-// 2.1.332; its status line has no field for it). The last such line on the screen says.
-const RC_ON = /\/remote-control is active|Continue here, on your phone|Remote Control on(?! (?:this|your|the|a)\b)/;
-const RC_OFF = /Remote Control (?:disconnected|is not connected|session expired|was turned off|is off\b|requires|needs a|is only available|is not available|is disabled|is turned off|cannot be enabled|not enabled|initialization failed)|Not connected · \/remote-control|Run \/remote-control to retry/;
+// phone, or at …" once when it starts, "Remote Control disconnected." and the like when not, and,
+// for as long as it is on, a badge in its footer: "/rc active", "/rc connecting…", "/rc reconnecting",
+// "/rc failed" (Claude Code 2.1.332; its status line has no field for it). A session started with
+// Remote Control on may never print the long line, only the badge. The lowest such line on the
+// screen says (the footer is at the bottom, so its badge wins).
+const RC_ON = /\/remote-control is active|\/remote-control session is active|Continue here, on your phone|\/rc active\b|Remote Control on(?! (?:this|your|the|a)\b)/;
+const RC_PENDING = /\/rc (?:connecting|reconnecting)/;
+const RC_OFF = /Remote Control (?:disconnected|is not connected|session expired|was turned off|is off\b|requires|needs a|is only available|is not available|is disabled|is turned off|cannot be enabled|not enabled|not started here|initialization failed)|Not connected · \/remote-control|Run \/remote-control to retry|\/rc failed|disabled after repeated failures|\/remote-control is no longer active/;
 const termIsClaude = (t) => t.kind === 'claude' || (t.kind === 'shell' && !!t.sessionId);
 
 function termRcSoon(t) {
@@ -1748,14 +1751,16 @@ function termRcScan(t) {
     const line = buf.getLine(i)?.translateToString(true) || '';
     if (RC_OFF.test(line)) state = 'off';
     else if (RC_ON.test(line)) state = 'on';
+    else if (RC_PENDING.test(line)) state = 'pending';
   }
   if (!state) return;
   // Just switched: the line from before the switch is still on the screen for a moment.
-  if (t.rcHeld && Date.now() - t.rcHeld.at < 10000 && state === t.rcHeld.was) return;
-  const remote = state === 'on';
-  if (state === t.rc && t.remote === remote && !t.rcPending) return;
+  if (t.rcHeld && Date.now() - t.rcHeld.at < 10000 && (state === t.rcHeld.was || (t.rcHeld.was === 'on' && state === 'pending'))) return;
+  // Connecting (or reconnecting) is on as far as a restart goes: it comes back with Remote Control.
+  const remote = state !== 'off', pending = state === 'pending';
+  if (state === t.rc && t.remote === remote && !!t.rcPending === pending) return;
   t.rc = state;
-  t.rcPending = false;
+  t.rcPending = pending;
   t.remote = remote;
   saveClaudeSessions();
   renderTermTabs();
