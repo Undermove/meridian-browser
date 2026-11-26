@@ -150,7 +150,10 @@ for (const [name, skip] of machinesHere()) {
       }
       note('steps', steps);
       assert.ok(steps.includes('arc'), `the move from Arc was offered (${steps.join(' → ')})`);
-      assert.deepEqual((await b.state()).spaces.map((s) => s.name).filter((n) => ['Work', 'Home'].includes(n)).sort(), ['Home', 'Work'], 'Arc’s spaces came over');
+      const names = (await b.state()).spaces.map((s) => s.name);
+      note('spaces', names);
+      assert.deepEqual([...new Set(names.filter((n) => ['Work', 'Home'].includes(n)))].sort(), ['Home', 'Work'], 'Arc’s spaces came over');
+      assert.deepEqual(names.filter((n, i) => names.indexOf(n) !== i), [], `two spaces with the same name after moving in and the tour’s setup (${names.join(', ')})`);
       const anyAi = !!(truth().claudeCode || truth().desktop || truth().codex);
       if (anyAi) assert.ok(steps.includes('ai'), `the tour never asked about the AI that is here (${steps.join(' → ')})`);
       if (truth().claudeCode && truth().claudeCode.signedIn === false) assert.ok(steps.includes('signin'), 'signed out: the tour signs it in right there');
@@ -202,7 +205,7 @@ for (const [name, skip] of machinesHere()) {
       const code = truth().claudeCode;
       // The news page is the first tab: show it.
       const tab = await b.eval(`[...app.$.tabstrip.tabs_.values()].find((t) => t.url.startsWith(${JSON.stringify(url)}))?.id`);
-      if (tab !== undefined) await b.eval(`${H}.activateTab(${JSON.stringify(tab)})`);
+      if (tab !== undefined) await b.eval(`app.$.tabstrip.tabStripService_.activateTab(${JSON.stringify(tab)})`);
       await b.waitFor(`app.shadowRoot.querySelector('#urlPill .host')?.textContent === '127.0.0.1'`, 15000);
       await b.click('app.$.locationIconButton');
       await b.waitFor(`app.$.siteControl.open && !!${SC}.querySelector('#boostRow')`);

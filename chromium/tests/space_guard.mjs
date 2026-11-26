@@ -39,3 +39,4 @@ export function screenTaken(from, to, testPids) {
 }
 
 export const SPACE_GUARD_MODE = MODE;
+export const spaceEvents = () => events.slice();
