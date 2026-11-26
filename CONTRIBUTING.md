@@ -10,6 +10,14 @@ Workbench sources the build copies in (`src/`), the stand-alone MCP bridge (`mcp
 3. Wait for the checks (Chromium checks, code scanning) to pass.
 4. Merge. Delete the feature branch.
 
+## Tests
+
+- New functionality comes with automated tests in the same pull request: an end-to-end test in
+  `chromium/tests/*.test.mjs` for anything a person can see or do, and a unit test in
+  `meridian_unittests` for logic in C++.
+- A bug fix starts with a test that fails without the fix.
+- The full end-to-end suite runs before every release (see `chromium/RELEASE_CHECKLIST.md`).
+
 No other long-lived branches. A branch that lives longer than its pull request gets merged or closed.
 
 ## Releases

@@ -28,8 +28,10 @@ Only the latest release. Meridian 0.5 and later are built on Chromium (macOS, Ap
 
 ## Releases and updates
 
-- Every macOS release is signed with the same self-signed certificate ("Meridian Signing"), with the
-  hardened runtime. Library validation is off in its helpers until releases move to a Developer ID.
+- Since 1.0.0, every macOS release is signed with an Apple Developer ID (Team 323MYL73WD) with the
+  hardened runtime and notarized by Apple, so Gatekeeper reports it as "Notarized Developer ID".
+  Releases before 1.0.0 were signed with a self-signed certificate ("Meridian Signing"); the 0.6.30
+  bridge release taught those copies to accept the Developer ID (see below).
 - Windows installers are not code-signed yet, so Windows shows no verified publisher. The Windows
   updater trusts an installer only through the Ed25519-signed `SHA256SUMS-win.txt`, and checks it again
   right before running it.
