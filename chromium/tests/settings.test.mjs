@@ -8,6 +8,17 @@ import { launch, SB } from './harness.mjs';
 import { standIn } from './stand_in.mjs';
 
 const ST = 'app.$.settings.shadowRoot';
+
+// Connect… on a row; on one already connected, Reconnect… from its menu.
+async function clickConnect(b, row) {
+  if (await b.eval(`!!${row}.querySelector('.connect-menu')`)) {
+    await b.eval(`${row}.querySelector('.connect-menu .btn').click()`);
+    await b.waitFor(`!!${row}.querySelector('.connect-menu .menu button')`);
+    await b.eval(`${row}.querySelector('.connect-menu .menu button').click()`);
+  } else {
+    await b.eval(`${row}.querySelector('.btn').click()`);
+  }
+}
 const C = { showSettings: 13 };
 // Settings opens on the member's tab (Arc's); most tests then go to General.
 const open = async (b, section = 'general') => {
@@ -106,7 +117,7 @@ test('AI: choosing an access level starts the agent socket; Connect shows the ex
     await b.waitFor(`${ST}.querySelectorAll('.row-desc.mono').length === 4`);
     assert.match(await b.eval(`${ST}.querySelector('.row-desc.mono').textContent`), /mcp add -s user meridian -- .*(Meridian|chrome\.exe'?) --mcp-bridge/i);
     // An installed CLI's Connect… (the rows with a command), not the other AI buttons.
-    const connect = `[...${ST}.querySelectorAll('.row-desc.mono')].map((d) => d.closest('.row').querySelector('.btn')).find((x) => !x.disabled)`;
+    const connect = `[...${ST}.querySelectorAll('.row-desc.mono')].map((d) => d.closest('.row').querySelector('.btn')).find((x) => x && !x.disabled)`;
     if (await b.eval(`!!${connect}`)) {
       await b.eval(`${connect}.click()`);
       await b.waitFor(`!!${ST}.querySelector('.command')`);
@@ -131,7 +142,7 @@ test('AI › Connect Claude Desktop: adds "meridian" to its config, keeps the ot
   const b = await launch(['about:blank'], { profile, args: [`--meridian-claude-desktop-config=${config}`] });
   const row = `[...${ST}.querySelectorAll('.row')].find((r) => r.querySelector('.row-label')?.textContent.trim() === 'Claude Desktop')`;
   const connect = async () => {
-    await b.eval(`${row}.querySelector('.btn').click()`);
+    await clickConnect(b, row);
     await b.waitFor(`!!${ST}.querySelector('.command')`);
     assert.match(await b.eval(`${ST}.querySelector('.confirm-card').textContent`), /claude_desktop_config\.json[\s\S]*copy of the old file/);
     assert.match(await b.eval(`${ST}.querySelector('.command').textContent`), /"meridian": \{[\s\S]*"command": "[^"]+(Meridian|chrome\.exe)"[\s\S]*--mcp-bridge/i);
@@ -173,7 +184,7 @@ test('AI › Connect OpenCode: adds "meridian" to opencode.json, never touches o
   const b = await launch(['about:blank'], { profile, args: [`--meridian-opencode-config=${dir}`] });
   const row = `[...${ST}.querySelectorAll('.row')].find((r) => r.querySelector('.row-label')?.textContent.trim() === 'OpenCode')`;
   const connect = async () => {
-    await b.eval(`${row}.querySelector('.btn').click()`);
+    await clickConnect(b, row);
     await b.waitFor(`!!${ST}.querySelector('.command')`);
     assert.match(await b.eval(`${ST}.querySelector('.confirm-card').textContent`), /OpenCode's MCP\s+servers in[\s\S]*opencode\.json[\s\S]*copy of the old file/);
     assert.match(await b.eval(`${ST}.querySelector('.command').textContent`), /"mcp": \{[\s\S]*"meridian": \{[\s\S]*"type": "local"[\s\S]*"command": \["[^"]+(Meridian|chrome\.exe)", "--mcp-bridge"\]/i);
@@ -193,7 +204,7 @@ test('AI › Connect OpenCode: adds "meridian" to opencode.json, never touches o
     await open(b, 'ai');
     // Found by its config folder (no opencode on this PATH).
     await b.waitFor(`!!${row} && !${row}.querySelector('.btn').disabled`);
-    assert.match(await b.eval(`${row}.querySelector('.row-desc').textContent`), /opencode\.json$/);
+    assert.match(await b.eval(`${row}.querySelector('.row-desc.mono').textContent`), /opencode\.json$/);
 
     // No opencode.json yet: a new one, next to the untouched .jsonc.
     assert.match(await connect(), /OpenCode is connected \(a new config file\)[\s\S]*Restart OpenCode/);
@@ -249,7 +260,7 @@ test('AI › Connect the other agents: Cursor by its folder, Goose into its YAML
   const b = await launch(['about:blank'], { profile, args: [`--meridian-cursor-config=${cursor}`, `--meridian-goose-config=${goose}`, `--meridian-windsurf-config=${windsurf}`, `--meridian-agents-path=${bin}`] });
   const row = (name) => `[...${ST}.querySelectorAll('.row')].find((r) => r.querySelector('.row-label')?.textContent.trim() === ${JSON.stringify(name)})`;
   const connect = async (name, card, command) => {
-    await b.eval(`${row(name)}.querySelector('.btn').click()`);
+    await clickConnect(b, row(name));
     await b.waitFor(`!!${ST}.querySelector('.command')`);
     assert.match(await b.eval(`${ST}.querySelector('.confirm-card').textContent`), card);
     assert.match(await b.eval(`${ST}.querySelector('.command').textContent`), command);
@@ -271,7 +282,7 @@ test('AI › Connect the other agents: Cursor by its folder, Goose into its YAML
     const more = await b.eval(`${ST}.getElementById('agentsMore').textContent.replace(/\\s+/g, ' ')`);
     assert.match(more, /Also connects Windsurf, GitHub Copilot CLI, Qwen Code, Amp, Factory Droid once you install them/);
     assert.doesNotMatch(more, /Cursor|Goose|VS Code|Gemini/);
-    assert.match(await b.eval(`${row('Cursor')}.querySelector('.row-desc').textContent`), /\.cursor[\\/]mcp\.json$/);
+    assert.match(await b.eval(`${row('Cursor')}.querySelector('.row-desc.mono').textContent`), /\.cursor[\\/]mcp\.json$/);
 
     // Cursor: a new ~/.cursor/mcp.json.
     assert.match(await connect('Cursor', /Cursor's MCP\s+servers in[\s\S]*mcp\.json/, /"mcpServers": \{[\s\S]*"meridian": \{[\s\S]*"command": "[^"]+", *\n? *"args": \["--mcp-bridge"\]/),

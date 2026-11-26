@@ -158,7 +158,7 @@ test('Two Claude accounts: Meridian offers Work in Work and Personal in Personal
     assert.equal(all.spaces[personal].claude, pers);
     assert.equal(all.hint, 'applied');
     const where = await b.eval(`[...${ST}.querySelectorAll('#accounts-claude .acc:not(.add)')].map((e) => e.querySelector('b').textContent + ': ' + e.querySelector('small').textContent)`);
-    assert.deepEqual(where, ['Default: other spaces', 'Personal: in Personal', 'Work: in Work']);
+    assert.deepEqual(where, ['Default: Claude account · Used in your other spaces', 'Personal: Claude account · Used in Personal', 'Work: Claude account · Used in Work'], 'in plain words');
     await b.eval('app.$.settings.hide()');
 
     // Ask in Work: Claude Code started with the Work folder; in Personal, the Personal one.
@@ -209,7 +209,7 @@ test('Two Claude accounts: Meridian offers Work in Work and Personal in Personal
     await shot(b, 'acc-settings-add');
     await b.click(`[...${ST}.querySelectorAll('.account-edit .btn')].find((e) => e.textContent.includes('Sign in'))`);
     for (let i = 0; i < 50 && !fs.existsSync(signins); i++) await sleep(100);
-    assert.equal(fs.readFileSync(signins, 'utf8').trim(), `CLAUDE_CONFIG_DIR='${client}' claude`);
+    assert.equal(fs.readFileSync(signins, 'utf8').trim(), `CLAUDE_CONFIG_DIR='${client}' '${path.join(bin, 'claude')}'`, 'the copy Meridian runs');
     // Renamed.
     await b.eval(`(() => { const i = ${ST}.querySelector('.account-edit input'); i.value = 'Acme'; i.dispatchEvent(new Event('change')); })()`);
     await b.waitFor(`[...${ST}.querySelectorAll('#accounts-claude .acc b')].some((e) => e.textContent === 'Acme')`);
