@@ -1,0 +1,265 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 22:27:27 +0400
+Subject: [PATCH 1/2] Meridian: the first 1.x window on a 0.x profile explains
+ the keychain question
+
+From 0.x (signed by Meridian itself) to 1.x (Apple's Developer ID) macOS
+asks about "Meridian Safe Storage" before the first window, and at every
+start until Always Allow. The note in Restart to update could never show:
+it needed a 0.x app running 1.x's code. Now the first window of 1.x on a
+profile last opened by 0.x shows the system-ask sheet for it (macOS only,
+once): the keychain window drawn with Always Allow glowing.
+- update::FirstStartAfterZeroX (unit-tested); "safe-storage" kind in
+  system_ask / mac_ask, with no System Settings button.
+- The dead note in the update sheet is gone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar_handler.cc    | 10 ++++++++++
+ chrome/browser/meridian/update_check.cc       | 16 ++++++++++++++++
+ chrome/browser/meridian/update_check.h        | 10 ++++++++++
+ .../browser/meridian/update_check_unittest.cc | 15 +++++++++++++++
+ .../webui_browser/meridian/mac_ask.ts         | 12 ++++++++++++
+ .../webui_browser/meridian/system_ask.html.ts |  5 +++--
+ .../webui_browser/meridian/system_ask.ts      | 19 ++++++++++++++++++-
+ .../webui_browser/meridian/update_sheet.css   | 19 -------------------
+ .../meridian/update_sheet.html.ts             |  4 ----
+ .../webui_browser/meridian/update_sheet.ts    | 10 ----------
+ 10 files changed, 84 insertions(+), 36 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index b51b7c6..e2bcf72 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -3901,6 +3901,16 @@ void SidebarHandler::MaybeShowWhatsNew() {
+   prefs->SetString(prefs::kLastVersion, update::kVersion);
+   const bool updated = last.empty() ? prefs->GetBoolean(prefs::kOnboarded)
+                                     : update::IsNewer(update::kVersion, last);
++#if BUILDFLAG(IS_MAC)
++  // From 0.x (signed by Meridian) to 1.x (Apple's Developer ID): macOS has
++  // just asked about "Meridian Safe Storage", before this window, and asks at
++  // every start until Always Allow. Said once, now (ExplainSystemAsk keeps
++  // it to once).
++  if (update::FirstStartAfterZeroX(last, prefs->GetBoolean(prefs::kOnboarded),
++                                   update::kVersion)) {
++    ExplainSystemAsk("safe-storage", base::DoNothing());
++  }
++#endif
+   std::string page = "https://meridianbrowser.app/changelog.html";
+   if (TestSwitchesAllowed()) {
+     // Tests: only one that asks for it.
+diff --git a/chrome/browser/meridian/update_check.cc b/chrome/browser/meridian/update_check.cc
+index ba514b7..6e2ceab 100644
+--- a/chrome/browser/meridian/update_check.cc
++++ b/chrome/browser/meridian/update_check.cc
+@@ -82,6 +82,22 @@ bool IsNewer(std::string_view latest, std::string_view current) {
+   return false;
+ }
+ 
++bool FirstStartAfterZeroX(std::string_view last,
++                          bool onboarded,
++                          std::string_view current) {
++  std::optional<std::vector<int>> now =
++      Parts(current.substr(0, current.find('-')));
++  if (!now || now->empty() || (*now)[0] < 1) {
++    return false;
++  }
++  if (last.empty()) {
++    return onboarded;
++  }
++  std::optional<std::vector<int>> before =
++      Parts(last.substr(0, last.find('-')));
++  return before && !before->empty() && (*before)[0] == 0;
++}
++
+ bool IsAllowedDownloadUrl(std::string_view url, bool test_feed) {
+   GURL gurl(url);
+   return gurl.is_valid() &&
+diff --git a/chrome/browser/meridian/update_check.h b/chrome/browser/meridian/update_check.h
+index c81c4a0..4eca5a9 100644
+--- a/chrome/browser/meridian/update_check.h
++++ b/chrome/browser/meridian/update_check.h
+@@ -52,6 +52,16 @@ std::string TrustedRequirement(const std::string& running);
+ // "1.0.10" > "1.0.9"; a pre-release tag ("1.1.0-beta") is never newer.
+ bool IsNewer(std::string_view latest, std::string_view current);
+ 
++// Whether this is the first start of 1.x on a profile last opened by 0.x
++// (`last`: the version that last opened it, "" before Meridian kept it, when
++// `onboarded` tells an old profile from a new one). 0.x was signed by
++// Meridian itself, 1.x with Apple's Developer ID: macOS asks once more about
++// the "Meridian Safe Storage" keychain item, and keeps asking at every start
++// until Always Allow.
++bool FirstStartAfterZeroX(std::string_view last,
++                          bool onboarded,
++                          std::string_view current);
++
+ // What a release offers this Mac: the zip the updater swaps in, the
+ // checksums it is verified against and their signature (empty when the
+ // release has none), and the page for doing it by hand.
+diff --git a/chrome/browser/meridian/update_check_unittest.cc b/chrome/browser/meridian/update_check_unittest.cc
+index 650cda9..4cd6919 100644
+--- a/chrome/browser/meridian/update_check_unittest.cc
++++ b/chrome/browser/meridian/update_check_unittest.cc
+@@ -26,6 +26,21 @@
+ namespace meridian::update {
+ namespace {
+ 
++TEST(UpdateCheckTest, FirstStartAfterZeroX) {
++  // From a 0.x profile to 1.x: macOS asks about the keychain item again.
++  EXPECT_TRUE(FirstStartAfterZeroX("0.6.30", true, "1.5.3"));
++  EXPECT_TRUE(FirstStartAfterZeroX("0.6.9", false, "1.0.0"));
++  // A profile from before the version was kept, but used (onboarded).
++  EXPECT_TRUE(FirstStartAfterZeroX("", true, "1.5.3"));
++  // A new install, the same signature, or a later start.
++  EXPECT_FALSE(FirstStartAfterZeroX("", false, "1.5.3"));
++  EXPECT_FALSE(FirstStartAfterZeroX("1.0.0", true, "1.5.3"));
++  EXPECT_FALSE(FirstStartAfterZeroX("1.5.3", true, "1.5.3"));
++  EXPECT_FALSE(FirstStartAfterZeroX("0.6.29", true, "0.6.30"));
++  EXPECT_TRUE(FirstStartAfterZeroX("0.6.30", true, "1.0.0-dev"));
++  EXPECT_FALSE(FirstStartAfterZeroX("garbage", true, "1.5.3"));
++}
++
+ TEST(UpdateCheckTest, TrustsTheRunningCertificate) {
+   const std::string team =
+       "(anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] "
+diff --git a/chrome/browser/resources/webui_browser/meridian/mac_ask.ts b/chrome/browser/resources/webui_browser/meridian/mac_ask.ts
+index 5a1174d..a6e0037 100644
+--- a/chrome/browser/resources/webui_browser/meridian/mac_ask.ts
++++ b/chrome/browser/resources/webui_browser/meridian/mac_ask.ts
+@@ -78,6 +78,18 @@ export function macAskLook(kind: string, app = 'Chrome'): MacAskLook {
+         buttons: ['Later', 'Quit & Reopen'],
+         press: 'Quit & Reopen',
+       };
++    // Meridian's own key (0.x to 1.x, sidebar_handler.cc): Always Allow,
++    // or macOS asks at every start.
++    case 'safe-storage':
++      return {
++        style: 'keychain',
++        icon: 'key',
++        title: 'Meridian wants to use your confidential information stored ' +
++            'in “Meridian Safe Storage” in your keychain.',
++        text: 'To allow this, enter the “login” keychain password.',
++        buttons: ['Always Allow', 'Deny', 'Allow'],
++        press: 'Always Allow',
++      };
+     case 'keychain':
+     default:
+       return {
+diff --git a/chrome/browser/resources/webui_browser/meridian/system_ask.html.ts b/chrome/browser/resources/webui_browser/meridian/system_ask.html.ts
+index 27c1f89..be5a604 100644
+--- a/chrome/browser/resources/webui_browser/meridian/system_ask.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/system_ask.html.ts
+@@ -19,8 +19,9 @@ export function getHtml(this: MeridianSystemAskElement) {
+       <meridian-mac-ask .kind="${this.kind_}"></meridian-mac-ask>
+     </div>
+     <p class="wrong">${this.text_.wrong}
+-      <button id="settings" class="link" @click="${this.onSettingsClick_}">
+-        ${this.text_.settings}</button>
++      ${this.text_.settings ? html`
++        <button id="settings" class="link" @click="${this.onSettingsClick_}">
++          ${this.text_.settings}</button>` : ''}
+     </p>
+     <footer>
+       <button id="ok" class="btn primary" @click="${this.onOkClick_}">
+diff --git a/chrome/browser/resources/webui_browser/meridian/system_ask.ts b/chrome/browser/resources/webui_browser/meridian/system_ask.ts
+index 678758a..2233efe 100644
+--- a/chrome/browser/resources/webui_browser/meridian/system_ask.ts
++++ b/chrome/browser/resources/webui_browser/meridian/system_ask.ts
+@@ -3,7 +3,8 @@
+ // found in the LICENSE file.
+ 
+ // Before macOS asks about Meridian for the first time (the camera, the
+-// microphone, recording the screen, notifications, the location), one short
++// microphone, recording the screen, notifications, the location; the keychain
++// item after 0.x, just after it asked), one short
+ // sheet: what will appear, why, which button to press, with a drawing of it,
+ // and where to change it if the wrong button got pressed. Once per kind
+ // (sidebar_handler.cc remembers); macOS asks only after "Continue".
+@@ -75,6 +76,22 @@ export function systemAskText(kind: string): SystemAskText {
+         settings: 'Open Notifications settings',
+         ok: 'Got it',
+       };
++    case 'safe-storage':
++      // Shown after macOS asked (it asks before any window opens).
++      return {
++        title: 'If your Mac asks about “Meridian Safe Storage”',
++        lines: [
++          'Meridian is now signed with Apple’s Developer ID, so macOS asks ' +
++              'once more for the key that keeps your saved logins and ' +
++              'cookies encrypted. Chrome and Arc keep theirs the same way.',
++          'Press Always Allow, and it stops asking:',
++        ],
++        steps: [],
++        wrong: 'Pressed Allow? Then macOS asks at every start: press Always ' +
++            'Allow next time.',
++        settings: '',
++        ok: 'Got it',
++      };
+     case 'screen':
+     default:
+       return {
+diff --git a/chrome/browser/resources/webui_browser/meridian/update_sheet.css b/chrome/browser/resources/webui_browser/meridian/update_sheet.css
+index 812c773..ae9f6a1 100644
+--- a/chrome/browser/resources/webui_browser/meridian/update_sheet.css
++++ b/chrome/browser/resources/webui_browser/meridian/update_sheet.css
+@@ -145,22 +145,3 @@ a:hover {
+   opacity: 0.6;
+   cursor: default;
+ }
+-
+-/* Before a restart macOS will ask about Meridian's keychain item. */
+-.keychain {
+-  display: flex;
+-  gap: 8px;
+-  align-items: flex-start;
+-  margin: 4px 20px 2px;
+-  padding: 8px 10px;
+-  border-radius: 8px;
+-  font-size: 12px;
+-  line-height: 1.45;
+-  background: color-mix(in srgb, var(--meridian-space) 10%, transparent);
+-}
+-
+-.keychain svg {
+-  flex: none;
+-  margin-top: 2px;
+-  color: var(--meridian-space);
+-}
+diff --git a/chrome/browser/resources/webui_browser/meridian/update_sheet.html.ts b/chrome/browser/resources/webui_browser/meridian/update_sheet.html.ts
+index 791317b..a3821d4 100644
+--- a/chrome/browser/resources/webui_browser/meridian/update_sheet.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/update_sheet.html.ts
+@@ -21,10 +21,6 @@ export function getHtml(this: MeridianUpdateSheetElement) {
+           opens again with your tabs.</div>
+       </div>
+     </header>
+-    ${this.safeStorageNote_() ? html`
+-      <p id="safeStorage" class="keychain">${icon('lock', 14)}
+-        <span>After the restart macOS may ask about “Meridian Safe
+-          Storage”: press <b>Always Allow</b>.</span></p>` : ''}
+     <div id="notes" class="notes">
+       ${!this.notes_() ? html`
+         <p class="muted">Fixes and improvements.</p>` :
+diff --git a/chrome/browser/resources/webui_browser/meridian/update_sheet.ts b/chrome/browser/resources/webui_browser/meridian/update_sheet.ts
+index 604c06b..8100476 100644
+--- a/chrome/browser/resources/webui_browser/meridian/update_sheet.ts
++++ b/chrome/browser/resources/webui_browser/meridian/update_sheet.ts
+@@ -54,16 +54,6 @@ export class MeridianUpdateSheetElement extends CrLitElement {
+     this.open = false;
+   }
+ 
+-  // macOS asks about "Meridian Safe Storage" after the restart when the new
+-  // version is signed differently: from 0.x (signed by Meridian itself) to 1.x
+-  // (Apple's Developer ID). macOS only; nothing in the app can explain it
+-  // then (it asks before any window), so it's said here.
+-  protected safeStorageNote_(): boolean {
+-    const major = (v: string|undefined) => Number((v || '').split('.')[0]);
+-    return navigator.userAgent.includes('Mac') &&
+-        major(this.state_?.current) === 0 && major(this.state_?.version) >= 1;
+-  }
+-
+   protected notes_(): string {
+     // GitHub's release notes; the first heading repeats the version.
+     return (this.state_?.notes || '')

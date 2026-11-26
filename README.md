@@ -137,6 +137,8 @@ node chromium/tools/verify_release.mjs SHA256SUMS.txt SHA256SUMS.txt.sig Meridia
 
 Agents started in the Workbench get the browser tools for that session only; your global configs aren't touched.
 
+Models that can't take images (many OpenAI-compatible endpoints answer HTTP 400 once a screenshot is in the conversation) need nothing from you: OpenCode's **Connect** sets the browser tools up without screenshots when its model is one of those, and Ask asks again without images when a provider refuses one, and remembers it. (Other MCP clients: `--mcp-bridge --text-only`, or `MERIDIAN_MCP_TEXT_ONLY=1`.)
+
 ## Security
 
 Agents act inside your logged-in browser, so access is explicit:
