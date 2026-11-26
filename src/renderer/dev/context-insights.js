@@ -126,18 +126,46 @@ function renderLimitsChip() {
   chip.title = lines.join('\n') + '\nClick for Context Insights';
 }
 
-// The context gauge on an agent terminal's tab (Claude Code: its status line; others: their record).
+// What a session has cost so far, in dollars: Claude Code's status line, else the agent's own
+// record (when it prices in dollars). null when nothing says.
+function termCost(t) {
+  const usd = CI.usage[t.id]?.cost_usd ?? CI.ctx[t.id]?.cost_usd;
+  return typeof usd === 'number' && usd >= 0 ? usd : null;
+}
+function termCostText(usd) {
+  if (usd > 0 && usd < 0.01) return '<$0.01';
+  return `$${usd >= 100 ? Math.round(usd) : usd.toFixed(2)}`;
+}
+
+// On an agent terminal's tab: what the session has cost and the context gauge (Claude Code: its
+// status line; others: their record). A click opens Context Insights.
 function termUsageBadge(t) {
   const u = CI.usage[t.id]?.context_pct != null ? CI.usage[t.id] : CI.ctx[t.id];
-  if (!u || u.context_pct == null) return null;
-  const pct = Math.round(u.context_pct);
-  const b = document.createElement('span');
-  b.className = `ctx-badge ${ciLevel(pct)}`;
-  b.style.setProperty('--p', `${Math.min(100, pct)}%`);
-  b.textContent = `${pct}%`;
-  b.title = `Context: ${pct}% used${u.context_tokens ? ` · ${ciK(u.context_tokens)} / ${ciK(u.context_size)}` : ''}${u.compactions ? ` · compacted ${u.compactions}×` : ''}\nClick for Context Insights`;
-  b.addEventListener('click', (e) => { e.stopPropagation(); CI.termId = t.id; activateTerm(t); openPanel('insights'); });
-  return b;
+  const cost = termCost(t);
+  const hasCtx = u && u.context_pct != null;
+  if (!hasCtx && cost == null) return null;
+  const box = document.createElement('span');
+  box.className = 'tab-usage';
+  const lines = [];
+  if (cost != null) {
+    const c = document.createElement('span');
+    c.className = 'cost';
+    c.textContent = termCostText(cost);
+    box.appendChild(c);
+    lines.push(`Cost so far: ${cost < 0.01 && cost > 0 ? 'under 1 cent' : `$${cost.toFixed(2)}`}${CI.usage[t.id]?.cost_usd != null ? ' (Claude Code’s estimate at API prices)' : ''}`);
+  }
+  if (hasCtx) {
+    const pct = Math.round(u.context_pct);
+    const b = document.createElement('span');
+    b.className = `ctx-badge ${ciLevel(pct)}`;
+    b.style.setProperty('--p', `${Math.min(100, pct)}%`);
+    b.textContent = `${pct}%`;
+    box.appendChild(b);
+    lines.push(`Context: ${pct}% used${u.context_tokens ? ` · ${ciK(u.context_tokens)} / ${ciK(u.context_size)}` : ''}${u.compactions ? ` · compacted ${u.compactions}×` : ''}`);
+  }
+  box.title = `${lines.join('\n')}\nClick for Context Insights`;
+  box.addEventListener('click', (e) => { e.stopPropagation(); CI.termId = t.id; activateTerm(t); openPanel('insights'); });
+  return box;
 }
 
 function termSessionName(t) { return CI.usage[t.id]?.session_name || ''; }
@@ -520,6 +548,8 @@ function ciNoteContext(id, data) {
   const t = S.terms.find((x) => x.id === id);
   if (!t || ciIsClaude(t) || !data || data.available === false || !data.contextSize || !data.requests) return;
   const next = { context_pct: (data.contextTokens / data.contextSize) * 100, context_tokens: data.contextTokens, context_size: data.contextSize, compactions: data.compactions?.length || 0 };
+  // What it has cost, when its record prices in dollars.
+  if (data.unit !== 'tokens' && data.costUsd > 0) next.cost_usd = data.costUsd;
   if (JSON.stringify(CI.ctx[id]) === JSON.stringify(next)) return;
   CI.ctx[id] = next;
   if (typeof renderTermTabs === 'function') renderTermTabs();

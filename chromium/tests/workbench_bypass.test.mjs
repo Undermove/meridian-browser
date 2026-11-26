@@ -1,11 +1,15 @@
-// A Claude Code tab restarts with bypass permissions from a button: asked first, the same session,
-// the same place on the tab bar and the same name.
+// A Claude Code tab restarts with bypass permissions from its settings (the button on the tab):
+// asked first, the same session, the same place on the tab bar and the same name.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { launch, SB } from './harness.mjs';
+
+// The tab's settings, then "Permissions: Bypass".
+const pickBypass = `(() => { document.querySelector('.ttab.active .tab-settings').click(); const s = document.querySelector('#popover [data-setting="mode"]');
+  s.value = 'bypassPermissions'; s.dispatchEvent(new Event('change')); return true; })()`;
 
 const FAKE_CLAUDE = `#!/usr/bin/python3
 import json, os, subprocess, sys, time
@@ -41,14 +45,14 @@ test('a Claude Code tab restarts with bypass permissions, after asking, in the s
     await wb.waitFor('!!S.project');
     await wb.eval(`launch('shell').then((t) => !!t)`);
     await wb.eval(`launch('claude').then((t) => !!t)`);
-    await wb.waitFor(`!!document.querySelector('.ttab.active .tab-bypass')`, 15000);
+    await wb.waitFor(`S.activeTerm?.sessionId === 's1' && !!document.querySelector('.ttab.active .tab-settings')`, 15000);
     await wb.eval(`(() => { S.activeTerm.custom = 'Login bug'; saveClaudeSessions(); renderTermTabs(); })()`);
     // Move it first, so "the same place" means something.
     await wb.eval(`(() => { const t = S.terms.pop(); S.terms.unshift(t); renderTermTabs(); })()`);
     assert.equal(runs().length, 1);
 
     // Cancel changes nothing.
-    await wb.eval(`document.querySelector('.ttab.active .tab-bypass').click()`);
+    await wb.eval(pickBypass);
     await wb.waitFor(`!!document.querySelector('[data-a="ok"]')`);
     assert.match(await wb.eval(`document.querySelector('#modal-overlay').innerText`), /stops asking/);
     await wb.eval(`document.querySelector('[data-a="cancel"]').click()`);
@@ -56,10 +60,12 @@ test('a Claude Code tab restarts with bypass permissions, after asking, in the s
     assert.equal(runs().length, 1, 'not restarted');
 
     // Yes: the same session, bypass, same place and name.
-    await wb.eval(`document.querySelector('.ttab.active .tab-bypass').click()`);
+    await wb.eval(pickBypass);
     await wb.waitFor(`!!document.querySelector('[data-a="ok"]')`);
     await wb.eval(`document.querySelector('[data-a="ok"]').click()`);
-    await wb.waitFor(`!!document.querySelector('.ttab.active .bypass-on')`, 15000);
+    // A warning dot on the tab says so.
+    await wb.waitFor(`!!document.querySelector('.ttab.active .tab-settings.risky') && S.activeTerm.permissionMode === 'bypassPermissions'`, 15000);
+    assert.match(await wb.eval(`document.querySelector('.ttab.active .tab-settings').title`), /Bypass/);
     const again = runs().at(-1);
     assert.equal(runs().length, 2);
     assert.equal(again[again.indexOf('--resume') + 1], 's1');
@@ -67,7 +73,8 @@ test('a Claude Code tab restarts with bypass permissions, after asking, in the s
     assert.equal(await wb.eval(`S.terms.length`), 2);
     assert.equal(await wb.eval(`S.terms[0] === S.activeTerm && S.terms[0].kind`), 'claude');
     assert.match(await wb.eval(`document.querySelector('.ttab.active .name').textContent`), /Login bug/);
-    assert.equal(await wb.eval(`!!document.querySelector('.ttab.active .tab-bypass')`), false);
+    await wb.eval(`(document.querySelector('.ttab.active .tab-settings').click(), true)`);
+    assert.equal(await wb.eval(`document.querySelector('#popover [data-setting="mode"]').value`), 'bypassPermissions');
     // It's remembered for the next browser restart.
     await wb.waitFor(`wb.claudeSessions().then((l) => l.some((s) => s.id === 's1' && s.mode === 'bypassPermissions'))`);
   } finally {

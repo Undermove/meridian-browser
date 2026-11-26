@@ -204,7 +204,10 @@ test('Owner’s setup: imported with sensible names, renamed in place; one picke
     await wb.eval(`launch('claude').then((t) => !!t)`);
     await wb.waitFor(`S.activeTerm?.kind === 'claude' && ${termText}.includes('ready CLAUDE_CONFIG_DIR=')`, 15000).catch(async (e) => { throw new Error(e.message + '\n' + await wb.eval(termText)); });
     assert.match((await wb.eval(termText)).replace(/\n/g, ''), /ready CLAUDE_CONFIG_DIR=<unset>/);
-    assert.equal(await wb.eval(`document.querySelector('#term-tab-list .ttab.active .acct')?.textContent`), 'Work Claude');
+    // The account is in the tab's settings (not on the tab).
+    await wb.eval(`(document.querySelector('#term-tab-list .ttab.active .tab-settings').click(), true)`);
+    assert.match(await wb.eval(`document.querySelector('#popover [data-row="account"]')?.innerText || ''`), /Account\s+Work Claude/);
+    await wb.eval(`(document.getElementById('popover').hidden = true, true)`);
   } finally {
     process.env.HOME = savedHome;
     wb?.close();
@@ -362,7 +365,10 @@ test('Resume lists the project’s sessions under every Claude account; a sessio
     const first = (await wb.eval(termText)).replace(/\n/g, '');
     assert.ok(first.includes(`ready CLAUDE_CONFIG_DIR=${personalDir} args=--resume old-1`), first);
     assert.match(first, /Resumed with Personal Claude/);
-    assert.equal(await wb.eval(`document.querySelector('#term-tab-list .ttab.active .acct')?.textContent`), 'Personal Claude');
+    // The account is in the tab's settings (not on the tab).
+    await wb.eval(`(document.querySelector('#term-tab-list .ttab.active .tab-settings').click(), true)`);
+    assert.match(await wb.eval(`document.querySelector('#popover [data-row="account"]')?.innerText || ''`), /Account\s+Personal Claude/);
+    await wb.eval(`(document.getElementById('popover').hidden = true, true)`);
     // Kept with its account for the next start.
     await wb.waitFor(`wb.claudeSessions().then((l) => l.some((s) => s.id === 'old-1' && s.account === ${JSON.stringify(pers)}))`, 10000);
 
