@@ -1,7 +1,7 @@
 // Drives the built Meridian (Chromium) over the DevTools protocol. The browser's own UI is the page
 // chrome://webui-browser, so tests evaluate in it and send real mouse/keyboard input to it.
 import { afterEach, beforeEach } from 'node:test';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -141,18 +141,73 @@ function watchInvariants(b) {
 
 // `profile`: reuse a profile dir (to test what survives a restart); it's then left for the caller to delete.
 // Browsers still running when this test process ends (a test timed out, --test-force-exit) are
-// killed with it, so a later test never reaches a leftover one.
+// killed with it, so a later test never reaches a leftover one, and the folders made for them go too.
 const running = new Set();
-process.on('exit', () => { for (const p of running) { try { p.kill('SIGKILL'); } catch {} } });
+const leftovers = new Set();
+function endRun() {
+  for (const p of running) { try { p.kill('SIGKILL'); } catch {} }
+  for (const d of leftovers) { try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 3 }); } catch {} }
+  leftovers.clear();
+}
+process.on('exit', endRun);
+// A run ended from outside (`timeout`, Ctrl+C, the runner's kill) still goes through 'exit'.
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+  process.once(sig, () => { endRun(); process.exit(128 + ({ SIGHUP: 1, SIGINT: 2, SIGTERM: 15 })[sig]); });
+}
+
+// What runs killed before they could clean up left in the temp folder: test profiles
+// (meridian-e2e-*: ~100 MB each, 123 of them filled 15 GB on 26.11) and the empty "other browser"
+// folders (meridian-empty-*). Each goes when it is older than an hour and nothing uses it: no
+// browser holds its SingletonLock, no running process names it, nothing in it changed for an hour.
+// Another run going on beside this one (another checkout, an agent) keeps its folders.
+export function cleanAbandoned({ olderThanMs = 3600_000, dryRun = false } = {}) {
+  // (Windows: a profile in use is locked differently and `ps` isn't there; not cleaned there yet.)
+  if (process.platform === 'win32') return [];
+  const tmp = os.tmpdir();
+  let real = tmp; try { real = fs.realpathSync(tmp); } catch {}
+  const now = Date.now();
+  let args;
+  try { args = execFileSync('/bin/ps', ['-axww', '-o', 'args='], { encoding: 'utf8', timeout: 5000, maxBuffer: 64 << 20 }); } catch { return []; }
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+  const newest = (p, depth) => {
+    let st; try { st = fs.lstatSync(p); } catch { return 0; }
+    let t = st.mtimeMs;
+    if (st.isDirectory() && depth > 0) {
+      let names = []; try { names = fs.readdirSync(p); } catch {}
+      for (const n of names) { t = Math.max(t, newest(path.join(p, n), depth - 1)); if (now - t < olderThanMs) break; }
+    }
+    return t;
+  };
+  const removed = [];
+  let names = []; try { names = fs.readdirSync(tmp); } catch {}
+  for (const name of names) {
+    if (!/^meridian-(e2e|empty)-/.test(name)) continue;
+    const dir = path.join(tmp, name);
+    let lock = null; try { lock = fs.readlinkSync(path.join(dir, 'SingletonLock')); } catch {}
+    const pid = lock && Number(lock.split('-').pop());
+    if (pid && alive(pid)) continue;
+    if (args.includes(dir) || args.includes(path.join(real, name))) continue;
+    if (now - newest(dir, 3) < olderThanMs) continue;
+    removed.push(dir);
+    if (!dryRun) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} }
+  }
+  return removed;
+}
+// For harness_clean.test.mjs: a folder this process removes on its way out, as launch()'s are.
+export const _trackForTest = (dir) => leftovers.add(dir);
+// Once per test file (each file is its own process): what earlier killed runs left.
+if (!process.env.MERIDIAN_KEEP_TEMP) cleanAbandoned();
 
 // `firstRun`: start like the very first launch (without --no-first-run). `app`: another binary
 // for this launch (an older release, to test updating from it). `env`: variables over the test
 // process's own (already without the owner's, isolation.mjs), such as a fixture's HOME.
 export async function launch(urls = [], { profile: keep, args = [], firstRun = false, app = APP, env } = {}) {
   const profile = keep || fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  if (!keep) leftovers.add(profile);
   const port = 9400 + Math.floor(Math.random() * 500);
   // Never the real Arc, Chrome or any other browser: an empty folder unless a test gives its own.
   const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-empty-'));
+  leftovers.add(empty);
   for (const sw of ['arc', 'chrome', 'brave', 'edge', 'vivaldi', 'opera', 'firefox', 'safari'].map((k) => `--meridian-${k}-dir`)) {
     if (!args.some((a) => a.startsWith(sw + '='))) args = [...args, `${sw}=${empty}`];
   }
@@ -409,6 +464,7 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
       }
       if (!keep) fs.rmSync(profile, { recursive: true, force: true });
       fs.rmSync(empty, { recursive: true, force: true });
+      leftovers.delete(profile); leftovers.delete(empty);
       // What the browser left in the temp folder (downloads in progress, sockets) when killed.
       for (const name of fs.readdirSync(os.tmpdir())) {
         if (!name.startsWith('dev.meridian.browser.')) continue;
