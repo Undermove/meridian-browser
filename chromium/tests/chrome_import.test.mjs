@@ -99,15 +99,20 @@ test('Chrome import: a space per profile with its bookmarks and open tabs, anoth
     // Real counts: Chrome's profiles, the tabs it has open, its bookmarks.
     assert.deepEqual(await b.eval(`[...${OB}.querySelectorAll('.arc-stats b')].map((e) => e.textContent.trim())`), ['2 profiles', '2 open tabs', '4 bookmarks']);
     await b.click(`${OB}.getElementById('next')`);
-    await b.waitFor(`!!${OB}.querySelector('.confirm')`);
-    assert.match(await b.eval(`${OB}.querySelector('.confirm').textContent`), /copies\s+Chrome’s sign-ins/);
-    // What macOS will show for Chrome's keychain item, and the button to press: Allow (Meridian
-    // reads it once), not Always Allow.
-    const mock = `${OB}.querySelector('.confirm meridian-mac-ask').shadowRoot`;
-    assert.match(await b.eval(`${mock}.querySelector('.title').textContent`), /“Chrome Safe Storage”/);
-    assert.equal(await b.eval(`${mock}.querySelector('.press').textContent.trim()`), 'Allow');
-    assert.match(await b.eval(`${OB}.querySelector('.confirm').textContent.replace(/\\s+/g, ' ')`), /Pressed Deny\? Your tabs and bookmarks still come over/);
-    await b.click(`${OB}.getElementById('confirmContinue')`);
+    // macOS asks before Meridian reads the keychain; Windows asks nothing.
+    if (process.platform === 'darwin') {
+      await b.waitFor(`!!${OB}.querySelector('.confirm')`);
+      assert.match(await b.eval(`${OB}.querySelector('.confirm').textContent`), /copies\s+Chrome’s sign-ins/);
+      // What macOS will show for Chrome's keychain item, and the button to press: Allow (Meridian
+      // reads it once), not Always Allow.
+      const mock = `${OB}.querySelector('.confirm meridian-mac-ask').shadowRoot`;
+      assert.match(await b.eval(`${mock}.querySelector('.title').textContent`), /“Chrome Safe Storage”/);
+      assert.equal(await b.eval(`${mock}.querySelector('.press').textContent.trim()`), 'Allow');
+      assert.match(await b.eval(`${OB}.querySelector('.confirm').textContent.replace(/\\s+/g, ' ')`), /Pressed Deny\? Your tabs and bookmarks still come over/);
+      await b.click(`${OB}.getElementById('confirmContinue')`);
+    } else {
+      assert.equal(await b.eval(`!!${OB}.querySelector('.confirm')`), false, 'no Mac dialog');
+    }
     await b.waitFor(`app.$.tabstrip.state_.spaces.map((s) => s.name).join() === 'Personal,Work'`, 15000);
 
     // Personal: the bookmarks bar on top, a folder for its folder, "Other bookmarks" as a folder;
@@ -175,8 +180,13 @@ test('both Arc and Chrome here: the tour moves in from Arc, Chrome is one click 
     await b.waitFor(`${OB}.querySelector('h2').textContent.includes('Bring everything from Chrome')`);
     assert.deepEqual(await b.eval(`[...${OB}.querySelectorAll('.arc-stats b')].map((e) => e.textContent.trim())`), ['2 profiles', '2 open tabs', '4 bookmarks', '2 passwords']);
     await b.click(`${OB}.getElementById('next')`);
-    await b.waitFor(`!!${OB}.querySelector('.confirm')`);
-    await b.click(`${OB}.getElementById('confirmContinue')`);
+    // macOS asks before Meridian reads the keychain; Windows asks nothing.
+    if (process.platform === 'darwin') {
+      await b.waitFor(`!!${OB}.querySelector('.confirm')`);
+      await b.click(`${OB}.getElementById('confirmContinue')`);
+    } else {
+      assert.equal(await b.eval(`!!${OB}.querySelector('.confirm')`), false, 'no Mac dialog');
+    }
     await b.waitFor(`app.$.tabstrip.state_.spaces.map((s) => s.name).join() === 'Personal,Work'`, 15000);
   } finally { await b.close(); server.close(); fs.rmSync(chrome, { recursive: true, force: true }); fs.rmSync(arc, { recursive: true, force: true }); }
 });
@@ -234,5 +244,38 @@ test('sign-ins Chrome locked to itself: said so; its passwords come all the same
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
     assert.deepEqual(await b.eval(`${H}.importArcLogins('chrome')`), { imported: 0, passwords: 1, cards: 0, error: 'app-bound' });
+  } finally { await b.close(); server.close(); fs.rmSync(chrome, { recursive: true, force: true }); }
+});
+
+// The same in the moving-in step: what comes and what can't is said as it is, and with no
+// passwords from Chrome, a way to bring the file Chrome exports. No Mac words off the Mac.
+test('sign-ins Chrome locked to itself, no passwords: the step says so and offers importing a passwords file', async () => {
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(`<title>page ${req.url}</title>`); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+  const chrome = await fakeChrome((p) => `http://127.0.0.1:${port}${p}`);
+  writeCookies(path.join(chrome, 'Default'), 'test-pass', [{ host: '127.0.0.1', name: 'sid', value: 'locked', port, prefix: 'v20' }]);
+  const b = await launch(['about:blank'], { args: [`--meridian-chrome-dir=${chrome}`, '--meridian-chrome-safe-storage=test-pass'] });
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    await b.eval(`app.$.onboarding.show('chrome')`);
+    await b.waitFor(`app.$.onboarding.open && !!${OB}.getElementById('logins')`);
+    const option = await b.eval(`${OB}.getElementById('logins').textContent.replace(/\\s+/g, ' ')`);
+    if (process.platform === 'darwin') {
+      assert.match(option, /Stay signed in to your sites/);
+    } else {
+      assert.match(option, /Saved passwords and cards too.*lock theirs to themselves/);
+      assert.doesNotMatch(await b.eval(`${OB}.getElementById('root').textContent`), /Mac|Keychain|⌘/);
+    }
+    await b.click(`${OB}.getElementById('next')`);
+    if (process.platform === 'darwin') {
+      await b.waitFor(`!!${OB}.querySelector('.confirm')`);
+      await b.click(`${OB}.getElementById('confirmContinue')`);
+    }
+    await b.waitFor(`${step} === 'done'`, 15000);
+    const note = await b.eval(`[...${OB}.querySelectorAll('.whisper')].map((e) => e.textContent).join(' ').replace(/\\s+/g, ' ')`);
+    assert.match(note, /Chrome locks its sign-ins to itself, so no other browser can read them: sign in to your sites once more\. For its passwords, use Export passwords in Chrome’s password manager settings, then import that file here\./);
+    await b.click(`${OB}.getElementById('passwordsFile')`);
+    await b.waitFor(`!app.$.onboarding.open && [...app.$.tabstrip.tabs_.values()].some((t) => t.isActive && t.url.startsWith('chrome://password-manager/settings'))`, 10000);
   } finally { await b.close(); server.close(); fs.rmSync(chrome, { recursive: true, force: true }); }
 });
