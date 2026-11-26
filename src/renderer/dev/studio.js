@@ -10,6 +10,11 @@
  * studio-transcript.js. Every text from the session is set with textContent or esc().
  */
 
+// A camera for "took a screenshot" (icons.js has none).
+if (typeof ICON_PATHS === 'object' && !ICON_PATHS.camera) {
+  ICON_PATHS.camera = '<path d="M4.5 8.5a2 2 0 0 1 2-2h1.8l1.5-2h4.4l1.5 2h1.8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2z"/><circle cx="12" cy="13" r="3.3"/>';
+}
+
 const ST = {
   on: false,
   lang: /^ru\b/i.test(navigator.language || '') ? 'ru' : 'en',
@@ -74,7 +79,9 @@ async function studioBoot() {
   try { info = await wb.studioInfo(); } catch { return; }
   if (!info?.enabled) return;
   ST.on = true;
+  ST.info = info;
   if (['designer', 'manager', 'developer', 'everyday'].includes(info.persona)) ST.persona = info.persona;
+  try { ST.board = localStorage.getItem('wb.studioBoard') === '1'; } catch {}
   document.body.classList.add('studio-on');
   stBuild();
   stSwitchInTopbar();
@@ -196,15 +203,25 @@ function stBuild() {
     <header class="st-head">
       <div class="st-titles"><span class="st-ttl" id="st-title"></span><span class="st-sub" id="st-sub"></span></div>
       <div class="grow"></div>
+      <div class="st-viewseg" role="tablist" aria-label="${esc(w.tasks)}">
+        <button role="tab" data-mode="board">${icon('grid', 13)}<span>${esc(w.cards)}</span></button>
+        <button role="tab" data-mode="list">${icon('chat', 13)}<span>${esc(w.chat)}</span></button></div>
       <button class="st-role-btn" id="st-role" title="${esc(w.roleChange)}">${icon('user', 14)}<span></span></button>
       ${stSwitchHtml()}
     </header>
+    <div class="st-board" id="st-board" hidden></div>
     <div class="st-body">
       <aside class="st-tasks" aria-label="${esc(w.tasks)}">
         <button class="st-new" id="st-new">${icon('plus', 14)}<span>${esc(w.newTask)}</span></button>
+        <button class="st-new st-allcards" id="st-allcards">${icon('grid', 14)}<span>${esc(w.allTasks)}</span></button>
         <div class="st-task-list" id="st-task-list" role="list"></div>
       </aside>
       <div class="st-chat">
+        <div class="st-ctabs" role="tablist"><div class="st-seg">
+          <button role="tab" data-pane="chat" class="on">${icon('chat', 14)}<span>${esc(w.chat)}</span></button>
+          <button role="tab" data-pane="brand">${icon('palette', 14)}<span>${esc(w.brand)}</span></button>
+        </div></div>
+        <div class="st-brand" id="st-brand" hidden></div>
         <div class="st-resultbar" id="st-resultbar" hidden></div>
         <div class="st-feed" id="st-feed" aria-live="polite"></div>
         <div class="st-composer">
@@ -223,7 +240,21 @@ function stBuild() {
   ST.el = el;
   $('.st-switch', el).addEventListener('click', stOnSwitch);
   $('#st-role', el).addEventListener('click', () => stPersonaPicker({ current: ST.persona }));
+  $('.st-viewseg', el).addEventListener('click', (e) => {
+    const m = e.target.closest('[data-mode]')?.dataset.mode;
+    if (m) stSetBoard(m === 'board');
+  });
+  $('#st-board', el).addEventListener('click', stOnBoardClick);
+  $('.st-ctabs', el).addEventListener('click', (e) => {
+    const p = e.target.closest('[data-pane]')?.dataset.pane;
+    if (!p) return;
+    ST.pane = p;
+    if (p === 'brand') stLoadBrand();
+    stRender();
+  });
+  $('#st-brand', el).addEventListener('click', stOnBrandClick);
   $('#st-new', el).addEventListener('click', () => { ST.current = ''; ST.preview = null; stRender(); $('#st-input').focus(); });
+  $('#st-allcards', el).addEventListener('click', () => stSetBoard(true));
   $('#st-task-list', el).addEventListener('click', (e) => {
     const row = e.target.closest('[data-term]');
     if (!row) return;
@@ -249,6 +280,8 @@ function stBuild() {
   });
   $('#st-feed', el).addEventListener('click', stOnFeedClick);
   $('#st-result', el).addEventListener('click', stOnResultClick);
+  $('#st-result', el).addEventListener('pointerdown', stWipeDrag);
+  $('#st-result', el).addEventListener('dblclick', stWipeDrag);
   $('#st-resultbar', el).addEventListener('click', stOnResultBarClick);
   // Pressed look (scale .97) for every button, by pointer only: keys don't animate.
   el.addEventListener('pointerdown', (e) => { const b = e.target.closest('button'); if (b) b.classList.add('st-press'); });
@@ -276,8 +309,20 @@ function stRender() {
   const w = STW();
   if (!S.project) return stRenderPick();
   $('#st-pick').hidden = true;
-  $('.st-body', ST.el).hidden = false;
   const terms = stTerms();
+  // The board: every task as a card. It is where Studio starts when there are tasks and none is open.
+  $('.st-body', ST.el).hidden = ST.board;
+  $('#st-board').hidden = !ST.board;
+  for (const b of ST.el.querySelectorAll('.st-viewseg button')) b.classList.toggle('on', (b.dataset.mode === 'board') === ST.board);
+  if (ST.board) {
+    $('#st-title').textContent = w.studio;
+    $('#st-sub').textContent = `${S.project.name} · ${w.taskCount(terms.length)}`;
+    $('#st-role span').textContent = w.personas[ST.persona]?.name || '';
+    document.title = w.studio;
+    stRenderBoard(terms);
+    stReport();
+    return;
+  }
   if (ST.current && !terms.some((t) => t.id === ST.current)) ST.current = '';
   const t = stCurrent();
   $('#st-title').textContent = t ? stTitle(t) : w.newTask;
@@ -285,6 +330,7 @@ function stRender() {
   $('#st-role span').textContent = w.personas[ST.persona]?.name || '';
   document.title = t ? stTitle(t) : w.studio;
   stRenderTasks(terms);
+  stRenderPane();
   stRenderFeed(t);
   stRenderChips(t);
   stRenderResult(t);
@@ -370,7 +416,9 @@ function stRenderFeed(t) {
       else if (it.type === 'steps') {
         // The plan itself isn't a step: it shows as "step i of n" on the step being done.
         const steps = it.steps.filter((s) => s.tool !== 'TodoWrite');
-        if (steps.length) parts.push(`<div class="st-steps" data-key="s${ti}.${ii}">${steps.map((s) => stStepHtml(s, last && (status === 'work' || status === 'needs'), progress, status)).join('')}</div>`);
+        // One check, on the last step done: less noise than a column of them.
+        const lastOk = steps.map((s) => s.state).lastIndexOf('ok');
+        if (steps.length) parts.push(`<div class="st-steps" data-key="s${ti}.${ii}">${steps.map((s, si) => stStepHtml(s, last && (status === 'work' || status === 'needs'), progress, status, si === lastOk)).join('')}</div>`);
       }
     });
     for (const a of answeredHere.filter((x) => x.after >= turn.items.length)) parts.push(answeredHtml(a));
@@ -413,7 +461,11 @@ function stRenderFeed(t) {
   feed.dataset.html = html;
   stFillImages(feed);
   stLoadThumbs(k);
-  if (atBottom) feed.scrollTop = feed.scrollHeight;
+  if (firstPaint) {
+    // Opened: the person's last message at the top, the answer below it.
+    const lastUser = [...feed.querySelectorAll('.st-msg-user')].pop();
+    feed.scrollTop = lastUser ? Math.max(0, lastUser.offsetTop - feed.offsetTop - 12) : feed.scrollHeight;
+  } else if (atBottom) feed.scrollTop = feed.scrollHeight;
 }
 
 // Same element, new content: steps keep their rows so a spinner turns into a check in place.
@@ -473,14 +525,14 @@ const stInline = (s) => {
   return out.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/`([^`]+)`/g, '$1');
 };
 
-function stStepHtml(s, live, progress, status = 'work') {
+function stStepHtml(s, live, progress, status = 'work', checked = true) {
   const [ic, done, doing] = StudioWords.stepWords(s.tool, s.input, ST.lang);
   let text = s.state === 'running' ? doing : done;
   if (s.state === 'running' && progress && live && progress.total > 1) {
     text += ` — ${STW().step(progress.index, progress.total)}`;
   }
   const state = s.state === 'running' && !live ? 'stopped' : s.state;
-  const mark = state === 'ok' ? `<span class="st-ok">${icon('check', 14)}</span>`
+  const mark = state === 'ok' ? (checked ? `<span class="st-ok">${icon('check', 12)}</span>` : '')
     : state === 'running' ? stDot(status === 'needs' ? 'needs' : 'work')
       : state === 'denied' ? `<span class="st-no">${icon('x', 13)}</span>`
         : state === 'error' ? `<span class="st-no">${icon('x', 13)}</span>` : '';
@@ -514,8 +566,8 @@ function stFiles(k) {
 function stFileCard(k, item, i) {
   const w = STW();
   if (item.kind === 'shot') {
-    return `<button class="st-fc" data-file="${esc(item.key)}" data-sig="${esc(item.key)}" data-kind="shot" data-i="${item.i}" style="--i:${Math.min(i, 5)}">
-      <span class="st-th img">${stImg(stShotKey(item.s))}</span><span class="st-fmeta"><span class="st-fn">${esc(w.shot)} ${item.i + 1}</span><span class="st-fm">${esc(stAgo(item.s.at))}</span></span></button>`;
+    return `<button class="st-fc" data-file="${esc(item.key)}" data-sig="${esc(item.key)}|${k.model.shots.length}" data-kind="shot" data-i="${item.i}" style="--i:${Math.min(i, 5)}">
+      <span class="st-th img">${stImg(stShotKey(item.s))}</span><span class="st-fmeta"><span class="st-fn">${esc(item.i === 0 && k.model.shots.length > 1 ? w.shotBefore : item.i === k.model.shots.length - 1 && k.model.shots.length > 1 ? w.shotAfter : `${w.shot} ${item.i + 1}`)}</span><span class="st-fm">${esc(stAgo(item.s.at))}</span></span></button>`;
   }
   const f = item.f;
   const thumb = k.thumbs.get(f.rel);
@@ -577,7 +629,7 @@ function stRenderChips(t) {
   const site = t && stTask(t).site && !ST.pointing;
   const point = site ? `<button type="button" class="st-chip hero" data-point>${stCursorIcon()}<span>${esc(w.pointChip)}</span></button>` : '';
   const picked = ST.pointing && ST.picked?.length ? `<span class="st-picked">${stCursorIcon()}${esc(ST.picked[0].name)}${ST.picked.length > 1 ? ` ${esc(w.andMore(ST.picked.length - 1))}` : ''}</span>` : '';
-  const html = (show ? `<span class="st-role">${esc(w.roles[role])}</span>${w.chips[role].map((c) => `<button type="button" class="st-chip" data-chip="${esc(c)}">${esc(c)}</button>`).join('')}` : '') + point + picked;
+  const html = (show ? `${w.chips[role].map((c) => `<button type="button" class="st-chip" data-chip="${esc(c)}">${esc(c)}</button>`).join('')}` : '') + point + picked;
   if (box.dataset.html !== html) { box.innerHTML = html; box.dataset.html = html; }
   box.hidden = !html;
 }
@@ -602,16 +654,36 @@ function stRenderResult(t) {
     html = `<div class="st-r-head"><span class="st-r-name">${esc(w.shot)} ${sel.key + 1}</span></div><div class="st-r-img">${stImg(stShotKey(shots[sel.key]))}</div>`;
   } else if (k?.site) {
     const shot = shots[shots.length - 1];
-    html = `<div class="st-r-head"><span class="st-url">${icon('lock', 12)}<b>${esc(StudioWords.host(k.site))}</b></span>${shot ? `<span class="st-r-sub">${esc(w.lastShot)}</span>` : ''}<div class="grow"></div>
+    html = `<div class="st-r-head"><span class="st-url">${icon('lock', 12)}<b>${esc(StudioWords.host(k.site))}</b></span>${shot ? `<span class="st-r-sub">${esc(shots.length > 1 ? w.wipeHint : w.lastShot)}</span>` : ''}<div class="grow"></div>
       <button class="st-btn pri" data-r="site">${icon('layers', 14)}<span>${esc(w.showSite)}</span></button></div>`
-      + (shot ? `<div class="st-r-img">${stImg(stShotKey(shot))}</div>` : `<div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(StudioWords.host(k.site))}</div></div>`);
+      + (shot ? (shots.length > 1 ? stWipeHtml(shots[0], shot) : `<div class="st-r-img">${stImg(stShotKey(shot))}</div>`) : `<div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(StudioWords.host(k.site))}</div></div>`);
   } else if (shots.length) {
-    html = `<div class="st-r-img">${stImg(stShotKey(shots[shots.length - 1]))}</div>`;
+    html = shots.length > 1 ? stWipeHtml(shots[0], shots[shots.length - 1]) : `<div class="st-r-img">${stImg(stShotKey(shots[shots.length - 1]))}</div>`;
   } else {
     html = `<div class="st-r-empty">${icon('eye', 22)}<p>${esc(w.resultEmpty)}</p></div>`;
   }
   if (pane.dataset.html !== html) { pane.innerHTML = html; pane.dataset.html = html; pane.classList.remove('st-fade'); void pane.offsetWidth; pane.classList.add('st-fade'); }
   stFillImages(pane);
+}
+
+// До/После as a wipe: the first snapshot under the latest, a handle to drag (double click: half).
+function stWipeHtml(before, after) {
+  const w = STW();
+  return `<div class="st-wipe" style="--x:50%"><div class="st-wipe-after">${stImg(stShotKey(after))}</div>
+    <div class="st-wipe-before">${stImg(stShotKey(before))}</div>
+    <span class="st-wipe-h" role="slider" aria-label="${esc(w.before)} / ${esc(w.after)}" tabindex="0"><i></i></span></div>`;
+}
+function stWipeDrag(e) {
+  const box = e.target.closest('.st-wipe');
+  if (!box) return;
+  const set = (x) => { const r = box.getBoundingClientRect(); box.style.setProperty('--x', `${Math.max(0, Math.min(100, ((x - r.left) / r.width) * 100))}%`); };
+  if (e.type === 'dblclick') { box.classList.add('snap'); box.style.setProperty('--x', '50%'); setTimeout(() => box.classList.remove('snap'), 200); return; }
+  e.preventDefault();
+  set(e.clientX);
+  const move = (m) => set(m.clientX);
+  const up = () => { removeEventListener('pointermove', move); removeEventListener('pointerup', up); };
+  addEventListener('pointermove', move);
+  addEventListener('pointerup', up);
 }
 
 function stRenderResultBar(t) {
@@ -828,17 +900,303 @@ function stFlush(t) {
   if (q) stType(t, q.text);
 }
 
+// ---------------------------------------------------------------- the brand (brand.json in the folder)
+
+// The brand Studio keeps to: colours and fonts, from the live site or from Figma (read only), in
+// brand.json in the task folder. «Проверить сайт» finds what on the page isn't in it.
+async function stLoadBrand() {
+  if (ST.brandLoaded || !S.project) return;
+  ST.brandLoaded = true;
+  try {
+    const f = await wb.read('brand.json');
+    const b = JSON.parse(f?.content || 'null');
+    if (b && Array.isArray(b.colors)) ST.brand = { source: String(b.source || ''), name: String(b.name || ''), colors: b.colors.filter((c) => /^#[0-9a-f]{6}$/i.test(c?.value || '')).slice(0, 16).map((c) => ({ value: c.value.toUpperCase(), name: String(c.name || '') })), fonts: (Array.isArray(b.fonts) ? b.fonts : []).slice(0, 6).map((x) => ({ family: String(x?.family || ''), use: String(x?.use || '') })) };
+  } catch {}
+  stRender();
+}
+async function stSaveBrand() {
+  if (!ST.brand) return;
+  try { await wb.write('brand.json', JSON.stringify(ST.brand, null, 2) + '\n'); } catch (err) { toast(err.message); }
+}
+const stBrandColors = () => (ST.brand?.colors || []).map((c) => c.value);
+
+function stRenderPane() {
+  const brand = ST.pane === 'brand';
+  for (const b of ST.el.querySelectorAll('.st-ctabs button')) b.classList.toggle('on', (b.dataset.pane === 'brand') === brand);
+  $('#st-brand').hidden = !brand;
+  $('#st-feed').hidden = brand;
+  $('.st-composer', ST.el).hidden = brand;
+  $('#st-resultbar').classList.toggle('in-brand', brand);
+  if (brand) stRenderBrand();
+}
+
+function stRenderBrand() {
+  const w = STW();
+  const box = $('#st-brand');
+  const b = ST.brand;
+  const t = stCurrent();
+  const k = t && stTask(t);
+  const figma = ST.info?.figma;
+  const figmaCard = figma
+    ? `<div class="st-bsrc"><span class="st-fig">${stFigmaIcon()}</span><div><b>Figma</b> <span class="m">· ${esc(w.figmaOn)}</span></div><span class="ro">${icon('eye', 12)}${esc(w.readOnly)}</span></div>
+       <form class="st-figform" id="st-figform"><input placeholder="${esc(w.figmaLink)}" aria-label="${esc(w.figmaLink)}"><button class="st-btn" type="submit">${esc(w.figmaTake)}</button></form>`
+    : `<div class="st-bsrc"><span class="st-fig">${stFigmaIcon()}</span><div><b>Figma</b> <span class="m">· ${esc(w.figmaOff)}</span></div><button class="st-btn" data-b="figma">${esc(w.figmaConnect)}</button></div>`;
+  let html;
+  if (!b) {
+    html = `<div class="st-bempty"><div class="st-empty-ic">${icon('palette', 22)}</div><h3>${esc(w.brandNone)}</h3><p>${esc(w.brandNoneHint)}</p>
+      <button class="st-btn pri" data-b="site"${k?.site ? '' : ' disabled'}>${icon('globe', 14)}<span>${esc(k?.site ? w.brandFromSite(StudioWords.host(k.site)) : w.brandNeedSite)}</span></button></div>${figmaCard}`;
+  } else {
+    const drift = ST.drift;
+    const groups = drift ? stDriftGroups(drift) : [];
+    const driftHtml = !drift ? ''
+      : !groups.length ? `<div class="st-bok">${icon('check', 14)}<span>${esc(w.brandAllGood)}</span></div>`
+        : `<div class="st-drift st-in"><div class="st-ask-q">${stDot('needs')}<span>${esc(w.driftTitle(groups.length))}</span></div>
+          <div class="st-drows">${groups.slice(0, 6).map((g) => `<div class="st-drow"><i style="background:${g.value}"></i><span class="ar">→</span><i style="background:${g.nearest}"></i><em>${esc(stBrandName(g.nearest))}</em><span>· ${esc(g.names.slice(0, 2).join(', '))}${g.names.length > 2 ? ` ${esc(w.andMore(g.names.length - 2))}` : ''}</span></div>`).join('')}</div>
+          <div class="st-ask-btns"><button class="st-btn pri" data-b="fix">${esc(w.driftFix)}</button><button class="st-btn" data-b="where">${esc(w.driftWhere)}</button><button class="st-btn" data-b="keep">${esc(w.driftKeep)}</button></div></div>`;
+    html = `<div class="st-bsrc"><span class="st-fig">${b.source === 'figma' ? stFigmaIcon() : icon('globe', 14)}</span><div><b>${esc(b.name || w.brand)}</b> <span class="m">· ${esc(b.source === 'figma' ? 'Figma' : w.fromSite)}</span></div></div>
+      <div class="st-bcheck"><button class="st-btn pri" data-b="check"${k?.site ? '' : ' disabled'}>${icon('search', 14)}<span>${esc(w.brandCheck)}</span></button>${k?.site ? '' : `<span class="m">${esc(w.brandNeedSite)}</span>`}</div>
+      ${driftHtml}
+      <div class="st-bsec"><h4>${esc(w.palette)} <span>· ${b.colors.length}</span></h4><div class="st-sw">${b.colors.map((c, i) => `<div><i style="background:${c.value}"></i><b>${esc(c.name || c.value)}</b>${c.name ? `<span>${esc(c.value)}</span>` : ''}<button class="st-swx" data-b="drop" data-i="${i}" title="${esc(w.remove)}">${icon('x', 11)}</button></div>`).join('')}</div></div>
+      ${b.fonts.length ? `<div class="st-bsec"><h4>${esc(w.fonts)}</h4>${b.fonts.map((f) => `<div class="st-font"><span class="ex" style="font-family:'${esc(f.family.replace(/'/g, ''))}'">Аа ${esc(w.fontSample)}</span><span class="fm">${esc(f.family)} · ${esc(f.use === 'head' ? w.headings : w.bodyText)}</span></div>`).join('')}</div>` : ''}
+      ${figmaCard}
+      <button class="st-link-btn" data-b="site"${k?.site ? '' : ' disabled'}>${esc(w.brandRetake)}</button>`;
+  }
+  if (box.dataset.html === html) return;
+  box.innerHTML = html;
+  box.dataset.html = html;
+  const form = $('#st-figform', box);
+  if (form) form.onsubmit = (e) => { e.preventDefault(); stFigmaBrand(form.querySelector('input').value.trim()); };
+}
+
+const stFigmaIcon = () => '<svg width="10" height="15" viewBox="0 0 38 57" aria-hidden="true"><path d="M19 28.5a9.5 9.5 0 1 1 19 0 9.5 9.5 0 0 1-19 0z" fill="#1abcfe"/><path d="M0 47.5A9.5 9.5 0 0 1 9.5 38H19v9.5a9.5 9.5 0 1 1-19 0z" fill="#0acf83"/><path d="M19 0v19h9.5a9.5 9.5 0 1 0 0-19z" fill="#ff7262"/><path d="M0 9.5A9.5 9.5 0 0 0 9.5 19H19V0H9.5A9.5 9.5 0 0 0 0 9.5z" fill="#f24e1e"/><path d="M0 28.5A9.5 9.5 0 0 0 9.5 38H19V19H9.5A9.5 9.5 0 0 0 0 28.5z" fill="#a259ff"/></svg>';
+const stBrandName = (v) => ST.brand?.colors.find((c) => c.value === v)?.name || v;
+
+// What isn't in the brand, by colour: [{value, nearest, prop, items: [{sel, name}], names}].
+function stDriftGroups(drift) {
+  const by = new Map();
+  for (const d of drift) {
+    const key = `${d.value}>${d.nearest}`;
+    const g = by.get(key) || { value: d.value, nearest: d.nearest, items: [], names: [] };
+    g.items.push({ sel: d.sel, name: d.name, prop: d.prop });
+    if (!g.names.includes(d.name)) g.names.push(d.name);
+    by.set(key, g);
+  }
+  return [...by.values()].sort((a, b) => b.items.length - a.items.length);
+}
+
+async function stBrandFromSite(k) {
+  const w = STW();
+  if (!k?.site) return toast(w.brandNeedSite);
+  let site = await wb.studioPoint('site').catch(() => null);
+  if (!site?.open) {
+    stOpenSite(k);
+    for (let i = 0; i < 40 && !site?.open; i++) { await new Promise((r) => setTimeout(r, 150)); site = await wb.studioPoint('site').catch(() => null); }
+  }
+  for (let i = 0; i < 20; i++) {
+    const got = await wb.studioPoint('brand', { op: 'read' }).catch(() => null);
+    if (got?.colors?.length) {
+      ST.brand = { source: 'site', name: StudioWords.host(k.site), colors: got.colors.map((c) => ({ value: c.value, name: '' })), fonts: got.fonts || [] };
+      ST.drift = null;
+      await stSaveBrand();
+      return stRender();
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  toast(w.brandNoColors);
+}
+
+async function stOnBrandClick(e) {
+  const a = e.target.closest('[data-b]');
+  if (!a || a.disabled) return;
+  const t = stCurrent();
+  const k = t && stTask(t);
+  const w = STW();
+  const op = a.dataset.b;
+  if (op === 'site') return stBrandFromSite(k);
+  if (op === 'figma') {
+    try { ST.info.figma = await wb.studioFigma(true); } catch (err) { toast(err.message); }
+    toast(w.figmaHow, 7000);
+    return stRender();
+  }
+  if (op === 'drop') {
+    ST.brand.colors.splice(Number(a.dataset.i), 1);
+    await stSaveBrand();
+    return stRender();
+  }
+  if (op === 'check') {
+    a.disabled = true;
+    const got = await wb.studioPoint('brand', { op: 'check', arg: stBrandColors() }).catch(() => null);
+    ST.drift = Array.isArray(got) ? got : [];
+    return stRender();
+  }
+  if (op === 'keep') { ST.drift = null; wb.studioPoint('brand', { op: 'show', arg: [] }).catch(() => {}); return stRender(); }
+  if (op === 'where') {
+    const groups = stDriftGroups(ST.drift || []);
+    const marks = groups.flatMap((g) => g.items.slice(0, 3).map((it) => ({ sel: it.sel, text: `${g.value} → ${stBrandName(g.nearest)}`, who: w.brand })));
+    wb.studioPoint('brand', { op: 'show', arg: marks }).catch(() => {});
+    return;
+  }
+  if (op === 'fix' && t) {
+    // Each one to its nearest brand colour, by hand (Studio's Boost): at once, and undoable.
+    for (const g of stDriftGroups(ST.drift || [])) {
+      for (const it of g.items) await stHand(t, k, [{ sel: it.sel, name: it.name }], { [it.prop]: g.nearest });
+    }
+    ST.drift = [];
+    wb.studioPoint('brand', { op: 'show', arg: [] }).catch(() => {});
+    stRender();
+  }
+}
+
+// Brand from Figma: a task of its own (sessions get Figma when they start), read only.
+async function stFigmaBrand(link) {
+  const w = STW();
+  if (!/^https:\/\/(www\.)?figma\.com\//.test(link)) return toast(w.figmaBadLink);
+  ST.current = '';
+  ST.pane = 'chat';
+  $('#st-input').value = w.figmaPrompt(link);
+  stRender();
+  stSubmit();
+}
+
+// ---------------------------------------------------------------- the board (tasks as cards)
+
+function stSetBoard(on) {
+  ST.board = !!on;
+  try { localStorage.setItem('wb.studioBoard', ST.board ? '1' : '0'); } catch {}
+  stRender();
+}
+
+// The picture a task's card shows: its latest snapshot, else its latest picture file.
+function stCardPicture(k) {
+  const shots = k.model.shots;
+  if (shots.length) return { after: stShotKey(shots[shots.length - 1]), before: shots.length > 1 ? stShotKey(shots[0]) : '' };
+  const img = [...k.model.files.values()].filter((f) => f.image).sort((a, b) => b.at - a.at)[0];
+  const th = img && k.thumbs.get(img.rel);
+  if (th?.src) return { after: th.src, before: '' };
+  return null;
+}
+
+function stCardLine(t, k, status) {
+  const w = STW();
+  const ask = ST.mission[t.id]?.asks?.[0];
+  if (status === 'needs' && ask) return `<b>${esc(w.waiting)}:</b> ${esc(StudioWords.askWords(ask.tool, ask.summary, ST.lang)[0])}`;
+  if (status === 'work') {
+    const p = StudioTranscript.planProgress(k.model.plan);
+    const turn = k.model.turns[k.model.turns.length - 1];
+    const step = turn?.items.filter((x) => x.type === 'steps').flatMap((x) => x.steps).filter((s) => s.tool !== 'TodoWrite').pop();
+    const words = step ? StudioWords.stepWords(step.tool, step.input, ST.lang)[2] : w.working;
+    return esc(p?.now || words) + (p && p.total > 1 ? ` · ${esc(w.step(p.index, p.total))}` : '');
+  }
+  const text = k.model.turns.flatMap((x) => x.items).filter((x) => x.type === 'text').pop()?.text || '';
+  const first = text.replace(/\[\[pin:[^\]]*\]\]/g, '').split('\n').find((l) => l.trim()) || '';
+  const files = k.model.files.size;
+  return esc(first.length > 110 ? `${first.slice(0, 109)}…` : first) || esc(files ? w.filesCount(files) : '');
+}
+
+function stRenderBoard(terms) {
+  const w = STW();
+  const board = $('#st-board');
+  const counts = { needs: 0, work: 0, done: 0 };
+  const items = terms.map((t) => {
+    const k = stTask(t);
+    if (!k.loaded) stRead(t, k);
+    const status = stStatus(t);
+    if (counts[status] !== undefined) counts[status]++;
+    return { t, k, status };
+  });
+  // Needs you first, then working, then the rest, newest first.
+  const order = { needs: 0, work: 1, done: 2, idle: 3 };
+  items.sort((a, b) => order[a.status] - order[b.status] || (b.k.model.turns.at(-1)?.at || 0) - (a.k.model.turns.at(-1)?.at || 0));
+  const filter = ST.boardFilter || 'all';
+  const shown = items.filter((x) => filter === 'all' || x.status === filter || (filter === 'done' && x.status === 'idle'));
+  const chips = w.chips[ST.persona in w.chips ? ST.persona : 'designer'];
+  const newCard = `<div class="st-card st-newcard" data-key="new"><div class="st-nc-ttl"><span class="st-nc-pl">${icon('plus', 15)}</span>${esc(w.newTask)}</div>
+    ${chips.map((c) => `<button class="st-chip" data-newchip="${esc(c)}">${esc(c)}</button>`).join('')}
+    <button class="st-nc-blank" data-new>${esc(w.ownWords)}</button></div>`;
+  const cards = shown.map(({ t, k, status }) => {
+    const pic = stCardPicture(k);
+    const ask = ST.mission[t.id]?.asks?.[0];
+    const when = stAgo(k.model.turns.at(-1)?.at);
+    const pv = pic
+      ? `<div class="st-cpv">${stImg(pic.after)}${pic.before ? `<span class="st-cpv-before">${stImg(pic.before)}</span><span class="st-cba"><button data-ba="before">${esc(w.before)}</button><button data-ba="after" class="on">${esc(w.after)}</button></span>` : ''}</div>`
+      : `<div class="st-cpv empty">${k.site ? icon('globe', 22) : icon('file', 22)}${k.site ? `<span>${esc(StudioWords.host(k.site))}</span>` : ''}</div>`;
+    const acts = status === 'needs' && ask && ask.answerable !== false
+      ? `<div class="st-cacts"><button class="st-btn pri" data-answer="${ask.canAlways ? 'session' : 'allow'}" data-ask="${esc(ask.id)}">${esc(w.allow)}</button>${ask.canAlways ? `<button class="st-btn" data-answer="allow" data-ask="${esc(ask.id)}">${esc(w.once)}</button>` : ''}<button class="st-btn" data-answer="deny" data-ask="${esc(ask.id)}">${esc(w.no)}</button></div>`
+      : (status === 'done' || status === 'idle') && (k.model.files.size || k.boost?.changed)
+        ? `<div class="st-cacts"><button class="st-btn" data-open>${icon('eye', 13)}<span>${esc(w.look)}</span></button><button class="st-btn" data-handoff>${icon('arrowRight', 13)}<span>${esc(w.handoff)}</span></button></div>`
+        : '';
+    return `<div class="st-card ${status}" data-term="${esc(t.id)}" data-key="c${esc(t.id)}" tabindex="0">${pv}
+      <div class="st-cbody"><div class="st-ct1">${stDot(status)}<span class="st-cttl">${esc(stTitle(t))}</span><span class="st-cwhen">${esc(when)}</span></div>
+      <div class="st-ct2">${stCardLine(t, k, status)}</div>${acts}</div></div>`;
+  });
+  const f = (id, label, n) => `<button class="st-filter${filter === id ? ' on' : ''}" data-filter="${id}">${id !== 'all' ? stDot(id === 'done' ? 'done' : id) : ''}${esc(label)}${n !== undefined ? ` · ${n}` : ''}</button>`;
+  const html = `<div class="st-bhead"><h2>${esc(w.tasks)}</h2>${counts.needs ? `<span class="st-bcount">${esc(w.needsCount(counts.needs))}</span>` : ''}
+    <div class="st-filters">${f('all', w.all)}${counts.needs ? f('needs', w.waiting, counts.needs) : ''}${counts.work ? f('work', w.inWork, counts.work) : ''}${f('done', w.done)}</div></div>
+    <div class="st-grid">${newCard}${cards.join('')}</div>`;
+  if (board.dataset.html === html) return;
+  const first = !board.dataset.html;
+  board.innerHTML = html;
+  board.dataset.html = html;
+  if (first) board.querySelectorAll('.st-card').forEach((c, i) => { c.classList.add('st-in'); c.style.animationDelay = `${Math.min(i, 8) * 30}ms`; });
+  stFillImages(board);
+}
+
+async function stOnBoardClick(e) {
+  const w = STW();
+  const flt = e.target.closest('[data-filter]');
+  if (flt) { ST.boardFilter = flt.dataset.filter; return stRender(); }
+  const chip = e.target.closest('[data-newchip]');
+  if (chip || e.target.closest('[data-new]')) {
+    ST.current = '';
+    ST.preview = null;
+    stSetBoard(false);
+    $('#st-input').value = chip ? chip.dataset.newchip : '';
+    $('#st-input').focus();
+    return;
+  }
+  const card = e.target.closest('.st-card[data-term]');
+  if (!card) return;
+  const t = stTerms().find((x) => x.id === card.dataset.term);
+  if (!t) return;
+  const ba = e.target.closest('[data-ba]');
+  if (ba) {
+    // До/После on the card: the first snapshot over the latest one, crossfaded.
+    card.classList.toggle('show-before', ba.dataset.ba === 'before');
+    for (const b of card.querySelectorAll('[data-ba]')) b.classList.toggle('on', b === ba);
+    return;
+  }
+  const ans = e.target.closest('[data-answer]');
+  if (ans) {
+    for (const b of card.querySelectorAll('[data-answer]')) b.disabled = true;
+    try {
+      if (await wb.studioAnswer(ans.dataset.ask, ans.dataset.answer)) {
+        const k = stTask(t);
+        const ti = Math.max(0, k.model.turns.length - 1);
+        const ask = ST.mission[t.id]?.asks?.find((x) => x.id === ans.dataset.ask);
+        const what = ask ? StudioWords.askWords(ask.tool, ask.summary, ST.lang)[0].replace(/^(Разрешить|Allow)\s+/, '').replace(/\?$/, '') : '';
+        k.answered.push({ id: ans.dataset.ask, choice: ans.dataset.answer, title: what, turn: ti, after: k.model.turns[ti]?.items.length || 0 });
+        if (ST.mission[t.id]?.asks) ST.mission[t.id].asks = ST.mission[t.id].asks.filter((x) => x.id !== ans.dataset.ask);
+        card.classList.add('st-answered-card');
+      }
+    } catch {}
+    setTimeout(stRender, stReduced() ? 0 : 200);
+    return;
+  }
+  if (e.target.closest('[data-handoff]')) { stSend(t, w.handoffPrompt); }
+  // Anything else on the card opens the task.
+  ST.current = t.id;
+  ST.preview = null;
+  stTask(t).seen = true;
+  stSetBoard(false);
+}
+
 // ---------------------------------------------------------------- "Кто вы?" (the persona picker)
 
-const ST_PERSONAS = [
-  ['developer', 'dev', '#43cea2', '#2ef2d2'],
-  ['designer', 'des', '#c471f5', '#c58cff'],
-  ['manager', 'man', '#4facfe', '#ffd36b'],
-  ['everyday', 'use', '#8a8fe0', '#ff9a6b'],
-];
+const ST_PERSONAS = [['developer', 'dev'], ['designer', 'des'], ['manager', 'man'], ['everyday', 'use']];
 
-// Four characters, as in a game: the guess (or the current one) picked already. The pick decides
-// what the Workbench tab shows first (Studio, or the Workbench for developers); both stay a click away.
+// Four heroes, as a game's character select (art and effects: studio-persona-fx.js, studio-persona.css):
+// the guess (or the current one) picked already. The pick decides what the Workbench tab shows first
+// (Studio, or the Workbench for developers); both stay a click away.
 function stPersonaPicker({ guess = '', current = '' } = {}) {
   const w = STW();
   $('#st-persona')?.remove();
@@ -847,22 +1205,32 @@ function stPersonaPicker({ guess = '', current = '' } = {}) {
   box.id = 'st-persona';
   box.setAttribute('role', 'dialog');
   box.setAttribute('aria-label', w.whoTitle);
-  const cards = ST_PERSONAS.map(([id, k, c, hc]) => {
+  const svg = (name, size = 15, sw = 1.8) => `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${(typeof STUDIO_PERSONA_ICONS === 'object' && STUDIO_PERSONA_ICONS[name]) || ''}</svg>`;
+  const cards = ST_PERSONAS.map(([id, k], i) => {
     const p = w.personas[id];
+    const col = (typeof STUDIO_PERSONA_COLORS === 'object' && STUDIO_PERSONA_COLORS[k]) || { c: '#8a8fe0', c2: '#ffffff', bg: ['#1d1b49', '#0c0b22'] };
     const art = `studio-art/hero-${k}.webp`;
-    return `<div class="pc${id === sel ? ' sel' : ''}" data-k="${k}" data-id="${id}" data-cta="${esc(p.cta)}" style="--c:${c};--hc:${hc}" tabindex="0" role="button">
-      ${id === guess && !current ? `<span class="guess">${icon('sparkles', 11)}${esc(w.guess)}</span>` : ''}
-      ${id === sel ? `<span class="check">${icon('check', 14)}</span>` : ''}
-      <div class="art"><div class="tilt"><div class="stk" style="--img:url(${art})"><canvas class="back"></canvas><img class="hero" src="${art}" alt=""><img class="rgb r" src="${art}" alt=""><img class="rgb b" src="${art}" alt=""><span class="mask foil"><i></i></span><span class="mask scan"><i></i></span><span class="mask flash-m"><span class="flash"></span></span><canvas class="front"></canvas></div></div></div>
-      <div class="name">${esc(p.name)}</div><div class="role">${esc(p.role)}</div>
-      <ul>${p.points.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>
-      <div class="gets">${icon('arrowRight', 13)}<span>${p.gets}</span></div></div>`;
+    const frame = (typeof STUDIO_PERSONA_FRAMES === 'object' && STUDIO_PERSONA_FRAMES[k]) || '';
+    const rgb = k === 'dev' ? `<img class="rgb r" src="${art}" alt=""><img class="rgb b" src="${art}" alt="">` : '';
+    const scan = k === 'dev' ? '<span class="mask scan"><i></i></span>' : '';
+    return `<div class="pc${id === sel ? ' sel' : ''}" data-k="${k}" data-id="${id}" data-cta="${esc(p.cta)}" style="--c:${col.c};--c2:${col.c2};--hc:${col.c};--i:${i}" tabindex="0" role="button" aria-label="${esc(p.name)}">
+      <div class="beam"></div><div class="floor"></div>${frame}
+      <div class="art"><div class="tilt"><div class="stk" style="--img:url(${art})"><canvas class="back"></canvas>
+        <div class="bust"><img class="hero" src="${art}" alt="">${rgb}<span class="mask foil"><i></i></span>${scan}<span class="mask flash-m"><span class="flash"></span></span></div>
+        <canvas class="front"></canvas></div></div></div>
+      <div class="plate"><svg class="ribbon" width="292" height="46" viewBox="0 0 292 46" aria-hidden="true"><path d="M0 10 h20 v-6 h252 v6 h20 l-10 13 10 13 h-20 v6 h-252 v-6 h-20 l10 -13z" fill="${col.bg[1]}" stroke="${col.c}" stroke-opacity=".7"/><path d="M20 4 v6 M272 4 v6 M20 36 v6 M272 36 v6" stroke="${col.c}" stroke-opacity=".7"/></svg><h3>${esc(p.name)}</h3></div>
+      <div class="cls"><b>${esc(p.cls)}</b> · ${esc(p.role)}</div>
+      <ul class="perks">${p.perks.map(([icn, t]) => `<li><span class="pi">${svg(icn)}</span><span>${esc(t)}</span></li>`).join('')}</ul>
+      <div class="opens">${svg('arrow', 13)}<span>${p.gets}</span></div>
+      ${id === guess && !current ? `<div class="guess"><span class="seal">${svg('spark', 12, 2.2)}</span>${esc(w.guess)}</div>` : ''}
+    </div>`;
   }).join('');
-  box.innerHTML = `<div class="stp-in"><h2>${esc(w.whoTitle)}</h2><p class="lead">${esc(w.whoLead)}</p>
+  box.innerHTML = `<canvas class="dust"></canvas><h2>${esc(w.whoTitle)}</h2><p class="lead">${esc(w.whoLead)}</p>
     <div class="cards">${cards}</div>
     <div class="foot">${current ? '' : `<button class="btn ghost" data-a="skip">${esc(w.skip)}</button>`}<button class="btn pri" data-a="go">${esc(w.personas[sel].cta)}</button></div>
-    <div class="note">${esc(current ? w.whoChange : w.whoNote)}</div></div>`;
+    <div class="note">${esc(current ? w.whoChange : w.whoNote)}</div>`;
   document.body.appendChild(box);
+  if (typeof studioPersonaDust === 'function') studioPersonaDust(box);
   let picked = sel;
   const fx = typeof studioPersonaFx === 'function'
     ? studioPersonaFx(box, (k) => { picked = ST_PERSONAS.find((x) => x[1] === k)?.[0] || picked; })
@@ -878,7 +1246,7 @@ function stPersonaPicker({ guess = '', current = '' } = {}) {
     const card = e.target.closest('.pc');
     if (!card) return;
     picked = card.dataset.id;
-    for (const c of box.querySelectorAll('.pc')) c.classList.toggle('sel', c === card);
+    for (const c of box.querySelectorAll('.pc')) { c.classList.toggle('sel', c === card); c.classList.toggle('dim', c !== card); }
     box.querySelector('.btn.pri').textContent = card.dataset.cta;
   });
   box.addEventListener('click', async (e) => {
@@ -910,7 +1278,8 @@ async function stPoint(on) {
   }
   if (!site?.open) { toast(STW().pointNoSite); return; }
   await stBoostSnapshot(k, StudioWords.host(k.site));
-  ST.pointing = !!(await wb.studioPoint('start', { lang: ST.lang, colors: [] }).catch(() => false));
+  await stLoadBrand();
+  ST.pointing = !!(await wb.studioPoint('start', { lang: ST.lang, colors: stBrandColors() }).catch(() => false));
   stSendPins(t, k, true);
   stRender();
 }
@@ -926,6 +1295,7 @@ async function stOnPoint(msg) {
     if (ev.type === 'select') ST.picked = items;
     if (ev.type === 'edit' && items.length && ev.props && typeof ev.props === 'object') await stHand(t, k, items, ev.props);
     if (ev.type === 'say' && typeof ev.text === 'string' && ev.text.trim()) stSayAbout(t, k, items, ev.text.trim());
+    if (ev.type === 'pin' && ev.kind === 'brand') continue;
     if (ev.type === 'pin' && Number.isFinite(+ev.n)) {
       const pin = (k.pins || []).find((p) => p.n === +ev.n);
       if (pin && ev.answer === 'yes') stSend(t, STW().pinYes(pin.n, pin.text));
@@ -1036,6 +1406,9 @@ function stOnModel(t, k) {
     if (!k.siteOpened && ST.view === 'studio' && ST.current === t.id && !document.hidden) stOpenSite(k);
   }
   stSendPins(t, k);
+  // Claude wrote the brand (from Figma): read it again.
+  const bf = k.model.files.get('brand.json');
+  if (bf && bf.times !== k.brandSeen) { k.brandSeen = bf.times; ST.brandLoaded = false; stLoadBrand(); }
   // A restyle that went through: Before/After and Undo for it.
   for (const turn of k.model.turns) for (const it of turn.items) {
     if (it.type === 'steps' && it.steps.some((s) => s.tool === 'mcp__meridian__set_boost' && s.state === 'ok') && k.boost) {

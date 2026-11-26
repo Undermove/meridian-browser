@@ -227,6 +227,7 @@
     // transcript from an offset, an answer to its question, the result site's Boost.
     studioInfo: () => invoke('studioInfo'),
     studioSetPersona: (p) => invoke('studioSetPersona', str(p)),
+    studioFigma: (on) => invoke('studioFigma', on === true),
     // Point and say on Studio's site tab: 'start' (config), 'stop', 'pins' (list), 'settled', 'site'.
     studioPoint: (op, arg) => invoke('studioPoint', str(op), ...(arg === undefined ? [] : [JSON.parse(JSON.stringify(arg))])),
     studioTranscript: (id, offset) => invoke('studioTranscript', str(id), Math.max(0, Number(offset) || 0)),
