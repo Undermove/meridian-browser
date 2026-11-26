@@ -125,7 +125,7 @@ if (a.includes('-p') || a.includes('--print')) {
       process.exit(1);
     }
     const out = /css/i.test(text)
-      ? JSON.stringify({ name: 'Calm', css: '#promo { display: none !important; }', summary: 'Hid the banner.' })
+      ? JSON.stringify({ name: 'Calm', css: 'h1 { letter-spacing: 0.5px; }', hide: ['#promo'], summary: 'Hid the banner.' })
       : 'Answer from Claude Code ' + VERSION + ' (' + account + ')';
     console.log(JSON.stringify({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'content_block_delta', delta: { type: 'text_delta', text: out } } }));
     console.log(JSON.stringify({ type: 'result', is_error: false, result: out }));
