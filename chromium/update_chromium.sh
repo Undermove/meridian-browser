@@ -82,6 +82,8 @@ say "Tests…"
 trap - ERR
 echo "$NEW_REV" > "$HERE/CHROMIUM_REVISION"
 echo "$NEW_VER" > "$HERE/CHROMIUM_VERSION"
+# README badge and any other place people read the engine version.
+node "$HERE/tools/sync_chromium_mentions.mjs"
 "$HERE/export.sh" >/dev/null
 say "Packaging (signed)…"
 "$HERE/package.sh"
@@ -89,7 +91,7 @@ say "Packaging (signed)…"
 # never a push to main.
 UPDATE_BRANCH="chromium-$NEW_VER"
 git -C "$REPO_ROOT" checkout -q -b "$UPDATE_BRANCH"
-git -C "$REPO_ROOT" add -A chromium
+git -C "$REPO_ROOT" add -A chromium README.md
 git -C "$REPO_ROOT" commit -q -m "Chromium $NEW_VER, Meridian $VERSION"
 if [ "$PR" = 1 ]; then
   say "Opening the pull request…"

@@ -89,6 +89,12 @@ Keep these intact:
 - the user's running Meridian (§2);
 - the real Arc data (fixtures only).
 
+## 8. One source for the Chromium version
+`chromium/CHROMIUM_VERSION` is the only place the engine version lives. Anywhere people read it
+(the README badge today) is rewritten by `chromium/tools/sync_chromium_mentions.mjs`, which
+`update_chromium.sh` runs after a bump and CI runs with `--check`. A new mention goes into that
+script's list, not in by hand.
+
 ## Map
 - **Chromium:** `~/repos/chromium/src`, branch `meridian`.
   - Logic: `chrome/browser/meridian/`.
