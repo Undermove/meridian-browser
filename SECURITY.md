@@ -90,8 +90,6 @@ the Site Control Center. The other patches in `chromium/patches/` are UI and Mer
   extra real-time checks of new sites answer only Chrome's own key. It needs a Google API key built in:
   a build made without `~/.config/meridian/google_api_keys` (`google_api_key = "…"`, a key limited to the
   Safe Browsing API) has no such warnings, only the download warnings Chromium gives without it.
-- **Not notarized** while releases are signed with the self-signed "Meridian Signing" certificate: macOS
-  asks to allow the first launch (System Settings → Privacy & Security → Open Anyway).
 - **Any program running as you can use the MCP server:** the token file is readable by your user, so a
   program running under your account can connect as an agent with the access level you set. Use "ask"
   or "off" unless you need "full".
