@@ -4,7 +4,7 @@
 // over with the rest of its data.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -291,9 +291,10 @@ function fakeClaude(answer) {
   return new Promise((r) => server.listen(0, '127.0.0.1', () => r({ server, requests, base: `http://127.0.0.1:${server.address().port}` })));
 }
 
-test('Improve with Claude: the page outline goes to Claude, its CSS becomes the boost; Undo', async () => {
+test('Improve with Claude: the page measured, with a screenshot, goes to Claude, its CSS becomes the boost, clutter a zap; Undo', async () => {
   const s = await site();
-  const api = await fakeClaude({ name: 'Calm News', css: '#promo { display: none !important; }', summary: 'Hid the subscription banner.' });
+  // The same answer again in the review round: nothing to change, so it's done.
+  const api = await fakeClaude({ name: 'Calm News', css: '#story h1 { color: rgb(1, 2, 3); }', hide: ['#promo'], summary: 'Hid the subscription banner.' });
   const b = await launch([s.url], { args: [`--meridian-ai-base-url=${api.base}`] });
   try {
     const page = await b.page(s.url);
@@ -312,30 +313,44 @@ test('Improve with Claude: the page outline goes to Claude, its CSS becomes the 
     await clickEditor(b, `${BE}.getElementById('improve')`);
     await b.waitFor(`${BE}.getElementById('note')?.textContent.includes('Hid the subscription banner.')`, 15000, `${BE}.getElementById('note')?.textContent`);
     await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
-    // A boost still called "My Boost" takes the AI's name.
-    assert.equal((await b.eval(`${H}.getBoost()`)).state.boost.name, 'Calm News');
+    await page.waitFor(`getComputedStyle(document.querySelector('#story h1')).color === 'rgb(1, 2, 3)'`, 5000);
+    // A boost still called "My Boost" takes the AI's name; the clutter is a zap (its own Undo in Zap).
+    const made = (await b.eval(`${H}.getBoost()`)).state.boost;
+    assert.equal(made.name, 'Calm News');
+    assert.deepEqual(made.zaps, ['#promo']);
 
-    // What Claude got: the boost instructions, the outline with the page's elements, the wish.
-    const req = api.requests.filter((r) => r.stream).pop();
-    assert.match(req.system, /Boosts in the Meridian browser/);
+    // What Claude got: the designer's brief, the page measured (landmarks, type, colours, the
+    // outline with the page's elements), a screenshot, the wish; then a review round.
+    const asked = api.requests.filter((r) => r.stream);
+    assert.equal(asked.length, 2, 'a redesign and a review');
+    const req = asked[0];
+    assert.match(req.system, /senior product designer/);
     assert.equal(req.tools, undefined, 'no browser tools for a boost');
     const text = JSON.stringify(req.messages);
     assert.match(text, /div#promo\.promo-banner/);
     assert.match(text, /Subscribe now!/);
     assert.match(text, /hide the banner/);
+    assert.match(text, /Viewport: \d+x\d+ CSS px/);
+    assert.match(text, /Type scale in use/);
+    assert.match(text, /main#story/);
+    const image = req.messages.at(-1).content.find((c) => c.type === 'image');
+    assert.equal(image?.source?.media_type, 'image/jpeg', 'a screenshot of the page');
+    assert.ok(Buffer.from(image.source.data, 'base64').subarray(0, 2).equals(Buffer.from([0xff, 0xd8])), 'a JPEG');
+    assert.match(JSON.stringify(asked[1].messages), /Review round 2 of 3/);
 
     // Undo: the boost as it was before.
     await clickEditor(b, `${BE}.getElementById('undo')`);
     await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'block'`, 5000);
     const after = (await b.eval(`${H}.getBoost()`)).state.boost;
     assert.equal(after.css, '');
+    assert.deepEqual(after.zaps, []);
     assert.equal(after.name, 'My Boost');
     page.close();
   } finally { await b.close(); s.server.close(); api.server.close(); }
 });
 
-// A stand-in `claude` (Claude Code), signed in: it answers a boost with `answer` and writes down the
-// CLAUDE_CONFIG_DIR each run got (the space's account).
+// A stand-in `claude` (Claude Code), signed in: it answers a boost with `answer` (and a review round
+// with "done") and writes down the CLAUDE_CONFIG_DIR each run got (the space's account).
 function fakeClaudeCode(dir, answer) {
   const log = path.join(dir, 'log');
   fs.mkdirSync(log);
@@ -349,7 +364,8 @@ let stdin = '';
 process.stdin.on('data', (d) => { stdin += d; });
 process.stdin.on('end', () => {
   const out = (o) => console.log(JSON.stringify(o));
-  const text = ${JSON.stringify(JSON.stringify(answer))};
+  // A review round: nothing more to change.
+  const text = /Review round/.test(stdin) ? '{"done": true}' : ${JSON.stringify(JSON.stringify(answer))};
   out({ type: 'system', subtype: 'init', session_id: 's-' + n, model: 'claude-opus-5-5' });
   out({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'content_block_delta', delta: { type: 'text_delta', text } } });
   out({ type: 'result', subtype: 'success', is_error: false, result: text });
@@ -358,10 +374,197 @@ process.stdin.on('end', () => {
   return () => fs.readdirSync(log).sort((a, c) => parseInt(a) - parseInt(c)).map((f) => fs.readFileSync(path.join(log, f), 'utf8'));
 }
 
+// The pixels at the left and right edges, a fifth from the bottom, of a JPEG (base64), read through
+// macOS's sips as a BMP.
+function pageEdges(jpeg) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-shot-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'a.jpg'), Buffer.from(jpeg, 'base64'));
+    execFileSync('sips', ['-s', 'format', 'bmp', path.join(dir, 'a.jpg'), '--out', path.join(dir, 'a.bmp')], { stdio: 'ignore' });
+    const bmp = fs.readFileSync(path.join(dir, 'a.bmp'));
+    const at = bmp.readUInt32LE(10), w = bmp.readInt32LE(18), h = bmp.readInt32LE(22), bpp = bmp.readUInt16LE(28) / 8;
+    const row = Math.ceil((w * bpp) / 4) * 4;
+    const y = Math.round(Math.abs(h) * 0.8);
+    const line = h > 0 ? Math.abs(h) - 1 - y : y;  // Bottom-up unless the height is negative.
+    const px = (x) => { const o = at + line * row + x * bpp; return [bmp[o + 2], bmp[o + 1], bmp[o]]; };
+    return [px(1), px(4), px(w - 2), px(w - 5)];
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+// A stand-in Claude Code that designs in rounds: run n answers `rounds[n]` (the last one again
+// after that), a second and a half later, as a real one takes its time; each run's message is
+// written down: what it was asked and whether a screenshot came with it.
+function fakeDesigner(dir, rounds) {
+  const log = path.join(dir, 'log');
+  fs.mkdirSync(log);
+  standIn(dir, 'claude', `const fs = require('fs'), path = require('path');
+const log = ${JSON.stringify(log)};
+const rounds = ${JSON.stringify(rounds)};
+const args = process.argv.slice(2);
+if (args[0] === 'auth' && args[1] === 'status') { console.log(JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' })); process.exit(0); }
+const n = fs.readdirSync(log).length;
+let stdin = '';
+process.stdin.on('data', (d) => { stdin += d; });
+process.stdin.on('end', () => {
+  // A screenshot comes as a stream-json user message: its picture and its text.
+  let text = stdin, images = [];
+  if (args.includes('--input-format')) {
+    const content = JSON.parse(stdin.trim()).message.content;
+    images = content.filter((c) => c.type === 'image').map((c) => c.source.media_type + ':' + c.source.data);
+    text = content.filter((c) => c.type === 'text').map((c) => c.text).join('');
+  }
+  fs.writeFileSync(path.join(log, n + '.json'), JSON.stringify({ text, images }));
+  const out = (o) => console.log(JSON.stringify(o));
+  const answer = JSON.stringify(rounds[Math.min(n, rounds.length - 1)]);
+  setTimeout(() => {
+    out({ type: 'system', subtype: 'init', session_id: 's-' + n, model: 'claude-opus-5-5' });
+    out({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'content_block_delta', delta: { type: 'text_delta', text: answer } } });
+    out({ type: 'result', subtype: 'success', is_error: false, result: answer });
+  }, 1500);
+});
+`);
+  return () => fs.readdirSync(log).sort((a, c) => parseInt(a) - parseInt(c)).map((f) => JSON.parse(fs.readFileSync(path.join(log, f), 'utf8')));
+}
+
+test('Improve redesigns in rounds: each CSS checked (nothing hidden, nothing from the internet), a screenshot to review it, progress in the editor; kept after a reload; Undo', async () => {
+  const s = await site();
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-accounts-')));
+  fs.mkdirSync(path.join(home, '.claude'));
+  fs.writeFileSync(path.join(home, '.claude', 'settings.json'), '');
+  const runs = fakeDesigner(bin, [
+    // Round 1: a redesign, with a rule that hides the content and a picture from the internet.
+    { name: 'Night Desk', summary: 'A dark, calm reading desk.', hide: [],
+      css: 'main#story { background: rgb(10, 20, 30); color: rgb(240, 240, 240) }\n' +
+        'main { display: none !important }\n' +
+        'body { background-image: url(https://tracker.example/pixel.png); font-size: 17px }\n' +
+        'a:focus-visible { outline: 2px solid rgb(120, 160, 255) }' },
+    // Round 2, the review: fixes, the whole CSS again.
+    { summary: 'Fixed the heading.', hide: [],
+      css: 'main#story { background: rgb(10, 20, 30); color: rgb(240, 240, 240) }\n' +
+        'body { font-size: 17px }\n#story h1 { letter-spacing: 1px }' },
+    // Round 3: good as it is.
+    { done: true, css: '', summary: '' },
+  ]);
+  const b = await launch([s.url], { args: [`--meridian-agents-path=${bin}`, `--meridian-accounts-home=${home}`] });
+  try {
+    const page = await b.page(s.url);
+    await page.waitFor(`document.readyState === 'complete'`);
+    const before = await page.eval(`getComputedStyle(document.getElementById('story')).backgroundColor`);
+    await openEditor(b);
+    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
+    await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
+    await b.eval(`${BE}.getElementById('wish').value = 'dark and strict'`);
+    await clickEditor(b, `${BE}.getElementById('improve')`);
+    // The rounds, as the button and the page's status pill show them; the glow over the page all the
+    // while, never in the way.
+    const labels = new Set(), pills = new Set();
+    let overlay = null, magic = null;
+    for (let i = 0; i < 300; i++) {
+      const now = await b.eval(`({ label: ${BE}.getElementById('improve').textContent.trim(), magic: ${BE}.getElementById('improve').classList.contains('magic'), note: ${BE}.getElementById('note')?.textContent || '', state: app.$.boostMagic.state, pill: app.$.boostMagic.shadowRoot.getElementById('pill')?.textContent.replace(/\\s+/g, ' ').trim() || '' })`);
+      labels.add(now.label);
+      if (now.state === 'running') {
+        pills.add(now.pill);
+        magic ||= now.magic;
+        overlay ||= await b.eval(`(() => { const m = app.$.boostMagic, r = m.getBoundingClientRect(), c = app.$.contentRegion.getBoundingClientRect(); const st = getComputedStyle(m); return { over: Math.abs(r.left - c.left) < 2 && Math.abs(r.top - c.top) < 2 && Math.abs(r.width - c.width) < 2 && Math.abs(r.height - c.height) < 2, pointer: st.pointerEvents, opacity: st.opacity, turning: getComputedStyle(m.shadowRoot.querySelector('.ring.edge i')).animationName }; })()`);
+      }
+      if (now.note) break;
+      await sleep(100);
+    }
+    assert.match(await b.eval(`${BE}.getElementById('note').textContent`), /A dark, calm reading desk\./);
+    assert.ok([...labels].some((l) => /Designing… 1\/3/.test(l)), [...labels].join(' | '));
+    assert.ok([...labels].some((l) => /2\/3/.test(l)), [...labels].join(' | '));
+    assert.ok([...labels].some((l) => /3\/3/.test(l)), [...labels].join(' | '));
+    assert.ok(magic, 'the button glows while it works');
+    assert.deepEqual({ ...overlay, opacity: undefined }, { over: true, pointer: 'none', opacity: undefined, turning: 'magic-turn' });
+    assert.ok([...pills].some((p) => /Designing… 1\/3.*going for “dark and strict”/.test(p)), [...pills].join(' | '));
+    assert.ok([...pills].some((p) => /Reviewing… 2\/3.*fixing what the checks took out/.test(p)), [...pills].join(' | '));
+    assert.ok([...pills].some((p) => /Polishing… 3\/3/.test(p)), [...pills].join(' | '));
+    // Done: a moment with Undo in the pill, then it goes by itself.
+    await b.waitFor(`app.$.boostMagic.state === 'done' && /Done/.test(app.$.boostMagic.shadowRoot.getElementById('pill').textContent) && !!app.$.boostMagic.shadowRoot.getElementById('magicUndo')`, 3000);
+    await b.waitFor(`app.$.boostMagic.state === 'off' && getComputedStyle(app.$.boostMagic).visibility === 'hidden'`, 8000);
+
+    // Three runs, each with a screenshot; the review hears what the checks took out.
+    const asked = runs();
+    assert.equal(asked.length, 3);
+    for (const r of asked) assert.deepEqual(r.images.map((i) => i.split(':')[0]), ['image/jpeg'], 'a screenshot each round');
+    // The glow is the browser's, over the tab: the AI's screenshot (taken while it shone) is the
+    // page alone, its edges the page's own white.
+    if (process.platform === 'darwin') {
+      const edges = pageEdges(asked[1].images[0].split(':')[1]);
+      assert.ok(edges.every((px) => px.every((v) => v > 235)), `screenshot edges ${JSON.stringify(edges)}`);
+    }
+    assert.match(asked[0].text, /The person's direction: dark and strict/);
+    assert.match(asked[0].text, /Landmarks/);
+    assert.match(asked[1].text, /Review round 2 of 3/);
+    assert.match(asked[1].text, /main: display: none hides content/);
+    assert.match(asked[1].text, /loads from the internet/);
+    assert.match(asked[1].text, /<css_on_the_page>[\s\S]*main#story/);
+
+    // On the page: round 2's CSS; the content shown; nothing loaded from the internet.
+    const look = () => page.eval(`(() => { const st = getComputedStyle(document.getElementById('story')); return { bg: st.backgroundColor, display: st.display, spacing: getComputedStyle(document.querySelector('#story h1')).letterSpacing, image: getComputedStyle(document.body).backgroundImage }; })()`);
+    await page.waitFor(`getComputedStyle(document.querySelector('#story h1')).letterSpacing === '1px'`, 5000);
+    assert.deepEqual(await look(), { bg: 'rgb(10, 20, 30)', display: 'block', spacing: '1px', image: 'none' });
+    const saved = (await b.eval(`${H}.getBoost()`)).state.boost;
+    assert.equal(saved.name, 'Night Desk');
+    assert.match(saved.css, /#story h1 \{\n {2}letter-spacing: 1px !important;\n\}/);
+    assert.doesNotMatch(saved.css, /display: none|tracker\.example/);
+    // In the editor's code, to change by hand.
+    await clickEditor(b, `${BE}.getElementById('code')`);
+    await b.waitFor(`${BE}.getElementById('css')?.value.includes('letter-spacing: 1px')`, 5000);
+
+    // A reload: still there.
+    await page.eval('location.reload()');
+    await page.waitFor(`document.readyState === 'complete' && getComputedStyle(document.getElementById('story')).backgroundColor === 'rgb(10, 20, 30)'`, 8000);
+
+    // Undo: the page as before Improve, also after a reload.
+    await clickEditor(b, `${BE}.getElementById('undo')`);
+    await page.waitFor(`getComputedStyle(document.getElementById('story')).backgroundColor === ${JSON.stringify(before)}`, 5000);
+    assert.equal((await b.eval(`${H}.getBoost()`)).state.boost.css, '');
+    await page.eval('location.reload()');
+    await page.waitFor(`document.readyState === 'complete'`);
+    await sleep(500);
+    assert.equal(await page.eval(`getComputedStyle(document.getElementById('story')).backgroundColor`), before);
+    page.close();
+  } finally {
+    await b.close(); s.server.close();
+    fs.rmSync(bin, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Improve with reduced motion: the glow stands still, the round in words; it goes on an error', async () => {
+  const s = await site();
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-accounts-')));
+  fs.mkdirSync(path.join(home, '.claude'));
+  fs.writeFileSync(path.join(home, '.claude', 'settings.json'), '');
+  // Not a boost: an error, and the magic goes at once.
+  fakeDesigner(bin, [{ nothing: 'here' }]);
+  const b = await launch([s.url], { args: [`--meridian-agents-path=${bin}`, `--meridian-accounts-home=${home}`] });
+  try {
+    const page = await b.page(s.url);
+    await page.waitFor(`document.readyState === 'complete'`);
+    await b.cdp.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
+    await openEditor(b);
+    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
+    await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
+    await clickEditor(b, `${BE}.getElementById('improve')`);
+    await b.waitFor(`app.$.boostMagic.state === 'running' && /Designing… 1\\/3/.test(app.$.boostMagic.shadowRoot.getElementById('pill').textContent)`, 8000);
+    const still = await b.eval(`(() => { const r = app.$.boostMagic.shadowRoot; const a = (sel) => getComputedStyle(r.querySelector(sel)).animationName; return { ring: a('.ring.edge i'), glow: a('.ring.glow'), shimmer: getComputedStyle(r.querySelector('.shimmer')).display, button: getComputedStyle(${BE}.getElementById('improve'), '::before').animationName, shown: getComputedStyle(app.$.boostMagic).opacity }; })()`);
+    assert.deepEqual(still, { ring: 'none', glow: 'none', shimmer: 'none', button: 'none', shown: '1' });
+    await b.waitFor(`${BE}.getElementById('note')?.classList.contains('err')`, 15000);
+    await b.waitFor(`app.$.boostMagic.state === 'off'`, 2000);
+    page.close();
+  } finally {
+    await b.close(); s.server.close();
+    fs.rmSync(bin, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('Improve with Claude Code when nothing is picked in Settings › AI: in the default space and in a space with its own profile (as its AI account)', async () => {
   const s = await site();
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
-  const runs = fakeClaudeCode(bin, { name: 'Calm News', css: '#promo { display: none !important; }', summary: 'Hid the banner.' });
+  const runs = fakeClaudeCode(bin, { name: 'Calm News', css: '#story { color: rgb(1, 2, 3); }', hide: ['#promo'], summary: 'Hid the banner.' });
   // Claude Code's accounts: its own folder and a Work one.
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-accounts-')));
   for (const dir of ['.claude', '.claude-work']) { fs.mkdirSync(path.join(home, dir)); fs.writeFileSync(path.join(home, dir, 'settings.json'), ''); }
@@ -380,7 +583,7 @@ test('Improve with Claude Code when nothing is picked in Settings › AI: in the
     await clickEditor(b, `${BE}.getElementById('improve')`);
     await b.waitFor(`${BE}.getElementById('note')?.textContent.includes('Hid the banner.')`, 20000, `${BE}.getElementById('note')?.textContent`);
     await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
-    assert.deepEqual(runs(), ['<unset>'], 'one run, as Claude Code’s own account');
+    assert.deepEqual(runs(), ['<unset>', '<unset>'], 'a redesign and a review, as Claude Code’s own account');
     await b.eval('app.$.boostEditor.open = false');
     page.close();
 
@@ -410,7 +613,7 @@ test('Improve with Claude Code when nothing is picked in Settings › AI: in the
     await clickEditor(b, `${BE}.getElementById('improve')`);
     await b.waitFor(`${BE}.getElementById('note')?.textContent.includes('Hid the banner.')`, 20000, `${BE}.getElementById('note')?.textContent`);
     await page2.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
-    assert.deepEqual(runs(), ['<unset>', path.join(home, '.claude-work')], 'the space’s Work account');
+    assert.deepEqual(runs(), ['<unset>', '<unset>', path.join(home, '.claude-work'), path.join(home, '.claude-work')], 'the space’s Work account');
     page2.close();
   } finally {
     await b.close(); s.server.close();
@@ -421,7 +624,7 @@ test('Improve with Claude Code when nothing is picked in Settings › AI: in the
 test('Improve with AI in a space that never chose runs as the main subscription (Settings › AI › New spaces)', async () => {
   const s = await site();
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
-  const runs = fakeClaudeCode(bin, { name: 'Calm News', css: '#promo { display: none !important; }', summary: 'Hid the banner.' });
+  const runs = fakeClaudeCode(bin, { name: 'Calm News', css: '#story { color: rgb(1, 2, 3); }', hide: ['#promo'], summary: 'Hid the banner.' });
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-accounts-')));
   for (const dir of ['.claude', '.claude-work']) { fs.mkdirSync(path.join(home, dir)); fs.writeFileSync(path.join(home, dir, 'settings.json'), ''); }
   const b = await launch([s.url], { args: [`--meridian-agents-path=${bin}`, `--meridian-accounts-home=${home}`] });
@@ -438,7 +641,7 @@ test('Improve with AI in a space that never chose runs as the main subscription 
     await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
     await clickEditor(b, `${BE}.getElementById('improve')`);
     await b.waitFor(`${BE}.getElementById('note')?.textContent.includes('Hid the banner.')`, 20000, `${BE}.getElementById('note')?.textContent`);
-    assert.deepEqual(runs(), [path.join(home, '.claude-work')], 'as the main subscription');
+    assert.deepEqual(runs(), [path.join(home, '.claude-work'), path.join(home, '.claude-work')], 'as the main subscription');
     page.close();
   } finally {
     await b.close(); s.server.close();

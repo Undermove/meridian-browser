@@ -26,7 +26,7 @@ process.stdin.on('data', (d) => { stdin += d; });
 process.stdin.on('end', () => {
   fs.writeFileSync(path.join(log, n + '.stdin'), stdin);
   const boost = stdin.includes('page_outline');
-  const full = boost ? JSON.stringify({ name: 'Calm', css: '#promo { display: none !important; }', summary: 'Hid the promo banner.' }) : 'Try a space for work.';
+  const full = boost ? JSON.stringify({ name: 'Calm', css: 'h1 { letter-spacing: 0.5px; }', hide: ['#promo'], summary: 'Hid the promo banner.' }) : 'Try a space for work.';
   setTimeout(() => {
     if (boost) { say(full); console.log(JSON.stringify({ type: 'result', is_error: false, result: full })); return; }
     say('Try a space ');
@@ -44,7 +44,7 @@ test('Ask opens with suggestions; one click makes a Boost, explains it and can u
   const log = fakeClaude(bin);
   const b = await launch([`http://127.0.0.1:${site.address().port}/`], { args: [`--meridian-agents-path=${bin}`] });
   const starter = (k) => `${AK}.querySelector('.starter[data-kind="${k}"]')`;
-  const boosts = `app.$.tabstrip.handler_.getBoost().then(({state}) => state.boosts.map((x) => x.css))`;
+  const boosts = `app.$.tabstrip.handler_.getBoost().then(({state}) => state.boosts.map((x) => [x.css, ...x.zaps]))`;
   try {
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
     await b.eval(`app.$.tabstrip.handler_.getSettings().then(({settings}) => app.$.tabstrip.handler_.setSettings({...settings, aiProvider: 'claude-code', aiConsent: 'always'}))`);
@@ -57,7 +57,8 @@ test('Ask opens with suggestions; one click makes a Boost, explains it and can u
     await b.click(starter('focus'));
     await b.waitFor(`!!${AK}.querySelector('.thinking')`);
     await b.waitFor(`[...${AK}.querySelectorAll('.msg.assistant')].pop()?.textContent.includes('Hid the promo banner')`, 20000);
-    assert.deepEqual(await b.eval(boosts), ['#promo { display: none !important; }']);
+    // The CSS as checked (each declaration !important), the clutter as a zap.
+    assert.deepEqual(await b.eval(boosts), [['h1 {\n  letter-spacing: 0.5px !important;\n}\n', '#promo']]);
     assert.ok(await b.eval(`!${AK}.querySelector('.starter')`), 'suggestions gave way to the chat');
     await b.click(`${AK}.querySelector('.undo-boost')`);
     await b.waitFor(`${AK}.querySelector('.boost-note')?.textContent.includes('Undone')`);

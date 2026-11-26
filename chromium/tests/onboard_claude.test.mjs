@@ -61,7 +61,8 @@ if (a[0] === 'mcp' && a[1] === 'add') {
 fs.appendFileSync(${JSON.stringify(runs)}, ${JSON.stringify(version)} + '\\n');
 let text = ''; process.stdin.on('data', (d) => { text += d; }); process.stdin.on('end', () => {
   // Improve's answer (the tour's setup then falls back to the one worked out locally).
-  const out = JSON.stringify({ name: 'Calm News', css: '#promo { display: none !important; }', summary: 'Hid the banner.' });
+  // (A review round gets the same answer: nothing changed, so it's done.)
+  const out = JSON.stringify({ name: 'Calm News', css: 'h1 { letter-spacing: 0.5px; }', hide: ['#promo'], summary: 'Hid the banner.' });
   console.log(JSON.stringify({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'content_block_delta', delta: { type: 'text_delta', text: out } } }));
   console.log(JSON.stringify({ type: 'result', is_error: false, result: out }));
 });`);
