@@ -1430,6 +1430,7 @@ function renderTermTabs() {
   $('#term-empty').hidden = S.terms.length > 0;
   renderTermStart();
   sendMissionNames();
+  if (typeof chatsAfterTabs === 'function') chatsAfterTabs(); // the Chats list (a preview, off by default)
 }
 
 // ---------------------------------------------------------------- a terminal's settings

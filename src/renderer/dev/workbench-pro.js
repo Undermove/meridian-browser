@@ -1332,6 +1332,18 @@ function renderCustomizePanel(el) {
   act.append(h('b', '', 'Continue agents after a restart'), h('span', 'muted small', ' — when Meridian restarts, agent sessions come back where they were and wait. With this on, each one is told “continue” by itself.'));
   ac.append(acb, act);
   adv.appendChild(ac);
+  // A preview: the sessions as a list in the left pane, with what each is doing.
+  if (typeof chatsSetEnabled === 'function') {
+    const cl = h('label', 'switch-row chats-list');
+    const clb = h('input');
+    clb.type = 'checkbox';
+    clb.checked = chatsEnabled();
+    clb.addEventListener('change', () => chatsSetEnabled(clb.checked));
+    const clt = h('span');
+    clt.append(h('b', '', 'Chats list (preview)'), h('span', 'muted small', ' — agent sessions as a list next to Files and Changes, each saying whether it needs you, works or has finished.'));
+    cl.append(clb, clt);
+    adv.appendChild(cl);
+  }
   if (st.safeMode) adv.open = true;
   el.appendChild(adv);
 }
