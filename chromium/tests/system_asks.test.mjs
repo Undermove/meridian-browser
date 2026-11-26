@@ -147,23 +147,57 @@ test('every kind has its words, its drawing and a way back from the wrong button
   } finally { await b.close(); }
 });
 
-test('Restart to update from 0.x to 1.x: macOS will ask about Meridian Safe Storage, say Always Allow', { skip: process.platform === 'win32' && 'macOS asks these' }, async () => {
+// From 0.x (signed by Meridian) to 1.x (Apple's Developer ID) macOS asks about "Meridian Safe Storage"
+// before the first window, and at every start until Always Allow. The 0.x app can't be taught to say
+// so beforehand, so the first 1.x window says it, once per profile last opened by 0.x.
+test('first start of 1.x on a 0.x profile: the keychain question explained, Always Allow; once', { skip: process.platform !== 'darwin' && 'macOS asks this' }, async () => {
+  const profileOf = (meridian) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+    fs.mkdirSync(path.join(dir, 'Default'));
+    fs.writeFileSync(path.join(dir, 'Default', 'Preferences'), JSON.stringify({ meridian }));
+    return dir;
+  };
+  const old = profileOf({ last_version: '0.6.30', onboarded: true });
+  const recent = profileOf({ last_version: '1.0.0', onboarded: true });
+  const args = ['--meridian-test-changelog-url='];
+  let b;
+  try {
+    b = await launch(['about:blank'], { profile: old, args });
+    await b.waitFor(`${SA}.open && ${SAR}.getElementById('card').dataset.kind === 'safe-storage'`, 10000);
+    assert.match(await b.eval(`${SAR}.getElementById('title').textContent`), /Meridian Safe Storage/);
+    assert.match(await b.eval(`${SAR}.getElementById('card').textContent`), /Press Always Allow/);
+    const mac = `${SAR}.querySelector('meridian-mac-ask').shadowRoot`;
+    assert.equal(await b.eval(`${mac}.querySelector('.press').textContent.trim()`), 'Always Allow');
+    assert.match(await b.eval(`${mac}.textContent`), /“Meridian Safe Storage”/);
+    assert.equal(await b.eval(`!!${SAR}.getElementById('settings')`), false, 'no System Settings pane for this one');
+    await b.click(`${SAR}.getElementById('ok')`);
+    await b.waitFor(`!${SA}.open`);
+    await b.quit();
+
+    // The next start: already said.
+    b = await launch([], { profile: old, args });
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length >= 1`);
+    await sleep(2500);
+    assert.equal(await b.eval(`${SA}.open`), false, 'said once');
+    await b.close();
+
+    // A profile 1.x opened before: the same signature, nothing to explain.
+    b = await launch(['about:blank'], { profile: recent, args });
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length >= 1`);
+    await sleep(2500);
+    assert.equal(await b.eval(`${SA}.open`), false, 'not after 1.x');
+  } finally {
+    await b?.close();
+    for (const d of [old, recent]) fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('Restart to update says nothing about the keychain: the 0.x app that would show it never had this code', { skip: process.platform === 'win32' && 'macOS asks these' }, async () => {
   const b = await launch(['about:blank']);
   try {
     await b.waitFor(`typeof app !== 'undefined' && !!app.$.updateSheet`);
     const US = 'app.$.updateSheet';
-    const show = (current, version) => b.eval(`${US}.show({ status: 0, current: ${JSON.stringify(current)}, version: ${JSON.stringify(version)}, progress: 1, error: '', pageUrl: '', notes: '' })`);
-    await show('0.6.31', '1.0.0');
-    await b.waitFor(`${US}.open && !!${US}.shadowRoot.getElementById('safeStorage')`);
-    assert.equal(await b.eval(`${US}.shadowRoot.getElementById('safeStorage').textContent.replace(/\\s+/g, ' ').trim()`),
-      'After the restart macOS may ask about “Meridian Safe Storage”: press Always Allow.');
-    await b.eval(`${US}.hide()`);
-    // Within 1.x (or 0.x): the same signature, nothing to ask.
-    await show('1.0.0', '1.0.1');
-    await b.waitFor(`${US}.open`);
-    assert.equal(await b.eval(`!!${US}.shadowRoot.getElementById('safeStorage')`), false);
-    await b.eval(`${US}.hide()`);
-    await show('0.6.30', '0.6.31');
+    await b.eval(`${US}.show({ status: 0, current: '0.6.31', version: '1.0.0', progress: 1, error: '', pageUrl: '', notes: '' })`);
     await b.waitFor(`${US}.open`);
     assert.equal(await b.eval(`!!${US}.shadowRoot.getElementById('safeStorage')`), false);
   } finally { await b.close(); }
