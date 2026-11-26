@@ -10,7 +10,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
-import { launch, APP } from './harness.mjs';
+import { launch, APP, NEEDS_FRAMES } from './harness.mjs';
 import { standIn } from './stand_in.mjs';
 
 const OB = 'app.$.onboarding.shadowRoot';
@@ -184,7 +184,7 @@ test('first run, Claude Desktop’s config file missing: Yes makes it; the end s
   } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); f.clean(); }
 });
 
-test('first run, no Claude Desktop, Claude Code signed out: the tour signs it in right there, then Improve with AI works', async () => {
+test('first run, no Claude Desktop, Claude Code signed out: the tour signs it in right there, then Improve with AI works', { skip: NEEDS_FRAMES }, async () => {
   const f = setup({ desktop: 'none', signedIn: false });
   const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(PAGE); });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));

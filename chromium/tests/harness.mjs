@@ -492,6 +492,15 @@ export const SB = `app.$.tabstrip.shadowRoot`;
 // MERIDIAN_FOREGROUND=1 (when nobody is working at the Mac): `{ skip: NEEDS_SCREEN }`.
 export const FOREGROUND = process.platform !== 'darwin' || !!process.env.MERIDIAN_FOREGROUND;
 export const NEEDS_SCREEN = !FOREGROUND && 'needs a window on screen: run with MERIDIAN_FOREGROUND=1';
+// While the Mac's screen is locked, macOS draws no new frames for any window: a page shows what it
+// showed when the screen locked, and a second screenshot after a change never comes (26.11: the
+// rounds of Improve with AI got no picture after the first; the same build passes unlocked). Tests
+// that need a new frame after a change: `{ skip: NEEDS_FRAMES }`.
+function screenLocked() {
+  if (process.platform !== 'darwin') return false;
+  try { return /<key>CGSSessionScreenIsLocked<\/key>\s*<true\/>/.test(execFileSync('/usr/sbin/ioreg', ['-n', 'Root', '-d1', '-a'], { encoding: 'utf8', timeout: 5000 })); } catch { return false; }
+}
+export const NEEDS_FRAMES = screenLocked() && 'the screen is locked: macOS draws no new frames (unlock it and run again)';
 export const tabEl = (i) => `${SB}.querySelectorAll('meridian-tab-row')[${i}]`;
 export const itemEl = (title) => `(() => { const all = []; const walk = (root) => { for (const el of root.querySelectorAll('meridian-item')) { all.push(el); walk(el.shadowRoot); } }; walk(${SB}); return all.find((el) => el.item.title === ${JSON.stringify(title)}); })()`;
 export const favEl = (i) => `${SB}.querySelectorAll('meridian-fav')[${i}]`;
