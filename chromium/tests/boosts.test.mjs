@@ -399,7 +399,12 @@ test('Improve with Claude Code when nothing is picked in Settings › AI: in the
     const page2 = await b.page(there);
     await page2.waitFor(`document.readyState === 'complete'`);
     // The site's boost from (a), improved again here.
-    await openEditor(b, '.boost-edit');
+    // On Windows the new page can bring a mouse move of its own (the OS cursor is elsewhere):
+    // the sidebar's mouseleave closes the site controls 450 ms later. Then again, as a person would.
+    await openEditor(b, '.boost-edit').catch(async (e) => {
+      if (process.platform !== 'win32' || await b.eval('app.$.siteControl.open')) throw e;
+      await openEditor(b, '.boost-edit');
+    });
     await clickEditor(b, `${BE}.getElementById('improveToggle')`);
     await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
     await clickEditor(b, `${BE}.getElementById('improve')`);

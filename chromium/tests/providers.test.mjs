@@ -370,9 +370,14 @@ test('agent CLIs where they can’t run: “macOS only for now”, can’t be pi
     await b.click(`${ST}.querySelector('[data-id="ai"]')`);
     await b.waitFor(`!!${ST}.getElementById('aiRows')`);
     await b.click(`${ST}.getElementById('otherAgents')`);
-    for (const id of ['codex', 'opencode', 'cursor', 'qwen', 'amp', 'goose', 'droid', 'copilot']) {
-      await b.waitFor(`${ST}.getElementById('ai-${id}')?.textContent.includes('macOS only for now')`, 15000);
-      assert.equal(await b.eval(`${ST}.getElementById('ai-${id}').hasAttribute('disabled')`), true, `${id} can't be picked`);
+    // Codex, found on this computer, has its row: it says so and can't be picked.
+    await b.waitFor(`${ST}.getElementById('ai-codex')?.textContent.includes('macOS only for now')`, 15000);
+    assert.equal(await b.eval(`${ST}.getElementById('ai-codex').hasAttribute('disabled')`), true, 'codex can\'t be picked');
+    // The others aren't here: folded under More AI tools, which offers nothing to pick or install.
+    for (const id of ['opencode', 'cursor', 'qwen', 'amp', 'goose', 'droid', 'copilot']) {
+      await b.waitFor(`!!${ST}.getElementById('more-${id}')`, 15000);
+      assert.equal(await b.eval(`!!${ST}.getElementById('ai-${id}')`), false, `${id} has no row to pick`);
+      assert.equal(await b.eval(`[...${ST}.getElementById('more-${id}').querySelectorAll('button')].every((x) => x.disabled)`), true, `${id} offers no install`);
     }
     await b.eval(`${ST}.getElementById('ai-codex').click()`);
     await sleep(500);
