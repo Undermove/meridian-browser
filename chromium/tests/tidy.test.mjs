@@ -36,9 +36,9 @@ test('Tidy Today: Claude proposes folders and titles; only what is kept is appli
   const b = await launch([`${s}/f`, `${s}/h`, `${s}/m`, `${s}/r`], { args: [`--meridian-ai-base-url=http://127.0.0.1:${api.address().port}`] });
   try {
     await b.waitFor(`[...${SB}.querySelectorAll('#today meridian-tab-row')].filter((r) => r.tab?.title && r.tab.title !== r.tab.url).length === 4`);
-    // No key yet: the dialog says what's missing.
+    // No AI yet: the dialog says how to connect one (Settings), not only "add a key".
     await b.click(`${SB}.getElementById('tidyToday')`);
-    await b.waitFor(`${TD}.getElementById('error')?.textContent.includes('Claude API key')`);
+    await b.waitFor(`${TD}.getElementById('error')?.textContent.includes('connect an AI in Settings › AI')`);
     await b.eval('app.$.tidy.hide()');
 
     assert.equal((await b.eval(`app.$.tabstrip.handler_.setAiKey(${JSON.stringify(KEY)})`)).ok, true);
