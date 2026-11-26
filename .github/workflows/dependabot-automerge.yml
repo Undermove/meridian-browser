@@ -1,0 +1,60 @@
+name: Dependabot auto-merge
+
+# Dependabot PRs with a patch or minor bump (version or security update) are set to squash-merge
+# by themselves once the required checks on main pass (ruleset "main: checks must pass").
+# A major bump, or a minor bump of a 0.x package, is labelled needs-review and waits for a person.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  automerge:
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'Undermove/meridian-browser'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Decide
+        id: decide
+        env:
+          TYPE: ${{ steps.meta.outputs.update-type }}
+          PREV: ${{ steps.meta.outputs.previous-version }}
+        run: |
+          # Patch, or minor on a 1.x+ package: merge. Major, unknown, or minor of a 0.x package
+          # (semver allows breaking changes there, e.g. monaco-editor 0.57 -> 0.58): a person looks.
+          auto=false
+          case "$TYPE" in
+            version-update:semver-patch) auto=true ;;
+            version-update:semver-minor) case "$PREV" in 0.*) ;; *) auto=true ;; esac ;;
+          esac
+          echo "auto=$auto" >> "$GITHUB_OUTPUT"
+          echo "$TYPE from $PREV -> auto-merge: $auto"
+      - name: Auto-merge once checks pass
+        if: steps.decide.outputs.auto == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --squash "$PR"
+      - name: Needs review
+        if: steps.decide.outputs.auto != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.html_url }}
+          DEPS: ${{ steps.meta.outputs.dependency-names }}
+          TYPE: ${{ steps.meta.outputs.update-type }}
+        run: |
+          gh label create needs-review --color fbca04 --description "Needs a person to review" -R "$GITHUB_REPOSITORY" 2>/dev/null || true
+          if ! gh pr view "$PR" --json labels -q '.labels[].name' | grep -qx needs-review; then
+            gh pr edit "$PR" --add-label needs-review
+            gh pr comment "$PR" --body "Not merged automatically: $TYPE of $DEPS (a major, a minor of a 0.x package, or a type Dependabot did not report). Check the changelog for breaking changes, then merge by hand."
+          fi
