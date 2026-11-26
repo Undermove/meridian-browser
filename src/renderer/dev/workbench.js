@@ -1115,7 +1115,7 @@ function mountTerm(info) {
   return t;
 }
 
-async function launch(kind, { resume = false, resumeId, resumeMode, resumeModel, resumeRemote = false, name, restored = false } = {}) {
+async function launch(kind, { resume = false, resumeId, resumeMode, resumeModel, resumeRemote = false, name, restored = false, accountId, accountLabel } = {}) {
   if (!S.project) { toast('Open a project first'); return null; }
   if (S.info?.terminals === false) { toast(`Terminals are unavailable: ${S.info.terminalError || ''}`, 5000); return null; }
   // Where it sends what you type, said first (not for a session reopened after a restart).
@@ -1132,7 +1132,7 @@ async function launch(kind, { resume = false, resumeId, resumeMode, resumeModel,
     // Size the pty right from the start so TUIs (Claude Code, Codex) draw correctly.
     const host = $('#term-host');
     const dims = estimateDims(host);
-    info = await wb.ptyCreate({ kind, cols: dims.cols, rows: dims.rows, secrets, resume, resumeId, resumeMode, resumeModel, resumeRemote });
+    info = await wb.ptyCreate({ kind, cols: dims.cols, rows: dims.rows, secrets, resume, resumeId, resumeMode, resumeModel, resumeRemote, accountId });
   } catch (err) {
     toast(err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, ''), 5000);
     if (/not installed/i.test(err.message)) refreshInfo();
@@ -1141,6 +1141,9 @@ async function launch(kind, { resume = false, resumeId, resumeMode, resumeModel,
   const t = mountTerm(info);
   if (resumeId) {
     t.sessionId = resumeId; t.permissionMode = resumeMode || ''; t.model = resumeModel || ''; t.remote = !!resumeRemote;
+    // Picked up under another account than the space's, where its history is.
+    if (accountId) t.accountId = accountId;
+    if (accountLabel) { t.xterm.writeln(`\x1b[2mResumed with ${accountLabel}\x1b[0m`); toast(`Resumed with ${accountLabel}`); }
     if (name) saveTermName(t, name);
     syncTermMeta(t);
   }
@@ -1401,8 +1404,64 @@ function resumeButton(className) {
   label.textContent = 'Resume Claude Code…';
   b.append(mark, label);
   b.title = 'Pick up a recent Claude Code session in this project';
-  b.addEventListener('click', () => launch('claude', { resume: true }));
+  b.addEventListener('click', () => resumeClaude());
   return b;
+}
+
+// "3 h ago", "yesterday", "12 Nov".
+function sessionWhen(ms) {
+  const d = Date.now() - ms;
+  if (d < 60_000) return 'just now';
+  if (d < 3_600_000) return `${Math.round(d / 60_000)} min ago`;
+  if (d < 86_400_000) return `${Math.round(d / 3_600_000)} h ago`;
+  if (d < 2 * 86_400_000) return 'yesterday';
+  return new Date(ms).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+}
+
+// Sessions are kept per Claude account (config folder): a space that now runs another account would
+// see none of its earlier sessions in Claude Code's own list. With sessions under the person's other
+// accounts, Meridian lists them all, each under its account's name; one picked there goes on under
+// that account. Otherwise Claude Code's own list, as before.
+async function resumeClaude() {
+  let data = null;
+  try { data = await wb.claudeAccountSessions(); } catch { data = null; }
+  const accounts = Array.isArray(data?.accounts) ? data.accounts : [];
+  const others = accounts.filter((a) => !a.current && a.sessions.length);
+  if (accounts.length < 2 || !others.length) return launch('claude', { resume: true });
+  const cur = accounts.find((a) => a.current);
+  const item = (a, x) => `<button class="resume-item" data-id="${esc(x.id)}" data-account="${esc(a.id)}">
+      <span class="resume-title">${esc(x.title || `Session ${x.id.slice(0, 8)}`)}</span>
+      <span class="resume-when">${esc(sessionWhen(x.modified))}</span></button>`;
+  const group = (a, head) => `<div class="resume-group" data-account="${esc(a.id)}"><div class="resume-head">${esc(head)}</div>
+      ${a.sessions.slice(0, 10).map((x) => item(a, x)).join('') || '<div class="resume-none">No sessions in this project yet</div>'}</div>`;
+  return new Promise((resolve) => {
+    modal(`<h3>Resume Claude Code</h3>
+      <div class="resume-list">
+        ${cur ? group(cur, cur.label) : ''}
+        ${others.map((a) => group(a, `Earlier sessions under ${a.label}`)).join('')}
+      </div>
+      <div class="modal-actions"><button class="btn" data-a="native">Claude Code’s own list…</button><button class="btn" data-a="cancel">Cancel</button></div>`, (m, close) => {
+      m.classList.add('wide');
+      // (#modal is shared: this list's listeners must not answer the next modal.)
+      let done = false;
+      const finish = () => { if (done) return false; done = true; close(); return true; };
+      m.addEventListener('click', async (e) => {
+        const pick = e.target.closest('.resume-item');
+        const a = e.target.closest('[data-a]')?.dataset.a;
+        if ((!pick && !a) || !finish()) return;
+        if (a === 'native') return resolve(await launch('claude', { resume: true }));
+        if (!pick) return resolve(null);
+        const account = accounts.find((x) => x.id === pick.dataset.account);
+        const mine = !account || account.current;
+        const t = await launch('claude', { resumeId: pick.dataset.id, ...(mine ? {} : { accountId: account.id, accountLabel: account.label }) });
+        // Its session (and account) kept for the next start right away.
+        if (t) saveClaudeSessions();
+        resolve(t);
+      });
+      m.addEventListener('keydown', (e) => { if (e.key === 'Escape' && finish()) resolve(null); });
+      $('#modal-overlay').addEventListener('dismiss', () => { done = true; resolve(null); }, { once: true });
+    });
+  });
 }
 
 function layoutTerminals() { renderTermTabs(); fitActive(); }
@@ -1434,7 +1493,7 @@ function saveClaudeSessions() {
   if (!root || S.restoringSessions || typeof wb.saveClaudeSessions !== 'function') return;
   // (Claude Code started by hand in a shell tab too, while it runs there.)
   const list = S.terms.filter((t) => RESUMABLE(t) && t.root === root && t.sessionId && !t.closed)
-    .map((t) => ({ id: t.sessionId, name: t.custom || '', mode: t.kind === 'codex' ? '' : t.permissionMode || '', kind: t.kind === 'codex' ? 'codex' : 'claude', model: t.model || '', remote: !!t.remote }));
+    .map((t) => ({ id: t.sessionId, name: t.custom || '', mode: t.kind === 'codex' ? '' : t.permissionMode || '', kind: t.kind === 'codex' ? 'codex' : 'claude', model: t.model || '', remote: !!t.remote, ...(t.accountId ? { account: t.accountId } : {}) }));
   const key = JSON.stringify(list);
   if (S.savedSessions === key) return;
   S.savedSessions = key;
@@ -1493,6 +1552,8 @@ async function restoreClaudeSessions(root) {
   list = list.filter((s) => s && /^[\w-]{1,80}$/.test(String(s.id)));
   S.savedSessions = JSON.stringify(list);
   if (!list.length) return;
+  // Sessions resumed under another account: Meridian learns the accounts first.
+  if (list.some((s) => typeof s.account === 'string')) { try { await wb.claudeAccountSessions(); } catch {} }
   S.restoringSessions = true;
   try {
     for (const s of list) {
@@ -1502,6 +1563,7 @@ async function restoreClaudeSessions(root) {
       await launch(kind, {
         resumeId: String(s.id), resumeMode: typeof s.mode === 'string' ? s.mode : '', resumeModel: typeof s.model === 'string' ? s.model : '',
         resumeRemote: s.remote === true, name: typeof s.name === 'string' ? s.name.slice(0, 80) : '', restored: true,
+        accountId: kind === 'claude' && typeof s.account === 'string' ? s.account : undefined,
       });
     }
   } finally { S.restoringSessions = false; }

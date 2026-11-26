@@ -390,7 +390,7 @@ test('Improve with Claude Code when nothing is picked in Settings › AI: in the
     const { spaceId } = await b.eval(`${H}.createSpace('Client', '', '', '')`);
     await b.eval(`${H}.setSpaceProfile(${JSON.stringify(spaceId)}, ${JSON.stringify(profileId)})`);
     const accounts = JSON.parse((await b.eval(`${H}.getAiAccounts()`)).json);
-    const work = accounts.vendors.find((v) => v.id === 'claude').accounts.find((a) => a.label === 'Work').id;
+    const work = accounts.vendors.find((v) => v.id === 'claude').accounts.find((a) => a.label === 'Claude Work').id;
     await b.eval(`${H}.setSpaceAiAccount(${JSON.stringify(spaceId)}, 'claude', ${JSON.stringify(work)})`);
     await b.eval(`${H}.activateSpace(${JSON.stringify(spaceId)})`);
     await b.waitFor(`app.$.tabstrip.state_.activeSpaceId === ${JSON.stringify(spaceId)} && app.$.tabstrip.state_.profileId === ${JSON.stringify(profileId)}`);
@@ -412,6 +412,34 @@ test('Improve with Claude Code when nothing is picked in Settings › AI: in the
     await page2.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
     assert.deepEqual(runs(), ['<unset>', path.join(home, '.claude-work')], 'the space’s Work account');
     page2.close();
+  } finally {
+    await b.close(); s.server.close();
+    fs.rmSync(bin, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('Improve with AI in a space that never chose runs as the main subscription (Settings › AI › New spaces)', async () => {
+  const s = await site();
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
+  const runs = fakeClaudeCode(bin, { name: 'Calm News', css: '#promo { display: none !important; }', summary: 'Hid the banner.' });
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-accounts-')));
+  for (const dir of ['.claude', '.claude-work']) { fs.mkdirSync(path.join(home, dir)); fs.writeFileSync(path.join(home, dir, 'settings.json'), ''); }
+  const b = await launch([s.url], { args: [`--meridian-agents-path=${bin}`, `--meridian-accounts-home=${home}`] });
+  try {
+    const page = await b.page(s.url);
+    await page.waitFor(`document.readyState === 'complete'`);
+    await b.waitFor(`!!app?.$?.tabstrip?.handler_`);
+    // The main subscription is Work; this space never chose one.
+    const accounts = JSON.parse((await b.eval(`${H}.getAiAccounts()`)).json);
+    const work = accounts.vendors.find((v) => v.id === 'claude').accounts.find((a) => a.label === 'Claude Work').id;
+    await b.eval(`${H}.setMainAiAccount('claude', ${JSON.stringify(work)})`);
+    await openEditor(b);
+    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
+    await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
+    await clickEditor(b, `${BE}.getElementById('improve')`);
+    await b.waitFor(`${BE}.getElementById('note')?.textContent.includes('Hid the banner.')`, 20000, `${BE}.getElementById('note')?.textContent`);
+    assert.deepEqual(runs(), [path.join(home, '.claude-work')], 'as the main subscription');
+    page.close();
   } finally {
     await b.close(); s.server.close();
     fs.rmSync(bin, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true });

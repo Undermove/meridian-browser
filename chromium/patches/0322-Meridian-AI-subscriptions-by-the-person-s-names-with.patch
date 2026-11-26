@@ -1,0 +1,2076 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 14:27:23 +0400
+Subject: [PATCH] Meridian: AI subscriptions by the person's names, with a
+ picker per space and New spaces
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Settings › AI showed accounts as chips ("Default · no space yet") whose
+click only opened a small editor, and "Default" named two different
+folders. Each AI tool with accounts now has one block:
+
+- Each subscription by the person's own name (click it to rename in
+  place); imported folders read "Claude (~/.claude)", "Claude Work",
+  never a bare "Default". One true status: Signed in / Needs sign-in
+  [Sign in] / Update needed [Update] / Not installed, and its browser
+  tools (connected / Connect). Remove is in a ⋯ menu: "Remove from
+  Meridian — the folder stays".
+- "+ Add Claude" asks only for a name: Meridian makes a private folder
+  under its own AI Accounts folder (beside its profiles), starts the
+  newest CLI's own sign-in for it (CLAUDE_CONFIG_DIR / CODEX_HOME), and
+  the row turns ✓ when that is done. Copilot keeps its accounts itself
+  and isn't offered Add.
+- "Claude in each space": one picker per space and "New spaces", the
+  main subscription that new spaces and spaces that never chose follow
+  (ai_main_account; absent = the CLI's default, as before). The space
+  menu shows and sets the same choice. One account: just "Claude ✓
+  Signed in", no picker.
+- 1.4/1.5 prefs keep working: same ids, same space choices; a kept
+  "Default" label reads as the folder's name.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/meridian/agent/agent_service.cc   |  13 +-
+ .../browser/meridian/agent/agent_tools.json   |   6 +-
+ chrome/browser/meridian/ai/account_prefs.cc   | 133 ++++++--
+ chrome/browser/meridian/ai/account_prefs.h    |  32 +-
+ chrome/browser/meridian/ai/accounts.cc        | 147 ++++++--
+ chrome/browser/meridian/ai/accounts.h         |  47 ++-
+ .../browser/meridian/ai/accounts_unittest.cc  |  94 +++++-
+ chrome/browser/meridian/prefs.cc              |   1 +
+ chrome/browser/meridian/prefs.h               |   6 +-
+ chrome/browser/meridian/sidebar.mojom         |  13 +-
+ chrome/browser/meridian/sidebar_handler.cc    |  75 ++++-
+ chrome/browser/meridian/sidebar_handler.h     |   3 +
+ .../webui_browser/meridian/settings.css       | 217 +++++++-----
+ .../webui_browser/meridian/settings.html.ts   | 170 +++++++---
+ .../webui_browser/meridian/settings.ts        | 316 +++++++++++++-----
+ .../webui_browser/meridian/sidebar.ts         |  13 +-
+ 16 files changed, 953 insertions(+), 333 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index eebd21e11e..a8923eb90a 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -3428,9 +3428,10 @@ void AgentService::SetSpaceAiAccount(std::unique_ptr<Call> call) {
+             const ai::AccountVendor* vendor =
+                 ai::FindAccountVendor(vendor_id);
+             std::optional<ai::Account> account;
++            // No account: back to the main subscription (New spaces).
+             for (const ai::Account& a : list) {
+-              if (a.vendor == vendor_id &&
+-                  (account_id.empty() ? a.is_default : a.id == account_id)) {
++              if (a.vendor == vendor_id && !account_id.empty() &&
++                  a.id == account_id) {
+                 account = a;
+               }
+             }
+@@ -3439,7 +3440,7 @@ void AgentService::SetSpaceAiAccount(std::unique_ptr<Call> call) {
+                   "no such account (list_ai_accounts shows them)");
+             }
+             const std::string label =
+-                account ? account->label : std::string("the default");
++                account ? account->label : std::string("the main one");
+             self->Confirm(
+                 std::move(call),
+                 "use " + vendor->short_label + " account “" + label +
+@@ -3459,11 +3460,9 @@ void AgentService::SetSpaceAiAccount(std::unique_ptr<Call> call) {
+                               .Set("space_id", space_id)
+                               .Set("vendor", vendor_id)
+                               .Set("account_id",
+-                                   account && !account->is_default
+-                                       ? account->id
+-                                       : std::string())
++                                   account ? account->id : std::string())
+                               .Set("label", account ? account->label
+-                                                    : std::string("Default"))));
++                                                    : std::string("main"))));
+                     },
+                     self, space_id, vendor_id, std::move(account)));
+           },
+diff --git a/chrome/browser/meridian/agent/agent_tools.json b/chrome/browser/meridian/agent/agent_tools.json
+index 34d7989e80..815c49d201 100644
+--- a/chrome/browser/meridian/agent/agent_tools.json
++++ b/chrome/browser/meridian/agent/agent_tools.json
+@@ -748,7 +748,7 @@
+  {
+   "name": "list_ai_accounts",
+   "access": "read",
+-  "description": "The person's AI subscriptions side by side: for each coding-agent CLI with accounts on this computer (Claude Code, Codex, Copilot CLI, Gemini CLI), its accounts by name (\"Work\", \"Personal\") and which spaces use each one. Meridian runs that CLI as the space's account for Ask and for Workbench terminals opened in the space. Returns {vendors: [{id, label, accounts: [{id, label, default, spaces: [space ids]}]}]}. No sign-ins, tokens or folders.",
++  "description": "The person's AI subscriptions side by side: for each coding-agent CLI with accounts on this computer (Claude Code, Codex, Copilot CLI, Gemini CLI), its accounts by name (\"Work\", \"Personal\") and which spaces use each one. Meridian runs that CLI as the space's account for Ask and for Workbench terminals opened in the space. Returns {vendors: [{id, label, main, canAdd, accounts: [{id, label, default, main, managed, spaces: [space ids]}]}]}; main is the subscription new spaces (and spaces that never chose) use. No sign-ins, tokens or folders.",
+   "input_schema": {
+    "type": "object",
+    "properties": {}
+@@ -757,7 +757,7 @@
+  {
+   "name": "set_space_ai_account",
+   "access": "write",
+-  "description": "Choose which account of an AI tool a space uses (see list_ai_accounts): Ask and Workbench terminals opened in that space then run that tool signed in as that account. Omit account_id (or pass \"\") for the tool's default account.",
++  "description": "Choose which account of an AI tool a space uses (see list_ai_accounts): Ask and Workbench terminals opened in that space then run that tool signed in as that account. Omit account_id (or pass \"\") to follow the main subscription (what new spaces use).",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+@@ -771,7 +771,7 @@
+     },
+     "account_id": {
+      "type": "string",
+-     "description": "Account id from list_ai_accounts; \"\" = the default."
++     "description": "Account id from list_ai_accounts; \"\" = follow the main subscription."
+     }
+    },
+    "required": [
+diff --git a/chrome/browser/meridian/ai/account_prefs.cc b/chrome/browser/meridian/ai/account_prefs.cc
+index 8f2b28e08f..f0d34d5342 100644
+--- a/chrome/browser/meridian/ai/account_prefs.cc
++++ b/chrome/browser/meridian/ai/account_prefs.cc
+@@ -7,6 +7,7 @@
+ #include <utility>
+ 
+ #include "base/files/file_util.h"
++#include "base/path_service.h"
+ #include "base/task/thread_pool.h"
+ #include "chrome/browser/meridian/ai/process_runner.h"
+ #include "chrome/browser/meridian/prefs.h"
+@@ -15,6 +16,7 @@
+ #include "chrome/browser/meridian/space_profiles.h"
+ #include "chrome/browser/meridian/test_switches.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/common/chrome_paths.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/prefs/scoped_user_pref_update.h"
+ 
+@@ -31,6 +33,7 @@ PrefService* Prefs(Profile* profile) {
+ std::string LabelOf(PrefService* prefs,
+                     const AccountVendor& vendor,
+                     const base::FilePath& dir) {
++  std::string saved;
+   if (const base::ListValue* list =
+           prefs->GetDict(prefs::kAiAccounts).FindList(vendor.id)) {
+     for (const base::Value& entry : *list) {
+@@ -39,16 +42,12 @@ std::string LabelOf(PrefService* prefs,
+       }
+       const std::string* d = entry.GetDict().FindString("dir");
+       const std::string* label = entry.GetDict().FindString("label");
+-      if (d && label && !label->empty() &&
+-          base::FilePath::FromUTF8Unsafe(*d) == dir) {
+-        return *label;
++      if (d && label && base::FilePath::FromUTF8Unsafe(*d) == dir) {
++        saved = *label;
+       }
+     }
+   }
+-  // A space names an account only when it isn't the default
+-  // (SetSpaceAccount), so the CLI's own folder here is "~/.claude".
+-  return AccountLabelFromDir(vendor, AccountsHome(), dir,
+-                             /*is_default=*/false);
++  return ShownAccountLabel(vendor, AccountsHome(), dir, saved);
+ }
+ 
+ // The saved entry for `dir` (made if missing).
+@@ -76,6 +75,12 @@ base::FilePath AccountsHome() {
+   return test.empty() ? base::GetHomeDir() : test;
+ }
+ 
++base::FilePath ManagedAccountsRoot() {
++  base::FilePath user_data;
++  base::PathService::Get(chrome::DIR_USER_DATA, &user_data);
++  return user_data.AppendASCII("AI Accounts");
++}
++
+ void ListAccountsAsync(Profile* profile,
+                        base::OnceCallback<void(std::vector<Account>)> done) {
+   base::DictValue saved = Prefs(profile)->GetDict(prefs::kAiAccounts).Clone();
+@@ -100,22 +105,22 @@ std::optional<SpaceAccount> SpaceAccountFor(Profile* profile,
+                                             const std::string& space_id,
+                                             const std::string& vendor_id) {
+   const AccountVendor* vendor = FindAccountVendor(vendor_id);
+-  if (!vendor || space_id.empty()) {
++  if (!vendor) {
+     return std::nullopt;
+   }
+   PrefService* prefs = Prefs(profile);
+-  const base::DictValue* space =
+-      prefs->GetDict(prefs::kAiSpaceAccounts).FindDict(space_id);
+-  const base::DictValue* entry = space ? space->FindDict(vendor_id) : nullptr;
+-  const std::string* id = entry ? entry->FindString("id") : nullptr;
+-  const std::string* dir = entry ? entry->FindString("dir") : nullptr;
+-  if (!id || !dir || dir->empty()) {
++  bool from_main = false;
++  std::optional<ChosenAccount> chosen = ChosenAccountFor(
++      prefs->GetDict(prefs::kAiSpaceAccounts),
++      prefs->GetDict(prefs::kAiMainAccount), space_id, vendor_id, &from_main);
++  if (!chosen) {
+     return std::nullopt;
+   }
+   SpaceAccount out;
+-  out.id = *id;
+-  out.dir = base::FilePath::FromUTF8Unsafe(*dir);
++  out.id = chosen->id;
++  out.dir = chosen->dir;
+   out.label = LabelOf(prefs, *vendor, out.dir);
++  out.from_main = from_main;
+   return out;
+ }
+ 
+@@ -173,7 +178,9 @@ void SetSpaceAccount(Profile* profile,
+                      const Account* account) {
+   ScopedDictPrefUpdate update(Prefs(profile), prefs::kAiSpaceAccounts);
+   base::DictValue* space = update->EnsureDict(space_id);
+-  if (!account || account->is_default) {
++  // Its own choice even when that is the CLI's default: the main
++  // subscription may be another one.
++  if (!account) {
+     space->Remove(vendor_id);
+   } else {
+     space->Set(vendor_id,
+@@ -186,6 +193,20 @@ void SetSpaceAccount(Profile* profile,
+   }
+ }
+ 
++void SetMainAccount(Profile* profile,
++                    const std::string& vendor_id,
++                    const Account* account) {
++  ScopedDictPrefUpdate update(Prefs(profile), prefs::kAiMainAccount);
++  if (!account || account->is_default) {
++    update->Remove(vendor_id);
++  } else {
++    update->Set(vendor_id,
++                base::DictValue()
++                    .Set("id", account->id)
++                    .Set("dir", account->dir.AsUTF8Unsafe()));
++  }
++}
++
+ void SaveAccount(Profile* profile,
+                  const std::string& vendor_id,
+                  const base::FilePath& dir,
+@@ -207,9 +228,18 @@ void HideAccount(Profile* profile,
+     entry->Set("hidden", true);
+     entry->Remove("label");
+   }
+-  // Spaces that used it go back to the default.
+-  ScopedDictPrefUpdate spaces(Prefs(profile), prefs::kAiSpaceAccounts);
+   const std::string id = AccountId(dir);
++  // The main one goes back to the CLI's default; spaces that used it, to the
++  // main one.
++  {
++    ScopedDictPrefUpdate main(Prefs(profile), prefs::kAiMainAccount);
++    const base::DictValue* entry = main->FindDict(vendor_id);
++    const std::string* used = entry ? entry->FindString("id") : nullptr;
++    if (used && *used == id) {
++      main->Remove(vendor_id);
++    }
++  }
++  ScopedDictPrefUpdate spaces(Prefs(profile), prefs::kAiSpaceAccounts);
+   std::vector<std::string> empty;
+   for (auto [space_id, value] : *spaces) {
+     if (!value.is_dict()) {
+@@ -240,23 +270,58 @@ base::DictValue AccountsToDict(Profile* profile,
+       spaces.emplace_back(s.id, s.name);
+     }
+   }
+-  // Each space's choice, for the accounts still listed.
++  const base::FilePath home = AccountsHome();
++  const base::FilePath managed = ManagedAccountsRoot();
++  auto listed = [&](const std::string& vendor_id, const std::string& id) {
++    return std::ranges::any_of(accounts, [&](const Account& x) {
++      return x.vendor == vendor_id && x.id == id;
++    });
++  };
++  // The main subscription of each vendor: the one kept, while it's listed,
++  // else the CLI's default.
++  std::map<std::string, std::string> main_of;
++  for (const AccountVendor& vendor : AccountVendors()) {
++    std::optional<ChosenAccount> m = ChosenAccountFor(
++        base::DictValue(), prefs->GetDict(prefs::kAiMainAccount), "",
++        vendor.id);
++    if (m && listed(vendor.id, m->id)) {
++      main_of[vendor.id] = m->id;
++      continue;
++    }
++    for (const Account& a : accounts) {
++      if (a.vendor == vendor.id && a.is_default) {
++        main_of[vendor.id] = a.id;
++      }
++    }
++  }
++  // Each space's own choice, for the accounts still listed.
+   base::DictValue chosen;
+   for (const auto& [space_id, name] : spaces) {
+     base::DictValue per;
++    const base::DictValue* own =
++        prefs->GetDict(prefs::kAiSpaceAccounts).FindDict(space_id);
+     for (const AccountVendor& vendor : AccountVendors()) {
+-      std::optional<SpaceAccount> a =
+-          SpaceAccountFor(profile, space_id, vendor.id);
+-      if (a && std::ranges::any_of(accounts, [&](const Account& x) {
+-            return x.vendor == vendor.id && x.id == a->id;
+-          })) {
+-        per.Set(vendor.id, a->id);
++      const base::DictValue* entry = own ? own->FindDict(vendor.id) : nullptr;
++      const std::string* id = entry ? entry->FindString("id") : nullptr;
++      if (id && listed(vendor.id, *id)) {
++        per.Set(vendor.id, *id);
+       }
+     }
+     if (!per.empty()) {
+       chosen.Set(space_id, std::move(per));
+     }
+   }
++  // What each space really runs as.
++  auto effective = [&](const std::string& space_id,
++                       const std::string& vendor_id) -> std::string {
++    const base::DictValue* per = chosen.FindDict(space_id);
++    const std::string* id = per ? per->FindString(vendor_id) : nullptr;
++    if (id) {
++      return *id;
++    }
++    auto m = main_of.find(vendor_id);
++    return m != main_of.end() ? m->second : std::string();
++  };
+   base::ListValue vendors;
+   for (const AccountVendor& vendor : AccountVendors()) {
+     base::ListValue list;
+@@ -266,9 +331,7 @@ base::DictValue AccountsToDict(Profile* profile,
+       }
+       base::ListValue used_by;
+       for (const auto& [space_id, name] : spaces) {
+-        const base::DictValue* per = chosen.FindDict(space_id);
+-        const std::string* id = per ? per->FindString(vendor.id) : nullptr;
+-        if (id ? *id == a.id : a.is_default) {
++        if (effective(space_id, vendor.id) == a.id) {
+           used_by.Append(space_id);
+         }
+       }
+@@ -276,10 +339,11 @@ base::DictValue AccountsToDict(Profile* profile,
+       entry.Set("id", a.id);
+       entry.Set("label", a.label);
+       entry.Set("default", a.is_default);
++      entry.Set("main", main_of[vendor.id] == a.id);
+       entry.Set("found", a.found);
++      entry.Set("managed", managed.IsParent(a.dir));
+       entry.Set("spaces", std::move(used_by));
+       if (paths) {
+-        const base::FilePath home = AccountsHome();
+         std::string shown = a.dir.AsUTF8Unsafe();
+         if (home.IsParent(a.dir)) {
+           base::FilePath relative;
+@@ -297,6 +361,8 @@ base::DictValue AccountsToDict(Profile* profile,
+                        .Set("id", vendor.id)
+                        .Set("label", vendor.label)
+                        .Set("short", vendor.short_label)
++                       .Set("main", main_of[vendor.id])
++                       .Set("canAdd", vendor.can_add)
+                        .Set("accounts", std::move(list)));
+   }
+   base::DictValue suggestion = SuggestAccounts(accounts, spaces);
+@@ -305,12 +371,7 @@ base::DictValue AccountsToDict(Profile* profile,
+   for (auto [space_id, value] : suggestion) {
+     base::DictValue per;
+     for (auto [vendor_id, id] : value.GetDict()) {
+-      const base::DictValue* now = chosen.FindDict(space_id);
+-      const std::string* current = now ? now->FindString(vendor_id) : nullptr;
+-      const bool is_default = std::ranges::any_of(accounts, [&](const Account& a) {
+-        return a.vendor == vendor_id && a.id == id.GetString() && a.is_default;
+-      });
+-      if (current ? *current != id.GetString() : !is_default) {
++      if (effective(space_id, vendor_id) != id.GetString()) {
+         per.Set(vendor_id, id.GetString());
+       }
+     }
+diff --git a/chrome/browser/meridian/ai/account_prefs.h b/chrome/browser/meridian/ai/account_prefs.h
+index 23ffe5fbe8..32cb735d73 100644
+--- a/chrome/browser/meridian/ai/account_prefs.h
++++ b/chrome/browser/meridian/ai/account_prefs.h
+@@ -22,22 +22,30 @@ namespace meridian::ai {
+ // The accounts of ai/accounts.h as Meridian keeps them, in the main
+ // profile's prefs (every space's profile shares them):
+ //  - prefs::kAiAccounts: what the person added, renamed or took off the list;
+-//  - prefs::kAiSpaceAccounts: space id -> vendor -> {id, dir}.
+-// A space that doesn't name an account for a vendor uses that CLI's default.
++//  - prefs::kAiSpaceAccounts: space id -> vendor -> {id, dir};
++//  - prefs::kAiMainAccount: vendor -> {id, dir}, the main subscription.
++// A space that doesn't name an account for a vendor uses the main one; with
++// no main one, that CLI's default (ChosenAccountFor).
+ 
+ // Where account folders are looked for: the home folder, or the tests' own
+ // (--meridian-accounts-home).
+ base::FilePath AccountsHome();
+ 
++// Where the subscriptions the person adds by name get their folders: Meridian's
++// own "AI Accounts" folder beside its profiles (the tests' --user-data-dir).
++base::FilePath ManagedAccountsRoot();
++
+ // Lists them (blocking work off the UI thread).
+ void ListAccountsAsync(Profile* profile,
+                        base::OnceCallback<void(std::vector<Account>)> done);
+ 
+-// What space `space_id` uses for `vendor_id`: nullopt = the default.
++// What space `space_id` uses for `vendor_id` (its own choice, else the main
++// subscription): nullopt = the CLI's default.
+ struct SpaceAccount {
+   std::string id;
+   std::string label;
+   base::FilePath dir;
++  bool from_main = false;
+ };
+ std::optional<SpaceAccount> SpaceAccountFor(Profile* profile,
+                                             const std::string& space_id,
+@@ -58,12 +66,19 @@ std::map<std::string, std::string> AccountEnvForKind(
+     const std::string& kind,
+     std::string* label);
+ 
+-// Space `space_id` uses `account` for its vendor (null: the default).
++// Space `space_id` uses `account` for its vendor (null: whatever the main
++// subscription is).
+ void SetSpaceAccount(Profile* profile,
+                      const std::string& space_id,
+                      const std::string& vendor_id,
+                      const Account* account);
+ 
++// The main subscription of `vendor_id` (null or the CLI's default: none
++// kept, the CLI's default stays main).
++void SetMainAccount(Profile* profile,
++                    const std::string& vendor_id,
++                    const Account* account);
++
+ // Adding, renaming and taking an account off the list (its folder stays).
+ void SaveAccount(Profile* profile,
+                  const std::string& vendor_id,
+@@ -73,10 +88,11 @@ void HideAccount(Profile* profile,
+                  const std::string& vendor_id,
+                  const base::FilePath& dir);
+ 
+-// For Settings, the space menu and MCP: {vendors: [{id, label, accounts:
+-// [{id, label, default, found, spaces: [space ids]}]}], spaces: {space id:
+-// {vendor: account id}}, suggestion: {space id: {vendor: account id}},
+-// hint: "" | "dismissed" | "applied"}. With `paths`, each account's folder
++// For Settings, the space menu and MCP: {vendors: [{id, label, short, main:
++// account id, canAdd, accounts: [{id, label, default, main, found, managed,
++// spaces: [space ids]}]}], spaces: {space id: {vendor: account id}} (the
++// spaces' own choices), suggestion: {space id: {vendor: account id}}, hint:
++// "" | "dismissed" | "applied"}. With `paths`, each account's folder
+ // too (Settings only; never MCP).
+ base::DictValue AccountsToDict(Profile* profile,
+                                const std::vector<Account>& accounts,
+diff --git a/chrome/browser/meridian/ai/accounts.cc b/chrome/browser/meridian/ai/accounts.cc
+index 86c121e048..bf56f73516 100644
+--- a/chrome/browser/meridian/ai/accounts.cc
++++ b/chrome/browser/meridian/ai/accounts.cc
+@@ -11,6 +11,7 @@
+ #include "base/files/file_util.h"
+ #include "base/hash/hash.h"
+ #include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/strings/utf_string_conversions.h"
+@@ -74,6 +75,25 @@ int Match(const std::string& space, const std::string& label) {
+   return 0;
+ }
+ 
++// "Client X 2" -> "client-x-2".
++std::string Slug(const std::string& typed) {
++  std::string slug;
++  for (char c : Lower(typed)) {
++    if (base::IsAsciiAlphaNumeric(c)) {
++      slug += c;
++    } else if (!slug.empty() && slug.back() != '-') {
++      slug += '-';
++    }
++  }
++  while (!slug.empty() && slug.back() == '-') {
++    slug.pop_back();
++  }
++  if (slug.size() > 40) {
++    slug.resize(40);
++  }
++  return slug;
++}
++
+ bool SameDir(const base::FilePath& a, const base::FilePath& b) {
+   return a.StripTrailingSeparators() == b.StripTrailingSeparators();
+ }
+@@ -131,7 +151,8 @@ const std::vector<AccountVendor>& AccountVendors() {
+            {"settings.json", "session-state", "mcp-config.json"},
+            "copilot",
+            {"copilot"},
+-           {"copilot"}},
++           {"copilot"},
++           /*can_add=*/false},
+           {"gemini",
+            "Gemini CLI",
+            "Gemini",
+@@ -195,30 +216,44 @@ std::string Stem(const AccountVendor& vendor) {
+ 
+ std::string AccountLabelFromDir(const AccountVendor& vendor,
+                                 const base::FilePath& home,
+-                                const base::FilePath& dir,
+-                                bool is_default) {
++                                const base::FilePath& dir) {
++  const std::string brand = vendor.short_label;
+   if (SameDir(dir, OwnDir(vendor, home))) {
+-    return is_default ? "Default" : "~/" + Stem(vendor);
++    return brand + " (~/" + Stem(vendor) + ")";
+   }
+   std::string name = dir.StripTrailingSeparators().BaseName().AsUTF8Unsafe();
+-  const std::string stem = Stem(vendor);
+-  if (name.starts_with(stem) && name.size() > stem.size() + 1 &&
+-      (name[stem.size()] == '-' || name[stem.size()] == '_' ||
+-       name[stem.size()] == '.')) {
+-    name = name.substr(stem.size() + 1);
+-  } else if (name.starts_with(".")) {
+-    name = name.substr(1);
++  // ~/.claude-work and Meridian's own AI Accounts/claude-work.
++  bool sibling = false;
++  for (const std::string& stem : {Stem(vendor), vendor.id}) {
++    if (name.starts_with(stem) && name.size() > stem.size() + 1 &&
++        (name[stem.size()] == '-' || name[stem.size()] == '_' ||
++         name[stem.size()] == '.')) {
++      name = name.substr(stem.size() + 1);
++      sibling = true;
++      break;
++    }
++  }
++  if (!sibling) {
++    return brand + " (" + name + ")";
+   }
+   for (char& c : name) {
+     if (c == '-' || c == '_') {
+       c = ' ';
+     }
+   }
+-  if (name.empty()) {
+-    return "Account";
+-  }
+   name[0] = base::ToUpperASCII(name[0]);
+-  return name;
++  return brand + " " + name;
++}
++
++std::string ShownAccountLabel(const AccountVendor& vendor,
++                              const base::FilePath& home,
++                              const base::FilePath& dir,
++                              const std::string& saved_label) {
++  std::string label(base::TrimWhitespaceASCII(saved_label, base::TRIM_ALL));
++  if (label.empty() || base::EqualsCaseInsensitiveASCII(label, "default")) {
++    return AccountLabelFromDir(vendor, home, dir);
++  }
++  return label;
+ }
+ 
+ base::FilePath DefaultAccountDir(
+@@ -307,9 +342,9 @@ std::vector<Account> ListAccounts(
+       a.found = LooksLikeAccountDir(vendor, dir);
+       a.saved = is_saved;
+       auto label = labels.find(dir);
+-      a.label = label != labels.end()
+-                    ? label->second
+-                    : AccountLabelFromDir(vendor, home, dir, a.is_default);
++      a.label = ShownAccountLabel(
++          vendor, home, dir,
++          label != labels.end() ? label->second : std::string());
+       list.push_back(std::move(a));
+     };
+     if (LooksLikeAccountDir(vendor, default_dir)) {
+@@ -395,17 +430,7 @@ std::optional<base::FilePath> NewAccountDir(const AccountVendor& vendor,
+       return std::nullopt;
+     }
+   } else {
+-    std::string slug;
+-    for (char c : Lower(typed)) {
+-      if (base::IsAsciiAlphaNumeric(c)) {
+-        slug += c;
+-      } else if (!slug.empty() && slug.back() != '-') {
+-        slug += '-';
+-      }
+-    }
+-    while (!slug.empty() && slug.back() == '-') {
+-      slug.pop_back();
+-    }
++    const std::string slug = Slug(typed);
+     if (slug.empty()) {
+       *error = "Use letters or digits in the name.";
+       return std::nullopt;
+@@ -420,6 +445,55 @@ std::optional<base::FilePath> NewAccountDir(const AccountVendor& vendor,
+   return dir;
+ }
+ 
++std::optional<base::FilePath> NewManagedAccountDir(const AccountVendor& vendor,
++                                                   const base::FilePath& root,
++                                                   const std::string& name,
++                                                   std::string* error) {
++  const std::string slug = Slug(name);
++  if (slug.empty()) {
++    *error = std::string(base::TrimWhitespaceASCII(name, base::TRIM_ALL))
++                     .empty()
++                 ? "Give it a name, such as Work."
++                 : "Use letters or digits in the name.";
++    return std::nullopt;
++  }
++  const std::string base_name = vendor.id + "-" + slug;
++  base::FilePath dir = root.AppendASCII(base_name);
++  for (int n = 2; base::PathExists(dir) && n < 100; n++) {
++    dir = root.AppendASCII(base_name + "-" + base::NumberToString(n));
++  }
++  return dir;
++}
++
++std::optional<ChosenAccount> ChosenAccountFor(const base::DictValue& spaces,
++                                              const base::DictValue& main,
++                                              const std::string& space_id,
++                                              const std::string& vendor_id,
++                                              bool* from_main) {
++  if (from_main) {
++    *from_main = false;
++  }
++  auto read = [](const base::DictValue* entry) -> std::optional<ChosenAccount> {
++    const std::string* id = entry ? entry->FindString("id") : nullptr;
++    const std::string* dir = entry ? entry->FindString("dir") : nullptr;
++    if (!id || id->empty() || !dir || dir->empty()) {
++      return std::nullopt;
++    }
++    return ChosenAccount{*id, base::FilePath::FromUTF8Unsafe(*dir)};
++  };
++  if (!space_id.empty()) {
++    const base::DictValue* space = spaces.FindDict(space_id);
++    if (auto own = read(space ? space->FindDict(vendor_id) : nullptr)) {
++      return own;
++    }
++  }
++  std::optional<ChosenAccount> m = read(main.FindDict(vendor_id));
++  if (m && from_main) {
++    *from_main = true;
++  }
++  return m;
++}
++
+ base::DictValue SuggestAccounts(
+     const std::vector<Account>& accounts,
+     const std::vector<std::pair<std::string, std::string>>& spaces) {
+@@ -438,10 +512,17 @@ base::DictValue SuggestAccounts(
+       const Account* best = nullptr;
+       int score = 0;
+       for (const Account* a : mine) {
+-        // "Default" or "~/.claude" says nothing about work or home.
+-        int s = a->label == "Default" || a->label.starts_with("~/")
+-                    ? 0
+-                    : Match(name, a->label);
++        // "Claude (~/.claude)" says nothing about work or home, nor does
++        // the word "Claude" in "Claude Work".
++        std::string label = a->label;
++        if (label.ends_with(")")) {
++          label.clear();
++        }
++        if (base::StartsWith(label, vendor.short_label + " ",
++                             base::CompareCase::INSENSITIVE_ASCII)) {
++          label = label.substr(vendor.short_label.size() + 1);
++        }
++        int s = label.empty() ? 0 : Match(name, label);
+         if (s > score) {
+           score = s;
+           best = a;
+diff --git a/chrome/browser/meridian/ai/accounts.h b/chrome/browser/meridian/ai/accounts.h
+index e80db5e320..aea75551a2 100644
+--- a/chrome/browser/meridian/ai/accounts.h
++++ b/chrome/browser/meridian/ai/accounts.h
+@@ -49,6 +49,10 @@ struct AccountVendor {
+   // Ask providers (ai/providers.h) and Workbench terminal kinds it runs as.
+   std::vector<std::string> providers;
+   std::vector<std::string> kinds;
++  // Whether Meridian offers "+ Add" for it: a folder per subscription is the
++  // CLI's own way. Copilot keeps several accounts inside one folder (its own
++  // /user switch), so it isn't offered there.
++  bool can_add = true;
+ };
+ 
+ const std::vector<AccountVendor>& AccountVendors();
+@@ -74,14 +78,21 @@ struct Account {
+ 
+ std::string AccountId(const base::FilePath& dir);
+ 
+-// "Work" for ~/.claude-work, else the folder's name. The CLI's own folder
+-// (~/.claude) is "Default" only while it is the default: when the login
+-// environment points the CLI elsewhere (CLAUDE_CONFIG_DIR=~/.claude-personal)
+-// it is "~/.claude", not a second "Default" next to the real one.
++// The name an account gets until the person gives it one: "Claude Work" for
++// ~/.claude-work, "Claude (~/.claude)" for the CLI's own folder, "Claude
++// (folder)" for any other. Never a bare "Default": which one is the default
++// is said apart from the name.
+ std::string AccountLabelFromDir(const AccountVendor& vendor,
+                                 const base::FilePath& home,
+-                                const base::FilePath& dir,
+-                                bool is_default = true);
++                                const base::FilePath& dir);
++
++// The name shown for an account: the one the person gave it, else the one
++// from its folder. A "Default" kept by 1.4/1.5 (never written by Meridian
++// itself, but possible through the old rename) reads as the folder's name.
++std::string ShownAccountLabel(const AccountVendor& vendor,
++                              const base::FilePath& home,
++                              const base::FilePath& dir,
++                              const std::string& saved_label);
+ 
+ // The folder the CLI uses by default: its variable in the person's login
+ // environment, else its own folder in `home`.
+@@ -121,6 +132,30 @@ std::optional<base::FilePath> NewAccountDir(const AccountVendor& vendor,
+                                             const std::string& typed,
+                                             std::string* error);
+ 
++// The folder Meridian makes for a subscription the person adds by name
++// only: `root`/<vendor>-<slug> ("Work" -> AI Accounts/claude-work), with -2,
++// -3… when that one exists. nullopt and why when the name has no letters
++// or digits.
++std::optional<base::FilePath> NewManagedAccountDir(const AccountVendor& vendor,
++                                                   const base::FilePath& root,
++                                                   const std::string& name,
++                                                   std::string* error);
++
++// What a space runs a vendor's CLI as, from the prefs of account_prefs.h:
++// its own choice (`spaces`: space id -> vendor -> {id, dir}), else the main
++// subscription (`main`: vendor -> {id, dir}; what new spaces and spaces that
++// never chose follow), else nullopt (the CLI's default, as before 1.5.2).
++// `from_main` says which.
++struct ChosenAccount {
++  std::string id;
++  base::FilePath dir;
++};
++std::optional<ChosenAccount> ChosenAccountFor(const base::DictValue& spaces,
++                                              const base::DictValue& main,
++                                              const std::string& space_id,
++                                              const std::string& vendor_id,
++                                              bool* from_main = nullptr);
++
+ // A space -> vendor -> account id mapping by names: a space whose name goes
+ // with an account's label (Work and "work", Personal and "Home") gets that
+ // account. Only vendors with two accounts or more; spaces that match nothing
+diff --git a/chrome/browser/meridian/ai/accounts_unittest.cc b/chrome/browser/meridian/ai/accounts_unittest.cc
+index 539e23a8db..ff6a6b7a45 100644
+--- a/chrome/browser/meridian/ai/accounts_unittest.cc
++++ b/chrome/browser/meridian/ai/accounts_unittest.cc
+@@ -49,9 +49,10 @@ TEST_F(AccountsTest, FindsDefaultAndSiblingsByNamesOnly) {
+   std::vector<Account> all = ListAccounts(home_, {}, base::DictValue());
+   std::vector<Account> claude = Of(all, "claude");
+   ASSERT_EQ(claude.size(), 2u);
+-  EXPECT_EQ(claude[0].label, "Default");
++  // Never a bare "Default": which one is the default is said apart.
++  EXPECT_EQ(claude[0].label, "Claude (~/.claude)");
+   EXPECT_TRUE(claude[0].is_default);
+-  EXPECT_EQ(claude[1].label, "Work");
++  EXPECT_EQ(claude[1].label, "Claude Work");
+   EXPECT_FALSE(claude[1].is_default);
+   EXPECT_EQ(Of(all, "codex").size(), 1u);
+   std::vector<Account> gemini = Of(all, "gemini");
+@@ -60,7 +61,7 @@ TEST_F(AccountsTest, FindsDefaultAndSiblingsByNamesOnly) {
+   ASSERT_EQ(gemini.size(), 2u);
+   EXPECT_TRUE(gemini[0].is_default);
+   EXPECT_FALSE(gemini[0].found);
+-  EXPECT_EQ(gemini[1].label, "Home");
++  EXPECT_EQ(gemini[1].label, "Gemini Home");
+ }
+ 
+ TEST_F(AccountsTest, LoginEnvironmentNamesTheDefault) {
+@@ -71,10 +72,10 @@ TEST_F(AccountsTest, LoginEnvironmentNamesTheDefault) {
+                    base::DictValue()),
+       "claude");
+   ASSERT_EQ(claude.size(), 2u);
+-  EXPECT_EQ(claude[0].label, "Personal");
++  EXPECT_EQ(claude[0].label, "Claude Personal");
+   EXPECT_TRUE(claude[0].is_default);
+   // Not a second "Default": the real default is ~/.claude-personal.
+-  EXPECT_EQ(claude[1].label, "~/.claude");
++  EXPECT_EQ(claude[1].label, "Claude (~/.claude)");
+   EXPECT_FALSE(claude[1].is_default);
+ }
+ 
+@@ -151,6 +152,89 @@ TEST_F(AccountsTest, NewAccountDirFromANameOrAFolder) {
+   EXPECT_FALSE(NewAccountDir(codex, home_, "!!!", &error));
+ }
+ 
++TEST_F(AccountsTest, NewManagedAccountDirIsMeridiansOwn) {
++  const AccountVendor& claude = *FindAccountVendor("claude");
++  const base::FilePath root = home_.AppendASCII("AI Accounts");
++  std::string error;
++  EXPECT_EQ(NewManagedAccountDir(claude, root, " Client X ", &error),
++            root.AppendASCII("claude-client-x"));
++  base::CreateDirectory(root.AppendASCII("claude-client-x"));
++  // Taken: the next free one, never someone else's folder.
++  EXPECT_EQ(NewManagedAccountDir(claude, root, "client x", &error),
++            root.AppendASCII("claude-client-x-2"));
++  EXPECT_FALSE(NewManagedAccountDir(claude, root, "  ", &error));
++  EXPECT_EQ(error, "Give it a name, such as Work.");
++  EXPECT_FALSE(NewManagedAccountDir(claude, root, "!!!", &error));
++  // Named after its folder until the person names it.
++  EXPECT_EQ(AccountLabelFromDir(claude, home_, root.AppendASCII("claude-acme")),
++            "Claude Acme");
++  EXPECT_EQ(AccountLabelFromDir(claude, home_, home_.AppendASCII("plans")),
++            "Claude (plans)");
++  EXPECT_FALSE(FindAccountVendor("copilot")->can_add);
++  EXPECT_TRUE(FindAccountVendor("codex")->can_add);
++}
++
++// 1.4/1.5 prefs: a space's choice keeps working by its id; a kept "Default"
++// reads as the folder's name; with no main subscription kept, spaces that
++// never chose run the CLI's default as before.
++TEST_F(AccountsTest, MigratesOldPrefs) {
++  const AccountVendor& claude = *FindAccountVendor("claude");
++  Make(".claude", "settings.json");
++  base::FilePath personal = Make(".claude-personal", "settings.json");
++  base::DictValue saved;
++  saved.Set("claude", base::ListValue().Append(
++                          base::DictValue()
++                              .Set("dir", home_.AppendASCII(".claude")
++                                              .AsUTF8Unsafe())
++                              .Set("label", "Default")));
++  std::vector<Account> list = Of(
++      ListAccounts(home_, {{"CLAUDE_CONFIG_DIR", personal.AsUTF8Unsafe()}},
++                   saved),
++      "claude");
++  ASSERT_EQ(list.size(), 2u);
++  EXPECT_EQ(list[1].label, "Claude (~/.claude)");
++  EXPECT_EQ(ShownAccountLabel(claude, home_, personal, "Personal"),
++            "Personal");
++  // The 1.5 shape: space -> vendor -> {id, dir}; no main subscription.
++  const std::string own_id = AccountId(home_.AppendASCII(".claude"));
++  base::DictValue spaces;
++  spaces.Set("work",
++             base::DictValue().Set(
++                 "claude", base::DictValue()
++                               .Set("id", own_id)
++                               .Set("dir", home_.AppendASCII(".claude")
++                                               .AsUTF8Unsafe())));
++  bool from_main = true;
++  std::optional<ChosenAccount> work =
++      ChosenAccountFor(spaces, base::DictValue(), "work", "claude", &from_main);
++  ASSERT_TRUE(work);
++  EXPECT_EQ(work->id, own_id);
++  EXPECT_EQ(work->id, list[1].id);
++  EXPECT_FALSE(from_main);
++  // Never chose, no main: the CLI's default (nothing changes in its env).
++  EXPECT_FALSE(ChosenAccountFor(spaces, base::DictValue(), "home", "claude"));
++  EXPECT_FALSE(ChosenAccountFor(spaces, base::DictValue(), "work", "codex"));
++  // A main subscription: spaces that never chose (and new ones) follow it;
++  // a space's own choice still wins.
++  base::DictValue main;
++  main.Set("claude", base::DictValue()
++                         .Set("id", AccountId(personal))
++                         .Set("dir", personal.AsUTF8Unsafe()));
++  std::optional<ChosenAccount> home =
++      ChosenAccountFor(spaces, main, "home", "claude", &from_main);
++  ASSERT_TRUE(home);
++  EXPECT_EQ(home->dir, personal);
++  EXPECT_TRUE(from_main);
++  EXPECT_EQ(ChosenAccountFor(spaces, main, "work", "claude")->id, own_id);
++  EXPECT_EQ(ChosenAccountFor(spaces, main, "", "claude")->id,
++            AccountId(personal));
++  // Broken entries are ignored, not half-used.
++  base::DictValue broken;
++  broken.Set("x", base::DictValue().Set("claude",
++                                        base::DictValue().Set("id", "1")));
++  EXPECT_FALSE(ChosenAccountFor(broken, base::DictValue(), "x", "claude"));
++}
++
+ TEST_F(AccountsTest, SuggestsBySpaceNames) {
+   Make(".claude", "settings.json");
+   Make(".claude-work", "settings.json");
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index 7197e369e3..8b49174fac 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -58,6 +58,7 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterListPref(kWorkbenchSecretOptOuts);
+   registry->RegisterDictionaryPref(kAiAccounts);
+   registry->RegisterDictionaryPref(kAiSpaceAccounts);
++  registry->RegisterDictionaryPref(kAiMainAccount);
+   registry->RegisterStringPref(kAiAccountsHint, std::string());
+   registry->RegisterIntegerPref(kSleepAfterMinutes, 60);
+   registry->RegisterBooleanPref(kCleanLinks, true);
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index bd85542ebc..3dc855f1d3 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -106,8 +106,12 @@ inline constexpr char kWorkbenchSecretOptOuts[] =
+ // added, renamed or took off the list, per vendor: [{dir, label, hidden}].
+ inline constexpr char kAiAccounts[] = "meridian.ai_accounts";
+ // Which account each space runs each AI tool as: space id -> vendor ->
+-// {id, dir}; missing = that tool's default.
++// {id, dir}; missing = the main subscription below.
+ inline constexpr char kAiSpaceAccounts[] = "meridian.ai_space_accounts";
++// The main subscription of each AI tool (1.5.2): what new spaces and spaces
++// that never chose run as. vendor -> {id, dir}; missing = that tool's own
++// default (its variable in the login environment), as in 1.4/1.5.
++inline constexpr char kAiMainAccount[] = "meridian.ai_main_account";
+ // The "different subscriptions in different spaces?" card: "" (offered),
+ // "dismissed" or "applied".
+ inline constexpr char kAiAccountsHint[] = "meridian.ai_accounts_hint";
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 41c7d1925e..8d119b0eea 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -841,7 +841,8 @@ interface SidebarHandler {
+   // each with a sentence and, when something can be done, one fix.
+   CheckAiConnections() => (array<AiConnectionCheck> checks);
+   // Settings › AI: per account "vendor/id" -> {signedIn: 1|0|-1,
+-  // needsUpdate, connected}, each account's CLI asked as that account
++  // needsUpdate, connected, installed}, each account's CLI asked as that
++  // account
+   // (seconds; GetAiAccounts stays quick for the space menu).
+   GetAiAccountStates() => (string json);
+   // Opens Claude Desktop with `request` ready in a new chat (and on the
+@@ -1046,15 +1047,19 @@ interface SidebarHandler {
+   // coding-agent CLIs and which one each space uses, as JSON
+   // (AccountsToDict, with folders).
+   GetAiAccounts() => (string json);
+-  // "Add account…": a name ("Work" -> ~/.claude-work) or a folder inside the
+-  // home folder (made if missing). `error` says why not ("" when added).
++  // "+ Add Claude": a name ("Work" -> Meridian's own AI Accounts/claude-work,
++  // made private), or a folder inside the home folder (made if missing).
++  // `error` says why not ("" when added).
+   AddAiAccount(string vendor, string typed) => (string id, string error);
+   // A new name for an account; taking one off the list (the folder stays,
+   // spaces that used it go back to the default).
+   RenameAiAccount(string vendor, string id, string label) => ();
+   RemoveAiAccount(string vendor, string id) => ();
+-  // What space `space_id` runs the vendor's CLI as; "" = its default.
++  // What space `space_id` runs the vendor's CLI as; "" = the main one.
+   SetSpaceAiAccount(string space_id, string vendor, string account_id) => ();
++  // The vendor's main subscription ("New spaces", and the spaces that never
++  // chose); "" = the CLI's own default.
++  SetMainAiAccount(string vendor, string account_id) => ();
+   // The CLI's own sign-in in a terminal, as that account (Meridian never
+   // sees it).
+   SignInAiAccount(string vendor, string id) => (bool ok, string error);
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 5c117077e2..ea202820bb 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -5064,10 +5064,33 @@ void SidebarHandler::GetAiAccountStates(
+                       // config read for Meridian.
+                       base::DictValue states;
+                       const base::FilePath home = ai::AccountsHome();
++                      // Is each vendor's CLI here at all (one look each)?
++                      std::map<std::string, bool> installed;
+                       for (const ai::Account& a : list) {
+                         const ai::AccountVendor* vendor =
+                             ai::FindAccountVendor(a.vendor);
+-                        if (!vendor || !a.found || vendor->providers.empty()) {
++                        if (vendor && !vendor->providers.empty() &&
++                            !installed.contains(a.vendor)) {
++                          installed[a.vendor] =
++                              !ai::LocalAgents::FindCliBlocking(
++                                   vendor->providers.front())
++                                   .empty();
++                        }
++                      }
++                      for (const ai::Account& a : list) {
++                        const ai::AccountVendor* vendor =
++                            ai::FindAccountVendor(a.vendor);
++                        // A folder Meridian just made is empty until the
++                        // CLI's sign-in fills it: asked all the same.
++                        if (!vendor || vendor->providers.empty() ||
++                            !(a.found || base::DirectoryExists(a.dir))) {
++                          continue;
++                        }
++                        if (!installed[a.vendor]) {
++                          states.Set(a.vendor + "/" + a.id,
++                                     base::DictValue()
++                                         .Set("signedIn", -1)
++                                         .Set("installed", false));
+                           continue;
+                         }
+                         bool needs_update = false;
+@@ -5082,6 +5105,7 @@ void SidebarHandler::GetAiAccountStates(
+                                 .Set("signedIn",
+                                      signed_in ? (*signed_in ? 1 : 0) : -1)
+                                 .Set("needsUpdate", needs_update)
++                                .Set("installed", true)
+                                 .Set("connected", AgentConnectedForAccount(
+                                                       a.vendor, a.dir, home)));
+                       }
+@@ -5101,17 +5125,31 @@ void SidebarHandler::AddAiAccount(const std::string& vendor_id,
+     std::move(callback).Run("", "Unknown AI.");
+     return;
+   }
++  // A name only (the usual way): Meridian's own folder for it. A folder
++  // typed (~/… or /…) is still taken, as before 1.5.2.
++  std::string label(base::TrimWhitespaceASCII(typed, base::TRIM_ALL));
++  const bool folder = label.starts_with("/") || label.starts_with("~");
++  if (!folder && !vendor->can_add) {
++    std::move(callback).Run(
++        "", vendor->short_label +
++                " keeps several accounts itself: switch them inside " +
++                vendor->short_label + ".");
++    return;
++  }
+   std::string error;
+   std::optional<base::FilePath> dir =
+-      ai::NewAccountDir(*vendor, ai::AccountsHome(), typed, &error);
++      folder ? ai::NewAccountDir(*vendor, ai::AccountsHome(), typed, &error)
++             : ai::NewManagedAccountDir(*vendor, ai::ManagedAccountsRoot(),
++                                        typed, &error);
+   if (!dir) {
+     std::move(callback).Run("", error);
+     return;
+   }
+   // A name typed becomes the label; a folder gets one from its name.
+-  std::string label(base::TrimWhitespaceASCII(typed, base::TRIM_ALL));
+-  if (label.starts_with("/") || label.starts_with("~")) {
++  if (folder) {
+     label.clear();
++  } else if (label.size() > 40) {
++    label.resize(40);
+   }
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock()},
+@@ -5125,6 +5163,10 @@ void SidebarHandler::AddAiAccount(const std::string& vendor_id,
+               return false;
+             }
+ #if BUILDFLAG(IS_POSIX)
++            // Meridian's AI Accounts folder too: only the person's.
++            if (dir.DirName().BaseName().value() == "AI Accounts") {
++              base::SetPosixFilePermissions(dir.DirName(), 0700);
++            }
+             return base::SetPosixFilePermissions(dir, 0700);
+ #else
+             return true;  // Windows: the user's profile folder is theirs.
+@@ -5219,6 +5261,31 @@ void SidebarHandler::SetSpaceAiAccount(const std::string& space_id,
+           std::move(callback)));
+ }
+ 
++void SidebarHandler::SetMainAiAccount(const std::string& vendor,
++                                      const std::string& account_id,
++                                      SetMainAiAccountCallback callback) {
++  if (!ai::FindAccountVendor(vendor)) {
++    std::move(callback).Run();
++    return;
++  }
++  ai::ListAccountsAsync(
++      browser_->GetProfile(),
++      base::BindOnce(
++          [](base::WeakPtr<SidebarHandler> self, std::string vendor,
++             std::string account_id, SetMainAiAccountCallback callback,
++             std::vector<ai::Account> list) {
++            if (self) {
++              const ai::Account* a = FindAccount(list, vendor, account_id);
++              if (a || account_id.empty()) {
++                ai::SetMainAccount(self->browser_->GetProfile(), vendor, a);
++              }
++            }
++            std::move(callback).Run();
++          },
++          weak_factory_.GetWeakPtr(), vendor, account_id,
++          std::move(callback)));
++}
++
+ void SidebarHandler::SignInAiAccount(const std::string& vendor_id,
+                                      const std::string& id,
+                                      SignInAiAccountCallback callback) {
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 346033b1d5..79ec7130ec 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -359,6 +359,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+                          const std::string& vendor,
+                          const std::string& account_id,
+                          SetSpaceAiAccountCallback callback) override;
++  void SetMainAiAccount(const std::string& vendor,
++                        const std::string& account_id,
++                        SetMainAiAccountCallback callback) override;
+   void SignInAiAccount(const std::string& vendor,
+                        const std::string& id,
+                        SignInAiAccountCallback callback) override;
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.css b/chrome/browser/resources/webui_browser/meridian/settings.css
+index 345cb4253b..c7086edcb8 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.css
++++ b/chrome/browser/resources/webui_browser/meridian/settings.css
+@@ -655,70 +655,11 @@ select:focus {
+                         transparent);
+ }
+ 
+-.row.accounts {
+-  min-height: 0;
+-  padding: 0 12px 10px 46px;
+-}
+-
+-.row.accounts::before,
+-.row.account-add::before,
+-.row.account-edit::before {
++.row.account-add::before {
+   display: none;
+ }
+ 
+-.acc-list {
+-  display: flex;
+-  flex-wrap: wrap;
+-  align-items: center;
+-  gap: 6px;
+-  min-width: 0;
+-}
+-
+-.acc-title {
+-  font-size: 11px;
+-  color: var(--meridian-text-muted);
+-  margin-right: 2px;
+-}
+-
+-.acc {
+-  display: inline-flex;
+-  align-items: baseline;
+-  gap: 5px;
+-  max-width: 100%;
+-  padding: 3px 9px;
+-  border-radius: 999px;
+-  font-size: 12px;
+-  background: var(--meridian-surface);
+-  box-shadow: 0 0 0 0.5px var(--meridian-border);
+-}
+-
+-.acc b {
+-  font-weight: 500;
+-}
+-
+-.acc small {
+-  color: var(--meridian-text-muted);
+-  font-size: 11px;
+-  overflow: hidden;
+-  text-overflow: ellipsis;
+-  white-space: nowrap;
+-}
+-
+-.acc.on {
+-  box-shadow: 0 0 0 1.5px var(--meridian-space, #5b6cff);
+-}
+-
+-.acc.add {
+-  align-items: center;
+-  background: transparent;
+-  color: var(--meridian-text-muted);
+-  box-shadow: none;
+-  border: 1px dashed var(--meridian-border);
+-  padding: 2px 9px;
+-}
+-
+ .row.account-add,
+-.row.account-edit,
+ .row.account-spaces {
+   min-height: 0;
+   padding: 0 12px 10px 46px;
+@@ -741,14 +682,6 @@ select:focus {
+   color: var(--meridian-text-muted);
+ }
+ 
+-.row.account-edit .text {
+-  width: 180px;
+-}
+-
+-.row.account-edit .row-desc {
+-  margin-top: 4px;
+-}
+-
+ .hint-card {
+   display: flex;
+   align-items: center;
+@@ -931,27 +864,151 @@ details.fold[open] summary::after {
+   color: #d23c3c;
+ }
+ 
+-.acc-wrap {
+-  display: inline-flex;
+-  align-items: center;
+-  gap: 4px;
++.row-head .row-label {
++  display: inline;
++}
++
++/* Settings › AI › a tool's subscriptions (1.5.2). */
++.subs {
++  display: flex;
++  flex-direction: column;
++  padding: 0 0 6px 34px;
++}
++
++.subs .row::before {
++  display: none;
++}
++
++.subs .row {
++  min-height: 0;
++  padding: 6px 12px;
++  gap: 8px;
+ }
+ 
+-.acc-state {
+-  margin-inline-start: 4px;
++.sub-title {
++  padding: 4px 12px 2px;
+   font-size: 11px;
++  font-weight: 600;
++  color: var(--meridian-text-muted);
++}
++
++.row.account-spaces .sub-title {
++  flex-basis: 100%;
++  padding: 0;
++}
++
++.sub-name {
++  padding: 0;
++  font: inherit;
++  font-size: 13px;
+   font-weight: 500;
+-  opacity: 0.8;
++  color: inherit;
++  background: none;
++  border: 0;
++  border-radius: 4px;
++  cursor: text;
++}
++
++.sub-name:hover {
++  text-decoration: underline dotted;
++  text-underline-offset: 3px;
++}
++
++.sub-name-input {
++  width: 200px;
+ }
+ 
+-.acc-state.ok {
++.sub .row-desc {
++  font-size: 11px;
++}
++
++.sub-state {
++  margin-left: 0;
++  white-space: nowrap;
++}
++
++.sub-mcp {
++  font-size: 11px;
++  white-space: nowrap;
++  color: var(--meridian-text-muted);
++}
++
++.sub-mcp.on {
+   color: #3aa55d;
+ }
+ 
+-.acc-state.warn {
+-  color: #d9822b;
++.sub-dir {
++  max-width: 180px;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++  direction: rtl;
++  font-size: 11px;
++  color: var(--meridian-text-muted);
++}
++
++.sub-more-wrap {
++  position: relative;
+ }
+ 
+-.row-head .row-label {
+-  display: inline;
++.sub-menu {
++  position: absolute;
++  inset-inline-end: 0;
++  top: calc(100% + 4px);
++  z-index: 5;
++  display: flex;
++  flex-direction: column;
++  min-width: 220px;
++  padding: 4px;
++  border-radius: 8px;
++  background: var(--meridian-surface, Canvas);
++  box-shadow: 0 6px 24px rgb(0 0 0 / 18%);
++}
++
++.sub-menu button {
++  padding: 6px 10px;
++  font: inherit;
++  font-size: 12px;
++  text-align: start;
++  color: inherit;
++  background: none;
++  border: 0;
++  border-radius: 5px;
++}
++
++.sub-menu button:hover {
++  background: color-mix(in srgb, currentColor 10%, transparent);
++}
++
++.sub-menu .danger {
++  color: #d23c3c;
++}
++
++.sub-add {
++  display: inline-flex;
++  align-items: center;
++  gap: 5px;
++  padding: 3px 9px;
++  font: inherit;
++  font-size: 12px;
++  color: var(--meridian-text-muted);
++  background: transparent;
++  border: 1px dashed var(--meridian-border);
++  border-radius: 999px;
++}
++
++.subs .grow {
++  flex: 1;
++}
++
++.subs .row.account-spaces {
++  padding: 8px 12px 6px;
++}
++
++.acc-space .select {
++  min-width: 150px;
++}
++
++.acc-space.main span {
++  font-style: italic;
+ }
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index 4aa64675c5..3b22e02f57 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -5,7 +5,7 @@
+ import {html} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+ import {icon} from './icons.js';
+-import type {MeridianSettingsElement} from './settings.js';
++import type {AccountGroup, MeridianSettingsElement} from './settings.js';
+ import {keyText} from './keys.js';
+ 
+ export function getHtml(this: MeridianSettingsElement) {
+@@ -510,66 +510,128 @@ export function getHtml(this: MeridianSettingsElement) {
+                     <div class="row-desc">Runs in Workbench terminals.</div>
+                   </div>
+                 </div>` : ''}
+-                ${it.group ? html`
+-      <div class="row accounts" id="accounts-${it.group.vendor}">
+-        <div class="acc-list">
+-          <span class="acc-title">${it.group.chips.length > 1 ? 'Accounts' :
+-                                                         'Account'}</span>
+-          ${it.group.chips.map(c => html`
+-            <span class="acc-wrap">
+-              <button class="acc ${c.editing ? 'on' : ''}"
+-                  data-vendor="${c.vendor}" data-id="${c.id}" title="${c.dir}"
+-                  @click="${this.onAccountClick_}">
+-                <b>${c.label}</b>${c.stateLabel ? html`<span
+-                    class="acc-state ${c.stateKind}">${c.stateLabel}</span>` : ''}
+-                <small>${it.group!.short} account · ${c.where}</small></button>
+-              ${c.needsSignIn ? html`
+-                <button class="btn small acc-signin" data-vendor="${c.vendor}"
+-                    data-id="${c.id}" @click="${this.onSignInAccountClick_}">
+-                  Sign in</button>` : ''}
+-            </span>`)}
+-          <button class="acc add" data-vendor="${it.group.vendor}"
+-              id="addAccount-${it.group.vendor}" @click="${this.onAddAccountClick_}">
+-            ${icon('plus', 12)}<b>Add account</b></button>
+-        </div>
+-      </div>
+-      ${it.group.perSpace.length ? html`
+-        <div class="row account-spaces" id="accountSpaces-${it.group.vendor}">
+-          ${it.group.perSpace.map(s => html`
++                ${[it.group].filter((g): g is AccountGroup => !!g).map(g => html`
++    <div class="subs" id="accounts-${g.vendor}">
++      ${g.single ? html`
++        <div class="row sub single" data-vendor="${g.vendor}"
++            data-id="${g.single.id}">
++          <div class="row-text"><div class="row-label">${g.short}</div></div>
++          ${g.single.stateLabel ? html`<span
++              class="tag sub-state ${g.single.stateKind}">${g.single.stateKind ===
++                  'ok' ? '✓ ' : ''}${g.single.stateLabel}</span>` : ''}
++          ${g.single.action ? html`
++            <button class="btn small sub-action" data-vendor="${g.vendor}"
++                data-id="${g.single.id}" data-action="${g.single.action}"
++                @click="${this.onSignInAccountClick_}">${g.single.actionLabel}
++            </button>` : ''}
++          ${g.single.connectable ? html`${g.single.connected ? html`
++            <span class="sub-mcp on">Browser tools: connected</span>` : html`
++            <button class="btn small sub-mcp" data-vendor="${g.vendor}"
++                data-id="${g.single.id}"
++                title="Let this account use Meridian’s browser tools"
++                @click="${this.onAccountConnectClick_}">Browser tools: Connect
++            </button>`}` : ''}
++          <span class="grow"></span>
++          ${g.canAdd ? html`
++            <button class="sub-add" data-vendor="${g.vendor}"
++                id="addAccount-${g.vendor}" @click="${this.onAddAccountClick_}">
++              ${icon('plus', 12)}<span>Add ${g.short}</span></button>` : ''}
++        </div>` : html`
++        <div class="sub-title">${g.short}</div>
++        ${g.chips.map(c => html`
++          <div class="row sub" data-vendor="${c.vendor}" data-id="${c.id}">
++            <div class="row-text">
++              ${c.renaming ? html`
++                <input class="text sub-name-input" .value="${c.label}"
++                    data-vendor="${c.vendor}" data-id="${c.id}"
++                    aria-label="Name for this ${g.short}" spellcheck="false"
++                    @change="${this.onAccountNameChange_}"
++                    @blur="${this.onAccountNameBlur_}"
++                    @keydown="${this.onAccountNameKeydown_}">` : html`
++                <button class="sub-name" title="Rename" data-vendor="${c.vendor}"
++                    data-id="${c.id}" @click="${this.onAccountClick_}">${c.label}</button>`}
++              <div class="row-desc">${c.where}</div>
++            </div>
++            ${c.stateLabel ? html`<span
++                class="tag sub-state ${c.stateKind}">${c.stateKind === 'ok' ?
++                    '✓ ' : ''}${c.stateLabel}</span>` : ''}
++            ${c.action ? html`
++              <button class="btn small sub-action" data-vendor="${c.vendor}"
++                  data-id="${c.id}" data-action="${c.action}"
++                  @click="${this.onSignInAccountClick_}">${c.actionLabel}
++              </button>` : ''}
++            ${c.connectable ? html`${c.connected ? html`
++              <span class="sub-mcp on">Browser tools: connected</span>` : html`
++              <button class="btn small sub-mcp" data-vendor="${c.vendor}"
++                  data-id="${c.id}"
++                  title="Let this account use Meridian’s browser tools"
++                  @click="${this.onAccountConnectClick_}">Browser tools: Connect
++              </button>`}` : ''}
++            <span class="sub-dir" title="${c.dir}">${c.dir}</span>
++            <span class="sub-more-wrap">
++              <button class="icon-btn sub-more" title="More"
++                  aria-label="More for ${c.label}" data-vendor="${c.vendor}"
++                  data-id="${c.id}" @click="${this.onAccountMoreClick_}">⋯</button>
++              ${c.menuOpen ? html`
++                <div class="sub-menu" role="menu">
++                  <button role="menuitem" data-vendor="${c.vendor}"
++                      data-id="${c.id}" @click="${this.onAccountMenuRenameClick_}">
++                    Rename</button>
++                  <button role="menuitem" data-vendor="${c.vendor}"
++                      data-id="${c.id}" data-action="signin"
++                      @click="${this.onSignInAccountClick_}">Sign in again</button>
++                  ${!c.isDefault ? html`
++                    <button role="menuitem" class="danger" data-vendor="${c.vendor}"
++                        data-id="${c.id}" @click="${this.onRemoveAccountClick_}">
++                      Remove from Meridian — the folder stays</button>` : ''}
++                </div>` : ''}
++            </span>
++          </div>`)}
++        ${g.canAdd ? html`
++          <div class="row sub-add-row">
++            <button class="sub-add" data-vendor="${g.vendor}"
++                id="addAccount-${g.vendor}" @click="${this.onAddAccountClick_}">
++              ${icon('plus', 12)}<span>Add ${g.short}</span></button>
++          </div>` : ''}`}
++      ${!g.canAdd ? html`
++        <div class="row sub-note"><div class="row-desc">${g.short} keeps
++          several accounts itself: switch them inside ${g.short}.</div></div>` :
++          ''}
++      ${g.adding ? html`
++        <div class="row account-add" data-vendor="${g.vendor}">
++          <input class="text grow" spellcheck="false" autocomplete="off"
++              placeholder="A name, such as Work Claude"
++              aria-label="Name for the new ${g.short}"
++              @keydown="${this.onAddAccountKeydown_}">
++          <button class="btn primary" @click="${this.onAddAccountSaveClick_}">
++            Create and sign in</button>
++        </div>` : ''}
++      ${g.perSpace.length ? html`
++        <div class="row account-spaces" id="accountSpaces-${g.vendor}">
++          <div class="sub-title">${g.short} in each space</div>
++          ${g.perSpace.map(s => html`
+             <label class="acc-space">
+-              <span>${it.group!.short} in ${s.name}</span>
+-              <select data-vendor="${it.group!.vendor}" data-space="${s.id}"
+-                  aria-label="${it.group!.short} account in ${s.name}"
++              <span>${s.name}</span>
++              <select class="select" data-vendor="${g.vendor}" data-space="${s.id}"
++                  aria-label="${g.short} in ${s.name}"
+                   @change="${this.onSpaceAccountChange_}">
+-                ${it.group!.choices.map(c => html`
++                ${g.choices.map(c => html`
+                   <option value="${c.value}" ?selected="${c.value === s.chosen}">
+                     ${c.label}</option>`)}
+               </select>
+             </label>`)}
++          <label class="acc-space main">
++            <span>New spaces</span>
++            <select class="select" id="mainAccount-${g.vendor}"
++                data-vendor="${g.vendor}" aria-label="${g.short} in new spaces"
++                @change="${this.onMainAccountChange_}">
++              ${g.choices.map(c => html`
++                <option value="${c.value}" ?selected="${c.value === g.main}">
++                  ${c.label}</option>`)}
++            </select>
++          </label>
+         </div>` : ''}
+-      ${it.group.adding ? html`
+-        <div class="row account-add" data-vendor="${it.group.vendor}">
+-          <input class="text grow" spellcheck="false" autocomplete="off"
+-              placeholder="A name, such as Work (or a folder in your home)"
+-              aria-label="New ${it.group.short} account"
+-              @keydown="${this.onAddAccountKeydown_}">
+-          <button class="btn primary" @click="${this.onAddAccountSaveClick_}">
+-            Add</button>
+-        </div>` : ''}
+-      ${it.group.chips.filter(c => c.editing).map(c => html`
+-        <div class="row account-edit">
+-          <div class="row-text">
+-            <input class="text" .value="${c.label}" data-vendor="${c.vendor}"
+-                data-id="${c.id}" aria-label="Account name"
+-                @change="${this.onAccountNameChange_}">
+-            <div class="row-desc mono">${c.dir}</div>
+-          </div>
+-          <button class="btn" data-vendor="${c.vendor}" data-id="${c.id}"
+-              @click="${this.onSignInAccountClick_}">Sign in…</button>
+-          ${!c.isDefault ? html`
+-            <button class="btn" data-vendor="${c.vendor}" data-id="${c.id}"
+-                @click="${this.onRemoveAccountClick_}">Remove</button>` : ''}
+-        </div>`)}` : ''}`)}
++    </div>`)}`)}
+               ${!this.aiRows_.length && !this.hasAiKey_ ? html`
+                 <div class="row" id="aiNone">
+                   <div class="row-text">
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index f051320f15..1917a0950a 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -98,44 +98,64 @@ export interface AiRow {
+ export interface AiAccount {
+   id: string;
+   label: string;
++  // The CLI's own default (its variable in the login environment).
+   default: boolean;
++  // The main subscription: "New spaces", and the spaces that never chose.
++  main: boolean;
+   found: boolean;
+-  // The spaces that use it (for the default: those that don't name one).
++  // A folder Meridian made for it (AI Accounts).
++  managed?: boolean;
++  // The spaces that run as it (their own choice, or the main one's).
+   spaces: string[];
+   dir: string;
+   // Its CLI asked as this account: 1 signed in, 0 not, -1 can't tell; too
+-  // old to say; Meridian is in this account's MCP servers.
++  // old to say; the CLI isn't here; Meridian is in this account's MCP
++  // servers.
+   signedIn?: number;
+   needsUpdate?: boolean;
++  installed?: boolean;
+   connected?: boolean;
+ }
+ export interface AiAccountVendor {
+   id: string;
+   label: string;
+   short: string;
++  // The main subscription's id.
++  main: string;
++  // "+ Add": a folder per subscription is that CLI's own way.
++  canAdd: boolean;
+   accounts: AiAccount[];
+ }
+ export interface AiAccounts {
+   vendors: AiAccountVendor[];
+-  // space id -> vendor -> account id.
++  // space id -> vendor -> account id: the spaces' own choices.
+   spaces: {[space: string]: {[vendor: string]: string}};
+   suggestion: {[space: string]: {[vendor: string]: string}};
+   hint: string;
+ }
+-// An account as Settings shows it.
++// An account as Settings shows it: its name, one true status, its
++// browser-tools connection and a ⋯ menu.
+ export interface AccountChip {
+   vendor: string;
+   id: string;
+   label: string;
+-  // "Work space" / "All spaces" / "No space yet".
++  // "Used in Work, Personal · New spaces" / "Not used in a space yet".
+   where: string;
+   dir: string;
+   isDefault: boolean;
+-  editing: boolean;
+-  // "Signed in" / "Needs sign-in" / "Update needed" / "".
++  isMain: boolean;
++  renaming: boolean;
++  menuOpen: boolean;
++  // "Signed in" / "Needs sign-in" / "Update needed" / "Not installed" / "".
+   stateLabel: string;
+   stateKind: string;
+-  needsSignIn: boolean;
++  // "signin", "update" or "".
++  action: string;
++  actionLabel: string;
++  // Claude Code / Codex: Meridian's browser tools in this account's MCP
++  // servers (Settings › Connect does the same).
++  connectable: boolean;
++  connected: boolean;
+ }
+ 
+ // A row of "Connect" as it really is.
+@@ -157,20 +177,25 @@ export interface ConnectRow {
+   accounts: {id: string, label: string, connected: boolean}[];
+   menu: boolean;
+ }
+-// A vendor's accounts under its row in "Your AI".
++// A vendor's subscriptions under its row in "Your AI".
+ export interface AccountGroup {
+   vendor: string;
+   short: string;
+   chips: AccountChip[];
++  // One account: just its status, no names and no pickers.
++  single: AccountChip|null;
++  canAdd: boolean;
+   adding: boolean;
+-  // With two accounts or more: which one each space runs as ("" = the
+-  // default), picked right here as in the space's menu.
++  // With two accounts or more: which one each space runs as, picked right
++  // here as in the space's menu, and "New spaces" (the main one).
+   perSpace: SpaceAccountPick[];
++  main: string;
+   choices: {value: string, label: string}[];
+ }
+ export interface SpaceAccountPick {
+   id: string;
+   name: string;
++  // What it runs as: its own choice, else the main one.
+   chosen: string;
+ }
+ 
+@@ -316,6 +341,7 @@ export class MeridianSettingsElement extends CrLitElement {
+       aiItems_: {state: true, type: Array},
+       accountAdd_: {state: true, type: String},
+       accountEdit_: {state: true, type: String},
++      accountMenu_: {state: true, type: String},
+       accountMessage_: {state: true, type: String},
+       hint_: {state: true, type: String},
+       backupNote_: {state: true, type: String},
+@@ -391,6 +417,8 @@ export class MeridianSettingsElement extends CrLitElement {
+   // ("vendor/id").
+   protected accessor accountAdd_: string = '';
+   protected accessor accountEdit_: string = '';
++  // The account whose ⋯ menu is open ("vendor/id").
++  protected accessor accountMenu_: string = '';
+   protected accessor accountMessage_: string = '';
+   // "Different subscriptions in different spaces?" ("" = not offered).
+   protected accessor hint_: string = '';
+@@ -672,13 +700,14 @@ export class MeridianSettingsElement extends CrLitElement {
+         const was = known?.vendors.find(x => x.id === v.id)
+                         ?.accounts.find(x => x.id === a.id);
+         Object.assign(a, {signedIn: was?.signedIn, needsUpdate:
+-                          was?.needsUpdate, connected: was?.connected});
++                          was?.needsUpdate, installed: was?.installed,
++                          connected: was?.connected});
+       }
+     }
+     this.accounts_ = accounts;
+     const states = JSON.parse((await this.handler_.getAiAccountStates()).json) as
+         {[key: string]: {signedIn: number, needsUpdate: boolean,
+-                         connected: boolean}};
++                         installed: boolean, connected: boolean}};
+     if (this.accounts_ !== accounts || !accounts) {
+       return;
+     }
+@@ -691,7 +720,7 @@ export class MeridianSettingsElement extends CrLitElement {
+     };
+   }
+ 
+-  // A vendor's accounts as chips, when it has any.
++  // A vendor's subscriptions, when it has any.
+   private accountGroup_(vendorId: string): AccountGroup|null {
+     const vendor = this.accounts_?.vendors.find(v => v.id === vendorId);
+     if (!vendor || !vendor.accounts.length) {
+@@ -699,50 +728,72 @@ export class MeridianSettingsElement extends CrLitElement {
+     }
+     const nameOf = (id: string) =>
+         this.spaces_.find(s => s.id === id)?.name || 'Space';
+-    const named = Object.values(this.accounts_?.spaces || {})
+-                      .some(per => !!per[vendorId]);
+     const many = vendor.accounts.length > 1;
++    const connectable = vendorId === 'claude' || vendorId === 'codex';
++    const chips = vendor.accounts.map(a => {
++      // Plain words: the spaces it runs in.
++      const used = a.spaces.map(nameOf);
++      const where = [
++        ...(used.length ? [`Used in ${used.join(', ')}`] : []),
++        ...(a.main ? ['New spaces'] : []),
++      ].join(' · ') || 'Not used in a space yet';
++      // One true status.
++      let stateLabel = '';
++      let stateKind = '';
++      let action = '';
++      let actionLabel = '';
++      if (a.installed === false) {
++        stateLabel = 'Not installed';
++      } else if (a.needsUpdate) {
++        stateLabel = 'Update needed';
++        stateKind = 'warn';
++        action = 'update';
++        actionLabel = 'Update';
++      } else if (a.signedIn === 1) {
++        stateLabel = 'Signed in';
++        stateKind = 'ok';
++      } else if (a.signedIn === 0 || (a.managed && !a.found)) {
++        stateLabel = 'Needs sign-in';
++        stateKind = 'warn';
++        action = 'signin';
++        actionLabel = 'Sign in';
++      }
++      const key = `${vendorId}/${a.id}`;
++      return {
++        vendor: vendorId,
++        id: a.id,
++        label: a.label,
++        where,
++        dir: a.dir,
++        isDefault: a.default,
++        isMain: a.main,
++        renaming: this.accountEdit_ === key,
++        menuOpen: this.accountMenu_ === key,
++        stateLabel,
++        stateKind,
++        action,
++        actionLabel,
++        connectable: connectable && a.installed !== false,
++        connected: !!a.connected,
++      };
++    });
++    const main = vendor.main ||
++        vendor.accounts.find(a => a.default)?.id || vendor.accounts[0]!.id;
+     return {
+       vendor: vendorId,
+       short: vendor.short,
++      chips: many ? chips : [],
++      single: many ? null : chips[0]!,
++      canAdd: vendor.canAdd,
+       adding: this.accountAdd_ === vendorId,
++      main,
+       perSpace: many ? this.spaces_.map(s => ({
+         id: s.id,
+         name: s.name || 'Space',
+-        chosen: this.accounts_?.spaces[s.id]?.[vendorId] || '',
++        chosen: this.accounts_?.spaces[s.id]?.[vendorId] || main,
+       })) : [],
+-      choices: many ? vendor.accounts.map(a => ({
+-        value: a.default ? '' : a.id,
+-        label: a.default && a.label !== 'Default' ? `${a.label} (default)` :
+-                                                    a.label,
+-      })) : [],
+-      chips: vendor.accounts.map(a => {
+-        // Plain words: which spaces this account works in.
+-        let where = '';
+-        if (a.default) {
+-          where = named ? 'Used in your other spaces' : 'Used in every space';
+-        } else {
+-          where = a.spaces.length ?
+-              `Used in ${a.spaces.map(nameOf).join(', ')}` :
+-              'Not used in a space yet';
+-        }
+-        const stateLabel = a.needsUpdate ? 'Update needed' :
+-            a.signedIn === 1             ? 'Signed in' :
+-            a.signedIn === 0             ? 'Needs sign-in' :
+-                                           '';
+-        return {
+-          stateLabel,
+-          stateKind: a.signedIn === 1 ? 'ok' : stateLabel ? 'warn' : '',
+-          needsSignIn: a.signedIn === 0 && !a.needsUpdate,
+-          vendor: vendorId,
+-          id: a.id,
+-          label: a.label,
+-          where,
+-          dir: a.dir,
+-          isDefault: a.default,
+-          editing: this.accountEdit_ === `${vendorId}/${a.id}`,
+-        };
+-      }),
++      choices: many ? vendor.accounts.map(a => ({value: a.id, label: a.label})) :
++                      [],
+     };
+   }
+ 
+@@ -766,8 +817,10 @@ export class MeridianSettingsElement extends CrLitElement {
+         const v = a.vendors.find(x => x.id === vendorId);
+         const label = v?.accounts.find(x => x.id === id)?.label || '';
+         if (label) {
+-          pairs.push(many.length > 1 ? `${v!.short} ${label} in ${space}` :
+-                                       `${label} in ${space}`);
++          // "Claude Work in Work", not "Claude Claude Work".
++          const named = label.toLowerCase().includes(v!.short.toLowerCase());
++          pairs.push(many.length > 1 && !named ? `${v!.short} ${label} in ${space}` :
++                                                 `${label} in ${space}`);
+         }
+       }
+     }
+@@ -886,19 +939,22 @@ export class MeridianSettingsElement extends CrLitElement {
+     // A CLI with accounts: its badge says what its accounts really are
+     // (each chip says which one needs a sign-in, with the button there).
+     this.aiRows_ = this.aiRows_.map(r => {
+-      const chips = r.accounts?.chips || [];
++      const g = r.accounts;
++      const chips = g ? (g.single ? [g.single] : g.chips) : [];
+       if (!chips.length || r.status === 'Update needed' ||
+           chips.every(c => !c.stateLabel)) {
+         return r;
+       }
++      // Derived from the accounts, never against them: only the ones that
++      // really need a sign-in count (an account that can't tell doesn't).
++      const out = chips.filter(c => c.action === 'signin').length;
+       const signed = chips.filter(c => c.stateKind === 'ok').length;
+-      if (signed === chips.length) {
+-        return r.status === 'Not signed in' ?
++      if (!out) {
++        return r.status === 'Not signed in' && signed ?
+             {...r, status: 'Ready', statusKind: 'ok', action: '',
+              actionLabel: ''} :
+             r;
+       }
+-      const out = chips.length - signed;
+       return {
+         ...r,
+         status: chips.length === 1 ? 'Needs sign-in' :
+@@ -1386,15 +1442,30 @@ export class MeridianSettingsElement extends CrLitElement {
+ 
+   // ---- accounts
+ 
++  // A click on a subscription's name: renamed in place.
+   protected onAccountClick_(e: Event) {
+     const el = e.currentTarget as HTMLElement;
+     const key = `${el.dataset['vendor']}/${el.dataset['id']}`;
+-    this.accountEdit_ = this.accountEdit_ === key ? '' : key;
++    this.accountEdit_ = key;
++    this.accountMenu_ = '';
+     this.accountAdd_ = '';
+     this.accountMessage_ = '';
++    this.updateComplete.then(() => {
++      const input =
++          this.shadowRoot.querySelector<HTMLInputElement>('.sub-name-input');
++      input?.focus();
++      input?.select();
++    });
++  }
++
++  protected onAccountMoreClick_(e: Event) {
++    e.stopPropagation();
++    const el = e.currentTarget as HTMLElement;
++    const key = `${el.dataset['vendor']}/${el.dataset['id']}`;
++    this.accountMenu_ = this.accountMenu_ === key ? '' : key;
+   }
+ 
+-  // "Claude in Work: ~/.claude ▾": the same choice as the space's menu.
++  // "Claude in each space": the same choice as the space's menu.
+   protected async onSpaceAccountChange_(e: Event) {
+     const select = e.target as HTMLSelectElement;
+     await this.handler_.setSpaceAiAccount(select.dataset['space'] || '',
+@@ -1405,10 +1476,22 @@ export class MeridianSettingsElement extends CrLitElement {
+     this.fire('meridian-ai-accounts-changed');
+   }
+ 
++  // "New spaces": the main subscription, which spaces that never chose
++  // follow too.
++  protected async onMainAccountChange_(e: Event) {
++    const select = e.target as HTMLSelectElement;
++    await this.handler_.setMainAiAccount(select.dataset['vendor'] || '',
++                                         select.value);
++    await this.loadAccounts_();
++    this.accountMessage_ = '';
++    this.fire('meridian-ai-accounts-changed');
++  }
++
+   protected onAddAccountClick_(e: Event) {
+     const vendor = (e.currentTarget as HTMLElement).dataset['vendor'] || '';
+     this.accountAdd_ = this.accountAdd_ === vendor ? '' : vendor;
+     this.accountEdit_ = '';
++    this.accountMenu_ = '';
+     this.accountMessage_ = '';
+     this.updateComplete.then(() => {
+       this.shadowRoot.querySelector<HTMLInputElement>('.account-add input')
+@@ -1416,6 +1499,8 @@ export class MeridianSettingsElement extends CrLitElement {
+     });
+   }
+ 
++  // "+ Add Claude": a name only. Meridian makes its folder and opens the
++  // CLI's own sign-in for it; the row turns ✓ when that is done.
+   protected async onAddAccountSaveClick_(e: Event) {
+     const box = (e.currentTarget as HTMLElement).closest('.account-add')!;
+     const input = box.querySelector('input') as HTMLInputElement;
+@@ -1427,10 +1512,8 @@ export class MeridianSettingsElement extends CrLitElement {
+     }
+     this.accountAdd_ = '';
+     await this.loadAccounts_();
+-    this.accountEdit_ = `${vendor}/${id}`;
+-    this.accountMessage_ = 'Added. Sign in to it once: its own sign-in ' +
+-        'opens in Terminal, and Meridian never sees it.';
+     this.fire('meridian-ai-accounts-changed');
++    await this.signIn_(vendor, id);
+   }
+ 
+   protected onAddAccountKeydown_(e: KeyboardEvent) {
+@@ -1445,6 +1528,10 @@ export class MeridianSettingsElement extends CrLitElement {
+     const input = e.target as HTMLInputElement;
+     const vendor = input.dataset['vendor'] || '';
+     const id = input.dataset['id'] || '';
++    const key = `${vendor}/${id}`;
++    if (this.accountEdit_ === key) {
++      this.accountEdit_ = '';
++    }
+     if (!input.value.trim()) {
+       return;
+     }
+@@ -1453,35 +1540,93 @@ export class MeridianSettingsElement extends CrLitElement {
+     this.fire('meridian-ai-accounts-changed');
+   }
+ 
++  // Leaving the name: the change (if any) was saved by onAccountNameChange_.
++  protected onAccountNameBlur_() {
++    this.accountEdit_ = '';
++  }
++
++  protected onAccountNameKeydown_(e: KeyboardEvent) {
++    if (e.key === 'Enter') {
++      (e.target as HTMLInputElement).blur();
++    } else if (e.key === 'Escape') {
++      const input = e.target as HTMLInputElement;
++      input.value = '';
++      this.accountEdit_ = '';
++    }
++  }
++
+   protected async onSignInAccountClick_(e: Event) {
+     const el = e.currentTarget as HTMLElement;
+-    const {ok, error} = await this.handler_.signInAiAccount(
+-        el.dataset['vendor'] || '', el.dataset['id'] || '');
++    this.accountMenu_ = '';
++    if (el.dataset['action'] === 'update') {
++      // The CLI's own update, as the row above offers it.
++      const p = this.providers_.find(x => ACCOUNT_VENDOR_OF[x.id] ===
++                                          el.dataset['vendor']);
++      if (p?.installCommand) {
++        this.setup_ = {id: p.id, what: 'install', label: p.label,
++                       command: p.installCommand};
++      } else if (p) {
++        this.fire('meridian-open-url', p.docs);
++        this.hide();
++      }
++      return;
++    }
++    await this.signIn_(el.dataset['vendor'] || '', el.dataset['id'] || '');
++  }
++
++  private async signIn_(vendor: string, id: string) {
++    const {ok, error} = await this.handler_.signInAiAccount(vendor, id);
++    const label = this.accounts_?.vendors.find(v => v.id === vendor)
++                      ?.accounts.find(x => x.id === id)?.label || '';
+     this.accountMessage_ = ok ?
+-        'Sign in in the Terminal window. Meridian doesn’t see it: the tool ' +
+-            'keeps it in that account’s folder. This updates when it’s done.' :
++        `Sign in to ${label} in the Terminal window that opened. Meridian ` +
++            'doesn’t see it: the tool keeps it in that account’s folder. ' +
++            'This updates when it’s done.' :
+         error;
+-    if (ok) {
+-      // Watch that account turn "Signed in".
+-      if (this.accountsPoll_ !== null) {
+-        clearInterval(this.accountsPoll_);
+-      }
+-      const start = Date.now();
+-      this.accountsPoll_ = setInterval(async () => {
+-        await this.loadAccounts_();
+-        const a = this.accounts_?.vendors
+-                      .find(v => v.id === el.dataset['vendor'])
+-                      ?.accounts.find(x => x.id === el.dataset['id']);
+-        if (a?.signedIn === 1 || !this.open || Date.now() - start > 5 * 60_000) {
+-          clearInterval(this.accountsPoll_!);
+-          this.accountsPoll_ = null;
+-          if (a?.signedIn === 1) {
+-            this.accountMessage_ = `Signed in as ${a.label}.`;
+-            this.loadProviders_(true);
+-          }
+-        }
+-      }, 3000);
++    if (!ok) {
++      return;
++    }
++    // Watch that account turn "Signed in".
++    if (this.accountsPoll_ !== null) {
++      clearInterval(this.accountsPoll_);
+     }
++    const start = Date.now();
++    this.accountsPoll_ = setInterval(async () => {
++      await this.loadAccounts_();
++      const a = this.accounts_?.vendors.find(v => v.id === vendor)
++                    ?.accounts.find(x => x.id === id);
++      if (a?.signedIn === 1 || !this.open || Date.now() - start > 5 * 60_000) {
++        clearInterval(this.accountsPoll_!);
++        this.accountsPoll_ = null;
++        if (a?.signedIn === 1) {
++          this.accountMessage_ = `${a.label} is signed in.`;
++          this.loadProviders_(true);
++          this.fire('meridian-ai-accounts-changed');
++        }
++      }
++    }, 3000);
++  }
++
++  // "Browser tools: Connect" on a subscription: Meridian's MCP server in
++  // that account's own config, as Settings › Connect does it.
++  protected async onAccountConnectClick_(e: Event) {
++    const el = e.currentTarget as HTMLElement;
++    const vendor = el.dataset['vendor'] || '';
++    const id = el.dataset['id'] || '';
++    const label = this.accounts_?.vendors.find(v => v.id === vendor)
++                      ?.accounts.find(x => x.id === id)?.label || vendor;
++    this.accountMessage_ = `Connecting ${label}…`;
++    const {ok, output} = await this.handler_.connectAgentCliAccount(vendor, id);
++    this.accountMessage_ = ok ?
++        `${label} can use Meridian’s browser tools. Start a new session ` +
++            'there to use them.' :
++        `${label} wasn’t connected: ${output}`;
++    await this.loadAccounts_();
++    this.loadClis_();
++  }
++
++  protected onAccountMenuRenameClick_(e: Event) {
++    this.onAccountClick_(e);
+   }
+ 
+   protected async onRemoveAccountClick_(e: Event) {
+@@ -1489,7 +1634,8 @@ export class MeridianSettingsElement extends CrLitElement {
+     await this.handler_.removeAiAccount(
+         el.dataset['vendor'] || '', el.dataset['id'] || '');
+     this.accountEdit_ = '';
+-    this.accountMessage_ = 'Taken off the list. Its folder and sign-in ' +
++    this.accountMenu_ = '';
++    this.accountMessage_ = 'Removed from Meridian. Its folder and sign-in ' +
+         'stay where they are.';
+     await this.loadAccounts_();
+     this.fire('meridian-ai-accounts-changed');
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 89d1f8035a..336dc9e2ee 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -621,15 +621,14 @@ export class MeridianSidebarElement extends CrLitElement implements
+     const submenu: MenuEntry[] = [];
+     vendors.forEach((v, i) => {
+       submenu.push({label: v.short, header: true, separatorBefore: i > 0});
++      // What it runs as: its own choice, else the main one (New spaces).
++      const current = chosen[v.id] || v.main;
+       for (const a of v.accounts) {
+-        const on = chosen[v.id] ? chosen[v.id] === a.id : a.default;
+         submenu.push({
+-          label: a.default && a.label !== 'Default' ? `${a.label} (default)` :
+-                                                      a.label,
+-          checked: on,
+-          action: () => this.handler_
+-                            .setSpaceAiAccount(space.id, v.id,
+-                                               a.default ? '' : a.id)
++          label: a.label,
++          checked: current === a.id,
++          // Settings › AI reads the same choice when it opens.
++          action: () => this.handler_.setSpaceAiAccount(space.id, v.id, a.id)
+                             .then(this.loadAiAccounts_),
+         });
+       }
+-- 
+2.36.1
+

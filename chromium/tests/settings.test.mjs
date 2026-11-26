@@ -257,7 +257,8 @@ test('AI › Connect the other agents: Cursor by its folder, Goose into its YAML
   for (const name of ['code', 'gemini']) {
     standIn(bin, name, `require('fs').appendFileSync(${JSON.stringify(log)}, ${JSON.stringify(name)} + '\\n' + process.argv.slice(2).join('\\n') + '\\n\\n');`);
   }
-  const b = await launch(['about:blank'], { profile, args: [`--meridian-cursor-config=${cursor}`, `--meridian-goose-config=${goose}`, `--meridian-windsurf-config=${windsurf}`, `--meridian-agents-path=${bin}`] });
+  const vscode = path.join(profile, 'Code', 'User');
+  const b = await launch(['about:blank'], { profile, args: [`--meridian-cursor-config=${cursor}`, `--meridian-goose-config=${goose}`, `--meridian-windsurf-config=${windsurf}`, `--meridian-vscode-config=${vscode}`, `--meridian-agents-path=${bin}`] });
   const row = (name) => `[...${ST}.querySelectorAll('.row')].find((r) => r.querySelector('.row-label')?.textContent.trim() === ${JSON.stringify(name)})`;
   const connect = async (name, card, command) => {
     await clickConnect(b, row(name));
@@ -276,11 +277,11 @@ test('AI › Connect the other agents: Cursor by its folder, Goose into its YAML
       await b.waitFor(`!!${row(name)} && !${row(name)}.querySelector('.btn').disabled`);
     }
     // Not installed: not a row of its own, but named.
-    for (const name of ['Windsurf', 'Amp', 'Factory Droid', 'Qwen Code', 'GitHub Copilot CLI']) {
+    for (const name of ['Windsurf', 'Amp', 'Factory Droid', 'Qwen Code', 'GitHub Copilot']) {
       assert.equal(await b.eval(`!!${row(name)}`), false, name);
     }
     const more = await b.eval(`${ST}.getElementById('agentsMore').textContent.replace(/\\s+/g, ' ')`);
-    assert.match(more, /Also connects Windsurf, GitHub Copilot CLI, Qwen Code, Amp, Factory Droid once you install them/);
+    assert.match(more, /Also connects Windsurf, GitHub Copilot, Qwen Code, Amp, Factory Droid once you install them/);
     assert.doesNotMatch(more, /Cursor|Goose|VS Code|Gemini/);
     assert.match(await b.eval(`${row('Cursor')}.querySelector('.row-desc.mono').textContent`), /\.cursor[\\/]mcp\.json$/);
 
@@ -302,24 +303,21 @@ test('AI › Connect the other agents: Cursor by its folder, Goose into its YAML
     assert.match(after, /\n    cmd: "[^"\n]+"\n/);
     assert.equal(fs.readFileSync(path.join(goose, 'config.yaml.meridian-backup'), 'utf8'), yaml);
 
-    // VS Code: its own `code --add-mcp`, shown first.
-    assert.match(await connect('VS Code', /run this command/, /^code --add-mcp '\{"name":"meridian","type":"stdio","command":"[^"]+","args":\["--mcp-bridge"\]\}'$/),
-      /VS Code is connected\. Restart VS Code to use Meridian\./);
+    // VS Code: written into its profile's mcp.json ("servers"), no `code` run: the Copilot
+    // extension alone is enough.
+    assert.match(await connect('VS Code', /VS Code's MCP\s+servers in[\s\S]*mcp\.json/, /"servers": \{[\s\S]*"meridian": \{[\s\S]*"type": "stdio"/),
+      /VS Code is connected \(a new config file\)\. Restart VS Code to use Meridian\./);
+    const vs = JSON.parse(fs.readFileSync(path.join(vscode, 'mcp.json'), 'utf8'));
+    assert.match(vs.servers.meridian.command, program);
+    assert.deepEqual(vs.servers.meridian.args, ['--mcp-bridge']);
     // Gemini CLI: for the person (user scope); Meridian's own flag after "--".
     assert.match(await connect('Gemini CLI', /run this command/, /^gemini mcp add -s user meridian \S+ -- --mcp-bridge$/),
       /Gemini CLI is connected\. Start a new Gemini CLI session to use Meridian\./);
     const runs = fs.readFileSync(log, 'utf8').trim().split('\n\n').map((r) => r.split('\n'));
-    assert.equal(runs.length, 2);
-    assert.equal(runs[0][0], 'code');
-    assert.equal(runs[0][1], '--add-mcp');
-    const added = JSON.parse(runs[0][2]);
-    assert.equal(added.name, 'meridian');
-    assert.equal(added.type, 'stdio');
-    assert.match(added.command, program);
-    assert.deepEqual(added.args, ['--mcp-bridge']);
-    assert.deepEqual(runs[1].slice(0, 6), ['gemini', 'mcp', 'add', '-s', 'user', 'meridian']);
-    assert.match(runs[1][6], program);
-    assert.deepEqual(runs[1].slice(7), ['--', '--mcp-bridge']);
+    assert.equal(runs.length, 1, 'only Gemini CLI was run');
+    assert.deepEqual(runs[0].slice(0, 6), ['gemini', 'mcp', 'add', '-s', 'user', 'meridian']);
+    assert.match(runs[0][6], program);
+    assert.deepEqual(runs[0].slice(7), ['--', '--mcp-bridge']);
     assert.equal(fs.existsSync(windsurf), false, 'nothing made for what isn’t installed');
   } finally { await b.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });

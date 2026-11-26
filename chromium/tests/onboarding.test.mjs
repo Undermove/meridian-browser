@@ -332,11 +332,12 @@ test('first run: Cursor and VS Code found: one Yes connects both, then says to r
   const bin = path.join(dir, 'bin');
   const empty = path.join(dir, 'none');
   const cursor = path.join(dir, 'home', '.cursor');
+  const vscodeUser = path.join(dir, 'home', 'Code', 'User');
   for (const d of [bin, empty, cursor]) fs.mkdirSync(d, { recursive: true });
   const log = path.join(dir, 'code.log');
   standIn(bin, 'code', `require('fs').appendFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(' ') + '\\n');`);
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
-  const b = await launch(['about:blank'], { profile, args: ['--meridian-onboarding', `--meridian-arc-dir=${empty}`, `--meridian-chrome-dir=${empty}`, `--meridian-agents-path=${bin}`, `--meridian-cursor-config=${cursor}`, '--meridian-test-ai-consent', '--lang=en-US'] });
+  const b = await launch(['about:blank'], { profile, args: ['--meridian-onboarding', `--meridian-arc-dir=${empty}`, `--meridian-chrome-dir=${empty}`, `--meridian-agents-path=${bin}`, `--meridian-cursor-config=${cursor}`, `--meridian-vscode-config=${vscodeUser}`, '--meridian-test-ai-consent', '--lang=en-US'] });
   try {
     await b.waitFor(`${step} === 'hello'`);
     await b.click(`${OB}.getElementById('next')`);
@@ -351,7 +352,10 @@ test('first run: Cursor and VS Code found: one Yes connects both, then says to r
     const written = JSON.parse(fs.readFileSync(path.join(cursor, 'mcp.json'), 'utf8'));
     assert.match(written.mcpServers.meridian.command, /(Meridian|chrome)(\.exe)?$/i);
     assert.deepEqual(written.mcpServers.meridian.args, ['--mcp-bridge']);
-    assert.match(fs.readFileSync(log, 'utf8'), /^--add-mcp \{"name":"meridian","type":"stdio","command":"[^"]+","args":\["--mcp-bridge"\]\}\n$/);
+    // VS Code: its profile's mcp.json written directly; `code` itself never run.
+    const vs = JSON.parse(fs.readFileSync(path.join(vscodeUser, 'mcp.json'), 'utf8'));
+    assert.deepEqual([vs.servers.meridian.type, vs.servers.meridian.args], ['stdio', ['--mcp-bridge']]);
+    assert.equal(fs.existsSync(log), false);
     assert.equal((await b.eval(`${H}.getSettings().then((r) => r.settings)`)).agentAccess, 'ask');
     await b.waitFor(`${step} === 'tailor'`);
     await b.click(`${OB}.getElementById('next')`);

@@ -153,6 +153,7 @@
       resumeMode: typeof opts?.resumeMode === 'string' ? opts.resumeMode.slice(0, 30) : undefined,
       resumeModel: typeof opts?.resumeModel === 'string' ? opts.resumeModel.slice(0, 80) : undefined,
       resumeRemote: opts?.resumeRemote === true,
+      accountId: typeof opts?.accountId === 'string' ? opts.accountId.slice(0, 16) : undefined,
     }),
     ptyList: () => invoke('ptyList'),
     // What the page knows about a terminal (its name, its agent's session), kept with it while the
@@ -161,8 +162,11 @@
       .filter(([, v]) => typeof v === 'string' || typeof v === 'boolean').map(([k, v]) => [str(k).slice(0, 30), typeof v === 'string' ? v.slice(0, 240) : v]))),
     // The open project's agent sessions (Claude Code, Codex), reopened after a restart.
     claudeSessions: () => invoke('claudeSessions'),
+    // Claude Code's sessions of this project under each of the person's Claude accounts.
+    claudeAccountSessions: () => invoke('claudeAccountSessions'),
     saveClaudeSessions: (list) => invoke('saveClaudeSessions', Array.isArray(list) ? list.slice(0, 20).map((s) => ({ id: str(s?.id), name: str(s?.name), mode: str(s?.mode),
-      kind: s?.kind === 'codex' ? 'codex' : 'claude', model: str(s?.model).slice(0, 80), remote: s?.remote === true })) : []),
+      kind: s?.kind === 'codex' ? 'codex' : 'claude', model: str(s?.model).slice(0, 80), remote: s?.remote === true,
+      ...(typeof s?.account === 'string' ? { account: s.account.slice(0, 16) } : {}) })) : []),
     // Before an agent that works with an online AI starts: "", "always" or "off".
     aiConsent: (agent) => invoke('aiConsent', String(agent || '')),
     setAiConsent: (agent, value) => invoke('setAiConsent', String(agent || ''), value === 'always' ? 'always' : 'once'),
