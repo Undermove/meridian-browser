@@ -20,8 +20,9 @@ Only the latest release. Meridian 0.5 and later are built on Chromium (macOS, Ap
 - A scheduled GitHub Action (`chromium-watch`) compares it with Google's releases and opens an issue
   when a newer build of the branch (Chrome ships security fixes this way) or a newer stable branch is
   out; it's marked urgent after 14 days.
-- `chromium/update_chromium.sh` moves to that Chromium, builds, runs every test, packages and drafts the
-  release. It is started by hand on the maintainer's Mac: this public repository has no self-hosted
+- `chromium/update_chromium.sh` moves to that Chromium, builds, runs every test, packages and opens a
+  pull request to main from a branch `chromium-<version>`; the release follows from main once it is
+  merged (`chromium/RELEASE_CHECKLIST.md`). It is started by hand on the maintainer's Mac: this public repository has no self-hosted
   runner.
 - Target: a release within days of a Chrome security release.
 

@@ -14,7 +14,7 @@ cache="${MERIDIAN_VENDOR_CACHE:-$here/.vendor}"
 vendor="$here/tools/workbench-vendor"
 
 if ! cmp -s "$vendor/package-lock.json" "$cache/package-lock.json" \
-   || [ ! -d "$cache/node_modules/monaco-editor/min" ] || [ ! -d "$cache/node_modules/@xterm/xterm/lib" ]; then
+   || [ ! -d "$cache/node_modules/monaco-editor/min" ] || [ ! -d "$cache/node_modules/@xterm/xterm/lib" ] || [ ! -d "$cache/node_modules/@xterm/addon-unicode-graphemes/lib" ]; then
   mkdir -p "$cache"
   rm -rf "$cache/node_modules"
   cp "$vendor/package.json" "$vendor/package-lock.json" "$cache/"
@@ -36,9 +36,10 @@ cp "$repo/src/agents/hooks/mission-hook.js" "$dest.tmp/hooks/mission-hook.js"
 perl -0pi -e 's|(<script src="/vendor/xterm/lib/xterm.js"></script>)|<script src="bridge.js"></script>\n  $1|' "$dest.tmp/workbench.html"
 grep -q 'src="bridge.js"' "$dest.tmp/workbench.html"
 cp -R "$cache/node_modules/monaco-editor/min" "$dest.tmp/vendor/monaco"
-mkdir -p "$dest.tmp/vendor/xterm" "$dest.tmp/vendor/xterm-fit"
+mkdir -p "$dest.tmp/vendor/xterm" "$dest.tmp/vendor/xterm-fit" "$dest.tmp/vendor/xterm-unicode-graphemes"
 cp -R "$cache/node_modules/@xterm/xterm/css" "$cache/node_modules/@xterm/xterm/lib" "$dest.tmp/vendor/xterm/"
 cp -R "$cache/node_modules/@xterm/addon-fit/lib" "$dest.tmp/vendor/xterm-fit/"
+cp -R "$cache/node_modules/@xterm/addon-unicode-graphemes/lib" "$dest.tmp/vendor/xterm-unicode-graphemes/"
 find "$dest.tmp/vendor" -name '*.map' -delete
 rm -rf "$dest"
 mv "$dest.tmp" "$dest"

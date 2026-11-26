@@ -21,6 +21,7 @@ way on macOS, Windows and Linux.
 | `build.sh` | incremental build, a few minutes; first build ~2.5 h on an M4 |
 | `export.sh` | write the commits on the `meridian` branch back into `patches/` |
 | `package.sh`, `package_win.sh` | release packaging: the signed app on macOS, the installer on Windows |
+| `RELEASE_CHECKLIST.md`, `tools/quality_gate.sh` | the gate before a release: the newcomer journey on each "real computer", the isolation guard, Mac-only words, crash reports |
 
 Chromium lives outside this repo, by default in `~/repos/chromium` (set `CHROMIUM_DIR` to move it).
 Plan for about 60 GB free: about 32 GB of source, about 9 GB of build, and Xcode.
