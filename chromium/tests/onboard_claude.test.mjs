@@ -230,7 +230,7 @@ test('first run, no Claude Desktop, Claude Code signed out: the tour signs it in
   } finally { await b.close(); server.close(); fs.rmSync(profile, { recursive: true, force: true }); f.clean(); }
 });
 
-test('Improve with AI, Claude Code signed out: "Sign in to Claude to use AI" starts the sign-in, then the same button improves', async () => {
+test('Improve with AI, Claude Code signed out: "Sign in to Claude to use AI" starts the sign-in, then the same button improves', { skip: NEEDS_FRAMES }, async () => {
   const f = setup({ desktop: 'none', signedIn: false });
   const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(PAGE); });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
