@@ -16,7 +16,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // A stand-in Claude Code: runs its hooks like the real one (Mission Control's async ones, then the
 // blocking guard), one step after another, and prints what the guard said.
 const FAKE_CLAUDE = `#!/usr/bin/python3
-import json, os, subprocess, sys
+import json, os, subprocess, sys, time
 args = sys.argv
 settings = json.load(open(args[args.index('--settings') + 1]))
 cwd = os.getcwd()
@@ -50,6 +50,9 @@ bash('G1', "cd sub && python3 - <<'EOF'\\nimport json\\nd = {'hint': 'never cat 
 bash('G1b', "cat >> upload.test.mjs <<'EOF'\\ntest('skips .env', () => { /* cat .env */ });\\nEOF")
 # A real read: the person answers in Mission Control.
 bash('G2', 'cat .env | head -3')
+# Holds until the test has seen that question close: the next question comes ~150 ms later.
+while not os.path.exists(os.path.join(cwd, 'go-g3')):
+    time.sleep(0.05)
 # A subagent of the same session reads it another way: allowed for the session.
 bash('G3', 'grep PORT ./.env', agent_id='a1', agent_type='general-purpose')
 # Another session (after /clear): asked again.
@@ -149,6 +152,7 @@ test('permission questions: real reads only, a session’s allowance, answers in
     await b.click(row('.ask-session'));
     assert.match((await waitTerm(/G2 \[(.*?)\]/))[1], /"permissionDecision":"allow".*Allowed for this session/);
     s = await waitState((x) => !x.asks?.length && x.nodes.find((n) => n.kind === 'session')?.status !== 'waiting', 'the question to close');
+    fs.writeFileSync(path.join(project, 'go-g3'), '');
 
     // 3. A subagent of that session reads the same file another way: no question.
     assert.match((await waitTerm(/G3 \[(.*?)\]/))[1], /"permissionDecision":"allow".*Allowed for this session/);
