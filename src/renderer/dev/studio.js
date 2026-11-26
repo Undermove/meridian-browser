@@ -74,6 +74,7 @@ async function studioBoot() {
   try { info = await wb.studioInfo(); } catch { return; }
   if (!info?.enabled) return;
   ST.on = true;
+  ST.info = info;
   if (['designer', 'manager', 'developer', 'everyday'].includes(info.persona)) ST.persona = info.persona;
   try { ST.board = localStorage.getItem('wb.studioBoard') === '1'; } catch {}
   document.body.classList.add('studio-on');
@@ -211,6 +212,11 @@ function stBuild() {
         <div class="st-task-list" id="st-task-list" role="list"></div>
       </aside>
       <div class="st-chat">
+        <div class="st-ctabs" role="tablist">
+          <button role="tab" data-pane="chat" class="on">${icon('chat', 14)}<span>${esc(w.chat)}</span></button>
+          <button role="tab" data-pane="brand">${icon('palette', 14)}<span>${esc(w.brand)}</span></button>
+        </div>
+        <div class="st-brand" id="st-brand" hidden></div>
         <div class="st-resultbar" id="st-resultbar" hidden></div>
         <div class="st-feed" id="st-feed" aria-live="polite"></div>
         <div class="st-composer">
@@ -234,6 +240,14 @@ function stBuild() {
     if (m) stSetBoard(m === 'board');
   });
   $('#st-board', el).addEventListener('click', stOnBoardClick);
+  $('.st-ctabs', el).addEventListener('click', (e) => {
+    const p = e.target.closest('[data-pane]')?.dataset.pane;
+    if (!p) return;
+    ST.pane = p;
+    if (p === 'brand') stLoadBrand();
+    stRender();
+  });
+  $('#st-brand', el).addEventListener('click', stOnBrandClick);
   $('#st-new', el).addEventListener('click', () => { ST.current = ''; ST.preview = null; stRender(); $('#st-input').focus(); });
   $('#st-allcards', el).addEventListener('click', () => stSetBoard(true));
   $('#st-task-list', el).addEventListener('click', (e) => {
@@ -309,6 +323,7 @@ function stRender() {
   $('#st-role span').textContent = w.personas[ST.persona]?.name || '';
   document.title = t ? stTitle(t) : w.studio;
   stRenderTasks(terms);
+  stRenderPane();
   stRenderFeed(t);
   stRenderChips(t);
   stRenderResult(t);
@@ -852,6 +867,164 @@ function stFlush(t) {
   if (q) stType(t, q.text);
 }
 
+// ---------------------------------------------------------------- the brand (brand.json in the folder)
+
+// The brand Studio keeps to: colours and fonts, from the live site or from Figma (read only), in
+// brand.json in the task folder. «Проверить сайт» finds what on the page isn't in it.
+async function stLoadBrand() {
+  if (ST.brandLoaded || !S.project) return;
+  ST.brandLoaded = true;
+  try {
+    const f = await wb.read('brand.json');
+    const b = JSON.parse(f?.content || 'null');
+    if (b && Array.isArray(b.colors)) ST.brand = { source: String(b.source || ''), name: String(b.name || ''), colors: b.colors.filter((c) => /^#[0-9a-f]{6}$/i.test(c?.value || '')).slice(0, 16).map((c) => ({ value: c.value.toUpperCase(), name: String(c.name || '') })), fonts: (Array.isArray(b.fonts) ? b.fonts : []).slice(0, 6).map((x) => ({ family: String(x?.family || ''), use: String(x?.use || '') })) };
+  } catch {}
+  stRender();
+}
+async function stSaveBrand() {
+  if (!ST.brand) return;
+  try { await wb.write('brand.json', JSON.stringify(ST.brand, null, 2) + '\n'); } catch (err) { toast(err.message); }
+}
+const stBrandColors = () => (ST.brand?.colors || []).map((c) => c.value);
+
+function stRenderPane() {
+  const brand = ST.pane === 'brand';
+  for (const b of ST.el.querySelectorAll('.st-ctabs button')) b.classList.toggle('on', (b.dataset.pane === 'brand') === brand);
+  $('#st-brand').hidden = !brand;
+  $('#st-feed').hidden = brand;
+  $('.st-composer', ST.el).hidden = brand;
+  $('#st-resultbar').classList.toggle('in-brand', brand);
+  if (brand) stRenderBrand();
+}
+
+function stRenderBrand() {
+  const w = STW();
+  const box = $('#st-brand');
+  const b = ST.brand;
+  const t = stCurrent();
+  const k = t && stTask(t);
+  const figma = ST.info?.figma;
+  const figmaCard = figma
+    ? `<div class="st-bsrc"><span class="st-fig">${stFigmaIcon()}</span><div><b>Figma</b> <span class="m">· ${esc(w.figmaOn)}</span></div><span class="ro">${icon('eye', 12)}${esc(w.readOnly)}</span></div>
+       <form class="st-figform" id="st-figform"><input placeholder="${esc(w.figmaLink)}" aria-label="${esc(w.figmaLink)}"><button class="st-btn" type="submit">${esc(w.figmaTake)}</button></form>`
+    : `<div class="st-bsrc"><span class="st-fig">${stFigmaIcon()}</span><div><b>Figma</b> <span class="m">· ${esc(w.figmaOff)}</span></div><button class="st-btn" data-b="figma">${esc(w.figmaConnect)}</button></div>`;
+  let html;
+  if (!b) {
+    html = `<div class="st-bempty"><div class="st-empty-ic">${icon('palette', 22)}</div><h3>${esc(w.brandNone)}</h3><p>${esc(w.brandNoneHint)}</p>
+      <button class="st-btn pri" data-b="site"${k?.site ? '' : ' disabled'}>${icon('globe', 14)}<span>${esc(k?.site ? w.brandFromSite(StudioWords.host(k.site)) : w.brandNeedSite)}</span></button></div>${figmaCard}`;
+  } else {
+    const drift = ST.drift;
+    const groups = drift ? stDriftGroups(drift) : [];
+    const driftHtml = !drift ? ''
+      : !groups.length ? `<div class="st-bok">${icon('check', 14)}<span>${esc(w.brandAllGood)}</span></div>`
+        : `<div class="st-drift st-in"><div class="st-ask-q">${stDot('needs')}<span>${esc(w.driftTitle(groups.length))}</span></div>
+          <div class="st-drows">${groups.slice(0, 6).map((g) => `<div class="st-drow"><i style="background:${g.value}"></i><span class="ar">→</span><i style="background:${g.nearest}"></i><em>${esc(stBrandName(g.nearest))}</em><span>· ${esc(g.names.slice(0, 2).join(', '))}${g.names.length > 2 ? ` ${esc(w.andMore(g.names.length - 2))}` : ''}</span></div>`).join('')}</div>
+          <div class="st-ask-btns"><button class="st-btn pri" data-b="fix">${esc(w.driftFix)}</button><button class="st-btn" data-b="where">${esc(w.driftWhere)}</button><button class="st-btn" data-b="keep">${esc(w.driftKeep)}</button></div></div>`;
+    html = `<div class="st-bsrc"><span class="st-fig">${b.source === 'figma' ? stFigmaIcon() : icon('globe', 14)}</span><div><b>${esc(b.name || w.brand)}</b> <span class="m">· ${esc(b.source === 'figma' ? 'Figma' : w.fromSite)}</span></div></div>
+      <div class="st-bcheck"><button class="st-btn pri" data-b="check"${k?.site ? '' : ' disabled'}>${icon('search', 14)}<span>${esc(w.brandCheck)}</span></button>${k?.site ? '' : `<span class="m">${esc(w.brandNeedSite)}</span>`}</div>
+      ${driftHtml}
+      <div class="st-bsec"><h4>${esc(w.palette)} <span>· ${b.colors.length}</span></h4><div class="st-sw">${b.colors.map((c, i) => `<div><i style="background:${c.value}"></i><b>${esc(c.name || c.value)}</b>${c.name ? `<span>${esc(c.value)}</span>` : ''}<button class="st-swx" data-b="drop" data-i="${i}" title="${esc(w.remove)}">${icon('x', 11)}</button></div>`).join('')}</div></div>
+      ${b.fonts.length ? `<div class="st-bsec"><h4>${esc(w.fonts)}</h4>${b.fonts.map((f) => `<div class="st-font"><span class="ex" style="font-family:'${esc(f.family.replace(/'/g, ''))}'">Аа ${esc(w.fontSample)}</span><span class="fm">${esc(f.family)} · ${esc(f.use === 'head' ? w.headings : w.bodyText)}</span></div>`).join('')}</div>` : ''}
+      ${figmaCard}
+      <button class="st-link-btn" data-b="site"${k?.site ? '' : ' disabled'}>${esc(w.brandRetake)}</button>`;
+  }
+  if (box.dataset.html === html) return;
+  box.innerHTML = html;
+  box.dataset.html = html;
+  const form = $('#st-figform', box);
+  if (form) form.onsubmit = (e) => { e.preventDefault(); stFigmaBrand(form.querySelector('input').value.trim()); };
+}
+
+const stFigmaIcon = () => '<svg width="10" height="15" viewBox="0 0 38 57" aria-hidden="true"><path d="M19 28.5a9.5 9.5 0 1 1 19 0 9.5 9.5 0 0 1-19 0z" fill="#1abcfe"/><path d="M0 47.5A9.5 9.5 0 0 1 9.5 38H19v9.5a9.5 9.5 0 1 1-19 0z" fill="#0acf83"/><path d="M19 0v19h9.5a9.5 9.5 0 1 0 0-19z" fill="#ff7262"/><path d="M0 9.5A9.5 9.5 0 0 0 9.5 19H19V0H9.5A9.5 9.5 0 0 0 0 9.5z" fill="#f24e1e"/><path d="M0 28.5A9.5 9.5 0 0 0 9.5 38H19V19H9.5A9.5 9.5 0 0 0 0 28.5z" fill="#a259ff"/></svg>';
+const stBrandName = (v) => ST.brand?.colors.find((c) => c.value === v)?.name || v;
+
+// What isn't in the brand, by colour: [{value, nearest, prop, items: [{sel, name}], names}].
+function stDriftGroups(drift) {
+  const by = new Map();
+  for (const d of drift) {
+    const key = `${d.value}>${d.nearest}`;
+    const g = by.get(key) || { value: d.value, nearest: d.nearest, items: [], names: [] };
+    g.items.push({ sel: d.sel, name: d.name, prop: d.prop });
+    if (!g.names.includes(d.name)) g.names.push(d.name);
+    by.set(key, g);
+  }
+  return [...by.values()].sort((a, b) => b.items.length - a.items.length);
+}
+
+async function stBrandFromSite(k) {
+  const w = STW();
+  if (!k?.site) return toast(w.brandNeedSite);
+  let site = await wb.studioPoint('site').catch(() => null);
+  if (!site?.open) {
+    stOpenSite(k);
+    for (let i = 0; i < 40 && !site?.open; i++) { await new Promise((r) => setTimeout(r, 150)); site = await wb.studioPoint('site').catch(() => null); }
+  }
+  for (let i = 0; i < 20; i++) {
+    const got = await wb.studioPoint('brand', { op: 'read' }).catch(() => null);
+    if (got?.colors?.length) {
+      ST.brand = { source: 'site', name: StudioWords.host(k.site), colors: got.colors.map((c) => ({ value: c.value, name: '' })), fonts: got.fonts || [] };
+      ST.drift = null;
+      await stSaveBrand();
+      return stRender();
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  toast(w.brandNoColors);
+}
+
+async function stOnBrandClick(e) {
+  const a = e.target.closest('[data-b]');
+  if (!a || a.disabled) return;
+  const t = stCurrent();
+  const k = t && stTask(t);
+  const w = STW();
+  const op = a.dataset.b;
+  if (op === 'site') return stBrandFromSite(k);
+  if (op === 'figma') {
+    try { ST.info.figma = await wb.studioFigma(true); } catch (err) { toast(err.message); }
+    toast(w.figmaHow, 7000);
+    return stRender();
+  }
+  if (op === 'drop') {
+    ST.brand.colors.splice(Number(a.dataset.i), 1);
+    await stSaveBrand();
+    return stRender();
+  }
+  if (op === 'check') {
+    a.disabled = true;
+    const got = await wb.studioPoint('brand', { op: 'check', arg: stBrandColors() }).catch(() => null);
+    ST.drift = Array.isArray(got) ? got : [];
+    return stRender();
+  }
+  if (op === 'keep') { ST.drift = null; wb.studioPoint('brand', { op: 'show', arg: [] }).catch(() => {}); return stRender(); }
+  if (op === 'where') {
+    const groups = stDriftGroups(ST.drift || []);
+    const marks = groups.flatMap((g) => g.items.slice(0, 3).map((it) => ({ sel: it.sel, text: `${g.value} → ${stBrandName(g.nearest)}`, who: w.brand })));
+    wb.studioPoint('brand', { op: 'show', arg: marks }).catch(() => {});
+    return;
+  }
+  if (op === 'fix' && t) {
+    // Each one to its nearest brand colour, by hand (Studio's Boost): at once, and undoable.
+    for (const g of stDriftGroups(ST.drift || [])) {
+      for (const it of g.items) await stHand(t, k, [{ sel: it.sel, name: it.name }], { [it.prop]: g.nearest });
+    }
+    ST.drift = [];
+    wb.studioPoint('brand', { op: 'show', arg: [] }).catch(() => {});
+    stRender();
+  }
+}
+
+// Brand from Figma: a task of its own (sessions get Figma when they start), read only.
+async function stFigmaBrand(link) {
+  const w = STW();
+  if (!/^https:\/\/(www\.)?figma\.com\//.test(link)) return toast(w.figmaBadLink);
+  ST.current = '';
+  ST.pane = 'chat';
+  $('#st-input').value = w.figmaPrompt(link);
+  stRender();
+  stSubmit();
+}
+
 // ---------------------------------------------------------------- the board (tasks as cards)
 
 function stSetBoard(on) {
@@ -1066,7 +1239,8 @@ async function stPoint(on) {
   }
   if (!site?.open) { toast(STW().pointNoSite); return; }
   await stBoostSnapshot(k, StudioWords.host(k.site));
-  ST.pointing = !!(await wb.studioPoint('start', { lang: ST.lang, colors: [] }).catch(() => false));
+  await stLoadBrand();
+  ST.pointing = !!(await wb.studioPoint('start', { lang: ST.lang, colors: stBrandColors() }).catch(() => false));
   stSendPins(t, k, true);
   stRender();
 }
@@ -1082,6 +1256,7 @@ async function stOnPoint(msg) {
     if (ev.type === 'select') ST.picked = items;
     if (ev.type === 'edit' && items.length && ev.props && typeof ev.props === 'object') await stHand(t, k, items, ev.props);
     if (ev.type === 'say' && typeof ev.text === 'string' && ev.text.trim()) stSayAbout(t, k, items, ev.text.trim());
+    if (ev.type === 'pin' && ev.kind === 'brand') continue;
     if (ev.type === 'pin' && Number.isFinite(+ev.n)) {
       const pin = (k.pins || []).find((p) => p.n === +ev.n);
       if (pin && ev.answer === 'yes') stSend(t, STW().pinYes(pin.n, pin.text));
@@ -1192,6 +1367,9 @@ function stOnModel(t, k) {
     if (!k.siteOpened && ST.view === 'studio' && ST.current === t.id && !document.hidden) stOpenSite(k);
   }
   stSendPins(t, k);
+  // Claude wrote the brand (from Figma): read it again.
+  const bf = k.model.files.get('brand.json');
+  if (bf && bf.times !== k.brandSeen) { k.brandSeen = bf.times; ST.brandLoaded = false; stLoadBrand(); }
   // A restyle that went through: Before/After and Undo for it.
   for (const turn of k.model.turns) for (const it of turn.items) {
     if (it.type === 'steps' && it.steps.some((s) => s.tool === 'mcp__meridian__set_boost' && s.state === 'ok') && k.boost) {
