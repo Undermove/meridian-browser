@@ -1,0 +1,431 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 16:35:41 +0400
+Subject: [PATCH 333/335] Meridian: a CLI's --version is asked with the HOME
+ Meridian was given, never in the home folder
+
+agent_cli's Which() asked each copy of Claude Code its --version with
+HOME = base::GetHomeDir(), which on macOS asks the system and ignores
+HOME, and ran it in that folder. In a test that meant the owner's real
+home and folder: the stand-ins refused to run there, neither copy said
+its version, and the old one first on the PATH won.
+
+ai::CliHome() is the one home for the person's CLIs: HOME as the process
+got it; under the test switches --meridian-test-home, else the test's
+HOME, and never the computer's real home (a private empty folder then).
+Which(), Connect's config home and the accounts' home use it, as does the
+tests' minimal login environment. ai::FindNewestCli() is the newest-copy
+lookup every place that starts an agent CLI shares; its --version probes
+run in an empty temp folder of their own, with HOME from CliHome() when a
+test left the real one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/agent/agent_cli.cc    | 11 ++-
+ chrome/browser/meridian/ai/account_prefs.cc   |  2 +-
+ chrome/browser/meridian/ai/cli_versions.cc    | 60 +++++++++++--
+ chrome/browser/meridian/ai/cli_versions.h     | 13 +++
+ .../meridian/ai/cli_versions_unittest.cc      | 89 +++++++++++++++++++
+ chrome/browser/meridian/ai/process_runner.cc  | 74 ++++++++++++++-
+ chrome/browser/meridian/ai/process_runner.h   | 12 +++
+ 7 files changed, 245 insertions(+), 16 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_cli.cc b/chrome/browser/meridian/agent/agent_cli.cc
+index b6e0d4217b..1dd8e459f8 100644
+--- a/chrome/browser/meridian/agent/agent_cli.cc
++++ b/chrome/browser/meridian/agent/agent_cli.cc
+@@ -122,12 +122,11 @@ std::string LoginPath() {
+ 
+ // The newest copy of `name` (an old Claude Code in /usr/local/bin and the
+ // current one in ~/.local/bin: the current one, whatever the PATH's order),
+-// as Ask and the Workbench run it (cli_versions.h).
++// as Ask and the Workbench run it (cli_versions.h). Its --version is asked
++// with HOME as the process has it (a test's own, never the real one), not
++// base::GetHomeDir(), which on macOS ignores HOME.
+ std::string Which(const std::string& name, const std::string& path) {
+-  return ai::FindNewestProgram(
+-      name, path,
+-      {{"HOME", base::GetHomeDir().AsUTF8Unsafe()},
+-       {"PATH", path}});
++  return ai::FindNewestCli(name, path);
+ }
+ 
+ // An app in /Applications or ~/Applications (never in a test).
+@@ -925,7 +924,7 @@ base::FilePath StateHome() {
+   if (TestSwitchesAllowed()) {
+     return TestSwitchPath("meridian-accounts-home");
+   }
+-  return base::GetHomeDir();
++  return ai::CliHome();
+ }
+ 
+ // A variable of the person's login environment (CLAUDE_CONFIG_DIR, …).
+diff --git a/chrome/browser/meridian/ai/account_prefs.cc b/chrome/browser/meridian/ai/account_prefs.cc
+index f0d34d5342..95b755d05d 100644
+--- a/chrome/browser/meridian/ai/account_prefs.cc
++++ b/chrome/browser/meridian/ai/account_prefs.cc
+@@ -72,7 +72,7 @@ base::DictValue* EntryFor(base::DictValue& accounts,
+ 
+ base::FilePath AccountsHome() {
+   base::FilePath test = TestSwitchPath("meridian-accounts-home");
+-  return test.empty() ? base::GetHomeDir() : test;
++  return test.empty() ? CliHome() : test;
+ }
+ 
+ base::FilePath ManagedAccountsRoot() {
+diff --git a/chrome/browser/meridian/ai/cli_versions.cc b/chrome/browser/meridian/ai/cli_versions.cc
+index ab68ace7ff..14ef6b37d4 100644
+--- a/chrome/browser/meridian/ai/cli_versions.cc
++++ b/chrome/browser/meridian/ai/cli_versions.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/meridian/ai/cli_versions.h"
+ 
+ #include <algorithm>
++#include <optional>
+ #include <set>
+ 
+ #include "base/environment.h"
+@@ -30,11 +31,21 @@ constexpr char kSeparator[] = ";";
+ constexpr char kSeparator[] = ":";
+ #endif
+ 
++// Unit tests' stand-in for the installers' folders.
++std::optional<std::vector<std::string>>& InstallerFoldersForTesting() {
++  static base::NoDestructor<std::optional<std::vector<std::string>>> folders;
++  return *folders;
++}
++
+ std::vector<std::string> Folders(const std::string& search_path,
+                                  const std::map<std::string, std::string>& env) {
+   std::vector<std::string> out =
+       base::SplitString(search_path, kSeparator, base::TRIM_WHITESPACE,
+                         base::SPLIT_WANT_NONEMPTY);
++  if (const auto& testing = InstallerFoldersForTesting()) {
++    out.insert(out.end(), testing->begin(), testing->end());
++    return out;
++  }
+ #if BUILDFLAG(IS_WIN)
+   // Where Claude Code's own installer puts it on Windows, and npm's global
+   // folder (its claude.cmd, codex.cmd), which a Meridian started before they
+@@ -89,12 +100,26 @@ std::string VersionOf(const std::string& path,
+       return it->second;
+     }
+   }
+-  auto home = env.find("HOME");
++  // Its HOME is never the real one in a test (CliHome), and it runs in an
++  // empty folder of its own, not in the home folder: a CLI that looks around
++  // where it starts sees nothing of the person's.
++  std::map<std::string, std::string> run_env = env;
++  auto home = run_env.find("HOME");
++  if (TestSwitchesAllowed() &&
++      (home == run_env.end() ||
++       IsRealHome(base::FilePath::FromUTF8Unsafe(home->second)))) {
++    run_env["HOME"] = CliHome().AsUTF8Unsafe();
++  }
++  base::FilePath cwd;
++  if (!base::CreateNewTempDirectory(FILE_PATH_LITERAL("meridian-cli-"),
++                                    &cwd)) {
++    return std::string();
++  }
+   int exit_code = -1;
+-  const std::string out =
+-      CaptureOutput({path, "--version"}, env,
+-                    home != env.end() ? home->second : std::string(),
+-                    base::Seconds(8), &exit_code);
++  const std::string out = CaptureOutput({path, "--version"}, run_env,
++                                        cwd.AsUTF8Unsafe(), base::Seconds(8),
++                                        &exit_code);
++  base::DeletePathRecursively(cwd);
+   const std::string version = ParseCliVersion(out);
+   if (!version.empty()) {
+     base::AutoLock hold(*lock);
+@@ -180,4 +205,29 @@ std::string FindNewestProgram(const std::string& name,
+   return newest;
+ }
+ 
++std::string FindNewestCli(const std::string& name,
++                          const std::string& search_path,
++                          std::vector<CliCopy>* copies) {
++#if BUILDFLAG(IS_WIN)
++  // Programs there need the system's variables (SystemRoot…); reading them
++  // runs nothing.
++  std::map<std::string, std::string> env = LoginEnvironment();
++  env["PATH"] = search_path;
++#else
++  std::map<std::string, std::string> env = {{"HOME", CliHome().AsUTF8Unsafe()},
++                                            {"PATH", search_path},
++                                            {"LANG", "en_US.UTF-8"},
++                                            {"NO_COLOR", "1"}};
++#endif
++  return FindNewestProgram(name, search_path, env, copies);
++}
++
++void SetInstallerFoldersForTesting(const std::vector<std::string>* folders) {
++  if (folders) {
++    InstallerFoldersForTesting() = *folders;
++  } else {
++    InstallerFoldersForTesting().reset();
++  }
++}
++
+ }  // namespace meridian::ai
+diff --git a/chrome/browser/meridian/ai/cli_versions.h b/chrome/browser/meridian/ai/cli_versions.h
+index 425700bfdf..36fa674dfc 100644
+--- a/chrome/browser/meridian/ai/cli_versions.h
++++ b/chrome/browser/meridian/ai/cli_versions.h
+@@ -46,6 +46,19 @@ std::string FindNewestProgram(const std::string& name,
+                               const std::map<std::string, std::string>& env,
+                               std::vector<CliCopy>* copies = nullptr);
+ 
++// FindNewestProgram as every place that starts an agent CLI uses it (the
++// Workbench's agent and shell tabs, Resume, Connect): `search_path` is the
++// login PATH, and the copies are asked their --version with HOME as CliHome()
++// says (the test's own under the test switches) and PATH `search_path`, in an
++// empty temp folder. Blocking.
++std::string FindNewestCli(const std::string& name,
++                          const std::string& search_path,
++                          std::vector<CliCopy>* copies = nullptr);
++
++// Unit tests: the folders installers put CLIs in, in place of the real ones
++// (~/.local/bin, /usr/local/bin, …); nullptr puts the real ones back.
++void SetInstallerFoldersForTesting(const std::vector<std::string>* folders);
++
+ }  // namespace meridian::ai
+ 
+ #endif  // CHROME_BROWSER_MERIDIAN_AI_CLI_VERSIONS_H_
+diff --git a/chrome/browser/meridian/ai/cli_versions_unittest.cc b/chrome/browser/meridian/ai/cli_versions_unittest.cc
+index 949eada5df..1e4ff8b46f 100644
+--- a/chrome/browser/meridian/ai/cli_versions_unittest.cc
++++ b/chrome/browser/meridian/ai/cli_versions_unittest.cc
+@@ -4,6 +4,14 @@
+ 
+ #include "chrome/browser/meridian/ai/cli_versions.h"
+ 
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/scoped_environment_variable_override.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "build/build_config.h"
++#include "chrome/browser/meridian/ai/process_runner.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+ namespace meridian::ai {
+@@ -25,4 +33,85 @@ TEST(CliVersionsTest, ComparesPartByPartAsNumbers) {
+   EXPECT_EQ(CompareCliVersions("", ""), 0);
+ }
+ 
++#if BUILDFLAG(IS_POSIX)
++namespace {
++
++// A stand-in CLI that says `version` and writes down the HOME and the
++// folder it was started with.
++void StandIn(const base::FilePath& dir,
++             const std::string& version,
++             const base::FilePath& log) {
++  ASSERT_TRUE(base::CreateDirectory(dir));
++  base::FilePath bin = dir.AppendASCII("claude");
++  ASSERT_TRUE(base::WriteFile(
++      bin, "#!/bin/sh\nprintf '%s|%s\\n' \"$HOME\" \"$(pwd -P)\" >> '" +
++               log.value() + "'\necho '" + version + " (Claude Code)'\n"));
++  ASSERT_TRUE(base::SetPosixFilePermissions(bin, 0755));
++}
++
++}  // namespace
++
++// The Workbench, Connect and Ask find a CLI the same way: the newest copy,
++// whichever the PATH lists first, asked its --version with the HOME this
++// process was given (base::GetHomeDir() ignores it on macOS) and never in
++// the home folder itself.
++TEST(CliVersionsTest, NewestCliIsAskedWithTheGivenHomeInAnEmptyFolder) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath root = base::MakeAbsoluteFilePath(temp.GetPath());
++  const base::FilePath home = root.AppendASCII("home");
++  ASSERT_TRUE(base::CreateDirectory(home));
++  const base::FilePath log = root.AppendASCII("runs.log");
++  const base::FilePath old_dir = root.AppendASCII("usr-local-bin");
++  const base::FilePath new_dir = home.AppendASCII(".local/bin");
++  StandIn(old_dir, "2.0.14", log);
++  StandIn(new_dir, "2.1.332", log);
++  const std::vector<std::string> none;
++  SetInstallerFoldersForTesting(&none);
++  base::ScopedEnvironmentVariableOverride given("HOME", home.value());
++  ASSERT_EQ(CliHome(), home);
++
++  std::vector<CliCopy> copies;
++  const std::string path = old_dir.value() + ":" + new_dir.value();
++  EXPECT_EQ(FindNewestCli("claude", path, &copies),
++            new_dir.AppendASCII("claude").value());
++  ASSERT_EQ(copies.size(), 2u);
++  EXPECT_EQ(copies[0].version, "2.1.332");
++  EXPECT_EQ(copies[1].version, "2.0.14");
++
++  std::string runs;
++  ASSERT_TRUE(base::ReadFileToString(log, &runs));
++  std::vector<std::string> lines = base::SplitString(
++      runs, "\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++  ASSERT_EQ(lines.size(), 2u);
++  for (const std::string& line : lines) {
++    const size_t bar = line.find('|');
++    ASSERT_NE(bar, std::string::npos) << line;
++    EXPECT_EQ(line.substr(0, bar), home.value()) << "HOME as given";
++    const std::string cwd = line.substr(bar + 1);
++    EXPECT_NE(cwd, home.value()) << "asked in the home folder";
++    EXPECT_FALSE(base::FilePath(cwd).IsParent(base::GetHomeDir()) ||
++                 base::FilePath(cwd) == base::GetHomeDir())
++        << "asked in the real home: " << cwd;
++    EXPECT_FALSE(base::PathExists(base::FilePath(cwd)))
++        << "its empty folder is cleaned up";
++  }
++  SetInstallerFoldersForTesting(nullptr);
++}
++
++TEST(CliVersionsTest, RealHomeIsTheSystemsWhateverHomeSays) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  EXPECT_FALSE(IsRealHome(temp.GetPath()));
++  EXPECT_FALSE(IsRealHome(base::FilePath()));
++  base::ScopedEnvironmentVariableOverride given("HOME",
++                                               temp.GetPath().value());
++  // The account's own folder, which HOME no longer names.
++  const base::FilePath real = base::GetHomeDir();
++  if (real != temp.GetPath()) {
++    EXPECT_TRUE(IsRealHome(real));
++  }
++}
++#endif  // BUILDFLAG(IS_POSIX)
++
+ }  // namespace meridian::ai
+diff --git a/chrome/browser/meridian/ai/process_runner.cc b/chrome/browser/meridian/ai/process_runner.cc
+index eda157a9bb..8ad456ad49 100644
+--- a/chrome/browser/meridian/ai/process_runner.cc
++++ b/chrome/browser/meridian/ai/process_runner.cc
+@@ -9,6 +9,7 @@
+ #if !BUILDFLAG(IS_WIN)
+ #include <fcntl.h>
+ #include <poll.h>
++#include <pwd.h>
+ #include <signal.h>
+ #include <unistd.h>
+ #endif
+@@ -427,6 +428,65 @@ bool Skipped(const std::string& name) {
+ 
+ }  // namespace
+ 
++bool IsRealHome(const base::FilePath& dir) {
++  if (dir.empty()) {
++    return false;
++  }
++  std::vector<base::FilePath> real = {base::GetHomeDir()};
++#if !BUILDFLAG(IS_WIN)
++  // getpwuid: the account's own folder (base::GetHomeDir() reads HOME on
++  // Linux).
++  if (const struct passwd* pw = getpwuid(getuid()); pw && pw->pw_dir) {
++    real.push_back(base::FilePath(pw->pw_dir));
++  }
++#endif
++  base::FilePath mine = RealFilePath(dir);
++  if (mine.empty()) {
++    mine = dir.StripTrailingSeparators();
++  }
++  for (const base::FilePath& home : real) {
++    if (home.empty()) {
++      continue;
++    }
++    base::FilePath theirs = RealFilePath(home);
++    if ((theirs.empty() ? home.StripTrailingSeparators() : theirs) == mine) {
++      return true;
++    }
++  }
++  return false;
++}
++
++base::FilePath CliHome() {
++#if BUILDFLAG(IS_WIN)
++  const std::string home = Env("USERPROFILE");
++#else
++  const std::string home = Env("HOME");
++#endif
++  if (!TestSwitchesAllowed()) {
++    return home.empty() ? base::GetHomeDir() : base::FilePath::FromUTF8Unsafe(home);
++  }
++  if (base::FilePath test = TestSwitchPath("meridian-test-home");
++      !test.empty()) {
++    return test;
++  }
++  base::FilePath given = base::FilePath::FromUTF8Unsafe(home);
++  if (!home.empty() && !IsRealHome(given)) {
++    return given;
++  }
++  // A test that left HOME as it was: never the person's real folder.
++  static base::NoDestructor<base::Lock> lock;
++  static base::NoDestructor<base::FilePath> made;
++  base::AutoLock hold(*lock);
++  if (made->empty()) {
++    base::FilePath dir;
++    if (base::CreateNewTempDirectory(FILE_PATH_LITERAL("meridian-home-"),
++                                     &dir)) {
++      *made = dir;
++    }
++  }
++  return *made;
++}
++
+ std::map<std::string, std::string> TestLoginEnv() {
+   std::map<std::string, std::string> env;
+   for (const std::string& pair :
+@@ -478,8 +538,10 @@ std::map<std::string, std::string> LoginEnvironment() {
+       env["HOME"] = env["USERPROFILE"];
+     }
+     std::string test_path = TestPath();
+-    if (!test_path.empty()) {
+-      env["PATH"] = test_path + ";" + Env("SystemRoot") + "\\System32";
++    // A test's PATH, even an empty one (a computer without any agent CLI).
++    if (HasTestSwitch("meridian-agents-path")) {
++      env["PATH"] = (test_path.empty() ? "" : test_path + ";") +
++                    Env("SystemRoot") + "\\System32";
+     } else if (env.contains("HOME")) {
+       // Where the installers of agent CLIs (Claude Code's own, others') put
+       // them. A PATH that got the folder after Meridian started doesn't have
+@@ -505,9 +567,13 @@ std::map<std::string, std::string> LoginEnvironment() {
+         {"TMPDIR", Env("TMPDIR")},   {"LANG", "en_US.UTF-8"},
+         {"PATH", "/usr/bin:/bin:/usr/sbin:/sbin"}};
+     std::string test_path = TestPath();
+-    if (!test_path.empty()) {
++    // A test's PATH, even an empty one (a computer without any agent CLI):
++    // never the person's login shell, whose PATH has their real CLIs.
++    if (HasTestSwitch("meridian-agents-path")) {
+       env = base_env;
+-      env["PATH"] = test_path + ":/usr/bin:/bin";
++      // The test's own home, never the real one (CliHome).
++      env["HOME"] = CliHome().AsUTF8Unsafe();
++      env["PATH"] = (test_path.empty() ? "" : test_path + ":") + "/usr/bin:/bin";
+       for (const auto& [name, value] : TestLoginEnv()) {
+         env[name] = value;
+       }
+diff --git a/chrome/browser/meridian/ai/process_runner.h b/chrome/browser/meridian/ai/process_runner.h
+index c9a5041a51..0147d6ce3f 100644
+--- a/chrome/browser/meridian/ai/process_runner.h
++++ b/chrome/browser/meridian/ai/process_runner.h
+@@ -111,6 +111,18 @@ std::vector<std::string> SandboxedArgv(
+ // environment whose PATH is that folder first.
+ std::map<std::string, std::string> LoginEnvironment();
+ 
++// The home folder of the person's CLIs: HOME as this process got it (what
++// the CLIs Meridian starts are given; base::GetHomeDir() on macOS asks the
++// system and ignores HOME), else the system's. Under the test switches it is
++// --meridian-test-home, else the test's HOME, and never the computer's real
++// home folder: a test that left HOME alone gets a private empty one. Never
++// blocks for long (a folder made once, in a test).
++base::FilePath CliHome();
++
++// Whether `dir` is this computer's real home folder for the person (the
++// system's, whatever HOME says), through symlinks.
++bool IsRealHome(const base::FilePath& dir);
++
+ // Tests: --meridian-test-login-env=NAME=value[;NAME=value…], what the
+ // person's login environment has (CLAUDE_CONFIG_DIR=…), in the minimal one
+ // above and where accounts are listed.

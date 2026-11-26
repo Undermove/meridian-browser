@@ -1,0 +1,273 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 16:35:48 +0400
+Subject: [PATCH 335/335] Meridian: the tour's suggested spaces merge with the
+ ones moved in from Arc
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Moving in from Arc brought Work and Home; the tour's setup from the apps
+then added its own Work and Personal: Work, Home, Work, Personal.
+
+The tour's suggestions (from the apps or from the AI) leave out a space
+the person already has by that name, compared without case, emoji or
+punctuation (SpaceNameKey: "💼 Work" is "work"), and one suggested
+twice: the result is Work, Home, Personal. The proposal shown, the AI's
+answer and ApplySetup all do it. A lone empty first space, which the
+setup replaces, doesn't count; a space the person makes later may still
+share a name.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |  1 +
+ chrome/browser/meridian/setup_profile.cc      | 48 +++++++++++++++++
+ chrome/browser/meridian/setup_profile.h       | 13 +++++
+ .../meridian/setup_profile_unittest.cc        | 53 +++++++++++++++++++
+ chrome/browser/meridian/sidebar_handler.cc    | 37 ++++++++++---
+ 5 files changed, 145 insertions(+), 7 deletions(-)
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 55c05b87ec..a336c5c2b0 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -129,6 +129,7 @@ source_set("model") {
+     "//components/sessions",
+     "//net",
+     "//third_party/boringssl",
++    "//third_party/icu",
+   ]
+ }
+ 
+diff --git a/chrome/browser/meridian/setup_profile.cc b/chrome/browser/meridian/setup_profile.cc
+index df53187ad9..c56110aad9 100644
+--- a/chrome/browser/meridian/setup_profile.cc
++++ b/chrome/browser/meridian/setup_profile.cc
+@@ -13,7 +13,11 @@
+ #include "base/files/file_enumerator.h"
+ #include "base/files/file_util.h"
+ #include "base/path_service.h"
++#include "base/i18n/case_conversion.h"
+ #include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/third_party/icu/icu_utf.h"
++#include "third_party/icu/source/common/unicode/uchar.h"
+ 
+ namespace meridian {
+ 
+@@ -239,4 +243,48 @@ SetupProposal ProposeSetup(const std::vector<std::string>& apps,
+   return p;
+ }
+ 
++std::string SpaceNameKey(std::string_view name) {
++  const std::u16string folded =
++      base::i18n::FoldCase(base::UTF8ToUTF16(name));
++  std::u16string key;
++  bool gap = false;
++  size_t i = 0;
++  while (i < folded.size()) {
++    base_icu::UChar32 c;
++    CBU16_NEXT(folded, i, folded.size(), c);
++    if (u_isalnum(c)) {
++      if (gap && !key.empty()) {
++        key.push_back(u' ');
++      }
++      gap = false;
++      if (c > 0xFFFF) {
++        key.push_back(static_cast<char16_t>(((c - 0x10000) >> 10) + 0xD800));
++        key.push_back(static_cast<char16_t>(((c - 0x10000) & 0x3FF) + 0xDC00));
++      } else {
++        key.push_back(static_cast<char16_t>(c));
++      }
++    } else {
++      // Emoji, punctuation, spaces: between words at most.
++      gap = true;
++    }
++  }
++  return base::UTF16ToUTF8(key);
++}
++
++void LeaveOutKnownSpaces(std::vector<Space>& proposed,
++                         const std::vector<Space>& existing) {
++  std::set<std::string> taken;
++  const bool replaced = existing.size() == 1 && existing[0].pinned.empty();
++  if (!replaced) {
++    for (const Space& space : existing) {
++      taken.insert(SpaceNameKey(space.name));
++    }
++  }
++  std::erase_if(proposed, [&](const Space& space) {
++    const std::string key = SpaceNameKey(space.name);
++    // A name of emoji alone is compared as it is.
++    return !taken.insert(key.empty() ? space.name : key).second;
++  });
++}
++
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/setup_profile.h b/chrome/browser/meridian/setup_profile.h
+index 04a678c89e..357bad8904 100644
+--- a/chrome/browser/meridian/setup_profile.h
++++ b/chrome/browser/meridian/setup_profile.h
+@@ -53,6 +53,19 @@ SetupProposal ProposeSetup(const std::vector<std::string>& apps,
+                            std::string_view persona = {},
+                            bool strong_dev = false);
+ 
++// A space's name as two names are compared: letters and digits only, in
++// lower case, words one space apart ("💼 Work", "work" and "WORK!" are the
++// same name; "Работа" and "работа" too).
++std::string SpaceNameKey(std::string_view name);
++
++// The tour's suggested spaces (from the apps or the AI) without those the
++// person already has by that name (SpaceNameKey), or that come twice: moving
++// in from Arc brought "Work", so the tour's "Work" is the same space, not a
++// second one. A lone empty first space, which the setup replaces, doesn't
++// count. A space the person makes themselves later may share a name.
++void LeaveOutKnownSpaces(std::vector<Space>& proposed,
++                         const std::vector<Space>& existing);
++
+ }  // namespace meridian
+ 
+ #endif  // CHROME_BROWSER_MERIDIAN_SETUP_PROFILE_H_
+diff --git a/chrome/browser/meridian/setup_profile_unittest.cc b/chrome/browser/meridian/setup_profile_unittest.cc
+index ca6654a237..f823af63b9 100644
+--- a/chrome/browser/meridian/setup_profile_unittest.cc
++++ b/chrome/browser/meridian/setup_profile_unittest.cc
+@@ -62,5 +62,58 @@ TEST(SetupProfileTest, PersonaOverridesTheGuess) {
+   EXPECT_EQ(ProposeSetup({"Xcode"}, "en", "bogus").persona, "developer");
+ }
+ 
++Space Named(const std::string& name, bool with_tab = true) {
++  Space space;
++  space.name = name;
++  if (with_tab) {
++    Item tab;
++    tab.title = "A tab";
++    space.pinned.push_back(tab);
++  }
++  return space;
++}
++
++std::vector<std::string> Names(const std::vector<Space>& spaces) {
++  std::vector<std::string> out;
++  for (const Space& space : spaces) {
++    out.push_back(space.name);
++  }
++  return out;
++}
++
++TEST(SetupProfileTest, SpaceNamesCompareWithoutCaseOrEmoji) {
++  EXPECT_EQ(SpaceNameKey("Work"), "work");
++  EXPECT_EQ(SpaceNameKey("💼 Work"), SpaceNameKey("work"));
++  EXPECT_EQ(SpaceNameKey("WORK!"), "work");
++  EXPECT_EQ(SpaceNameKey("  Side   project 🚀"), "side project");
++  EXPECT_EQ(SpaceNameKey("Работа"), SpaceNameKey("работа"));
++  EXPECT_NE(SpaceNameKey("Work"), SpaceNameKey("Home"));
++}
++
++// Arc brought "Work" and "Home"; the tour's setup (the apps' or the AI's)
++// suggests "Work" and "Personal": the result is Work, Home, Personal.
++TEST(SetupProfileTest, SuggestedSpacesMergeWithTheOnesThePersonHas) {
++  std::vector<Space> arc = {Named("Work"), Named("🏠 Home")};
++  std::vector<Space> proposed = {Named("💼 work", false), Named("Personal", false),
++                                 Named("HOME", false), Named("personal", false)};
++  LeaveOutKnownSpaces(proposed, arc);
++  EXPECT_EQ(Names(proposed), (std::vector<std::string>{"Personal"}));
++
++  SetupProposal dev =
++      ProposeSetup({"Visual Studio Code"}, "en", "developer", true);
++  ASSERT_EQ(Names(dev.spaces), (std::vector<std::string>{"Work", "Personal"}));
++  LeaveOutKnownSpaces(dev.spaces, arc);
++  EXPECT_EQ(Names(dev.spaces), (std::vector<std::string>{"Personal"}));
++}
++
++// The lone empty space of a new profile is replaced by the setup, so its
++// name is free.
++TEST(SetupProfileTest, TheUntouchedFirstSpaceDoesNotTakeAName) {
++  std::vector<Space> fresh = {Named("Personal", false)};
++  std::vector<Space> proposed = {Named("Work", false), Named("Personal", false)};
++  LeaveOutKnownSpaces(proposed, fresh);
++  EXPECT_EQ(Names(proposed), (std::vector<std::string>{"Work", "Personal"}));
++}
++
+ }  // namespace
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 2ee6a54b5d..b966dcc77c 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -2461,7 +2461,10 @@ void SidebarHandler::ProposeSetup(bool use_apps,
+           },
+           use_apps, base::i18n::GetConfiguredLocale(), persona),
+       base::BindOnce(
+-          [](ProposeSetupCallback callback, SetupProposal p) {
++          [](ProposeSetupCallback callback, std::vector<Space> existing,
++             SetupProposal p) {
++            // Spaces by names the person has (moved in from Arc) are theirs.
++            LeaveOutKnownSpaces(p.spaces, existing);
+             auto out = mojom::SetupProposal::New();
+             out->title = p.title;
+             out->mode = p.mode;
+@@ -2479,7 +2482,7 @@ void SidebarHandler::ProposeSetup(bool use_apps,
+             out->seen_apps = p.seen;
+             std::move(callback).Run(std::move(out));
+           },
+-          std::move(callback)));
++          std::move(callback), service_->spaces()));
+ }
+ 
+ void SidebarHandler::ApplySetup(std::vector<mojom::SpacePtr> spaces,
+@@ -2494,6 +2497,9 @@ void SidebarHandler::ApplySetup(std::vector<mojom::SpacePtr> spaces,
+     space.color2 = s->color2;
+     chosen.push_back(std::move(space));
+   }
++  // Whatever the page sent: a suggested space by a name the person already
++  // has merges into theirs ("Work" from Arc and the tour's "Work").
++  LeaveOutKnownSpaces(chosen, service_->spaces());
+   std::vector<Item> links;
+   for (const mojom::ItemPtr& f : favorites) {
+     if (!f->is_folder && f->url.SchemeIsHTTPOrHTTPS()) {
+@@ -2603,14 +2609,12 @@ mojom::SetupProposalPtr ParseTailored(
+   out->mode = "everyday";
+   if (const base::ListValue* spaces = json->FindList("spaces")) {
+     for (const base::Value& v : *spaces) {
+-      if (!v.is_dict() || out->spaces.size() >= 3) {
++      // (Up to 3 once those the person has are left out, below.)
++      if (!v.is_dict() || out->spaces.size() >= 8) {
+         continue;
+       }
+       const std::string* name = v.GetDict().FindString("name");
+-      if (!name || name->empty() ||
+-          std::ranges::any_of(existing, [&](const Space& s) {
+-            return base::EqualsCaseInsensitiveASCII(s.name, *name);
+-          })) {
++      if (!name || name->empty()) {
+         continue;
+       }
+       auto s = mojom::Space::New();
+@@ -2644,6 +2648,25 @@ mojom::SetupProposalPtr ParseTailored(
+       out->favorites.push_back(ToMojo(item));
+     }
+   }
++  // Not the spaces the person has by those names (case, emoji aside), nor
++  // one twice.
++  std::vector<Space> named;
++  for (size_t i = 0; i < out->spaces.size(); ++i) {
++    Space s;
++    s.id = base::NumberToString(i);
++    s.name = out->spaces[i]->name;
++    named.push_back(std::move(s));
++  }
++  LeaveOutKnownSpaces(named, existing);
++  std::vector<mojom::SpacePtr> kept;
++  for (const Space& s : named) {
++    size_t i = 0;
++    base::StringToSizeT(s.id, &i);
++    if (kept.size() < 3) {
++      kept.push_back(std::move(out->spaces[i]));
++    }
++  }
++  out->spaces = std::move(kept);
+   if (out->spaces.empty() && out->favorites.empty()) {
+     return nullptr;
+   }
