@@ -1,0 +1,224 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 16:24:28 +0400
+Subject: [PATCH] Meridian: a click on a command bar suggestion opens it, like
+ Return
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In the ⌘T bar a click on a suggestion did nothing. The bar shows the
+suggestions in Arc's order (what Return opens, then pages, then
+searches), not the browser's. Return was mapped back to the browser's
+line, a click wasn't: the row named its place in the shown list, the
+browser found another match there, the URLs didn't agree and it
+ignored the click. Nothing closed the bar or opened the new tab
+either, and "Search YouTube" on a row went nowhere (keyword-click had
+no listener here).
+
+The searchbox now takes the clicks on its rows itself (before the
+rows' own handlers): a click acts like Return on that row; a middle
+click or ⌘-click (Ctrl elsewhere) opens it in a background tab and
+leaves the bar open with what was typed (Arc); "Search YouTube" enters
+that site's search in the bar, as "youtube ⇥" does (Chromium's keyword
+chip when Meridian has no mode for it). Remove and action buttons on a
+row name the browser's line too. A press on a row keeps the focus in
+the field.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/command_bar.html.ts              |   3 +-
+ .../webui_browser/meridian/command_bar.ts     |  13 ++
+ .../webui_browser/webui_browser_searchbox.ts  | 118 +++++++++++++++++-
+ 3 files changed, 132 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+index b232644eab..ad21e39e55 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+@@ -27,7 +27,8 @@ export function getHtml(this: MeridianCommandBarElement) {
+         .newTab="${this.newTab}" .inlineDropdown="${true}"
+         .placeholderText="${'Search or Enter URL…'}"
+         @keyup="${this.onAddressKeyup_}"
+-        @searchbox-navigated="${this.onAddressSearchboxNavigated_}">
++        @searchbox-navigated="${this.onAddressSearchboxNavigated_}"
++        @searchbox-keyword="${this.onAddressSearchboxKeyword_}">
+       ${this.quick_ ? html`
+         <button id="quick" class="tab-row quick ${this.tabSel_ < 0 &&
+                 this.quick_.action !== 'none' ? 'sel' : ''}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index f6e536a343..b6dc19e3b8 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -905,6 +905,19 @@ export class MeridianCommandBarElement extends CrLitElement {
+   protected onAddressSearchboxNavigated_() {
+     this.hide();
+   }
++
++  // "Search YouTube" clicked on a suggestion: that site's search, the way
++  // "youtube ⇥" enters it (the field's own keyword chip if Meridian has no
++  // mode for it).
++  protected onAddressSearchboxKeyword_(e: CustomEvent<{keyword: string}>) {
++    const mode = this.siteFor_(e.detail.keyword.toLowerCase());
++    if (!mode) {
++      return;
++    }
++    e.preventDefault();
++    this.tabSel_ = -1;
++    this.enterMode_(mode);
++  }
+ }
+ 
+ declare global {
+diff --git a/chrome/browser/resources/webui_browser/webui_browser_searchbox.ts b/chrome/browser/resources/webui_browser/webui_browser_searchbox.ts
+index 5511cf7dd7..07e6753711 100644
+--- a/chrome/browser/resources/webui_browser/webui_browser_searchbox.ts
++++ b/chrome/browser/resources/webui_browser/webui_browser_searchbox.ts
+@@ -8,6 +8,7 @@ import '//resources/cr_components/searchbox/searchbox_input.js';
+ import {SearchboxBrowserProxy} from '//resources/cr_components/searchbox/searchbox_browser_proxy.js';
+ import type {SearchboxDropdownElement} from '//resources/cr_components/searchbox/searchbox_dropdown.js';
+ import type {SearchboxInputElement} from '//resources/cr_components/searchbox/searchbox_input.js';
++import type {SearchboxMatchElement} from '//resources/cr_components/searchbox/searchbox_match.js';
+ import type {SearchboxMixinInterface} from '//resources/cr_components/searchbox/searchbox_mixin.js';
+ import {SearchboxMixin} from '//resources/cr_components/searchbox/searchbox_mixin.js';
+ import {I18nMixinLit} from '//resources/cr_elements/i18n_mixin_lit.js';
+@@ -16,7 +17,8 @@ import {loadTimeData} from '//resources/js/load_time_data.js';
+ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {AutocompleteResult, PageCallbackRouter, PageHandlerInterface} from '//resources/mojo/components/omnibox/browser/searchbox.mojom-webui.js';
+-import {SelectionLineState} from '//resources/mojo/components/omnibox/browser/searchbox.mojom-webui.js';
++import {KeywordActivationMethod, KeywordType, SelectionLineState} from '//resources/mojo/components/omnibox/browser/searchbox.mojom-webui.js';
++import {mojoTimeTicks} from '//resources/cr_components/searchbox/utils.js';
+ 
+ import {getCss} from './webui_browser_searchbox.css.js';
+ import {getHtml} from './webui_browser_searchbox.html.js';
+@@ -154,7 +156,113 @@ export class WebuiBrowserSearchboxElement extends
+     this.navigateToLine_(matchIndex, e);
+   }
+ 
++  // Meridian: a middle click or ⌘-click (Ctrl elsewhere) opens the match in
++  // a background tab and leaves the bar as it is, to open more (Arc).
++  override isBackgroundTabNavigation(e: KeyboardEvent|MouseEvent): boolean {
++    return e instanceof MouseEvent && !e.shiftKey &&
++        (e.button === 1 ||
++         (navigator.userAgent.includes('Mac') ? e.metaKey : e.ctrlKey));
++  }
++
++  // The browser's line of the match shown at `matchIndex` (the shown order is
++  // Meridian's, see `onAutocompleteResultChanged()`).
++  private browserLine_(matchIndex: number): number {
++    const line = this.lines_[matchIndex];
++    return line !== undefined && this.browserResult_ &&
++            this.result?.sequenceId === this.browserResult_.sequenceId ?
++        line :
++        matchIndex;
++  }
++
++  // Meridian: the press keeps the focus in the field (the row would take it,
++  // and fill the field with its text before the click).
++  private onMatchesMousedownCapture_ = (e: MouseEvent) => {
++    if (this.matchOf_(e)) {
++      e.preventDefault();
++    }
++  };
++
++  private matchOf_(e: Event): SearchboxMatchElement|null {
++    return (e.composedPath().find(
++               n => n instanceof HTMLElement &&
++                   n.localName === 'cr-searchbox-match') as
++            SearchboxMatchElement | undefined) ??
++        null;
++  }
++
++  // Meridian: a click on a suggestion acts like Return on it. The rows would
++  // tell the browser their place in the shown order, which isn't the
++  // browser's (it then does nothing: the line and the URL don't agree), and
++  // nothing would close the command bar or open a new tab for ⌘T.
++  private onMatchesClickCapture_ = (e: MouseEvent) => {
++    if (e.button > 1) {
++      return;
++    }
++    const row = this.matchOf_(e);
++    const match = row?.match;
++    if (!row || !match || row.matchIndex < 0) {
++      return;
++    }
++    e.preventDefault();
++    e.stopPropagation();
++    const path = e.composedPath();
++    const hit = (id: string) =>
++        path.find(n => n instanceof HTMLElement && n.id === id) as
++            HTMLElement |
++        undefined;
++    const line = this.browserLine_(row.matchIndex);
++    if (hit('remove')) {
++      if (e.button === 0) {
++        this.pageHandler().deleteAutocompleteMatch(line, match.destinationUrl);
++      }
++      return;
++    }
++    const action = hit('action');
++    if (action) {
++      this.pageHandler().executeAction(
++          line, Number(action.getAttribute('action-index')) || 0,
++          match.destinationUrl, mojoTimeTicks(Date.now()), e.button || 0,
++          e.altKey, e.ctrlKey, e.metaKey, e.shiftKey);
++      this.fire('searchbox-navigated');
++      return;
++    }
++    // "Search YouTube" on the row (or a row that is that search itself):
++    // that site's search, like Tab.
++    if (match.keywordModel &&
++        (hit('keyword') || match.keywordModel.type === KeywordType.kInstant)) {
++      // The command bar takes it into its own site search (the pill).
++      const taken = !this.dispatchEvent(new CustomEvent('searchbox-keyword', {
++        bubbles: true,
++        composed: true,
++        cancelable: true,
++        detail: {keyword: match.keywordModel.keyword},
++      }));
++      if (!taken) {
++        this.enterKeywordOf_(row.matchIndex, line);
++      }
++      return;
++    }
++    this.navigateToMatch(row.matchIndex, e);
++  };
++
++  // Chromium's keyword mode for the match (the chip in the field).
++  private enterKeywordOf_(matchIndex: number, line: number) {
++    const match = this.result?.matches[matchIndex];
++    if (!match?.keywordModel) {
++      return;
++    }
++    this.pageHandler().activateKeyword(
++        line, match.destinationUrl, mojoTimeTicks(Date.now()),
++        KeywordActivationMethod.kClick);
++    this.onKeywordClick(new CustomEvent(
++        'keyword-click', {detail: {match, matchIndex}}));
++  }
++
+   private navigateToLine_(matchIndex: number, e: KeyboardEvent|MouseEvent) {
++    if (this.isBackgroundTabNavigation(e)) {
++      super.navigateToMatch(matchIndex, e);
++      return;
++    }
+     if (!this.newTab) {
+       super.navigateToMatch(matchIndex, e);
+       this.fire('searchbox-navigated');
+@@ -316,6 +424,14 @@ export class WebuiBrowserSearchboxElement extends
+ 
+   override firstUpdated(changedProperties: PropertyValues<this>) {
+     super.firstUpdated(changedProperties);
++    // Before the rows' own handlers (see `onMatchesClickCapture_()`).
++    const matches = this.$.matches;
++    matches.addEventListener(
++        'mousedown', this.onMatchesMousedownCapture_, {capture: true});
++    matches.addEventListener(
++        'click', this.onMatchesClickCapture_, {capture: true});
++    matches.addEventListener(
++        'auxclick', this.onMatchesClickCapture_, {capture: true});
+     this.initialInputScrollHeight = this.$.input.scrollHeight;
+   }
+ 
