@@ -20,9 +20,9 @@ step() {  # name, command…
   if "$@" > "$LOGS/$name.log" 2>&1; then echo "   ok"; else echo "   FAILED (see $LOGS/$name.log)"; fail+=("$name"); fi
   grep -E '^# (pass|fail|todo|skipped)' "$LOGS/$name.log" | tr '\n' ' ' | sed 's/^/   /'; echo
 }
-cd "$HERE/tests"
+cd "$HERE/tests" || exit 1
 tests=(--test --test-force-exit --test-concurrency=1 --test-timeout=180000 --test-reporter=tap)
-all=($(ls ./*.test.mjs | sort))
+all=(./*.test.mjs)  # a glob comes sorted
 half=$(( (${#all[@]} + 1) / 2 ))
 
 step lint node "$HERE/tools/lint_platform_words.mjs"
