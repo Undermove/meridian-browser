@@ -137,7 +137,7 @@ node chromium/tools/verify_release.mjs SHA256SUMS.txt SHA256SUMS.txt.sig Meridia
 
 Agents started in the Workbench get the browser tools for that session only; your global configs aren't touched.
 
-Model can't take images (many OpenAI-compatible endpoints answer HTTP 400 once a screenshot is in the conversation)? Add `--text-only` after `--mcp-bridge` in the client's config, or set `MERIDIAN_MCP_TEXT_ONLY=1`: the screenshot tool is left out and the agent reads pages as text. OpenCode's **Connect** adds it by itself when OpenCode's model is an OpenAI-compatible one set up without image input.
+Models that can't take images (many OpenAI-compatible endpoints answer HTTP 400 once a screenshot is in the conversation) need nothing from you: OpenCode's **Connect** sets the browser tools up without screenshots when its model is one of those, and Ask asks again without images when a provider refuses one, and remembers it. (Other MCP clients: `--mcp-bridge --text-only`, or `MERIDIAN_MCP_TEXT_ONLY=1`.)
 
 ## Security
 

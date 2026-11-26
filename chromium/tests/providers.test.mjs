@@ -300,7 +300,7 @@ else {
     await b.eval('app.$.tabstrip.runCommand(14, 0)');
     await b.waitFor(`app.$.ask.open && !!${AK}.getElementById('input')`);
     await b.eval(`(() => { const i = ${AK}.getElementById('input'); i.value = 'What is this page?'; ${AK}.getElementById('send').click(); })()`);
-    await b.waitFor(`/ANSWER|Agent not found|Unrecognized|no model is set/.test([...${AK}.querySelectorAll('.msg.assistant')].pop()?.textContent || '')`, 20000)
+    await b.waitFor(`/ANSWER|Agent not found|Unrecognized|free model/.test([...${AK}.querySelectorAll('.msg.assistant')].pop()?.textContent || '')`, 20000)
       .catch(async (e) => { throw new Error(`${e.message}\nAsk shows: ${await b.eval(`${AK}.textContent.replace(/\\s+/g, ' ').slice(-400)`)}`); });
     const said = await b.eval(`[...${AK}.querySelectorAll('.msg.assistant')].pop().textContent`);
     const runs = fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
@@ -345,8 +345,107 @@ test('OpenCode Ask runs with the person’s own model: the one last picked in Op
 test('OpenCode Ask with no model anywhere: no -m made up, and a plain word when its free one runs out', { skip: process.platform !== 'darwin' && 'needs the macOS sandbox' }, async () => {
   const none = await askOpenCode(2, { jsonc: '{ /* freeLimit */ }', json: '{}' });
   assert.ok(!none.runs[0].includes('-m'), `no model made up: ${none.runs[0]}`);
-  assert.match(none.said, /no model is set for OpenCode/);
-  assert.match(none.said, /opencode\.json/);
+  assert.match(none.said, /its own free model/);
+  // Nothing to edit by hand, no "try again later": another AI from the menu.
+  assert.doesNotMatch(none.said, /opencode\.json|later/);
+  assert.match(none.said, /another AI/);
+});
+
+// Ask with a stand-in OpenCode 2 (`behave`: the body that answers a run, with `args`, `env`, `log`
+// and `answer(text)` / `fail(message)` at hand). Returns the browser and a way to ask.
+async function openCodeAsk(jsonc, behave) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-oc-')));
+  const bin = path.join(root, 'bin');
+  const home = path.join(root, 'home');
+  const log = path.join(root, 'runs.log');
+  fs.mkdirSync(bin);
+  fs.mkdirSync(path.join(home, '.config', 'opencode'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.config', 'opencode', 'opencode.jsonc'), jsonc);
+  standIn(bin, 'opencode', `const fs = require('fs');
+const args = process.argv.slice(2); const env = process.env;
+const answer = (t) => console.log(JSON.stringify({ type: 'text', sessionID: 'ses_1', part: { text: t } }));
+const fail = (m) => { console.log(JSON.stringify({ type: 'error', sessionID: 'ses_1', error: { type: 'unknown', message: m } })); process.exit(1); };
+if (args[0] === 'auth') { console.log('1 credentials'); }
+else if (args.includes('--help')) { console.log('opencode run [message..]\\n  --format\\n  --agent\\n  --standalone  Run with a private server'); }
+else {
+  fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args, textOnly: env.MERIDIAN_MCP_TEXT_ONLY || '', config: env.OPENCODE_CONFIG_CONTENT || '' }) + '\\n');
+  process.stdin.resume();
+  process.stdin.on('end', () => { ${behave} });
+}
+`);
+  const b = await launch(['about:blank'], { args: [`--meridian-agents-path=${bin}`, `--meridian-test-home=${home}`] });
+  await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+  await b.eval('app.$.tabstrip.runCommand(13, 0)');
+  await b.waitFor(`app.$.settings.open && !!${ST}.querySelector('[data-id="ai"]')`);
+  await b.click(`${ST}.querySelector('[data-id="ai"]')`);
+  await b.waitFor(`!!${ST}.getElementById('aiRows')`);
+  await b.click(`${ST}.getElementById('otherAgents')`);
+  await b.waitFor(`${ST}.getElementById('ai-opencode')?.textContent.includes('Ready')`, 15000);
+  await b.eval(`${ST}.getElementById('ai-opencode').click()`);
+  await b.waitFor(`${ST}.getElementById('ai-opencode').classList.contains('on')`);
+  await b.eval('app.$.settings.hide()');
+  await b.eval('app.$.tabstrip.runCommand(14, 0)');
+  await b.waitFor(`app.$.ask.open && !!${AK}.getElementById('input')`);
+  const last = `[...${AK}.querySelectorAll('.msg.assistant')].pop()`;
+  const ask = async (q, until) => {
+    await b.eval(`(() => { const i = ${AK}.getElementById('input'); i.value = ${JSON.stringify(q)}; ${AK}.getElementById('send').click(); })()`);
+    await b.waitFor(`!app.$.ask.busy_ && ${until.toString()}.test(${last}?.textContent || '')`, 30000)
+      .catch(async (e) => { throw new Error(`${e.message}\nAsk shows: ${await b.eval(`${AK}.textContent.replace(/\\s+/g, ' ').slice(-400)`)}`); });
+    return b.eval(`${last}.textContent.replace(/\\s+/g, ' ')`);
+  };
+  const runs = () => fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const done = async () => { await b.close(); fs.rmSync(root, { recursive: true, force: true }); };
+  return { b, ask, runs, last, done };
+}
+
+// A report (26.11.2026): a corporate OpenAI-compatible model answered HTTP 400 "Failed to read HTTP
+// message" once a screenshot was in the conversation. Ask asks again by itself, without images, and
+// remembers that for this agent and model: nobody has to set anything.
+test('OpenCode Ask: a provider that refuses images is asked again text-only, and remembered', { skip: process.platform !== 'darwin' && 'needs the macOS sandbox' }, async () => {
+  const oc = await openCodeAsk('{"model": "alfagen/EVC-Com-model"}',
+    `if (env.MERIDIAN_MCP_TEXT_ONLY === '1') answer('ANSWER without images');
+     else { answer('Taking a screenshot…'); fail('Provider request failed with HTTP 400: {"source":"CLIENT","type":"VALIDATION","internalMessage":"400 BAD_REQUEST \\\\"Failed to read HTTP message\\\\""}'); }`);
+  try {
+    const first = await oc.ask('What is on this page?', /ANSWER|HTTP 400|Failed|went wrong/);
+    assert.match(first, /ANSWER without images/);
+    assert.doesNotMatch(first, /Taking a screenshot|HTTP 400|Send a report/, 'the refused go leaves nothing behind');
+    let runs = oc.runs();
+    assert.equal(runs.length, 2);
+    assert.equal(runs[0].textOnly, '');
+    assert.equal(runs[1].textOnly, '1', 'the second go: the bridge leaves screenshots out');
+    assert.equal(JSON.parse(runs[1].config).tools['*'], false, 'and OpenCode has no tools');
+    // Next time: text only from the start.
+    assert.match(await oc.ask('And now?', /ANSWER|HTTP 400|went wrong/), /ANSWER without images/);
+    runs = oc.runs();
+    assert.equal(runs.length, 3);
+    assert.equal(runs[2].textOnly, '1');
+  } finally { await oc.done(); }
+});
+
+// OpenCode's own free model ran out, and the person has a model of their own set up in OpenCode: one
+// button uses it and asks again. Never "try again later".
+test('OpenCode Ask: its free model ran out, one button switches to the person’s own model', { skip: process.platform !== 'darwin' && 'needs the macOS sandbox' }, async () => {
+  const oc = await openCodeAsk(`{
+  // the bank's gateway; no "model" here, none picked in OpenCode either
+  "provider": { "alfagen": { "npm": "@ai-sdk/openai-compatible", "models": { "EVC-Com-model": {} } } },
+}`,
+    `const m = args.indexOf('-m');
+     if (m < 0) fail('Free usage limit reached. Connect a provider or subscribe to OpenCode Go');
+     else answer('ANSWER from ' + args[m + 1]);`);
+  try {
+    const said = await oc.ask('What is on this page?', /ANSWER|limit/);
+    assert.match(said, /its own free model/);
+    assert.doesNotMatch(said, /later|opencode\.json/);
+    const button = `${oc.last}.querySelector('.error .fix')`;
+    assert.equal(await oc.b.eval(`${button}?.textContent.trim()`), 'Use your model alfagen/EVC-Com-model');
+    await oc.b.click(button);
+    await oc.b.waitFor(`!app.$.ask.busy_ && /ANSWER/.test(${oc.last}?.textContent || '')`, 30000);
+    assert.match(await oc.b.eval(`${oc.last}.textContent`), /ANSWER from alfagen\/EVC-Com-model/);
+    assert.equal(await oc.b.eval(`!!${oc.last}.querySelector('.error')`), false);
+    // Chosen once: the next question uses it straight away.
+    assert.match(await oc.ask('Thanks. And this?', /ANSWER|limit/), /ANSWER from alfagen\/EVC-Com-model/);
+    assert.equal(oc.runs().length, 3);
+  } finally { await oc.done(); }
 });
 
 test('LM Studio installed but off: Start server turns it on, then it answers', async () => {
