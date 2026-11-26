@@ -118,7 +118,7 @@ if (a[0] === 'mcp') {
 }
 if (a.includes('-p') || a.includes('--print')) {
   // Ask, Improve with AI and the tour's setup: one answer in Claude Code's stream-json.
-  let text = ''; process.stdin.on('data', (d) => { text += d; }); process.stdin.on('end', () => {
+  let text = a.join(' '); process.stdin.on('data', (d) => { text += d; }); process.stdin.on('end', () => {
     run({ version: VERSION, account, call: 'print', signedIn });
     if (!signedIn) {
       console.log(JSON.stringify({ type: 'result', is_error: true, result: 'Invalid API key · Please run /login' }));

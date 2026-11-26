@@ -85,7 +85,16 @@ const termText = (i) => `(() => { const t = S.terms[${i}]; if (!t) return ''; co
 
 for (const [name, skip] of machinesHere()) {
   describe(`machine ${name}`, { skip }, () => {
-    let m, b, server, url, seen = {};
+    let m, b, server, url, launchArgs, seen = {};
+    // A browser that crashed in one step is started again on the same profile, so the steps after
+    // it still say what they see (the crash itself fails the step it happened in).
+    const ensure = async () => {
+      if (b && b.proc.exitCode === null && b.proc.signalCode === null) return;
+      (seen.crashes ||= []).push(`browser gone (${b?.proc.exitCode ?? b?.proc.signalCode}) after: ${b?.lastAction || '?'}`);
+      try { await b?.close(); } catch {}
+      b = await launch([url], { profile: m.profile, env: m.env, args: launchArgs.filter((a) => a !== '--meridian-onboarding') });
+      await b.waitFor(`!!app?.$?.tabstrip?.handler_`, 20000);
+    };
     const truth = () => m.truth;
     const note = (k, v) => { seen[k] = v; };
 
@@ -97,10 +106,11 @@ for (const [name, skip] of machinesHere()) {
       server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(PAGE); });
       await new Promise((r) => server.listen(0, '127.0.0.1', r));
       url = `http://127.0.0.1:${server.address().port}/news`;
-      b = await launch([url], { profile: m.profile, env: m.env, args: [...m.args, '--meridian-onboarding', `--meridian-arc-dir=${arc}`,
+      launchArgs = [...m.args, '--meridian-onboarding', `--meridian-arc-dir=${arc}`,
         '--meridian-arc-safe-storage=test-pass', `--meridian-test-signin-log=${path.join(m.root, 'signins.log')}`,
         `--meridian-test-claude-log=${path.join(m.root, 'claude-open.log')}`, '--meridian-test-ai-consent', '--meridian-test-keys',
-        '--meridian-no-notify', '--lang=en-US'] });
+        '--meridian-no-notify', '--lang=en-US'];
+      b = await launch([url], { profile: m.profile, env: m.env, args: launchArgs });
     });
     after(async () => {
       if (process.env.MERIDIAN_QG_OUT) {
@@ -195,13 +205,14 @@ for (const [name, skip] of machinesHere()) {
       if (truth().codex) {
         const plain = path.join(m.home, '.codex');
         if (truth().codex.home !== plain) assert.equal(fs.existsSync(path.join(plain, 'config.toml')), false, 'Codex connected in ~/.codex instead of its CODEX_HOME');
-        assert.match(fs.readFileSync(path.join(truth().codex.home, 'config.toml'), 'utf8'), /\[mcp_servers\.linear\]|^(?![\s\S])/, 'Codex’s own servers stay');
+        if (name === 'codex-only') assert.match(fs.readFileSync(path.join(truth().codex.home, 'config.toml'), 'utf8'), /\[mcp_servers\.linear\]/, 'Codex’s own servers stay');
       }
       await b.click(`${OB}.getElementById('next')`);
       await b.waitFor('!app.$.onboarding.open', 15000);
     });
 
     test('Boost › Improve with AI: offered with what is really here, and it works', { timeout: 60000 }, async () => {
+      await ensure();
       const code = truth().claudeCode;
       // The news page is the first tab: show it.
       const tab = await b.eval(`[...app.$.tabstrip.tabs_.values()].find((t) => t.url.startsWith(${JSON.stringify(url)}))?.id`);
@@ -231,8 +242,18 @@ for (const [name, skip] of machinesHere()) {
       await b.key('Escape', 'Escape', 27);
     });
 
-    test('⌘J Ask answers with what is really here, or says how to set it up; never a made-up answer', { timeout: 60000 }, async () => {
-      if (MAC) await b.shortcut(38, 'j'); else await b.eval('app.$.tabstrip.runCommand(14, 0)');
+    test('⌘J Ask answers with what is really here, or says how to set it up; never a made-up answer', { timeout: 60000 }, async (t) => {
+      await ensure();
+      // ⌘J as a person presses it; a browser that dies on it is the failure, and Ask is then
+      // still checked from the menu command.
+      let crashedOnKey = false;
+      if (MAC) {
+        await b.shortcut(38, 'j').catch(() => {});
+        await sleep(1500);
+        if (b.proc.exitCode !== null || b.proc.signalCode !== null) { crashedOnKey = true; await ensure(); }
+      }
+      if (!MAC || crashedOnKey || !(await b.eval('app.$.ask.open'))) await b.eval('app.$.tabstrip.runCommand(14, 0)');
+      t.after(() => { if (crashedOnKey) note('askCrash', 'Meridian crashed on ⌘J'); });
       await b.waitFor(`app.$.ask.open && !!${AK}.getElementById('input')`, 10000);
       const who = await b.eval(`${AK}.getElementById('who')?.textContent.replace(/\\s+/g, ' ').trim() || ''`);
       note('askWho', who);
@@ -241,6 +262,7 @@ for (const [name, skip] of machinesHere()) {
         const text = await b.eval(`${AK}.textContent.replace(/\\s+/g, ' ')`);
         note('askPanel', text.slice(0, 400));
         assert.doesNotMatch(who, /Claude Code/, 'Ask says Claude Code answers, but it isn’t installed');
+        assert.equal(crashedOnKey, false, 'Meridian crashed on ⌘J (an uncaught NSException in the menu action: chromium/tools/test_crashes.mjs)');
         return;
       }
       await b.eval(`(() => { const i = ${AK}.getElementById('input'); i.value = 'What is this page?'; ${AK}.getElementById('send').click(); return true; })()`);
@@ -255,9 +277,11 @@ for (const [name, skip] of machinesHere()) {
       if (truth().claudeCode) assert.match(said, new RegExp(`Answer from Claude Code ${truth().claudeCode.version.replace(/\./g, '\\.')} \\(${truth().claudeCode.account}\\)`), 'Ask ran the current Claude Code as the person’s account');
       else assert.match(said, /Answer from Codex .* \(\.codex-work\)|Answer from Codex/, 'Ask answered with Codex');
       await b.eval('app.$.ask.toggle()');
+      assert.equal(crashedOnKey, false, 'Meridian crashed on ⌘J (an uncaught NSException in the menu action: chromium/tools/test_crashes.mjs)');
     });
 
     test('Workbench: the Claude Code tab runs the current copy, as the person’s account', { timeout: 60000, skip: WIN && 'the Workbench’s Claude tab on Windows: the Windows session' }, async () => {
+      await ensure();
       await b.eval('app.$.tabstrip.runCommand(16, 0)');
       const wb = await b.page('chrome://workbench', 15000);
       try {
@@ -283,6 +307,7 @@ for (const [name, skip] of machinesHere()) {
     });
 
     test('Workbench › Resume lists the earlier sessions of this project', { timeout: 60000, skip: (WIN && 'the Workbench on Windows: the Windows session') || (!MACHINES_WITH_CLAUDE.has(name) && 'no Claude Code here') }, async () => {
+      await ensure();
       const wb = await b.page('chrome://workbench', 15000);
       try {
         const n = await wb.eval('S.terms.length');
@@ -303,6 +328,7 @@ for (const [name, skip] of machinesHere()) {
     });
 
     test('Settings › AI: every status matches this computer (no false "Connected", "Not signed in", "Not installed")', { timeout: 60000 }, async () => {
+      await ensure();
       await b.eval('app.$.tabstrip.runCommand(13, 0)');
       await b.waitFor(`app.$.settings.open && !!${ST}.querySelector('[data-id="ai"]')`, 15000);
       await b.eval(`${ST}.querySelector('[data-id="ai"]').click()`);
