@@ -14,8 +14,8 @@ Meridian is MIT-licensed (see LICENSE). It includes the following open-source pa
 | @ghostery/adblocker-electron-preload | 2.20.1 | MPL-2.0 |
 | @ghostery/adblocker-extended-selectors | 2.20.1 | MPL-2.0 |
 | @ghostery/url-parser | 1.3.1 | MPL-2.0 |
-| @hono/node-server | 2.1.5 | MIT |
-| @modelcontextprotocol/sdk | 1.32.1 | MIT |
+| @hono/node-server | 2.1.11 | MIT |
+| @modelcontextprotocol/sdk | 1.32.2 | MIT |
 | @opentelemetry/api | 1.10.0 | Apache-2.0 |
 | @remusao/guess-url-type | 2.1.0 | MPL-2.0 |
 | @remusao/small | 2.1.0 | MPL-2.0 |
@@ -26,6 +26,7 @@ Meridian is MIT-licensed (see LICENSE). It includes the following open-source pa
 | @stablelib/base64 | 1.0.1 | MIT |
 | @types/node | 24.19.2 | MIT |
 | @types/trusted-types | 2.0.7 | MIT |
+| @vscode/diff | 0.0.2-145 | MIT |
 | @xterm/addon-fit | 0.11.0 | MIT |
 | @xterm/xterm | 6.0.0 | MIT |
 | accepts | 2.0.0 | MIT |
@@ -45,7 +46,7 @@ Meridian is MIT-licensed (see LICENSE). It includes the following open-source pa
 | cross-spawn | 7.0.6 | MIT |
 | debug | 4.4.3 | MIT |
 | depd | 2.0.0 | MIT |
-| dompurify | 3.4.15 | (MPL-2.0 OR Apache-2.0) |
+| dompurify | 3.4.17 | (MPL-2.0 OR Apache-2.0) |
 | dunder-proto | 1.0.1 | MIT |
 | ee-first | 1.1.1 | MIT |
 | electron | 45.0.0 | MIT |
@@ -73,7 +74,7 @@ Meridian is MIT-licensed (see LICENSE). It includes the following open-source pa
 | graceful-fs | 4.2.11 | ISC |
 | has-symbols | 1.1.0 | MIT |
 | hasown | 2.0.4 | MIT |
-| hono | 4.13.13 | MIT |
+| hono | 4.13.22 | MIT |
 | http-errors | 2.0.1 | MIT |
 | iconv-lite | 0.7.3 | MIT |
 | inherits | 2.0.4 | ISC |
@@ -91,7 +92,7 @@ Meridian is MIT-licensed (see LICENSE). It includes the following open-source pa
 | merge-descriptors | 2.0.0 | MIT |
 | mime-db | 1.54.0 | MIT |
 | mime-types | 3.0.2 | MIT |
-| monaco-editor | 0.57.0 | MIT |
+| monaco-editor | 0.58.0 | MIT |
 | ms | 2.1.3 | MIT |
 | negotiator | 1.1.0 | MIT |
 | node-addon-api | 7.1.1 | MIT |
@@ -2710,7 +2711,7 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
   defined by the Mozilla Public License, v. 2.0.
 ```
 
-## @hono/node-server 2.1.5
+## @hono/node-server 2.1.11
 
 ```
 MIT License
@@ -2736,7 +2737,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## @modelcontextprotocol/sdk 1.32.1
+## @modelcontextprotocol/sdk 1.32.2
 
 ```
 MIT License
@@ -5314,6 +5315,32 @@ MIT License
     SOFTWARE
 ```
 
+## @vscode/diff 0.0.2-145
+
+```
+    MIT License
+
+    Copyright (c) Microsoft Corporation.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE
+```
+
 ## @xterm/addon-fit 0.11.0
 
 ```
@@ -5818,7 +5845,7 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-## dompurify 3.4.15
+## dompurify 3.4.17
 
 ```
 Apache License
@@ -6731,7 +6758,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## hono 4.13.13
+## hono 4.13.22
 
 ```
 MIT License
@@ -7235,7 +7262,7 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-## monaco-editor 0.57.0
+## monaco-editor 0.58.0
 
 ```
 The MIT License (MIT)
