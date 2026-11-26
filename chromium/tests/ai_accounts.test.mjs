@@ -319,3 +319,111 @@ test('Workbench: a Codex terminal in a space with a Codex account runs with its 
     for (const d of [home, project, bin]) fs.rmSync(d, { recursive: true, force: true });
   }
 });
+
+// The owner's setup: the login environment points Claude Code at ~/.claude-personal
+// (CLAUDE_CONFIG_DIR in .zshrc), and ~/.claude is a second account. ~/.claude isn't called a second
+// "Default"; Settings › AI picks it for a space; Ask, a Claude Code tab and a shell there run as it
+// (the variable taken away, also after the .zshrc set it again).
+test('Settings › AI picks ~/.claude for a space when CLAUDE_CONFIG_DIR points elsewhere; Ask, a Claude Code tab and a shell use it', { skip: process.platform === 'win32' && 'zsh startup files (macOS, Linux)' }, async () => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-accounts-')));
+  for (const dir of ['.claude', '.claude-personal']) { fs.mkdirSync(path.join(home, dir)); fs.writeFileSync(path.join(home, dir, 'settings.json'), ''); }
+  const personalDir = path.join(home, '.claude-personal');
+  fs.writeFileSync(path.join(home, '.zshrc'), `export CLAUDE_CONFIG_DIR=${personalDir}\n`);
+  const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-ai-')));
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
+  const log = path.join(bin, 'log');
+  fs.mkdirSync(log);
+  // Ask runs it with the prompt on stdin; in a terminal it says what it got and waits.
+  standIn(bin, 'claude', `const fs = require('fs'), path = require('path');
+const args = process.argv.slice(2);
+const dir = process.env.CLAUDE_CONFIG_DIR ?? '<unset>';
+if (args[0] === 'auth' && args[1] === 'status') { console.log(JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' })); process.exit(0); }
+if (process.stdin.isTTY) { console.log('ready CLAUDE_CONFIG_DIR=' + dir); process.stdin.once('data', () => process.exit(0)); return; }
+const n = fs.readdirSync(${JSON.stringify(log)}).length;
+fs.writeFileSync(path.join(${JSON.stringify(log)}, n + '.env'), dir);
+process.stdin.resume();
+process.stdin.on('end', () => {
+  const out = (o) => console.log(JSON.stringify(o));
+  const text = 'from ' + path.basename(process.env.CLAUDE_CONFIG_DIR || 'default');
+  out({ type: 'system', subtype: 'init', session_id: 's-' + n, model: 'claude-opus-5-5' });
+  out({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'content_block_delta', delta: { type: 'text_delta', text } } });
+  out({ type: 'result', subtype: 'success', is_error: false, result: text });
+});
+`);
+  const lastEnv = () => { const files = fs.readdirSync(log).sort((a, c) => parseInt(a) - parseInt(c)); return fs.readFileSync(path.join(log, files.pop()), 'utf8'); };
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  fs.mkdirSync(path.join(profile, 'Default'));
+  fs.writeFileSync(path.join(profile, 'Default', 'Preferences'), JSON.stringify({ meridian: { ai_provider: 'claude-code' } }));
+  const savedHome = process.env.HOME;
+  process.env.HOME = home;
+  let b, wb;
+  try {
+    b = await launch(['about:blank'], { profile, args: [`--meridian-agents-path=${bin}`, `--meridian-accounts-home=${home}`, `--meridian-test-login-env=CLAUDE_CONFIG_DIR=${personalDir}`, `--meridian-test-project=${project}`, `--meridian-agent-home=${home}`, '--meridian-no-notify'] });
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    const { state } = await b.eval(`${H}.getState()`);
+    const work = state.activeSpaceId;
+    await b.eval(`${H}.updateSpace(${JSON.stringify(work)}, 'Work', '', '#8a8fe0', '#8a8fe0')`);
+    const { spaceId: personal } = await b.eval(`${H}.createSpace('Personal', '', '', '')`);
+
+    // The default is ~/.claude-personal ("Personal"); ~/.claude is "~/.claude", not "Default".
+    const all = JSON.parse((await b.eval(`${H}.getAiAccounts()`)).json);
+    const claude = all.vendors.find((v) => v.id === 'claude').accounts;
+    assert.deepEqual(claude.map((a) => [a.label, a.default]), [['Personal', true], ['~/.claude', false]]);
+    const own = claude.find((a) => a.label === '~/.claude').id;
+
+    // Settings › AI: a picker per space under Claude's accounts; Work picks ~/.claude.
+    await b.eval('app.$.tabstrip.runCommand(13, 0)');
+    await b.waitFor(`app.$.settings.open && !!${ST}.querySelector('[data-id="ai"]')`);
+    await b.eval(`${ST}.querySelector('[data-id="ai"]').click()`);
+    const pick = (space) => `${ST}.querySelector('#accountSpaces-claude select[data-space="${space}"]')`;
+    await b.waitFor(`!!${pick(work)} && !!${pick(personal)}`, 15000);
+    assert.deepEqual(await b.eval(`[...${pick(work)}.options].map((o) => o.textContent.trim())`), ['Personal (default)', '~/.claude']);
+    assert.equal(await b.eval(`${pick(work)}.value`), '');
+    await b.eval(`(() => { const s = ${pick(work)}; s.value = ${JSON.stringify(own)}; s.dispatchEvent(new Event('change')); return true; })()`);
+    await b.waitFor(`${H}.getAiAccounts().then((r) => JSON.parse(r.json).spaces[${JSON.stringify(work)}]?.claude === ${JSON.stringify(own)})`);
+    await b.waitFor(`${pick(work)}.value === ${JSON.stringify(own)} && ${pick(personal)}.value === ''`);
+    await b.eval('app.$.settings.hide()');
+
+    // Ask in Work: Claude Code without CLAUDE_CONFIG_DIR (its own ~/.claude); in Personal, the default.
+    const ask = async (text) => {
+      if (!(await b.eval('app.$.ask.open'))) await b.eval('app.$.tabstrip.runCommand(14, 0)');
+      await b.waitFor(`app.$.ask.open && !!${AK}.getElementById('input')`);
+      const before = await b.eval(`${AK}.querySelectorAll('.msg.assistant').length`);
+      await b.eval(`(() => { const i = ${AK}.getElementById('input'); i.value = ${JSON.stringify(text)}; ${AK}.getElementById('send').click(); })()`);
+      await b.waitFor(`${AK}.querySelectorAll('.msg.assistant').length > ${before} && !${AK}.querySelector('#stop')`, 20000);
+      return b.eval(`[...${AK}.querySelectorAll('.msg.assistant')].pop().textContent.replace(/\\s+/g, ' ').trim()`);
+    };
+    assert.match(await ask('Hello?'), /from default/);
+    assert.equal(lastEnv(), '<unset>');
+    await b.eval(`${H}.activateSpace(${JSON.stringify(personal)})`);
+    await b.waitFor(`${H}.getState().then((r) => r.state.activeSpaceId === ${JSON.stringify(personal)})`);
+    assert.match(await ask('And here?'), /from \.claude-personal/);
+    assert.equal(lastEnv(), personalDir);
+    await b.eval('app.$.ask.open = false');
+    await b.eval(`${H}.activateSpace(${JSON.stringify(work)})`);
+    await b.waitFor(`${H}.getState().then((r) => r.state.activeSpaceId === ${JSON.stringify(work)})`);
+
+    // Workbench in Work: a Claude Code tab, and a shell whose .zshrc sets CLAUDE_CONFIG_DIR again.
+    await b.eval('app.$.tabstrip.runCommand(16, 0)');
+    wb = await b.page('chrome://workbench');
+    await wb.waitFor(`!document.querySelector('#welcome').hidden`, 15000);
+    await wb.eval(`document.querySelector('#open-folder').click()`);
+    await wb.waitFor('!!S.project');
+    const termText = `(S.activeTerm ? [...Array(S.activeTerm.xterm.buffer.active.length).keys()].map((i) => S.activeTerm.xterm.buffer.active.getLine(i)?.translateToString(true)).join('\\n') : '')`;
+    await wb.eval(`launch('claude').then((t) => !!t)`);
+    await wb.waitFor(`S.activeTerm?.kind === 'claude' && ${termText}.includes('ready CLAUDE_CONFIG_DIR=')`, 15000).catch(async (e) => { throw new Error(e.message + '\n' + await wb.eval(termText)); });
+    assert.match((await wb.eval(termText)).replace(/\n/g, ''), /ready CLAUDE_CONFIG_DIR=<unset>/);
+    await wb.eval(`launch('shell').then((t) => !!t)`);
+    await wb.waitFor(`S.activeTerm?.kind === 'shell'`, 15000);
+    const id = await wb.eval('S.activeTerm.id');
+    await sleep(1000);
+    await wb.eval(`(() => { window.workbench.ptyWrite(${JSON.stringify(id)}, 'echo "CC=\${CLAUDE_CONFIG_DIR:-none}"\\r'); return true; })()`);
+    await wb.waitFor(`${termText}.includes('CC=none')`, 10000).catch(async (e) => { throw new Error(e.message + '\n' + await wb.eval(termText)); });
+    assert.ok(!(await wb.eval(termText)).includes(`CC=${personalDir}`));
+  } finally {
+    process.env.HOME = savedHome;
+    wb?.close();
+    await b?.close();
+    for (const d of [home, project, bin]) fs.rmSync(d, { recursive: true, force: true });
+  }
+});

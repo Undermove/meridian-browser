@@ -12,6 +12,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { launch, APP, SB } from './harness.mjs';
+import { standIn } from './stand_in.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const SC = 'app.$.siteControl.shadowRoot';
@@ -331,6 +332,85 @@ test('Improve with Claude: the page outline goes to Claude, its CSS becomes the 
     assert.equal(after.name, 'My Boost');
     page.close();
   } finally { await b.close(); s.server.close(); api.server.close(); }
+});
+
+// A stand-in `claude` (Claude Code), signed in: it answers a boost with `answer` and writes down the
+// CLAUDE_CONFIG_DIR each run got (the space's account).
+function fakeClaudeCode(dir, answer) {
+  const log = path.join(dir, 'log');
+  fs.mkdirSync(log);
+  standIn(dir, 'claude', `const fs = require('fs'), path = require('path');
+const log = ${JSON.stringify(log)};
+const args = process.argv.slice(2);
+if (args[0] === 'auth' && args[1] === 'status') { console.log(JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' })); process.exit(0); }
+const n = fs.readdirSync(log).length;
+fs.writeFileSync(path.join(log, n + '.env'), process.env.CLAUDE_CONFIG_DIR ?? '<unset>');
+let stdin = '';
+process.stdin.on('data', (d) => { stdin += d; });
+process.stdin.on('end', () => {
+  const out = (o) => console.log(JSON.stringify(o));
+  const text = ${JSON.stringify(JSON.stringify(answer))};
+  out({ type: 'system', subtype: 'init', session_id: 's-' + n, model: 'claude-opus-5-5' });
+  out({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'content_block_delta', delta: { type: 'text_delta', text } } });
+  out({ type: 'result', subtype: 'success', is_error: false, result: text });
+});
+`);
+  return () => fs.readdirSync(log).sort((a, c) => parseInt(a) - parseInt(c)).map((f) => fs.readFileSync(path.join(log, f), 'utf8'));
+}
+
+test('Improve with Claude Code when nothing is picked in Settings › AI: in the default space and in a space with its own profile (as its AI account)', async () => {
+  const s = await site();
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
+  const runs = fakeClaudeCode(bin, { name: 'Calm News', css: '#promo { display: none !important; }', summary: 'Hid the banner.' });
+  // Claude Code's accounts: its own folder and a Work one.
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-accounts-')));
+  for (const dir of ['.claude', '.claude-work']) { fs.mkdirSync(path.join(home, dir)); fs.writeFileSync(path.join(home, dir, 'settings.json'), ''); }
+  // No AI picked, no key: "Automatic".
+  const b = await launch([s.url], { args: [`--meridian-agents-path=${bin}`, `--meridian-accounts-home=${home}`] });
+  try {
+    const page = await b.page(s.url);
+    await page.waitFor(`document.readyState === 'complete'`);
+    await b.waitFor(`!!app?.$?.tabstrip?.handler_`);
+    assert.equal((await b.eval(`${H}.getSettings()`)).settings.aiProvider, '');
+
+    // (a) The default space: Claude Code, found on this computer, improves the boost.
+    await openEditor(b);
+    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
+    await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
+    await clickEditor(b, `${BE}.getElementById('improve')`);
+    await b.waitFor(`${BE}.getElementById('note')?.textContent.includes('Hid the banner.')`, 20000, `${BE}.getElementById('note')?.textContent`);
+    await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
+    assert.deepEqual(runs(), ['<unset>'], 'one run, as Claude Code’s own account');
+    await b.eval('app.$.boostEditor.open = false');
+    page.close();
+
+    // (b) A space in its own profile, with the Work account for Claude: the same button, and the
+    // run goes as Work.
+    const { profileId } = await b.eval(`${H}.addProfile('Work')`);
+    const { spaceId } = await b.eval(`${H}.createSpace('Client', '', '', '')`);
+    await b.eval(`${H}.setSpaceProfile(${JSON.stringify(spaceId)}, ${JSON.stringify(profileId)})`);
+    const accounts = JSON.parse((await b.eval(`${H}.getAiAccounts()`)).json);
+    const work = accounts.vendors.find((v) => v.id === 'claude').accounts.find((a) => a.label === 'Work').id;
+    await b.eval(`${H}.setSpaceAiAccount(${JSON.stringify(spaceId)}, 'claude', ${JSON.stringify(work)})`);
+    await b.eval(`${H}.activateSpace(${JSON.stringify(spaceId)})`);
+    await b.waitFor(`app.$.tabstrip.state_.activeSpaceId === ${JSON.stringify(spaceId)} && app.$.tabstrip.state_.profileId === ${JSON.stringify(profileId)}`);
+    const there = `${s.url}?client`;
+    await b.eval(`app.$.tabstrip.openUrl(${JSON.stringify(there)})`);
+    const page2 = await b.page(there);
+    await page2.waitFor(`document.readyState === 'complete'`);
+    // The site's boost from (a), improved again here.
+    await openEditor(b, '.boost-edit');
+    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
+    await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
+    await clickEditor(b, `${BE}.getElementById('improve')`);
+    await b.waitFor(`${BE}.getElementById('note')?.textContent.includes('Hid the banner.')`, 20000, `${BE}.getElementById('note')?.textContent`);
+    await page2.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
+    assert.deepEqual(runs(), ['<unset>', path.join(home, '.claude-work')], 'the space’s Work account');
+    page2.close();
+  } finally {
+    await b.close(); s.server.close();
+    fs.rmSync(bin, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 // An MCP client talking to the bridge.
