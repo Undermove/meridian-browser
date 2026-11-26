@@ -1,0 +1,352 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 22:14:02 +0400
+Subject: [PATCH] Meridian: a text-only MCP bridge for models that take no
+ images; results compact and capped
+
+An agent on an OpenAI-compatible provider (OpenCode with a corporate
+model) failed every turn after a screenshot with HTTP 400 "Failed to read
+HTTP message": the client puts the screenshot into the conversation (as a
+user message with image/content parts) and that endpoint refuses it.
+- `Meridian --mcp-bridge --text-only` (or MERIDIAN_MCP_TEXT_ONLY=1): the
+  screenshot tool isn't listed, and a screenshot asked for anyway answers
+  with text pointing at read_page and get_interactive_elements.
+- Tool results are compact JSON (pretty printing was a third of a long
+  element list) and cut at 100 KB on a whole UTF-8 character, with a note
+  on how to ask for less (agent/mcp_result.h, unit-tested).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              | 11 ++++
+ chrome/browser/meridian/agent/mcp_bridge.cc   | 33 ++++++++--
+ chrome/browser/meridian/agent/mcp_bridge.h    |  2 +
+ chrome/browser/meridian/agent/mcp_result.cc   | 43 ++++++++++++
+ chrome/browser/meridian/agent/mcp_result.h    | 46 +++++++++++++
+ .../meridian/agent/mcp_result_unittest.cc     | 65 +++++++++++++++++++
+ 6 files changed, 195 insertions(+), 5 deletions(-)
+ create mode 100644 chrome/browser/meridian/agent/mcp_result.cc
+ create mode 100644 chrome/browser/meridian/agent/mcp_result.h
+ create mode 100644 chrome/browser/meridian/agent/mcp_result_unittest.cc
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 85d531d..57bbaa4 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -317,6 +317,14 @@ source_set("agent_socket_path") {
+   ]
+ }
+ 
++# What the bridge hands MCP clients (no deps, unit-tested).
++source_set("mcp_result") {
++  sources = [
++    "agent/mcp_result.cc",
++    "agent/mcp_result.h",
++  ]
++}
++
+ # `Meridian --mcp-bridge` (chrome/app/chrome_main.cc): no browser deps.
+ source_set("mcp_bridge") {
+   sources = [
+@@ -325,6 +333,7 @@ source_set("mcp_bridge") {
+   ]
+   deps = [
+     ":agent_embed",
++    ":mcp_result",
+     ":platform",
+     "//base",
+     "//chrome/common:constants",
+@@ -605,6 +614,7 @@ test("meridian_unittests") {
+     "mission/secrets_unittest.cc",
+     "agent/agent_cli_unittest.cc",
+     "agent/agent_input_unittest.cc",
++    "agent/mcp_result_unittest.cc",
+     "agent/socket_path_unittest.cc",
+     "workbench/agent_insights_unittest.cc",
+     "workbench/agents_unittest.cc",
+@@ -623,6 +633,7 @@ test("meridian_unittests") {
+     ":ai_providers",
+     ":currency_parse",
+     ":guard_hook",
++    ":mcp_result",
+     ":mission_hook",
+     ":model",
+     ":report",
+diff --git a/chrome/browser/meridian/agent/mcp_bridge.cc b/chrome/browser/meridian/agent/mcp_bridge.cc
+index 2abb71d..5977c6a 100644
+--- a/chrome/browser/meridian/agent/mcp_bridge.cc
++++ b/chrome/browser/meridian/agent/mcp_bridge.cc
+@@ -10,6 +10,7 @@
+ #include <iostream>
+ #include <string>
+ #include <string_view>
++#include <vector>
+ 
+ #include "base/compiler_specific.h"
+ #include "base/containers/span.h"
+@@ -26,6 +27,7 @@
+ #include "base/strings/string_util.h"
+ #include "base/values.h"
+ #include "chrome/browser/meridian/agent/agent_embed.h"  // generated
++#include "chrome/browser/meridian/agent/mcp_result.h"
+ #include "chrome/browser/meridian/local_socket.h"
+ #include "crypto/hash.h"
+ #include "chrome/common/chrome_paths_internal.h"
+@@ -109,7 +111,8 @@ base::DictValue Result(const base::Value* id, base::DictValue result) {
+ 
+ base::DictValue Text(const std::string& text, bool error) {
+   base::ListValue content;
+-  content.Append(base::DictValue().Set("type", "text").Set("text", text));
++  content.Append(
++      base::DictValue().Set("type", "text").Set("text", mcp::CapText(text)));
+   base::DictValue out;
+   out.Set("content", std::move(content));
+   if (error) {
+@@ -215,6 +218,10 @@ base::DictValue CallTool(const base::FilePath& user_data_dir,
+                          const std::string& client,
+                          const base::DictValue& params);
+ 
++// Started for a model that takes no images (mcp_result.h): set once, before
++// any call thread.
++bool g_text_only = false;
++
+ // One tool call on a thread of its own: a call that waits (a page that is
+ // slow to answer, the person deciding) doesn't hold up the others.
+ class CallThread : public base::PlatformThread::Delegate {
+@@ -307,6 +314,11 @@ base::DictValue CallTool(const base::FilePath& user_data_dir,
+   const base::Value* result = response->Find("result");
+   if (result && result->is_dict()) {
+     const std::string* image = result->GetDict().FindString("image");
++    // Many OpenAI-compatible endpoints refuse a request with an image in it
++    // (HTTP 400), and the client sends it again every turn.
++    if (image && g_text_only) {
++      return Text(mcp::NoImagesText(), false);
++    }
+     if (image) {
+       base::ListValue content;
+       const std::string* mime = result->GetDict().FindString("mime_type");
+@@ -320,10 +332,9 @@ base::DictValue CallTool(const base::FilePath& user_data_dir,
+   if (result && result->is_string()) {
+     return Text(result->GetString(), false);
+   }
+-  return Text(result ? base::WriteJsonWithOptions(
+-                           *result, base::JSONWriter::OPTIONS_PRETTY_PRINT)
+-                           .value_or("null")
+-                     : "null",
++  // Compact: indentation would be a third of a long list's size, sent to the
++  // model again every turn.
++  return Text(result ? base::WriteJson(*result).value_or("null") : "null",
+               false);
+ }
+ 
+@@ -340,6 +351,13 @@ bool IsMcpBridge(int argc, const char** argv) {
+ 
+ int RunMcpBridge(int argc, const char** argv) {
+   const base::FilePath user_data_dir = UserDataDir(argc, argv);
++  {
++    std::vector<std::string_view> args;
++    for (const char* arg : Args(argc, argv)) {
++      args.emplace_back(arg);
++    }
++    g_text_only = mcp::WantsTextOnly(args, getenv(mcp::kTextOnlyEnv));
++  }
+   std::optional<base::Value> tools = base::JSONReader::Read(kAgentToolsJson, 0);
+   std::string client = "MCP client";
+   ClientId();  // (made once, before any call thread)
+@@ -392,6 +410,11 @@ int RunMcpBridge(int argc, const char** argv) {
+       base::ListValue list;
+       for (const base::Value& tool : tools->GetList()) {
+         const base::DictValue& t = tool.GetDict();
++        // Text-only: an agent that doesn't see the screenshot tool doesn't
++        // reach for it.
++        if (g_text_only && *t.FindString("name") == mcp::kScreenshotTool) {
++          continue;
++        }
+         list.Append(base::DictValue()
+                         .Set("name", *t.FindString("name"))
+                         .Set("description", *t.FindString("description"))
+diff --git a/chrome/browser/meridian/agent/mcp_bridge.h b/chrome/browser/meridian/agent/mcp_bridge.h
+index 911f036..edddb0f 100644
+--- a/chrome/browser/meridian/agent/mcp_bridge.h
++++ b/chrome/browser/meridian/agent/mcp_bridge.h
+@@ -11,6 +11,8 @@ namespace meridian {
+ // Codex or any MCP client. It starts no browser: tool calls go to the
+ // running Meridian over its agent socket (AgentServer).
+ //   claude mcp add -s user meridian -- /Applications/Meridian.app/Contents/MacOS/Meridian --mcp-bridge
++// `--mcp-bridge --text-only` (or MERIDIAN_MCP_TEXT_ONLY=1) is for a client
++// whose model takes no images: no screenshot tool (mcp_result.h).
+ bool IsMcpBridge(int argc, const char** argv);
+ int RunMcpBridge(int argc, const char** argv);
+ 
+diff --git a/chrome/browser/meridian/agent/mcp_result.cc b/chrome/browser/meridian/agent/mcp_result.cc
+new file mode 100644
+index 0000000..90be8bd
+--- /dev/null
++++ b/chrome/browser/meridian/agent/mcp_result.cc
+@@ -0,0 +1,43 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/agent/mcp_result.h"
++
++#include <algorithm>
++
++namespace meridian::mcp {
++
++bool WantsTextOnly(const std::vector<std::string_view>& args, const char* env) {
++  if (std::ranges::find(args, std::string_view(kTextOnlySwitch)) !=
++      args.end()) {
++    return true;
++  }
++  return env && *env && std::string_view(env) != "0";
++}
++
++std::string NoImagesText() {
++  return "No screenshot: this connection is text-only (Meridian --mcp-bridge "
++         "--text-only), because its AI model can't take images. See the page "
++         "with read_page and get_interactive_elements instead.";
++}
++
++std::string CapText(std::string text, size_t max_bytes) {
++  if (text.size() <= max_bytes) {
++    return text;
++  }
++  const size_t total = text.size();
++  size_t cut = max_bytes;
++  // Back to the first byte of a UTF-8 character.
++  while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) {
++    --cut;
++  }
++  text.resize(cut);
++  text += "\n\n[Cut here: this result was " + std::to_string(total / 1000) +
++          " KB, more than one message to an AI model should carry. Ask for "
++          "less: read_page with offset and max_chars, "
++          "get_interactive_elements with query, within or only_visible.]";
++  return text;
++}
++
++}  // namespace meridian::mcp
+diff --git a/chrome/browser/meridian/agent/mcp_result.h b/chrome/browser/meridian/agent/mcp_result.h
+new file mode 100644
+index 0000000..31bd32a
+--- /dev/null
++++ b/chrome/browser/meridian/agent/mcp_result.h
+@@ -0,0 +1,46 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_AGENT_MCP_RESULT_H_
++#define CHROME_BROWSER_MERIDIAN_AGENT_MCP_RESULT_H_
++
++#include <cstddef>
++#include <string>
++#include <string_view>
++#include <vector>
++
++// What `Meridian --mcp-bridge` hands an MCP client, in a shape every AI
++// provider behind it takes. The client sends each tool result on to its
++// model with the rest of the conversation, every turn: a result a provider
++// can't read fails the whole request (an OpenAI-compatible endpoint answers
++// HTTP 400), and the agent is stuck.
++namespace meridian::mcp {
++
++// The switch, and the environment variable, for a client whose model takes
++// no images (many OpenAI-compatible models): screenshots are then left out.
++inline constexpr char kTextOnlySwitch[] = "--text-only";
++inline constexpr char kTextOnlyEnv[] = "MERIDIAN_MCP_TEXT_ONLY";
++
++// The tool that answers with an image.
++inline constexpr char kScreenshotTool[] = "screenshot";
++
++// The longest text one tool result gives, in bytes (a note is added when
++// more was cut). Larger answers (a whole page's text, 400 elements of a
++// shop's page) pile up in the conversation the client sends every turn.
++inline constexpr size_t kMaxResultBytes = 100000;
++
++// Whether the bridge was started for a text-only model: `--text-only` among
++// `args`, or `env` (MERIDIAN_MCP_TEXT_ONLY) set to anything but "" or "0".
++bool WantsTextOnly(const std::vector<std::string_view>& args, const char* env);
++
++// The answer to a screenshot in text-only mode, instead of the image.
++std::string NoImagesText();
++
++// `text` cut to at most `max_bytes` (on a whole UTF-8 character), with a
++// note on how to ask for less; unchanged when it fits.
++std::string CapText(std::string text, size_t max_bytes = kMaxResultBytes);
++
++}  // namespace meridian::mcp
++
++#endif  // CHROME_BROWSER_MERIDIAN_AGENT_MCP_RESULT_H_
+diff --git a/chrome/browser/meridian/agent/mcp_result_unittest.cc b/chrome/browser/meridian/agent/mcp_result_unittest.cc
+new file mode 100644
+index 0000000..ae18aea
+--- /dev/null
++++ b/chrome/browser/meridian/agent/mcp_result_unittest.cc
+@@ -0,0 +1,65 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/agent/mcp_result.h"
++
++#include <string>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace meridian::mcp {
++namespace {
++
++TEST(McpResultTest, TextOnlyFromTheSwitch) {
++  EXPECT_TRUE(WantsTextOnly({"Meridian", "--mcp-bridge", "--text-only"},
++                            nullptr));
++  // Gemini and Qwen put "--" before the bridge's own arguments.
++  EXPECT_TRUE(
++      WantsTextOnly({"Meridian", "--", "--mcp-bridge", "--text-only"}, ""));
++  EXPECT_FALSE(WantsTextOnly({"Meridian", "--mcp-bridge"}, nullptr));
++  EXPECT_FALSE(WantsTextOnly({"Meridian", "--mcp-bridge", "--text-only=0",
++                              "--user-data-dir=/tmp/--text-only"},
++                             nullptr));
++}
++
++TEST(McpResultTest, TextOnlyFromTheEnvironment) {
++  EXPECT_TRUE(WantsTextOnly({"Meridian", "--mcp-bridge"}, "1"));
++  EXPECT_TRUE(WantsTextOnly({"Meridian", "--mcp-bridge"}, "yes"));
++  EXPECT_FALSE(WantsTextOnly({"Meridian", "--mcp-bridge"}, "0"));
++  EXPECT_FALSE(WantsTextOnly({"Meridian", "--mcp-bridge"}, ""));
++}
++
++TEST(McpResultTest, NoImagesPointsAtTheTextTools) {
++  const std::string text = NoImagesText();
++  EXPECT_NE(text.find("read_page"), std::string::npos);
++  EXPECT_NE(text.find("get_interactive_elements"), std::string::npos);
++}
++
++TEST(McpResultTest, ShortTextIsUnchanged) {
++  EXPECT_EQ(CapText("Фильтры: до 5000 ₽", 100), "Фильтры: до 5000 ₽");
++  EXPECT_EQ(CapText(std::string(100, 'a'), 100), std::string(100, 'a'));
++  EXPECT_EQ(CapText(""), "");
++}
++
++TEST(McpResultTest, LongTextIsCutWithANote) {
++  const std::string text = CapText(std::string(250000, 'a'));
++  EXPECT_EQ(text.substr(0, kMaxResultBytes), std::string(kMaxResultBytes, 'a'));
++  EXPECT_EQ(text[kMaxResultBytes], '\n');
++  EXPECT_NE(text.find("250 KB"), std::string::npos);
++  EXPECT_NE(text.find("max_chars"), std::string::npos);
++  EXPECT_LT(text.size(), kMaxResultBytes + 400);
++}
++
++TEST(McpResultTest, ACutKeepsWholeCharacters) {
++  // "ж" is two bytes, "₽" three: a cut in the middle of one drops all of it.
++  const std::string cyrillic = CapText("жжж", 3);
++  EXPECT_EQ(cyrillic.substr(0, cyrillic.find('\n')), "ж");
++  const std::string rouble = CapText("a₽₽", 5);
++  EXPECT_EQ(rouble.substr(0, rouble.find('\n')), "a₽");
++  const std::string emoji = CapText("\xF0\x9F\x9B\x92 cart", 2);
++  EXPECT_EQ(emoji.substr(0, emoji.find('\n')), "");
++}
++
++}  // namespace
++}  // namespace meridian::mcp
