@@ -32,11 +32,29 @@ function site() {
   })));
 }
 
+// Off the Mac (no NSEvent): Ctrl+T as a browser shortcut from the page, the way a person's
+// reaches the browser; everything else as CDP keys pressed and let go in the UI, where the bar
+// has the focus (it reads what is typed on keyup, so each key is a keyDown with its text and a keyUp).
+const NAMED = { 125: ['ArrowDown', 40], 126: ['ArrowUp', 38], 36: ['Enter', 13], 53: ['Escape', 27] };
+async function pressCdp(b, code, ch, mods) {
+  if (mods) return b.shortcut(code, ch, mods);
+  const named = NAMED[code];
+  const k = named ? { key: named[0], code: named[0], windowsVirtualKeyCode: named[1] }
+    : ch === '.' ? { key: '.', code: 'Period', windowsVirtualKeyCode: 190, text: '.' }
+      : /\d/.test(ch) ? { key: ch, code: 'Digit' + ch, windowsVirtualKeyCode: ch.charCodeAt(0), text: ch }
+        : { key: ch, code: 'Key' + ch.toUpperCase(), windowsVirtualKeyCode: ch.toUpperCase().charCodeAt(0), text: ch };
+  const { text, ...up } = k;
+  await b.cdp.send('Input.dispatchKeyEvent', { type: named ? 'rawKeyDown' : 'keyDown', ...k, nativeVirtualKeyCode: k.windowsVirtualKeyCode });
+  await b.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...up, nativeVirtualKeyCode: k.windowsVirtualKeyCode });
+}
+
 async function start(names) {
   const s = await site();
   const b = await launch(names.map((n) => s.url(n)), { args: ['--meridian-test-keys'] });
   await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === ${names.length}`);
-  const press = ([code, ch], mods = 0) => b.eval(`app.$.tabstrip.handler_.testKeyPress(${code}, ${JSON.stringify(ch)}, ${mods})`);
+  const press = process.platform === 'darwin'
+    ? ([code, ch], mods = 0) => b.eval(`app.$.tabstrip.handler_.testKeyPress(${code}, ${JSON.stringify(ch)}, ${mods})`)
+    : ([code, ch], mods = 0) => pressCdp(b, code, ch, mods);
   const state = () => b.eval(`(() => {
     const dd = ${CB}.getElementById('address').shadowRoot.querySelector('cr-searchbox-dropdown');
     const visible = dd && !dd.hidden;
