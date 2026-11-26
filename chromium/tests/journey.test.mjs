@@ -22,11 +22,7 @@ import { launch, SB } from './harness.mjs';
 import { machine, machinesHere, signInClaude, MAC, WIN } from './machines.mjs';
 
 // Features on a branch not merged into chromium-port yet. Remove a line when its PR lands.
-const PENDING = {
-  perSpaceSubs: 'ai-subs: AI subscriptions by the person’s names (Settings › AI), not merged yet',
-  connectWithoutCli: 'ai-subs: Connect writes the config files itself (an editor extension alone connects), not merged yet',
-  resumeAcrossAccounts: 'ai-subs: Resume lists the project’s sessions under every Claude account, not merged yet',
-};
+const PENDING = {};
 // Which machines have what (decided before the machines are built: `skip` needs it up front).
 const MACHINES_WITH_CLAUDE = new Set(['native-and-old-on-path', 'npm-global', 'claude-code-signed-out', 'two-claude-accounts', 'run-from-disk-image']);
 const MACHINES_WITH_SESSIONS_ELSEWHERE = new Set(['two-claude-accounts']);
@@ -297,7 +293,7 @@ for (const [name, skip] of machinesHere()) {
         }
         assert.equal(missing, false, 'the Workbench says Claude Code isn’t installed');
         await clickIn(wb, claudeButton);
-        for (let i = 0; i < 50 && (await wb.eval('S.terms.length')) === 0; i++) { if (await wb.eval(`!!document.querySelector('.modal [data-a="ok"]')`)) await clickIn(wb, `document.querySelector('.modal [data-a="ok"]')`); await sleep(200); }
+        for (let i = 0; i < 50 && (await wb.eval('S.terms.length')) === 0; i++) { if (await wb.eval(`!!document.querySelector('#modal [data-a="ok"]')`)) await clickIn(wb, `document.querySelector('#modal [data-a="ok"]')`); await sleep(200); }
         await wb.waitFor(`${termText(0)}.includes('Claude Code v')`, 20000);
         const text = await wb.eval(termText(0));
         note('workbenchClaude', text.split('\n').filter(Boolean).slice(0, 4));
@@ -313,10 +309,11 @@ for (const [name, skip] of machinesHere()) {
         const n = await wb.eval('S.terms.length');
         await wb.waitFor(`!!document.querySelector('#launcher .launch.resume, .term-resume-btn')`, 15000);
         await clickIn(wb, `document.querySelector('#launcher .launch.resume, .term-resume-btn')`);
-        await wb.waitFor(`S.terms.length > ${n} || /Earlier sessions|Resume/.test(document.querySelector('.modal')?.textContent || '')`, 15000);
+        await wb.waitFor(`S.terms.length > ${n} || /Earlier sessions|Resume/.test(document.querySelector('#modal')?.textContent || '')`, 15000);
         await sleep(1500);
-        const listed = (await wb.eval(`S.terms.length > ${n} ? ${termText(n)} : ''`)) + '\n' + (await wb.eval(`document.querySelector('.modal')?.textContent || ''`));
-        note('resume', listed.split('\n').filter(Boolean).slice(0, 12));
+        const listed = (await wb.eval(`S.terms.length > ${n} ? ${termText(n)} : ''`)) + '\n' + (await wb.eval(`document.querySelector('#modal')?.textContent || ''`));
+        // Every line of it (the other account's group comes after the space's: not cut off).
+        note('resume', listed.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 40));
         for (const t of truth().resume.titles) assert.ok(listed.includes(t), `Resume doesn’t list "${t}" (the account the person uses)`);
         if (!truth().resume.titles.length) assert.match(listed, /No conversations|Resume/);
       } finally { wb.close(); }

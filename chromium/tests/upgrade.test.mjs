@@ -1,7 +1,8 @@
 // Updating from 0.5.4 (the last Latest before the one-window profiles): a profile made there, with
 // two spaces, a pinned tab, a favorite and a space in a Work profile (its own window in 0.5.4),
 // opens in this build as one window with every space, tab and cookie where it was.
-// Needs the 0.5.4 app: MERIDIAN_OLD_APP, or the copy in Meridian Backups; skipped without it.
+// Needs the 0.5.4 app: MERIDIAN_OLD_APP, or the copy in Meridian Backups with MERIDIAN_FOREGROUND=1
+// (it takes the screen); skipped without it.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -12,8 +13,11 @@ import { launch, SB } from './harness.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const T = 'app.$.tabstrip';
-const OLD = process.env.MERIDIAN_OLD_APP ||
-    path.join(os.homedir(), 'Library/Application Support/Meridian Backups/Meridian-0.5.4.app/Contents/MacOS/Meridian');
+// 0.5.4 predates --meridian-test-background: its window comes to the front and switches the
+// person's Space. So the copy in Meridian Backups only with the screen given to the tests
+// (MERIDIAN_FOREGROUND=1), or one named in MERIDIAN_OLD_APP.
+const OLD = process.env.MERIDIAN_OLD_APP || (process.env.MERIDIAN_FOREGROUND ?
+    path.join(os.homedir(), 'Library/Application Support/Meridian Backups/Meridian-0.5.4.app/Contents/MacOS/Meridian') : '');
 
 // Pages that show their cookie; /main and /work set one.
 function cookieSite() {
@@ -50,7 +54,7 @@ async function inWindows(b, expr) {
   return out;
 }
 
-test('updating from 0.5.4: one window with every space, the pinned tab, the favorite and the Work cookies', { skip: !fs.existsSync(OLD) && 'no 0.5.4 app' }, async () => {
+test('updating from 0.5.4: one window with every space, the pinned tab, the favorite and the Work cookies', { skip: !fs.existsSync(OLD) && 'no 0.5.4 app (MERIDIAN_FOREGROUND=1 or MERIDIAN_OLD_APP)' }, async () => {
   const s = await cookieSite();
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-upgrade-'));
   try {

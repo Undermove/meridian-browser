@@ -211,10 +211,13 @@ test('a space of another Arc profile is signed in as that profile: its pinned, o
   } finally { s.close(); fs.rmSync(arcDir, { recursive: true, force: true }); fs.rmSync(profile, { recursive: true, force: true }); }
 });
 
-const OLD = process.env.MERIDIAN_OLD_ARC_APP ||
-    path.join(os.homedir(), 'Library/Application Support/Meridian Backups/Meridian-0.5.13-test1.app/Contents/MacOS/Meridian');
+// 0.5.13 predates --meridian-test-background: its window comes to the front and switches the
+// person's Space. So the copy in Meridian Backups only with the screen given to the tests
+// (MERIDIAN_FOREGROUND=1), or one named in MERIDIAN_OLD_ARC_APP.
+const OLD = process.env.MERIDIAN_OLD_ARC_APP || (process.env.MERIDIAN_FOREGROUND ?
+    path.join(os.homedir(), 'Library/Application Support/Meridian Backups/Meridian-0.5.13-test1.app/Contents/MacOS/Meridian') : '');
 
-test('tabs 0.5.13 put in the main profile move to their space\'s profile, unarchived', { skip: !fs.existsSync(OLD) && 'no 0.5.13 app' }, async () => {
+test('tabs 0.5.13 put in the main profile move to their space\'s profile, unarchived', { skip: !fs.existsSync(OLD) && 'no 0.5.13 app (MERIDIAN_FOREGROUND=1 or MERIDIAN_OLD_ARC_APP)' }, async () => {
   const s = await cookieEcho();
   const arcDir = arcWithTwoProfiles(s.u);
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-arc-'));
@@ -321,7 +324,7 @@ async function marksOn(b, url) {
 // Arc: each Arc profile's extensions are there in Meridian, in that profile's spaces only, with
 // nothing to add by hand: imported now, or before Meridian added them (0.5.13).
 for (const imported of ['now', 'by 0.5.13']) {
-  test(`Arc's extensions come over into their own profile's spaces (imported ${imported})`, { skip: imported !== 'now' && !fs.existsSync(OLD) && 'no 0.5.13 app' }, async () => {
+  test(`Arc's extensions come over into their own profile's spaces (imported ${imported})`, { skip: imported !== 'now' && !fs.existsSync(OLD) && 'no 0.5.13 app (MERIDIAN_FOREGROUND=1 or MERIDIAN_OLD_ARC_APP)' }, async () => {
     const work = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-ext-'));
     const personal = packExtension(work, 'Personal');
     const office = packExtension(work, 'Office');
