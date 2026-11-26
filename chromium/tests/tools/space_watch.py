@@ -19,11 +19,16 @@ ALLOWED = [a for a in sys.argv[1:] if a]
 BROWSER = re.compile(r'/(Meridian[^/]*|Arc|Google Chrome[^/]*|Chromium|Brave Browser|Microsoft Edge|Vivaldi|Opera)\.app/Contents/MacOS/[^/]+$')
 
 def browsers():
+    # None when `ps` didn't answer (a busy Mac): then nothing is known anew. (An empty answer made
+    # every browser already running — the owner's Chrome and Meridian — look started a moment later.)
     out = {}
     try:
-        ps = subprocess.run(['/bin/ps', '-axo', 'pid=,ppid=,comm='], capture_output=True, text=True, timeout=3).stdout
+        run = subprocess.run(['/bin/ps', '-axo', 'pid=,ppid=,comm='], capture_output=True, text=True, timeout=10)
     except Exception:
-        return out
+        return None
+    ps = run.stdout
+    if run.returncode != 0 or not ps.strip():
+        return None
     for line in ps.splitlines():
         parts = line.strip().split(None, 2)
         # Only an app itself, not its helpers (…/Contents/Frameworks/…/Helpers/X Helper (Renderer).app):
@@ -88,14 +93,19 @@ def idle():
     return round(cg.CGEventSourceSecondsSinceLastEventType(HID_STATE, ANY_INPUT), 2)
 
 def front():
+    # The owner of the topmost window that can be seen (layer 0, alpha above 0), read in this process:
+    # what the person looks at. (It was `lsappinfo front` twice per look, ~13 processes a second per
+    # test file; on a busy Mac with a run and a build that was part of the load.)
+    arr = cg.CGWindowListCopyWindowInfo(ON_SCREEN_ONLY | EXCLUDE_DESKTOP, 0)
+    if not arr:
+        return 0
     try:
-        asn = subprocess.run(['/usr/bin/lsappinfo', 'front'], capture_output=True, text=True, timeout=2).stdout.strip()
-        out = subprocess.run(['/usr/bin/lsappinfo', 'info', '-only', 'pid', asn], capture_output=True, text=True, timeout=2).stdout
-        for part in out.replace('=', ' = ').split():
-            if part.isdigit():
-                return int(part)
-    except Exception:
-        pass
+        for i in range(cf.CFArrayGetCount(arr)):
+            d = cf.CFArrayGetValueAtIndex(arr, i)
+            if (number(d, K_LAYER, 4) or 0) == 0 and (number(d, K_ALPHA, 13) or 0) > 0.01:
+                return int(number(d, K_PID, 4) or 0)
+    finally:
+        cf.CFRelease(arr)
     return 0
 
 test_pids = set()
@@ -108,18 +118,19 @@ def read_pids():
     os._exit(0)
 
 threading.Thread(target=read_pids, daemon=True).start()
-known = browsers()
+known = browsers() or {}
 seen = set()
 last = None
 tick = 0
 while True:
     tick += 1
     if tick % 4 == 0:
-        now_browsers = browsers()
-        for pid, exe in now_browsers.items():
-            if pid not in known:
-                print(json.dumps({'t': int(time.time() * 1000), 'alien': {'pid': pid, 'exe': exe}}), flush=True)
-        known = now_browsers
+        now_browsers = browsers() if tick % 12 == 0 else None
+        if now_browsers is not None:
+            for pid, exe in now_browsers.items():
+                if pid not in known:
+                    print(json.dumps({'t': int(time.time() * 1000), 'alien': {'pid': pid, 'exe': exe}}), flush=True)
+            known = now_browsers
         for pid, wid in shown(set(test_pids)):
             if (pid, wid) not in seen:
                 seen.add((pid, wid))
