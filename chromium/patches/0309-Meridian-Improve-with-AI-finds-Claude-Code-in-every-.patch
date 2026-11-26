@@ -1,0 +1,411 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 11:11:39 +0400
+Subject: [PATCH 1/4] Meridian: Improve with AI finds Claude Code in every
+ space
+
+The boost editor asked the active tab's profile for the AI, so in a space
+with its own profile it said "Set up an AI in Settings"; it now asks the
+main profile, as Improve does. "Automatic" (nothing picked in Settings > AI)
+now also falls back to the first agent found on this computer (Claude Code
+first; opt-in ones only with Other agents on), from the cached detection.
+Improve runs as the space's AI account, like Ask.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/ai/ai_service.cc      | 50 +++++++++++++---
+ chrome/browser/meridian/ai/ai_service.h       |  7 ++-
+ chrome/browser/meridian/ai/local_agents.cc    | 27 +++++++++
+ chrome/browser/meridian/ai/local_agents.h     |  7 +++
+ chrome/browser/meridian/ai/providers.cc       | 29 ++++++++++
+ chrome/browser/meridian/ai/providers.h        | 22 +++++++
+ .../browser/meridian/ai/providers_unittest.cc | 58 +++++++++++++++++++
+ .../meridian/boosts/boost_tab_helper.cc       |  5 ++
+ chrome/browser/meridian/sidebar_handler.cc    | 33 +++++++++--
+ .../webui_browser/meridian/settings.html.ts   |  3 +-
+ 10 files changed, 226 insertions(+), 15 deletions(-)
+
+diff --git a/chrome/browser/meridian/ai/ai_service.cc b/chrome/browser/meridian/ai/ai_service.cc
+index a8f54bccf0..6d9e6272f0 100644
+--- a/chrome/browser/meridian/ai/ai_service.cc
++++ b/chrome/browser/meridian/ai/ai_service.cc
+@@ -833,16 +833,45 @@ void AiService::RemoveKey() {
+   profile_->GetPrefs()->ClearPref(prefs::kAiKey);
+ }
+ 
++namespace {
++
++// A test run looks only at the stand-ins it gives (--meridian-agents-path):
++// never at the real agents of the computer the tests run on.
++bool PicksLocalAgents() {
++  return !TestSwitchesAllowed() ||
++         !TestSwitchValue("meridian-agents-path").empty();
++}
++
++}  // namespace
++
+ std::string AiService::CurrentProvider() const {
+-  std::string chosen = profile_->GetPrefs()->GetString(prefs::kAiProvider);
+-  if (chosen == "api" || (!chosen.empty() && ai::FindProvider(chosen))) {
+-    return chosen;
++  PrefService* prefs = profile_->GetPrefs();
++  std::optional<std::vector<ai::Detected>> found =
++      PicksLocalAgents() ? local_->Found() : std::nullopt;
++  return ai::PickProvider(prefs->GetString(prefs::kAiProvider), HasKey(),
++                          local_->CloudKeyIds(),
++                          found.value_or(std::vector<ai::Detected>()),
++                          prefs->GetBoolean(prefs::kAiOtherAgents));
++}
++
++void AiService::WhenDetected(base::OnceClosure done) {
++  if (!PicksLocalAgents()) {
++    std::move(done).Run();
++    return;
+   }
+-  if (HasKey()) {
+-    return "api";
++  // Known already: right away (a new look in the background when it's old).
++  if (local_->Found()) {
++    local_->RefreshFound();
++    std::move(done).Run();
++    return;
+   }
+-  std::vector<std::string> keys = local_->CloudKeyIds();
+-  return keys.empty() ? std::string() : keys.front();
++  local_->List(/*fresh=*/false,
++               base::BindOnce(
++                   [](base::OnceClosure done,
++                      std::vector<ai::LocalAgents::Status>) {
++                     std::move(done).Run();
++                   },
++                   std::move(done)));
+ }
+ 
+ std::string AiService::CurrentLabel() const {
+@@ -1011,6 +1040,13 @@ void AiService::OnConsent(const std::string& choice) {
+ }
+ 
+ void AiService::Chat(Request request, EventCallback events) {
++  // "Automatic" with nothing looked for yet: the agents here first.
++  if (request.provider.empty() && CurrentProvider().empty() &&
++      PicksLocalAgents() && !local_->Found()) {
++    WhenDetected(base::BindOnce(&AiService::Chat, weak_factory_.GetWeakPtr(),
++                                std::move(request), events));
++    return;
++  }
+   // Nothing leaves before the person allowed it (for whoever answers).
+   if (std::string provider = request.provider.empty() ? CurrentProvider()
+                                                       : request.provider;
+diff --git a/chrome/browser/meridian/ai/ai_service.h b/chrome/browser/meridian/ai/ai_service.h
+index b18d69f6de..044661b21f 100644
+--- a/chrome/browser/meridian/ai/ai_service.h
++++ b/chrome/browser/meridian/ai/ai_service.h
+@@ -82,8 +82,13 @@ class AiService : public KeyedService {
+ 
+   // Who answers by default: "api" (Claude on the key), a provider id
+   // (ai/providers.h), or "" when nothing is set up. "Automatic" picks the
+-  // Claude key, else the first saved cloud key.
++  // Claude key, else the first saved cloud key, else the first agent found
++  // on this computer (Claude Code first; ai::PickProvider), as the last look
++  // for them found it (nothing is run here).
+   std::string CurrentProvider() const;
++  // Runs `done` once the agents on this computer were looked for at least
++  // once (right away after that), so CurrentProvider() can count them.
++  void WhenDetected(base::OnceClosure done);
+   // The name shown for it ("Claude", "Ollama"…), or "" when nothing is set
+   // up.
+   std::string CurrentLabel() const;
+diff --git a/chrome/browser/meridian/ai/local_agents.cc b/chrome/browser/meridian/ai/local_agents.cc
+index c0dafffb70..5700c00ee1 100644
+--- a/chrome/browser/meridian/ai/local_agents.cc
++++ b/chrome/browser/meridian/ai/local_agents.cc
+@@ -652,6 +652,33 @@ LocalAgents::~LocalAgents() {
+   }
+ }
+ 
++std::optional<std::vector<Detected>> LocalAgents::Found() const {
++  if (!cache_) {
++    return std::nullopt;
++  }
++  std::vector<Detected> out;
++  for (const Status& s : cache_->second) {
++    out.push_back({s.id, s.installed, s.signed_in, !s.unavailable.empty()});
++  }
++  return out;
++}
++
++void LocalAgents::RefreshFound() {
++  if (refreshing_ || !cache_ ||
++      base::TimeTicks::Now() - cache_->first < kListCacheAge) {
++    return;
++  }
++  refreshing_ = true;
++  List(/*fresh=*/true,
++       base::BindOnce(
++           [](base::WeakPtr<LocalAgents> self, std::vector<Status>) {
++             if (self) {
++               self->refreshing_ = false;
++             }
++           },
++           weak_factory_.GetWeakPtr()));
++}
++
+ void LocalAgents::List(bool fresh,
+                        base::OnceCallback<void(std::vector<Status>)> done) {
+   if (!fresh && cache_ &&
+diff --git a/chrome/browser/meridian/ai/local_agents.h b/chrome/browser/meridian/ai/local_agents.h
+index f8689c577b..7961833515 100644
+--- a/chrome/browser/meridian/ai/local_agents.h
++++ b/chrome/browser/meridian/ai/local_agents.h
+@@ -68,6 +68,12 @@ class LocalAgents {
+ 
+   // Installed? Signed in? Cached for a minute unless `fresh`.
+   void List(bool fresh, base::OnceCallback<void(std::vector<Status>)> done);
++  // What the last List found, however old (nothing is run to find out);
++  // nullopt before the first one.
++  std::optional<std::vector<Detected>> Found() const;
++  // Looks again in the background when that is over a minute old (once at a
++  // time).
++  void RefreshFound();
+ 
+   void Chat(const std::string& run_id,
+             const std::string& provider_id,
+@@ -141,6 +147,7 @@ class LocalAgents {
+   base::FilePath workdir_;
+   std::map<std::string, std::unique_ptr<Run>> runs_;
+   std::optional<std::pair<base::TimeTicks, std::vector<Status>>> cache_;
++  bool refreshing_ = false;
+   std::map<std::string, std::pair<base::TimeTicks, std::vector<std::string>>>
+       models_;
+   base::WeakPtrFactory<LocalAgents> weak_factory_{this};
+diff --git a/chrome/browser/meridian/ai/providers.cc b/chrome/browser/meridian/ai/providers.cc
+index d1b627b5c9..96b6f60645 100644
+--- a/chrome/browser/meridian/ai/providers.cc
++++ b/chrome/browser/meridian/ai/providers.cc
+@@ -505,6 +505,35 @@ std::optional<bool> OpenCodeAuth(const std::string& out, std::string*) {
+ 
+ }  // namespace
+ 
++std::string PickProvider(const std::string& chosen,
++                         bool has_key,
++                         const std::vector<std::string>& cloud_keys,
++                         const std::vector<Detected>& found,
++                         bool other_agents) {
++  if (chosen == "api" || (!chosen.empty() && FindProvider(chosen))) {
++    return chosen;
++  }
++  if (has_key) {
++    return "api";
++  }
++  if (!cloud_keys.empty()) {
++    return cloud_keys.front();
++  }
++  for (const Provider& p : Providers()) {
++    if (p.kind != Kind::kCli ||
++        (p.policy == Policy::kOptIn && !other_agents)) {
++      continue;
++    }
++    for (const Detected& d : found) {
++      if (d.id == p.id && d.installed && d.signed_in != false &&
++          !d.unavailable) {
++        return p.id;
++      }
++    }
++  }
++  return std::string();
++}
++
+ const std::vector<Provider>& Providers() {
+   static const base::NoDestructor<std::vector<Provider>> providers(
+       MakeProviders());
+diff --git a/chrome/browser/meridian/ai/providers.h b/chrome/browser/meridian/ai/providers.h
+index 8776353445..39241847d0 100644
+--- a/chrome/browser/meridian/ai/providers.h
++++ b/chrome/browser/meridian/ai/providers.h
+@@ -71,6 +71,28 @@ struct Provider {
+ const std::vector<Provider>& Providers();
+ const Provider* FindProvider(const std::string& id);
+ 
++// A local agent or model server as LocalAgents::List last found it.
++struct Detected {
++  std::string id;
++  bool installed = false;
++  // nullopt = can't tell.
++  std::optional<bool> signed_in;
++  // Can't answer on this system ("macOS only for now").
++  bool unavailable = false;
++};
++
++// Who answers when nothing more specific is asked for: the one picked in
++// Settings > AI ("api" or a known provider id); else ("Automatic") Claude on
++// the key ("api"), the first saved cloud key, then the first coding agent
++// (a CLI) found on this computer that can answer, in Providers() order
++// (Claude Code first), the opt-in ones only with "Other agents" on. Local
++// model servers only when picked. "" when nothing is set up.
++std::string PickProvider(const std::string& chosen,
++                         bool has_key,
++                         const std::vector<std::string>& cloud_keys,
++                         const std::vector<Detected>& found,
++                         bool other_agents);
++
+ // One CLI run.
+ struct CommandSpec {
+   std::vector<std::string> args;
+diff --git a/chrome/browser/meridian/ai/providers_unittest.cc b/chrome/browser/meridian/ai/providers_unittest.cc
+index 9a88f8c1e4..09d8980634 100644
+--- a/chrome/browser/meridian/ai/providers_unittest.cc
++++ b/chrome/browser/meridian/ai/providers_unittest.cc
+@@ -152,5 +152,63 @@ TEST(ProvidersTest, FriendlyErrors) {
+   EXPECT_EQ(FriendlyCliError(codex, "", "line 1\nboom"), "Codex: boom");
+ }
+ 
++TEST(ProvidersTest, PickProviderChosenWins) {
++  std::vector<Detected> found = {{"claude-code", true, true, false}};
++  EXPECT_EQ(PickProvider("codex", false, {}, found, false), "codex");
++  EXPECT_EQ(PickProvider("api", false, {}, found, false), "api");
++  EXPECT_EQ(PickProvider("ollama", true, {"openai"}, found, false), "ollama");
++  // One that isn't known any more: Automatic.
++  EXPECT_EQ(PickProvider("gone", false, {}, found, false), "claude-code");
++}
++
++TEST(ProvidersTest, PickProviderAutomaticKeysFirst) {
++  std::vector<Detected> found = {{"claude-code", true, true, false}};
++  EXPECT_EQ(PickProvider("", true, {"openai"}, found, false), "api");
++  EXPECT_EQ(PickProvider("", false, {"openai", "gemini"}, found, false),
++            "openai");
++}
++
++TEST(ProvidersTest, PickProviderAutomaticFallsBackToAnAgentHere) {
++  // Nothing found yet, or nothing installed: nothing set up.
++  EXPECT_EQ(PickProvider("", false, {}, {}, false), "");
++  EXPECT_EQ(PickProvider("", false, {}, {{"claude-code", false, {}, false}},
++                         false),
++            "");
++  // Claude Code first, whatever order the list is in.
++  std::vector<Detected> both = {{"codex", true, true, false},
++                                {"claude-code", true, true, false}};
++  EXPECT_EQ(PickProvider("", false, {}, both, true), "claude-code");
++  // Signed out or unable to answer here: the next one.
++  EXPECT_EQ(PickProvider("", false, {},
++                         {{"claude-code", true, false, false},
++                          {"codex", true, true, false}},
++                         true),
++            "codex");
++  EXPECT_EQ(PickProvider("", false, {},
++                         {{"claude-code", true, {}, true},
++                          {"qwen", true, {}, false}},
++                         true),
++            "qwen");
++  // A local model server answers only when picked.
++  EXPECT_EQ(PickProvider("", false, {},
++                         {{"ollama", true, {}, false},
++                          {"lmstudio", true, {}, false}},
++                         true),
++            "");
++  // Can't tell whether it's signed in: it may answer.
++  EXPECT_EQ(PickProvider("", false, {}, {{"claude-code", true, {}, false}},
++                         false),
++            "claude-code");
++}
++
++TEST(ProvidersTest, PickProviderOptInAgentsOnlyWithOtherAgents) {
++  std::vector<Detected> codex = {{"codex", true, true, false}};
++  EXPECT_EQ(PickProvider("", false, {}, codex, false), "");
++  EXPECT_EQ(PickProvider("", false, {}, codex, true), "codex");
++  // Claude Code still before it.
++  codex.push_back({"claude-code", true, true, false});
++  EXPECT_EQ(PickProvider("", false, {}, codex, true), "claude-code");
++}
++
+ }  // namespace
+ }  // namespace meridian::ai
+diff --git a/chrome/browser/meridian/boosts/boost_tab_helper.cc b/chrome/browser/meridian/boosts/boost_tab_helper.cc
+index e029dce4db..5a356ec7c4 100644
+--- a/chrome/browser/meridian/boosts/boost_tab_helper.cc
++++ b/chrome/browser/meridian/boosts/boost_tab_helper.cc
+@@ -18,6 +18,7 @@
+ #include "chrome/browser/meridian/ai/ai_service.h"
+ #include "chrome/browser/meridian/ai/ai_service_factory.h"
+ #include "chrome/browser/meridian/boosts/boost_service_factory.h"
++#include "chrome/browser/meridian/tab_data.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/common/chrome_isolated_world_ids.h"
+ #include "content/public/browser/navigation_entry.h"
+@@ -833,6 +834,10 @@ void BoostTabHelper::OnOutline(
+   request.system = kImproveSystem;
+   request.provider = improve_provider_;
+   request.mode = "chat";
++  // The tab's space: its AI account, as Ask uses it (ai/account_prefs.h).
++  if (const TabData* data = TabData::Get(web_contents())) {
++    request.space_id = data->space_id();
++  }
+ 
+   struct Run {
+     std::string answer;
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 5b5f579b5f..c77c5da311 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -1718,8 +1718,16 @@ void SidebarHandler::AiChatWith(const std::string& session_id,
+ 
+ void SidebarHandler::GetAiStatus(GetAiStatusCallback callback) {
+   AiService* ai = AiServiceFactory::GetForProfile(browser_->GetProfile());
+-  std::string label = ai ? ai->CurrentLabel() : std::string();
+-  std::move(callback).Run(!label.empty(), label);
++  if (!ai) {
++    std::move(callback).Run(false, std::string());
++    return;
++  }
++  ai->WhenDetected(base::BindOnce(
++      [](base::WeakPtr<AiService> ai, GetAiStatusCallback callback) {
++        std::string label = ai ? ai->CurrentLabel() : std::string();
++        std::move(callback).Run(!label.empty(), label);
++      },
++      ai->GetWeakPtr(), std::move(callback)));
+ }
+ 
+ void SidebarHandler::GetAiProviders(bool fresh,
+@@ -4338,11 +4346,24 @@ void SidebarHandler::GetBoost(GetBoostCallback callback) {
+       state->zapping = helper->zapping();
+     }
+   }
+-  if (AiService* ai = profile ? AiServiceFactory::GetForProfile(profile)
+-                              : nullptr) {
+-    state->ai_label = ai->CurrentLabel();
++  // The AI is set up in the main profile (Settings > AI), also for a tab of
++  // a space with its own profile: as Improve asks it (BoostTabHelper).
++  AiService* ai =
++      profile ? AiServiceFactory::GetForProfile(MainProfileFor(profile))
++              : nullptr;
++  if (!ai) {
++    std::move(callback).Run(std::move(state));
++    return;
+   }
+-  std::move(callback).Run(std::move(state));
++  ai->WhenDetected(base::BindOnce(
++      [](base::WeakPtr<AiService> ai, mojom::BoostStatePtr state,
++         GetBoostCallback callback) {
++        if (ai) {
++          state->ai_label = ai->CurrentLabel();
++        }
++        std::move(callback).Run(std::move(state));
++      },
++      ai->GetWeakPtr(), std::move(state), std::move(callback)));
+ }
+ 
+ void SidebarHandler::GetBoosts(GetBoostsCallback callback) {
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index a710545703..00cefa3c9a 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -444,7 +444,8 @@ export function getHtml(this: MeridianSettingsElement) {
+                 <div class="row-text">
+                   <div class="row-desc">${keyText('⌘J')}, Ask in the command
+                     bar and the AI buttons. Automatic: your Claude key, else
+-                    the first other key.</div>
++                    the first other key, else Claude Code or another agent
++                    on this computer.</div>
+                 </div>
+                 <select class="select" id="askWith"
+                     @change="${this.onAskWithChange_}">
