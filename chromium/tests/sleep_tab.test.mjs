@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import { launch, SB } from './harness.mjs';
+import { launch, SB, rowLook } from './harness.mjs';
 
 const TONE = `<!doctype html><title>Tone</title><script>
   const ctx = new AudioContext(); const osc = ctx.createOscillator(); const gain = ctx.createGain();
@@ -42,6 +42,10 @@ test('Put to Sleep discards a quiet tab and says why it keeps a typed-in, playin
     await b.waitFor(`${row('open')}.tab.isActive`);
     await b.waitFor(`!!${row('Tone')}?.shadowRoot.querySelector('.audio')`, 15000);
 
+    // How the quiet row looks awake (in the background, loaded).
+    const awake = await b.eval(rowLook(row('quiet')));
+    assert.equal(JSON.parse(awake).mark, false);
+    const asleep = (title) => `${T}.isAsleep(${row(title)}.tab)`;
     const sleep = async (title) => b.eval(`${T}.putToSleep(${JSON.stringify(await idOf(title))})`);
     // The open tab: the menu item is greyed out, and the handler says no.
     assert.equal(await sleep('open'), 'active');
@@ -61,18 +65,19 @@ test('Put to Sleep discards a quiet tab and says why it keeps a typed-in, playin
     assert.ok(toasts.includes('Not put to sleep: it is playing sound or video'), toasts.join(' | '));
     assert.ok(toasts.includes('Not put to sleep: something typed on the page would be lost'));
     assert.ok(toasts.includes('Not put to sleep: an agent is working in this tab'));
-    // Asleep in the sidebar: a dimmed favicon with a small moon; the others look as before.
-    await b.waitFor(`${row('quiet')}.asleep && !!${row('quiet')}.shadowRoot.querySelector('.row.asleep .moon')`, 5000);
-    await b.waitFor(`${row('agent')}.asleep`, 5000);
-    assert.equal(await b.eval(`${row('Tone')}.asleep || !!${row('Tone')}.shadowRoot.querySelector('.moon')`), false);
-    assert.equal(await b.eval(`getComputedStyle(${row('quiet')}.shadowRoot.querySelector('.favicon img')).opacity`), '0.45');
+    // Asleep, it looks exactly as it did awake (as in Arc): no moon, no dimming, no tooltip.
+    await b.waitFor(asleep('quiet'), 5000);
+    await b.waitFor(asleep('agent'), 5000);
+    assert.equal(await b.eval(asleep('Tone')), false);
+    assert.equal(await b.eval(rowLook(row('quiet'))), awake);
+    assert.equal(await b.eval(rowLook(row('agent'))), awake);
     if (SHOTS) { await new Promise((r) => setTimeout(r, 300)); await b.screenshot(path.join(SHOTS, 'sleep-mark.png')); }
-    // Opened again: it loads, and the mark goes.
+    // Opened again: it loads.
     await b.eval(`${T}.activateTab(${JSON.stringify(await idOf('quiet'))})`);
     const back = await b.page(url('/quiet'), 15000);
     assert.equal(await back.eval('document.title'), 'quiet');
     back.close();
-    await b.waitFor(`!${row('quiet')}.asleep && !${row('quiet')}.shadowRoot.querySelector('.moon')`, 10000);
-    assert.ok(await b.eval(`${row('agent')}.asleep`), 'the other sleeping tab stays asleep');
+    await b.waitFor(`!${asleep('quiet')}`, 10000);
+    assert.ok(await b.eval(asleep('agent')), 'the other sleeping tab stays asleep');
   } finally { await b.close(); server.close(); }
 });

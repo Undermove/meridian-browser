@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 17:03:34 +0400
+Subject: [PATCH] Meridian: tabs no longer fall asleep on a timer unless
+ Settings say so
+
+Auto-sleep (discarding background tabs after an hour unused) broke work
+apps on wake: a messenger reloaded into its "open the app" landing page,
+another tab showed a gateway error, Discord signed out. Arc never slept
+tabs on a timer. "Put tabs to sleep after" is now Never by default; 30
+minutes, 1 hour and 4 hours stay in Settings, and Put to Sleep in the tab
+menu is unchanged.
+
+Profiles from before keep 1 hour only because it was the default (saving
+Settings wrote it even unchanged): once per profile it becomes Never
+(meridian.sleep_never_migrated); 30 minutes or 4 hours picked by hand stay.
+Settings now write the choice only when it changes.
+--meridian-sleep-after-seconds shortens the wait only when Settings turn
+auto-sleep on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/prefs.cc              |  3 +-
+ chrome/browser/meridian/prefs.h               |  7 ++++-
+ chrome/browser/meridian/sidebar.mojom         |  4 +--
+ chrome/browser/meridian/sidebar_handler.cc    | 28 ++++++++++++++++---
+ chrome/browser/meridian/sidebar_handler.h     |  2 ++
+ .../webui_browser/meridian/settings.html.ts   |  2 +-
+ 6 files changed, 37 insertions(+), 9 deletions(-)
+
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index 8b49174fac..ddc0c6eb59 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -60,7 +60,8 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterDictionaryPref(kAiSpaceAccounts);
+   registry->RegisterDictionaryPref(kAiMainAccount);
+   registry->RegisterStringPref(kAiAccountsHint, std::string());
+-  registry->RegisterIntegerPref(kSleepAfterMinutes, 60);
++  registry->RegisterIntegerPref(kSleepAfterMinutes, 0);
++  registry->RegisterBooleanPref(kSleepNeverMigrated, false);
+   registry->RegisterBooleanPref(kCleanLinks, true);
+   registry->RegisterBooleanPref(kHideCookieBanners, true);
+ }
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index 3dc855f1d3..3f96419170 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -115,8 +115,13 @@ inline constexpr char kAiMainAccount[] = "meridian.ai_main_account";
+ // The "different subscriptions in different spaces?" card: "" (offered),
+ // "dismissed" or "applied".
+ inline constexpr char kAiAccountsHint[] = "meridian.ai_accounts_hint";
+-// Background tabs not used for this many minutes fall asleep (0 = never).
++// Background tabs not used for this many minutes fall asleep (0 = never,
++// the default: Arc never put tabs to sleep on a timer, and work apps woken
++// from sleep land on their sign-in or "open the app" pages).
+ inline constexpr char kSleepAfterMinutes[] = "meridian.sleep_after_minutes";
++// Whether the old default (1 hour) kept from before Never was the default was
++// turned to Never (once).
++inline constexpr char kSleepNeverMigrated[] = "meridian.sleep_never_migrated";
+ // Links copied without tracking parameters (utm_*, fbclid…).
+ inline constexpr char kCleanLinks[] = "meridian.clean_links";
+ // Cookie notices hidden (EasyList Cookie List's element hiding rules).
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 6c45d04859..d1e0a7bb0b 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -409,8 +409,8 @@ struct Settings {
+   // (the guard's "Don't ask again for this file in this project"). Saving
+   // only removes from it.
+   array<SecretFileOptOut> secret_file_optouts;
+-  // Background tabs fall asleep after this many minutes unused: 0 (never),
+-  // 30, 60 or 240.
++  // Background tabs fall asleep after this many minutes unused: 0 (never,
++  // the default), 30, 60 or 240.
+   int32 sleep_after_minutes;
+   // Copy Link and ⇧⌘C leave out tracking parameters (utm_*, fbclid…).
+   bool clean_links;
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 1346f23bdb..151ab007b0 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -334,6 +334,7 @@ SidebarHandler::SidebarHandler(
+   prefs_.Add(prefs::kArchiveAfterHours,
+              base::BindRepeating(&SidebarHandler::StartArchiveTimer,
+                                  base::Unretained(this)));
++  MigrateSleepPref(browser->GetProfile()->GetPrefs());
+   StartSleepTimer();
+   prefs_.Add(prefs::kSleepAfterMinutes,
+              base::BindRepeating(&SidebarHandler::StartSleepTimer,
+@@ -1242,7 +1243,26 @@ void SidebarHandler::StartArchiveTimer() {
+                        &SidebarHandler::ArchiveStaleTabs);
+ }
+ 
++// static
++void SidebarHandler::MigrateSleepPref(PrefService* prefs) {
++  if (prefs->GetBoolean(prefs::kSleepNeverMigrated)) {
++    return;
++  }
++  prefs->SetBoolean(prefs::kSleepNeverMigrated, true);
++  // 1 hour was the default, and saving Settings wrote it even unchanged:
++  // back to the default (Never). 30 minutes or 4 hours were picked by hand.
++  if (prefs->GetInteger(prefs::kSleepAfterMinutes) == 60) {
++    prefs->ClearPref(prefs::kSleepAfterMinutes);
++  }
++}
++
+ base::TimeDelta SidebarHandler::SleepAfter() {
++  int minutes =
++      browser_->GetProfile()->GetPrefs()->GetInteger(prefs::kSleepAfterMinutes);
++  if (minutes <= 0) {
++    return base::TimeDelta();
++  }
++  // Tests: seconds instead, when Settings turned it on.
+   const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
+   int seconds = 0;
+   if (base::StringToInt(cl->GetSwitchValueASCII("meridian-sleep-after-seconds"),
+@@ -1250,9 +1270,7 @@ base::TimeDelta SidebarHandler::SleepAfter() {
+       seconds > 0) {
+     return base::Seconds(seconds);
+   }
+-  int minutes =
+-      browser_->GetProfile()->GetPrefs()->GetInteger(prefs::kSleepAfterMinutes);
+-  return minutes > 0 ? base::Minutes(minutes) : base::TimeDelta();
++  return base::Minutes(minutes);
+ }
+ 
+ void SidebarHandler::StartSleepTimer() {
+@@ -3310,7 +3328,9 @@ void SidebarHandler::SetSettings(mojom::SettingsPtr settings) {
+     prefs->SetInteger(prefs::kArchiveAfterHours, hours);
+   }
+   const int sleep = settings->sleep_after_minutes;
+-  if (sleep == 0 || sleep == 30 || sleep == 60 || sleep == 240) {
++  // Written only when picked: saving other settings leaves the default.
++  if ((sleep == 0 || sleep == 30 || sleep == 60 || sleep == 240) &&
++      sleep != prefs->GetInteger(prefs::kSleepAfterMinutes)) {
+     prefs->SetInteger(prefs::kSleepAfterMinutes, sleep);
+   }
+   prefs->SetBoolean(prefs::kCleanLinks, settings->clean_links);
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 79ec7130ec..aaebbed0d9 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -509,6 +509,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void StartArchiveTimer();
+   // Auto-sleep: background tabs not used for SleepAfter() are discarded.
+   base::TimeDelta SleepAfter();
++  // Once per profile: the old default (1 hour) becomes Never.
++  static void MigrateSleepPref(PrefService* prefs);
+   void StartSleepTimer();
+   void SleepIdleTabs();
+   bool KeptAwake(tabs::TabInterface* tab);
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index 07ca1191c7..b19b20f66d 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -244,7 +244,7 @@ export function getHtml(this: MeridianSettingsElement) {
+                   ${this.sleepChoices_.map(c => html`
+                     <option value="${c.value}"
+                         ?selected="${c.value ===
+-                            `${this.settings_?.sleepAfterMinutes ?? 60}`}">
++                            `${this.settings_?.sleepAfterMinutes ?? 0}`}">
+                       ${c.label}</option>`)}
+                 </select>
+               </div>
