@@ -39,6 +39,15 @@
       handTitle: 'Вы поправили руками:', handNext: 'Claude узнает об этом со следующим сообщением.',
       handPrompt: (host, lines) => `Я поправил руками на странице ${host} (это уже в Boost «Studio · ${host}», не перезаписывай и учитывай дальше):\n${lines}`,
       sayPrompt: (host, list, text) => `На странице ${host} я показал на:\n${list}\n\n${text}\n\nМеняй только это (через Boost на этом сайте), остальное не трогай.`,
+      whoTitle: 'Кто вы?', whoLead: 'Подстроим Meridian под вашу работу. Поменять можно в любой момент.', skip: 'Пропустить',
+      whoNote: 'Догадка — по приложениям на этом компьютере. Никуда не отправляется.', whoChange: 'Студия и Workbench всегда в один клик — выбор решает, что открывается первым.',
+      guess: 'Похоже на вас', roleChange: 'Кто вы? Поменять роль',
+      personas: {
+        developer: { name: 'Разработчик', role: 'Пишу код и запускаю агентов', points: ['Workbench: код, терминал, агенты', 'Агенты видят и водят браузер', 'Mission Control — все агенты разом'], gets: 'Откроется <b>Workbench</b>', cta: 'Я разработчик — дальше' },
+        designer: { name: 'Дизайнер', role: 'Макеты, бренд, сайты', points: ['Студия: просите словами, результат — на живом сайте', 'Ткни в элемент и поправь руками', 'Всё в черновике, любое изменение можно отменить'], gets: 'Откроется <b>Студия</b>', cta: 'Я дизайнер — дальше' },
+        manager: { name: 'Менеджер', role: 'Задачи, отчёты, документы', points: ['Студия: отчёт из задач — в документ на глазах', 'Ничего не отправит наружу без вашего «да»', 'Работа и личное — в разных спейсах'], gets: 'Откроется <b>Студия</b>', cta: 'Я менеджер — дальше' },
+        everyday: { name: 'Просто пользуюсь', role: 'Сайты, почта, видео', points: ['Вкладки сами наводят порядок', 'Студия, когда нужно что-то сделать', 'AI — только когда сами попросите'], gets: 'Откроется <b>Студия</b>, попроще', cta: 'Дальше' },
+      },
       trustTitle: 'Разрешить Claude работать в этой папке?', trustDetail: (n) => `Claude будет смотреть файлы в папке ${n} и спрашивать, прежде чем что-то поменять.`,
     },
     en: {
@@ -74,6 +83,15 @@
       handTitle: 'You changed by hand:', handNext: 'Claude hears about it with the next message.',
       handPrompt: (host, lines) => `I changed these by hand on ${host} (already in the Boost "Studio · ${host}"; don't overwrite it, keep it from now on):\n${lines}`,
       sayPrompt: (host, list, text) => `On ${host} I pointed at:\n${list}\n\n${text}\n\nChange only that (through a Boost on this site), leave the rest.`,
+      whoTitle: 'Who are you?', whoLead: 'We’ll set Meridian up for your work. You can change it any time.', skip: 'Skip',
+      whoNote: 'The guess comes from the apps on this computer. Nothing is sent anywhere.', whoChange: 'Studio and the Workbench are always a click apart — this decides which opens first.',
+      guess: 'Looks like you', roleChange: 'Who are you? Change the role',
+      personas: {
+        developer: { name: 'Developer', role: 'I write code and run agents', points: ['Workbench: code, terminal, agents', 'Agents see and drive the browser', 'Mission Control: every agent at once'], gets: 'Opens the <b>Workbench</b>', cta: 'I’m a developer — next' },
+        designer: { name: 'Designer', role: 'Mockups, brand, sites', points: ['Studio: ask in words, see it on the live site', 'Point at an element and change it by hand', 'Everything in drafts, every change undoable'], gets: 'Opens <b>Studio</b>', cta: 'I’m a designer — next' },
+        manager: { name: 'Manager', role: 'Tasks, reports, documents', points: ['Studio: a report from tasks, written before your eyes', 'Nothing goes out without your yes', 'Work and personal in separate spaces'], gets: 'Opens <b>Studio</b>', cta: 'I’m a manager — next' },
+        everyday: { name: 'Just browsing', role: 'Sites, mail, video', points: ['Tabs that tidy themselves', 'Studio when you need something done', 'AI only when you ask'], gets: 'Opens <b>Studio</b>, simpler', cta: 'Next' },
+      },
       trustTitle: 'Let Claude work in this folder?', trustDetail: (n) => `Claude will look at the files in ${n} and ask before it changes anything.`,
     },
   };

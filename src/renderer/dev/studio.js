@@ -80,6 +80,8 @@ async function studioBoot() {
   stSwitchInTopbar();
   const wanted = new URL(location.href).searchParams.get('view');
   stShow(wanted === 'workbench' ? 'workbench' : wanted === 'studio' || ST.persona !== 'developer' ? 'studio' : 'workbench');
+  // "Кто вы?" once: the person's pick decides what the Workbench tab opens with.
+  if (info.ask) stPersonaPicker({ guess: ST.persona });
   bus.addEventListener('project', () => { stRender(); });
   if (typeof SessionStatus !== 'undefined' && SessionStatus?.onChange) SessionStatus.onChange(() => stRender());
   document.addEventListener('visibilitychange', stReport);
@@ -194,6 +196,7 @@ function stBuild() {
     <header class="st-head">
       <div class="st-titles"><span class="st-ttl" id="st-title"></span><span class="st-sub" id="st-sub"></span></div>
       <div class="grow"></div>
+      <button class="st-role-btn" id="st-role" title="${esc(w.roleChange)}">${icon('user', 14)}<span></span></button>
       ${stSwitchHtml()}
     </header>
     <div class="st-body">
@@ -219,6 +222,7 @@ function stBuild() {
   document.body.appendChild(el);
   ST.el = el;
   $('.st-switch', el).addEventListener('click', stOnSwitch);
+  $('#st-role', el).addEventListener('click', () => stPersonaPicker({ current: ST.persona }));
   $('#st-new', el).addEventListener('click', () => { ST.current = ''; ST.preview = null; stRender(); $('#st-input').focus(); });
   $('#st-task-list', el).addEventListener('click', (e) => {
     const row = e.target.closest('[data-term]');
@@ -278,6 +282,7 @@ function stRender() {
   const t = stCurrent();
   $('#st-title').textContent = t ? stTitle(t) : w.newTask;
   $('#st-sub').textContent = `${S.project.name} · ${w.claude}`;
+  $('#st-role span').textContent = w.personas[ST.persona]?.name || '';
   document.title = t ? stTitle(t) : w.studio;
   stRenderTasks(terms);
   stRenderFeed(t);
@@ -821,6 +826,72 @@ function stFlush(t) {
   const k = stTask(t);
   const q = k.queue.shift();
   if (q) stType(t, q.text);
+}
+
+// ---------------------------------------------------------------- "Кто вы?" (the persona picker)
+
+const ST_PERSONAS = [
+  ['developer', 'dev', '#43cea2', '#2ef2d2'],
+  ['designer', 'des', '#c471f5', '#c58cff'],
+  ['manager', 'man', '#4facfe', '#ffd36b'],
+  ['everyday', 'use', '#8a8fe0', '#ff9a6b'],
+];
+
+// Four characters, as in a game: the guess (or the current one) picked already. The pick decides
+// what the Workbench tab shows first (Studio, or the Workbench for developers); both stay a click away.
+function stPersonaPicker({ guess = '', current = '' } = {}) {
+  const w = STW();
+  $('#st-persona')?.remove();
+  const sel = w.personas[current] ? current : w.personas[guess] ? guess : 'designer';
+  const box = document.createElement('section');
+  box.id = 'st-persona';
+  box.setAttribute('role', 'dialog');
+  box.setAttribute('aria-label', w.whoTitle);
+  const cards = ST_PERSONAS.map(([id, k, c, hc]) => {
+    const p = w.personas[id];
+    const art = `studio-art/hero-${k}.webp`;
+    return `<div class="pc${id === sel ? ' sel' : ''}" data-k="${k}" data-id="${id}" data-cta="${esc(p.cta)}" style="--c:${c};--hc:${hc}" tabindex="0" role="button">
+      ${id === guess && !current ? `<span class="guess">${icon('sparkles', 11)}${esc(w.guess)}</span>` : ''}
+      ${id === sel ? `<span class="check">${icon('check', 14)}</span>` : ''}
+      <div class="art"><div class="tilt"><div class="stk" style="--img:url(${art})"><canvas class="back"></canvas><img class="hero" src="${art}" alt=""><img class="rgb r" src="${art}" alt=""><img class="rgb b" src="${art}" alt=""><span class="mask foil"><i></i></span><span class="mask scan"><i></i></span><span class="mask flash-m"><span class="flash"></span></span><canvas class="front"></canvas></div></div></div>
+      <div class="name">${esc(p.name)}</div><div class="role">${esc(p.role)}</div>
+      <ul>${p.points.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>
+      <div class="gets">${icon('arrowRight', 13)}<span>${p.gets}</span></div></div>`;
+  }).join('');
+  box.innerHTML = `<div class="stp-in"><h2>${esc(w.whoTitle)}</h2><p class="lead">${esc(w.whoLead)}</p>
+    <div class="cards">${cards}</div>
+    <div class="foot">${current ? '' : `<button class="btn ghost" data-a="skip">${esc(w.skip)}</button>`}<button class="btn pri" data-a="go">${esc(w.personas[sel].cta)}</button></div>
+    <div class="note">${esc(current ? w.whoChange : w.whoNote)}</div></div>`;
+  document.body.appendChild(box);
+  let picked = sel;
+  const fx = typeof studioPersonaFx === 'function'
+    ? studioPersonaFx(box, (k) => { picked = ST_PERSONAS.find((x) => x[1] === k)?.[0] || picked; })
+    : null;
+  // Keys: arrows move, Enter/Space picks (no motion for keys).
+  box.addEventListener('keydown', (e) => {
+    const card = e.target.closest('.pc');
+    if (card && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); card.click(); }
+    if (card && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) { e.preventDefault(); (e.key === 'ArrowRight' ? card.nextElementSibling : card.previousElementSibling)?.focus(); }
+    if (e.key === 'Escape' && current) box.remove();
+  });
+  if (!fx) box.querySelector('.cards').addEventListener('click', (e) => {
+    const card = e.target.closest('.pc');
+    if (!card) return;
+    picked = card.dataset.id;
+    for (const c of box.querySelectorAll('.pc')) c.classList.toggle('sel', c === card);
+    box.querySelector('.btn.pri').textContent = card.dataset.cta;
+  });
+  box.addEventListener('click', async (e) => {
+    const a = e.target.closest('[data-a]')?.dataset.a;
+    if (!a) return;
+    const persona = a === 'skip' ? (w.personas[guess] ? guess : 'designer') : picked;
+    try { await wb.studioSetPersona(persona); } catch {}
+    ST.persona = persona;
+    box.classList.add('out');
+    setTimeout(() => box.remove(), stReduced() ? 0 : 220);
+    stShow(persona === 'developer' ? 'workbench' : 'studio');
+  });
+  setTimeout(() => box.querySelector('.pc.sel')?.focus(), 0);
 }
 
 // ---------------------------------------------------------------- point and say (the site next to Studio)

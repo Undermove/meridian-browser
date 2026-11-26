@@ -148,7 +148,7 @@ test('Studio on: a task in plain words, a permission card answered with a button
     wb = await openWorkbench(b);
     // A designer sees Studio first, with the designer's suggestions and the switch.
     await wb.waitFor(`document.querySelector('#studio') && !document.querySelector('#studio').hidden`);
-    assert.deepEqual(await wb.eval('window.workbench.studioInfo()'), { enabled: true, persona: 'designer' });
+    assert.deepEqual(await wb.eval('window.workbench.studioInfo()'), { enabled: true, chosen: false, ask: false, persona: 'designer' });
     assert.equal(await wb.eval(`document.querySelectorAll('#st-chips .st-chip').length`), 3);
     assert.equal(await wb.eval(`document.querySelector('#studio .st-switch button.on').dataset.view`), 'studio');
     // Nothing about terminals, tokens or MCP in sight.

@@ -226,6 +226,9 @@
     // Studio (refused unless Meridian has it on): whether it's on and who the person is, a session's
     // transcript from an offset, an answer to its question, the result site's Boost.
     studioInfo: () => invoke('studioInfo'),
+    studioSetPersona: (p) => invoke('studioSetPersona', str(p)),
+    // Point and say on Studio's site tab: 'start' (config), 'stop', 'pins' (list), 'settled', 'site'.
+    studioPoint: (op, arg) => invoke('studioPoint', str(op), ...(arg === undefined ? [] : [JSON.parse(JSON.stringify(arg))])),
     studioTranscript: (id, offset) => invoke('studioTranscript', str(id), Math.max(0, Number(offset) || 0)),
     studioAnswer: (askId, choice) => invoke('studioAnswer', str(askId), ['allow', 'deny', 'session'].includes(choice) ? choice : 'deny'),
     studioBoost: (op, host, ...rest) => invoke('studioBoost', str(op), str(host), ...JSON.parse(JSON.stringify(rest.slice(0, 2)))),

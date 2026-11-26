@@ -23,10 +23,12 @@ fi
 
 rm -rf "$dest.tmp"
 mkdir -p "$dest.tmp/vendor"
-for f in workbench.html workbench.js workbench-pro.js workbench.css secret-detect.js mission-chip.js context-insights.js source-control.js terminal-extras.js session-status.js chats.js chats.css studio.js studio-words.js studio-transcript.js studio.css; do
+for f in workbench.html workbench.js workbench-pro.js workbench.css secret-detect.js mission-chip.js context-insights.js source-control.js terminal-extras.js session-status.js chats.js chats.css studio.js studio-words.js studio-transcript.js studio.css studio-persona-fx.js; do
   cp "$repo/src/renderer/dev/$f" "$dest.tmp/$f"
 done
 cp "$repo/src/renderer/icons.js" "$dest.tmp/icons.js"
+# Studio's persona heroes ("Кто вы?").
+cp -R "$repo/src/renderer/dev/studio-art" "$dest.tmp/studio-art"
 cp "$here/workbench/bridge.js" "$dest.tmp/bridge.js"
 # Docker sandboxes: the image recipe, and the Mission Control hook node runs inside it.
 mkdir -p "$dest.tmp/sandbox" "$dest.tmp/hooks"
