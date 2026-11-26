@@ -247,7 +247,7 @@ if (args[0] === 'auth') {
 // 2.x `run` joins its background service when one is up, and that service never saw Meridian's
 // config: no agent, and none of its "deny everything" either. --standalone gives the run a private
 // server. OpenCode 1.x doesn't know that flag. Both read the person's global config in a closed home.
-async function askOpenCode(version) {
+async function askOpenCode(version, { jsonc = '// mine\n{"model":"jsonc-model"}', json = '{"model":"json-model"}', state } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-oc-')));
   const bin = path.join(root, 'bin');
   const home = path.join(root, 'home');
@@ -258,9 +258,14 @@ async function askOpenCode(version) {
   fs.mkdirSync(path.join(home, '.ssh'));
   fs.writeFileSync(path.join(home, '.ssh', 'id_test'), 'PRIVATE');
   fs.writeFileSync(path.join(home, 'notes.txt'), 'PERSONAL');
-  fs.writeFileSync(path.join(home, '.config', 'opencode', 'opencode.jsonc'), '// mine\n{"model":"jsonc-model"}');
+  fs.writeFileSync(path.join(home, '.config', 'opencode', 'opencode.jsonc'), jsonc);
+  // The model last picked in OpenCode's own screen.
+  if (state) {
+    fs.mkdirSync(path.join(home, '.local', 'state', 'opencode'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.local', 'state', 'opencode', 'model.json'), JSON.stringify(state));
+  }
   // Kept in a dotfiles repository, as many people do.
-  fs.writeFileSync(path.join(home, 'dotfiles', 'opencode.json'), '{"model":"json-model"}');
+  fs.writeFileSync(path.join(home, 'dotfiles', 'opencode.json'), json);
   fs.symlinkSync(path.join(home, 'dotfiles', 'opencode.json'), path.join(home, '.config', 'opencode', 'opencode.json'));
   const v2 = version === 2;
   standIn(bin, 'opencode', `const fs = require('fs'); const path = require('path');
@@ -274,6 +279,8 @@ else {
   fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + '\\n');
   if (${!v2} && args.includes('--standalone')) { console.error('Unrecognized flag: --standalone in command opencode run'); process.exit(1); }
   if (${v2} && !args.includes('--standalone')) { console.log(JSON.stringify({ type: 'error', sessionID: 's', error: { type: 'unknown', message: 'Agent not found: "meridian"' } })); process.exit(1); }
+  // OpenCode 2 with no model named: its own free one, which has run out.
+  if (${JSON.stringify(jsonc.includes('freeLimit'))} && !args.includes('-m')) { console.log(JSON.stringify({ type: 'error', sessionID: 's', error: { type: 'unknown', message: 'Free usage limit reached. Connect a provider or subscribe to OpenCode Go' } })); process.exit(1); }
   process.stdin.resume();
   process.stdin.on('end', () => console.log(JSON.stringify({ type: 'text', sessionID: 'ses_1', part: { text: 'ANSWER jsonc=' + can('.config/opencode/opencode.jsonc') + ' json=' + can('.config/opencode/opencode.json') + ' ssh=' + can('.ssh/id_test') + ' notes=' + can('notes.txt') + ' state=' + canWrite() } })));
 }
@@ -293,7 +300,7 @@ else {
     await b.eval('app.$.tabstrip.runCommand(14, 0)');
     await b.waitFor(`app.$.ask.open && !!${AK}.getElementById('input')`);
     await b.eval(`(() => { const i = ${AK}.getElementById('input'); i.value = 'What is this page?'; ${AK}.getElementById('send').click(); })()`);
-    await b.waitFor(`/ANSWER|Agent not found|Unrecognized/.test([...${AK}.querySelectorAll('.msg.assistant')].pop()?.textContent || '')`, 20000)
+    await b.waitFor(`/ANSWER|Agent not found|Unrecognized|no model is set/.test([...${AK}.querySelectorAll('.msg.assistant')].pop()?.textContent || '')`, 20000)
       .catch(async (e) => { throw new Error(`${e.message}\nAsk shows: ${await b.eval(`${AK}.textContent.replace(/\\s+/g, ' ').slice(-400)`)}`); });
     const said = await b.eval(`[...${AK}.querySelectorAll('.msg.assistant')].pop().textContent`);
     const runs = fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
@@ -313,6 +320,34 @@ for (const version of [1, 2]) {
     assert.equal(runs[0].includes('--standalone'), version === 2);
   });
 }
+
+// A report (26.11.2026): Ask with OpenCode 2.3 answered "OpenCode hit a usage limit" ("Free usage
+// limit reached"): `opencode run` without -m doesn't take the model picked in OpenCode's own screen
+// (its state model.json); it takes its first available one, a free one. Meridian now names the
+// person's model: the config's "model" (JSONC, later file wins), else the one last picked. Never
+// one it made up; with none, Ask says so plainly.
+const CORPORATE = `{
+  // the bank's gateway
+  "provider": { "alfagen": { "npm": "@ai-sdk/openai-compatible",
+    "options": { "baseURL": "https://llm.example/v1" }, "models": { "EVC-Com-model": {} } } },
+}`;
+test('OpenCode Ask runs with the person’s own model: the one last picked in OpenCode, or the config’s', { skip: process.platform !== 'darwin' && 'needs the macOS sandbox' }, async () => {
+  const picked = await askOpenCode(2, { jsonc: CORPORATE, json: '{}', state: { recent: [{ providerID: 'alfagen', modelID: 'EVC-Com-model' }], favorite: [], variant: {} } });
+  assert.match(picked.said, /ANSWER/);
+  const m = picked.runs[0].indexOf('-m');
+  assert.ok(m > 0, `-m given: ${picked.runs[0]}`);
+  assert.equal(picked.runs[0][m + 1], 'alfagen/EVC-Com-model');
+  // The config's model wins over the last picked; the .json file over the .jsonc one.
+  const configured = await askOpenCode(2, { jsonc: CORPORATE.replace('{\n', '{\n  "model": "alfagen/EVC-Com-model",\n'), json: '{"model": "openai/gpt-5"}', state: { recent: [{ providerID: 'opencode', modelID: 'big-pickle' }] } });
+  assert.equal(configured.runs[0][configured.runs[0].indexOf('-m') + 1], 'openai/gpt-5');
+});
+
+test('OpenCode Ask with no model anywhere: no -m made up, and a plain word when its free one runs out', { skip: process.platform !== 'darwin' && 'needs the macOS sandbox' }, async () => {
+  const none = await askOpenCode(2, { jsonc: '{ /* freeLimit */ }', json: '{}' });
+  assert.ok(!none.runs[0].includes('-m'), `no model made up: ${none.runs[0]}`);
+  assert.match(none.said, /no model is set for OpenCode/);
+  assert.match(none.said, /opencode\.json/);
+});
 
 test('LM Studio installed but off: Start server turns it on, then it answers', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-lms-'));

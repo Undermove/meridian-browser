@@ -1,0 +1,523 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 22:27:28 +0400
+Subject: [PATCH 2/2] Meridian: OpenCode answers Ask with the person's model;
+ Connect adds --text-only for a model without images
+
+- Ask: `opencode run` without -m doesn't take the model picked in OpenCode's
+  own screen (state/opencode/model.json); it takes its first available one,
+  signed out a free one ("Free usage limit reached"). Meridian now names
+  the person's model: "model" of the global config files (JSONC; the later
+  file wins), else the one last picked in OpenCode. Never one it made up;
+  with none and OpenCode's free limit reached, Ask says so plainly.
+- Connect (OpenCode): when that model is one of an @ai-sdk/openai-compatible
+  provider set up in the config without image input (as OpenCode reads it,
+  1 and 2), the bridge entry gets --text-only. Unsure: as before.
+- ai::OpenCodeChosenModel, ai::OpenCodeModelTakesNoImages,
+  OpenCodeWantsTextOnly (unit-tested).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/agent/agent_cli.cc    | 53 ++++++++--
+ chrome/browser/meridian/agent/agent_cli.h     |  9 ++
+ .../meridian/agent/agent_cli_unittest.cc      | 83 ++++++++++++++++
+ chrome/browser/meridian/ai/local_agents.cc    | 21 ++++
+ chrome/browser/meridian/ai/providers.cc       | 97 +++++++++++++++++++
+ chrome/browser/meridian/ai/providers.h        | 16 +++
+ .../browser/meridian/ai/providers_unittest.cc | 83 ++++++++++++++++
+ 7 files changed, 354 insertions(+), 8 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_cli.cc b/chrome/browser/meridian/agent/agent_cli.cc
+index 1dd8e45..45204c3 100644
+--- a/chrome/browser/meridian/agent/agent_cli.cc
++++ b/chrome/browser/meridian/agent/agent_cli.cc
+@@ -24,6 +24,7 @@
+ #include "chrome/browser/meridian/ai/accounts.h"
+ #include "chrome/browser/meridian/ai/cli_versions.h"
+ #include "chrome/browser/meridian/ai/process_runner.h"
++#include "chrome/browser/meridian/ai/providers.h"
+ #include "chrome/browser/meridian/test_switches.h"
+ #include "third_party/re2/src/re2/re2.h"
+ 
+@@ -545,15 +546,22 @@ struct JsonEntry {
+   base::DictValue new_file;  // what a new file starts with
+ };
+ 
+-JsonEntry EntryFor(const std::string& id, const std::string& program) {
++// `text_only`: OpenCode on a model that takes no images (mcp_result.h).
++JsonEntry EntryFor(const std::string& id,
++                   const std::string& program,
++                   bool text_only = false) {
+   JsonEntry e;
+   auto args = [] { return base::Value(base::ListValue().Append("--mcp-bridge")); };
+   if (id == "opencode") {
+     e.key = "mcp";
+     e.fields.emplace_back("type", base::Value("local"));
+-    e.fields.emplace_back(
+-        "command",
+-        base::Value(base::ListValue().Append(program).Append("--mcp-bridge")));
++    base::ListValue command;
++    command.Append(program);
++    command.Append("--mcp-bridge");
++    if (text_only) {
++      command.Append("--text-only");
++    }
++    e.fields.emplace_back("command", base::Value(std::move(command)));
+     e.fields.emplace_back("enabled", base::Value(true));
+     e.new_file.Set("$schema", "https://opencode.ai/config.json");
+     return e;
+@@ -693,8 +701,9 @@ bool AddJson(const std::string& id,
+              bool existed,
+              const std::string& text,
+              const std::string& program,
+-             std::string* output) {
+-  JsonEntry entry = EntryFor(id, program);
++             std::string* output,
++             bool text_only = false) {
++  JsonEntry entry = EntryFor(id, program, text_only);
+   base::DictValue root;
+   if (base::TrimWhitespaceASCII(text, base::TRIM_ALL).empty()) {
+     if (!existed) {
+@@ -1263,8 +1272,36 @@ bool AddAgentServer(const std::string& id,
+     *output = "couldn’t read " + config.AsUTF8Unsafe();
+     return false;
+   }
+-  return id == "goose" ? AddGoose(config, existed, text, program, output)
+-                       : AddJson(id, config, existed, text, program, output);
++  if (id == "goose") {
++    return AddGoose(config, existed, text, program, output);
++  }
++  return AddJson(id, config, existed, text, program, output,
++                 id == "opencode" && OpenCodeWantsTextOnly(dir));
++}
++
++bool OpenCodeWantsTextOnly(const base::FilePath& dir,
++                           const base::FilePath& state_file) {
++  // Both files, as OpenCode merges them (the .jsonc one may have comments).
++  std::vector<std::string> configs;
++  for (const char* name : {"opencode.json", "opencode.jsonc"}) {
++    std::string text;
++    if (base::ReadFileToStringWithMaxSize(dir.AppendASCII(name), &text,
++                                          1 << 20)) {
++      configs.push_back(std::move(text));
++    }
++  }
++  base::FilePath state = state_file;
++  if (state.empty()) {
++    std::unique_ptr<base::Environment> env = base::Environment::Create();
++    const std::string xdg = env->GetVar("XDG_STATE_HOME").value_or("");
++    state = (xdg.empty() ? base::GetHomeDir().AppendASCII(".local/state")
++                         : base::FilePath::FromUTF8Unsafe(xdg))
++                .AppendASCII("opencode/model.json");
++  }
++  std::string state_json;
++  base::ReadFileToStringWithMaxSize(state, &state_json, 1 << 20);
++  return ai::OpenCodeModelTakesNoImages(
++      configs, ai::OpenCodeChosenModel(configs, state_json));
+ }
+ 
+ std::vector<AgentCli> DetectAgentClis() {
+diff --git a/chrome/browser/meridian/agent/agent_cli.h b/chrome/browser/meridian/agent/agent_cli.h
+index 07ed749..19f83b5 100644
+--- a/chrome/browser/meridian/agent/agent_cli.h
++++ b/chrome/browser/meridian/agent/agent_cli.h
+@@ -119,6 +119,15 @@ bool AddAgentServer(const std::string& id,
+                     const std::string& program,
+                     std::string* output);
+ 
++// Whether OpenCode's model (ai::OpenCodeChosenModel: its config files in
++// `dir`, else the one last picked, from `state_file` or, empty, OpenCode's own
++// state/opencode/model.json) is one that takes no images: an OpenAI-compatible
++// provider set up there without image input. Its "meridian" entry then runs
++// the bridge with --text-only (a screenshot in the conversation makes such
++// endpoints answer HTTP 400). false when unsure.
++bool OpenCodeWantsTextOnly(const base::FilePath& dir,
++                           const base::FilePath& state_file = {});
++
+ inline bool AddOpenCodeServer(const base::FilePath& dir,
+                               const std::string& program,
+                               std::string* output) {
+diff --git a/chrome/browser/meridian/agent/agent_cli_unittest.cc b/chrome/browser/meridian/agent/agent_cli_unittest.cc
+index 3551f76..8765a64 100644
+--- a/chrome/browser/meridian/agent/agent_cli_unittest.cc
++++ b/chrome/browser/meridian/agent/agent_cli_unittest.cc
+@@ -149,6 +149,89 @@ TEST_F(OpenCodeConnectTest, NeverTouchesJsonc) {
+   EXPECT_FALSE(ReadConfig(json()).FindString("model"));
+ }
+ 
++// A corporate model behind an OpenAI-compatible endpoint, set up in the .jsonc
++// file (comments and all), as OpenCode 1 and 2 write it.
++constexpr char kCorporate[] = R"({
++  // the bank's gateway
++  "$schema": "https://opencode.ai/config.json",
++  "model": "alfagen/EVC-Com-model",
++  "provider": {
++    "alfagen": {
++      "npm": "@ai-sdk/openai-compatible",
++      "options": {"baseURL": "https://llm.example/v1"},
++      "models": {"EVC-Com-model": {"name": "EVC"}},
++    },
++  },
++})";
++
++TEST_F(OpenCodeConnectTest, TextOnlyForAModelThatTakesNoImages) {
++  ASSERT_TRUE(base::CreateDirectory(dir_));
++  ASSERT_TRUE(base::WriteFile(jsonc(), kCorporate));
++  std::string output;
++  ASSERT_TRUE(AddOpenCodeServer(dir_, kProgram, &output)) << output;
++  const base::DictValue root = ReadConfig(json());
++  const base::ListValue* command =
++      root.FindListByDottedPath("mcp.meridian.command");
++  ASSERT_TRUE(command);
++  ASSERT_EQ(command->size(), 3u);
++  EXPECT_EQ((*command)[1].GetString(), "--mcp-bridge");
++  EXPECT_EQ((*command)[2].GetString(), "--text-only");
++  std::string after;
++  ASSERT_TRUE(base::ReadFileToString(jsonc(), &after));
++  EXPECT_EQ(after, kCorporate) << "the .jsonc file is never touched";
++}
++
++TEST_F(OpenCodeConnectTest, ConnectedBeforeGetsTextOnlyOnTheNextConnect) {
++  std::string output;
++  ASSERT_TRUE(AddOpenCodeServer(dir_, kProgram, &output)) << output;
++  ExpectMeridian(ReadConfig(json()));
++  ASSERT_TRUE(base::WriteFile(jsonc(), kCorporate));
++  ASSERT_TRUE(AddOpenCodeServer(dir_, kProgram, &output)) << output;
++  EXPECT_NE(output, "already connected");
++  EXPECT_EQ(ReadConfig(json()).FindListByDottedPath("mcp.meridian.command")
++                ->size(),
++            3u);
++}
++
++TEST_F(OpenCodeConnectTest, ImagesStayWhenTheModelTakesThemOrItIsUnsure) {
++  ASSERT_TRUE(base::CreateDirectory(dir_));
++  const base::FilePath no_state = temp_.GetPath().AppendASCII("none.json");
++  // The same provider, its model listing image input.
++  std::string sees = kCorporate;
++  const std::string name = R"({"name": "EVC"})";
++  sees.replace(sees.find(name), name.size(),
++               R"({"name": "EVC", "modalities": {"input": ["text", "image"]}})");
++  ASSERT_TRUE(base::WriteFile(jsonc(), sees));
++  EXPECT_FALSE(OpenCodeWantsTextOnly(dir_, no_state));
++  // A provider OpenCode knows by itself (not set up here): unsure.
++  ASSERT_TRUE(
++      base::WriteFile(jsonc(), R"({"model": "anthropic/claude-sonnet-4-5"})"));
++  EXPECT_FALSE(OpenCodeWantsTextOnly(dir_, no_state));
++  // No model anywhere: unsure.
++  ASSERT_TRUE(base::WriteFile(jsonc(), "{}"));
++  EXPECT_FALSE(OpenCodeWantsTextOnly(dir_, no_state));
++  std::string output;
++  ASSERT_TRUE(AddOpenCodeServer(dir_, kProgram, &output)) << output;
++  ExpectMeridian(ReadConfig(json()));
++}
++
++TEST_F(OpenCodeConnectTest, TheModelLastPickedInOpenCodeCounts) {
++  ASSERT_TRUE(base::CreateDirectory(dir_));
++  // The provider set up, the model picked in OpenCode (not in the config).
++  std::string config = kCorporate;
++  const std::string model = R"("model": "alfagen/EVC-Com-model",)";
++  config.erase(config.find(model), model.size());
++  ASSERT_TRUE(base::WriteFile(jsonc(), config));
++  const base::FilePath state = temp_.GetPath().AppendASCII("model.json");
++  ASSERT_TRUE(base::WriteFile(
++      state,
++      R"({"recent": [{"providerID": "alfagen", "modelID": "EVC-Com-model"}],
++          "favorite": [], "variant": {"alfagen/EVC-Com-model": "high"}})"));
++  EXPECT_TRUE(OpenCodeWantsTextOnly(dir_, state));
++  EXPECT_FALSE(
++      OpenCodeWantsTextOnly(dir_, temp_.GetPath().AppendASCII("none.json")));
++}
++
+ TEST_F(OpenCodeConnectTest, EmptyFileCountsAsNone) {
+   ASSERT_TRUE(base::CreateDirectory(dir_));
+   ASSERT_TRUE(base::WriteFile(json(), "  \n"));
+diff --git a/chrome/browser/meridian/ai/local_agents.cc b/chrome/browser/meridian/ai/local_agents.cc
+index c7f12ab..dc6d73c 100644
+--- a/chrome/browser/meridian/ai/local_agents.cc
++++ b/chrome/browser/meridian/ai/local_agents.cc
+@@ -455,13 +455,31 @@ CliOutcome RunCliBlocking(std::string provider_id,
+   denied.push_back(home);
+   std::vector<base::FilePath> allowed = CliOwnFolders(p->id, home, env);
+   std::vector<base::FilePath> readable = CliToolFolders(home, bin);
++  // OpenCode's model as the person uses it (OpenCodeChosenModel): `opencode
++  // run` doesn't read the one last picked in OpenCode, and without a model it
++  // answers with a free one of its own.
++  std::string opencode_model;
+   if (p->id == "opencode") {
+     for (base::FilePath& f : OpenCodeMovedFolders(home, env, protected_paths)) {
+       allowed.push_back(std::move(f));
+     }
++    std::vector<std::string> configs;
+     for (base::FilePath& f : OpenCodeConfigFiles(home, env, protected_paths)) {
++      std::string text;
++      if (base::ReadFileToStringWithMaxSize(f, &text, 1 << 20)) {
++        configs.push_back(std::move(text));
++      }
+       readable.push_back(std::move(f));
+     }
++    auto state_home = env.find("XDG_STATE_HOME");
++    const base::FilePath state =
++        (state_home != env.end() && !state_home->second.empty()
++             ? base::FilePath::FromUTF8Unsafe(state_home->second)
++             : home.AppendASCII(".local/state"))
++            .AppendASCII("opencode/model.json");
++    std::string state_json;
++    base::ReadFileToStringWithMaxSize(state, &state_json, 1 << 20);
++    opencode_model = OpenCodeChosenModel(configs, state_json);
+     // Inside the closed home it can't make the parents of its own folders
+     // (~/.local on a Mac that has none yet), and stops at start.
+     for (const base::FilePath& f : allowed) {
+@@ -473,6 +491,9 @@ CliOutcome RunCliBlocking(std::string provider_id,
+     return p->sandboxed ? SandboxedArgv(argv, denied, allowed, readable) : argv;
+   };
+   Turn prepared = std::move(turn);
++  if (prepared.model.empty()) {
++    prepared.model = opencode_model;
++  }
+   if (p->id == "opencode") {
+     prepared.private_server = OpenCodeWantsPrivateServer(
+         bin, contained({bin, "run", "--help"}), env, dir.AsUTF8Unsafe(), cancel);
+diff --git a/chrome/browser/meridian/ai/providers.cc b/chrome/browser/meridian/ai/providers.cc
+index 06869cf..abc16fd 100644
+--- a/chrome/browser/meridian/ai/providers.cc
++++ b/chrome/browser/meridian/ai/providers.cc
+@@ -559,6 +559,95 @@ bool OpenCodeNeedsPrivateServer(const std::string& run_help) {
+   return !run_help.contains("--format") || run_help.contains("--standalone");
+ }
+ 
++namespace {
++
++std::optional<base::DictValue> ReadJsonc(const std::string& text) {
++  return base::JSONReader::ReadDict(
++      text, base::JSON_ALLOW_COMMENTS | base::JSON_ALLOW_TRAILING_COMMAS);
++}
++
++// "provider/model", both parts there.
++bool IsModelRef(const std::string& model) {
++  const size_t slash = model.find('/');
++  return slash != std::string::npos && slash > 0 && slash + 1 < model.size();
++}
++
++}  // namespace
++
++std::string OpenCodeChosenModel(const std::vector<std::string>& configs,
++                                const std::string& state_json) {
++  std::string model;
++  for (const std::string& text : configs) {
++    std::optional<base::DictValue> root = ReadJsonc(text);
++    const std::string* m = root ? root->FindString("model") : nullptr;
++    if (m && IsModelRef(*m)) {
++      model = *m;
++    }
++  }
++  if (!model.empty()) {
++    return model;
++  }
++  std::optional<base::DictValue> state = ReadJsonc(state_json);
++  const base::ListValue* recent = state ? state->FindList("recent") : nullptr;
++  if (recent && !recent->empty() && recent->front().is_dict()) {
++    const base::DictValue& last = recent->front().GetDict();
++    const std::string* provider = last.FindString("providerID");
++    const std::string* id = last.FindString("modelID");
++    if (provider && id && IsModelRef(*provider + "/" + *id)) {
++      return *provider + "/" + *id;
++    }
++  }
++  return std::string();
++}
++
++bool OpenCodeModelTakesNoImages(const std::vector<std::string>& configs,
++                                const std::string& model) {
++  if (!IsModelRef(model)) {
++    return false;
++  }
++  const size_t slash = model.find('/');
++  const std::string provider_id = model.substr(0, slash);
++  const std::string model_id = model.substr(slash + 1);
++  // The later file wins, as in OpenCode.
++  std::optional<bool> no_images;
++  for (const std::string& text : configs) {
++    std::optional<base::DictValue> root = ReadJsonc(text);
++    const base::DictValue* providers =
++        root ? root->FindDict("provider") : nullptr;
++    const base::DictValue* provider =
++        providers ? providers->FindDict(provider_id) : nullptr;
++    if (!provider) {
++      continue;
++    }
++    // OpenCode 1 says "npm", 2 "package".
++    const std::string* package = provider->FindString("npm");
++    if (!package) {
++      package = provider->FindString("package");
++    }
++    const base::DictValue* models = provider->FindDict("models");
++    const base::DictValue* entry =
++        models ? models->FindDict(model_id) : nullptr;
++    if (!package || package->find("openai-compatible") == std::string::npos ||
++        !entry) {
++      no_images = false;
++      continue;
++    }
++    const base::ListValue* input =
++        entry->FindListByDottedPath("modalities.input");
++    if (!input) {
++      input = entry->FindListByDottedPath("capabilities.input");
++    }
++    bool image = false;
++    if (input) {
++      for (const base::Value& kind : *input) {
++        image |= kind.is_string() && kind.GetString().starts_with("image");
++      }
++    }
++    no_images = !image;
++  }
++  return no_images.value_or(false);
++}
++
+ CommandSpec BuildCommand(const Provider& p,
+                          const Turn& turn,
+                          const std::string& cwd) {
+@@ -807,6 +896,14 @@ std::string FriendlyCliError(const Provider& p,
+   if (RE2::PartialMatch(all, "(?i)policy|access denied")) {
+     return p.label + " is blocked by your organization’s policy.";
+   }
++  // No model named anywhere (OpenCodeChosenModel): OpenCode took its own
++  // free one.
++  if (p.id == "opencode" && RE2::PartialMatch(all, "(?i)free usage limit")) {
++    return "OpenCode answered with its own free model, which has reached "
++           "its limit: no model is set for OpenCode. Pick one in OpenCode, or "
++           "put \"model\": \"provider/model\" in "
++           "~/.config/opencode/opencode.json, then try again.";
++  }
+   if (RE2::PartialMatch(all, "(?i)rate.?limit|429|usage limit|quota")) {
+     return p.label +
+            " hit a usage limit. Try again later or pick another agent.";
+diff --git a/chrome/browser/meridian/ai/providers.h b/chrome/browser/meridian/ai/providers.h
+index 42eebd3..316199e 100644
+--- a/chrome/browser/meridian/ai/providers.h
++++ b/chrome/browser/meridian/ai/providers.h
+@@ -126,6 +126,22 @@ struct Turn {
+ // visibly instead of risking a service without Meridian's restrictions.
+ bool OpenCodeNeedsPrivateServer(const std::string& run_help);
+ 
++// The model ("provider/model") the person uses in OpenCode: "model" of its
++// global config files (`configs`, JSON or JSONC, in OpenCode's order: a later
++// one wins), else the one last picked in OpenCode (`state_json`, its
++// state/opencode/model.json, "recent"). "" when neither names one: OpenCode
++// would then answer with its first available model, which signed out of
++// OpenCode is a free one with a small limit.
++std::string OpenCodeChosenModel(const std::vector<std::string>& configs,
++                                const std::string& state_json);
++
++// Whether OpenCode's `model` ("provider/model") belongs to a provider set up
++// in `configs` on @ai-sdk/openai-compatible and lists no image input (or no
++// input at all, which OpenCode reads as text only). false when unsure: a
++// provider or model not set up there, or anything else.
++bool OpenCodeModelTakesNoImages(const std::vector<std::string>& configs,
++                                const std::string& model);
++
+ // `cwd`: the run's private working directory.
+ CommandSpec BuildCommand(const Provider& provider,
+                          const Turn& turn,
+diff --git a/chrome/browser/meridian/ai/providers_unittest.cc b/chrome/browser/meridian/ai/providers_unittest.cc
+index cd005ed..1d72900 100644
+--- a/chrome/browser/meridian/ai/providers_unittest.cc
++++ b/chrome/browser/meridian/ai/providers_unittest.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/meridian/ai/providers.h"
+ 
++#include <algorithm>
++
+ #include "base/json/json_reader.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+@@ -31,6 +33,87 @@ std::string Text(const std::vector<Event>& events, Event::Type type) {
+   return out;
+ }
+ 
++TEST(ProvidersTest, OpenCodeChosenModel) {
++  // The config's model; a later file wins; JSONC comments and trailing
++  // commas are fine.
++  EXPECT_EQ(OpenCodeChosenModel({R"({"model": "openai/gpt-5"})",
++                                 "{\n // mine\n \"model\": \"alfagen/EVC\",\n}"},
++                                ""),
++            "alfagen/EVC");
++  EXPECT_EQ(OpenCodeChosenModel({R"({"model": "openai/gpt-5"})", "{}"}, ""),
++            "openai/gpt-5");
++  // Else the one last picked in OpenCode.
++  const std::string state =
++      R"({"recent": [{"providerID": "alfagen", "modelID": "EVC-Com-model"},
++                     {"providerID": "opencode", "modelID": "big-pickle"}]})";
++  EXPECT_EQ(OpenCodeChosenModel({"{}"}, state), "alfagen/EVC-Com-model");
++  EXPECT_EQ(OpenCodeChosenModel({R"({"model": "openai/gpt-5"})"}, state),
++            "openai/gpt-5");
++  // Neither, or nonsense: none (OpenCode then picks; Meridian never does).
++  EXPECT_EQ(OpenCodeChosenModel({}, ""), "");
++  EXPECT_EQ(OpenCodeChosenModel({R"({"model": "gpt-5"})", "not json"},
++                                R"({"recent": [{"providerID": "x"}]})"),
++            "");
++}
++
++TEST(ProvidersTest, OpenCodeModelTakesNoImages) {
++  const std::string compatible = R"({"provider": {"alfagen": {
++      "npm": "@ai-sdk/openai-compatible",
++      "models": {"EVC": {},
++                 "Vision": {"modalities": {"input": ["text", "image"]}}}}}})";
++  EXPECT_TRUE(OpenCodeModelTakesNoImages({compatible}, "alfagen/EVC"));
++  EXPECT_FALSE(OpenCodeModelTakesNoImages({compatible}, "alfagen/Vision"));
++  // Not set up there, another provider, or no model: unsure, so no.
++  EXPECT_FALSE(OpenCodeModelTakesNoImages({compatible}, "alfagen/Other"));
++  EXPECT_FALSE(OpenCodeModelTakesNoImages({compatible}, "openai/gpt-5"));
++  EXPECT_FALSE(OpenCodeModelTakesNoImages({compatible}, ""));
++  EXPECT_FALSE(OpenCodeModelTakesNoImages(
++      {R"({"provider": {"alfagen": {"npm": "@ai-sdk/anthropic",
++           "models": {"EVC": {}}}}})"},
++      "alfagen/EVC"));
++  // OpenCode 2's keys.
++  EXPECT_TRUE(OpenCodeModelTakesNoImages(
++      {R"({"provider": {"alfagen": {"package": "@ai-sdk/openai-compatible",
++           "models": {"EVC": {"capabilities": {"input": ["text"]}}}}}})"},
++      "alfagen/EVC"));
++  // A later file that sets the provider up again wins.
++  EXPECT_FALSE(OpenCodeModelTakesNoImages(
++      {compatible,
++       R"({"provider": {"alfagen": {"npm": "@ai-sdk/openai-compatible",
++           "models": {"EVC": {"modalities": {"input": ["image"]}}}}}})"},
++      "alfagen/EVC"));
++}
++
++TEST(ProvidersTest, OpenCodeOnItsFreeModelSaysNoModelIsSet) {
++  const Provider& opencode = *FindProvider("opencode");
++  const std::string error = FriendlyCliError(
++      opencode,
++      "Free usage limit reached. Connect a provider or subscribe to "
++      "OpenCode Go",
++      "");
++  EXPECT_NE(error.find("no model is set for OpenCode"), std::string::npos)
++      << error;
++  EXPECT_NE(error.find("~/.config/opencode/opencode.json"), std::string::npos);
++  // Another agent's limit stays a limit.
++  EXPECT_NE(FriendlyCliError(*FindProvider("codex"), "usage limit reached", "")
++                .find("hit a usage limit"),
++            std::string::npos);
++}
++
++TEST(ProvidersTest, OpenCodeRunsWithTheModelItIsGiven) {
++  Turn turn;
++  turn.prompt = "hi";
++  turn.model = "alfagen/EVC-Com-model";
++  CommandSpec spec = BuildCommand(*FindProvider("opencode"), turn, "/tmp/x");
++  auto m = std::ranges::find(spec.args, "-m");
++  ASSERT_NE(m, spec.args.end());
++  EXPECT_EQ(*(m + 1), "alfagen/EVC-Com-model");
++  turn.model.clear();
++  spec = BuildCommand(*FindProvider("opencode"), turn, "/tmp/x");
++  EXPECT_EQ(std::ranges::find(spec.args, "-m"), spec.args.end())
++      << "no model is made up";
++}
++
+ TEST(ProvidersTest, CodexStreamGivesTextAndSession) {
+   std::vector<Event> events = Parse(
+       "codex",
