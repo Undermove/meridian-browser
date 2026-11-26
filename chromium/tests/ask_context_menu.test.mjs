@@ -32,9 +32,13 @@ test('the page context menu has Ask AI About This Page, and it opens Ask as ⌘J
   try {
     const page = await b.page(url);
     await page.waitFor(`document.readyState === 'complete'`);
-    // A real right click on the page: the menu lists the item.
-    await rightClick(page);
-    for (let i = 0; i < 50 && !fs.existsSync(pick + '.ids'); i++) await sleep(100);
+    // A real right click on the page: the menu lists the item. (A click that comes before the page's
+    // first frame has nothing to hit — on a locked Mac frames come late —, so again until the menu
+    // came, as a person would click again.)
+    for (let i = 0; i < 100 && !fs.existsSync(pick + '.ids'); i++) {
+      if (i % 10 === 0) await rightClick(page);
+      await sleep(100);
+    }
     const ids = fs.readFileSync(pick + '.ids', 'utf8').split('\n').filter(Boolean).map(Number);
     assert.ok(ids.includes(ASK_PAGE), `the page menu: ${ids.join(', ')}`);
     assert.equal(await b.eval('app.$.ask.open'), false);

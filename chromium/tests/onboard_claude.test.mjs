@@ -230,7 +230,7 @@ test('first run, no Claude Desktop, Claude Code signed out: the tour signs it in
   } finally { await b.close(); server.close(); fs.rmSync(profile, { recursive: true, force: true }); f.clean(); }
 });
 
-test('Improve with AI, Claude Code signed out: "Sign in to Claude to use AI" starts the sign-in, then the same button improves', async () => {
+test('Improve with AI, Claude Code signed out: "Sign in to Claude to use AI" starts the sign-in, then the same button improves', { skip: NEEDS_FRAMES }, async () => {
   const f = setup({ desktop: 'none', signedIn: false });
   const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(PAGE); });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -248,7 +248,8 @@ test('Improve with AI, Claude Code signed out: "Sign in to Claude to use AI" sta
     await b.eval(`${BE}.getElementById('improve').click()`);
     for (let i = 0; i < 50 && !fs.existsSync(f.signins); i++) await sleep(100);
     assert.equal(fs.readFileSync(f.signins, 'utf8').trim(), quoted(f.bin));
-    assert.match(await b.eval(`${BE}.getElementById('note').textContent`), /Finish signing in/);
+    // (The stand-in writes its log before the editor hears the sign-in started: wait for the note.)
+    await b.waitFor(`/Finish signing in/.test(${BE}.getElementById('note')?.textContent || '')`, 10000, `${BE}.getElementById('note')?.textContent`);
     fs.writeFileSync(path.join(f.home, '.claude', 'signed-in'), '');
     await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code'`, 20000, `${BE}.getElementById('improve').textContent`);
     await b.eval(`${BE}.getElementById('improve').click()`);
