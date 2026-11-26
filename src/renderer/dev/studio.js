@@ -1192,15 +1192,11 @@ async function stOnBoardClick(e) {
 
 // ---------------------------------------------------------------- "Кто вы?" (the persona picker)
 
-const ST_PERSONAS = [
-  ['developer', 'dev', '#43cea2', '#2ef2d2'],
-  ['designer', 'des', '#c471f5', '#c58cff'],
-  ['manager', 'man', '#4facfe', '#ffd36b'],
-  ['everyday', 'use', '#8a8fe0', '#ff9a6b'],
-];
+const ST_PERSONAS = [['developer', 'dev'], ['designer', 'des'], ['manager', 'man'], ['everyday', 'use']];
 
-// Four characters, as in a game: the guess (or the current one) picked already. The pick decides
-// what the Workbench tab shows first (Studio, or the Workbench for developers); both stay a click away.
+// Four heroes, as a game's character select (art and effects: studio-persona-fx.js, studio-persona.css):
+// the guess (or the current one) picked already. The pick decides what the Workbench tab shows first
+// (Studio, or the Workbench for developers); both stay a click away.
 function stPersonaPicker({ guess = '', current = '' } = {}) {
   const w = STW();
   $('#st-persona')?.remove();
@@ -1209,22 +1205,32 @@ function stPersonaPicker({ guess = '', current = '' } = {}) {
   box.id = 'st-persona';
   box.setAttribute('role', 'dialog');
   box.setAttribute('aria-label', w.whoTitle);
-  const cards = ST_PERSONAS.map(([id, k, c, hc]) => {
+  const svg = (name, size = 15, sw = 1.8) => `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${(typeof STUDIO_PERSONA_ICONS === 'object' && STUDIO_PERSONA_ICONS[name]) || ''}</svg>`;
+  const cards = ST_PERSONAS.map(([id, k], i) => {
     const p = w.personas[id];
+    const col = (typeof STUDIO_PERSONA_COLORS === 'object' && STUDIO_PERSONA_COLORS[k]) || { c: '#8a8fe0', c2: '#ffffff', bg: ['#1d1b49', '#0c0b22'] };
     const art = `studio-art/hero-${k}.webp`;
-    return `<div class="pc${id === sel ? ' sel' : ''}" data-k="${k}" data-id="${id}" data-cta="${esc(p.cta)}" style="--c:${c};--hc:${hc}" tabindex="0" role="button">
-      ${id === guess && !current ? `<span class="guess">${icon('sparkles', 11)}${esc(w.guess)}</span>` : ''}
-      ${id === sel ? `<span class="check">${icon('check', 14)}</span>` : ''}
-      <div class="art"><div class="tilt"><div class="stk" style="--img:url(${art})"><canvas class="back"></canvas><img class="hero" src="${art}" alt=""><img class="rgb r" src="${art}" alt=""><img class="rgb b" src="${art}" alt=""><span class="mask foil"><i></i></span><span class="mask scan"><i></i></span><span class="mask flash-m"><span class="flash"></span></span><canvas class="front"></canvas></div></div></div>
-      <div class="name">${esc(p.name)}</div><div class="role">${esc(p.role)}</div>
-      <ul>${p.points.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>
-      <div class="gets">${icon('arrowRight', 13)}<span>${p.gets}</span></div></div>`;
+    const frame = (typeof STUDIO_PERSONA_FRAMES === 'object' && STUDIO_PERSONA_FRAMES[k]) || '';
+    const rgb = k === 'dev' ? `<img class="rgb r" src="${art}" alt=""><img class="rgb b" src="${art}" alt="">` : '';
+    const scan = k === 'dev' ? '<span class="mask scan"><i></i></span>' : '';
+    return `<div class="pc${id === sel ? ' sel' : ''}" data-k="${k}" data-id="${id}" data-cta="${esc(p.cta)}" style="--c:${col.c};--c2:${col.c2};--hc:${col.c};--i:${i}" tabindex="0" role="button" aria-label="${esc(p.name)}">
+      <div class="beam"></div><div class="floor"></div>${frame}
+      <div class="art"><div class="tilt"><div class="stk" style="--img:url(${art})"><canvas class="back"></canvas>
+        <div class="bust"><img class="hero" src="${art}" alt="">${rgb}<span class="mask foil"><i></i></span>${scan}<span class="mask flash-m"><span class="flash"></span></span></div>
+        <canvas class="front"></canvas></div></div></div>
+      <div class="plate"><svg class="ribbon" width="292" height="46" viewBox="0 0 292 46" aria-hidden="true"><path d="M0 10 h20 v-6 h252 v6 h20 l-10 13 10 13 h-20 v6 h-252 v-6 h-20 l10 -13z" fill="${col.bg[1]}" stroke="${col.c}" stroke-opacity=".7"/><path d="M20 4 v6 M272 4 v6 M20 36 v6 M272 36 v6" stroke="${col.c}" stroke-opacity=".7"/></svg><h3>${esc(p.name)}</h3></div>
+      <div class="cls"><b>${esc(p.cls)}</b> · ${esc(p.role)}</div>
+      <ul class="perks">${p.perks.map(([icn, t]) => `<li><span class="pi">${svg(icn)}</span><span>${esc(t)}</span></li>`).join('')}</ul>
+      <div class="opens">${svg('arrow', 13)}<span>${p.gets}</span></div>
+      ${id === guess && !current ? `<div class="guess"><span class="seal">${svg('spark', 12, 2.2)}</span>${esc(w.guess)}</div>` : ''}
+    </div>`;
   }).join('');
-  box.innerHTML = `<div class="stp-in"><h2>${esc(w.whoTitle)}</h2><p class="lead">${esc(w.whoLead)}</p>
+  box.innerHTML = `<canvas class="dust"></canvas><h2>${esc(w.whoTitle)}</h2><p class="lead">${esc(w.whoLead)}</p>
     <div class="cards">${cards}</div>
     <div class="foot">${current ? '' : `<button class="btn ghost" data-a="skip">${esc(w.skip)}</button>`}<button class="btn pri" data-a="go">${esc(w.personas[sel].cta)}</button></div>
-    <div class="note">${esc(current ? w.whoChange : w.whoNote)}</div></div>`;
+    <div class="note">${esc(current ? w.whoChange : w.whoNote)}</div>`;
   document.body.appendChild(box);
+  if (typeof studioPersonaDust === 'function') studioPersonaDust(box);
   let picked = sel;
   const fx = typeof studioPersonaFx === 'function'
     ? studioPersonaFx(box, (k) => { picked = ST_PERSONAS.find((x) => x[1] === k)?.[0] || picked; })
@@ -1240,7 +1246,7 @@ function stPersonaPicker({ guess = '', current = '' } = {}) {
     const card = e.target.closest('.pc');
     if (!card) return;
     picked = card.dataset.id;
-    for (const c of box.querySelectorAll('.pc')) c.classList.toggle('sel', c === card);
+    for (const c of box.querySelectorAll('.pc')) { c.classList.toggle('sel', c === card); c.classList.toggle('dim', c !== card); }
     box.querySelector('.btn.pri').textContent = card.dataset.cta;
   });
   box.addEventListener('click', async (e) => {
