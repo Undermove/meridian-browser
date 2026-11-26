@@ -44,6 +44,14 @@ def tool(tid, name, inp, result='ok'):
     line('user', [{'type': 'tool_result', 'tool_use_id': tid, 'content': result}])
     hook('PostToolUse', tool_name=name, tool_input=inp, tool_use_id=tid, tool_response={})
 open(tpath, 'w').close()
+# A new folder: Claude Code asks whether to trust it before anything else (Enter = "Yes, proceed").
+if os.environ.get('STAND_IN_TRUST') or os.path.exists(os.path.join(cwd, '.ask-trust')):
+    print('Do you trust the files in this folder?', flush=True)
+    print(' > 1. Yes, proceed   2. No, exit', flush=True)
+    got = ''
+    while '\r' not in got and '\n' not in got:
+        got += os.read(0, 4096).decode('utf8', 'replace')
+    open(os.path.join(cwd, '.trusted'), 'w').write(got)
 hook('SessionStart', model='claude-opus-5-5', source='startup')
 print('READY', flush=True)
 buf = ''
@@ -133,6 +141,7 @@ test('Studio off (the default): the Workbench is as before, Studio\'s calls are 
 
 test('Studio on: a task in plain words, a permission card answered with a button, file cards, the same session in the Workbench', { skip: process.platform === 'win32' && 'the stand-in is a Python script' }, async () => {
   const s = await setup();
+  fs.writeFileSync(path.join(s.project, '.ask-trust'), '');
   const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio'] });
   let wb;
   try {
@@ -150,6 +159,12 @@ test('Studio on: a task in plain words, a permission card answered with a button
     const prompt = await wb.eval(`document.querySelector('#st-input').value`);
     assert.ok(prompt.length > 5);
     await click(wb, '#st-send');
+    // Claude Code first asks about the folder: a card in plain words, not lost typing.
+    await wb.waitFor(`document.querySelector('.st-ask[data-key="trust"]')?.innerText.includes('Let Claude work in this folder?')`, 15000);
+    assert.equal(fs.existsSync(path.join(s.project, '.trusted')), false);
+    await click(wb, '.st-ask [data-trust="yes"]');
+    for (let i = 0; i < 100 && !fs.existsSync(path.join(s.project, '.trusted')); i++) await sleep(100);
+    assert.match(fs.readFileSync(path.join(s.project, '.trusted'), 'utf8'), /^[\r\n]+$/);
     for (let i = 0; i < 150 && !fs.existsSync(path.join(s.project, '.prompt')); i++) await sleep(100);
     assert.equal(fs.readFileSync(path.join(s.project, '.prompt'), 'utf8'), prompt);
     const argv = JSON.parse(fs.readFileSync(path.join(s.project, '.argv'), 'utf8'));

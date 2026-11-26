@@ -401,6 +401,7 @@ function stRenderFeed(t) {
     return n;
   }));
   feed.dataset.html = html;
+  stFillImages(feed);
   stLoadThumbs(k);
   if (atBottom) feed.scrollTop = feed.scrollHeight;
 }
@@ -499,17 +500,35 @@ function stFileCard(k, item, i) {
   const w = STW();
   if (item.kind === 'shot') {
     return `<button class="st-fc" data-file="${esc(item.key)}" data-sig="${esc(item.key)}" data-kind="shot" data-i="${item.i}" style="--i:${Math.min(i, 5)}">
-      <span class="st-th img"><img alt="" src="${item.s.src}"></span><span class="st-fmeta"><span class="st-fn">${esc(w.shot)} ${item.i + 1}</span><span class="st-fm">${esc(stAgo(item.s.at))}</span></span></button>`;
+      <span class="st-th img">${stImg(stShotKey(item.s))}</span><span class="st-fmeta"><span class="st-fn">${esc(w.shot)} ${item.i + 1}</span><span class="st-fm">${esc(stAgo(item.s.at))}</span></span></button>`;
   }
   const f = item.f;
   const thumb = k.thumbs.get(f.rel);
   const th = f.image
-    ? `<span class="st-th img">${thumb?.src ? `<img alt="" src="${thumb.src}">` : ''}</span>`
+    ? `<span class="st-th img">${thumb?.src ? stImg(thumb.src) : ''}</span>`
     : `<span class="st-th doc">${thumb?.lines ? thumb.lines.map((l) => `<i style="width:${l}%"></i>`).join('') : '<i></i><i></i><i></i>'}</span>`;
   const sig = `${f.rel}|${f.times}|${thumb ? 1 : 0}`;
   return `<button class="st-fc" data-file="${esc(f.rel)}" data-sig="${esc(sig)}" data-kind="file" style="--i:${Math.min(i, 5)}">${th}
     <span class="st-fmeta"><span class="st-fn">${esc(basename(f.rel))}</span><span class="st-fm">${esc(f.created ? w.created : w.changed)} · ${esc(dirname(f.rel) || S.project?.name || '')}</span></span></button>`;
 }
+
+// Pictures are kept here and set on <img data-img> after each render: the markup that is compared
+// on every tick holds a short key, not megabytes of data: URLs.
+const stImages = new Map();
+const stImageKeys = new Map();
+function stImage(src) {
+  let key = stImageKeys.get(src);
+  if (!key) { key = `i${stImageKeys.size + 1}`; stImageKeys.set(src, key); stImages.set(key, src); }
+  return key;
+}
+const stImg = (key) => `<img alt="" data-img="${esc(key)}">`;
+function stFillImages(root) {
+  for (const img of root.querySelectorAll('img[data-img]:not([src])')) {
+    const src = stImages.get(img.dataset.img);
+    if (src) img.src = src;
+  }
+}
+const stShotKey = (sh) => { if (!sh.key) sh.key = stImage(sh.src); return sh.key; };
 
 async function stLoadThumbs(k) {
   for (const f of k.model.files.values()) {
@@ -520,7 +539,7 @@ async function stLoadThumbs(k) {
     try {
       if (f.image) {
         const img = await wb.termImage(f.abs);
-        if (img?.data) k.thumbs.set(f.rel, { sig, src: `data:${img.mime};base64,${img.data}` });
+        if (img?.data) k.thumbs.set(f.rel, { sig, src: stImage(`data:${img.mime};base64,${img.data}`) });
         else k.thumbs.set(f.rel, { sig });
       } else {
         const file = await wb.read(f.rel);
@@ -558,21 +577,22 @@ function stRenderResult(t) {
     const th = k.thumbs.get(fileSel.rel);
     html = `<div class="st-r-head"><span class="st-r-name">${esc(basename(fileSel.rel))}</span><span class="st-r-sub">${esc(dirname(fileSel.rel))}</span><div class="grow"></div>
       <button class="st-btn" data-r="reveal" data-rel="${esc(fileSel.rel)}">${esc(w.openFile)}</button></div>`
-      + (fileSel.image ? `<div class="st-r-img">${th?.src ? `<img alt="" src="${th.src}">` : ''}</div>`
+      + (fileSel.image ? `<div class="st-r-img">${th?.src ? stImg(th.src) : ''}</div>`
         : `<div class="st-r-doc"><div class="st-paper">${stText(th?.text || '')}</div></div>`);
   } else if (sel?.kind === 'shot' && shots[sel.key]) {
-    html = `<div class="st-r-head"><span class="st-r-name">${esc(w.shot)} ${sel.key + 1}</span></div><div class="st-r-img"><img alt="" src="${shots[sel.key].src}"></div>`;
+    html = `<div class="st-r-head"><span class="st-r-name">${esc(w.shot)} ${sel.key + 1}</span></div><div class="st-r-img">${stImg(stShotKey(shots[sel.key]))}</div>`;
   } else if (k?.site) {
     const shot = shots[shots.length - 1];
     html = `<div class="st-r-head"><span class="st-url">${icon('lock', 12)}<b>${esc(StudioWords.host(k.site))}</b></span>${shot ? `<span class="st-r-sub">${esc(w.lastShot)}</span>` : ''}<div class="grow"></div>
       <button class="st-btn pri" data-r="site">${icon('layers', 14)}<span>${esc(w.showSite)}</span></button></div>`
-      + (shot ? `<div class="st-r-img"><img alt="" src="${shot.src}"></div>` : `<div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(StudioWords.host(k.site))}</div></div>`);
+      + (shot ? `<div class="st-r-img">${stImg(stShotKey(shot))}</div>` : `<div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(StudioWords.host(k.site))}</div></div>`);
   } else if (shots.length) {
-    html = `<div class="st-r-img"><img alt="" src="${shots[shots.length - 1].src}"></div>`;
+    html = `<div class="st-r-img">${stImg(stShotKey(shots[shots.length - 1]))}</div>`;
   } else {
     html = `<div class="st-r-empty">${icon('eye', 22)}<p>${esc(w.resultEmpty)}</p></div>`;
   }
   if (pane.dataset.html !== html) { pane.innerHTML = html; pane.dataset.html = html; pane.classList.remove('st-fade'); void pane.offsetWidth; pane.classList.add('st-fade'); }
+  stFillImages(pane);
 }
 
 function stRenderResultBar(t) {
@@ -791,6 +811,7 @@ async function stRead(t, k) {
       if (!chunk) break;
       if (chunk.reset) { k.model = StudioTranscript.newModel(); k.thumbs.clear(); }
       const changed = StudioTranscript.feed(k.model, chunk.text, { root: S.project?.root || '' });
+
       k.offset = chunk.next;
       k.loaded = true;
       if (changed) stOnModel(t, k);
