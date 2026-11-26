@@ -573,9 +573,9 @@ function renderVaultStatus() {
   const el = $('#status-vault');
   const n = PRO.vault.items?.length || 0;
   el.hidden = !n;
-  el.innerHTML = `${icon('lock', 11)}<span></span>`;
+  el.innerHTML = '<span></span>';
   el.lastChild.textContent = `${n} secret${n === 1 ? '' : 's'}`;
-  el.title = `Vault secrets available to terminals and agents in this project (names only):\n${(PRO.vault.items || []).map((i) => `${i.name}${i.scope === 'project' ? ' (project)' : ''}`).join('\n')}`;
+  el.title = `${n} vault secret${n === 1 ? '' : 's'} that terminals and agents in this project get as environment variables (values stay hidden). Click to manage.\n${(PRO.vault.items || []).map((i) => `${i.name}${i.scope === 'project' ? ' (project)' : ''}`).join('\n')}`;
 }
 
 function editSecret(existing = null, preset = {}) {

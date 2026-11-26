@@ -181,10 +181,12 @@ test('after a restart Claude Code and Codex come back resumed with the same flag
     wb = await openWorkbench(b);
     await openProject(wb);
 
-    // Claude Code, then put in bypass by the person (its tab's Bypass button, confirmed).
+    // Claude Code, then put in bypass by the person (its tab's settings: Permissions, confirmed).
     await wb.eval(`launch('claude').then((t) => !!t)`);
     await wb.waitFor(`S.terms[0]?.sessionId === 's1' && S.terms[0]?.model === 'claude-opus-5-5'`, 15000);
-    await click(wb, `document.querySelector('#term-tab-list .ttab .tab-bypass')`);
+    await click(wb, `document.querySelector('#term-tab-list .ttab .tab-settings')`);
+    await wb.waitFor(`!!document.querySelector('#popover [data-setting="mode"]')`);
+    await wb.eval(`(() => { const s = document.querySelector('#popover [data-setting="mode"]'); s.value = 'bypassPermissions'; s.dispatchEvent(new Event('change')); return true; })()`);
     await wb.waitFor(`!!document.querySelector('#modal-overlay [data-a="ok"]')`);
     await click(wb, `document.querySelector('#modal-overlay [data-a="ok"]')`);
     await wb.waitFor(`${termText(0)}.includes('RESUMED s1') && S.terms[0]?.permissionMode === 'bypassPermissions'`, 15000);

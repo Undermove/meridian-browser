@@ -307,7 +307,11 @@ test('Workbench: a Codex terminal in a space with a Codex account runs with its 
     await wb.eval(`launch('codex').then((t) => !!t)`);
     await wb.waitFor(`S.activeTerm?.kind === 'codex' && ${termText}.includes('ready CODEX_HOME=')`, 15000);
     assert.match((await wb.eval(termText)).replace(/\n/g, ''), new RegExp(`ready CODEX_HOME=${path.join(home, '.codex-work').replace(/[.]/g, '\\.')}`));
-    assert.equal(await wb.eval(`document.querySelector('#term-tab-list .ttab.active .acct')?.textContent`), 'Codex Work');
+    // The account is in the tab's settings (not on the tab).
+    assert.equal(await wb.eval(`!!document.querySelector('#term-tab-list .ttab.active .acct')`), false);
+    await wb.eval(`(document.querySelector('#term-tab-list .ttab.active .tab-settings').click(), true)`);
+    assert.match(await wb.eval(`document.querySelector('#popover [data-row="account"]')?.innerText || ''`), /Account\s+Codex Work/);
+    await wb.eval(`(document.getElementById('popover').hidden = true, true)`);
 
     // Its session is read from the Work account's folder, and the panel says whose it is.
     const panel = `(document.querySelector('#side-body')?.innerText || '')`;
@@ -319,7 +323,9 @@ test('Workbench: a Codex terminal in a space with a Codex account runs with its 
     await wb.eval(`launch('codex').then((t) => !!t)`);
     await wb.waitFor(`S.terms.filter((t) => t.kind === 'codex').length === 2 && ${termText}.includes('ready CODEX_HOME=')`, 15000);
     assert.match((await wb.eval(termText)).replace(/\n/g, ''), /ready CODEX_HOME=<none>/);
-    assert.equal(await wb.eval(`!!document.querySelector('#term-tab-list .ttab.active .acct')`), false);
+    await wb.eval(`(document.querySelector('#term-tab-list .ttab.active .tab-settings').click(), true)`);
+    assert.match(await wb.eval(`document.querySelector('#popover [data-row="account"]')?.innerText || ''`), /Account\s+Default/);
+    await wb.eval(`(document.getElementById('popover').hidden = true, true)`);
     // Two accounts among the sessions: a filter. "Work" shows the Work session.
     await wb.waitFor(`!!document.querySelector('.ci-accounts [data-account="Codex Work"]')`, 20000);
     if (SHOTS) { await sleep(400); const { data } = await wb.cdp.send('Page.captureScreenshot', { format: 'png' }); fs.writeFileSync(path.join(SHOTS, 'acc-insights.png'), Buffer.from(data, 'base64')); }

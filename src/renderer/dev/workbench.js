@@ -40,6 +40,23 @@ const agentKinds = () => ['claude', 'codex', 'gemini', ...Object.keys(S.info?.ag
 const bus = new EventTarget();
 const emit = (type, detail) => bus.dispatchEvent(new CustomEvent(type, { detail }));
 const ACCESS_LABEL = { off: 'Off', read: 'Read only', ask: 'Ask before acting', full: 'Full control' };
+// The agent access levels in words (as in Settings › AI).
+const ACCESS_DETAIL = {
+  off: 'Agents can’t see or touch the browser.',
+  read: 'Agents can list tabs, read pages and take screenshots.',
+  ask: 'Agents can also navigate, click and type — you confirm every action.',
+  full: 'Agents act in the browser without asking. Only for agents you trust.',
+};
+// Claude Code's permission modes: the ones a session can be restarted in (`pick`), and the others
+// its hooks may report.
+const PERMISSION_MODES = {
+  default: { label: 'Ask before acting', detail: 'It asks before it runs commands or changes files.', pick: true },
+  acceptEdits: { label: 'Accept file edits', detail: 'It changes files without asking, and asks before running commands.', pick: true },
+  auto: { label: 'Auto', detail: 'Claude Code decides what is safe to run; it asks about the rest.', pick: true },
+  bypassPermissions: { label: 'Bypass: never ask', detail: 'It runs commands and changes files without asking.', pick: true, risky: true },
+  plan: { label: 'Plan only', detail: 'It reads and plans, and changes nothing until you approve the plan.' },
+  dontAsk: { label: 'Don’t ask', detail: 'It does only what is allowed in advance and skips the rest.' },
+};
 
 const S = {
   info: null,
@@ -148,6 +165,7 @@ function confirmBox(title, detail, okLabel = 'OK', danger = false) {
 
 function popover(anchor, html, onMount) {
   const pop = $('#popover');
+  pop.className = '';
   pop.innerHTML = html;
   pop.hidden = false;
   const r = anchor.getBoundingClientRect();
@@ -1143,7 +1161,9 @@ async function launch(kind, { resume = false, resumeId, resumeMode, resumeModel,
     t.sessionId = resumeId; t.permissionMode = resumeMode || ''; t.model = resumeModel || ''; t.remote = !!resumeRemote;
     // Picked up under another account than the space's, where its history is.
     if (accountId) t.accountId = accountId;
-    if (accountLabel) { t.xterm.writeln(`\x1b[2mResumed with ${accountLabel}\x1b[0m`); toast(`Resumed with ${accountLabel}`); }
+    if (accountLabel) { t.resumedWith = accountLabel; t.xterm.writeln(`\x1b[2mResumed with ${accountLabel}\x1b[0m`); toast(`Resumed with ${accountLabel}`); }
+    // Started with its state already: nothing to offer to restore.
+    t.restoredFrom = resumeId;
     if (name) saveTermName(t, name);
     syncTermMeta(t);
   }
@@ -1168,15 +1188,25 @@ async function restartTerm(t) {
   launch(kind);
 }
 
-// The same Claude Code session again, without permission prompts, in the same place on the tab bar.
-// Asked first; the old process is gone before the new one opens the session.
-async function restartWithBypass(t) {
-  if (t.kind !== 'claude' || !t.sessionId) return;
-  const ok = await confirmBox('Restart with bypass permissions?',
-    'This Claude Code session continues, but it stops asking before it runs commands or changes files. Anything it is doing now is interrupted.',
-    'Restart without asking', true);
-  if (!ok) return;
-  const { id, sessionId, custom, model, remote } = t;
+// The same Claude Code session again in another permission mode (bypass: no prompts), in the same
+// place on the tab bar. Asked first; the old process is gone before the new one opens the session.
+async function restartWithMode(t, mode) {
+  if (t.kind !== 'claude' || !t.sessionId || !PERMISSION_MODES[mode]) return false;
+  const ok = mode === 'bypassPermissions'
+    ? await confirmBox('Restart with bypass permissions?',
+      'This Claude Code session continues, but it stops asking before it runs commands or changes files. Anything it is doing now is interrupted.',
+      'Restart without asking', true)
+    : await confirmBox(`Restart in “${PERMISSION_MODES[mode].label}”?`,
+      `This Claude Code session continues: ${PERMISSION_MODES[mode].detail.replace(/^./, (c) => c.toLowerCase())} Anything it is doing now is interrupted.`,
+      'Restart');
+  if (!ok) return false;
+  return restartSession(t, { mode });
+}
+
+// The same Claude Code session started again (`--resume`) with these flags; the rest as it is now.
+async function restartSession(t, { mode = t.permissionMode || '', model = t.model || '', remote = !!t.remote, name = t.custom || '' } = {}) {
+  if (t.kind !== 'claude' || !t.sessionId) return false;
+  const { id, sessionId } = t;
   const at = S.terms.indexOf(t);
   await killTerm(t, { quiet: true });
   for (let i = 0; i < 30; i++) {
@@ -1185,12 +1215,13 @@ async function restartWithBypass(t) {
     if (!old || old.exited) break;
     await new Promise((r) => setTimeout(r, 100));
   }
-  const next = await launch('claude', { resumeId: sessionId, resumeMode: 'bypassPermissions', resumeModel: model || '', resumeRemote: !!remote, name: custom || '' });
-  if (!next) return;
+  const next = await launch('claude', { resumeId: sessionId, resumeMode: mode, resumeModel: model, resumeRemote: remote, name });
+  if (!next) return false;
   S.terms.splice(S.terms.indexOf(next), 1);
   S.terms.splice(Math.min(at, S.terms.length), 0, next);
   renderTermTabs();
   saveClaudeSessions();
+  return true;
 }
 
 async function killTerm(t, { quiet = false } = {}) {
@@ -1276,7 +1307,7 @@ function renameTerm(t) {
 // Drag a terminal's tab along the strip to put it elsewhere (pointer events, so a mouse and a
 // trackpad both do). The order is kept: Claude Code tabs come back in it after a restart.
 function dragTermTab(el, t, e) {
-  if (e.button !== 0 || e.target.closest('.tab-close, .ctx-badge, .rename')) return;
+  if (e.button !== 0 || e.target.closest('.tab-close, .tab-usage, .tab-settings, .tab-rc, .rename')) return;
   const list = $('#term-tab-list');
   const startX = e.clientX;
   let dragging = false;
@@ -1326,26 +1357,13 @@ function renderTermTabs() {
     name.textContent = termName(t) + (t.exited ? ' (exited)' : '');
     el.title = `${termName(t)}\nDouble-click to rename`;
     el.appendChild(name);
+    // The tab says what the session is and what it has cost; how it runs (account, browser tools,
+    // permission mode, secrets, sandbox) is behind one button, with a dot when something risky is on.
     const badge = typeof termUsageBadge === 'function' ? termUsageBadge(t) : null;
     if (badge) el.appendChild(badge);
-    if (t.browserTools) { const p = document.createElement('span'); p.className = 'plug'; p.title = 'Meridian browser tools connected'; p.innerHTML = icon('globe', 11); el.appendChild(p); }
-    // Workbench Pro: sandbox and vault indicators (secret NAMES only)
-    if (t.sandbox) { const p = document.createElement('span'); p.className = 'plug sbx'; p.title = 'Runs in a Docker sandbox: only this project is visible'; p.innerHTML = icon('shield', 11); el.appendChild(p); }
-    if (t.account) { const p = document.createElement('span'); p.className = 'acct'; p.textContent = t.account; p.title = `Runs as your ${t.account} account (this space’s choice in Settings › AI)`; el.appendChild(p); }
-    if (t.secrets?.length) { const p = document.createElement('span'); p.className = 'plug keys'; p.title = `Vault secrets in this session’s environment:\n${t.secrets.join('\n')}`; p.innerHTML = icon('lock', 11) + `<span>${t.secrets.length}</span>`; el.appendChild(p); }
-    if (t.kind === 'claude' && t.permissionMode === 'bypassPermissions') {
-      const p = document.createElement('span');
-      p.className = 'bypass-on';
-      p.textContent = 'Bypass';
-      p.title = 'This session runs without permission prompts';
-      el.appendChild(p);
-    } else if (t === S.activeTerm && t.kind === 'claude' && t.sessionId) {
-      const b = document.createElement('button');
-      b.className = 'tab-bypass';
-      b.textContent = 'Bypass';
-      b.title = 'Restart this session with bypass permissions';
-      el.appendChild(b);
-    }
+    const rc = termRcBadge(t);
+    if (rc) el.appendChild(rc);
+    el.appendChild(termSettingsButton(t));
     const x = document.createElement('button');
     x.className = 'tab-close'; x.title = t.exited ? 'Close' : 'Stop and close'; x.innerHTML = icon('x', 12);
     el.appendChild(x);
@@ -1355,8 +1373,9 @@ function renderTermTabs() {
       // The click that ends a drag isn't one.
       if (Date.now() - (S.termDraggedAt || 0) < 300) return;
       if (e.target.closest('.tab-close')) killTerm(t);
-      else if (e.target.closest('.tab-bypass')) restartWithBypass(t);
-      else if (e.detail === 2 && !e.target.closest('.ctx-badge')) renameTerm(t);
+      else if (e.target.closest('.tab-settings')) termSettings(t, e.target.closest('.tab-settings'));
+      else if (e.target.closest('.tab-rc')) termSettings(t, e.target.closest('.tab-rc'));
+      else if (e.detail === 2 && !e.target.closest('.tab-usage, .tab-rc')) renameTerm(t);
       else if (e.detail < 2) activateTerm(t);
     });
     el.addEventListener('mousedown', (e) => { if (e.button === 1) { e.preventDefault(); killTerm(t); } });
@@ -1365,6 +1384,116 @@ function renderTermTabs() {
   $('#term-empty').hidden = S.terms.length > 0;
   renderTermStart();
   sendMissionNames();
+}
+
+// ---------------------------------------------------------------- a terminal's settings
+
+// What is risky about how a session runs, in words (a dot on its tab says so).
+function termRisks(t) {
+  const out = [];
+  if (t.permissionMode === 'bypassPermissions') out.push('Bypass: it runs commands and changes files without asking');
+  if (t.browserTools && S.info?.agentAccess === 'full') out.push('Browser tools: full control, it acts in the browser without asking');
+  return out;
+}
+
+// The account a session actually runs as: the one it was resumed under, else the space's.
+const termAccount = (t) => t.resumedWith || t.account || '';
+
+// Whether the tab has settings to show: agents always; a shell when it has secrets or a sandbox.
+const termHasSettings = (t) => t.kind !== 'shell' || !!t.sessionId || !!t.secrets?.length || !!t.sandbox;
+
+function termSettingsButton(t) {
+  const b = document.createElement('button');
+  const risks = termRisks(t);
+  b.className = `tab-settings${risks.length ? ' risky' : ''}`;
+  b.hidden = !termHasSettings(t);
+  b.innerHTML = `${icon('sliders', 12)}<span class="risk-dot"></span>`;
+  b.title = (risks.length ? `${risks.join('\n')}\n\n` : '') + 'Session settings: account, browser tools, permissions, secrets';
+  b.setAttribute('aria-label', risks.length ? `Session settings (${risks.length === 1 ? 'one risky setting' : 'risky settings'} on)` : 'Session settings');
+  return b;
+}
+
+// One panel for how a session runs: each row says what it is in plain words, and what can be
+// changed here is changed here (the account and the browser access level live in Settings › AI).
+function termSettings(t, anchor) {
+  const pop = $('#popover');
+  if (!pop.hidden && pop.classList.contains('term-settings') && S.settingsTerm === t) { pop.hidden = true; return; }
+  if (S.activeTerm !== t) activateTerm(t);
+  // The tabs were drawn again: the button of this tab now.
+  anchor = [...document.querySelectorAll('#term-tab-list .ttab')][S.terms.indexOf(t)]?.querySelector('.tab-settings') || anchor;
+  S.settingsTerm = t;
+  const agent = t.kind !== 'shell' || !!t.sessionId;
+  const claude = t.kind === 'claude' || (t.kind === 'shell' && !!t.sessionId);
+  const access = S.info?.agentAccess || 'off';
+  const rows = [];
+  const row = (key, label, value, detail, { risky = false, control = '' } = {}) => rows.push(
+    `<div class="ts-row${risky ? ' risky' : ''}" data-row="${key}"><div class="ts-main"><span class="ts-label">${esc(label)}</span>${control || `<span class="ts-val">${esc(value)}</span>`}</div>${detail ? `<div class="ts-detail">${detail}</div>` : ''}</div>`);
+  if (agent) {
+    const acct = termAccount(t);
+    row('account', 'Account', acct || 'Default', t.resumedWith
+      ? `Resumed with ${esc(acct)}: the account this session’s history is under, not this space’s.`
+      : acct
+        ? `Runs as your ${esc(acct)} account: this space’s choice in Settings › AI.`
+        : `Runs as ${esc(AGENT_UI[t.kind]?.label || 'the agent')}’s own sign-in. A space can pick another account in Settings › AI.`);
+    row('browser', 'Browser tools', t.browserTools ? ACCESS_LABEL[access] || access : 'Not connected',
+      t.browserTools ? `${esc(ACCESS_DETAIL[access] || '')} For all agents: change it in Settings › AI.` : 'This session can’t see or use the browser.',
+      { risky: t.browserTools && access === 'full' });
+  }
+  if (claude) {
+    const mode = t.permissionMode || 'default';
+    const info = PERMISSION_MODES[mode] || { label: mode, detail: '' };
+    const canSwitch = t.kind === 'claude' && !!t.sessionId && !t.exited;
+    const options = Object.entries(PERMISSION_MODES).filter(([id, m]) => m.pick || id === mode)
+      .map(([id, m]) => `<option value="${id}"${id === mode ? ' selected' : ''}${m.pick ? '' : ' disabled'}>${esc(m.label)}</option>`).join('');
+    row('mode', 'Permissions', info.label, `${esc(info.detail)}${canSwitch ? ' Switching restarts the session where it left off.' : t.kind === 'claude' ? ' It can be switched after the session’s first answer.' : ''}`,
+      { risky: !!info.risky, control: canSwitch ? `<select class="ts-select" data-setting="mode" title="Restart this session in another permission mode">${options}</select>` : '' });
+  }
+  if (claude && !t.exited) {
+    const on = t.rc === 'on', pending = !on && (t.rcPending || (t.remote && t.rc !== 'off'));
+    row('remote', 'Remote Control', on ? 'On' : pending ? 'Connecting…' : 'Off',
+      on ? 'Continue this session on your phone (the Claude app) or at claude.ai/code.'
+        : pending ? 'Claude Code is connecting it; the tab’s RC fills in when it’s on.'
+        : 'Turn it on to continue this session on your phone or at claude.ai/code.',
+      { control: `<span class="ts-val">${on ? 'On' : pending ? 'Connecting…' : 'Off'}</span><button class="ts-switch${on || pending ? ' on' : ''}" role="switch" aria-checked="${on || pending}" data-a="rc" title="${on || pending ? 'Turn Remote Control off' : 'Turn Remote Control on'}"><i></i></button>` });
+  }
+  if (t.secrets?.length) {
+    row('secrets', 'Vault secrets', `${t.secrets.length} in this session`,
+      `Passed in as environment variables, values hidden: ${t.secrets.map(esc).join(', ')}.`,
+      { control: `<span class="ts-val">${t.secrets.length}</span><button class="btn small ts-link" data-a="vault">Manage</button>` });
+  }
+  if (t.guard) row('guard', 'Secret files', 'Guarded', 'Claude Code asks before it reads .env, keys or credentials files.');
+  if (t.sandbox) row('sandbox', 'Sandbox', 'Docker', 'Only this project is visible to it, nothing else on this computer.');
+  if (t.restoreOffer) {
+    const diffs = restoreDiffs(t, t.restoreOffer);
+    if (diffs.length) rows.unshift(`<div class="ts-row ts-restore" data-row="restore"><div class="ts-main"><span class="ts-label">Last time: ${esc(diffs.map((d) => d.text).join(' · '))}</span><button class="btn small accent" data-a="restore">Restore as it was</button></div>${restoreNotes(t, t.restoreOffer).map((n) => `<div class="ts-detail">${esc(n)}</div>`).join('')}</div>`);
+  }
+  const insights = agent && typeof openPanel === 'function';
+  const cost = typeof termCost === 'function' ? termCost(t) : null;
+  const close = popover(anchor, `<div class="ts"><div class="ts-head"><b>${esc(termName(t))}</b><span class="muted">${esc(AGENT_UI[t.kind]?.label || 'Terminal')}${t.model ? ` · ${esc(t.model)}` : ''}${cost != null ? ` · ${esc(termCostText(cost))} so far` : ''}</span></div>
+    ${rows.join('')}
+    <div class="ts-foot">${insights ? '<button class="btn small" data-a="insights">Context Insights</button>' : ''}<button class="btn small" data-a="rename">Rename</button></div></div>`, (p, done) => {
+    p.classList.add('term-settings');
+    // On the panel's content (new each time), not on the popover, which stays.
+    $('.ts', p).addEventListener('click', async (e) => {
+      const a = e.target.closest('[data-a]')?.dataset.a;
+      if (!a) return;
+      done();
+      if (a === 'vault') openPanel('secrets');
+      if (a === 'insights') { if (typeof CI !== 'undefined') CI.termId = t.id; openPanel('insights'); }
+      if (a === 'rename') renameTerm(t);
+      if (a === 'rc') toggleRemoteControl(t);
+      if (a === 'restore') restoreAsItWas(t);
+    });
+    $('[data-setting="mode"]', p)?.addEventListener('change', async (e) => {
+      const want = e.target.value;
+      done();
+      if (!(await restartWithMode(t, want))) e.target.value = t.permissionMode || 'default';
+    });
+  });
+  // Above the tab when the panel doesn't fit under it (tabs at the bottom of the window).
+  const r = anchor.getBoundingClientRect();
+  if (r.bottom + 8 + pop.offsetHeight > window.innerHeight - 8) pop.style.top = Math.max(8, r.top - 8 - pop.offsetHeight) + 'px';
+  return close;
 }
 
 // Mission Control shows each session under the name on its tab (only when one changes).
@@ -1494,6 +1623,7 @@ function saveClaudeSessions() {
   // (Claude Code started by hand in a shell tab too, while it runs there.)
   const list = S.terms.filter((t) => RESUMABLE(t) && t.root === root && t.sessionId && !t.closed)
     .map((t) => ({ id: t.sessionId, name: t.custom || '', mode: t.kind === 'codex' ? '' : t.permissionMode || '', kind: t.kind === 'codex' ? 'codex' : 'claude', model: t.model || '', remote: !!t.remote, ...(t.accountId ? { account: t.accountId } : {}) }));
+  rememberSessions(root);
   const key = JSON.stringify(list);
   if (S.savedSessions === key) return;
   S.savedSessions = key;
@@ -1513,11 +1643,12 @@ function syncTermMeta(t) {
 // The status line told us a terminal's session id (it changes on /clear, so keep following it).
 function noteClaudeSessions(usage) {
   let changed = false;
+  const fresh = [];
   for (const t of S.terms) {
     const claude = t.kind === 'claude' || t.kind === 'shell';
     const u = usage?.[t.id];
     const id = u?.session_id;
-    if ((claude || t.kind === 'codex') && typeof id === 'string' && id && id !== t.sessionId) { t.sessionId = id; changed = true; }
+    if ((claude || t.kind === 'codex') && typeof id === 'string' && id && id !== t.sessionId) { t.sessionId = id; changed = true; if (claude) fresh.push(t); }
     // The permission mode it's in (bypass, auto, accept edits…), to resume it in the same one.
     const mode = u?.permission_mode;
     if (claude && typeof mode === 'string' && mode && mode !== t.permissionMode) { t.permissionMode = mode; changed = true; }
@@ -1527,11 +1658,13 @@ function noteClaudeSessions(usage) {
     // Claude Code quit in a shell tab: the shell stays, nothing to bring back.
     if (t.kind === 'shell' && t.sessionId && !u) { t.sessionId = ''; t.permissionMode = ''; t.model = ''; t.remote = false; changed = true; }
   }
+  // Before this tab's state is remembered over the one it had.
+  for (const t of fresh) offerRestore(t);
   if (changed) { saveClaudeSessions(); renderTermTabs(); }
 }
 
 // Remote Control switched on in a Claude Code session (/remote-control, /rc): it comes back with it on.
-// (Only what was typed here tells; Claude Code reports nothing about it.)
+// (What was typed here, and what Claude Code prints about it: see termRcScan.)
 function noteTyped(t, data) {
   if (!(t.kind === 'claude' || (t.kind === 'shell' && t.sessionId))) return;
   if (data.startsWith('\x1b')) return;
@@ -1544,6 +1677,172 @@ function noteTyped(t, data) {
     else if (ch === '\x03' || ch === '\x15') t.typed = '';
     else if (ch >= ' ' && (t.typed || '').length < 200) t.typed = (t.typed || '') + ch;
   }
+}
+
+// ---------------------------------------------------------------- Remote Control
+
+// Claude Code's Remote Control (continue the session on the phone or at claude.ai/code) tells only
+// in the terminal whether it is connected: "/remote-control is active · Continue here, on your
+// phone, or at …" when it is, "Remote Control disconnected." and the like when not (Claude Code
+// 2.1.332; its status line has no field for it). The last such line on the screen says.
+const RC_ON = /\/remote-control is active|Continue here, on your phone|Remote Control on(?! (?:this|your|the|a)\b)/;
+const RC_OFF = /Remote Control (?:disconnected|is not connected|session expired|was turned off|is off\b|requires|needs a|is only available|is not available|is disabled|is turned off|cannot be enabled|not enabled|initialization failed)|Not connected · \/remote-control|Run \/remote-control to retry/;
+const termIsClaude = (t) => t.kind === 'claude' || (t.kind === 'shell' && !!t.sessionId);
+
+function termRcSoon(t) {
+  if (!termIsClaude(t) || t.rcTimer) return;
+  t.rcTimer = setTimeout(() => { t.rcTimer = 0; termRcScan(t); }, 250);
+}
+
+function termRcScan(t) {
+  if (t.closed) return;
+  const buf = t.xterm.buffer.active;
+  let state = '';
+  for (let i = buf.length - 1, n = 0; i >= 0 && n < 120 && !state; i--, n++) {
+    const line = buf.getLine(i)?.translateToString(true) || '';
+    if (RC_OFF.test(line)) state = 'off';
+    else if (RC_ON.test(line)) state = 'on';
+  }
+  if (!state) return;
+  // Just switched: the line from before the switch is still on the screen for a moment.
+  if (t.rcHeld && Date.now() - t.rcHeld.at < 10000 && state === t.rcHeld.was) return;
+  const remote = state === 'on';
+  if (state === t.rc && t.remote === remote && !t.rcPending) return;
+  t.rc = state;
+  t.rcPending = false;
+  t.remote = remote;
+  saveClaudeSessions();
+  renderTermTabs();
+}
+
+// On the tab: filled when connected, an outline when off (on the active tab only, to stay calm).
+function termRcBadge(t) {
+  if (!termIsClaude(t) || t.exited) return null;
+  const on = t.rc === 'on';
+  const pending = !on && (t.rcPending || (t.remote && t.rc !== 'off'));
+  const el = document.createElement('span');
+  el.className = `tab-rc${on ? ' on' : pending ? ' pending' : ' off'}`;
+  el.textContent = 'RC';
+  el.title = on ? 'Remote Control: on — continue this session on your phone or at claude.ai/code'
+    : pending ? 'Remote Control: connecting…'
+    : 'Remote Control: off — turn it on in this tab’s settings to continue on your phone';
+  return el;
+}
+
+// One click: Claude Code's own command, typed into the session (on when off, and off when on).
+function toggleRemoteControl(t) {
+  if (!termIsClaude(t) || t.exited) return;
+  const on = t.rc === 'on' || (t.remote && t.rc !== 'off');
+  t.rcPending = !on;
+  t.rcHeld = { at: Date.now(), was: on ? 'on' : 'off' };
+  setTimeout(() => termRcScan(t), 10500);
+  if (on) { t.remote = false; t.rc = 'off'; } else t.remote = true;
+  if (typeof typeRequest === 'function') typeRequest(t, '/remote-control');
+  else { wb.ptyWrite(t.id, '/remote-control'); setTimeout(() => wb.ptyWrite(t.id, '\r'), 150); }
+  saveClaudeSessions();
+  renderTermTabs();
+}
+
+// ---------------------------------------------------------------- "Restore as it was"
+
+// What each Claude Code session of a project last ran with (its name, permission mode, model, Remote
+// Control, the account and browser access level it had), kept in this profile, so a session picked
+// up again with Resume can come back as it was in one click.
+const HISTORY_MAX = 200;
+function sessionHistory(root) {
+  try { return JSON.parse(load(`sessions.${root}`) || '{}') || {}; } catch { return {}; }
+}
+function rememberSessions(root) {
+  const all = sessionHistory(root);
+  let changed = false;
+  for (const t of S.terms) {
+    if (!termIsClaude(t) || t.root !== root || !t.sessionId || t.closed || t.restoreOffer) continue;
+    const prev = all[t.sessionId] || {};
+    const next = { name: t.custom || prev.name || '', mode: t.permissionMode || '', model: t.model || '', remote: !!t.remote,
+      account: termAccount(t), access: t.browserTools ? S.info?.agentAccess || '' : '' };
+    if (JSON.stringify({ ...prev, at: 0 }) === JSON.stringify({ ...next, at: 0 })) continue;
+    all[t.sessionId] = { ...next, at: Date.now() };
+    changed = true;
+  }
+  if (!changed) return;
+  const ids = Object.keys(all).sort((a, b) => (all[b].at || 0) - (all[a].at || 0));
+  for (const id of ids.slice(HISTORY_MAX)) delete all[id];
+  store(`sessions.${root}`, JSON.stringify(all));
+}
+
+// What differs between a tab and how its session last ran, in words; [] when nothing does.
+function restoreDiffs(t, h) {
+  const out = [];
+  if (h.name && h.name !== t.custom) out.push({ key: 'name', text: `named “${h.name}”` });
+  const mode = h.mode || 'default', now = t.permissionMode || 'default';
+  if (mode !== now && PERMISSION_MODES[mode]?.pick) out.push({ key: 'mode', restart: true, text: PERMISSION_MODES[mode].label });
+  if (h.model && h.model !== t.model) out.push({ key: 'model', restart: true, text: h.model });
+  if (h.remote && !t.remote) out.push({ key: 'remote', text: 'Remote Control on' });
+  return out;
+}
+// What Meridian can't put back from here (the space's account, the browser access level): said, not done.
+function restoreNotes(t, h) {
+  const out = [];
+  if ((h.account || '') !== termAccount(t)) out.push(`It ran as ${h.account || 'the default'} account (now ${termAccount(t) || 'the default'}; Resume lists each account’s sessions, and a space’s account is set in Settings › AI).`);
+  if (h.access && t.browserTools && h.access !== (S.info?.agentAccess || '')) out.push(`Browser tools were “${ACCESS_LABEL[h.access] || h.access}” (now “${ACCESS_LABEL[S.info?.agentAccess] || 'Off'}”; change it in Settings › AI).`);
+  return out;
+}
+
+function offerRestore(t) {
+  if (!termIsClaude(t) || t.restoredFrom === t.sessionId || !t.root) return;
+  const h = sessionHistory(t.root)[t.sessionId];
+  if (!h) return;
+  const diffs = restoreDiffs(t, h);
+  if (!diffs.length) return;
+  t.restoreOffer = { ...h, id: t.sessionId };
+  showRestoreBar(t);
+}
+
+function showRestoreBar(t) {
+  hideRestoreBar(t);
+  const h = t.restoreOffer;
+  if (!h) return;
+  const diffs = restoreDiffs(t, h);
+  const bar = document.createElement('div');
+  bar.className = 'restored-bar restore-as-was';
+  const msg = document.createElement('span');
+  msg.className = 'msg';
+  msg.textContent = `This session ran ${diffs.map((d) => d.text).join(' · ')}`;
+  const notes = restoreNotes(t, h);
+  msg.title = [`Last time: ${diffs.map((d) => d.text).join(', ')}.`, ...(diffs.some((d) => d.restart) ? ['Restoring restarts the session where it left off.'] : []), ...notes].join('\n');
+  const go = document.createElement('button');
+  go.className = 'btn small accent';
+  go.dataset.a = 'restore';
+  go.textContent = 'Restore as it was';
+  go.addEventListener('click', () => restoreAsItWas(t));
+  const x = document.createElement('button');
+  x.className = 'icon-btn small';
+  x.dataset.a = 'dismiss';
+  x.title = 'Keep it as it is now';
+  x.innerHTML = icon('x', 12);
+  x.addEventListener('click', () => { t.restoreOffer = null; hideRestoreBar(t); saveClaudeSessions(); t.xterm.focus(); });
+  bar.append(msg, go, x);
+  t.el.appendChild(bar);
+  t.restoreBar = bar;
+}
+function hideRestoreBar(t) { t.restoreBar?.remove(); t.restoreBar = null; }
+
+// Everything the session had, back: the name here; mode and model by starting it again with them
+// (and Remote Control with them, then); Remote Control alone by typing its command.
+async function restoreAsItWas(t) {
+  const h = t.restoreOffer;
+  if (!h) return false;
+  const diffs = restoreDiffs(t, h);
+  t.restoreOffer = null;
+  hideRestoreBar(t);
+  if (diffs.some((d) => d.key === 'name')) saveTermName(t, h.name);
+  if (diffs.some((d) => d.restart) && t.kind === 'claude') {
+    return restartSession(t, { mode: h.mode || '', model: h.model || t.model || '', remote: !!h.remote || !!t.remote, name: h.name || t.custom || '' });
+  }
+  if (diffs.some((d) => d.key === 'remote')) toggleRemoteControl(t);
+  saveClaudeSessions();
+  renderTermTabs();
+  return true;
 }
 
 async function restoreClaudeSessions(root) {
@@ -1621,7 +1920,10 @@ function hideRestoredBar(t) {
 }
 
 function initTerminals() {
-  wb.onPtyData(({ id, data }) => S.terms.find((t) => t.id === id)?.xterm.write(data));
+  wb.onPtyData(({ id, data }) => {
+    const t = S.terms.find((x) => x.id === id);
+    if (t) t.xterm.write(data, () => termRcSoon(t));
+  });
   wb.onPtyExit(({ id, code }) => {
     const t = S.terms.find((x) => x.id === id);
     if (!t) return;
