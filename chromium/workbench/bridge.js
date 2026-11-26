@@ -154,6 +154,7 @@
       resumeModel: typeof opts?.resumeModel === 'string' ? opts.resumeModel.slice(0, 80) : undefined,
       resumeRemote: opts?.resumeRemote === true,
       accountId: typeof opts?.accountId === 'string' ? opts.accountId.slice(0, 16) : undefined,
+      ...(opts?.studio === true ? { studio: true } : {}),
     }),
     ptyList: () => invoke('ptyList'),
     // What the page knows about a terminal (its name, its agent's session), kept with it while the
@@ -221,6 +222,13 @@
     // The project's repository, the ones its agents worked in, and those inside it.
     gitRepos: () => invoke('gitRepos'),
     gitReadFile: (repo, path) => invoke('gitReadFile', str(repo), str(path)),
+
+    // Studio (refused unless Meridian has it on): whether it's on and who the person is, a session's
+    // transcript from an offset, an answer to its question, the result site's Boost.
+    studioInfo: () => invoke('studioInfo'),
+    studioTranscript: (id, offset) => invoke('studioTranscript', str(id), Math.max(0, Number(offset) || 0)),
+    studioAnswer: (askId, choice) => invoke('studioAnswer', str(askId), ['allow', 'deny', 'session'].includes(choice) ? choice : 'deny'),
+    studioBoost: (op, host, ...rest) => invoke('studioBoost', str(op), str(host), ...JSON.parse(JSON.stringify(rest.slice(0, 2)))),
 
     toHost: (msg) => send('toHost', JSON.parse(JSON.stringify(msg || {}))),
     onHostCommand: listen('wb:command'),

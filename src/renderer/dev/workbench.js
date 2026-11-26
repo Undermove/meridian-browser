@@ -1140,6 +1140,7 @@ function mountTerm(info) {
   if (typeof meta.mode === 'string') t.permissionMode = meta.mode;
   if (typeof meta.model === 'string') t.model = meta.model;
   if (meta.remote === true) t.remote = true;
+  if (meta.studio === true) t.studio = true;
   // The title the program sets (OSC 0/2): Claude Code names it after the session, with a spinner or
   // ✳ in front; a shell, after the folder or the command running.
   xterm.onTitleChange((title) => {
@@ -1176,7 +1177,7 @@ function mountTerm(info) {
   return t;
 }
 
-async function launch(kind, { resume = false, resumeId, resumeMode, resumeModel, resumeRemote = false, name, restored = false, accountId, accountLabel } = {}) {
+async function launch(kind, { resume = false, resumeId, resumeMode, resumeModel, resumeRemote = false, name, restored = false, accountId, accountLabel, studio = false } = {}) {
   if (!S.project) { toast('Open a project first'); return null; }
   if (S.info?.terminals === false) { toast(`Terminals are unavailable: ${S.info.terminalError || ''}`, 5000); return null; }
   // Where it sends what you type, said first (not for a session reopened after a restart).
@@ -1193,13 +1194,15 @@ async function launch(kind, { resume = false, resumeId, resumeMode, resumeModel,
     // Size the pty right from the start so TUIs (Claude Code, Codex) draw correctly.
     const host = $('#term-host');
     const dims = estimateDims(host);
-    info = await wb.ptyCreate({ kind, cols: dims.cols, rows: dims.rows, secrets, resume, resumeId, resumeMode, resumeModel, resumeRemote, accountId });
+    info = await wb.ptyCreate({ kind, cols: dims.cols, rows: dims.rows, secrets, resume, resumeId, resumeMode, resumeModel, resumeRemote, accountId, ...(studio ? { studio: true } : {}) });
   } catch (err) {
     toast(err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, ''), 5000);
     if (/not installed/i.test(err.message)) refreshInfo();
     return null;
   }
   const t = mountTerm(info);
+  // Started from Studio (studio.js): its chat, with Studio's rules.
+  if (studio) { t.studio = true; syncTermMeta(t); }
   if (resumeId) {
     t.sessionId = resumeId; t.permissionMode = resumeMode || ''; t.model = resumeModel || ''; t.remote = !!resumeRemote;
     // Picked up under another account than the space's, where its history is.
@@ -1679,7 +1682,7 @@ function saveClaudeSessions() {
 // What this page knows about a terminal goes with it while the Workbench tab is closed.
 function syncTermMeta(t) {
   if (typeof wb.ptyMeta !== 'function' || t.closed) return;
-  const meta = { name: t.custom || '', sessionId: t.sessionId || '', mode: t.permissionMode || '', model: t.model || '', remote: !!t.remote };
+  const meta = { name: t.custom || '', sessionId: t.sessionId || '', mode: t.permissionMode || '', model: t.model || '', remote: !!t.remote, ...(t.studio ? { studio: true } : {}) };
   const key = JSON.stringify(meta);
   if (t.metaKey === key) return;
   t.metaKey = key;
@@ -2080,6 +2083,7 @@ function onHostCommand(msg) {
   if (msg.type === 'mission' && typeof insightsUsage === 'function') insightsUsage(msg.usage);
   if (msg.type === 'mission') noteClaudeSessions(msg.usage);
   if (typeof proHostCommand === 'function') proHostCommand(msg); // Workbench Pro: new-hub, customize, safe-mode
+  if (typeof studioHostCommand === 'function') studioHostCommand(msg); // Studio (studio.js), when it's on
 }
 
 // ---------------------------------------------------------------- keyboard + focus zones
@@ -2127,6 +2131,8 @@ async function boot() {
   const info = await refreshInfo();
   if (info?.project) await setProject(info.project, { reattach: true }); // page reload: project and terminals are still alive
   else renderWelcome();
+  // Studio (studio.js): only when Meridian has it on.
+  if (typeof studioBoot === 'function') await studioBoot().catch((err) => console.error(err));
   wb.toHost({ type: 'ready' });
 }
 
