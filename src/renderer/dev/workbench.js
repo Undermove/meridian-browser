@@ -1403,7 +1403,7 @@ function renderTermTabs() {
     name.textContent = termName(t) + (t.exited ? ' (exited)' : '');
     el.title = `${termName(t)}\nDouble-click to rename`;
     el.appendChild(name);
-    // The tab says what the session is and what it has cost; how it runs (account, browser tools,
+    // The tab says what the session is and how full its context is; how it runs (account, browser tools,
     // permission mode, secrets, sandbox) is behind one button, with a dot when something risky is on.
     const badge = typeof termUsageBadge === 'function' ? termUsageBadge(t) : null;
     if (badge) el.appendChild(badge);
@@ -1514,8 +1514,7 @@ function termSettings(t, anchor) {
     if (diffs.length) rows.unshift(`<div class="ts-row ts-restore" data-row="restore"><div class="ts-main"><span class="ts-label">Last time: ${esc(diffs.map((d) => d.text).join(' · '))}</span><button class="btn small accent" data-a="restore">Restore as it was</button></div>${restoreNotes(t, t.restoreOffer).map((n) => `<div class="ts-detail">${esc(n)}</div>`).join('')}</div>`);
   }
   const insights = agent && typeof openPanel === 'function';
-  const cost = typeof termCost === 'function' ? termCost(t) : null;
-  const close = popover(anchor, `<div class="ts"><div class="ts-head"><b>${esc(termName(t))}</b><span class="muted">${esc(AGENT_UI[t.kind]?.label || 'Terminal')}${t.model ? ` · ${esc(t.model)}` : ''}${cost != null ? ` · ${esc(termCostText(cost))} so far` : ''}</span></div>
+  const close = popover(anchor, `<div class="ts"><div class="ts-head"><b>${esc(termName(t))}</b><span class="muted">${esc(AGENT_UI[t.kind]?.label || 'Terminal')}${t.model ? ` · ${esc(t.model)}` : ''}</span></div>
     ${rows.join('')}
     <div class="ts-foot">${insights ? '<button class="btn small" data-a="insights">Context Insights</button>' : ''}<button class="btn small" data-a="rename">Rename</button></div></div>`, (p, done) => {
     p.classList.add('term-settings');

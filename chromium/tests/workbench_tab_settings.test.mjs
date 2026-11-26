@@ -1,6 +1,6 @@
-// A Workbench terminal tab shows the session's name and what it has cost (a click: Context
-// Insights). How the session runs (its AI account, browser tools, permission mode, vault secrets)
-// is behind one settings button on the tab, each row in plain words; a dot on the tab only when
+// A Workbench terminal tab shows the session's name and its context gauge (a click: Context
+// Insights), never a dollar amount (on a subscription that isn't money the person pays). How the
+// session runs (its AI account, browser tools, permission mode, vault secrets) is behind one settings button on the tab, each row in plain words; a dot on the tab only when
 // something risky is on (bypass, browser tools in full control). The status bar says the same in
 // one group: "Browser tools: Full control · 5 secrets".
 import { test } from 'node:test';
@@ -43,7 +43,7 @@ async function shot(wb, name, clip) {
   fs.writeFileSync(path.join(process.env.MERIDIAN_SHOTS, name), Buffer.from(data, 'base64'));
 }
 
-test('a terminal tab shows the name and the cost; account, browser tools, permissions and secrets are in its settings', { skip: process.platform === 'win32' && 'the stand-in is a POSIX script' }, async () => {
+test('a terminal tab shows the name and the context gauge, no dollars; account, browser tools, permissions and secrets are in its settings', { skip: process.platform === 'win32' && 'the stand-in is a POSIX script' }, async () => {
   const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-tabset-')));
   fs.mkdirSync(path.join(project, 'home'));
   fs.writeFileSync(path.join(project, 'session.jsonl'), '');
@@ -62,8 +62,10 @@ test('a terminal tab shows the name and the cost; account, browser tools, permis
     await wb.eval(`launch('shell').then((t) => !!t)`);
     await wb.eval(`launch('claude').then((t) => !!t)`);
     const tab = `document.querySelector('#term-tab-list .ttab.active')`;
-    await wb.waitFor(`${tab}?.querySelector('.name')?.textContent === 'Personal finance dashboard' && ${tab}.querySelector('.tab-usage .cost')?.textContent === '$1.20'`, 15000);
-    assert.equal(await wb.eval(`${tab}.querySelector('.tab-usage .ctx-badge').textContent`), '14%');
+    await wb.waitFor(`${tab}?.querySelector('.name')?.textContent === 'Personal finance dashboard' && ${tab}.querySelector('.tab-usage .ctx-badge')?.textContent === '14%'`, 15000);
+    // The status line says $1.20, but the tab shows no dollars.
+    assert.equal(await wb.eval(`!!${tab}.querySelector('.tab-usage .cost')`), false);
+    assert.doesNotMatch(await wb.eval(`${tab}.innerText + ' ' + ${tab}.querySelector('.tab-usage').title`), /\$|cost/i);
 
     // The person's case: the Personal account, browser tools in full control, five vault secrets, bypass.
     await wb.eval(`(() => { const t = S.activeTerm; t.account = 'Personal'; t.browserTools = true; t.secrets = ['OPENAI_API_KEY', 'STRIPE_KEY', 'DB_URL', 'SENTRY_DSN', 'GH_TOKEN'];
@@ -73,14 +75,14 @@ test('a terminal tab shows the name and the cost; account, browser tools, permis
     const strip = await wb.eval(`(() => { const r = document.getElementById('term-tabs').getBoundingClientRect(); return { x: r.x, y: r.y, width: Math.min(r.width, 760), height: r.height }; })()`);
     await shot(wb, 'tab-after.png', strip);
 
-    // On the tab: the name in full, the cost and the gauge, the settings button with a warning dot.
+    // On the tab: the name in full, the gauge (no cost), the settings button with a warning dot.
     const t = await wb.eval(`(() => { const el = ${tab}; const n = el.querySelector('.name'); return {
       text: el.innerText.replace(/\\s+/g, ' ').trim(), full: n.scrollWidth <= n.clientWidth,
       old: !!el.querySelector('.acct, .plug, .bypass-on, .tab-bypass'), risky: !!el.querySelector('.tab-settings.risky .risk-dot'),
       riskTitle: el.querySelector('.tab-settings').title }; })()`);
     assert.equal(t.full, true, 'the name is not cut');
     assert.equal(t.old, false, 'no account, globe, lock or Bypass chips on the tab');
-    assert.doesNotMatch(t.text, /Personal\b(?! finance)|Bypass|🔒/);
+    assert.doesNotMatch(t.text, /Personal\b(?! finance)|Bypass|🔒|\$/);
     assert.equal(t.risky, true);
     assert.match(t.riskTitle, /Bypass: it runs commands/);
     assert.match(t.riskTitle, /Browser tools: full control/);
@@ -99,7 +101,9 @@ test('a terminal tab shows the name and the cost; account, browser tools, permis
     assert.equal(await wb.eval(`${row('mode')}.querySelector('select').value`), 'bypassPermissions');
     assert.equal(await wb.eval(`${row('mode')}.classList.contains('risky')`), true);
     assert.match(await wb.eval(`${row('secrets')}.innerText`), /Vault secrets\s+5[\s\S]*OPENAI_API_KEY/);
-    assert.match(await wb.eval(`document.querySelector('#popover .ts-head').innerText`), /Personal finance dashboard[\s\S]*\$1\.20 so far/);
+    const head = await wb.eval(`document.querySelector('#popover .ts-head').innerText`);
+    assert.match(head, /Personal finance dashboard/);
+    assert.doesNotMatch(head, /\$|so far/);
     const pop = await wb.eval(`(() => { const a = document.getElementById('term-tabs').getBoundingClientRect(), p = document.getElementById('popover').getBoundingClientRect();
       const x = Math.max(0, Math.min(a.x, p.x) - 8), y = Math.max(0, Math.min(a.y, p.y) - 8); return { x, y, width: Math.min(900, Math.max(a.x + 760, p.right) - x + 8), height: Math.max(a.bottom, p.bottom) - y + 8 }; })()`);
     await shot(wb, 'tab-settings-after.png', pop);
@@ -108,8 +112,8 @@ test('a terminal tab shows the name and the cost; account, browser tools, permis
     await click(wb, `document.querySelector('#popover [data-a="vault"]')`);
     await wb.waitFor(`document.getElementById('popover').hidden && PRO.activePanel === 'secrets'`);
 
-    // The cost chip: Context Insights about this session.
-    await click(wb, `${tab}.querySelector('.tab-usage .cost')`);
+    // The context gauge: Context Insights about this session.
+    await click(wb, `${tab}.querySelector('.tab-usage .ctx-badge')`);
     await wb.waitFor(`PRO.activePanel === 'insights'`);
 
     // Nothing risky: no dot, and the button only on the active or hovered tab.
