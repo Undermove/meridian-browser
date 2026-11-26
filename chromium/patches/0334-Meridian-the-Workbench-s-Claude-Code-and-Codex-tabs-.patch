@@ -1,0 +1,314 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 16:35:45 +0400
+Subject: [PATCH 334/335] Meridian: the Workbench's Claude Code and Codex tabs
+ run the newest copy
+
+With an old Claude Code (2.0.14) in /usr/local/bin first on the PATH and
+the current one (2.1.332) in ~/.local/bin, the Workbench's Claude Code
+tab started the old one: it looked the CLI up on the PATH, while Ask,
+Improve, sign-in and Connect already took the newest copy.
+
+The Workbench now starts every agent CLI by the full path of its newest
+copy (ai::FindNewestCli): the agent tabs, Resume, a session reopened
+after a restart and Remote Control, and what the launcher shows. A shell
+tab gets the newest Claude Code's and Codex's folders first on its PATH
+when the PATH would find an older copy first, and zsh puts them in front
+again after its startup files and macOS's path_helper (.zlogin), so
+`claude` typed there is the current one too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/workbench/agents.cc   | 83 +++++++++++++++++--
+ chrome/browser/meridian/workbench/agents.h    |  9 ++
+ .../meridian/workbench/agents_unittest.cc     | 80 ++++++++++++++++++
+ 3 files changed, 163 insertions(+), 9 deletions(-)
+
+diff --git a/chrome/browser/meridian/workbench/agents.cc b/chrome/browser/meridian/workbench/agents.cc
+index e20fc67249..32517b979b 100644
+--- a/chrome/browser/meridian/workbench/agents.cc
++++ b/chrome/browser/meridian/workbench/agents.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/meridian/workbench/agents.h"
+ 
+ 
++#include <algorithm>
+ #include <string_view>
+ 
+ #include "base/files/file_util.h"
+@@ -15,6 +16,7 @@
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
+ #include "build/build_config.h"
++#include "chrome/browser/meridian/ai/cli_versions.h"
+ #include "chrome/browser/meridian/ai/process_runner.h"
+ #include "chrome/browser/meridian/private_file.h"
+ 
+@@ -97,7 +99,8 @@ constexpr char kZshRc[] = R"(ZDOTDIR=$MERIDIAN_USER_ZDOTDIR
+ [[ -r $ZDOTDIR/.zshrc ]] && builtin source $ZDOTDIR/.zshrc
+ MERIDIAN_USER_ZDOTDIR=$ZDOTDIR
+ ZDOTDIR=$_meridian_zdotdir
+-if (( ${+aliases[claude]} )); then
++)";
++constexpr char kZshRcClaude[] = R"(if (( ${+aliases[claude]} )); then
+   _meridian_claude=${aliases[claude]}
+   unalias claude
+ elif (( ${+functions[claude]} )); then
+@@ -138,9 +141,20 @@ for _meridian_var in ${(s:,:)MERIDIAN_ACCOUNT_VARS}; do
+   fi
+ done
+ unset MERIDIAN_ACCOUNT_VARS _meridian_var _meridian_set
++# The newest copy of each agent CLI first (an old one in /usr/local/bin, the
++# current one in ~/.local/bin): macOS's path_helper and the startup files may
++# have put the old one's folder in front again.
++if [[ -n $MERIDIAN_PATH_FIRST ]]; then
++  export PATH=$MERIDIAN_PATH_FIRST:$PATH
++  typeset -U path
++fi
++unset MERIDIAN_PATH_FIRST
+ )";
+ 
+-void AddShellClaude(LaunchSpec& spec, const McpBridge& bridge) {
++// The shell tab's zsh startup files: the person's own, then (with the
++// Workbench's Claude Code settings) `claude` typed there reporting to
++// Meridian, and the newest agent CLIs first on the PATH.
++void AddShellStartup(LaunchSpec& spec, const McpBridge& bridge) {
+   base::FilePath dir;
+   if (!base::CreateNewTempDirectory(FILE_PATH_LITERAL("meridian-zsh-"), &dir)) {
+     return;
+@@ -159,6 +173,18 @@ void AddShellClaude(LaunchSpec& spec, const McpBridge& bridge) {
+   for (const std::string& a : bridge.args) {
+     bridge_args.Append(a);
+   }
++  if (write(".zshenv", kZshEnv).empty() ||
++      write(".zprofile", kZshProfile).empty() ||
++      write(".zlogin", kZshLogin).empty()) {
++    return;
++  }
++  if (!bridge.claude_settings) {
++    if (write(".zshrc", kZshRc).empty()) {
++      return;
++    }
++    spec.env["ZDOTDIR"] = dir.AsUTF8Unsafe();
++    return;
++  }
+   base::FilePath settings = write(
+       "settings.json", base::WriteJson(*bridge.claude_settings).value_or("{}"));
+   base::FilePath mcp = write(
+@@ -171,9 +197,8 @@ void AddShellClaude(LaunchSpec& spec, const McpBridge& bridge) {
+                                         .Set("command", bridge.command)
+                                         .Set("args", std::move(bridge_args)))))
+           .value_or("{}"));
+-  if (settings.empty() || mcp.empty() || write(".zshenv", kZshEnv).empty() ||
+-      write(".zprofile", kZshProfile).empty() ||
+-      write(".zshrc", kZshRc).empty() || write(".zlogin", kZshLogin).empty()) {
++  if (settings.empty() || mcp.empty() ||
++      write(".zshrc", std::string(kZshRc) + kZshRcClaude).empty()) {
+     return;
+   }
+   spec.env["ZDOTDIR"] = dir.AsUTF8Unsafe();
+@@ -190,10 +215,31 @@ std::string FindExecutable(const std::string& name,
+   return ai::FindProgram(name, search_path);
+ }
+ 
++std::string FindAgentExecutable(const std::string& name,
++                                const std::string& search_path) {
++  return ai::FindNewestCli(name, search_path);
++}
++
++std::vector<std::string> NewestCliFolders(const std::string& search_path) {
++  std::vector<std::string> out;
++  for (const char* name : {"claude", "codex"}) {
++    const std::string newest = FindAgentExecutable(name, search_path);
++    if (newest.empty() || newest == FindExecutable(name, search_path)) {
++      continue;
++    }
++    const std::string dir =
++        base::FilePath::FromUTF8Unsafe(newest).DirName().AsUTF8Unsafe();
++    if (std::ranges::find(out, dir) == out.end()) {
++      out.push_back(dir);
++    }
++  }
++  return out;
++}
++
+ base::DictValue DetectAgents(const std::string& search_path) {
+   base::DictValue out;
+   for (const Agent& a : Agents()) {
+-    std::string path = FindExecutable(a.bin, search_path);
++    std::string path = FindAgentExecutable(a.bin, search_path);
+     base::DictValue agent;
+     agent.Set("id", a.id);
+     agent.Set("label", a.label);
+@@ -246,9 +292,26 @@ base::expected<LaunchSpec, std::string> MakeLaunchSpec(
+     spec.argv = {shell};
+ #else
+     spec.argv = {shell, "-l"};
+-    if (bridge.claude_settings &&
++#endif
++    // `claude` typed there runs the newest copy, as a Claude Code tab does,
++    // whichever folder the PATH lists first.
++    const std::vector<std::string> first = NewestCliFolders(search_path);
++#if BUILDFLAG(IS_WIN)
++    constexpr char kSeparator[] = ";";
++#else
++    constexpr char kSeparator[] = ":";
++#endif
++    if (!first.empty()) {
++      spec.env["PATH"] = base::JoinString(first, kSeparator) +
++                         (search_path.empty() ? "" : kSeparator) + search_path;
++    }
++#if !BUILDFLAG(IS_WIN)
++    if ((bridge.claude_settings || !first.empty()) &&
+         base::FilePath::FromUTF8Unsafe(shell).BaseName().value() == "zsh") {
+-      AddShellClaude(spec, bridge);
++      if (!first.empty()) {
++        spec.env["MERIDIAN_PATH_FIRST"] = base::JoinString(first, kSeparator);
++      }
++      AddShellStartup(spec, bridge);
+     }
+ #endif
+     return spec;
+@@ -262,7 +325,9 @@ base::expected<LaunchSpec, std::string> MakeLaunchSpec(
+   if (!agent) {
+     return base::unexpected("unknown agent");
+   }
+-  std::string bin = FindExecutable(agent->bin, search_path);
++  // The newest copy (cli_versions.h), by its full path: an old Claude Code
++  // first on the PATH never runs in its tab, its Resume or Remote Control.
++  std::string bin = FindAgentExecutable(agent->bin, search_path);
+   if (bin.empty()) {
+     return base::unexpected(std::string(agent->label) +
+                             " is not installed. Install it with: " +
+diff --git a/chrome/browser/meridian/workbench/agents.h b/chrome/browser/meridian/workbench/agents.h
+index 84e7d91165..e019d3a285 100644
+--- a/chrome/browser/meridian/workbench/agents.h
++++ b/chrome/browser/meridian/workbench/agents.h
+@@ -60,6 +60,15 @@ base::expected<LaunchSpec, std::string> MakeLaunchSpec(
+ std::string FindExecutable(const std::string& name,
+                            const std::string& search_path);
+ 
++// An agent CLI as the Workbench starts it: the newest copy on this computer
++// (ai::FindNewestCli), by its full path. Blocking.
++std::string FindAgentExecutable(const std::string& name,
++                                const std::string& search_path);
++
++// Folders of the newest Claude Code and Codex where the PATH would find an
++// older copy first (or none): put in front of a shell tab's PATH. Blocking.
++std::vector<std::string> NewestCliFolders(const std::string& search_path);
++
+ }  // namespace meridian::workbench
+ 
+ #endif  // CHROME_BROWSER_MERIDIAN_WORKBENCH_AGENTS_H_
+diff --git a/chrome/browser/meridian/workbench/agents_unittest.cc b/chrome/browser/meridian/workbench/agents_unittest.cc
+index 1064237631..90b8c88f4d 100644
+--- a/chrome/browser/meridian/workbench/agents_unittest.cc
++++ b/chrome/browser/meridian/workbench/agents_unittest.cc
+@@ -7,13 +7,27 @@
+ #include "base/files/file_util.h"
+ #include "base/files/scoped_temp_dir.h"
+ #include "base/json/json_reader.h"
++#include "base/scoped_environment_variable_override.h"
+ #include "build/build_config.h"
++#include "chrome/browser/meridian/ai/cli_versions.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+ namespace meridian::workbench {
+ namespace {
+ 
++// Only the test's folders: never the computer's own ~/.local/bin or
++// /usr/local/bin (whose CLIs would be asked their --version).
++class OnlyTestFolders {
++ public:
++  OnlyTestFolders() { ai::SetInstallerFoldersForTesting(&none_); }
++  ~OnlyTestFolders() { ai::SetInstallerFoldersForTesting(nullptr); }
++
++ private:
++  const std::vector<std::string> none_;
++};
++
+ TEST(WorkbenchAgentsTest, ClaudeGetsMeridianForThisSessionOnly) {
++  OnlyTestFolders only;
+   base::ScopedTempDir dir;
+   ASSERT_TRUE(dir.CreateUniqueTempDir());
+ #if BUILDFLAG(IS_WIN)
+@@ -49,6 +63,7 @@ TEST(WorkbenchAgentsTest, ClaudeGetsMeridianForThisSessionOnly) {
+ }
+ 
+ TEST(WorkbenchAgentsTest, MissingAgentSaysHowToInstall) {
++  OnlyTestFolders only;
+   base::expected<LaunchSpec, std::string> spec =
+       MakeLaunchSpec("codex", "/nonexistent", "/bin/zsh", {});
+   ASSERT_FALSE(spec.has_value());
+@@ -71,5 +86,70 @@ TEST(WorkbenchAgentsTest, MissingAgentSaysHowToInstall) {
+ #endif
+ }
+ 
++#if BUILDFLAG(IS_POSIX)
++// A stand-in that says its version.
++base::FilePath StandIn(const base::FilePath& dir,
++                       const std::string& name,
++                       const std::string& version) {
++  EXPECT_TRUE(base::CreateDirectory(dir));
++  base::FilePath bin = dir.AppendASCII(name);
++  EXPECT_TRUE(
++      base::WriteFile(bin, "#!/bin/sh\necho '" + version + " (Claude Code)'\n"));
++  EXPECT_TRUE(base::SetPosixFilePermissions(bin, 0755));
++  return bin;
++}
++
++// An old Claude Code first on the PATH (/usr/local/bin) and the current one
++// in ~/.local/bin: its tab, Resume and Remote Control start the current one
++// by its full path; a shell tab finds it first on its PATH.
++TEST(WorkbenchAgentsTest, TabsRunTheNewestCopyWhateverThePathsOrder) {
++  OnlyTestFolders only;
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath root = base::MakeAbsoluteFilePath(temp.GetPath());
++  base::ScopedEnvironmentVariableOverride home("HOME", root.value());
++  const base::FilePath old_dir = root.AppendASCII("usr/local/bin");
++  const base::FilePath new_dir = root.AppendASCII(".local/bin");
++  StandIn(old_dir, "claude", "2.0.14");
++  const base::FilePath fresh = StandIn(new_dir, "claude", "2.1.332");
++  const std::string path =
++      old_dir.value() + ":" + new_dir.value() + ":/usr/bin:/bin";
++
++  EXPECT_EQ(FindAgentExecutable("claude", path), fresh.value());
++  EXPECT_EQ(*DetectAgents(path).FindStringByDottedPath("claude.path"),
++            fresh.value());
++  base::expected<LaunchSpec, std::string> tab =
++      MakeLaunchSpec("claude", path, "/bin/zsh", {});
++  ASSERT_TRUE(tab.has_value());
++  EXPECT_EQ(tab->argv[0], fresh.value());
++
++  // The shell tab: the newest one's folder first, for the shell and (zsh)
++  // again after the startup files, which may put /usr/local/bin first.
++  base::expected<LaunchSpec, std::string> shell =
++      MakeLaunchSpec("shell", path, "/bin/zsh", {});
++  ASSERT_TRUE(shell.has_value());
++  EXPECT_EQ(shell->env["PATH"], new_dir.value() + ":" + path);
++  EXPECT_EQ(shell->env["MERIDIAN_PATH_FIRST"], new_dir.value());
++  ASSERT_TRUE(shell->env.contains("ZDOTDIR"));
++  const base::FilePath zdotdir =
++      base::FilePath::FromUTF8Unsafe(shell->env["ZDOTDIR"]);
++  std::string zlogin;
++  ASSERT_TRUE(base::ReadFileToString(zdotdir.AppendASCII(".zlogin"), &zlogin));
++  EXPECT_NE(zlogin.find("MERIDIAN_PATH_FIRST:$PATH"), std::string::npos);
++  std::string zshrc;
++  ASSERT_TRUE(base::ReadFileToString(zdotdir.AppendASCII(".zshrc"), &zshrc));
++  // No Claude Code settings for this one: no claude() of Meridian's.
++  EXPECT_EQ(zshrc.find("claude()"), std::string::npos);
++  base::DeletePathRecursively(zdotdir);
++
++  // Already first: nothing changes.
++  base::expected<LaunchSpec, std::string> plain = MakeLaunchSpec(
++      "shell", new_dir.value() + ":" + old_dir.value(), "/bin/zsh", {});
++  ASSERT_TRUE(plain.has_value());
++  EXPECT_FALSE(plain->env.contains("PATH"));
++  EXPECT_FALSE(plain->env.contains("ZDOTDIR"));
++}
++#endif  // BUILDFLAG(IS_POSIX)
++
+ }  // namespace
+ }  // namespace meridian::workbench

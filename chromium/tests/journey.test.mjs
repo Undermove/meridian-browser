@@ -322,6 +322,29 @@ for (const [name, skip] of machinesHere()) {
       } finally { wb.close(); }
     });
 
+    // An old copy first on the PATH: `claude` typed in a plain shell tab is the current one too (its
+    // folder goes first on the tab's PATH, again after zsh's startup files and macOS's path_helper).
+    // Only on that machine: elsewhere the shell's PATH is the system's, where a real CLI may be.
+    test('Workbench › a shell tab: `claude` typed there is the current copy', { timeout: 60000, skip: (WIN && 'the Workbench on Windows: the Windows session') || (name !== 'native-and-old-on-path' && 'one copy of Claude Code here') }, async () => {
+      await ensure();
+      const wb = await b.page('chrome://workbench', 15000);
+      try {
+        await wb.waitFor(`!document.querySelector('#welcome')?.hidden || !!S.project`, 15000);
+        if (!(await wb.eval('!!S.project'))) { await clickIn(wb, `document.querySelector('#open-folder')`); await wb.waitFor('!!S.project'); }
+        const n = await wb.eval('S.terms.length');
+        await wb.eval(`launch('shell').then((t) => !!t)`);
+        await wb.waitFor(`S.terms.length > ${n}`, 15000);
+        const id = await wb.eval(`S.terms[${n}].id`);
+        await sleep(1500);
+        await wb.eval(`(() => { window.workbench.ptyWrite(${JSON.stringify(id)}, ${JSON.stringify('claude --version\r')}); return true; })()`);
+        await wb.waitFor(`${termText(n)}.includes('(Claude Code)')`, 20000, termText(n));
+        const text = await wb.eval(termText(n));
+        note('workbenchShellClaude', text.split('\n').filter((l) => /Claude Code/.test(l)).slice(0, 2));
+        assert.match(text, new RegExp(`${truth().claudeCode.version.replace(/\./g, '\\.')} \\(Claude Code\\)`), '`claude` in a shell tab runs the current copy');
+        assert.doesNotMatch(text, /2\.0\.14 \(Claude Code\)/, 'the old copy first on the PATH ran');
+      } finally { wb.close(); }
+    });
+
     test('Workbench › Resume also lists the sessions under the person’s other Claude account', { timeout: 30000, skip: (WIN && 'the Windows session') || (!MACHINES_WITH_SESSIONS_ELSEWHERE.has(name) && 'one account here'), ...todo('resumeAcrossAccounts') }, async () => {
       const listed = JSON.stringify(seen.resume || []);
       for (const t of truth().resume.elsewhere) assert.ok(listed.includes(t), `Resume doesn’t list "${t}", a session of this project under the other account`);
