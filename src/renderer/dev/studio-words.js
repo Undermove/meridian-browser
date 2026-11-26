@@ -22,7 +22,7 @@
       },
       allow: 'Разрешить', once: 'Только в этот раз', no: 'Нет', allowed: 'Разрешено', denied: 'Не разрешено',
       answerInWorkbench: 'Ответить можно в Workbench', openWorkbench: 'Открыть Workbench',
-      filesTitle: 'Файлы по ходу работы', created: 'новый', changed: 'изменён', shot: 'скриншот', shots: 'Снимки',
+      filesTitle: 'Файлы по ходу работы', created: 'новый', changed: 'изменён', shot: 'скриншот', shots: 'Снимки', shotBefore: 'Было', shotAfter: 'Стало', wipeHint: 'было ← шторка → стало',
       siteBar: 'Результат', showSite: 'Показать живой сайт рядом', lastShot: 'последний снимок', boostUndo: 'Boost · можно отменить', boostUndone: 'Вернули как было',
       before: 'До', after: 'После', undo: 'Отменить', undoTitle: 'Вернуть сайт как был до задачи',
       working: 'Работаю…', waiting: 'Ждёт вас', done: 'Готово', idle: 'Готово',
@@ -81,7 +81,7 @@
       },
       allow: 'Allow', once: 'Just this once', no: 'No', allowed: 'Allowed', denied: 'Not allowed',
       answerInWorkbench: 'This one is answered in the Workbench', openWorkbench: 'Open Workbench',
-      filesTitle: 'Files from this task', created: 'new', changed: 'changed', shot: 'screenshot', shots: 'Snapshots',
+      filesTitle: 'Files from this task', created: 'new', changed: 'changed', shot: 'screenshot', shots: 'Snapshots', shotBefore: 'Before', shotAfter: 'After', wipeHint: 'before ← drag → after',
       siteBar: 'Result', showSite: 'Show the live site alongside', lastShot: 'latest snapshot', boostUndo: 'Boost · can be undone', boostUndone: 'Back as it was',
       before: 'Before', after: 'After', undo: 'Undo', undoTitle: 'Put the site back as it was before the task',
       working: 'Working…', waiting: 'Needs you', done: 'Done', idle: 'Done',
@@ -143,7 +143,7 @@
       if (server.includes('meridian')) {
         switch (name) {
           case 'navigate': case 'open_tab': return say('globe', `Открыл сайт ${site}`.trim(), `Opened ${site || 'a site'}`, `Открываю ${site}`.trim(), `Opening ${site || 'a site'}`);
-          case 'screenshot': return say('eye', 'Снял скриншот', 'Took a screenshot', 'Снимаю скриншот', 'Taking a screenshot');
+          case 'screenshot': return say('camera', 'Снял скриншот', 'Took a screenshot', 'Снимаю скриншот', 'Taking a screenshot');
           case 'read_page': case 'get_interactive_elements': return say('file', 'Прочитал страницу', 'Read the page', 'Читаю страницу', 'Reading the page');
           case 'set_boost': return say('palette', 'Применил новый стиль к сайту', 'Restyled the site', 'Применяю стиль к сайту', 'Restyling the site');
           case 'get_boost': return say('palette', 'Посмотрел текущий стиль сайта', 'Checked the site’s style');

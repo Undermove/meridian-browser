@@ -10,6 +10,11 @@
  * studio-transcript.js. Every text from the session is set with textContent or esc().
  */
 
+// A camera for "took a screenshot" (icons.js has none).
+if (typeof ICON_PATHS === 'object' && !ICON_PATHS.camera) {
+  ICON_PATHS.camera = '<path d="M4.5 8.5a2 2 0 0 1 2-2h1.8l1.5-2h4.4l1.5 2h1.8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2z"/><circle cx="12" cy="13" r="3.3"/>';
+}
+
 const ST = {
   on: false,
   lang: /^ru\b/i.test(navigator.language || '') ? 'ru' : 'en',
@@ -212,10 +217,10 @@ function stBuild() {
         <div class="st-task-list" id="st-task-list" role="list"></div>
       </aside>
       <div class="st-chat">
-        <div class="st-ctabs" role="tablist">
+        <div class="st-ctabs" role="tablist"><div class="st-seg">
           <button role="tab" data-pane="chat" class="on">${icon('chat', 14)}<span>${esc(w.chat)}</span></button>
           <button role="tab" data-pane="brand">${icon('palette', 14)}<span>${esc(w.brand)}</span></button>
-        </div>
+        </div></div>
         <div class="st-brand" id="st-brand" hidden></div>
         <div class="st-resultbar" id="st-resultbar" hidden></div>
         <div class="st-feed" id="st-feed" aria-live="polite"></div>
@@ -275,6 +280,8 @@ function stBuild() {
   });
   $('#st-feed', el).addEventListener('click', stOnFeedClick);
   $('#st-result', el).addEventListener('click', stOnResultClick);
+  $('#st-result', el).addEventListener('pointerdown', stWipeDrag);
+  $('#st-result', el).addEventListener('dblclick', stWipeDrag);
   $('#st-resultbar', el).addEventListener('click', stOnResultBarClick);
   // Pressed look (scale .97) for every button, by pointer only: keys don't animate.
   el.addEventListener('pointerdown', (e) => { const b = e.target.closest('button'); if (b) b.classList.add('st-press'); });
@@ -409,7 +416,9 @@ function stRenderFeed(t) {
       else if (it.type === 'steps') {
         // The plan itself isn't a step: it shows as "step i of n" on the step being done.
         const steps = it.steps.filter((s) => s.tool !== 'TodoWrite');
-        if (steps.length) parts.push(`<div class="st-steps" data-key="s${ti}.${ii}">${steps.map((s) => stStepHtml(s, last && (status === 'work' || status === 'needs'), progress, status)).join('')}</div>`);
+        // One check, on the last step done: less noise than a column of them.
+        const lastOk = steps.map((s) => s.state).lastIndexOf('ok');
+        if (steps.length) parts.push(`<div class="st-steps" data-key="s${ti}.${ii}">${steps.map((s, si) => stStepHtml(s, last && (status === 'work' || status === 'needs'), progress, status, si === lastOk)).join('')}</div>`);
       }
     });
     for (const a of answeredHere.filter((x) => x.after >= turn.items.length)) parts.push(answeredHtml(a));
@@ -452,7 +461,11 @@ function stRenderFeed(t) {
   feed.dataset.html = html;
   stFillImages(feed);
   stLoadThumbs(k);
-  if (atBottom) feed.scrollTop = feed.scrollHeight;
+  if (firstPaint) {
+    // Opened: the person's last message at the top, the answer below it.
+    const lastUser = [...feed.querySelectorAll('.st-msg-user')].pop();
+    feed.scrollTop = lastUser ? Math.max(0, lastUser.offsetTop - feed.offsetTop - 12) : feed.scrollHeight;
+  } else if (atBottom) feed.scrollTop = feed.scrollHeight;
 }
 
 // Same element, new content: steps keep their rows so a spinner turns into a check in place.
@@ -512,14 +525,14 @@ const stInline = (s) => {
   return out.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/`([^`]+)`/g, '$1');
 };
 
-function stStepHtml(s, live, progress, status = 'work') {
+function stStepHtml(s, live, progress, status = 'work', checked = true) {
   const [ic, done, doing] = StudioWords.stepWords(s.tool, s.input, ST.lang);
   let text = s.state === 'running' ? doing : done;
   if (s.state === 'running' && progress && live && progress.total > 1) {
     text += ` — ${STW().step(progress.index, progress.total)}`;
   }
   const state = s.state === 'running' && !live ? 'stopped' : s.state;
-  const mark = state === 'ok' ? `<span class="st-ok">${icon('check', 14)}</span>`
+  const mark = state === 'ok' ? (checked ? `<span class="st-ok">${icon('check', 12)}</span>` : '')
     : state === 'running' ? stDot(status === 'needs' ? 'needs' : 'work')
       : state === 'denied' ? `<span class="st-no">${icon('x', 13)}</span>`
         : state === 'error' ? `<span class="st-no">${icon('x', 13)}</span>` : '';
@@ -553,8 +566,8 @@ function stFiles(k) {
 function stFileCard(k, item, i) {
   const w = STW();
   if (item.kind === 'shot') {
-    return `<button class="st-fc" data-file="${esc(item.key)}" data-sig="${esc(item.key)}" data-kind="shot" data-i="${item.i}" style="--i:${Math.min(i, 5)}">
-      <span class="st-th img">${stImg(stShotKey(item.s))}</span><span class="st-fmeta"><span class="st-fn">${esc(w.shot)} ${item.i + 1}</span><span class="st-fm">${esc(stAgo(item.s.at))}</span></span></button>`;
+    return `<button class="st-fc" data-file="${esc(item.key)}" data-sig="${esc(item.key)}|${k.model.shots.length}" data-kind="shot" data-i="${item.i}" style="--i:${Math.min(i, 5)}">
+      <span class="st-th img">${stImg(stShotKey(item.s))}</span><span class="st-fmeta"><span class="st-fn">${esc(item.i === 0 && k.model.shots.length > 1 ? w.shotBefore : item.i === k.model.shots.length - 1 && k.model.shots.length > 1 ? w.shotAfter : `${w.shot} ${item.i + 1}`)}</span><span class="st-fm">${esc(stAgo(item.s.at))}</span></span></button>`;
   }
   const f = item.f;
   const thumb = k.thumbs.get(f.rel);
@@ -616,7 +629,7 @@ function stRenderChips(t) {
   const site = t && stTask(t).site && !ST.pointing;
   const point = site ? `<button type="button" class="st-chip hero" data-point>${stCursorIcon()}<span>${esc(w.pointChip)}</span></button>` : '';
   const picked = ST.pointing && ST.picked?.length ? `<span class="st-picked">${stCursorIcon()}${esc(ST.picked[0].name)}${ST.picked.length > 1 ? ` ${esc(w.andMore(ST.picked.length - 1))}` : ''}</span>` : '';
-  const html = (show ? `<span class="st-role">${esc(w.roles[role])}</span>${w.chips[role].map((c) => `<button type="button" class="st-chip" data-chip="${esc(c)}">${esc(c)}</button>`).join('')}` : '') + point + picked;
+  const html = (show ? `${w.chips[role].map((c) => `<button type="button" class="st-chip" data-chip="${esc(c)}">${esc(c)}</button>`).join('')}` : '') + point + picked;
   if (box.dataset.html !== html) { box.innerHTML = html; box.dataset.html = html; }
   box.hidden = !html;
 }
@@ -641,16 +654,36 @@ function stRenderResult(t) {
     html = `<div class="st-r-head"><span class="st-r-name">${esc(w.shot)} ${sel.key + 1}</span></div><div class="st-r-img">${stImg(stShotKey(shots[sel.key]))}</div>`;
   } else if (k?.site) {
     const shot = shots[shots.length - 1];
-    html = `<div class="st-r-head"><span class="st-url">${icon('lock', 12)}<b>${esc(StudioWords.host(k.site))}</b></span>${shot ? `<span class="st-r-sub">${esc(w.lastShot)}</span>` : ''}<div class="grow"></div>
+    html = `<div class="st-r-head"><span class="st-url">${icon('lock', 12)}<b>${esc(StudioWords.host(k.site))}</b></span>${shot ? `<span class="st-r-sub">${esc(shots.length > 1 ? w.wipeHint : w.lastShot)}</span>` : ''}<div class="grow"></div>
       <button class="st-btn pri" data-r="site">${icon('layers', 14)}<span>${esc(w.showSite)}</span></button></div>`
-      + (shot ? `<div class="st-r-img">${stImg(stShotKey(shot))}</div>` : `<div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(StudioWords.host(k.site))}</div></div>`);
+      + (shot ? (shots.length > 1 ? stWipeHtml(shots[0], shot) : `<div class="st-r-img">${stImg(stShotKey(shot))}</div>`) : `<div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(StudioWords.host(k.site))}</div></div>`);
   } else if (shots.length) {
-    html = `<div class="st-r-img">${stImg(stShotKey(shots[shots.length - 1]))}</div>`;
+    html = shots.length > 1 ? stWipeHtml(shots[0], shots[shots.length - 1]) : `<div class="st-r-img">${stImg(stShotKey(shots[shots.length - 1]))}</div>`;
   } else {
     html = `<div class="st-r-empty">${icon('eye', 22)}<p>${esc(w.resultEmpty)}</p></div>`;
   }
   if (pane.dataset.html !== html) { pane.innerHTML = html; pane.dataset.html = html; pane.classList.remove('st-fade'); void pane.offsetWidth; pane.classList.add('st-fade'); }
   stFillImages(pane);
+}
+
+// До/После as a wipe: the first snapshot under the latest, a handle to drag (double click: half).
+function stWipeHtml(before, after) {
+  const w = STW();
+  return `<div class="st-wipe" style="--x:50%"><div class="st-wipe-after">${stImg(stShotKey(after))}</div>
+    <div class="st-wipe-before">${stImg(stShotKey(before))}</div>
+    <span class="st-wipe-h" role="slider" aria-label="${esc(w.before)} / ${esc(w.after)}" tabindex="0"><i></i></span></div>`;
+}
+function stWipeDrag(e) {
+  const box = e.target.closest('.st-wipe');
+  if (!box) return;
+  const set = (x) => { const r = box.getBoundingClientRect(); box.style.setProperty('--x', `${Math.max(0, Math.min(100, ((x - r.left) / r.width) * 100))}%`); };
+  if (e.type === 'dblclick') { box.classList.add('snap'); box.style.setProperty('--x', '50%'); setTimeout(() => box.classList.remove('snap'), 200); return; }
+  e.preventDefault();
+  set(e.clientX);
+  const move = (m) => set(m.clientX);
+  const up = () => { removeEventListener('pointermove', move); removeEventListener('pointerup', up); };
+  addEventListener('pointermove', move);
+  addEventListener('pointerup', up);
 }
 
 function stRenderResultBar(t) {
