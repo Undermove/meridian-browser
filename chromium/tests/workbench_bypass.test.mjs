@@ -66,6 +66,8 @@ test('a Claude Code tab restarts with bypass permissions, after asking, in the s
     // A warning dot on the tab says so.
     await wb.waitFor(`!!document.querySelector('.ttab.active .tab-settings.risky') && S.activeTerm.permissionMode === 'bypassPermissions'`, 15000);
     assert.match(await wb.eval(`document.querySelector('.ttab.active .tab-settings').title`), /Bypass/);
+    // The tab says so as soon as it asked for the restart; the program writes its log once it runs.
+    for (let i = 0; i < 100 && runs().length < 2; i++) await new Promise((r) => setTimeout(r, 100));
     const again = runs().at(-1);
     assert.equal(runs().length, 2);
     assert.equal(again[again.indexOf('--resume') + 1], 's1');
