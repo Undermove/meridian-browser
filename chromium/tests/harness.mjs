@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { installGuard } from './isolation.mjs';
-import { startSpaceWatch, screenTaken, SPACE_GUARD_MODE } from './space_guard.mjs';
+import { startSpaceWatch, screenTaken, ownSwitches, watchPid, SPACE_GUARD_MODE } from './space_guard.mjs';
 
 // Every test file: the owner's login environment out of every process it starts, and his real AI
 // configs hashed before and after (isolation.mjs); on macOS, no test may switch his Space or put
@@ -19,6 +19,7 @@ beforeEach(() => { testStarted = Date.now(); });
 afterEach(async (t) => {
   await new Promise((r) => setTimeout(r, 400));  // the watcher's last look
   const taken = screenTaken(testStarted, Date.now(), testPids);
+  for (const own of ownSwitches()) console.error(`space guard (${t.name}): ${own}`);
   if (!taken.length) return;
   const why = `reached past the test, onto the person's screen (a window background mode missed, or an app macOS started):\n  ${taken.join('\n  ')}`;
   if (SPACE_GUARD_MODE === 'warn') console.error(`SPACE GUARD (${t.name}): ${why}`);
@@ -245,6 +246,7 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
     ...(env ? { env: { ...process.env, ...env } } : {}) });
   running.add(proc);
   testPids.add(proc.pid);
+  watchPid(proc.pid);
   proc.once('exit', () => running.delete(proc));
   const base = `http://127.0.0.1:${port}`;
   let ui;
