@@ -139,12 +139,34 @@ test('site controls stay open when the pointer leaves a sidebar that stays; with
 
     // The floating sidebar (hidden with ⌘S, out from the left edge): the controls open in it, and
     // when the pointer leaves, both go.
-    await b.eval(`(() => { app.onMeridianToggleSidebar_(); app.onEdgeHotzoneMouseenter_(); app.$.tabstrip.pointerOverWindowControls = async () => false; return true; })()`);
-    await b.waitFor(`app.sidebarHidden_ && app.sidebarPeek_`);
-    await b.click(`app.$.locationIconButton`);
-    await b.waitFor(`app.$.siteControl.open`);
-    await b.eval(`(app.onSidebarMouseleave_(), true)`);
-    await b.waitFor(`!app.$.siteControl.open && !app.sidebarPeek_`, 3000);
+    if (process.platform === 'win32') {
+      // Windows: the button is in the top bar, not in the sidebar, and the controls belong to it.
+      // The sidebar hidden (not floating): they open in sight and take the pointer, over the page
+      // (they used to open unseen behind it, inside the hidden sidebar); a floating sidebar that
+      // goes doesn't take them.
+      await b.eval(`(() => { app.onMeridianToggleSidebar_(); app.$.tabstrip.pointerOverWindowControls = async () => false; return true; })()`);
+      await b.waitFor(`app.sidebarHidden_ && !app.sidebarPeek_`);
+      await sleep(400);
+      await b.click(`app.$.locationIconButton`);
+      await b.waitFor(`app.$.siteControl.open`);
+      await sleep(600);
+      assert.equal(await b.eval(`(() => { const r = app.$.siteControl.shadowRoot.querySelector('#boostRow, .boost-row').getBoundingClientRect(); const hit = app.shadowRoot.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2); return hit === app.$.siteControl; })()`), true, 'on top of the page');
+      await b.eval(`(app.onEdgeHotzoneMouseenter_(), true)`);
+      await b.waitFor(`app.sidebarPeek_`);
+      await b.eval(`(app.onSidebarMouseleave_(), true)`);
+      await b.waitFor(`!app.sidebarPeek_`, 3000);
+      await sleep(600);
+      assert.equal(await b.eval(`app.$.siteControl.open`), true, 'the top bar’s controls stay');
+      await b.key('Escape', 'Escape', 27);
+      await b.waitFor(`!app.$.siteControl.open`);
+    } else {
+      await b.eval(`(() => { app.onMeridianToggleSidebar_(); app.onEdgeHotzoneMouseenter_(); app.$.tabstrip.pointerOverWindowControls = async () => false; return true; })()`);
+      await b.waitFor(`app.sidebarHidden_ && app.sidebarPeek_`);
+      await b.click(`app.$.locationIconButton`);
+      await b.waitFor(`app.$.siteControl.open`);
+      await b.eval(`(app.onSidebarMouseleave_(), true)`);
+      await b.waitFor(`!app.$.siteControl.open && !app.sidebarPeek_`, 3000);
+    }
 
     // Floating, left, then shown again (⌘S) before it went: the controls opened then stay.
     await b.eval(`(app.onEdgeHotzoneMouseenter_(), true)`);

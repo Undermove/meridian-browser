@@ -76,6 +76,9 @@ test('a click on a suggestion opens it: a page from history, a search, after the
     await press(b, `${ROWS}[${page}]`);
     await b.waitFor(`!${BAR}.open`, 10000, `${ROWS}.map((m) => m.match.destinationUrl)`);
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 2`);
+    // (The new tab is about:blank for a moment before the page starts loading in it.)
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive)?.tab.url.endsWith('/p/Kiwi%20Orchard')`,
+        10000, `[...${SB}.querySelectorAll('meridian-tab-row')].map((r) => r.tab.url)`);
     let tab = await activeTab(b);
     assert.match(tab.url, /\/p\/Kiwi%20Orchard$/, 'the page, in a new tab (⌘T)');
 
@@ -102,6 +105,7 @@ test('a click on a suggestion opens it: a page from history, a search, after the
     await press(b, `${ROWS}[${st.shown.findIndex((m) => m.url.includes('/p/Kiwi'))}]`);
     await b.waitFor(`!${BAR}.open`);
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 4`);
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive)?.tab.url.endsWith('/p/Kiwi%20Orchard')`, 10000);
     assert.match((await activeTab(b)).url, /\/p\/Kiwi%20Orchard$/);
   } finally { await b.close(); await site.close(); }
 });
