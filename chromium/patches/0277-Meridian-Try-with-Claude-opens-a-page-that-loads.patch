@@ -1,0 +1,345 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 11:42:17 +0400
+Subject: [PATCH 277/297] Meridian: "Try with Claude" opens a page that loads
+
+"Give this site a new look" on an empty tab opened the first website at
+CERN, whose certificate expired: the person saw "Your connection is not
+private". Each card now has a list of plain pages, best first, and opens
+the first that answers (HEAD, no cookies, 4 s, all at once):
+meridianbrowser.app/demo/plain.html, then paulgraham.com and danluu.com
+to restyle; Hacker News, then text.npr.org to critique. Tests name the
+pages that "answer" with --meridian-reachable-urls (no network).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   2 +
+ chrome/browser/meridian/reachable.cc          | 145 ++++++++++++++++++
+ chrome/browser/meridian/reachable.h           |  29 ++++
+ chrome/browser/meridian/sidebar.mojom         |   5 +
+ chrome/browser/meridian/sidebar_handler.cc    |   7 +
+ chrome/browser/meridian/sidebar_handler.h     |   2 +
+ .../webui_browser/meridian/showcase.ts        |  30 ++--
+ .../webui_browser/meridian/try_claude.ts      |   5 +-
+ 8 files changed, 213 insertions(+), 12 deletions(-)
+ create mode 100644 chrome/browser/meridian/reachable.cc
+ create mode 100644 chrome/browser/meridian/reachable.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 59ffc39d1e..bb0afc7ab2 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -406,6 +406,8 @@ source_set("meridian") {
+     "little_window.h",
+     "currency_rates.cc",
+     "currency_rates.h",
++    "reachable.cc",
++    "reachable.h",
+     "sidebar_handler.cc",
+     "sidebar_handler.h",
+     "sidebar_handler_report.cc",
+diff --git a/chrome/browser/meridian/reachable.cc b/chrome/browser/meridian/reachable.cc
+new file mode 100644
+index 0000000000..4076e38418
+--- /dev/null
++++ b/chrome/browser/meridian/reachable.cc
+@@ -0,0 +1,145 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/reachable.h"
++
++#include <memory>
++#include <string>
++#include <utility>
++
++#include "base/memory/ref_counted.h"
++#include "base/strings/string_split.h"
++#include "base/time/time.h"
++#include "chrome/browser/meridian/test_switches.h"
++#include "chrome/browser/profiles/profile.h"
++#include "content/public/browser/storage_partition.h"
++#include "net/http/http_response_headers.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++
++namespace meridian {
++
++namespace {
++
++constexpr base::TimeDelta kTimeout = base::Seconds(4);
++
++constexpr net::NetworkTrafficAnnotationTag kAnnotation =
++    net::DefineNetworkTrafficAnnotation("meridian_reachable_page", R"(
++      semantics {
++        sender: "Meridian Try with Claude"
++        description:
++          "Before opening a sample page for a Try with Claude card (a plain "
++          "page to restyle or critique), checks that it loads, to open "
++          "another one if it doesn't."
++        trigger: "Clicking a Try with Claude card on an empty tab."
++        data: "None: a HEAD request without cookies."
++        destination: WEBSITE
++      }
++      policy {
++        cookies_allowed: NO
++        setting: "None: only when the person clicks the card."
++        policy_exception_justification: "Person-initiated."
++      })");
++
++class Probe : public base::RefCounted<Probe> {
++ public:
++  Probe(std::vector<GURL> urls, base::OnceCallback<void(const GURL&)> done)
++      : urls_(std::move(urls)),
++        state_(urls_.size(), kPending),
++        done_(std::move(done)) {}
++
++  void Start(scoped_refptr<network::SharedURLLoaderFactory> factory) {
++    for (size_t i = 0; i < urls_.size(); ++i) {
++      auto request = std::make_unique<network::ResourceRequest>();
++      request->url = urls_[i];
++      request->method = "HEAD";
++      request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++      auto loader =
++          network::SimpleURLLoader::Create(std::move(request), kAnnotation);
++      loader->SetTimeoutDuration(kTimeout);
++      network::SimpleURLLoader* raw = loader.get();
++      loaders_.push_back(std::move(loader));
++      raw->DownloadHeadersOnly(
++          factory.get(), base::BindOnce(&Probe::OnHeaders,
++                                        base::WrapRefCounted(this), i));
++    }
++    Decide();
++  }
++
++ private:
++  friend class base::RefCounted<Probe>;
++  enum State { kPending, kOk, kFailed };
++  ~Probe() = default;
++
++  void OnHeaders(size_t i, scoped_refptr<net::HttpResponseHeaders> headers) {
++    // Any answer short of a server error counts: some sites refuse HEAD
++    // (405) but load fine. No headers: no connection, a bad certificate or
++    // the timeout.
++    state_[i] = headers && headers->response_code() < 500 ? kOk : kFailed;
++    Decide();
++  }
++
++  // The first in order that answered, once the ones before it failed.
++  void Decide() {
++    if (!done_) {
++      return;
++    }
++    for (size_t i = 0; i < urls_.size(); ++i) {
++      if (state_[i] == kPending) {
++        return;
++      }
++      if (state_[i] == kOk) {
++        return Finish(urls_[i]);
++      }
++    }
++    Finish(urls_.empty() ? GURL() : urls_[0]);
++  }
++
++  void Finish(const GURL& url) {
++    std::move(done_).Run(url);
++    // The rest are cancelled (deleting a loader in its callback is fine).
++    loaders_.clear();
++  }
++
++  std::vector<GURL> urls_;
++  std::vector<State> state_;
++  std::vector<std::unique_ptr<network::SimpleURLLoader>> loaders_;
++  base::OnceCallback<void(const GURL&)> done_;
++};
++
++}  // namespace
++
++void FirstReachableUrl(Profile* profile,
++                       std::vector<GURL> urls,
++                       base::OnceCallback<void(const GURL&)> done) {
++  std::erase_if(urls, [](const GURL& u) { return !u.SchemeIs("https"); });
++  if (urls.empty()) {
++    std::move(done).Run(GURL());
++    return;
++  }
++  if (HasTestSwitch("meridian-reachable-urls")) {
++    std::vector<std::string> answer = base::SplitString(
++        TestSwitchValue("meridian-reachable-urls"), ",",
++        base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++    for (const GURL& url : urls) {
++      if (std::ranges::find(answer, url.spec()) != answer.end()) {
++        std::move(done).Run(url);
++        return;
++      }
++    }
++    std::move(done).Run(urls[0]);
++    return;
++  }
++  if (!profile) {
++    std::move(done).Run(urls[0]);
++    return;
++  }
++  auto probe = base::MakeRefCounted<Probe>(std::move(urls), std::move(done));
++  probe->Start(profile->GetDefaultStoragePartition()
++                   ->GetURLLoaderFactoryForBrowserProcess());
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/reachable.h b/chrome/browser/meridian/reachable.h
+new file mode 100644
+index 0000000000..c84fbde4c6
+--- /dev/null
++++ b/chrome/browser/meridian/reachable.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_REACHABLE_H_
++#define CHROME_BROWSER_MERIDIAN_REACHABLE_H_
++
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "url/gurl.h"
++
++class Profile;
++
++namespace meridian {
++
++// The first of `urls` (https) that answers within a few seconds with a valid
++// certificate and no server error, checked all at once with a HEAD request
++// and no cookies; the first one when none does. For pages Meridian opens by
++// itself ("Try with Claude"), so a site that's down or whose certificate
++// expired isn't what the person sees. Tests list the ones that "answer" in
++// --meridian-reachable-urls instead (no network).
++void FirstReachableUrl(Profile* profile,
++                       std::vector<GURL> urls,
++                       base::OnceCallback<void(const GURL&)> done);
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_REACHABLE_H_
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 5170eb44f6..748c1c2c61 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -941,4 +941,9 @@ interface SidebarHandler {
+   // opened. http(s) only; "" when it can't be added.
+   AddPinnedLink(ItemPosition position, string title, url.mojom.Url url)
+       => (string item_id);
++
++  // "Try with Claude" cards: the first of `urls` that loads (answers over
++  // https with a valid certificate, quickly), else the first. Nothing is
++  // sent but the request itself: no cookies.
++  FirstReachableUrl(array<url.mojom.Url> urls) => (url.mojom.Url url);
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 25c66238c1..7e9878db6d 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -87,6 +87,7 @@
+ #include "components/version_info/version_info.h"
+ #include "chrome/browser/meridian/little_window.h"
+ #include "chrome/browser/meridian/now_playing.h"
++#include "chrome/browser/meridian/reachable.h"
+ #include "chrome/browser/meridian/test_switches.h"
+ #include "chrome/browser/shell_integration.h"
+ #include "chrome/browser/ui/browser_commands.h"
+@@ -3567,6 +3568,12 @@ void SidebarHandler::AddFolder(mojom::ItemPositionPtr position,
+       position->container, position->parent_id, position->index, folder));
+ }
+ 
++void SidebarHandler::FirstReachableUrl(const std::vector<GURL>& urls,
++                                       FirstReachableUrlCallback callback) {
++  meridian::FirstReachableUrl(ActiveSpaceProfile(), urls,
++                              std::move(callback));
++}
++
+ void SidebarHandler::AddPinnedLink(mojom::ItemPositionPtr position,
+                                    const std::string& title,
+                                    const GURL& url,
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index d368a6055b..b7af59f4dc 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -318,6 +318,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+                      const std::string& title,
+                      const GURL& url,
+                      AddPinnedLinkCallback callback) override;
++  void FirstReachableUrl(const std::vector<GURL>& urls,
++                         FirstReachableUrlCallback callback) override;
+   void ShareTabInstead(const tabs_api::NodeId& tab_id) override;
+   void CanShareTabInstead(const tabs_api::NodeId& tab_id,
+                           CanShareTabInsteadCallback callback) override;
+diff --git a/chrome/browser/resources/webui_browser/meridian/showcase.ts b/chrome/browser/resources/webui_browser/meridian/showcase.ts
+index 5dbbfa3155..464fb4b81a 100644
+--- a/chrome/browser/resources/webui_browser/meridian/showcase.ts
++++ b/chrome/browser/resources/webui_browser/meridian/showcase.ts
+@@ -42,25 +42,35 @@ export const SHOWCASE: ShowcaseCard[] = [
+ 
+ export const DEFAULT_TOPIC = 'UI design trends 2026';
+ 
+-// Plain pages that always load: the first website ever (CERN keeps it as it
+-// was in 1992), and a famously bare one to critique.
+-export const RESTYLE_PAGE =
+-    'https://info.cern.ch/hypertext/WWW/TheProject.html';
+-export const CRITIQUE_PAGE = 'https://news.ycombinator.com/';
++// Plain pages to work on from an empty tab, best first; the first that loads
++// opens (FirstReachableUrl: a site that's down or whose certificate expired
++// is skipped). For restyling, our own deliberately plain article
++// (meridianbrowser.app/demo/plain.html), then two famously plain, long-lived
++// personal sites; to critique, Hacker News, then NPR's text-only site.
++export const RESTYLE_PAGES = [
++  'https://meridianbrowser.app/demo/plain.html',
++  'https://paulgraham.com/greatwork.html',
++  'https://danluu.com/',
++];
++export const CRITIQUE_PAGES = [
++  'https://news.ycombinator.com/',
++  'https://text.npr.org/',
++];
+ 
+ function isWebPage(url: string): boolean {
+   return /^https?:\/\//.test(url);
+ }
+ 
+-// The page to open first, or '' to keep the one in front.
+-export function sceneFor(id: ShowcaseId, activeUrl: string): string {
++// The pages to try opening first (best first), or [] to keep the one in
++// front.
++export function sceneFor(id: ShowcaseId, activeUrl: string): string[] {
+   if (id === 'restyle' && !isWebPage(activeUrl)) {
+-    return RESTYLE_PAGE;
++    return RESTYLE_PAGES;
+   }
+   if (id === 'critique' && !isWebPage(activeUrl)) {
+-    return CRITIQUE_PAGE;
++    return CRITIQUE_PAGES;
+   }
+-  return '';
++  return [];
+ }
+ 
+ // "Reply in Russian." for a person whose Meridian isn't in English.
+diff --git a/chrome/browser/resources/webui_browser/meridian/try_claude.ts b/chrome/browser/resources/webui_browser/meridian/try_claude.ts
+index 57415d6114..26e7d0335c 100644
+--- a/chrome/browser/resources/webui_browser/meridian/try_claude.ts
++++ b/chrome/browser/resources/webui_browser/meridian/try_claude.ts
+@@ -96,8 +96,9 @@ export class MeridianTryClaudeElement extends CrLitElement {
+       claude = await this.handler_.getClaudeDesktop();
+     }
+     const scene = sceneFor(id, this.host?.activeUrl() || '');
+-    if (scene) {
+-      this.host?.openUrl(scene);
++    if (scene.length) {
++      const {url} = await this.handler_.firstReachableUrl(scene);
++      this.host?.openUrl(url || scene[0]!);
+     }
+     this.request_ = showcaseRequest(id, topic);
+     if (claude.needsRestart) {

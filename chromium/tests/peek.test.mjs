@@ -101,3 +101,41 @@ test('a pinned tab of another site opened from the sidebar is a tab, not a Peek'
     await b.waitFor(`${itemEl('Other site')}.shadowRoot.querySelector('.row.active')`);
   } finally { await b.close(); site.close(); }
 });
+
+// "Open as Tab ▾": the peeked page as a tab in another space, which comes up with it.
+test('Peek: Open as Tab ▾ opens it as a tab in another space', async () => {
+  const site = await twoSites();
+  const b = await launch([site.url]);
+  try {
+    await b.waitFor(today(1));
+    await b.menu(`${SB}.querySelector('meridian-tab-row')`, 'Pin Tab');
+    await b.waitFor(`!!${itemEl('App')}`);
+    const page = (await (await fetch(`${b.base}/json/list`)).json()).find((t) => t.type === 'page' && t.url.includes('/app'));
+    const ws = new WebSocket(page.webSocketDebuggerUrl);
+    await new Promise((r) => ws.onopen = r);
+    // One space: no ▾.
+    ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: `document.getElementById('out').click()`, userGesture: true } }));
+    await b.waitFor(`${CR}.hasAttribute('peek')`);
+    assert.equal(await b.eval(`${CR}.shadowRoot.getElementById('peekMore').hidden`), true);
+    await b.click(`${CR}.shadowRoot.querySelector('#peekBar button[data-action="close"]')`);
+    await b.waitFor(`!${CR}.hasAttribute('peek')`);
+
+    await b.eval(`app.$.tabstrip.handler_.createSpace('Work', '', '#e08a8a', '#f0b5a8')`);
+    await b.waitFor(`app.$.tabstrip.state_.spaces.length === 2`);
+    const [first, work] = await b.eval(`app.$.tabstrip.state_.spaces.map((s) => s.id)`);
+    ws.send(JSON.stringify({ id: 2, method: 'Runtime.evaluate', params: { expression: `document.getElementById('out').click()`, userGesture: true } }));
+    await b.waitFor(`${CR}.hasAttribute('peek') && !${CR}.shadowRoot.getElementById('peekMore').hidden`);
+    await b.click(`${CR}.shadowRoot.getElementById('peekMore')`);
+    await b.waitFor(`!!app.shadowRoot.getElementById('peekSpaces')`);
+    assert.deepEqual(await b.eval(`[...app.shadowRoot.querySelectorAll('#peekSpaces .little-space')].map((e) => e.textContent.trim())`), ['Work'], 'the other spaces');
+    assert.equal(await b.eval(`app.shadowRoot.activeElement?.dataset.space`), work, 'the keyboard is in the menu');
+    if (process.env.MERIDIAN_SHOTS) await b.screenshot(`${process.env.MERIDIAN_SHOTS}/peek-menu.png`);
+    await b.click(`app.shadowRoot.querySelector('#peekSpaces .little-space')`);
+    await b.waitFor(`app.$.tabstrip.state_.activeSpaceId === ${JSON.stringify(work)}`);
+    await b.waitFor(`!${CR}.hasAttribute('peek')`);
+    await b.waitFor(`[...app.$.tabstrip.tabs_.values()].find((t) => t.isActive)?.title === 'Other site'`);
+    assert.ok(await b.eval(`app.$.tabstrip.state_.tabs.some((t) => t.spaceId === ${JSON.stringify(work)} && !t.peek)`));
+    assert.notEqual(first, work);
+    ws.close();
+  } finally { await b.close(); site.close(); }
+});

@@ -1,0 +1,368 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 11:45:33 +0400
+Subject: [PATCH 278/297] Meridian: "Allow for this task" on the agent's
+ question
+
+At access level "ask", a six-link moodboard took a dozen "Allow"s. The
+card now offers Allow once, Allow for this task and Deny (Always allow
+stays as the link). Allow for this task lets this agent's connection
+(its name and bridge process) act without asking on every site,
+including ones the person is signed in to, as the card says, until it
+reconnects, Stop is pressed, access changes, or 30 minutes pass. Its
+waiting questions are answered with it. Another connection is still
+asked. The question goes through a new AskAgentAction (choice string);
+AskAgent stays for the first "may it connect" question.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/meridian/agent/agent_service.cc   | 35 ++++++++++--
+ chrome/browser/meridian/agent/agent_service.h |  4 ++
+ chrome/browser/meridian/sidebar.mojom         |  7 +++
+ chrome/browser/meridian/sidebar_handler.cc    | 17 ++++++
+ chrome/browser/meridian/sidebar_handler.h     |  7 +++
+ .../webui_browser/meridian/agent.css          | 12 ++++
+ .../webui_browser/meridian/agent.html.ts      | 17 +++++-
+ .../resources/webui_browser/meridian/agent.ts | 57 +++++++++++++++----
+ 8 files changed, 138 insertions(+), 18 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index 0519a4756f..c90e350cb9 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -92,6 +92,9 @@ namespace {
+ 
+ constexpr int kRead = 1, kAsk = 2, kFull = 3;
+ 
++// How long "Allow for this task" lasts at most.
++constexpr base::TimeDelta kTaskGrant = base::Minutes(30);
++
+ int Rank(const std::string& access) {
+   return access == "full"   ? kFull
+          : access == "ask"  ? kAsk
+@@ -780,6 +783,7 @@ const base::ListValue& AgentService::Tools() {
+ }
+ 
+ void AgentService::OnAccessChanged() {
++  task_grants_.clear();
+   // Off by the person's decision: nothing listens. Not decided yet: the
+   // private socket is there so that a connected agent can ask.
+   bool on = Rank(profile_->GetPrefs()->GetString(prefs::kAgentAccess)) > 0 ||
+@@ -796,6 +800,9 @@ void AgentService::OnAccessChanged() {
+ 
+ void AgentService::SetPaused(bool paused) {
+   paused_ = paused;
++  if (paused) {
++    task_grants_.clear();
++  }
+   if (BrowserWindowInterface* window = Window()) {
+     SidebarHandler::AgentActivity(window, std::string(), std::string(),
+                                   std::string(), std::string(), paused_);
+@@ -1113,15 +1120,30 @@ void AgentService::Confirm(
+   if (!call->StillOnSameDocument()) {
+     return call->Fail("The page changed, so nothing was done. Look at it again.");
+   }
+-  SidebarHandler::AskAgent(
+-      window, client, summary,
++  // The agent's connection: its name and its bridge process (a new one
++  // when it reconnects).
++  std::string task = client + " · " + call->caller.client_id;
++  if (auto it = task_grants_.find(task); it != task_grants_.end()) {
++    if (base::TimeTicks::Now() < it->second) {
++      std::move(then).Run(std::move(call));
++      return;
++    }
++    task_grants_.erase(it);
++  }
++  SidebarHandler::AskAgentAction(
++      window, client, summary, task,
+       base::BindOnce(
+-          [](std::unique_ptr<Call> call,
++          [](base::WeakPtr<AgentService> self, std::string task,
++             std::unique_ptr<Call> call,
+              base::OnceCallback<void(std::unique_ptr<Call>)> then,
+-             bool allowed) {
+-            if (!allowed) {
++             const std::string& choice) {
++            if (choice != "once" && choice != "task" && choice != "always") {
+               return call->Fail("The person declined this action.");
+             }
++            if (choice == "task" && self) {
++              self->task_grants_[task] =
++                  base::TimeTicks::Now() + kTaskGrant;
++            }
+             if (!call->StillOnSameDocument()) {
+               return call->Fail(
+                   "The page changed while waiting for approval, so nothing "
+@@ -1129,7 +1151,8 @@ void AgentService::Confirm(
+             }
+             std::move(then).Run(std::move(call));
+           },
+-          std::move(call), std::move(then)));
++          weak_factory_.GetWeakPtr(), task, std::move(call),
++          std::move(then)));
+ }
+ 
+ void AgentService::RunInPage(content::WebContents* contents,
+diff --git a/chrome/browser/meridian/agent/agent_service.h b/chrome/browser/meridian/agent/agent_service.h
+index 9c07dcddc7..55f70795a9 100644
+--- a/chrome/browser/meridian/agent/agent_service.h
++++ b/chrome/browser/meridian/agent/agent_service.h
+@@ -159,6 +159,10 @@ class AgentService : public KeyedService {
+   std::unique_ptr<AgentServer> server_;
+   bool paused_ = false;
+   std::vector<std::pair<base::DictValue, Reply>> waiting_for_access_;
++  // "Allow for this task": an agent's connection (client name and bridge
++  // process) acts without asking until then. Gone with Stop, a change of
++  // access level, or when the agent reconnects (a new bridge process).
++  std::map<std::string, base::TimeTicks> task_grants_;
+   // Each client's current tab (the last it opened or used).
+   std::map<std::string, tabs::TabHandle> current_tab_;
+   // Tabs an agent works in stay awake (not frozen or throttled in the
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 748c1c2c61..ebd3e27b07 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -570,6 +570,13 @@ interface SidebarPage {
+   // "leave" when the pointer leaves the link.
+   OnLinkPreview(string phase, string url, string title, string summary,
+                 string host, string error);
++
++  // Access level "ask": the person answers one action. `task` names the
++  // agent's connection (an app, until it disconnects): "once", "task" (this
++  // connection may act without asking for 30 minutes), "always" (agent
++  // access set to full) or "deny".
++  AskAgentAction(string client, string summary, string task)
++      => (string choice);
+ };
+ 
+ interface SidebarHandler {
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 7e9878db6d..e129d3af33 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -1123,6 +1123,23 @@ void SidebarHandler::AskAgent(BrowserWindowInterface* browser,
+       mojo::WrapCallbackWithDefaultInvokeIfNotRun(std::move(done), false));
+ }
+ 
++void SidebarHandler::AskAgentAction(
++    BrowserWindowInterface* browser,
++    const std::string& client,
++    const std::string& summary,
++    const std::string& task,
++    base::OnceCallback<void(const std::string&)> done) {
++  SidebarHandler* handler = For(browser);
++  if (!handler || !handler->page_.is_connected()) {
++    std::move(done).Run("deny");
++    return;
++  }
++  handler->page_->AskAgentAction(
++      client, summary, task,
++      mojo::WrapCallbackWithDefaultInvokeIfNotRun(std::move(done),
++                                                  std::string("deny")));
++}
++
+ namespace {
+ 
+ // The AI features' question goes to the frontmost Meridian window of the
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index b7af59f4dc..81851dd3b1 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -357,6 +357,13 @@ class SidebarHandler : public mojom::SidebarHandler,
+                        const std::string& client,
+                        const std::string& summary,
+                        base::OnceCallback<void(bool)> done);
++  // One action at access level "ask" (AskAgentAction in sidebar.mojom):
++  // "deny" if the window goes away first.
++  static void AskAgentAction(BrowserWindowInterface* browser,
++                             const std::string& client,
++                             const std::string& summary,
++                             const std::string& task,
++                             base::OnceCallback<void(const std::string&)> done);
+ 
+   // SidebarService::Observer:
+   void OnSidebarChanged() override;
+diff --git a/chrome/browser/resources/webui_browser/meridian/agent.css b/chrome/browser/resources/webui_browser/meridian/agent.css
+index 8d8e62fe04..2f9d0eb4fc 100644
+--- a/chrome/browser/resources/webui_browser/meridian/agent.css
++++ b/chrome/browser/resources/webui_browser/meridian/agent.css
+@@ -139,6 +139,18 @@ button:disabled {
+   word-break: break-word;
+ }
+ 
++.task-note {
++  margin: 10px 0 0;
++  font-size: 12px;
++  line-height: 1.45;
++  color: var(--meridian-text-muted);
++}
++
++.task-note b {
++  color: var(--meridian-text);
++  font-weight: 600;
++}
++
+ .actions {
+   display: flex;
+   justify-content: flex-end;
+diff --git a/chrome/browser/resources/webui_browser/meridian/agent.html.ts b/chrome/browser/resources/webui_browser/meridian/agent.html.ts
+index 8537e80d43..c9ad1563ac 100644
+--- a/chrome/browser/resources/webui_browser/meridian/agent.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/agent.html.ts
+@@ -24,6 +24,12 @@ ${this.question_ ? html`
+     <div class="card" @keydown="${this.onCardKeydown_}">
+       <h3><b>${this.question_.client}</b> wants to</h3>
+       <pre class="summary">${this.question_.summary}</pre>
++      ${this.question_.task ? html`
++        <p class="task-note" id="taskNote">
++          <b>Allow for this task</b> lets ${this.question_.client} act
++          without asking on every site, including ones you’re signed in
++          to, until it disconnects or for 30 minutes.
++          Stop ends it at once.</p>` : ''}
+       <div class="actions">
+         <button id="always" class="btn link"
+             title="Don’t ask again: agents act without asking (Settings › AI › Agent access)"
+@@ -31,8 +37,15 @@ ${this.question_ ? html`
+         <div class="grow"></div>
+         <button id="deny" class="btn" @click="${this.onDenyClick_}">Deny
+         </button>
+-        <button id="allow" class="btn primary" @click="${this.onAllowClick_}">
+-          Allow</button>
++        ${this.question_.task ? html`
++          <button id="allow" class="btn" @click="${this.onAllowClick_}">
++            Allow once</button>
++          <button id="task" class="btn primary"
++              aria-describedby="taskNote"
++              @click="${this.onTaskClick_}">Allow for this task</button>` :
++        html`
++          <button id="allow" class="btn primary"
++              @click="${this.onAllowClick_}">Allow</button>`}
+       </div>
+     </div>
+   </div>` : ''}
+diff --git a/chrome/browser/resources/webui_browser/meridian/agent.ts b/chrome/browser/resources/webui_browser/meridian/agent.ts
+index 8ec3d8a624..6520055f0f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/agent.ts
++++ b/chrome/browser/resources/webui_browser/meridian/agent.ts
+@@ -4,7 +4,9 @@
+ 
+ // Agents in the window: a bar naming the agent and what it's doing, with
+ // Stop (agents pause until Resume), and, at access level "ask", the
+-// question for each action.
++// question for each action: Allow once, Allow for this task (this agent's
++// connection, every site, until it disconnects or for 30 minutes), Always
++// allow (full access), or Deny.
+ 
+ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+@@ -14,10 +16,16 @@ import type {AgentActivity, SidebarHandlerInterface} from '../sidebar.mojom-webu
+ import {getCss} from './agent.css.js';
+ import {getHtml} from './agent.html.js';
+ 
++// "once", "task", "always" or "deny".
++export type AgentChoice = 'once'|'task'|'always'|'deny';
++
+ interface Question {
+   client: string;
+   summary: string;
+-  answer: (allowed: boolean) => void;
++  // The agent's connection, for an action; '' for the question whether it
++  // may connect at all.
++  task: string;
++  answer: (choice: AgentChoice) => void;
+ }
+ 
+ // The bar stays this long after the last action.
+@@ -77,7 +85,20 @@ export class MeridianAgentElement extends CrLitElement {
+                 this.queue_.push({
+                   client,
+                   summary,
+-                  answer: (allowed: boolean) => resolve({allowed}),
++                  task: '',
++                  answer: (choice: AgentChoice) =>
++                      resolve({allowed: choice !== 'deny'}),
++                });
++                this.next_();
++              })),
++      router.askAgentAction.addListener(
++          (client: string, summary: string, task: string) =>
++              new Promise<{choice: string}>(resolve => {
++                this.queue_.push({
++                  client,
++                  summary,
++                  task,
++                  answer: (choice: AgentChoice) => resolve({choice}),
+                 });
+                 this.next_();
+               })),
+@@ -125,10 +146,16 @@ export class MeridianAgentElement extends CrLitElement {
+     }
+   }
+ 
+-  private answer_(allowed: boolean) {
++  private answer_(choice: AgentChoice) {
+     const q = this.question_;
+     this.question_ = null;
+-    q?.answer(allowed);
++    q?.answer(choice);
++    if (q && choice === 'task' && q.task) {
++      // The same agent's other waiting actions are part of the task too.
++      const same = this.queue_.filter(o => o.task === q.task);
++      this.queue_ = this.queue_.filter(o => o.task !== q.task);
++      same.forEach(o => o.answer('task'));
++    }
+     this.next_();
+   }
+ 
+@@ -136,7 +163,7 @@ export class MeridianAgentElement extends CrLitElement {
+     // Pending questions are denied too.
+     this.handler_.setAgentsPaused(true);
+     while (this.question_) {
+-      this.answer_(false);
++      this.answer_('deny');
+     }
+   }
+ 
+@@ -148,11 +175,21 @@ export class MeridianAgentElement extends CrLitElement {
+     if (performance.now() - this.shownAt_ < ALLOW_DELAY_MS) {
+       return;
+     }
+-    this.answer_(true);
++    this.answer_('once');
++  }
++
++  // This agent's connection acts without asking (on every site, signed-in
++  // ones too) until it disconnects or for 30 minutes (agent_service.cc); its waiting actions
++  // are allowed.
++  protected onTaskClick_() {
++    if (performance.now() - this.shownAt_ < ALLOW_DELAY_MS) {
++      return;
++    }
++    this.answer_('task');
+   }
+ 
+   protected onDenyClick_() {
+-    this.answer_(false);
++    this.answer_('deny');
+   }
+ 
+   // Don't ask again: agents get full control (Settings > AI > Agent access
+@@ -165,14 +202,14 @@ export class MeridianAgentElement extends CrLitElement {
+     const {settings} = await this.handler_.getSettings();
+     this.handler_.setSettings({...settings, agentAccess: 'full'});
+     while (this.question_) {
+-      this.answer_(true);
++      this.answer_(this.question_.task ? 'always' : 'once');
+     }
+   }
+ 
+   protected onCardKeydown_(e: KeyboardEvent) {
+     if (e.key === 'Escape') {
+       e.preventDefault();
+-      this.answer_(false);
++      this.answer_('deny');
+     }
+   }
+ }

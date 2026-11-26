@@ -29,16 +29,48 @@ const cleanErr = (err) => String(err?.message || err).replace(/^Error invoking r
 const DEFAULTS = {
   editor: { fontSize: 13, fontFamily: '', lineHeight: 20, minimap: false, wordWrap: 'off', tabSize: 2, theme: 'auto' },
   terminal: { fontSize: 12.5, fontFamily: '', lineHeight: 1.15, scrollSpeed: 1 },
-  layout: { treeWidth: 240, terminalHeight: '38%', sidePanelWidth: 320, showTree: true },
-  ui: { accent: '' },
+  layout: { treeWidth: 240, terminalHeight: '38%', sidePanelWidth: 320, showTree: true, showStatusBar: true, terminalTabs: 'top', editorTabs: 'top' },
+  ui: { accent: '', look: 'default' },
+  agents: { autoContinue: false },
 };
+
+// One-click looks from the Customize panel. Kept apart from the person's own settings (in this page's
+// storage, not in their files), laid over them, and taken off again with Reset.
+const UI_SANS = '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, "Segoe UI", Roboto, sans-serif';
+const PRESETS = {
+  designer: {
+    label: 'Designer mode',
+    about: 'A calm, light look: a regular (not code) font, soft colours and rounded corners, no file tree, no status bar, no minimap.',
+    settings: { editor: { fontFamily: UI_SANS, theme: 'light', minimap: false }, layout: { showTree: false, showStatusBar: false }, ui: { look: 'soft' } },
+  },
+  minimal: {
+    label: 'Minimal',
+    about: 'Only the editor and the agents: no file tree, no status bar, no minimap.',
+    settings: { editor: { minimap: false }, layout: { showTree: false, showStatusBar: false } },
+  },
+};
+function activePreset() { const id = load('preset'); return PRESETS[id] ? id : ''; }
+function mergeSettings(base, over) {
+  const out = { ...(base && typeof base === 'object' ? base : {}) };
+  for (const [k, v] of Object.entries(over || {})) out[k] = v && typeof v === 'object' && !Array.isArray(v) ? mergeSettings(out[k], v) : v;
+  return out;
+}
+function effectiveSettings(raw) { const p = activePreset(); return sanitizeSettings(p ? mergeSettings(raw, PRESETS[p].settings) : raw); }
+async function setPreset(id) {
+  store('preset', PRESETS[id] ? id : '');
+  const prev = PRO.settings;
+  PRO.settings = effectiveSettings(PRO.custom?.safeMode ? null : PRO.custom?.settings);
+  applySettings(prev);
+  toast(PRESETS[id] ? `${PRESETS[id].label} on — Reset takes it off` : 'Back to your own look');
+  if (PRO.activePanel === 'customize') renderPanel();
+}
 
 function sanitizeSettings(raw) {
   const r = raw && typeof raw === 'object' ? raw : {};
   const num = (v, min, max, d) => (typeof v === 'number' && Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : d);
   const font = (v) => (typeof v === 'string' && v.length <= 200 && !/[;{}<>\\]/.test(v) ? v : '');
   const pick = (v, list, d) => (list.includes(v) ? v : d);
-  const e = r.editor || {}, t = r.terminal || {}, l = r.layout || {}, u = r.ui || {};
+  const e = r.editor || {}, t = r.terminal || {}, l = r.layout || {}, u = r.ui || {}, a = r.agents || {};
   return {
     editor: {
       fontSize: num(e.fontSize, 8, 40, DEFAULTS.editor.fontSize), fontFamily: font(e.fontFamily), lineHeight: num(e.lineHeight, 0, 80, DEFAULTS.editor.lineHeight),
@@ -51,8 +83,12 @@ function sanitizeSettings(raw) {
       terminalHeight: typeof l.terminalHeight === 'string' && /^\d{1,4}(\.\d+)?(px|%|vh)$/.test(l.terminalHeight) ? l.terminalHeight : DEFAULTS.layout.terminalHeight,
       sidePanelWidth: Math.round(num(l.sidePanelWidth, 200, 900, DEFAULTS.layout.sidePanelWidth)),
       showTree: typeof l.showTree === 'boolean' ? l.showTree : true,
+      showStatusBar: typeof l.showStatusBar === 'boolean' ? l.showStatusBar : true,
+      terminalTabs: pick(l.terminalTabs, ['top', 'left'], 'top'),
+      editorTabs: pick(l.editorTabs, ['top', 'left'], 'top'),
     },
-    ui: { accent: typeof u.accent === 'string' && /^#[0-9a-f]{3}([0-9a-f]{3})?$/i.test(u.accent) ? u.accent : '' },
+    ui: { accent: typeof u.accent === 'string' && /^#[0-9a-f]{3}([0-9a-f]{3})?$/i.test(u.accent) ? u.accent : '', look: pick(u.look, ['default', 'soft'], 'default') },
+    agents: { autoContinue: a.autoContinue === true },
   };
 }
 
@@ -84,6 +120,13 @@ function applySettings(prev) {
   if (changed('sidePanelWidth') && (prev || s.layout.sidePanelWidth !== DEFAULTS.layout.sidePanelWidth)) root.setProperty('--side-w', s.layout.sidePanelWidth + 'px');
   $('#tree-pane').hidden = !s.layout.showTree;
   $('#tree-grip').hidden = !s.layout.showTree;
+  // The status bar, the tab bars' places (top, or a list on the left) and the soft look.
+  const body = document.body;
+  body.classList.toggle('wb-no-statusbar', !s.layout.showStatusBar);
+  body.dataset.termTabs = s.layout.terminalTabs;
+  body.dataset.editorTabs = s.layout.editorTabs;
+  body.dataset.look = s.ui.look;
+  if (!prev || prev.layout.terminalTabs !== s.layout.terminalTabs || prev.layout.editorTabs !== s.layout.editorTabs || prev.layout.showStatusBar !== s.layout.showStatusBar) requestAnimationFrame(() => { fitActive(); S.editor?.layout(); });
   if (s.ui.accent) applySpace(s.ui.accent);
   else if (prev?.ui.accent && PRO.hostSpace) applySpace(PRO.hostSpace);
 }
@@ -100,7 +143,7 @@ async function reloadCustom({ quiet = false } = {}) {
   try { st = await wb.customState(); } catch (err) { console.error(err); return; }
   PRO.custom = st;
   const prev = PRO.settings;
-  PRO.settings = sanitizeSettings(st.safeMode ? null : st.settings);
+  PRO.settings = effectiveSettings(st.safeMode ? null : st.settings);
   applySettings(prev);
   // user.css: swap the <link> (cache-busted by mtime)
   let link = $('#user-css');
@@ -1023,7 +1066,9 @@ async function customizeWithClaude() {
     if (!claude?.installed) { toast('Claude Code isn’t installed — install it, or edit the files here yourself', 5000); return; }
     const t = await launch('claude');
     if (t) t.xterm.writeln('\x1b[2mTell Claude what to change, e.g. “make the editor font 15px” or “add a Deploy button that runs npm run deploy”. Changes apply live.\x1b[0m');
+    return t;
   } catch (err) { toast(cleanErr(err), 5000); }
+  return null;
 }
 
 async function setSafeMode(on) {
@@ -1078,33 +1123,135 @@ function renderCustomStatus() {
   el.title = st.safeMode ? 'Customizations are off (Safe Mode). Click to manage.' : `Active plugins:\n${all.filter((p) => p.status === 'active').map((p) => `${p.name} (${p.file})`).join('\n') || 'none'}`;
 }
 
+// What a person can ask for, in their words. A click hands the request to Claude Code in the
+// customization folder (the same session if one runs there).
+const CUSTOM_IDEAS = [
+  { cat: 'Look', items: [
+    ['Bigger text', 'Make the editor and terminal font 15px.'],
+    ['Soft light theme', 'Give the Workbench a soft light theme: warm off-white backgrounds, gentle borders.'],
+    ['Rounded corners', 'Round the corners of panels, tabs and buttons more.'],
+    ['Taller terminal', 'Make the terminal area take half of the window height.'],
+  ] },
+  { cat: 'Layout', items: [
+    ['Hide the file tree', 'Hide the file tree.'],
+    ['Hide the status bar', 'Hide the status bar at the bottom.'],
+    ['Minimap off', 'Turn the editor minimap off.'],
+    ['Agent tabs on the left', 'Show the terminal tabs as a vertical list on the left.'],
+  ] },
+  { cat: 'Buttons & commands', items: [
+    ['A “Run tests” button', 'Add a button to the top bar that asks the agent in the current terminal to run the tests.'],
+    ['A hotkey', 'Add a hotkey (Cmd+Alt+T on Mac, Ctrl+Alt+T elsewhere) that opens a new terminal.'],
+  ] },
+  { cat: 'Panels', items: [
+    ['A checklist', 'Add a checklist panel on the right where I can tick off tasks; keep the items between restarts.'],
+    ['A colour palette', 'Add a colour palette panel on the right that copies a colour’s hex code on click.'],
+  ] },
+  { cat: 'Launchers', items: [
+    ['“Review my changes”', 'Add a launcher “Review my changes” that starts Claude Code and asks it to review the uncommitted changes.'],
+    ['“Explain this project”', 'Add a launcher “Explain this project” that starts Claude Code and asks it for a short tour of the project.'],
+  ] },
+];
+const CUSTOM_LIMITS = [
+  ['Rearranging the terminal and editor tab bars', 'only top or left (in Layout); anything else is styling that may break with an update'],
+  ['Changing how the terminal itself behaves', 'keys, scrolling and selection stay as they are'],
+  ['Add-ons that use the internet', 'they run inside the Workbench, with no network'],
+  ['A visual canvas', 'no drag-and-drop drawing surface'],
+  ['Replacing the code editor', 'the editor stays; its font, theme and options can change'],
+];
+
+// Sends a request to Claude Code in the customization folder: the session already open there, else a new one.
+async function askToCustomize(request) {
+  const st = PRO.custom || {};
+  const running = S.project?.root === st.root && S.terms.find((t) => t.kind === 'claude' && !t.exited && t.root === st.root);
+  if (running) { activateTerm(running); typeRequest(running, request); return; }
+  const t = await customizeWithClaude();
+  if (t) typeRequest(t, request);
+}
+
+// Types a request into an agent's prompt once it is ready (its output has gone quiet), then Enter.
+function typeRequest(t, text, { enter = true } = {}) {
+  let last = Date.now();
+  const sub = t.xterm.onWriteParsed(() => { last = Date.now(); });
+  const started = Date.now();
+  const tick = () => {
+    if (t.exited || t.closed) { sub.dispose(); return; }
+    const quiet = Date.now() - last > 700, ready = Date.now() - started > 900;
+    if ((quiet && ready) || Date.now() - started > 15000) {
+      sub.dispose();
+      wb.ptyWrite(t.id, text);
+      if (enter) setTimeout(() => { if (!t.exited) wb.ptyWrite(t.id, '\r'); }, 150);
+      return;
+    }
+    setTimeout(tick, 150);
+  };
+  setTimeout(tick, 150);
+}
+
 function renderCustomizePanel(el) {
   const st = PRO.custom || {};
   const head = h('div', 'panel-head');
   head.append(h('h2', '', 'Customize'));
   el.appendChild(head);
-  if (st.unavailable) { el.appendChild(h('p', 'warn-box', 'The customization folder is unavailable.')); return; }
-  el.appendChild(h('p', 'muted small', 'Plugins, styles and settings for this Workbench live in one folder. Ask Claude to change them — every save applies live.'));
+  if (st.unavailable) { el.appendChild(h('p', 'warn-box', 'Customizing is unavailable right now.')); return; }
+  el.appendChild(h('p', 'muted small', 'Change how the Workbench looks and works by asking in plain words. The AI makes the change, it shows up right away, and every change can be undone below.'));
   const actions = h('div', 'row-actions');
-  actions.append(btn('Customize with AI', 'accent', customizeWithClaude), btn('Open folder', '', async () => { try { await setProject(await wb.customOpen()); openPanel('customize'); } catch (err) { toast(cleanErr(err)); } }), btn(IS_MAC ? 'Finder' : 'Folder', '', () => wb.customReveal()));
+  actions.append(btn('Customize with AI', 'accent', () => customizeWithClaude()));
   el.appendChild(actions);
-  el.appendChild(h('div', 'path mono small', st.root || ''));
 
-  // Safe Mode
-  const safe = h('label', 'switch-row');
-  const cb = h('input');
-  cb.type = 'checkbox';
-  cb.checked = !!st.safeMode;
-  cb.addEventListener('change', () => setSafeMode(cb.checked));
-  const txt = h('span');
-  txt.append(h('b', '', 'Safe Mode'), h('span', 'muted small', ' — start without plugins, user.css and settings.json. Use it if a plugin breaks the Workbench.'));
-  safe.append(cb, txt);
-  el.appendChild(safe);
+  // What you can ask for: examples by kind, each one click away.
+  const ideas = h('div', 'section custom-ideas');
+  ideas.appendChild(h('h3', '', 'What you can ask for'));
+  ideas.appendChild(h('p', 'muted small', 'Click one to ask the AI for it, or say it your own way.'));
+  for (const group of CUSTOM_IDEAS) {
+    const g = h('div', 'idea-group');
+    g.appendChild(h('div', 'idea-cat', group.cat));
+    const list = h('div', 'idea-list');
+    for (const [label, request] of group.items) {
+      const b = h('button', 'idea', label);
+      b.title = request;
+      b.dataset.request = request;
+      b.addEventListener('click', () => askToCustomize(request));
+      list.appendChild(b);
+    }
+    g.appendChild(list);
+    ideas.appendChild(g);
+  }
+  el.appendChild(ideas);
 
-  // Plugins
+  // Ready-made looks: one click on, one click off.
+  const pre = h('div', 'section custom-presets');
+  const ph = h('div', 'panel-head');
+  ph.appendChild(h('h3', '', 'One-click looks'));
+  const current = activePreset();
+  if (current) ph.appendChild(btn('Reset', 'preset-reset', () => setPreset('')));
+  pre.appendChild(ph);
+  for (const [id, p] of Object.entries(PRESETS)) {
+    const card = h('button', `preset${current === id ? ' on' : ''}`);
+    card.dataset.preset = id;
+    card.append(h('b', '', p.label), h('span', 'muted small', p.about));
+    if (current === id) card.appendChild(h('span', 'preset-on small', 'On'));
+    card.addEventListener('click', () => setPreset(current === id ? '' : id));
+    pre.appendChild(card);
+  }
+  el.appendChild(pre);
+
+  // What it can't do (yet), said plainly so nobody waits for it.
+  const lim = h('div', 'section custom-limits');
+  lim.appendChild(h('h3', '', 'Not possible yet, or fragile'));
+  const ul = h('ul', 'limits');
+  for (const [what, why] of CUSTOM_LIMITS) { const li = h('li'); li.append(h('span', '', what), h('span', 'muted small', ` — ${why}`)); ul.appendChild(li); }
+  lim.appendChild(ul);
+  el.appendChild(lim);
+
+  // Add-ons (plugins)
   const pl = h('div', 'section');
-  pl.appendChild(h('h3', '', 'Plugins'));
-  if (!st.plugins?.length) pl.appendChild(h('div', 'empty muted small', 'No plugins yet. Ask Claude to add one, or copy examples/hello-button.js into plugins/.'));
+  pl.appendChild(h('h3', '', 'Add-ons'));
+  if (!st.plugins?.length) {
+    const empty = h('div', 'empty-state');
+    empty.append(h('b', '', 'No add-ons yet'), h('span', 'muted small', 'Add-ons are small extras: a button in the top bar, a panel on the right, a shortcut or a ready prompt. Pick an example above or describe your own.'));
+    empty.appendChild(btn('Ask for an add-on…', '', () => customizeWithClaude()));
+    pl.appendChild(empty);
+  }
   for (const p of st.plugins || []) {
     const rec = PRO.plugins.get(p.file);
     const off = (st.disabled || []).includes(p.file);
@@ -1116,20 +1263,21 @@ function renderCustomizePanel(el) {
     toggle.title = off ? 'Switched off — click to enable' : 'Enabled — click to switch off';
     toggle.addEventListener('change', () => wb.customTogglePlugin(p.file, toggle.checked).catch((err) => toast(cleanErr(err))));
     const info = h('div', 'plugin-info');
-    const title = h('button', 'link', rec?.name && rec.name !== p.file.replace(/\.js$/, '') ? `${rec.name} (${p.file})` : p.file);
+    const title = h('button', 'link', rec?.name && rec.name !== p.file.replace(/\.js$/, '') ? rec.name : p.file.replace(/\.js$/, ''));
+    title.title = 'Open its code';
     title.addEventListener('click', async () => { if (S.project?.root !== st.root) { await setProject(await wb.customOpen()); openPanel('customize'); } openFile(`plugins/${p.file}`, { focus: true }); });
     info.appendChild(title);
     const label = { active: 'active', error: 'error', inactive: 'not registered', off: 'off', safe: 'Safe Mode', loading: 'loading', pending: 'needs approval' }[status];
     info.appendChild(h('span', `pstatus ${status}`, label));
     if (status === 'pending') info.appendChild(btn('Approve…', 'small', approvePlugins));
     if (rec?.error && !off && !st.safeMode) info.appendChild(h('div', 'perr small', rec.error));
-    info.appendChild(h('div', 'muted small', `changed ${fmtTime(p.mtimeMs)} · ${p.size} bytes${p.approved ? ' · approved' : ''}`));
+    info.appendChild(h('div', 'muted small', `changed ${fmtTime(p.mtimeMs)}${p.approved ? ' · approved' : ''}`));
     row.append(toggle, info);
     pl.appendChild(row);
   }
   el.appendChild(pl);
 
-  if (st.settingsError) el.appendChild(h('p', 'warn-box', `settings.json isn’t valid JSON (${st.settingsError}); using defaults.`));
+  if (st.settingsError) el.appendChild(h('p', 'warn-box', `The settings file has a mistake (${st.settingsError}), so the defaults are used. Ask the AI to fix it.`));
 
   // History
   const hist = h('div', 'section');
@@ -1138,17 +1286,54 @@ function renderCustomizePanel(el) {
   const snaps = st.snapshots || [];
   if (snaps.length > 1) hh.appendChild(btn('Undo last change', '', () => restoreSnapshot(snaps[1])));
   hist.appendChild(hh);
-  hist.appendChild(h('p', 'muted small', 'Every change to this folder is snapshotted. Restoring keeps a snapshot of the current state, so you can go back again.'));
-  snaps.forEach((s, i) => {
-    const row = h('div', 'snap-row');
-    const txt = h('div');
-    txt.append(h('span', '', fmtTime(s.at)), h('span', 'muted small', ` · ${i === 0 ? 'current' : s.reason.replace('-', ' ')} · ${s.files.length} file${s.files.length === 1 ? '' : 's'}`));
-    txt.title = s.files.join('\n');
-    row.appendChild(txt);
-    if (i > 0) row.appendChild(btn('Restore', '', () => restoreSnapshot(s)));
-    hist.appendChild(row);
-  });
+  if (snaps.length <= 1) {
+    const empty = h('div', 'empty-state');
+    empty.append(h('b', '', 'Nothing changed yet'), h('span', 'muted small', 'Every change you or the AI make is saved here, so any of them can be undone with one click.'));
+    hist.appendChild(empty);
+  } else {
+    hist.appendChild(h('p', 'muted small', 'Every change is saved. Going back keeps the current state too, so you can return to it.'));
+    snaps.forEach((s, i) => {
+      const row = h('div', 'snap-row');
+      const txt = h('div');
+      txt.append(h('span', '', fmtTime(s.at)), h('span', 'muted small', ` · ${i === 0 ? 'current' : s.reason.replace('-', ' ')} · ${s.files.length} file${s.files.length === 1 ? '' : 's'}`));
+      txt.title = s.files.join('\n');
+      row.appendChild(txt);
+      if (i > 0) row.appendChild(btn('Go back', '', () => restoreSnapshot(s)));
+      hist.appendChild(row);
+    });
+  }
   el.appendChild(hist);
+
+  // Advanced: the folder and its files, Safe Mode.
+  const adv = h('details', 'section advanced');
+  adv.appendChild(h('summary', '', 'Advanced'));
+  adv.appendChild(h('p', 'muted small', 'Everything lives in one folder: plugins/ (add-ons, one file each), user.css (styles), settings.json (fonts, theme, layout), AGENTS.md (instructions for the AI) and API.md (the reference). You can edit them yourself.'));
+  const aa = h('div', 'row-actions');
+  aa.append(btn('Open folder', '', async () => { try { await setProject(await wb.customOpen()); openPanel('customize'); } catch (err) { toast(cleanErr(err)); } }), btn(IS_MAC ? 'Show in Finder' : 'Show in folder', '', () => wb.customReveal()));
+  adv.appendChild(aa);
+  adv.appendChild(h('div', 'path mono small', st.root || ''));
+  const safe = h('label', 'switch-row');
+  const cb = h('input');
+  cb.type = 'checkbox';
+  cb.checked = !!st.safeMode;
+  cb.addEventListener('change', () => setSafeMode(cb.checked));
+  const txt = h('span');
+  txt.append(h('b', '', 'Safe Mode'), h('span', 'muted small', ' — start without plugins, user.css and settings.json. Use it if an add-on breaks the Workbench.'));
+  safe.append(cb, txt);
+  adv.appendChild(safe);
+  // After a restart, agents come back waiting for a "continue"; this sends it by itself.
+  const ac = h('label', 'switch-row auto-continue');
+  const acb = h('input');
+  acb.type = 'checkbox';
+  acb.checked = autoContinue();
+  acb.disabled = PRO.settings?.agents?.autoContinue === true;
+  acb.addEventListener('change', () => store('autoContinue', acb.checked ? '1' : ''));
+  const act = h('span');
+  act.append(h('b', '', 'Continue agents after a restart'), h('span', 'muted small', ' — when Meridian restarts, agent sessions come back where they were and wait. With this on, each one is told “continue” by itself.'));
+  ac.append(acb, act);
+  adv.appendChild(ac);
+  if (st.safeMode) adv.open = true;
+  el.appendChild(adv);
 }
 
 async function restoreSnapshot(s) {
@@ -1175,7 +1360,7 @@ async function proBoot() {
     await wb.customSafeMode(true).catch(() => {});
     setTimeout(() => notice('crash-safe', 'The Workbench didn’t finish starting twice in a row, so it started in Safe Mode (no plugins). Check the Customize panel.', [{ label: 'Open Customize', accent: true, run: () => openPanel('customize') }]), 500);
   }
-  PRO.settings = sanitizeSettings(null);
+  PRO.settings = effectiveSettings(null);
   initSidePane();
   initProKeys();
   $('#new-hub').addEventListener('click', newHubWizard);

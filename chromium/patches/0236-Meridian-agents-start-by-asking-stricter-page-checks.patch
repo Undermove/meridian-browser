@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Mon, 23 Nov 2026 23:25:48 +0400
+Subject: [PATCH 236/297] Meridian: agents start by asking; stricter page
+ checks
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/meridian/agent/agent_service.cc   | 46 +++++++++++--------
+ chrome/browser/meridian/sidebar_handler.cc    |  2 +-
+ 2 files changed, 29 insertions(+), 19 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index a853226b20..1d32843dc6 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -630,8 +630,9 @@ void AgentService::AskForAccess(const std::string& client,
+   }
+   SidebarHandler::AskAgent(
+       window, client,
+-      "control Meridian: open pages, click and type,\n"
+-      "also on sites where you are signed in",
++      "connect to Meridian. It will ask you here before each action,\n"
++      "also on sites where you are signed in.\n"
++      "The name is what the app calls itself: Meridian can't verify it.",
+       base::BindOnce(&AgentService::OnAccessAnswer,
+                      weak_factory_.GetWeakPtr()));
+ }
+@@ -639,8 +640,11 @@ void AgentService::AskForAccess(const std::string& client,
+ void AgentService::OnAccessAnswer(bool allowed) {
+   PrefService* prefs = profile_->GetPrefs();
+   if (allowed) {
++    // Asking before each action, unless the person just chose Always allow.
+     // In this order: "decided" with access still off closes the socket.
+-    prefs->SetString(prefs::kAgentAccess, "full");
++    if (Rank(prefs->GetString(prefs::kAgentAccess)) == 0) {
++      prefs->SetString(prefs::kAgentAccess, "ask");
++    }
+     prefs->SetBoolean(prefs::kAgentAccessDecided, true);
+   }
+   auto waiting = std::move(waiting_for_access_);
+@@ -804,22 +808,15 @@ constexpr char kNoTab[] =
+ // Agents work on web pages only: never on Meridian's or Chromium's own pages
+ // (chrome://workbench has terminals, chrome://settings permissions…), local
+ // files or extensions. The empty new tab is fine (to navigate it).
++bool AgentCanGoTo(const GURL& url) {
++  return url.is_empty() || url.SchemeIsHTTPOrHTTPS() ||
++         url.SchemeIs(url::kDataScheme) || url.IsAboutBlank() ||
++         (url.SchemeIs("chrome") && url.host() == "newtab");
++}
++
+ bool AgentCanUse(content::WebContents* contents) {
+-  if (!contents) {
+-    return false;
+-  }
+-  for (const GURL& url :
+-       {contents->GetLastCommittedURL(), contents->GetVisibleURL()}) {
+-    if (url.is_empty() || url.SchemeIsHTTPOrHTTPS() ||
+-        url.SchemeIs(url::kDataScheme) || url.IsAboutBlank()) {
+-      continue;
+-    }
+-    if (url.SchemeIs("chrome") && url.host() == "newtab") {
+-      continue;
+-    }
+-    return false;
+-  }
+-  return true;
++  return contents && AgentCanGoTo(contents->GetLastCommittedURL()) &&
++         AgentCanGoTo(contents->GetVisibleURL());
+ }
+ 
+ }  // namespace
+@@ -934,6 +931,12 @@ void AgentService::RunInPage(content::WebContents* contents,
+                              const std::string& expression,
+                              base::OnceCallback<void(base::Value)> done,
+                              base::TimeDelta timeout) {
++  // Checked at the last moment: the tab may have moved since the call began.
++  if (!AgentCanUse(contents)) {
++    std::move(done).Run(base::Value(
++        base::DictValue().Set("error", "Agents only work on web pages.")));
++    return;
++  }
+   std::u16string script = base::UTF8ToUTF16(
+       std::string(kAgentPageJs) + "\n;(() => { try { return (" + expression +
+       "); } catch (e) { return {error: String(e && e.message || e)}; } })()");
+@@ -1520,6 +1523,13 @@ void AgentService::HistoryNav(std::unique_ptr<Call> call) {
+                 self->Activity(*call, tab);
+                 content::NavigationController& nav =
+                     tab->GetContents()->GetController();
++                if (action == "back" || action == "forward") {
++                  const content::NavigationEntry* to = nav.GetEntryAtOffset(
++                      action == "back" ? -1 : 1);
++                  if (to && !AgentCanGoTo(to->GetURL())) {
++                    return call->Fail("Agents only work on web pages.");
++                  }
++                }
+                 if (action == "back" && nav.CanGoBack()) {
+                   nav.GoBack();
+                 } else if (action == "forward" && nav.CanGoForward()) {
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 4bbf4ea6e5..f080c132c1 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -1945,7 +1945,7 @@ void SidebarHandler::GrantAgentAccess() {
+     return;
+   }
+   // In this order: "decided" with access still off closes the socket.
+-  prefs->SetString(prefs::kAgentAccess, "full");
++  prefs->SetString(prefs::kAgentAccess, "ask");
+   prefs->SetBoolean(prefs::kAgentAccessDecided, true);
+ }
+ 

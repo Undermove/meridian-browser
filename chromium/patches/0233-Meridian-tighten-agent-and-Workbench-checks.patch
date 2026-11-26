@@ -1,0 +1,262 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Mon, 23 Nov 2026 17:30:54 +0400
+Subject: [PATCH 233/297] Meridian: tighten agent and Workbench checks
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/agent/agent_page.js   | 21 +++--
+ .../browser/meridian/agent/agent_service.cc   | 31 ++++++-
+ .../browser/meridian/workbench/git_command.cc | 88 +++++++++++++++++++
+ 3 files changed, 130 insertions(+), 10 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_page.js b/chrome/browser/meridian/agent/agent_page.js
+index 1a5b2eb3e3..75b2779d67 100644
+--- a/chrome/browser/meridian/agent/agent_page.js
++++ b/chrome/browser/meridian/agent/agent_page.js
+@@ -86,7 +86,7 @@
+     } else if (spec.text) {
+       const want = spec.text.toLowerCase().trim();
+       const cands = deepAll('a,button,input:not([type=hidden]),textarea,[role=button],[role=link],[role=tab],[role=menuitem],[role=textbox],[contenteditable=""],[contenteditable=true],summary,label');
+-      const label = (e) => (labelOf(e) || e.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
++      const label = (e) => (labelOf(e) || valueOf(e)).replace(/\s+/g, ' ').trim().toLowerCase();
+       el = cands.find((e) => label(e) === want) || cands.find((e) => label(e).includes(want));
+       if (el && el.tagName === 'LABEL' && el.control) el = el.control;
+       if (!el) {
+@@ -104,6 +104,11 @@
+     return el ? {el} : {error: 'element not found'};
+   };
+ 
++  // A password field's content never leaves the page, also while "show
++  // password" has turned it into a text field.
++  const isSecret = (e) => e?.type === 'password' || /(^|\s)(current|new)-password(\s|$)/i.test(e?.getAttribute?.('autocomplete') || '');
++  const valueOf = (e) => (!isSecret(e) && typeof e?.value === 'string' ? e.value : '');
++
+   window.__meridianAgent = {
+     read(offset, max) {
+       const text = deepText().replace(/[ \t ]+/g, ' ').replace(/\n\s*\n\s*\n+/g, '\n\n').trim();
+@@ -135,7 +140,7 @@
+         const r = el.getBoundingClientRect();
+         const tag = el.tagName.toLowerCase();
+         const type = el.getAttribute('type') || undefined;
+-        const label = clip((tag === 'select' ? fieldName(el) : labelOf(el)) || el.querySelector?.('img')?.alt || el.value && type !== 'password' && el.value || '', 100);
++        const label = clip((tag === 'select' ? fieldName(el) : labelOf(el)) || el.querySelector?.('img')?.alt || valueOf(el), 100);
+         const out = {i, tag, label};
+         if (hostOf(el)) out.in_shadow_dom = true;
+         const visible = clip(el.innerText, 100);
+@@ -144,8 +149,8 @@
+         if (role) out.role = role;
+         if (type) out.type = type;
+         if (tag === 'a') out.href = clip(el.href, 160);
+-        if ((tag === 'input' || tag === 'textarea') && type !== 'password') {
+-          const v = clip(el.value, 80);
++        if (tag === 'input' || tag === 'textarea') {
++          const v = clip(valueOf(el), 80);
+           if (v) out.value = v;
+         }
+         if (tag === 'input' && el.placeholder) out.placeholder = clip(el.placeholder, 60);
+@@ -173,9 +178,9 @@
+         x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height,
+         tag: el.tagName.toLowerCase(),
+         // A dropdown's text is all its options: its label names it.
+-        label: clip(el.tagName === 'SELECT' ? fieldName(el) || 'dropdown' : el.getAttribute('aria-label') || el.innerText || el.value || el.placeholder || '', 80),
+-        visible: clip(el.innerText || el.value || '', 120),
+-        password: el.type === 'password',
++        label: clip(el.tagName === 'SELECT' ? fieldName(el) || 'dropdown' : el.getAttribute('aria-label') || el.innerText || valueOf(el) || el.placeholder || '', 80),
++        visible: clip(el.innerText || valueOf(el), 120),
++        password: isSecret(el),
+         select: el.tagName === 'SELECT' || undefined,
+         href: el.closest('a')?.href?.slice(0, 200) || undefined,
+         form: el.form?.action?.slice(0, 200) || undefined,
+@@ -224,7 +229,7 @@
+ 
+     readTarget() {
+       const el = window.__meridianTarget;
+-      if (!el || !el.isConnected) return null;
++      if (!el || !el.isConnected || isSecret(el)) return null;
+       return 'value' in el && typeof el.value === 'string' ? el.value : (el.innerText || '').replace(/\n$/, '');
+     },
+ 
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index 5e85ae7038..a853226b20 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -75,6 +75,7 @@
+ #include "components/javascript_dialogs/tab_modal_dialog_manager.h"
+ #include "base/timer/timer.h"
+ #include "content/public/browser/web_contents.h"
++#include "content/public/browser/weak_document_ptr.h"
+ #include "content/public/browser/web_contents_observer.h"
+ #include "third_party/blink/public/common/input/web_mouse_event.h"
+ #include "third_party/blink/public/common/page/page_zoom.h"
+@@ -522,6 +523,17 @@ struct AgentService::Call {
+   Reply reply;
+   // Keeps a hidden tab drawing (input and screenshots need frames).
+   base::ScopedClosureRunner capture;
++  // The document this call started on: an approval holds for it alone.
++  mutable base::WeakPtr<content::WebContents> page;
++  mutable std::optional<content::WeakDocumentPtr> document;
++
++  bool StillOnSameDocument() const {
++    if (!document) {
++      return true;
++    }
++    return page && document->AsRenderFrameHostIfValid() ==
++                       page->GetPrimaryMainFrame();
++  }
+ 
+   const std::string* Str(const char* key) const {
+     return input.FindString(key);
+@@ -870,6 +882,10 @@ void AgentService::Activity(const Call& call, tabs::TabInterface* tab) {
+   if (tab) {
+     current_tab_[call.client] = tab->GetHandle();
+     KeepAwake(tab);
++    if (!call.document) {
++      call.page = tab->GetContents()->GetWeakPtr();
++      call.document = tab->GetContents()->GetPrimaryMainFrame()->GetWeakDocumentPtr();
++    }
+   }
+   if (BrowserWindowInterface* window = Window()) {
+     SidebarHandler::AgentActivity(
+@@ -892,6 +908,9 @@ void AgentService::Confirm(
+   if (!window) {
+     return call->Fail("Meridian has no window to ask the person in.");
+   }
++  if (!call->StillOnSameDocument()) {
++    return call->Fail("The page changed, so nothing was done. Look at it again.");
++  }
+   SidebarHandler::AskAgent(
+       window, client, summary,
+       base::BindOnce(
+@@ -901,6 +920,11 @@ void AgentService::Confirm(
+             if (!allowed) {
+               return call->Fail("The person declined this action.");
+             }
++            if (!call->StillOnSameDocument()) {
++              return call->Fail(
++                  "The page changed while waiting for approval, so nothing "
++                  "was done. Look at it again.");
++            }
+             std::move(then).Run(std::move(call));
+           },
+           std::move(call), std::move(then)));
+@@ -1712,8 +1736,11 @@ void AgentService::TypeText(std::unique_ptr<Call> call) {
+                  : "(window.__meridianTarget = document.activeElement, "
+                    "{tag: document.activeElement && "
+                    "document.activeElement.tagName.toLowerCase(), label: '', "
+-                   "password: document.activeElement && "
+-                   "document.activeElement.type === 'password'})";
++                   "password: !!document.activeElement && "
++                   "(document.activeElement.type === 'password' || "
++                   "/(^|\\s)(current|new)-password(\\s|$)/i.test("
++                   "document.activeElement.getAttribute('autocomplete') || "
++                   "''))})";
+   tabs::TabHandle handle = tab->GetHandle();
+   RunInPage(
+       contents, expr,
+diff --git a/chrome/browser/meridian/workbench/git_command.cc b/chrome/browser/meridian/workbench/git_command.cc
+index 6b2e450e4e..d0ebc2067e 100644
+--- a/chrome/browser/meridian/workbench/git_command.cc
++++ b/chrome/browser/meridian/workbench/git_command.cc
+@@ -279,12 +279,100 @@ base::ListValue FindGitRepos(const base::FilePath& project,
+   return list;
+ }
+ 
++namespace {
++
++// A setting that makes git start a program. The ones RunGitCommand overrides
++// on every call (fsmonitor, pager, sshCommand, diff.external) aren't here.
++bool RunsAProgram(std::string key) {
++  key = base::ToLowerASCII(key);
++  const auto section = [&](std::string_view s) {
++    return key.starts_with(std::string(s) + ".");
++  };
++  const auto ends = [&](std::string_view s) { return key.ends_with(s); };
++  if (section("filter")) {
++    return ends(".clean") || ends(".smudge") || ends(".process");
++  }
++  if (section("diff")) {
++    return ends(".command") || ends(".textconv");
++  }
++  if (section("merge")) {
++    return ends(".driver");
++  }
++  if (section("remote")) {
++    return ends(".uploadpack") || ends(".receivepack") || ends(".vcs");
++  }
++  if (section("credential")) {
++    return ends(".helper");
++  }
++  if (section("gpg")) {
++    return ends(".program");
++  }
++  if (section("submodule")) {
++    return ends(".update");
++  }
++  return section("pager") || key == "core.gitproxy" || key == "core.editor" ||
++         key == "core.askpass" || key == "sequence.editor" ||
++         key == "interactive.difffilter";
++}
++
++// The first setting in the repository's own config (with what it includes)
++// that would start a program. The person's global config is their own; a
++// repository's arrives with a downloaded folder. Listing runs nothing.
++std::string ProgramInRepoConfig(const std::string& program,
++                                const base::FilePath& root,
++                                const std::map<std::string, std::string>& env) {
++  ai::ProcessSpec spec;
++  spec.argv = {program,        "-c",     "core.fsmonitor=false", "config",
++               "--includes",   "--show-scope", "--name-only",    "--list"};
++  spec.env = env;
++  spec.env["LC_ALL"] = "C";
++  spec.cwd = root.AsUTF8Unsafe();
++  spec.timeout = base::Seconds(10);
++  spec.max_output = 1u << 20;
++  std::string out;
++  ai::RunProcess(spec, base::MakeRefCounted<ai::CancelFlag>(),
++                 base::BindRepeating([](std::string* out,
++                                        std::string_view chunk) {
++                   out->append(chunk);
++                 }, base::Unretained(&out)));
++  for (std::string_view line : base::SplitStringPiece(
++           out, "\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++    const size_t tab = line.find('\t');
++    if (tab == std::string_view::npos) {
++      continue;
++    }
++    const std::string_view scope = line.substr(0, tab);
++    const std::string key(line.substr(tab + 1));
++    if ((scope == "local" || scope == "worktree") && RunsAProgram(key)) {
++      return key;
++    }
++  }
++  return std::string();
++}
++
++}  // namespace
++
+ base::DictValue RunGitCommand(const std::string& program,
+                               bool is_git,
+                               const base::FilePath& root,
+                               const std::vector<std::string>& args,
+                               const std::optional<std::string>& stdin_text,
+                               std::map<std::string, std::string> env) {
++  if (is_git) {
++    if (std::string key = ProgramInRepoConfig(program, root, env);
++        !key.empty()) {
++      return base::DictValue()
++          .Set("started", true)
++          .Set("code", 1)
++          .Set("stdout", "")
++          .Set("stderr",
++               "This repository's git settings (" + key +
++                   ") can start a program, so the Workbench won't run git "
++                   "here. If you trust it, use the terminal.")
++          .Set("timedOut", false)
++          .Set("truncated", false);
++    }
++  }
+   ai::ProcessSpec spec;
+   spec.argv = {program};
+   if (is_git) {

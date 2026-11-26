@@ -1,0 +1,3117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 13:42:14 +0400
+Subject: [PATCH] Meridian: Claude connects for real on the first run, and
+ every AI state is told right
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A new user (Claude Desktop + a Claude Code she never signed in to) said Yes
+everywhere and got nothing: no Meridian in Claude Desktop, Claude Code left at
+"Sign in…" deep in Settings, Improve with AI dead.
+
+- The newest copy of an agent CLI runs (ai/cli_versions): an old Claude Code
+  in /usr/local/bin no longer wins over the current one in ~/.local/bin, so
+  sign-in isn't misread. Its sign-in runs that copy too (a Terminal's login
+  profile may list the old one first). Settings says which one, and a CLI too
+  old for `auth status` says "Update needed", never "Not signed in".
+- The welcome tour signs Claude Code in right after Yes and waits for it, and
+  ends with an honest check: Claude Desktop verified (its bridge said hello),
+  needs a restart, will load it when it opens, or failed with why; Claude Code
+  signed in or Sign in now. Each with one fix button.
+- Claude Desktop: the entry is put back after Claude quits (it may write its
+  old copy of the file back), and Meridian refuses to connect from a download
+  or disk image whose path goes away.
+- Boost's Improve with AI says "Sign in to Claude to use AI" and starts it.
+- Settings › Connect shows each agent's real state, read from its config the
+  way Connect writes it (per Claude/Codex account), Disconnect/Reconnect, and
+  the raw file or command behind Details. Account chips say Signed in / Needs
+  sign-in with the Sign in on the chip.
+- Tests' stand-in CLIs run in the tests' own environment, never through the
+  person's login shell (whose CLAUDE_CONFIG_DIR names a real config).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   4 +
+ chrome/browser/meridian/agent/agent_cli.cc    | 345 +++++++++++++-
+ chrome/browser/meridian/agent/agent_cli.h     |  25 +
+ chrome/browser/meridian/agent/mcp_bridge.cc   |  23 +
+ chrome/browser/meridian/ai/accounts.cc        |  15 +-
+ chrome/browser/meridian/ai/accounts.h         |   9 +-
+ chrome/browser/meridian/ai/ai_service.cc      |  37 +-
+ chrome/browser/meridian/ai/ai_service.h       |   4 +
+ chrome/browser/meridian/ai/cli_versions.cc    | 164 +++++++
+ chrome/browser/meridian/ai/cli_versions.h     |  51 ++
+ .../meridian/ai/cli_versions_unittest.cc      |  28 ++
+ chrome/browser/meridian/ai/local_agents.cc    |  74 ++-
+ chrome/browser/meridian/ai/local_agents.h     |  22 +
+ chrome/browser/meridian/ai/providers.cc       |   9 +
+ chrome/browser/meridian/ai/providers.h        |   5 +
+ .../meridian/boosts/boost_tab_helper.cc       |   8 +-
+ chrome/browser/meridian/sidebar.mojom         |  46 ++
+ chrome/browser/meridian/sidebar_handler.cc    | 444 +++++++++++++++++-
+ chrome/browser/meridian/sidebar_handler.h     |  11 +
+ .../browser/meridian/sidebar_handler_mac.mm   |  51 +-
+ .../meridian/boost_editor.html.ts             |   2 +-
+ .../webui_browser/meridian/boost_editor.ts    |  74 ++-
+ .../webui_browser/meridian/onboarding.css     |  55 +++
+ .../webui_browser/meridian/onboarding.html.ts |  38 +-
+ .../webui_browser/meridian/onboarding.ts      | 183 +++++++-
+ .../webui_browser/meridian/settings.css       | 105 +++++
+ .../webui_browser/meridian/settings.html.ts   |  75 ++-
+ .../webui_browser/meridian/settings.ts        | 255 +++++++++-
+ 28 files changed, 2084 insertions(+), 78 deletions(-)
+ create mode 100644 chrome/browser/meridian/ai/cli_versions.cc
+ create mode 100644 chrome/browser/meridian/ai/cli_versions.h
+ create mode 100644 chrome/browser/meridian/ai/cli_versions_unittest.cc
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index a9ca81eac1..55c05b87ec 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -162,6 +162,8 @@ source_set("ai_providers") {
+     "ai/page_text.h",
+     "ai/accounts.cc",
+     "ai/accounts.h",
++    "ai/cli_versions.cc",
++    "ai/cli_versions.h",
+     "ai/process_runner.cc",
+     "ai/process_runner.h",
+     "ai/providers.cc",
+@@ -295,6 +297,7 @@ source_set("agent_cli") {
+   deps = [
+     ":ai_providers",
+     ":test_switches",
++    "//third_party/re2",
+   ]
+ }
+ 
+@@ -586,6 +589,7 @@ test("meridian_unittests") {
+     "update_check_unittest.cc",
+     "ai/accounts_unittest.cc",
+     "ai/chats_unittest.cc",
++    "ai/cli_versions_unittest.cc",
+     "ai/page_text_unittest.cc",
+     "ai/process_runner_unittest.cc",
+     "ai/providers_unittest.cc",
+diff --git a/chrome/browser/meridian/agent/agent_cli.cc b/chrome/browser/meridian/agent/agent_cli.cc
+index 4467baed63..594c599fd4 100644
+--- a/chrome/browser/meridian/agent/agent_cli.cc
++++ b/chrome/browser/meridian/agent/agent_cli.cc
+@@ -20,8 +20,11 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/values.h"
+ #include "build/build_config.h"
++#include "chrome/browser/meridian/ai/accounts.h"
++#include "chrome/browser/meridian/ai/cli_versions.h"
+ #include "chrome/browser/meridian/ai/process_runner.h"
+ #include "chrome/browser/meridian/test_switches.h"
++#include "third_party/re2/src/re2/re2.h"
+ 
+ namespace meridian {
+ 
+@@ -127,8 +130,14 @@ std::string LoginPath() {
+ #endif
+ }
+ 
++// The newest copy of `name` (an old Claude Code in /usr/local/bin and the
++// current one in ~/.local/bin: the current one, whatever the PATH's order),
++// as Ask and the Workbench run it (cli_versions.h).
+ std::string Which(const std::string& name, const std::string& path) {
+-  return ai::FindProgram(name, path);
++  return ai::FindNewestProgram(
++      name, path,
++      {{"HOME", base::GetHomeDir().AsUTF8Unsafe()},
++       {"PATH", path}});
+ }
+ 
+ // An app in /Applications or ~/Applications (never in a test).
+@@ -176,36 +185,65 @@ std::string CommandOf(const Known& cli) {
+   return command;
+ }
+ 
+-bool RunCli(const Known& cli, std::string* output) {
++// `env`: changes for an account (ai::AccountEnv: an empty value takes the
++// variable away). `args`: what to run instead of the "mcp add" (a remove).
++bool RunCli(const Known& cli,
++            std::string* output,
++            const std::map<std::string, std::string>& env = {},
++            std::optional<std::vector<std::string>> custom_args = {}) {
+   std::string bin = Locate(cli, LoginPath());
+   if (bin.empty()) {
+     *output = std::string(cli.bin) + " was not found on your PATH";
+     return false;
+   }
+-  const std::vector<std::string> args = cli.args(Program());
++  const std::vector<std::string> args =
++      custom_args ? *custom_args : cli.args(Program());
+   int exit_code = -1;
+ #if BUILDFLAG(IS_WIN)
+   base::CommandLine command(base::FilePath::FromUTF8Unsafe(bin));
+   for (const std::string& arg : args) {
+     command.AppendArgNative(base::UTF8ToWide(arg));
+   }
++  // (An account's variables: macOS and Linux only for now.)
+   base::GetAppOutputAndError(command, output);
+   // (Only the output says how it went there.)
+   exit_code =
+       base::ToLowerASCII(*output).find("error") == std::string::npos ? 0 : 1;
+ #else
++  if (TestSwitchesAllowed()) {
++    // A test's stand-in runs in the tests' own minimal environment, never
++    // through the person's login shell, whose CLAUDE_CONFIG_DIR, CODEX_HOME…
++    // name their real configs.
++    std::map<std::string, std::string> test_env = ai::LoginEnvironment();
++    ai::ApplyAccountEnv(env, test_env);
++    std::vector<std::string> argv = {bin};
++    argv.insert(argv.end(), args.begin(), args.end());
++    *output = ai::CaptureOutput(argv, test_env, test_env["HOME"],
++                                base::Seconds(30), &exit_code);
++  } else {
+   // Through the login shell, for the CLI's own PATH (node and the like).
+-  std::string script = Quote(bin);
++  std::string script;
++  for (const auto& [name, value] : env) {
++    script += value.empty() ? "unset " + name + "; "
++                            : "export " + name + "=" + Quote(value) + "; ";
++  }
++  script += Quote(bin);
+   for (const std::string& arg : args) {
+     script += " " + Quote(arg);
+   }
+   base::GetAppOutputWithExitCode(
+       base::CommandLine({Shell(), "-lc", script + " 2>&1"}), output,
+       &exit_code);
++  }
+ #endif
+   if (output->size() > 2000) {
+     output->resize(2000);
+   }
++  if (custom_args) {
++    // Removing what isn't there is done too.
++    return exit_code == 0 ||
++           base::ToLowerASCII(*output).find("not found") != std::string::npos;
++  }
+   return exit_code == 0 ||
+          base::ToLowerASCII(*output).find("already exists") !=
+              std::string::npos;
+@@ -819,6 +857,141 @@ bool AddGoose(const base::FilePath& config,
+                      output);
+ }
+ 
++// ---- Whether Meridian is already in an agent's config (read only)
++
++// The home folder whose configs are read: the tests' own, never the real one.
++base::FilePath StateHome() {
++  if (TestSwitchesAllowed()) {
++    return TestSwitchPath("meridian-accounts-home");
++  }
++  return base::GetHomeDir();
++}
++
++// A variable of the person's login environment (CLAUDE_CONFIG_DIR, …).
++std::string LoginEnvVar(const std::string& name) {
++  const std::map<std::string, std::string> env = ai::LoginEnvironment();
++  auto it = env.find(name);
++  return it != env.end() ? it->second : std::string();
++}
++
++std::optional<base::DictValue> ReadJsonFile(const base::FilePath& file) {
++  std::string text;
++  if (file.empty() || !base::ReadFileToString(file, &text)) {
++    return std::nullopt;
++  }
++  return base::JSONReader::ReadDict(text,
++                                    base::JSON_PARSE_CHROMIUM_EXTENSIONS);
++}
++
++// "connected" when `servers_key` of the JSON file has "meridian"; a file that
++// isn't there: "not-connected"; one that can't be read: "".
++std::string JsonState(const base::FilePath& file, const std::string& key) {
++  if (file.empty()) {
++    return std::string();
++  }
++  if (!base::PathExists(file)) {
++    return "not-connected";
++  }
++  std::optional<base::DictValue> root = ReadJsonFile(file);
++  if (!root) {
++    return std::string();
++  }
++  const base::DictValue* servers = root->FindDict(key);
++  return servers && servers->FindDict("meridian") ? "connected"
++                                                  : "not-connected";
++}
++
++base::FilePath ClaudeJson(const base::FilePath& dir, const base::FilePath& home) {
++  // The CLI's own folder keeps its file next to it, in the home folder.
++  if (dir.StripTrailingSeparators() ==
++      home.AppendASCII(".claude").StripTrailingSeparators()) {
++    return home.AppendASCII(".claude.json");
++  }
++  return dir.AppendASCII(".claude.json");
++}
++
++bool CodexTomlHasMeridian(const base::FilePath& file) {
++  std::string text;
++  return base::ReadFileToString(file, &text) &&
++         RE2::PartialMatch(
++             text, "(?m)^\\s*\\[\\s*mcp_servers\\.\\\"?meridian\\\"?\\s*\\]");
++}
++
++// The default account's folder: the login environment's variable, else the
++// CLI's own folder.
++base::FilePath DefaultDir(const std::string& var, const char* folder,
++                          const base::FilePath& home) {
++  const std::string from_env =
++      TestSwitchesAllowed() ? ai::TestLoginEnv()[var] : LoginEnvVar(var);
++  return from_env.empty() ? home.AppendASCII(folder)
++                          : base::FilePath::FromUTF8Unsafe(from_env);
++}
++
++std::string CliState(const std::string& id) {
++  const base::FilePath home = StateHome();
++  if (home.empty()) {
++    return std::string();
++  }
++  if (id == "claude") {
++    return JsonState(
++        ClaudeJson(DefaultDir("CLAUDE_CONFIG_DIR", ".claude", home), home),
++        "mcpServers");
++  }
++  if (id == "codex") {
++    return CodexTomlHasMeridian(
++               DefaultDir("CODEX_HOME", ".codex", home)
++                   .AppendASCII("config.toml"))
++               ? "connected"
++               : "not-connected";
++  }
++  if (id == "copilot") {
++    return JsonState(DefaultDir("COPILOT_HOME", ".copilot", home)
++                         .AppendASCII("mcp-config.json"),
++                     "mcpServers");
++  }
++  if (id == "gemini") {
++    return JsonState(home.AppendASCII(".gemini/settings.json"), "mcpServers");
++  }
++  if (id == "qwen") {
++    return JsonState(home.AppendASCII(".qwen/settings.json"), "mcpServers");
++  }
++  if (id == "vscode") {
++#if BUILDFLAG(IS_MAC)
++    return JsonState(
++        home.AppendASCII("Library/Application Support/Code/User/mcp.json"),
++        "servers");
++#elif BUILDFLAG(IS_WIN)
++    base::FilePath roaming;
++    if (TestSwitchesAllowed() ||
++        !base::PathService::Get(base::DIR_ROAMING_APP_DATA, &roaming)) {
++      return JsonState(home.AppendASCII("Code/User/mcp.json"), "servers");
++    }
++    return JsonState(roaming.AppendASCII("Code/User/mcp.json"), "servers");
++#else
++    return JsonState(home.AppendASCII(".config/Code/User/mcp.json"),
++                     "servers");
++#endif
++  }
++  return std::string();
++}
++
++std::string FileAgentState(const std::string& id, const base::FilePath& file) {
++  if (id == "goose") {
++    std::string text;
++    if (!base::PathExists(file)) {
++      return "not-connected";
++    }
++    if (!base::ReadFileToString(file, &text)) {
++      return std::string();
++    }
++    return RE2::PartialMatch(text,
++                             "(?m)^extensions:[\\s\\S]*^\\s+meridian:\\s*$")
++               ? "connected"
++               : "not-connected";
++  }
++  return JsonState(file, EntryFor(id, Program()).key);
++}
++
+ AgentCli DetectFileAgent(const FileAgent& agent,
+                          const std::string& path,
+                          const std::string& xdg_home) {
+@@ -830,6 +1003,8 @@ AgentCli DetectFileAgent(const FileAgent& agent,
+   }
+   const base::FilePath dir = ConfigDir(agent, xdg_home);
+   out.file = DisplayPath(dir.AppendASCII(agent.file));
++  out.state = FileAgentState(agent.id, dir.AppendASCII(agent.file));
++  out.can_disconnect = std::string_view(agent.id) != "goose";
+   for (const char* bin : agent.bins) {
+     if (out.path.empty()) {
+       out.path = Which(bin, path);
+@@ -880,17 +1055,30 @@ std::vector<AgentCli> DetectAgentClis() {
+   const std::string xdg_home = any_xdg ? LoginVar("XDG_CONFIG_HOME") : "";
+   auto cli = [&](const char* id) {
+     const Known& known = *FindKnown(id);
+-    return AgentCli{known.id, known.name, Locate(known, path),
+-                    CommandOf(known), ""};
++    AgentCli out{known.id, known.name, Locate(known, path), CommandOf(known),
++                 ""};
++    out.state = CliState(id);
++    out.can_disconnect = std::string_view(id) == "claude" ||
++                         std::string_view(id) == "codex" ||
++                         std::string_view(id) == "gemini" ||
++                         std::string_view(id) == "qwen";
++    return out;
+   };
++  AgentCli desktop{kDesktopId, "Claude Desktop",
++                   DesktopInstalled() ? DesktopConfig().AsUTF8Unsafe() : "",
++                   DesktopCommand(), DisplayPath(DesktopConfig())};
++  if (!TestSwitchesAllowed() ||
++      base::CommandLine::ForCurrentProcess()->HasSwitch(
++          kClaudeDesktopConfigSwitch)) {
++    desktop.state = JsonState(DesktopConfig(), "mcpServers");
++    desktop.can_disconnect = true;
++  }
+   auto file = [&](const char* id) {
+     return DetectFileAgent(*FindFileAgent(id), path, xdg_home);
+   };
+   return {cli("claude"),
+           cli("codex"),
+-          {kDesktopId, "Claude Desktop",
+-           DesktopInstalled() ? DesktopConfig().AsUTF8Unsafe() : "",
+-           DesktopCommand(), DisplayPath(DesktopConfig())},
++          desktop,
+           file("opencode"),
+           file("cursor"),
+           cli("vscode"),
+@@ -903,7 +1091,30 @@ std::vector<AgentCli> DetectAgentClis() {
+           file("droid")};
+ }
+ 
++// Meridian started from a disk image or from a copy macOS made to run a
++// download (App Translocation): a path that is gone after the next restart,
++// so an agent given it would find nothing. Why, or "".
++std::string UnstableProgram() {
++#if BUILDFLAG(IS_MAC)
++  const std::string program =
++      HasTestSwitch("meridian-test-program")
++          ? TestSwitchValue("meridian-test-program")
++          : Program();
++  if (program.find("/AppTranslocation/") != std::string::npos ||
++      base::StartsWith(program, "/Volumes/")) {
++    return "Meridian is running from the download (or its disk image), not "
++           "from Applications, and that place goes away. Move Meridian to "
++           "Applications, open it from there, and connect again.";
++  }
++#endif
++  return std::string();
++}
++
+ bool ConnectAgentCli(const std::string& id, std::string* output) {
++  if (std::string unstable = UnstableProgram(); !unstable.empty()) {
++    *output = unstable;
++    return false;
++  }
+   if (id == kDesktopId) {
+     return ConnectDesktop(output);
+   }
+@@ -931,4 +1142,120 @@ ClaudeDesktopState GetClaudeDesktopState() {
+   return DesktopState();
+ }
+ 
++bool AgentConnectedForAccount(const std::string& vendor_id,
++                              const base::FilePath& dir,
++                              const base::FilePath& home) {
++  if (vendor_id == "claude") {
++    return JsonState(ClaudeJson(dir, home), "mcpServers") == "connected";
++  }
++  if (vendor_id == "codex") {
++    return CodexTomlHasMeridian(dir.AppendASCII("config.toml"));
++  }
++  if (vendor_id == "copilot") {
++    return JsonState(dir.AppendASCII("mcp-config.json"), "mcpServers") ==
++           "connected";
++  }
++  if (vendor_id == "gemini") {
++    return JsonState(dir.AppendASCII(".gemini/settings.json"), "mcpServers") ==
++           "connected";
++  }
++  return false;
++}
++
++bool ConnectAgentCliAs(const std::string& id,
++                       const std::map<std::string, std::string>& env,
++                       std::string* output) {
++  if (std::string unstable = UnstableProgram(); !unstable.empty()) {
++    *output = unstable;
++    return false;
++  }
++  const Known* cli = FindKnown(id);
++  if (!cli) {
++    *output = "unknown agent";
++    return false;
++  }
++  return RunCli(*cli, output, env);
++}
++
++namespace {
++
++// Takes "meridian" out of `key` of a JSON config, keeping everything else.
++bool RemoveJsonEntry(const base::FilePath& file,
++                     const std::string& key,
++                     std::string* output) {
++  std::string text;
++  if (!base::PathExists(file)) {
++    *output = "not connected";
++    return true;
++  }
++  if (!base::ReadFileToString(file, &text)) {
++    *output = "couldn’t read " + file.AsUTF8Unsafe();
++    return false;
++  }
++  std::optional<base::DictValue> root =
++      base::JSONReader::ReadDict(text, base::JSON_ALLOW_TRAILING_COMMAS);
++  if (!root) {
++    *output = file.AsUTF8Unsafe() +
++              " isn’t plain JSON, so Meridian left it as it is. Take "
++              "\"meridian\" out of it yourself.";
++    return false;
++  }
++  base::DictValue* servers = root->FindDict(key);
++  if (!servers || !servers->Remove("meridian")) {
++    *output = "not connected";
++    return true;
++  }
++  std::string json;
++  base::JSONWriter::WriteWithOptions(
++      *root, base::JSONWriter::OPTIONS_PRETTY_PRINT, &json);
++  return WriteConfig(file, true, json, output);
++}
++
++}  // namespace
++
++bool DisconnectAgentCli(const std::string& id,
++                        const std::map<std::string, std::string>& env,
++                        std::string* output) {
++  if (id == kDesktopId) {
++    if (TestSwitchesAllowed() &&
++        !base::CommandLine::ForCurrentProcess()->HasSwitch(
++            kClaudeDesktopConfigSwitch)) {
++      *output = "no test config";
++      return false;
++    }
++    return RemoveJsonEntry(DesktopConfig(), "mcpServers", output);
++  }
++  if (const FileAgent* agent = FindFileAgent(id)) {
++    if (TestWithoutConfig(*agent) || id == "goose") {
++      *output = id == "goose" ? "Take meridian out of Goose’s extensions "
++                                "yourself."
++                              : "no test config";
++      return false;
++    }
++    const bool needs_xdg =
++        agent->xdg &&
++        !base::CommandLine::ForCurrentProcess()->HasSwitch(
++            agent->config_switch);
++    base::FilePath file =
++        ConfigDir(*agent, needs_xdg ? LoginVar("XDG_CONFIG_HOME") : "")
++            .AppendASCII(agent->file);
++    if (!FollowLink(&file, output)) {
++      return false;
++    }
++    return RemoveJsonEntry(file, EntryFor(id, Program()).key, output);
++  }
++  const Known* cli = FindKnown(id);
++  if (!cli || id == "vscode" || id == "copilot") {
++    *output = "Meridian can’t take itself out of this one; remove "
++              "\"meridian\" from its MCP servers there.";
++    return false;
++  }
++  std::vector<std::string> args = {"mcp", "remove"};
++  if (id == "claude" || id == "gemini" || id == "qwen") {
++    args.insert(args.end(), {"-s", "user"});
++  }
++  args.push_back("meridian");
++  return RunCli(*cli, output, env, args);
++}
++
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/agent/agent_cli.h b/chrome/browser/meridian/agent/agent_cli.h
+index 4332cd448a..68dcb058f9 100644
+--- a/chrome/browser/meridian/agent/agent_cli.h
++++ b/chrome/browser/meridian/agent/agent_cli.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_MERIDIAN_AGENT_AGENT_CLI_H_
+ #define CHROME_BROWSER_MERIDIAN_AGENT_AGENT_CLI_H_
+ 
++#include <map>
+ #include <string>
+ #include <vector>
+ 
+@@ -24,6 +25,11 @@ struct AgentCli {
+   std::string path;     // empty if not found
+   std::string command;  // what Connect runs, or the entry it adds to `file`
+   std::string file;     // agents set up by file: the file Connect edits
++  // Read from the agent's own config, the way Connect writes it (nothing is
++  // run): "connected", "not-connected", or "" when it can't be told.
++  std::string state;
++  // Meridian can take its entry out again (Disconnect).
++  bool can_disconnect = false;
+ };
+ 
+ std::vector<AgentCli> DetectAgentClis();
+@@ -88,6 +94,25 @@ inline bool AddOpenCodeServer(const base::FilePath& dir,
+ // is what happened. Already registered counts as connected.
+ bool ConnectAgentCli(const std::string& id, std::string* output);
+ 
++// Claude Code and Codex keep one config per account (ai/accounts.h): whether
++// Meridian is in the one of the account in `dir` (Claude Code: the user-scope
++// "mcpServers" of <dir>/.claude.json, or ~/.claude.json for ~/.claude;
++// Codex: [mcp_servers.meridian] in <dir>/config.toml). Read only, nothing
++// is run. `home`: the home folder those defaults are in.
++bool AgentConnectedForAccount(const std::string& vendor_id,
++                              const base::FilePath& dir,
++                              const base::FilePath& home);
++
++// Connects / disconnects agent `id` for one account: its "mcp add" / "mcp
++// remove" run with `env` (ai::AccountEnv: the account's variable, or taken
++// away for the default folder).
++bool ConnectAgentCliAs(const std::string& id,
++                       const std::map<std::string, std::string>& env,
++                       std::string* output);
++bool DisconnectAgentCli(const std::string& id,
++                        const std::map<std::string, std::string>& env,
++                        std::string* output);
++
+ }  // namespace meridian
+ 
+ #endif  // CHROME_BROWSER_MERIDIAN_AGENT_AGENT_CLI_H_
+diff --git a/chrome/browser/meridian/agent/mcp_bridge.cc b/chrome/browser/meridian/agent/mcp_bridge.cc
+index 59d08122c1..2abb71d412 100644
+--- a/chrome/browser/meridian/agent/mcp_bridge.cc
++++ b/chrome/browser/meridian/agent/mcp_bridge.cc
+@@ -23,6 +23,7 @@
+ #include "base/threading/platform_thread.h"
+ #include "base/time/time.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
+ #include "base/values.h"
+ #include "chrome/browser/meridian/agent/agent_embed.h"  // generated
+ #include "chrome/browser/meridian/local_socket.h"
+@@ -65,6 +66,27 @@ base::FilePath UserDataDir(int argc, const char** argv) {
+   return dir;
+ }
+ 
++// The app that started this bridge said hello: Meridian's settings can then
++// say "Claude Desktop is connected" for real, not only that its config has
++// the entry. One file per client name (Claude Desktop says "claude-ai"),
++// holding when; agent_cli.h kMcpClientsDir reads them.
++void NoteClient(const base::FilePath& user_data_dir, const std::string& name) {
++  std::string file;
++  for (char c : name) {
++    file += base::IsAsciiAlphaNumeric(c) || c == '-' || c == '_' || c == '.'
++                ? c
++                : '_';
++  }
++  if (file.empty() || file[0] == '.' || user_data_dir.empty()) {
++    return;
++  }
++  const base::FilePath dir = user_data_dir.AppendASCII("Meridian MCP Clients");
++  base::CreateDirectory(dir);
++  base::WriteFile(dir.AppendASCII(file),
++                  base::NumberToString(
++                      base::Time::Now().InMillisecondsSinceUnixEpoch()));
++}
++
+ // Tool calls answer from their own threads: one line at a time.
+ base::Lock& WriteLock() {
+   static base::NoDestructor<base::Lock> lock;
+@@ -345,6 +367,7 @@ int RunMcpBridge(int argc, const char** argv) {
+       if (name && !name->empty()) {
+         client = name->substr(0, 60);
+       }
++      NoteClient(user_data_dir, client);
+       Write(Result(
+           id, base::DictValue()
+                   .Set("protocolVersion", version ? *version : "2025-06-18")
+diff --git a/chrome/browser/meridian/ai/accounts.cc b/chrome/browser/meridian/ai/accounts.cc
+index 8c7ced0240..c90592b9b6 100644
+--- a/chrome/browser/meridian/ai/accounts.cc
++++ b/chrome/browser/meridian/ai/accounts.cc
+@@ -449,16 +449,27 @@ base::DictValue SuggestAccounts(
+   return out;
+ }
+ 
++std::string WithProgram(const std::string& command,
++                        const std::string& program) {
++  if (program.empty() || command.empty()) {
++    return command;
++  }
++  const size_t space = command.find(' ');
++  return Quote(program) +
++         (space == std::string::npos ? std::string() : command.substr(space));
++}
++
+ std::string AccountLoginCommand(const AccountVendor& vendor,
+                                 const base::FilePath& home,
+-                                const base::FilePath& dir) {
++                                const base::FilePath& dir,
++                                const std::string& program) {
+   std::map<std::string, std::string> env = AccountEnv(vendor, home, dir);
+   std::string prefix;
+   for (const auto& [name, value] : env) {
+     prefix += value.empty() ? "env -u " + name + " "
+                             : name + "=" + Quote(value) + " ";
+   }
+-  return prefix + vendor.login;
++  return prefix + WithProgram(vendor.login, program);
+ }
+ 
+ }  // namespace meridian::ai
+diff --git a/chrome/browser/meridian/ai/accounts.h b/chrome/browser/meridian/ai/accounts.h
+index 76c9458693..e80db5e320 100644
+--- a/chrome/browser/meridian/ai/accounts.h
++++ b/chrome/browser/meridian/ai/accounts.h
+@@ -130,9 +130,16 @@ base::DictValue SuggestAccounts(
+     const std::vector<std::pair<std::string, std::string>>& spaces);
+ 
+ // The command that starts the vendor's sign-in as `dir` in a terminal.
++// `program`: the CLI to run there (the copy Meridian uses), else the
++// vendor's command name as the terminal's PATH finds it.
+ std::string AccountLoginCommand(const AccountVendor& vendor,
+                                 const base::FilePath& home,
+-                                const base::FilePath& dir);
++                                const base::FilePath& dir,
++                                const std::string& program = std::string());
++
++// `command` ("claude", "codex login") with its program replaced by
++// `program` (quoted), when that is given.
++std::string WithProgram(const std::string& command, const std::string& program);
+ 
+ }  // namespace meridian::ai
+ 
+diff --git a/chrome/browser/meridian/ai/ai_service.cc b/chrome/browser/meridian/ai/ai_service.cc
+index 6d9e6272f0..a5c52fa5aa 100644
+--- a/chrome/browser/meridian/ai/ai_service.cc
++++ b/chrome/browser/meridian/ai/ai_service.cc
+@@ -874,6 +874,31 @@ void AiService::WhenDetected(base::OnceClosure done) {
+                    std::move(done)));
+ }
+ 
++std::string AiService::SignedOutProvider() const {
++  if (!CurrentProvider().empty() || !PicksLocalAgents()) {
++    return std::string();
++  }
++  std::optional<std::vector<ai::Detected>> found = local_->Found();
++  if (!found) {
++    return std::string();
++  }
++  const bool other_agents =
++      profile_->GetPrefs()->GetBoolean(prefs::kAiOtherAgents);
++  for (const ai::Provider& p : ai::Providers()) {
++    if (p.kind != ai::Kind::kCli ||
++        (p.policy == ai::Policy::kOptIn && !other_agents)) {
++      continue;
++    }
++    for (const ai::Detected& d : *found) {
++      if (d.id == p.id && d.installed && d.signed_in == false &&
++          !d.unavailable) {
++        return p.id;
++      }
++    }
++  }
++  return std::string();
++}
++
+ std::string AiService::CurrentLabel() const {
+   std::string id = CurrentProvider();
+   if (id == "api") {
+@@ -1140,9 +1165,15 @@ void AiService::Chat(Request request, EventCallback events) {
+   std::string provider =
+       request.provider.empty() ? CurrentProvider() : request.provider;
+   if (provider.empty()) {
+-    session->events.Run("error",
+-                        "Set up an AI in Settings > AI: Claude Code, Codex, "
+-                        "an API key, or a local model like Ollama.");
++    const ai::Provider* signed_out = ai::FindProvider(SignedOutProvider());
++    session->events.Run(
++        "error", signed_out
++                     ? signed_out->label +
++                           " isn’t signed in yet. Open Settings > AI and "
++                           "sign in to it."
++                     : std::string("Set up an AI in Settings > AI: Claude "
++                                   "Code, Codex, an API key, or a local "
++                                   "model like Ollama."));
+     return;
+   }
+   if (provider != "api") {
+diff --git a/chrome/browser/meridian/ai/ai_service.h b/chrome/browser/meridian/ai/ai_service.h
+index 044661b21f..ac827b1cdc 100644
+--- a/chrome/browser/meridian/ai/ai_service.h
++++ b/chrome/browser/meridian/ai/ai_service.h
+@@ -92,6 +92,10 @@ class AiService : public KeyedService {
+   // The name shown for it ("Claude", "Ollama"…), or "" when nothing is set
+   // up.
+   std::string CurrentLabel() const;
++  // Nothing answers (CurrentProvider() is ""), but a coding agent Automatic
++  // would pick is installed and signed out: its provider id ("claude-code"),
++  // else "".
++  std::string SignedOutProvider() const;
+ 
+   // Consent before anything goes to an AI service on the internet (not one
+   // on this computer): the person said yes once this run, or always; or AI
+diff --git a/chrome/browser/meridian/ai/cli_versions.cc b/chrome/browser/meridian/ai/cli_versions.cc
+new file mode 100644
+index 0000000000..c06a93f248
+--- /dev/null
++++ b/chrome/browser/meridian/ai/cli_versions.cc
+@@ -0,0 +1,164 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/ai/cli_versions.h"
++
++#include <algorithm>
++#include <set>
++
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++#include "base/synchronization/lock.h"
++#include "base/time/time.h"
++#include "build/build_config.h"
++#include "chrome/browser/meridian/ai/process_runner.h"
++#include "chrome/browser/meridian/test_switches.h"
++#include "third_party/re2/src/re2/re2.h"
++
++namespace meridian::ai {
++
++namespace {
++
++#if BUILDFLAG(IS_WIN)
++constexpr char kSeparator[] = ";";
++#else
++constexpr char kSeparator[] = ":";
++#endif
++
++std::vector<std::string> Folders(const std::string& search_path,
++                                 const std::map<std::string, std::string>& env) {
++  std::vector<std::string> out =
++      base::SplitString(search_path, kSeparator, base::TRIM_WHITESPACE,
++                        base::SPLIT_WANT_NONEMPTY);
++#if !BUILDFLAG(IS_WIN)
++  // A test sees its stand-ins only, never the computer's real CLIs.
++  if (TestSwitchesAllowed()) {
++    return out;
++  }
++  auto home = env.find("HOME");
++  if (home != env.end() && !home->second.empty()) {
++    for (const char* dir :
++         {"/.local/bin", "/.claude/local", "/.npm-global/bin", "/.volta/bin",
++          "/.bun/bin"}) {
++      out.push_back(home->second + dir);
++    }
++  }
++  out.push_back("/opt/homebrew/bin");
++  out.push_back("/usr/local/bin");
++#endif
++  return out;
++}
++
++// What --version says, per file and its change time and size.
++std::string VersionOf(const std::string& path,
++                      const std::map<std::string, std::string>& env) {
++  static base::NoDestructor<base::Lock> lock;
++  static base::NoDestructor<std::map<std::string, std::string>> known;
++  base::File::Info info;
++  base::GetFileInfo(base::FilePath::FromUTF8Unsafe(path), &info);
++  const std::string key =
++      path + "|" +
++      base::NumberToString(info.last_modified.InMillisecondsSinceUnixEpoch()) +
++      "|" + base::NumberToString(info.size);
++  {
++    base::AutoLock hold(*lock);
++    if (auto it = known->find(key); it != known->end()) {
++      return it->second;
++    }
++  }
++  auto home = env.find("HOME");
++  int exit_code = -1;
++  const std::string out =
++      CaptureOutput({path, "--version"}, env,
++                    home != env.end() ? home->second : std::string(),
++                    base::Seconds(8), &exit_code);
++  const std::string version = ParseCliVersion(out);
++  if (!version.empty()) {
++    base::AutoLock hold(*lock);
++    (*known)[key] = version;
++  }
++  return version;
++}
++
++}  // namespace
++
++std::string ParseCliVersion(const std::string& output) {
++  std::string version;
++  RE2::PartialMatch(output, "(\\d+\\.\\d+(?:\\.\\d+)*)", &version);
++  return version;
++}
++
++int CompareCliVersions(const std::string& a, const std::string& b) {
++  if (a.empty() || b.empty()) {
++    return a.empty() == b.empty() ? 0 : a.empty() ? -1 : 1;
++  }
++  const std::vector<std::string> pa = base::SplitString(
++      a, ".", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++  const std::vector<std::string> pb = base::SplitString(
++      b, ".", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++  for (size_t i = 0; i < std::max(pa.size(), pb.size()); ++i) {
++    int x = 0;
++    int y = 0;
++    if (i < pa.size()) {
++      base::StringToInt(pa[i], &x);
++    }
++    if (i < pb.size()) {
++      base::StringToInt(pb[i], &y);
++    }
++    if (x != y) {
++      return x < y ? -1 : 1;
++    }
++  }
++  return 0;
++}
++
++std::vector<CliCopy> FindCliCopies(
++    const std::string& name,
++    const std::string& search_path,
++    const std::map<std::string, std::string>& env) {
++  std::vector<CliCopy> copies;
++  std::set<std::string> seen;
++  for (const std::string& dir : Folders(search_path, env)) {
++    const std::string found = FindProgram(name, dir);
++    if (found.empty()) {
++      continue;
++    }
++    base::FilePath real =
++        base::MakeAbsoluteFilePath(base::FilePath::FromUTF8Unsafe(found));
++    const std::string key = real.empty() ? found : real.AsUTF8Unsafe();
++    if (!seen.insert(key).second) {
++      continue;
++    }
++    copies.push_back({found, ""});
++  }
++  if (copies.size() < 2) {
++    return copies;
++  }
++  for (CliCopy& copy : copies) {
++    copy.version = VersionOf(copy.path, env);
++  }
++  // Newest first; the PATH's order among equals.
++  std::stable_sort(copies.begin(), copies.end(),
++                   [](const CliCopy& x, const CliCopy& y) {
++                     return CompareCliVersions(x.version, y.version) > 0;
++                   });
++  return copies;
++}
++
++std::string FindNewestProgram(const std::string& name,
++                              const std::string& search_path,
++                              const std::map<std::string, std::string>& env,
++                              std::vector<CliCopy>* copies) {
++  std::vector<CliCopy> found = FindCliCopies(name, search_path, env);
++  std::string newest = found.empty() ? std::string() : found.front().path;
++  if (copies) {
++    *copies = std::move(found);
++  }
++  return newest;
++}
++
++}  // namespace meridian::ai
+diff --git a/chrome/browser/meridian/ai/cli_versions.h b/chrome/browser/meridian/ai/cli_versions.h
+new file mode 100644
+index 0000000000..425700bfdf
+--- /dev/null
++++ b/chrome/browser/meridian/ai/cli_versions.h
+@@ -0,0 +1,51 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_AI_CLI_VERSIONS_H_
++#define CHROME_BROWSER_MERIDIAN_AI_CLI_VERSIONS_H_
++
++#include <map>
++#include <string>
++#include <vector>
++
++namespace meridian::ai {
++
++// One copy of a CLI on this computer.
++struct CliCopy {
++  std::string path;
++  // "2.1.332" from its --version; "" when it didn't say (or there was only
++  // one copy, which is then never asked).
++  std::string version;
++};
++
++// "2.1.332" out of "2.1.332 (Claude Code)", "codex-cli 0.46.0" and the like;
++// "" when there is no version in it.
++std::string ParseCliVersion(const std::string& output);
++
++// <0, 0, >0 as `a` is older than, the same as, newer than `b` (numerically,
++// part by part: 2.1.332 > 2.1.41). An empty version is the oldest.
++int CompareCliVersions(const std::string& a, const std::string& b);
++
++// Every copy of `name`: in the folders of `search_path` first (in order),
++// then where installers put agent CLIs (~/.local/bin, ~/.claude/local,
++// /opt/homebrew/bin, /usr/local/bin, npm, Volta and Bun folders; not in a
++// test, which sees only its PATH). A link to a copy already listed is left
++// out. With more than one, each is asked its --version (cached per file and
++// its change time), and `copies` lists them newest first. Blocking.
++std::vector<CliCopy> FindCliCopies(
++    const std::string& name,
++    const std::string& search_path,
++    const std::map<std::string, std::string>& env);
++
++// The newest copy of `name` (on a tie, the first on the PATH); "" when there
++// is none. A computer with an old Claude Code in /usr/local/bin and a new one
++// in ~/.local/bin runs the new one, whichever the PATH lists first. Blocking.
++std::string FindNewestProgram(const std::string& name,
++                              const std::string& search_path,
++                              const std::map<std::string, std::string>& env,
++                              std::vector<CliCopy>* copies = nullptr);
++
++}  // namespace meridian::ai
++
++#endif  // CHROME_BROWSER_MERIDIAN_AI_CLI_VERSIONS_H_
+diff --git a/chrome/browser/meridian/ai/cli_versions_unittest.cc b/chrome/browser/meridian/ai/cli_versions_unittest.cc
+new file mode 100644
+index 0000000000..949eada5df
+--- /dev/null
++++ b/chrome/browser/meridian/ai/cli_versions_unittest.cc
+@@ -0,0 +1,28 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/ai/cli_versions.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace meridian::ai {
++
++TEST(CliVersionsTest, ParsesWhatCommonCliesSay) {
++  EXPECT_EQ(ParseCliVersion("2.1.332 (Claude Code)\n"), "2.1.332");
++  EXPECT_EQ(ParseCliVersion("codex-cli 0.46.0"), "0.46.0");
++  EXPECT_EQ(ParseCliVersion("v1.2"), "1.2");
++  EXPECT_EQ(ParseCliVersion("command not found"), "");
++}
++
++TEST(CliVersionsTest, ComparesPartByPartAsNumbers) {
++  EXPECT_GT(CompareCliVersions("2.1.332", "2.1.41"), 0);
++  EXPECT_LT(CompareCliVersions("2.1.41", "2.1.332"), 0);
++  EXPECT_EQ(CompareCliVersions("2.1.0", "2.1"), 0);
++  EXPECT_GT(CompareCliVersions("10.0", "9.9.9"), 0);
++  // A copy that didn't say is the oldest.
++  EXPECT_LT(CompareCliVersions("", "0.0.1"), 0);
++  EXPECT_EQ(CompareCliVersions("", ""), 0);
++}
++
++}  // namespace meridian::ai
+diff --git a/chrome/browser/meridian/ai/local_agents.cc b/chrome/browser/meridian/ai/local_agents.cc
+index 5700c00ee1..81f51c9781 100644
+--- a/chrome/browser/meridian/ai/local_agents.cc
++++ b/chrome/browser/meridian/ai/local_agents.cc
+@@ -27,6 +27,7 @@
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/meridian/ai/accounts.h"
++#include "chrome/browser/meridian/ai/cli_versions.h"
+ #include "chrome/browser/meridian/ai/process_runner.h"
+ #include "chrome/browser/meridian/prefs.h"
+ #include "chrome/browser/meridian/private_file.h"
+@@ -111,8 +112,16 @@ std::string Which(const std::string& name, const std::string& path) {
+ 
+ // Cursor also installs itself as `agent`, a name other tools use too: that
+ // one only counts when it really is Cursor's.
+-std::string FindBin(const Provider& p, const std::string& path) {
+-  std::string direct = Which(p.bin, path);
++//
++// With several copies of the CLI (an old Claude Code in /usr/local/bin, the
++// one its own installer keeps current in ~/.local/bin), the newest one,
++// whichever the PATH lists first (cli_versions.h); `copies` lists them all.
++std::string FindBin(const Provider& p,
++                    const std::map<std::string, std::string>& env,
++                    std::vector<CliCopy>* copies = nullptr) {
++  auto it = env.find("PATH");
++  const std::string path = it != env.end() ? it->second : std::string();
++  std::string direct = FindNewestProgram(p.bin, path, env, copies);
+   if (!direct.empty()) {
+     return direct;
+   }
+@@ -171,8 +180,17 @@ std::vector<LocalAgents::Status> ListBlocking() {
+       status.start_with = LmsPath(env["HOME"]);
+     }
+     if (p.kind == Kind::kCli) {
+-      std::string bin = FindBin(p, path);
++      std::vector<CliCopy> copies;
++      std::string bin = FindBin(p, env, &copies);
+       status.installed = !bin.empty();
++      status.path = bin;
++      for (const CliCopy& copy : copies) {
++        if (copy.path == bin) {
++          status.version = copy.version;
++        } else {
++          status.other_copies.push_back(copy);
++        }
++      }
+       if (!kCliSandbox && p.sandboxed) {
+         // Not offered: nothing here would run it (and nothing is run to ask
+         // whether it's signed in).
+@@ -184,9 +202,14 @@ std::vector<LocalAgents::Status> ListBlocking() {
+       if (status.installed && check) {
+         std::vector<std::string> argv = {bin};
+         argv.insert(argv.end(), check->args.begin(), check->args.end());
+-        std::string output =
+-            CaptureOutput(argv, env, env["HOME"], base::Seconds(4));
++        int exit_code = -1;
++        std::string output = CaptureOutput(argv, env, env["HOME"],
++                                           base::Seconds(10), &exit_code);
+         status.signed_in = check->parse(output, &status.account);
++        // Too old to say (no such command): never "Not signed in".
++        if (!status.signed_in && AuthCommandUnknown(output)) {
++          status.needs_update = true;
++        }
+       }
+     }
+     out.push_back(std::move(status));
+@@ -394,7 +417,7 @@ CliOutcome RunCliBlocking(std::string provider_id,
+   CliOutcome outcome;
+   const Provider* p = FindProvider(provider_id);
+   std::map<std::string, std::string> env = ChildEnv();
+-  std::string bin = p ? FindBin(*p, env["PATH"]) : std::string();
++  std::string bin = p ? FindBin(*p, env) : std::string();
+   if (bin.empty()) {
+     return outcome;
+   }
+@@ -632,6 +655,45 @@ class LocalAgents::LineStream : public network::SimpleURLLoaderStreamConsumer {
+   int status_ = 0;
+ };
+ 
++// static
++// static
++std::optional<bool> LocalAgents::SignedInAsBlocking(
++    const std::string& id,
++    const std::map<std::string, std::string>& account_env,
++    bool* needs_update) {
++  *needs_update = false;
++  const Provider* p = FindProvider(id);
++  std::optional<AuthCheck> check = p ? AuthCheckFor(*p) : std::nullopt;
++  if (!check) {
++    return std::nullopt;
++  }
++  std::map<std::string, std::string> env = ChildEnv();
++  const std::string bin = FindBin(*p, env);
++  if (bin.empty()) {
++    return std::nullopt;
++  }
++  ApplyAccountEnv(account_env, env);
++  std::vector<std::string> argv = {bin};
++  argv.insert(argv.end(), check->args.begin(), check->args.end());
++  const std::string output =
++      CaptureOutput(argv, env, env["HOME"], base::Seconds(10));
++  std::string account;
++  std::optional<bool> signed_in = check->parse(output, &account);
++  if (!signed_in && AuthCommandUnknown(output)) {
++    *needs_update = true;
++  }
++  return signed_in;
++}
++
++// static
++std::string LocalAgents::FindCliBlocking(const std::string& id) {
++  const Provider* p = FindProvider(id);
++  if (!p || p->kind != Kind::kCli) {
++    return std::string();
++  }
++  return FindBin(*p, ChildEnv());
++}
++
+ // static
+ bool LocalAgents::StartServerBlocking(const std::string& start_with) {
+   std::map<std::string, std::string> env = ChildEnv();
+diff --git a/chrome/browser/meridian/ai/local_agents.h b/chrome/browser/meridian/ai/local_agents.h
+index 7961833515..ffe43a7839 100644
+--- a/chrome/browser/meridian/ai/local_agents.h
++++ b/chrome/browser/meridian/ai/local_agents.h
+@@ -16,6 +16,7 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/time/time.h"
++#include "chrome/browser/meridian/ai/cli_versions.h"
+ #include "chrome/browser/meridian/ai/providers.h"
+ 
+ class Profile;
+@@ -49,12 +50,33 @@ class LocalAgents {
+     std::string start_with;
+     // Why it can't answer on this system ("macOS only for now"), else empty.
+     std::string unavailable;
++    // The copy Meridian runs (the newest), its version (when there are
++    // several), and the others, newest first.
++    std::string path;
++    std::string version;
++    std::vector<CliCopy> other_copies;
++    // Its sign-in check isn't a command this version knows: too old to tell.
++    bool needs_update = false;
+   };
+ 
+   // Blocking: `<start_with> server start`, in the background; whether it
+   // started.
+   static bool StartServerBlocking(const std::string& start_with);
+ 
++  // Blocking: the copy of provider `id`'s CLI that Meridian runs (the newest
++  // one, cli_versions.h), or "". Its sign-in runs that one too: a Terminal
++  // started for it reads only the login profile, whose PATH may still list
++  // an old copy first.
++  static std::string FindCliBlocking(const std::string& id);
++
++  // Blocking: whether provider `id`'s CLI (the copy above) is signed in as
++  // the account whose environment changes are `account_env` (ApplyAccountEnv);
++  // nullopt = can't tell, `needs_update` when the CLI is too old to say.
++  static std::optional<bool> SignedInAsBlocking(
++      const std::string& id,
++      const std::map<std::string, std::string>& account_env,
++      bool* needs_update);
++
+   // "text" (a delta), "session" (internal: the CLI's session id), "done"
+   // ("stopped" when the person stopped it) or "error".
+   using EventCallback =
+diff --git a/chrome/browser/meridian/ai/providers.cc b/chrome/browser/meridian/ai/providers.cc
+index 96b6f60645..60f69d6380 100644
+--- a/chrome/browser/meridian/ai/providers.cc
++++ b/chrome/browser/meridian/ai/providers.cc
+@@ -799,6 +799,15 @@ std::string FriendlyCliError(const Provider& p,
+   return p.label + ": " + last;
+ }
+ 
++bool AuthCommandUnknown(const std::string& output) {
++  return RE2::PartialMatch(
++      output,
++      "(?i)unknown (?:command|subcommand|option|argument)|"
++      "unrecognized (?:command|subcommand|argument)|"
++      "no such (?:command|subcommand)|invalid (?:command|choice)|"
++      "did you mean");
++}
++
+ std::optional<AuthCheck> AuthCheckFor(const Provider& p) {
+   if (p.id == "claude-code") {
+     return AuthCheck{{"auth", "status"}, ClaudeCodeAuth};
+diff --git a/chrome/browser/meridian/ai/providers.h b/chrome/browser/meridian/ai/providers.h
+index 39241847d0..739393b5aa 100644
+--- a/chrome/browser/meridian/ai/providers.h
++++ b/chrome/browser/meridian/ai/providers.h
+@@ -158,6 +158,11 @@ struct AuthCheck {
+ };
+ std::optional<AuthCheck> AuthCheckFor(const Provider& provider);
+ 
++// The CLI's answer to its sign-in check says it has no such command (an old
++// Claude Code without `auth status`): it needs an update, and whether it is
++// signed in can't be told.
++bool AuthCommandUnknown(const std::string& output);
++
+ // ---------------------------------------------------------------- cloud keys
+ 
+ // Which cloud providers a pasted key could belong to, most likely first
+diff --git a/chrome/browser/meridian/boosts/boost_tab_helper.cc b/chrome/browser/meridian/boosts/boost_tab_helper.cc
+index 5a356ec7c4..94a472aadb 100644
+--- a/chrome/browser/meridian/boosts/boost_tab_helper.cc
++++ b/chrome/browser/meridian/boosts/boost_tab_helper.cc
+@@ -16,6 +16,7 @@
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/uuid.h"
+ #include "chrome/browser/meridian/ai/ai_service.h"
++#include "chrome/browser/meridian/ai/providers.h"
+ #include "chrome/browser/meridian/ai/ai_service_factory.h"
+ #include "chrome/browser/meridian/boosts/boost_service_factory.h"
+ #include "chrome/browser/meridian/tab_data.h"
+@@ -806,8 +807,13 @@ void BoostTabHelper::OnOutline(
+     return;
+   }
+   if (improve_provider_.empty() && ai->CurrentProvider().empty()) {
++    const ai::Provider* signed_out = ai::FindProvider(ai->SignedOutProvider());
+     std::move(done).Run(
+-        "Set up an AI in Settings > AI: Claude Code, Codex or an API key.",
++        signed_out
++            ? signed_out->label + " isn’t signed in yet. Sign in to it, then "
++                                  "try again."
++            : "Set up an AI in Settings > AI: Claude Code, Codex or an API "
++              "key.",
+         std::string());
+     return;
+   }
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index d6fe6e65c8..41c7d1925e 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -339,6 +339,10 @@ struct BoostState {
+   array<Boost> boosts;
+   // Who Improve asks ("Claude", "Codex"…; "" when no AI is set up).
+   string ai_label;
++  // No AI answers, but this agent is here and only needs a sign-in (Claude
++  // Code signed out): its provider id and name, so the button can start it.
++  string ai_sign_in;
++  string ai_sign_in_label;
+   // Zap is on in the tab (the person is picking things to hide).
+   bool zapping;
+ };
+@@ -485,6 +489,13 @@ struct AiProvider {
+   string unavailable;
+   string login_command;
+   string docs;
++  // The copy Meridian runs, and a quiet line when an older one is also here
++  // ("An older Claude Code (2.1.41) is also in /usr/local/bin. Meridian uses
++  // 2.1.332.").
++  string path;
++  string copies_note;
++  // Too old to say whether it's signed in: "Update", never "Not signed in".
++  bool needs_update;
+ };
+ 
+ // An AI the person said "always send" to, and where it goes.
+@@ -500,6 +511,23 @@ struct SearchKeyword {
+ };
+ 
+ // A coding agent Meridian can register its MCP server with.
++// One line of the honest check at the end of the welcome tour.
++struct AiConnectionCheck {
++  // "claude-desktop" or "claude-code".
++  string id;
++  string name;
++  // "ok"; "waiting" (Claude Desktop loads it when it next opens);
++  // "restart"; "sign-in"; "update"; "failed".
++  string state;
++  // What it is, in a sentence ("Claude Desktop needs a restart to load
++  // Meridian.").
++  string message;
++  // What the button does ("" = none): "connect", "restart-desktop",
++  // "open-desktop", "sign-in", "update"; and what it says.
++  string fix;
++  string fix_label;
++};
++
+ struct AgentCli {
+   // "claude", "codex", "claude-desktop", "opencode", "cursor", "vscode",
+   // "windsurf", "copilot", "gemini", "qwen", "goose", "amp" or "droid".
+@@ -512,6 +540,10 @@ struct AgentCli {
+   string command;
+   // The config file Connect edits (empty for the agents with a command).
+   string file;
++  // Read from its config the way Connect writes it: "connected",
++  // "not-connected" or "" (can't tell).
++  string state;
++  bool can_disconnect;
+ };
+ 
+ // A starting setup for the welcome tour (setup_profile.h).
+@@ -805,6 +837,13 @@ interface SidebarHandler {
+   // its config, and (macOS) is running since before Meridian was added, so
+   // it must restart to use it.
+   GetClaudeDesktop() => (bool installed, bool connected, bool needs_restart);
++  // The end of the welcome tour (and Boost's Improve): what really works,
++  // each with a sentence and, when something can be done, one fix.
++  CheckAiConnections() => (array<AiConnectionCheck> checks);
++  // Settings › AI: per account "vendor/id" -> {signedIn: 1|0|-1,
++  // needsUpdate, connected}, each account's CLI asked as that account
++  // (seconds; GetAiAccounts stays quick for the space menu).
++  GetAiAccountStates() => (string json);
+   // Opens Claude Desktop with `request` ready in a new chat (and on the
+   // clipboard); it only runs when the person presses Enter. Claude restarts
+   // first when it needs to (never forced: it asks about unsaved work). An
+@@ -859,6 +898,13 @@ interface SidebarHandler {
+   GetCurrencyRates() => (map<string, double> rates, string date,
+                          array<string> nbg_codes, string nbg_date);
+   ConnectAgentCli(string id) => (bool ok, string output);
++  // Claude Code / Codex for one account (ai/accounts.h) of `id`'s vendor.
++  ConnectAgentCliAccount(string id, string account_id)
++      => (bool ok, string output);
++  // Takes Meridian out of the agent's config again ("" = its default
++  // account).
++  DisconnectAgentCli(string id, string account_id)
++      => (bool ok, string output);
+ 
+   // The built-in AI (⌘J, Ask in the command bar), with the person's
+   // Anthropic API key.
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index c77c5da311..acfff79abb 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -23,6 +23,7 @@
+ 
+ #include "base/command_line.h"
+ #include "base/path_service.h"
++#include "chrome/common/chrome_paths.h"
+ #include "base/i18n/rtl.h"
+ #include "base/no_destructor.h"
+ #include "base/scoped_observation.h"
+@@ -1548,6 +1549,8 @@ void SidebarHandler::GetAgentClis(GetAgentClisCallback callback) {
+               m->found = !cli.path.empty();
+               m->command = cli.command;
+               m->file = cli.file;
++              m->state = cli.state;
++              m->can_disconnect = cli.can_disconnect;
+               out.push_back(std::move(m));
+             }
+             std::move(callback).Run(std::move(out));
+@@ -1761,8 +1764,37 @@ void SidebarHandler::GetAiProviders(bool fresh,
+               m->install_missing = s.install_missing;
+               m->can_start = !s.installed && !s.start_with.empty();
+               m->unavailable = s.unavailable;
+-              m->login_command = p->login;
++              m->login_command = ai::WithProgram(p->login, s.path);
+               m->docs = p->docs;
++              m->path = s.path;
++              m->needs_update = s.needs_update;
++              if (!s.other_copies.empty()) {
++                const ai::CliCopy& older = s.other_copies.front();
++                const std::string where =
++                    base::FilePath::FromUTF8Unsafe(older.path)
++                        .DirName()
++                        .AsUTF8Unsafe();
++                m->copies_note =
++                    ai::CompareCliVersions(older.version, s.version) < 0
++                        ? "An older " + p->label +
++                              (older.version.empty()
++                                   ? std::string()
++                                   : " (" + older.version + ")") +
++                              " is also in " + where + ". Meridian uses " +
++                              (s.version.empty() ? std::string("the newer one")
++                                                 : s.version) +
++                              " from " +
++                              base::FilePath::FromUTF8Unsafe(s.path)
++                                  .DirName()
++                                  .AsUTF8Unsafe() +
++                              "."
++                        : "Another " + p->label + " is also in " + where +
++                              ". Meridian uses the one in " +
++                              base::FilePath::FromUTF8Unsafe(s.path)
++                                  .DirName()
++                                  .AsUTF8Unsafe() +
++                              ".";
++              }
+               out.push_back(std::move(m));
+             }
+             std::move(callback).Run(std::move(out));
+@@ -2074,11 +2106,30 @@ void SidebarHandler::RunAiSetup(const std::string& id,
+                                           " on this computer.");
+               return;
+             }
++            // Tests: what would run, written down (no Terminal window).
++            base::FilePath log = TestSwitchPath("meridian-test-signin-log");
+             base::ThreadPool::PostTaskAndReplyWithResult(
+                 FROM_HERE, {base::MayBlock()},
+-                base::BindOnce(&OpenInTerminal, command,
+-                               (what == "install" ? "Install " : "Sign in to ") +
+-                                   p->label),
++                base::BindOnce(
++                    [](std::string id, std::string what, std::string command,
++                       std::string title, base::FilePath log) {
++                      // The copy Meridian runs, not whichever the Terminal's
++                      // login profile finds first.
++                      if (what == "login") {
++                        command = ai::WithProgram(
++                            command, ai::LocalAgents::FindCliBlocking(id));
++                      }
++                      if (!log.empty()) {
++                        return base::PathExists(log)
++                                   ? base::AppendToFile(log, command + "\n")
++                                   : base::WriteFile(log, command + "\n");
++                      }
++                      return OpenInTerminal(command, title);
++                    },
++                    id, what, command,
++                    (what == "install" ? "Install " : "Sign in to ") +
++                        p->label,
++                    log),
+                 base::BindOnce(
+                     [](RunAiSetupCallback callback, bool ok) {
+                       std::move(callback).Run(
+@@ -2709,6 +2760,303 @@ void SidebarHandler::GetClaudeDesktop(GetClaudeDesktopCallback callback) {
+           std::move(callback)));
+ }
+ 
++namespace {
++
++// The account `id` of `vendor` in `list`, or null.
++const ai::Account* FindAccount(const std::vector<ai::Account>& list,
++                               const std::string& vendor,
++                               const std::string& id) {
++  for (const ai::Account& a : list) {
++    if (a.vendor == vendor && a.id == id) {
++      return &a;
++    }
++  }
++  return nullptr;
++}
++
++// Claude Desktop as its files say (blocking): what CheckAiConnections tells.
++struct DesktopFacts {
++  bool installed = false;
++  bool connected = false;
++  // The program in its "meridian" entry is still there.
++  bool program_there = true;
++  base::Time config_changed;
++  // When a bridge Claude Desktop started last said hello ("claude-ai").
++  base::Time hello;
++  std::string unstable;  // Meridian runs from a place that goes away
++};
++
++DesktopFacts ReadDesktopFacts(base::FilePath user_data) {
++  DesktopFacts f;
++  ClaudeDesktopState state = GetClaudeDesktopState();
++  f.installed = state.installed;
++  f.connected = state.connected;
++  if (!f.installed) {
++    return f;
++  }
++  base::File::Info info;
++  if (base::GetFileInfo(state.config, &info)) {
++    f.config_changed = info.last_modified;
++  }
++  std::string text;
++  if (f.connected && base::ReadFileToString(state.config, &text)) {
++    std::optional<base::DictValue> root =
++        base::JSONReader::ReadDict(text, base::JSON_ALLOW_TRAILING_COMMAS);
++    const std::string* command =
++        root ? root->FindStringByDottedPath("mcpServers.meridian.command")
++             : nullptr;
++    f.program_there =
++        !command || base::PathExists(base::FilePath::FromUTF8Unsafe(*command));
++  }
++  std::string hello;
++  int64_t ms = 0;
++  if (base::ReadFileToString(
++          user_data.AppendASCII("Meridian MCP Clients").AppendASCII("claude-ai"),
++          &hello) &&
++      base::StringToInt64(base::TrimWhitespaceASCII(hello, base::TRIM_ALL),
++                          &ms)) {
++    f.hello = base::Time::FromMillisecondsSinceUnixEpoch(ms);
++  }
++#if BUILDFLAG(IS_MAC)
++  const std::string program =
++      HasTestSwitch("meridian-test-program")
++          ? TestSwitchValue("meridian-test-program")
++          : base::CommandLine::ForCurrentProcess()->GetProgram().AsUTF8Unsafe();
++  if (program.find("/AppTranslocation/") != std::string::npos ||
++      base::StartsWith(program, "/Volumes/")) {
++    f.unstable =
++        "Meridian is running from the download, not from Applications, so "
++        "Claude Desktop can’t start it later. Move Meridian to Applications, "
++        "open it from there, and connect again.";
++  }
++#endif
++  return f;
++}
++
++mojom::AiConnectionCheckPtr Check(std::string id,
++                                  std::string name,
++                                  std::string state,
++                                  std::string message,
++                                  std::string fix = std::string(),
++                                  std::string fix_label = std::string()) {
++  auto c = mojom::AiConnectionCheck::New();
++  c->id = std::move(id);
++  c->name = std::move(name);
++  c->state = std::move(state);
++  c->message = std::move(message);
++  c->fix = std::move(fix);
++  c->fix_label = std::move(fix_label);
++  return c;
++}
++
++// `launched`: when the running Claude Desktop started (null: not running).
++mojom::AiConnectionCheckPtr DesktopCheck(const DesktopFacts& f,
++                                         base::Time launched,
++                                         bool test_needs_restart) {
++  const char kName[] = "Claude Desktop";
++  if (!f.unstable.empty()) {
++    return Check("claude-desktop", kName, "failed", f.unstable);
++  }
++  if (!f.connected) {
++    return Check("claude-desktop", kName, "failed",
++                 "Meridian isn’t in Claude Desktop’s settings yet.", "connect",
++                 "Connect");
++  }
++  if (!f.program_there) {
++    return Check("claude-desktop", kName, "failed",
++                 "Claude Desktop’s settings point to a Meridian that isn’t "
++                 "there any more.",
++                 "connect", "Connect again");
++  }
++  // It said hello after the entry was last written: it really works.
++  if (!f.hello.is_null() &&
++      (f.config_changed.is_null() || f.hello >= f.config_changed)) {
++    return Check("claude-desktop", kName, "ok",
++                 "Claude Desktop is connected: it started Meridian’s tools.");
++  }
++  const bool started_before =
++      TestSwitchesAllowed() ? test_needs_restart
++                            : !launched.is_null() &&
++                                  launched < f.config_changed;
++  if (started_before) {
++    return Check("claude-desktop", kName, "restart",
++                 "Claude Desktop was open before Meridian was added, so it "
++                 "needs a restart to load it.",
++                 "restart-desktop", "Restart Claude");
++  }
++  if (launched.is_null()) {
++    return Check("claude-desktop", kName, "waiting",
++                 "Claude Desktop loads Meridian when it opens.",
++                 "open-desktop", "Open Claude");
++  }
++  if (base::Time::Now() - launched < base::Seconds(20)) {
++    return Check("claude-desktop", kName, "waiting",
++                 "Claude Desktop is starting and loading Meridian…");
++  }
++  return Check("claude-desktop", kName, "failed",
++               "Claude Desktop started but didn’t load Meridian. Restart it; "
++               "if it still doesn’t show up, Claude’s Settings › Developer "
++               "says why.",
++               "restart-desktop", "Restart Claude");
++}
++
++}  // namespace
++
++void SidebarHandler::CheckAiConnections(CheckAiConnectionsCallback callback) {
++  AiService* ai = AiServiceFactory::GetForProfile(
++      MainProfileFor(browser_->GetProfile()));
++  base::FilePath user_data;
++  base::PathService::Get(chrome::DIR_USER_DATA, &user_data);
++  auto with_desktop = base::BindOnce(
++      [](base::FilePath user_data, CheckAiConnectionsCallback callback,
++         std::vector<ai::LocalAgents::Status> list) {
++        base::ThreadPool::PostTaskAndReplyWithResult(
++            FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++            base::BindOnce(
++                [](base::FilePath user_data) {
++                  DesktopFacts f = ReadDesktopFacts(user_data);
++                  std::string code_state;
++                  for (const AgentCli& cli : DetectAgentClis()) {
++                    if (cli.id == "claude" && !cli.path.empty()) {
++                      code_state = cli.state.empty() ? "unknown" : cli.state;
++                    }
++                  }
++                  return std::make_pair(f, code_state);
++                },
++                user_data),
++            base::BindOnce(
++                [](CheckAiConnectionsCallback callback,
++                   std::vector<ai::LocalAgents::Status> list,
++                   std::pair<DesktopFacts, std::string> found) {
++                  std::vector<mojom::AiConnectionCheckPtr> out;
++                  const DesktopFacts& f = found.first;
++                  if (f.installed) {
++                    out.push_back(DesktopCheck(
++                        f, ClaudeDesktopLaunchTime(),
++                        HasTestSwitch("meridian-test-claude-needs-restart")));
++                  }
++                  for (const ai::LocalAgents::Status& s : list) {
++                    if (s.id != "claude-code" || !s.installed) {
++                      continue;
++                    }
++                    const char kName[] = "Claude Code";
++                    if (s.needs_update) {
++                      out.push_back(Check(
++                          "claude-code", kName, "update",
++                          "This Claude Code is too old to tell whether "
++                          "you’re signed in.",
++                          "update", "Update Claude Code"));
++                    } else if (s.signed_in == false) {
++                      out.push_back(Check(
++                          "claude-code", kName, "sign-in",
++                          "Claude Code is installed but not signed in, so "
++                          "Meridian’s AI features can’t use it yet.",
++                          "sign-in", "Sign in to Claude"));
++                    } else if (found.second == "not-connected") {
++                      out.push_back(Check(
++                          "claude-code", kName, "failed",
++                          "Claude Code can answer, but Meridian isn’t in its "
++                          "MCP servers.",
++                          "connect", "Connect"));
++                    } else {
++                      out.push_back(Check(
++                          "claude-code", kName, "ok",
++                          s.signed_in ? "Claude Code is signed in and "
++                                        "connected."
++                                      : "Claude Code is connected."));
++                    }
++                  }
++                  std::move(callback).Run(std::move(out));
++                },
++                std::move(callback), std::move(list)));
++      },
++      user_data, std::move(callback));
++  if (!ai) {
++    std::move(with_desktop).Run({});
++    return;
++  }
++  ai->local().List(/*fresh=*/true, std::move(with_desktop));
++}
++
++void SidebarHandler::ConnectAgentCliAccount(
++    const std::string& id,
++    const std::string& account_id,
++    ConnectAgentCliAccountCallback callback) {
++  ai::ListAccountsAsync(
++      browser_->GetProfile(),
++      base::BindOnce(
++          [](std::string id, std::string account_id,
++             ConnectAgentCliAccountCallback callback,
++             std::vector<ai::Account> list) {
++            const ai::AccountVendor* vendor = ai::FindAccountVendor(id);
++            const ai::Account* a =
++                vendor ? FindAccount(list, vendor->id, account_id) : nullptr;
++            if (!a) {
++              std::move(callback).Run(false, "That account isn’t listed.");
++              return;
++            }
++            std::map<std::string, std::string> env =
++                ai::AccountEnv(*vendor, ai::AccountsHome(), a->dir);
++            base::ThreadPool::PostTaskAndReplyWithResult(
++                FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++                base::BindOnce(
++                    [](std::string id,
++                       std::map<std::string, std::string> env) {
++                      std::string output;
++                      bool ok = meridian::ConnectAgentCliAs(id, env, &output);
++                      return std::make_pair(ok, output);
++                    },
++                    id, env),
++                base::BindOnce(
++                    [](ConnectAgentCliAccountCallback callback,
++                       std::pair<bool, std::string> r) {
++                      std::move(callback).Run(r.first, r.second);
++                    },
++                    std::move(callback)));
++          },
++          id, account_id, std::move(callback)));
++}
++
++void SidebarHandler::DisconnectAgentCli(const std::string& id,
++                                        const std::string& account_id,
++                                        DisconnectAgentCliCallback callback) {
++  ai::ListAccountsAsync(
++      browser_->GetProfile(),
++      base::BindOnce(
++          [](std::string id, std::string account_id,
++             DisconnectAgentCliCallback callback,
++             std::vector<ai::Account> list) {
++            std::map<std::string, std::string> env;
++            if (!account_id.empty()) {
++              const ai::AccountVendor* vendor = ai::FindAccountVendor(id);
++              const ai::Account* a =
++                  vendor ? FindAccount(list, vendor->id, account_id) : nullptr;
++              if (!a) {
++                std::move(callback).Run(false, "That account isn’t listed.");
++                return;
++              }
++              env = ai::AccountEnv(*vendor, ai::AccountsHome(), a->dir);
++            }
++            base::ThreadPool::PostTaskAndReplyWithResult(
++                FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++                base::BindOnce(
++                    [](std::string id,
++                       std::map<std::string, std::string> env) {
++                      std::string output;
++                      bool ok = meridian::DisconnectAgentCli(id, env, &output);
++                      return std::make_pair(ok, output);
++                    },
++                    id, env),
++                base::BindOnce(
++                    [](DisconnectAgentCliCallback callback,
++                       std::pair<bool, std::string> r) {
++                      std::move(callback).Run(r.first, r.second);
++                    },
++                    std::move(callback)));
++          },
++          id, account_id, std::move(callback)));
++}
++
+ void SidebarHandler::GetPersona(GetPersonaCallback callback) {
+   std::string forced = TestSwitchValue("meridian-test-persona");
+   if (!forced.empty()) {
+@@ -2733,6 +3081,10 @@ bool ClaudeDesktopStartedBefore(base::Time) {
+   return false;
+ }
+ 
++base::Time ClaudeDesktopLaunchTime() {
++  return base::Time();
++}
++
+ void SidebarHandler::OpenInClaude(const std::string& request,
+                                   OpenInClaudeCallback callback) {
+   // Claude's link for a new chat with `request` typed in (not sent), as on
+@@ -4360,6 +4712,10 @@ void SidebarHandler::GetBoost(GetBoostCallback callback) {
+          GetBoostCallback callback) {
+         if (ai) {
+           state->ai_label = ai->CurrentLabel();
++          state->ai_sign_in = ai->SignedOutProvider();
++          if (const ai::Provider* p = ai::FindProvider(state->ai_sign_in)) {
++            state->ai_sign_in_label = p->label;
++          }
+         }
+         std::move(callback).Run(std::move(state));
+       },
+@@ -4664,22 +5020,6 @@ void SidebarHandler::TestFloatingWindowShot(
+ 
+ // ------------------------------------------------------------- AI accounts
+ 
+-namespace {
+-
+-// The account `id` of `vendor` in `list`, or null.
+-const ai::Account* FindAccount(const std::vector<ai::Account>& list,
+-                               const std::string& vendor,
+-                               const std::string& id) {
+-  for (const ai::Account& a : list) {
+-    if (a.vendor == vendor && a.id == id) {
+-      return &a;
+-    }
+-  }
+-  return nullptr;
+-}
+-
+-}  // namespace
+-
+ void SidebarHandler::GetAiAccounts(GetAiAccountsCallback callback) {
+   Profile* profile = browser_->GetProfile();
+   ai::ListAccountsAsync(
+@@ -4699,6 +5039,51 @@ void SidebarHandler::GetAiAccounts(GetAiAccountsCallback callback) {
+                    weak_factory_.GetWeakPtr(), std::move(callback)));
+ }
+ 
++void SidebarHandler::GetAiAccountStates(
++    GetAiAccountStatesCallback callback) {
++  ai::ListAccountsAsync(
++      browser_->GetProfile(),
++      base::BindOnce(
++          [](GetAiAccountStatesCallback callback,
++             std::vector<ai::Account> list) {
++            base::ThreadPool::PostTaskAndReplyWithResult(
++                FROM_HERE,
++                {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++                base::BindOnce(
++                    [](std::vector<ai::Account> list) {
++                      // Each account's CLI asked as that account, and its
++                      // config read for Meridian.
++                      base::DictValue states;
++                      const base::FilePath home = ai::AccountsHome();
++                      for (const ai::Account& a : list) {
++                        const ai::AccountVendor* vendor =
++                            ai::FindAccountVendor(a.vendor);
++                        if (!vendor || !a.found || vendor->providers.empty()) {
++                          continue;
++                        }
++                        bool needs_update = false;
++                        std::optional<bool> signed_in =
++                            ai::LocalAgents::SignedInAsBlocking(
++                                vendor->providers.front(),
++                                ai::AccountEnv(*vendor, home, a.dir),
++                                &needs_update);
++                        states.Set(
++                            a.vendor + "/" + a.id,
++                            base::DictValue()
++                                .Set("signedIn",
++                                     signed_in ? (*signed_in ? 1 : 0) : -1)
++                                .Set("needsUpdate", needs_update)
++                                .Set("connected", AgentConnectedForAccount(
++                                                      a.vendor, a.dir, home)));
++                      }
++                      return base::WriteJson(states).value_or("{}");
++                    },
++                    std::move(list)),
++                std::move(callback));
++          },
++          std::move(callback)));
++}
++
+ void SidebarHandler::AddAiAccount(const std::string& vendor_id,
+                                   const std::string& typed,
+                                   AddAiAccountCallback callback) {
+@@ -4840,8 +5225,8 @@ void SidebarHandler::SignInAiAccount(const std::string& vendor_id,
+               std::move(callback).Run(false, "That account isn’t listed.");
+               return;
+             }
+-            const std::string command =
+-                ai::AccountLoginCommand(*vendor, ai::AccountsHome(), a->dir);
++            const ai::AccountVendor vendor_copy = *vendor;
++            const base::FilePath dir = a->dir;
+             const std::string title =
+                 "Sign in to " + vendor->short_label + " (" + a->label + ")";
+             // Tests: what would run, written down (no Terminal window).
+@@ -4849,8 +5234,17 @@ void SidebarHandler::SignInAiAccount(const std::string& vendor_id,
+             base::ThreadPool::PostTaskAndReplyWithResult(
+                 FROM_HERE, {base::MayBlock()},
+                 base::BindOnce(
+-                    [](std::string command, std::string title,
+-                       base::FilePath log) {
++                    [](ai::AccountVendor vendor, base::FilePath dir,
++                       std::string title, base::FilePath log) {
++                      // The copy Meridian runs (the newest), not whichever
++                      // the Terminal's login profile finds first.
++                      const std::string program =
++                          vendor.providers.empty()
++                              ? std::string()
++                              : ai::LocalAgents::FindCliBlocking(
++                                    vendor.providers.front());
++                      const std::string command = ai::AccountLoginCommand(
++                          vendor, ai::AccountsHome(), dir, program);
+                       if (!log.empty()) {
+                         return base::PathExists(log)
+                                    ? base::AppendToFile(log, command + "\n")
+@@ -4858,7 +5252,7 @@ void SidebarHandler::SignInAiAccount(const std::string& vendor_id,
+                       }
+                       return OpenInTerminal(command, title);
+                     },
+-                    command, title, log),
++                    vendor_copy, dir, title, log),
+                 base::BindOnce(
+                     [](SignInAiAccountCallback callback, bool ok) {
+                       std::move(callback).Run(
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 9d6cf9f9ae..346033b1d5 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -41,6 +41,9 @@ std::string SystemUserFullName();
+ // Claude Desktop is running and started before `time` (so it hasn't read a
+ // config changed then). macOS only; false elsewhere.
+ bool ClaudeDesktopStartedBefore(base::Time time);
++// When the running Claude Desktop started; null when it isn't running (or
++// not on macOS).
++base::Time ClaudeDesktopLaunchTime();
+ 
+ #if BUILDFLAG(IS_MAC)
+ // Before macOS asks about the location: Meridian's sheet (system_asks.h).
+@@ -249,6 +252,14 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void GrantAgentAccess() override;
+   void RestartClaudeDesktop(RestartClaudeDesktopCallback callback) override;
+   void GetClaudeDesktop(GetClaudeDesktopCallback callback) override;
++  void CheckAiConnections(CheckAiConnectionsCallback callback) override;
++  void GetAiAccountStates(GetAiAccountStatesCallback callback) override;
++  void ConnectAgentCliAccount(const std::string& id,
++                              const std::string& account_id,
++                              ConnectAgentCliAccountCallback callback) override;
++  void DisconnectAgentCli(const std::string& id,
++                          const std::string& account_id,
++                          DisconnectAgentCliCallback callback) override;
+   void OpenInClaude(const std::string& request,
+                     OpenInClaudeCallback callback) override;
+   void GetPersona(GetPersonaCallback callback) override;
+diff --git a/chrome/browser/meridian/sidebar_handler_mac.mm b/chrome/browser/meridian/sidebar_handler_mac.mm
+index 1031ab8510..b87de0bdb6 100644
+--- a/chrome/browser/meridian/sidebar_handler_mac.mm
++++ b/chrome/browser/meridian/sidebar_handler_mac.mm
+@@ -95,13 +95,41 @@ void OpenClaude(NSURL* url,
+   std::move(done).Run(true, open.ready);
+ }
+ 
++// Claude Desktop keeps its settings in the same file and may write the copy
++// it had in memory back as it quits, without Meridian's entry: once it is
++// closed, the entry is put back (if it's gone) before it opens again.
++void ReconnectThenOpen(NSURL* url,
++                       ClaudeOpen open,
++                       base::OnceCallback<void(bool, const std::string&)> done) {
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_BLOCKING},
++      base::BindOnce([] {
++        std::string output;
++        bool ok = ConnectAgentCli("claude-desktop", &output);
++        return std::make_pair(ok, output);
++      }),
++      base::BindOnce(
++          [](NSURL* url, ClaudeOpen open,
++             base::OnceCallback<void(bool, const std::string&)> done,
++             std::pair<bool, std::string> connected) {
++            if (!connected.first) {
++              std::move(done).Run(false, "Meridian couldn’t be added to "
++                                         "Claude Desktop: " +
++                                             connected.second);
++              return;
++            }
++            OpenClaude(url, std::move(open), std::move(done));
++          },
++          url, std::move(open), std::move(done)));
++}
++
+ void WaitForQuit(NSRunningApplication* app,
+                  NSURL* url,
+                  ClaudeOpen open,
+                  int checks,
+                  base::OnceCallback<void(bool, const std::string&)> done) {
+   if (app.terminated) {
+-    return OpenClaude(url, std::move(open), std::move(done));
++    return ReconnectThenOpen(url, std::move(open), std::move(done));
+   }
+   if (checks <= 0) {
+     // It may be asking about unsaved work: never forced.
+@@ -133,14 +161,33 @@ void SidebarHandler::RestartClaudeDesktop(
+       [NSRunningApplication runningApplicationsWithBundleIdentifier:bundle]
+           .firstObject;
+   ClaudeOpen open{kFirstRequest, kRequestReady};
++  if (!url) {
++    std::move(callback).Run(false,
++                            "Claude Desktop isn’t on this Mac. Get it from "
++                            "claude.ai/download, then connect it in "
++                            "Settings › AI.");
++    return;
++  }
+   if (!app) {
+-    return OpenClaude(url, std::move(open), std::move(callback));
++    return ReconnectThenOpen(url, std::move(open), std::move(callback));
+   }
+   // A normal quit: Claude itself asks about anything unsaved.
+   [app terminate];
+   WaitForQuit(app, url, std::move(open), kQuitChecks, std::move(callback));
+ }
+ 
++base::Time ClaudeDesktopLaunchTime() {
++  NSRunningApplication* app = [NSRunningApplication
++      runningApplicationsWithBundleIdentifier:base::SysUTF8ToNSString(
++                                                  kClaudeBundle)]
++                                  .firstObject;
++  if (!app || !app.launchDate) {
++    return base::Time();
++  }
++  return base::Time::FromSecondsSinceUnixEpoch(
++      app.launchDate.timeIntervalSince1970);
++}
++
+ bool ClaudeDesktopStartedBefore(base::Time time) {
+   NSRunningApplication* app = [NSRunningApplication
+       runningApplicationsWithBundleIdentifier:base::SysUTF8ToNSString(
+diff --git a/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts b/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts
+index dc9ed817e9..6b1fee8508 100644
+--- a/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts
+@@ -113,7 +113,7 @@ ${this.boost_ ? html`
+       <textarea id="wish" rows="2"
+           placeholder="What to change? Empty: less clutter"></textarea>
+       <button id="improve" class="primary"
+-          ?disabled="${this.improving_ || !this.aiLabel_}"
++          ?disabled="${this.improveDisabled_()}"
+           @click="${this.onImproveClick_}">${this.improveLabel_()}</button>
+       ${this.note_ ? html`
+         <div id="note" class="note ${this.noteError_ ? 'err' : ''}">
+diff --git a/chrome/browser/resources/webui_browser/meridian/boost_editor.ts b/chrome/browser/resources/webui_browser/meridian/boost_editor.ts
+index c050749a1a..d4772ed286 100644
+--- a/chrome/browser/resources/webui_browser/meridian/boost_editor.ts
++++ b/chrome/browser/resources/webui_browser/meridian/boost_editor.ts
+@@ -67,6 +67,9 @@ export class MeridianBoostEditorElement extends CrLitElement {
+       boost_: {state: true, type: Object},
+       fonts_: {state: true, type: Array},
+       aiLabel_: {state: true, type: String},
++      aiSignIn_: {state: true, type: String},
++      aiSignInLabel_: {state: true, type: String},
++      signingIn_: {state: true, type: Boolean},
+       adjustOpen_: {state: true, type: Boolean},
+       codeOpen_: {state: true, type: Boolean},
+       improveOpen_: {state: true, type: Boolean},
+@@ -87,6 +90,12 @@ export class MeridianBoostEditorElement extends CrLitElement {
+   protected accessor fonts_: BoostFont[] = [];
+   // Who Improve asks ("" when no AI is set up).
+   protected accessor aiLabel_: string = '';
++  // No AI answers, but this one only needs a sign-in ("claude-code"): the
++  // button starts it instead of pointing at Settings.
++  protected accessor aiSignIn_: string = '';
++  protected accessor aiSignInLabel_: string = '';
++  protected accessor signingIn_: boolean = false;
++  private signInPoll_: number|null = null;
+   protected accessor adjustOpen_: boolean = false;
+   protected accessor codeOpen_: boolean = false;
+   protected accessor improveOpen_: boolean = false;
+@@ -135,6 +144,8 @@ export class MeridianBoostEditorElement extends CrLitElement {
+     }
+     this.host_ = state.host;
+     this.aiLabel_ = state.aiLabel;
++    this.aiSignIn_ = state.aiSignIn;
++    this.aiSignInLabel_ = state.aiSignInLabel;
+     let boost = state.boosts.find(b => b.id === id) || null;
+     if (!boost) {
+       boost = {
+@@ -216,6 +227,8 @@ export class MeridianBoostEditorElement extends CrLitElement {
+       this.boost_ = fresh;
+     }
+     this.aiLabel_ = state.aiLabel;
++    this.aiSignIn_ = state.aiSignIn;
++    this.aiSignInLabel_ = state.aiSignInLabel;
+     return state;
+   }
+ 
+@@ -316,8 +329,62 @@ export class MeridianBoostEditorElement extends CrLitElement {
+     if (this.improving_) {
+       return 'Improving…';
+     }
+-    return this.aiLabel_ ? `Improve with ${this.aiLabel_}` :
+-                           'Set up an AI in Settings';
++    if (this.aiLabel_) {
++      return `Improve with ${this.aiLabel_}`;
++    }
++    if (this.signingIn_) {
++      return 'Waiting for you to sign in…';
++    }
++    // "Sign in to Claude to use AI" for Claude Code.
++    return this.aiSignIn_ ?
++        `Sign in to ${this.aiSignInLabel_.replace(/ Code$/, '')} to use AI` :
++        'Set up an AI in Settings';
++  }
++
++  protected improveDisabled_(): boolean {
++    return this.improving_ || this.signingIn_ ||
++        (!this.aiLabel_ && !this.aiSignIn_);
++  }
++
++  // Signed out: its own sign-in in Terminal, then the button works by itself.
++  private async signIn_() {
++    const id = this.aiSignIn_;
++    const {ok, error} = await this.handler_.runAiSetup(id, 'login');
++    if (!ok) {
++      this.noteError_ = true;
++      this.note_ = error || 'Terminal didn’t open.';
++      return;
++    }
++    this.signingIn_ = true;
++    this.noteError_ = false;
++    this.note_ = `Finish signing in to ${this.aiSignInLabel_} in the ` +
++        'Terminal window that just opened.';
++    const start = Date.now();
++    this.stopSignInPoll_();
++    this.signInPoll_ = setInterval(async () => {
++      const {providers} = await this.handler_.getAiProviders(true);
++      const p = providers.find(x => x.id === id);
++      if (p && p.signedIn === 1) {
++        this.stopSignInPoll_();
++        this.signingIn_ = false;
++        await this.reload_();
++        this.note_ = `Signed in. Improve with ${this.aiLabel_ || 'AI'} works now.`;
++        return;
++      }
++      if (!this.open || Date.now() - start > 5 * 60_000) {
++        this.stopSignInPoll_();
++        this.signingIn_ = false;
++        this.noteError_ = true;
++        this.note_ = 'Not signed in yet. Press the button to try again.';
++      }
++    }, 2000);
++  }
++
++  private stopSignInPoll_() {
++    if (this.signInPoll_ !== null) {
++      clearInterval(this.signInPoll_);
++      this.signInPoll_ = null;
++    }
+   }
+ 
+   protected deleteLabel_(): string {
+@@ -497,6 +564,9 @@ export class MeridianBoostEditorElement extends CrLitElement {
+     if (!this.boost_) {
+       return;
+     }
++    if (!this.aiLabel_ && this.aiSignIn_) {
++      return this.signIn_();
++    }
+     const wish = this.shadowRoot.querySelector<HTMLTextAreaElement>('#wish');
+     this.before_ = {...this.boost_};
+     this.improving_ = true;
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.css b/chrome/browser/resources/webui_browser/meridian/onboarding.css
+index b429f62ea1..3fc27bda70 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.css
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.css
+@@ -1087,6 +1087,61 @@ kbd {
+   font-size: 13px;
+ }
+ 
++.checks {
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++  width: min(460px, 100%);
++  margin: 18px auto 0;
++  text-align: start;
++}
++
++.check {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  padding: 10px 12px;
++  border-radius: 10px;
++  font-size: 13px;
++  background: color-mix(in srgb, currentColor 7%, transparent);
++}
++
++.check-ic {
++  flex: none;
++  display: grid;
++  place-items: center;
++  width: 22px;
++  height: 22px;
++  border-radius: 50%;
++  background: color-mix(in srgb, #d9822b 22%, transparent);
++}
++
++.check.ok .check-ic {
++  background: color-mix(in srgb, #3aa55d 24%, transparent);
++}
++
++.check.waiting .check-ic {
++  background: color-mix(in srgb, currentColor 12%, transparent);
++}
++
++.check-text {
++  flex: 1;
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++}
++
++.check-msg {
++  opacity: 0.75;
++}
++
++.check-fix {
++  flex: none;
++  padding: 6px 12px;
++  font-size: 13px;
++  background: color-mix(in srgb, currentColor 14%, transparent);
++}
++
+ .ai-done .restart {
+   flex: none;
+   padding: 6px 14px;
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+index b958a7539e..bb58f6a234 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+@@ -59,6 +59,24 @@ export function getHtml(this: MeridianOnboardingElement) {
+                 or history.` : ''}</p>
+           </div>` : ''}
+ 
++        ${this.step_ === 'signin' ? html`
++          <div class="ai-ask signin-step">
++            <div class="ai-orb"><i></i><i></i><i></i></div>
++            <h2>Sign in to Claude Code</h2>
++            <p class="whisper top">Claude Code is on your Mac but isn’t signed
++              in yet, so Meridian’s AI (Ask, Improve with AI) can’t use it.
++              Sign in once with your Claude account: a Terminal window opens
++              and your browser asks you to log in.</p>
++            <button id="signIn" class="btn primary big"
++                ?disabled="${!!this.busy_}" @click="${this.onSignInClick_}">
++              ${this.busy_ || 'Sign in to Claude'}</button>
++            <button id="signInLater" class="link"
++                @click="${this.onSignInLaterClick_}">Later</button>
++            ${this.signInNote_ ? html`
++              <p id="signInNote" class="whisper">${this.signInNote_}</p>` :
++                ''}
++          </div>` : ''}
++
+         ${this.step_ === 'arc' && this.arc_ ? html`
+           ${this.sources_.length ? html`
+             <div class="sources" role="radiogroup"
+@@ -284,6 +302,23 @@ export function getHtml(this: MeridianOnboardingElement) {
+                     your tabs.</em>
+                 </button>
+               </div>` : ''}
++            <!-- Last, so nothing above moves when it comes in. -->
++            ${this.checks_.length ? html`
++              <div class="checks" id="checks">
++                ${this.checks_.map(c => html`
++                  <div class="check ${c.state}" data-id="${c.id}">
++                    <span class="check-ic">${icon(this.checkIcon_(c), 14)}</span>
++                    <span class="check-text"><b>${c.name}</b>
++                      <span class="check-msg">${c.message}</span></span>
++                    ${c.fix ? html`
++                      <button class="btn ghost check-fix" data-id="${c.id}"
++                          @click="${this.onCheckFixClick_}">
++                        ${c.fixLabel}</button>` : ''}
++                  </div>`)}
++                ${this.checkNote_ ? html`
++                  <p id="checkNote" class="whisper">${this.checkNote_}</p>` :
++                    ''}
++              </div>` : ''}
+           </div>` : ''}
+       </div>`)}
+   </div>
+@@ -300,7 +335,8 @@ export function getHtml(this: MeridianOnboardingElement) {
+     <button id="next"
+         class="btn primary ${this.step_ === 'hello' ? 'round' : ''}
+             ${this.busy_ ? 'busy' : ''}"
+-        ?hidden="${this.step_ === 'ai' || this.step_ === 'claude'}"
++        ?hidden="${this.step_ === 'ai' || this.step_ === 'claude' ||
++                   this.step_ === 'signin'}"
+         ?disabled="${!!this.busy_}" @click="${this.onNextClick_}">
+       ${this.step_ === 'hello' ? html`${icon('arrowRight', 18)}` :
+                                  html`${this.nextLabel_}`}
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+index d04014bd23..a7045787e9 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+@@ -17,7 +17,7 @@ import {CrLitElement} from '//resources/lit/v3_0/lit.rollup.js';
+ import type {PropertyValues} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+ import {browserProxyFactory} from '../sidebar.mojom-webui.js';
+-import type {AgentCli, ArcPreview, Item, SetupProposal, SidebarHandlerInterface, Space} from '../sidebar.mojom-webui.js';
++import type {AgentCli, AiConnectionCheck, ArcPreview, Item, SetupProposal, SidebarHandlerInterface, Space} from '../sidebar.mojom-webui.js';
+ 
+ import './allow_mock.js';
+ import './mac_ask.js';
+@@ -27,8 +27,8 @@ import {IMPORT_KINDS, IMPORT_SOURCES, sourceName} from './import_sources.js';
+ import {getCss} from './onboarding.css.js';
+ import {getHtml} from './onboarding.html.js';
+ 
+-export type StepName = 'hello'|'ai'|'arc'|'tailor'|'preview'|'claude'|'try'|
+-    'default'|'done';
++export type StepName = 'hello'|'ai'|'signin'|'arc'|'tailor'|'preview'|
++    'claude'|'try'|'default'|'done';
+ 
+ // Apps that read Meridian's entry only when they start.
+ const RESTART_TO_USE =
+@@ -173,6 +173,10 @@ export class MeridianOnboardingElement extends CrLitElement {
+       restartApps_: {state: true, type: Array},
+       confirmRestart_: {state: true, type: Boolean},
+       restartNote_: {state: true, type: String},
++      codeSignedOut_: {state: true, type: Boolean},
++      signInNote_: {state: true, type: String},
++      checks_: {state: true, type: Array},
++      checkNote_: {state: true, type: String},
+       canUndo_: {state: true, type: Boolean},
+       sources_: {state: true, type: Array},
+       stats_: {state: true, type: Array},
+@@ -231,6 +235,14 @@ export class MeridianOnboardingElement extends CrLitElement {
+   protected accessor restartApps_: string[] = [];
+   protected accessor confirmRestart_: boolean = false;
+   protected accessor restartNote_: string = '';
++  // Claude Code is here but not signed in: the tour signs it in right away
++  // (it would otherwise only say "Sign in…" deep in Settings).
++  protected accessor codeSignedOut_: boolean = false;
++  protected accessor signInNote_: string = '';
++  // The honest check at the end: what really works, each with its fix.
++  protected accessor checks_: AiConnectionCheck[] = [];
++  protected accessor checkNote_: string = '';
++  private signInPoll_: number|null = null;
+   // Windows: Meridian can't reopen Claude, so it says what to do instead.
+   protected readonly canRestartClaude_: boolean =
+       !navigator.userAgent.includes('Windows');
+@@ -294,6 +306,10 @@ export class MeridianOnboardingElement extends CrLitElement {
+     this.restartApps_ = [];
+     this.confirmRestart_ = false;
+     this.restartNote_ = '';
++    this.codeSignedOut_ = false;
++    this.signInNote_ = '';
++    this.checks_ = [];
++    this.checkNote_ = '';
+     this.canUndo_ = false;
+     if (start === 'tour') {
+       await this.findAi_();
+@@ -367,6 +383,9 @@ export class MeridianOnboardingElement extends CrLitElement {
+     this.aiProvider_ = ready('claude', 'claude-code') ? 'claude-code' :
+         ready('codex', 'codex')                       ? 'codex' :
+                                                         '';
++    this.codeSignedOut_ = !this.aiProvider_ && has('claude') &&
++        providers.some(p => p.id === 'claude-code' && p.installed &&
++                           p.signedIn === 0 && !p.needsUpdate);
+   }
+ 
+   private tourSteps_(): StepName[] {
+@@ -379,6 +398,10 @@ export class MeridianOnboardingElement extends CrLitElement {
+     if (this.aiFound_.length) {
+       steps.push('ai');
+     }
++    // Said yes, and Claude Code only needs a sign-in: right here.
++    if (this.aiYes_ && this.codeSignedOut_) {
++      steps.push('signin');
++    }
+     // After a move the AI can suggest more from it; without one, the setup.
+     if (!arc || (this.aiYes_ && this.aiProvider_)) {
+       steps.push('tailor', 'preview');
+@@ -406,6 +429,7 @@ export class MeridianOnboardingElement extends CrLitElement {
+     this.nextLabel_ = this.busy_ || {
+       hello: '',
+       ai: '',
++      signin: '',
+       arc: this.arc_ && !this.arc_.needsAccess ? 'Bring everything' :
+                                                  'Continue',
+       tailor: 'Suggest a setup',
+@@ -475,6 +499,7 @@ export class MeridianOnboardingElement extends CrLitElement {
+       this.shadowRoot
+           .querySelector<HTMLElement>(
+               this.step_ === 'ai'     ? '#aiYes' :
++                  this.step_ === 'signin' ? '#signIn' :
+                   this.step_ === 'claude' ? '#restartClaude' :
+                                             '#next')
+           ?.focus();
+@@ -482,6 +507,9 @@ export class MeridianOnboardingElement extends CrLitElement {
+       if (this.step_ === 'tailor' && this.aiYes_ && !this.thinking_) {
+         this.suggest_();
+       }
++      if (this.step_ === 'done') {
++        this.runChecks_();
++      }
+     }
+   }
+ 
+@@ -517,6 +545,7 @@ export class MeridianOnboardingElement extends CrLitElement {
+ 
+   private finish_() {
+     this.stopHello_();
++    this.stopSignInPoll_();
+     this.open = false;
+     this.handler_.finishOnboarding();
+   }
+@@ -636,10 +665,12 @@ export class MeridianOnboardingElement extends CrLitElement {
+     this.busy_ = 'Connecting…';
+     const failed: string[] = [];
+     const restart: string[] = [];
++    const why: string[] = [];
+     for (const cli of this.aiFound_) {
+-      const {ok} = await this.handler_.connectAgentCli(cli.id);
++      const {ok, output} = await this.handler_.connectAgentCli(cli.id);
+       if (!ok) {
+         failed.push(cli.name);
++        why.push(`${cli.name}: ${output}`);
+       } else if (cli.id === 'claude-desktop') {
+         this.desktopConnected_ = true;
+       } else if (RESTART_TO_USE.has(cli.id)) {
+@@ -659,8 +690,9 @@ export class MeridianOnboardingElement extends CrLitElement {
+     }
+     this.restartApps_ = restart;
+     if (failed.length) {
+-      this.note_ = `${failed.join(' and ')} wasn’t connected. You can try ` +
+-          'again in Settings › AI.';
++      // Each with why: never a silent failure.
++      this.note_ = `${failed.join(' and ')} wasn’t connected (${
++          why.join('; ')}). The list below has a button to try again.`;
+     }
+     this.aiYes_ = true;
+     this.steps_ = this.tourSteps_();
+@@ -668,6 +700,145 @@ export class MeridianOnboardingElement extends CrLitElement {
+     this.advance_();
+   }
+ 
++  // ------------------------------------------------------------ sign-in
++
++  // Claude Code's own sign-in in Terminal (Meridian never sees it), then
++  // the tour waits here until it's done.
++  protected async onSignInClick_() {
++    if (this.busy_) {
++      return;
++    }
++    this.signInNote_ = '';
++    const {ok, error} =
++        await this.handler_.runAiSetup('claude-code', 'login');
++    if (!ok) {
++      this.signInNote_ = error || 'Terminal didn’t open.';
++      return;
++    }
++    this.busy_ = 'Waiting for you to sign in…';
++    this.signInNote_ = 'Finish signing in in the Terminal window that just ' +
++        'opened. This continues by itself when you’re done.';
++    this.waitForSignIn_(() => {
++      this.busy_ = '';
++      this.signInNote_ = '';
++      // Signed in: the step is done (it leaves the list), and the AI can
++      // now suggest the setup.
++      const here = this.step_ === 'signin';
++      this.steps_ = this.tourSteps_();
++      if (here) {
++        this.goTo_(this.steps_[this.steps_.indexOf('ai') + 1] || 'done');
++      }
++    });
++  }
++
++  protected onSignInLaterClick_() {
++    this.stopSignInPoll_();
++    this.busy_ = '';
++    this.advance_();
++  }
++
++  // Checks every two seconds for five minutes; `done` once signed in, with
++  // Claude Code then the AI that answers.
++  private waitForSignIn_(done: () => void) {
++    this.stopSignInPoll_();
++    const start = Date.now();
++    const tick = async () => {
++      const {providers} = await this.handler_.getAiProviders(true);
++      const code = providers.find(p => p.id === 'claude-code');
++      if (code && code.installed && code.signedIn === 1) {
++        this.stopSignInPoll_();
++        this.codeSignedOut_ = false;
++        this.aiProvider_ = 'claude-code';
++        this.handler_.allowAiProvider('claude-code');
++        const {settings} = await this.handler_.getSettings();
++        if (!settings.aiProvider) {
++          this.handler_.setSettings({...settings, aiProvider: 'claude-code'});
++        }
++        done();
++        return;
++      }
++      if (Date.now() - start > 5 * 60_000) {
++        this.stopSignInPoll_();
++        this.busy_ = '';
++        this.signInNote_ = 'Not signed in yet. Try again, or finish later ' +
++            'from the list at the end.';
++        this.checkNote_ = this.signInNote_;
++      }
++    };
++    this.signInPoll_ = setInterval(tick, 2000);
++  }
++
++  private stopSignInPoll_() {
++    if (this.signInPoll_ !== null) {
++      clearInterval(this.signInPoll_);
++      this.signInPoll_ = null;
++    }
++  }
++
++  // ------------------------------------------------------------ the check
++
++  private async runChecks_() {
++    const {checks} = await this.handler_.checkAiConnections();
++    if (this.open) {
++      this.checks_ = checks;
++    }
++  }
++
++  protected checkIcon_(c: AiConnectionCheck): 'check'|'clock'|'info' {
++    return c.state === 'ok' ? 'check' :
++        c.state === 'waiting' ? 'clock' :
++                                'info';
++  }
++
++  protected async onCheckFixClick_(e: Event) {
++    const id = (e.currentTarget as HTMLElement).dataset['id']!;
++    const check = this.checks_.find(c => c.id === id);
++    if (!check) {
++      return;
++    }
++    this.checkNote_ = '';
++    switch (check.fix) {
++      case 'connect': {
++        const {ok, output} = await this.handler_.connectAgentCli(
++            id === 'claude-code' ? 'claude' : id);
++        if (!ok) {
++          this.checkNote_ = `${check.name} wasn’t connected: ${output}`;
++        }
++        break;
++      }
++      case 'restart-desktop':
++      case 'open-desktop': {
++        this.checkNote_ = check.fix === 'restart-desktop' ?
++            'Restarting Claude…' : 'Opening Claude…';
++        const {ok, message} = check.fix === 'restart-desktop' ?
++            await this.handler_.restartClaudeDesktop() :
++            await this.handler_.openInClaude('');
++        this.checkNote_ = ok ? '' : message;
++        // It starts Meridian's tools a few seconds after it opens.
++        setTimeout(() => this.runChecks_(), 8000);
++        break;
++      }
++      case 'sign-in':
++      case 'update': {
++        const {ok, error} = await this.handler_.runAiSetup(
++            'claude-code', check.fix === 'update' ? 'install' : 'login');
++        if (!ok) {
++          this.checkNote_ = error || 'Terminal didn’t open.';
++          break;
++        }
++        this.checkNote_ = check.fix === 'update' ?
++            'Updating Claude Code in Terminal…' :
++            'Finish signing in in the Terminal window that just opened.';
++        this.waitForSignIn_(() => {
++          this.checkNote_ = '';
++          this.runChecks_();
++        });
++        break;
++      }
++    }
++    await this.runChecks_();
++  }
++
+   protected onAiNoClick_() {
+     this.advance_();
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.css b/chrome/browser/resources/webui_browser/meridian/settings.css
+index 3b5c56b903..345cb4253b 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.css
++++ b/chrome/browser/resources/webui_browser/meridian/settings.css
+@@ -850,3 +850,108 @@ details.fold summary::after {
+ details.fold[open] summary::after {
+   content: '⌄';
+ }
++
++/* Connect: each agent's real state, the file or command behind Details. */
++.connect-row.off {
++  opacity: 0.55;
++}
++
++.connect-state {
++  display: inline-flex;
++  align-items: center;
++  gap: 3px;
++}
++
++.connect-details summary {
++  cursor: pointer;
++  font-size: 12px;
++  opacity: 0.6;
++  list-style: none;
++}
++
++.connect-details summary::-webkit-details-marker {
++  display: none;
++}
++
++.connect-accounts {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 6px;
++  margin-top: 6px;
++}
++
++.connect-account {
++  display: inline-flex;
++  align-items: center;
++  gap: 4px;
++  padding: 2px 8px;
++  border-radius: 999px;
++  font-size: 12px;
++  background: color-mix(in srgb, currentColor 8%, transparent);
++}
++
++.connect-account.on {
++  background: color-mix(in srgb, #3aa55d 18%, transparent);
++}
++
++.connect-menu {
++  position: relative;
++}
++
++.connect-menu .menu {
++  position: absolute;
++  inset-inline-end: 0;
++  top: calc(100% + 4px);
++  z-index: 5;
++  display: flex;
++  flex-direction: column;
++  min-width: 150px;
++  padding: 4px;
++  border-radius: 8px;
++  background: var(--meridian-surface, Canvas);
++  box-shadow: 0 6px 24px rgb(0 0 0 / 18%);
++}
++
++.connect-menu .menu button {
++  padding: 6px 10px;
++  border: 0;
++  border-radius: 6px;
++  text-align: start;
++  font: inherit;
++  color: inherit;
++  background: none;
++  cursor: pointer;
++}
++
++.connect-menu .menu button:hover {
++  background: color-mix(in srgb, currentColor 10%, transparent);
++}
++
++.connect-menu .menu .danger {
++  color: #d23c3c;
++}
++
++.acc-wrap {
++  display: inline-flex;
++  align-items: center;
++  gap: 4px;
++}
++
++.acc-state {
++  margin-inline-start: 4px;
++  font-size: 11px;
++  font-weight: 500;
++  opacity: 0.8;
++}
++
++.acc-state.ok {
++  color: #3aa55d;
++}
++
++.acc-state.warn {
++  color: #d9822b;
++}
++
++.row-head .row-label {
++  display: inline;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index 7cae620aa5..4aa64675c5 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -516,10 +516,18 @@ export function getHtml(this: MeridianSettingsElement) {
+           <span class="acc-title">${it.group.chips.length > 1 ? 'Accounts' :
+                                                          'Account'}</span>
+           ${it.group.chips.map(c => html`
+-            <button class="acc ${c.editing ? 'on' : ''}"
+-                data-vendor="${c.vendor}" data-id="${c.id}" title="${c.dir}"
+-                @click="${this.onAccountClick_}">
+-              <b>${c.label}</b><small>${c.where}</small></button>`)}
++            <span class="acc-wrap">
++              <button class="acc ${c.editing ? 'on' : ''}"
++                  data-vendor="${c.vendor}" data-id="${c.id}" title="${c.dir}"
++                  @click="${this.onAccountClick_}">
++                <b>${c.label}</b>${c.stateLabel ? html`<span
++                    class="acc-state ${c.stateKind}">${c.stateLabel}</span>` : ''}
++                <small>${it.group!.short} account · ${c.where}</small></button>
++              ${c.needsSignIn ? html`
++                <button class="btn small acc-signin" data-vendor="${c.vendor}"
++                    data-id="${c.id}" @click="${this.onSignInAccountClick_}">
++                  Sign in</button>` : ''}
++            </span>`)}
+           <button class="acc add" data-vendor="${it.group.vendor}"
+               id="addAccount-${it.group.vendor}" @click="${this.onAddAccountClick_}">
+             ${icon('plus', 12)}<b>Add account</b></button>
+@@ -883,14 +891,61 @@ export function getHtml(this: MeridianSettingsElement) {
+             <h2>Connect</h2>
+             <div class="card">
+               ${this.connectRows_().map(cli => html`
+-                <div class="row">
++                <div class="row connect-row ${cli.found ? '' : 'off'}"
++                    id="connect-${cli.id}" data-state="${cli.status}">
+                   <div class="row-text">
+-                    <div class="row-label">${cli.name}</div>
+-                    <div class="row-desc mono">${cli.file || cli.command}</div>
++                    <div class="row-head"><span class="row-label">${cli.name}</span>${
++                      cli.status ? html`<span
++                          class="tag ${cli.statusKind} connect-state">${
++                          cli.connected && !cli.needsRestart ?
++                              html`${icon('check', 11)} ` : ''}${cli.status}</span>` :
++                          ''}</div>
++                    <div class="row-desc connect-desc">${cli.desc}</div>
++                    <details class="connect-details">
++                      <summary>Details</summary>
++                      <div class="row-desc mono">${cli.details}</div>
++                    </details>
++                    ${cli.accounts.length ? html`
++                      <div class="connect-accounts">
++                        ${cli.accounts.map(a => html`
++                          <span class="connect-account ${a.connected ? 'on' : ''}"
++                              data-account="${a.id}">
++                            ${a.connected ? html`${icon('check', 11)}` : ''}
++                            ${a.label}
++                            ${!a.connected ? html`
++                              <button class="link" data-id="${cli.id}"
++                                  data-account="${a.id}"
++                                  @click="${this.onConnectAccountClick_}">
++                                Connect</button>` : ''}
++                          </span>`)}
++                      </div>` : ''}
+                   </div>
+-                  <button class="btn" data-id="${cli.id}"
+-                      ?disabled="${!cli.found}" @click="${this.onConnectClick_}">
+-                    ${cli.found ? 'Connect…' : 'Not installed'}</button>
++                  ${cli.found && cli.needsRestart ? html`
++                    <button class="btn" data-id="${cli.id}"
++                        @click="${this.onRestartDesktopClick_}">
++                      Restart Claude</button>` : ''}
++                  ${cli.found && !cli.needsRestart && cli.connected &&
++                    !cli.accounts.length ? html`
++                    <div class="connect-menu">
++                      <button class="btn ghost" data-id="${cli.id}"
++                          aria-label="More for ${cli.name}"
++                          @click="${this.onConnectMenuClick_}">
++                        ${icon('more', 14)}</button>
++                      ${cli.menu ? html`
++                        <div class="menu">
++                          <button data-id="${cli.id}"
++                              @click="${this.onConnectClick_}">Reconnect…</button>
++                          ${cli.canDisconnect ? html`
++                            <button data-id="${cli.id}" class="danger"
++                                @click="${this.onDisconnectClick_}">
++                              Disconnect</button>` : ''}
++                        </div>` : ''}
++                    </div>` : ''}
++                  ${cli.found && !cli.needsRestart && !cli.connected &&
++                    !cli.accounts.length ? html`
++                    <button class="btn" data-id="${cli.id}"
++                        @click="${this.onConnectClick_}">Connect…</button>` :
++                    ''}
+                 </div>`)}
+             </div>
+             <p class="note">${this.connectResult_}</p>
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 1b473d3761..f051320f15 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -103,6 +103,11 @@ export interface AiAccount {
+   // The spaces that use it (for the default: those that don't name one).
+   spaces: string[];
+   dir: string;
++  // Its CLI asked as this account: 1 signed in, 0 not, -1 can't tell; too
++  // old to say; Meridian is in this account's MCP servers.
++  signedIn?: number;
++  needsUpdate?: boolean;
++  connected?: boolean;
+ }
+ export interface AiAccountVendor {
+   id: string;
+@@ -127,6 +132,30 @@ export interface AccountChip {
+   dir: string;
+   isDefault: boolean;
+   editing: boolean;
++  // "Signed in" / "Needs sign-in" / "Update needed" / "".
++  stateLabel: string;
++  stateKind: string;
++  needsSignIn: boolean;
++}
++
++// A row of "Connect" as it really is.
++export interface ConnectRow {
++  id: string;
++  name: string;
++  found: boolean;
++  // "Connected", "Not connected", "Not installed", "Needs restart of
++  // Claude Desktop", "" (can't tell).
++  status: string;
++  statusKind: string;
++  connected: boolean;
++  canDisconnect: boolean;
++  needsRestart: boolean;
++  // In plain words; the file or command behind "Details".
++  desc: string;
++  details: string;
++  // Claude Code / Codex: each account's own state.
++  accounts: {id: string, label: string, connected: boolean}[];
++  menu: boolean;
+ }
+ // A vendor's accounts under its row in "Your AI".
+ export interface AccountGroup {
+@@ -262,6 +291,8 @@ export class MeridianSettingsElement extends CrLitElement {
+       archiveValue_: {state: true, type: String},
+       noRules_: {state: true, type: Boolean},
+       clis_: {state: true, type: Array},
++      desktopNeedsRestart_: {state: true, type: Boolean},
++      connectMenu_: {state: true, type: String},
+       connecting_: {state: true, type: Object},
+       connectResult_: {state: true, type: String},
+       hasAiKey_: {state: true, type: Boolean},
+@@ -320,6 +351,10 @@ export class MeridianSettingsElement extends CrLitElement {
+   protected accessor noRules_: boolean = true;
+   // Settings > AI.
+   protected accessor clis_: AgentCli[] = [];
++  // Claude Desktop is connected but was open before: it must restart.
++  protected accessor desktopNeedsRestart_: boolean = false;
++  protected accessor connectMenu_: string = '';
++  private accountsPoll_: number|null = null;
+   // The CLI whose "mcp add" command is shown for confirmation.
+   protected accessor connecting_: AgentCli|null = null;
+   protected accessor connectResult_: string = '';
+@@ -416,7 +451,7 @@ export class MeridianSettingsElement extends CrLitElement {
+     }
+     this.connectResult_ = '';
+     this.connecting_ = null;
+-    this.handler_.getAgentClis().then(({clis}) => this.clis_ = clis);
++    this.loadClis_();
+     this.handler_.getArcExtensions().then(
+         ({extensions}) => this.arcExtensions_ = extensions);
+     this.handler_.getArcPreview('arc').then(
+@@ -623,11 +658,37 @@ export class MeridianSettingsElement extends CrLitElement {
+ 
+   private async loadAccounts_() {
+     const {json} = await this.handler_.getAiAccounts();
++    let accounts: AiAccounts|null = null;
+     try {
+-      this.accounts_ = JSON.parse(json) as AiAccounts;
++      accounts = JSON.parse(json) as AiAccounts;
+     } catch {
+-      this.accounts_ = null;
++      accounts = null;
++    }
++    // Shown at once with what was known; each account's own state (signed
++    // in, connected) fills in when its CLI has answered.
++    const known = this.accounts_;
++    for (const v of accounts?.vendors || []) {
++      for (const a of v.accounts) {
++        const was = known?.vendors.find(x => x.id === v.id)
++                        ?.accounts.find(x => x.id === a.id);
++        Object.assign(a, {signedIn: was?.signedIn, needsUpdate:
++                          was?.needsUpdate, connected: was?.connected});
++      }
++    }
++    this.accounts_ = accounts;
++    const states = JSON.parse((await this.handler_.getAiAccountStates()).json) as
++        {[key: string]: {signedIn: number, needsUpdate: boolean,
++                         connected: boolean}};
++    if (this.accounts_ !== accounts || !accounts) {
++      return;
+     }
++    this.accounts_ = {
++      ...accounts,
++      vendors: accounts.vendors.map(v => ({
++        ...v,
++        accounts: v.accounts.map(a => ({...a, ...states[`${v.id}/${a.id}`]})),
++      })),
++    };
+   }
+ 
+   // A vendor's accounts as chips, when it has any.
+@@ -656,15 +717,23 @@ export class MeridianSettingsElement extends CrLitElement {
+                                                     a.label,
+       })) : [],
+       chips: vendor.accounts.map(a => {
++        // Plain words: which spaces this account works in.
+         let where = '';
+         if (a.default) {
+-          where = named ? 'other spaces' : 'all spaces';
++          where = named ? 'Used in your other spaces' : 'Used in every space';
+         } else {
+           where = a.spaces.length ?
+-              `in ${a.spaces.map(nameOf).join(', ')}` :
+-              'no space yet';
++              `Used in ${a.spaces.map(nameOf).join(', ')}` :
++              'Not used in a space yet';
+         }
++        const stateLabel = a.needsUpdate ? 'Update needed' :
++            a.signedIn === 1             ? 'Signed in' :
++            a.signedIn === 0             ? 'Needs sign-in' :
++                                           '';
+         return {
++          stateLabel,
++          stateKind: a.signedIn === 1 ? 'ok' : stateLabel ? 'warn' : '',
++          needsSignIn: a.signedIn === 0 && !a.needsUpdate,
+           vendor: vendorId,
+           id: a.id,
+           label: a.label,
+@@ -738,6 +807,12 @@ export class MeridianSettingsElement extends CrLitElement {
+       statusKind = '';
+       action = p.installCommand ? 'install' : 'docs';
+       actionLabel = p.installCommand ? 'Install…' : 'How to install';
++    } else if (p.needsUpdate) {
++      // Too old to say: never "Not signed in".
++      status = 'Update needed';
++      statusKind = 'warn';
++      action = p.installCommand ? 'install' : 'docs';
++      actionLabel = p.installCommand ? 'Update…' : 'How to update';
+     } else if (p.signedIn === 0) {
+       status = 'Not signed in';
+       statusKind = 'warn';
+@@ -760,6 +835,9 @@ export class MeridianSettingsElement extends CrLitElement {
+     if (!installed && p.installMissing) {
+       desc += ` · needs ${p.installMissing}`;
+     }
++    if (p.copiesNote) {
++      desc += ` · ${p.copiesNote}`;
++    }
+     const models = this.cloudModels_[p.id];
+     const defaultLabel = p.account ? `Default (${p.account})` : 'Default';
+     return {
+@@ -805,6 +883,32 @@ export class MeridianSettingsElement extends CrLitElement {
+                        this.accountGroup_(ACCOUNT_VENDOR_OF[p.id]!) :
+                        null,
+                  }));
++    // A CLI with accounts: its badge says what its accounts really are
++    // (each chip says which one needs a sign-in, with the button there).
++    this.aiRows_ = this.aiRows_.map(r => {
++      const chips = r.accounts?.chips || [];
++      if (!chips.length || r.status === 'Update needed' ||
++          chips.every(c => !c.stateLabel)) {
++        return r;
++      }
++      const signed = chips.filter(c => c.stateKind === 'ok').length;
++      if (signed === chips.length) {
++        return r.status === 'Not signed in' ?
++            {...r, status: 'Ready', statusKind: 'ok', action: '',
++             actionLabel: ''} :
++            r;
++      }
++      const out = chips.length - signed;
++      return {
++        ...r,
++        status: chips.length === 1 ? 'Needs sign-in' :
++            `${out} of ${chips.length} accounts need sign-in`,
++        statusKind: 'warn',
++        // The Sign in is on the account that needs it.
++        action: '',
++        actionLabel: '',
++      };
++    });
+     this.moreRows_ =
+         this.providers_
+             .filter(p => !found(p) && p.kind !== 'cloud')
+@@ -1016,8 +1120,117 @@ export class MeridianSettingsElement extends CrLitElement {
+ 
+   // The first four always (each says whether it's installed); the others
+   // once they are found, so the list stays short.
+-  protected connectRows_(): AgentCli[] {
+-    return this.clis_.filter(c => c.found || ALWAYS_LISTED.has(c.id));
++  protected connectRows_(): ConnectRow[] {
++    return this.clis_.filter(c => c.found || ALWAYS_LISTED.has(c.id))
++        .map(c => this.connectRow_(c));
++  }
++
++  private async loadClis_() {
++    const [{clis}, desktop] = await Promise.all([
++      this.handler_.getAgentClis(),
++      this.handler_.getClaudeDesktop(),
++    ]);
++    this.clis_ = clis;
++    this.desktopNeedsRestart_ = desktop.needsRestart;
++  }
++
++  private connectRow_(c: AgentCli): ConnectRow {
++    const vendor = ACCOUNT_VENDOR_OF[c.id === 'claude' ? 'claude-code' : c.id];
++    const accounts = (vendor &&
++                      this.accounts_?.vendors.find(v => v.id === vendor)
++                          ?.accounts.filter(a => a.found)) || [];
++    const perAccount = c.found && accounts.length > 1 ?
++        accounts.map(a => ({id: a.id, label: a.label,
++                            connected: !!a.connected})) :
++        [];
++    const connected = perAccount.length ?
++        perAccount.some(a => a.connected) :
++        c.state === 'connected';
++    const needsRestart = c.id === 'claude-desktop' && connected &&
++        this.desktopNeedsRestart_;
++    let status = 'Not connected';
++    let statusKind = '';
++    if (!c.found) {
++      status = 'Not installed';
++    } else if (needsRestart) {
++      status = 'Needs restart of Claude Desktop';
++      statusKind = 'warn';
++    } else if (perAccount.length &&
++               perAccount.some(a => !a.connected) && connected) {
++      status = 'Connected for some accounts';
++      statusKind = 'ok';
++    } else if (connected) {
++      status = 'Connected';
++      statusKind = 'ok';
++    } else if (c.state === '') {
++      status = '';
++    }
++    let desc = c.id === 'claude-desktop' ?
++        'Claude Desktop can see and use your tabs.' :
++        `${c.name} can see and use your tabs while it works.`;
++    if (perAccount.length) {
++      const on = perAccount.filter(a => a.connected).map(a => a.label);
++      const off = perAccount.filter(a => !a.connected).map(a => a.label);
++      desc = [
++        on.length ? `Connected for ${on.join(', ')}` : '',
++        off.length ? `not for ${off.join(', ')}` : '',
++      ].filter(x => x).join(', ');
++      desc = desc.charAt(0).toUpperCase() + desc.slice(1) + '.';
++    }
++    return {
++      id: c.id,
++      name: c.name,
++      found: c.found,
++      status,
++      statusKind,
++      connected,
++      canDisconnect: c.canDisconnect && !perAccount.length,
++      needsRestart,
++      desc,
++      details: c.file || c.command,
++      accounts: perAccount,
++      menu: this.connectMenu_ === c.id,
++    };
++  }
++
++  protected onConnectMenuClick_(e: Event) {
++    const id = (e.currentTarget as HTMLElement).dataset['id'] || '';
++    this.connectMenu_ = this.connectMenu_ === id ? '' : id;
++  }
++
++  protected async onDisconnectClick_(e: Event) {
++    const el = e.currentTarget as HTMLElement;
++    const id = el.dataset['id'] || '';
++    const name = this.clis_.find(c => c.id === id)?.name || id;
++    this.connectMenu_ = '';
++    this.connectResult_ = `Disconnecting ${name}…`;
++    const {ok, output} = await this.handler_.disconnectAgentCli(id, '');
++    this.connectResult_ = ok ? `${name} is disconnected.` :
++                               `${name} wasn’t disconnected: ${output}`;
++    await this.loadClis_();
++  }
++
++  protected async onRestartDesktopClick_() {
++    this.connectResult_ = 'Restarting Claude…';
++    const {ok, message} = await this.handler_.restartClaudeDesktop();
++    this.connectResult_ = ok ? 'Claude Desktop restarted with Meridian.' :
++                               message;
++    await this.loadClis_();
++  }
++
++  protected async onConnectAccountClick_(e: Event) {
++    const el = e.currentTarget as HTMLElement;
++    const id = el.dataset['id'] || '';
++    const account = el.dataset['account'] || '';
++    const name = this.clis_.find(c => c.id === id)?.name || id;
++    this.connectResult_ = `Connecting ${name}…`;
++    const {ok, output} =
++        await this.handler_.connectAgentCliAccount(id, account);
++    this.connectResult_ = ok ?
++        `${name} is connected. Start a new session to use Meridian.` :
++        `${name} wasn’t connected: ${output}`;
++    await this.loadAccounts_();
++    await this.loadClis_();
+   }
+ 
+   protected notFoundAgents_(): string[] {
+@@ -1027,6 +1240,7 @@ export class MeridianSettingsElement extends CrLitElement {
+ 
+   protected onConnectClick_(e: Event) {
+     const id = (e.currentTarget as HTMLElement).dataset['id'];
++    this.connectMenu_ = '';
+     this.connecting_ = this.clis_.find(c => c.id === id) || null;
+     this.connectResult_ = '';
+   }
+@@ -1051,6 +1265,8 @@ export class MeridianSettingsElement extends CrLitElement {
+     if (this.settings_?.agentAccess === 'off') {
+       this.save_({agentAccess: 'full'});
+     }
++    this.loadClis_();
++    this.loadAccounts_();
+     const done = cli.file ? `${cli.name} is connected (${output}).` :
+                             `${cli.name} is connected.`;
+     if (cli.id === 'claude-desktop') {
+@@ -1243,8 +1459,29 @@ export class MeridianSettingsElement extends CrLitElement {
+         el.dataset['vendor'] || '', el.dataset['id'] || '');
+     this.accountMessage_ = ok ?
+         'Sign in in the Terminal window. Meridian doesn’t see it: the tool ' +
+-            'keeps it in that account’s folder.' :
++            'keeps it in that account’s folder. This updates when it’s done.' :
+         error;
++    if (ok) {
++      // Watch that account turn "Signed in".
++      if (this.accountsPoll_ !== null) {
++        clearInterval(this.accountsPoll_);
++      }
++      const start = Date.now();
++      this.accountsPoll_ = setInterval(async () => {
++        await this.loadAccounts_();
++        const a = this.accounts_?.vendors
++                      .find(v => v.id === el.dataset['vendor'])
++                      ?.accounts.find(x => x.id === el.dataset['id']);
++        if (a?.signedIn === 1 || !this.open || Date.now() - start > 5 * 60_000) {
++          clearInterval(this.accountsPoll_!);
++          this.accountsPoll_ = null;
++          if (a?.signedIn === 1) {
++            this.accountMessage_ = `Signed in as ${a.label}.`;
++            this.loadProviders_(true);
++          }
++        }
++      }, 3000);
++    }
+   }
+ 
+   protected async onRemoveAccountClick_(e: Event) {

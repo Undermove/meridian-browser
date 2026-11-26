@@ -123,6 +123,16 @@ function tree(app) {
   return out;
 }
 
+// The swap runs in a helper after the browser has quit, so `.previous` may not exist yet when we look:
+// wait for the installed app to say the new version, then for the old copy to go.
+async function swapped(installed, version) {
+  const file = path.join(installed, 'Contents', 'Resources', 'meridian-version');
+  const says = () => { try { return fs.readFileSync(file, 'utf8').trim(); } catch { return ''; } };
+  for (const end = Date.now() + 30000; Date.now() < end && (says() !== version || fs.existsSync(installed + '.previous')); await sleep(100));
+  assert.equal(says(), version, 'the installed app is the new version');
+  assert.equal(fs.existsSync(installed + '.previous'), false, 'swapped');
+}
+
 // Updates `installed` from the release and swaps it; returns the swapped app's tree.
 async function update(rel, installed) {
   const b = await launch(['about:blank'], { args: [`--meridian-update-feed=${rel.feed}`, `--meridian-test-update-key=${PUB}`, `--meridian-test-update-target=${installed}`] });
@@ -136,8 +146,7 @@ async function update(rel, installed) {
     assert.equal(s.status, S.ready, `ready: ${JSON.stringify(s)}`);
     await b.eval('app.$.tabstrip.handler_.installUpdate()');
     for (let i = 0; i < 100 && b.proc.exitCode === null && b.proc.signalCode === null; i++) await sleep(150);
-    for (let i = 0; i < 100 && fs.existsSync(installed + '.previous'); i++) await sleep(100);
-    assert.equal(fs.existsSync(installed + '.previous'), false, 'swapped');
+    await swapped(installed, s.version);
     return tree(installed);
   } finally { await b.close(); }
 }
@@ -249,7 +258,7 @@ test('Updates: a newer release while one is ready to install replaces it; a rest
     })(), 'the older download is gone');
     await b.eval('app.$.tabstrip.handler_.installUpdate()');
     for (let i = 0; i < 100 && b.proc.exitCode === null && b.proc.signalCode === null; i++) await sleep(150);
-    for (let i = 0; i < 100 && fs.existsSync(a.installed + '.previous'); i++) await sleep(100);
+    await swapped(a.installed, '9.9.10');
     assert.deepEqual(tree(a.installed), tree(newer), 'straight to the latest');
   } finally {
     await b.close(); proxy.close();

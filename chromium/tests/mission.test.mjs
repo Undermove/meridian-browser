@@ -51,7 +51,7 @@ print('DONE', flush=True)
 sys.stdin.readline()
 `;
 
-test('Mission Control: a Workbench session with a subagent, a wait, browser tools and history', async () => {
+test('Mission Control: a Workbench session with a subagent, a wait, browser tools and history', { skip: process.platform === 'win32' && 'the stand-in Claude Code is a Python script' }, async () => {
   const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-mc-')));
   fs.mkdirSync(path.join(project, 'src'));
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
@@ -157,7 +157,7 @@ print('WORKING', flush=True)
 sys.stdin.readline()
 `;
 
-test('closing the Workbench tab stops its sessions in Mission Control; a closed session can be resumed', async () => {
+test('closing the Workbench tab leaves its sessions running in Mission Control; the reopened Workbench shows them; a stopped one can be resumed', { skip: process.platform === 'win32' && 'the stand-in Claude Code is a Python script' }, async () => {
   const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-mc-')));
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
   const argvFile = path.join(bin, 'argv.jsonl');
@@ -191,14 +191,22 @@ test('closing the Workbench tab stops its sessions in Mission Control; a closed 
     await wb.eval(`launch('claude').then((t) => !!t)`);
     await waitState((s) => live(s, true).length === 1, 'the session');
 
-    // The tab is closed with its × in the sidebar: the session is no longer running there.
+    // The tab is closed with its × in the sidebar: the session goes on, still in Mission Control.
     wb.close(); wb = null;
     await b.click(`${wbRow}.shadowRoot.querySelector('.close')`);
     await b.waitFor(`!${wbRow}`);
-    await waitState((s) => live(s).length === 0, 'the session to stop', 8000);
+    await sleep(2000);
+    assert.equal(live(await state()).length, 1, 'the session still runs');
 
-    // The Workbench again: Claude Code's own list of this project's sessions picks it up.
+    // The Workbench again: the same session, in its terminal, owned by the new tab.
     wb = await openWorkbench();
+    await wb.waitFor('S.terms.length === 1', 15000);
+    const term = await wb.eval('S.terms[0].id');
+    await waitState((s) => live(s).some((n) => n.termId === term && n.ownerTab), 'the session in the reopened Workbench');
+
+    // Stopped by hand: Claude Code's own list of this project's sessions picks it up again.
+    await wb.eval('killTerm(S.terms[0], { quiet: true }).then(() => true)');
+    await waitState((s) => live(s).length === 0, 'the session to stop', 8000);
     await wb.waitFor(`!!document.querySelector('#term-start .term-resume-btn')`);
     const r = await wb.eval(`(() => { const r = document.querySelector('#term-start .term-resume-btn').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
     for (const type of ['mousePressed', 'mouseReleased']) {

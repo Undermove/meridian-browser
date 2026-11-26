@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 06:26:47 +0400
+Subject: [PATCH 267/297] Meridian: !bangs in the command bar
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+"!yt lofi", "lofi !yt" or "!yt" alone open that site's search (or the
+site), from the same site table as "youtube ⇥ lofi": !g !yt !w !gh !maps
+!r !a !x !figma !pin and every site word.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/command_bar.html.ts              | 12 ++++
+ .../webui_browser/meridian/command_bar.ts     | 40 ++++++++++-
+ .../webui_browser/meridian/site_searches.ts   | 68 ++++++++++++++++---
+ 3 files changed, 107 insertions(+), 13 deletions(-)
+
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+index df64ff03db..b232644eab 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.html.ts
+@@ -44,6 +44,18 @@ export function getHtml(this: MeridianCommandBarElement) {
+                                    this.copied_ ? 'Copied' : 'Copy'}</span>
+             <span class="go">↵</span>` : ''}
+         </button>` : ''}
++      ${this.bang_ && !this.mode_ ? html`
++        <button id="bangHint" class="tab-row site-hint sel" slot="before-matches"
++            data-url="${this.bang_.url}"
++            @mousedown="${this.onTabRowMousedown_}"
++            @click="${this.onBangClick_}">
++          <span class="tab-icon">${icon('search', 16)}</span>
++          <span class="tab-title">${this.bang_.terms ?
++              `Search ${this.bang_.site.name} for \u201c${this.bang_.terms}\u201d` :
++              `Open ${this.bang_.site.name}`}</span>
++          <span class="switch">!bang</span>
++          <span class="go">↵</span>
++        </button>` : ''}
+       ${this.siteHint_ && !this.mode_ ? html`
+         <button id="siteHint" class="tab-row site-hint" slot="before-matches"
+             @mousedown="${this.onTabRowMousedown_}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index 763079ac4a..d887d6c72f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -27,8 +27,8 @@ import {fixLayout} from './layout_fix.js';
+ import {renderMarkdown} from './markdown.js';
+ import {isMac, keyText} from './keys.js';
+ import {SETTINGS_INDEX} from './settings_index.js';
+-import {siteSearchFor, siteSearchUrl} from './site_searches.js';
+-import type {SiteSearch} from './site_searches.js';
++import {parseBang, siteSearchFor, siteSearchUrl} from './site_searches.js';
++import type {Bang, SiteSearch} from './site_searches.js';
+ 
+ // An open tab, for "Switch to Tab".
+ export interface CommandBarTab {
+@@ -209,6 +209,7 @@ export class MeridianCommandBarElement extends CrLitElement {
+       searchboxShown_: {state: true, type: Boolean},
+       quick_: {state: true, type: Object},
+       siteHint_: {state: true, type: String},
++      bang_: {state: true, type: Object},
+       mode_: {state: true, type: Object},
+       copied_: {state: true, type: Boolean},
+       developer: {type: Boolean},
+@@ -244,6 +245,8 @@ export class MeridianCommandBarElement extends CrLitElement {
+   private ratesUnavailable_ = false;
+   // "Search YouTube ⇥": what Tab would search, for what is typed.
+   protected accessor siteHint_: string = '';
++  // "!yt lofi" / "lofi !yt": the site search it names, opened on Return.
++  protected accessor bang_: Bang|null = null;
+   // "word ⇥" picked: what Return does with the text.
+   protected accessor mode_: CommandBarMode|null = null;
+   private keywords_: Map<string, string> = new Map();
+@@ -341,6 +344,23 @@ export class MeridianCommandBarElement extends CrLitElement {
+     }
+   }
+ 
++  protected onBangClick_() {
++    const bang = parseBang(this.inputValue_());
++    if (bang) {
++      this.openBang_(bang);
++    }
++  }
++
++  private openBang_(bang: Bang) {
++    // "!tr hello to georgian" as with "translate ⇥".
++    const tr = bang.terms && bang.site.host === 'translate.google.com' ?
++        translateQuery(`translate ${bang.terms}`, navigator.languages) :
++        null;
++    this.hide();
++    this.fire('command-bar-open-url',
++              tr ? translateUrl(tr.text, tr.code) : bang.url);
++  }
++
+   protected onLayoutFixClick_() {
+     this.applyLayoutFix_();
+   }
+@@ -500,6 +520,7 @@ export class MeridianCommandBarElement extends CrLitElement {
+       }
+       const site = this.siteFor_(this.query_.trim().toLowerCase());
+       this.siteHint_ = site ? site.label : '';
++      this.bang_ = parseBang(this.query_);
+     }
+     const first = q !== '' && !!rows[0] && starts(rows[0]);
+     if (changed.has('query_' as keyof MeridianCommandBarElement)) {
+@@ -509,7 +530,8 @@ export class MeridianCommandBarElement extends CrLitElement {
+       // (A setting only when it is named in full: "privacy" and Return
+       // still searches.)
+       const top = features[0];
+-      this.tabSel_ = top && (top.setting ? top.m === 3 : top.m >= 2) ? 0 :
++      this.tabSel_ = this.bang_ ? -1 :
++          top && (top.setting ? top.m === 3 : top.m >= 2) ? 0 :
+           first                          ? this.featureRows_.length :
+                                            -1;
+     }
+@@ -590,6 +612,7 @@ export class MeridianCommandBarElement extends CrLitElement {
+     this.mode_ = null;
+     this.query_ = '';
+     this.siteHint_ = '';
++    this.bang_ = null;
+     this.address_.reset('');
+     this.clearAnswer_();
+     this.fire('command-bar-closed', {handBack});
+@@ -754,6 +777,17 @@ export class MeridianCommandBarElement extends CrLitElement {
+       this.runMode_();
+       return;
+     }
++    // "!yt lofi" or "lofi !yt": the bang's site, unless a row below was
++    // picked with the arrows.
++    if (e.key === 'Enter' && !this.mode_ && this.tabSel_ < 0 &&
++        this.address_?.selectedLine() <= 0 && !e.shiftKey && !e.altKey) {
++      const bang = parseBang(this.inputValue_());
++      if (bang) {
++        own();
++        this.openBang_(bang);
++        return;
++      }
++    }
+     // Arc's way too: "kiwi pear" with a site's keyword first searches that
+     // site (Chromium's own keyword mode let go of it: the bug Meridian had).
+     if (e.key === 'Enter' && !this.mode_ && this.tabSel_ < 0 &&
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_searches.ts b/chrome/browser/resources/webui_browser/meridian/site_searches.ts
+index 9aeadc4a4b..10dc469977 100644
+--- a/chrome/browser/resources/webui_browser/meridian/site_searches.ts
++++ b/chrome/browser/resources/webui_browser/meridian/site_searches.ts
+@@ -15,6 +15,8 @@ export interface SiteSearch {
+   words: string[];
+   // The search page, %s for the words.
+   url: string;
++  // Short "!bangs" beyond its words ("!g kiwi", "kiwi !g"), DuckDuckGo's.
++  bangs?: string[];
+ }
+ 
+ export const SITE_SEARCHES: SiteSearch[] = [
+@@ -23,37 +25,37 @@ export const SITE_SEARCHES: SiteSearch[] = [
+   {name: 'GitHub', host: 'github.com', words: ['github', 'gh'],
+    url: 'https://github.com/search?q=%s'},
+   {name: 'Wikipedia', host: 'wikipedia.org',
+-   words: ['wikipedia', 'wiki'],
++   words: ['wikipedia', 'wiki'], bangs: ['w'],
+    url: 'https://en.wikipedia.org/w/index.php?search=%s'},
+   {name: 'Google Maps', host: 'maps.google.com',
+-   words: ['maps', 'map', 'google maps', 'gmaps'],
++   words: ['maps', 'map', 'google maps', 'gmaps'], bangs: ['m'],
+    url: 'https://www.google.com/maps/search/%s'},
+   {name: 'X', host: 'x.com', words: ['x', 'twitter'],
+    url: 'https://x.com/search?q=%s'},
+-  {name: 'Reddit', host: 'reddit.com', words: ['reddit'],
++  {name: 'Reddit', host: 'reddit.com', words: ['reddit'], bangs: ['r'],
+    url: 'https://www.reddit.com/search/?q=%s'},
+-  {name: 'Amazon', host: 'amazon.com', words: ['amazon', 'amz'],
++  {name: 'Amazon', host: 'amazon.com', words: ['amazon', 'amz'], bangs: ['a'],
+    url: 'https://www.amazon.com/s?k=%s'},
+   {name: 'Figma', host: 'figma.com', words: ['figma'],
+    url: 'https://www.figma.com/community/search?resource_type=mixed&query=%s'},
+-  {name: 'Pinterest', host: 'pinterest.com', words: ['pinterest'],
++  {name: 'Pinterest', host: 'pinterest.com', words: ['pinterest'], bangs: ['pin'],
+    url: 'https://www.pinterest.com/search/pins/?q=%s'},
+-  {name: 'Google', host: 'google.com', words: ['google'],
++  {name: 'Google', host: 'google.com', words: ['google'], bangs: ['g'],
+    url: 'https://www.google.com/search?q=%s'},
+-  {name: 'DuckDuckGo', host: 'duckduckgo.com', words: ['duckduckgo', 'ddg'],
++  {name: 'DuckDuckGo', host: 'duckduckgo.com', words: ['duckduckgo', 'ddg'], bangs: ['d'],
+    url: 'https://duckduckgo.com/?q=%s'},
+   {name: 'Stack Overflow', host: 'stackoverflow.com',
+-   words: ['stackoverflow', 'stack overflow'],
++   words: ['stackoverflow', 'stack overflow'], bangs: ['so'],
+    url: 'https://stackoverflow.com/search?q=%s'},
+   {name: 'npm', host: 'npmjs.com', words: ['npm'],
+    url: 'https://www.npmjs.com/search?q=%s'},
+   {name: 'MDN', host: 'developer.mozilla.org', words: ['mdn'],
+    url: 'https://developer.mozilla.org/search?q=%s'},
+   {name: 'Google Images', host: 'images.google.com',
+-   words: ['images', 'image'],
++   words: ['images', 'image'], bangs: ['i', 'gi'],
+    url: 'https://www.google.com/search?tbm=isch&q=%s'},
+   {name: 'Google Translate', host: 'translate.google.com',
+-   words: ['translate', 'tr'],
++   words: ['translate', 'tr'], bangs: ['gt'],
+    url: 'https://translate.google.com/?sl=auto&tl=en&text=%s&op=translate'},
+ ];
+ 
+@@ -66,3 +68,49 @@ export function siteSearchFor(word: string): SiteSearch|null {
+ export function siteSearchUrl(site: SiteSearch, terms: string): string {
+   return site.url.replace('%s', encodeURIComponent(terms));
+ }
++
++// The site a "!bang" names: its bangs or any of its words ("!yt", "!g",
++// "!wiki"), DuckDuckGo-style.
++export function siteForBang(bang: string): SiteSearch|null {
++  const w = bang.trim().toLowerCase();
++  if (!w) {
++    return null;
++  }
++  return SITE_SEARCHES.find(s => (s.bangs || []).includes(w)) ||
++      SITE_SEARCHES.find(s => s.words.includes(w)) || null;
++}
++
++export interface Bang {
++  site: SiteSearch;
++  // What to search for; empty for the bang alone ("!yt" opens the site).
++  terms: string;
++  // The URL it opens.
++  url: string;
++}
++
++// "!yt lofi", "lofi !yt" or "!yt": a site search typed as a bang, from the
++// same table as "youtube ⇥ lofi". Null when the text has no known bang.
++export function parseBang(text: string): Bang|null {
++  const t = text.trim();
++  let m = /^!(\S+)(?:\s+(.*))?$/s.exec(t);
++  let bang = '';
++  let terms = '';
++  if (m) {
++    bang = m[1]!;
++    terms = (m[2] || '').trim();
++  } else {
++    m = /^(.*\S)\s+!(\S+)$/s.exec(t);
++    if (!m) {
++      return null;
++    }
++    terms = m[1]!.trim();
++    bang = m[2]!;
++  }
++  const site = siteForBang(bang);
++  if (!site) {
++    return null;
++  }
++  const url = terms ? siteSearchUrl(site, terms) : `https://${
++      site.host === 'maps.google.com' ? 'www.google.com/maps' : site.host}`;
++  return {site, terms, url};
++}

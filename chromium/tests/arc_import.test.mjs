@@ -100,7 +100,7 @@ test('Arc logins: cookies come over, so sites stay signed in; Deny imports nothi
     try {
       await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
       assert.deepEqual(await b.eval(`${H}.importArcLogins('arc')`), { imported: 2, passwords: 0, cards: 0, error: '' });
-      await b.eval(`app.$.tabstrip.tabStripService_.createTabAt(null, 'http://127.0.0.1:${port}/')`);
+      await b.eval(`app.$.tabstrip.tabStripService_.createTabAt(null, 'http://127.0.0.1:${port}/').then(() => true)`);
       await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'cookie:sid=signed-in')`);
       // The sidebar after the sign-ins: Home (Arc's Profile 2) has that profile's cookie.
       assert.equal((await b.eval(`${H}.importArc('arc')`)).ok, true);
@@ -858,7 +858,15 @@ test('the rest of Arc comes over from Settings: history, form entries, an addres
       navigator.permissions.query({ name }).then((p) => p.state)))`), ['granted', 'denied', 'prompt']);
 
     // ⌘T knows Arc's history: the personal profile's here, the work profile's in Home.
-    const press1 = ([code, ch], mods = 0) => b.eval(`${T}.handler_.testKeyPress(${code}, ${JSON.stringify(ch)}, ${mods})`);
+    // Real key presses: AppKit ones on the Mac; elsewhere New Tab, and keys pressed and let go in
+    // the command bar.
+    const press1 = process.platform === 'darwin'
+      ? ([code, ch], mods = 0) => b.eval(`${T}.handler_.testKeyPress(${code}, ${JSON.stringify(ch)}, ${mods})`)
+      // (⌘T off the Mac: New Tab, which opens the same bar; a Ctrl+T sent into the page doesn't.)
+      : ([code, ch], mods = 0) => mods ? b.click(`${SB}.getElementById('newTabButton')`)
+        : ch === '\u001b' ? b.key('Escape', 'Escape', 27) : ch === '\r' ? b.key('Enter', 'Enter', 13)
+        // Each character as a key pressed and let go: the bar reads what is typed on keyup.
+        : ['keyDown', 'keyUp'].reduce((p, type) => p.then(() => b.cdp.send('Input.dispatchKeyEvent', { type, key: ch, code: ch === ' ' ? 'Space' : '', windowsVirtualKeyCode: ch === ' ' ? 32 : ch.toUpperCase().charCodeAt(0), text: type === 'keyDown' ? ch : undefined })), Promise.resolve());
     const type = async (text) => { for (const ch of text) await press1([KEYCODE[ch], ch]); };
     const CB = 'app.$.commandBar.shadowRoot';
     const matches = () => b.eval(`(() => {

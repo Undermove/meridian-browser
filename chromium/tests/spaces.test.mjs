@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { launch, tabEl, itemEl, favEl, SB } from './harness.mjs';
+import { startServer } from './server.mjs';
 
 const page = (t) => `data:text/html,<title>${t}</title><h1>${t}</h1>`;
 const todayCount = (n) => `${SB}.querySelectorAll('meridian-tab-row').length === ${n}`;
@@ -333,4 +334,31 @@ test('⌘W in a space shows the next tab of that space, never another space\'s',
     assert.equal(await workTabs(), 1, 'a new tab in Work');
     assert.equal(await b.eval(`${T}.state_.tabs.filter((t) => t.spaceId === ${JSON.stringify(personal)}).length`), 2, 'Personal keeps home and p2');
   } finally { await b.close(); server.close(); }
+});
+
+// Arc: a tab's menu has "Move to Space ▸" (the tab goes) and "Open in Space ▸" (a copy goes there,
+// this one stays, and nothing switches).
+test('a tab\'s menu: Open in Space puts a copy in that space and keeps this one', async () => {
+  const site = await startServer();
+  const b = await launch([site.url('/p/Keep here')]);
+  try {
+    await b.waitFor(todayCount(1));
+    const first = (await b.state()).spaces[0].id;
+    await b.eval(`app.$.tabstrip.handler_.createSpace('Work', '', '#e08a8a', '#f0b5a8')`);
+    await b.waitFor(`app.$.tabstrip.state_.spaces.length === 2`);
+    const work = (await b.state()).spaces.find((s) => s.name === 'Work').id;
+    const row = `[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.title === 'Keep here')`;
+    await b.menu(row, 'Open in Space > Work');
+    await b.waitFor(`app.$.tabstrip.state_.tabs.length === 2`);
+    assert.equal(await b.eval(`app.$.tabstrip.state_.activeSpaceId`), first, 'still here');
+    assert.equal(await b.eval(todayCount(1)), true, 'this one stays');
+    await b.waitFor(`app.$.tabstrip.state_.tabs.every((t) => app.$.tabstrip.tabs_.get(t.tabId)?.url)`);
+    const urls = await b.eval(`app.$.tabstrip.state_.tabs.map((t) => [t.spaceId, app.$.tabstrip.tabs_.get(t.tabId).url])`);
+    assert.equal(urls.filter(([, u]) => u.includes('Keep')).length, 2);
+    assert.ok(urls.some(([sp, u]) => sp === work && u.includes('Keep')), 'a copy in Work');
+    await b.waitFor(`app.shadowRoot.getElementById('missionToast')?.textContent.includes('Opened in Work')`);
+    // Move to Space ▸ still moves it.
+    await b.menu(row, 'Move to Space > Work');
+    await b.waitFor(todayCount(0));
+  } finally { await b.close(); await site.close(); }
 });

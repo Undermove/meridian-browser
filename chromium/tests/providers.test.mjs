@@ -243,6 +243,77 @@ if (args[0] === 'auth') {
   } finally { await b.close(); fs.rmSync(bin, { recursive: true, force: true }); }
 });
 
+// A report (24.11.2026): Ask with OpenCode 2.4.1 failed with `Agent not found: "meridian"`. OpenCode
+// 2.x `run` joins its background service when one is up, and that service never saw Meridian's
+// config: no agent, and none of its "deny everything" either. --standalone gives the run a private
+// server. OpenCode 1.x doesn't know that flag. Both read the person's global config in a closed home.
+async function askOpenCode(version) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-oc-')));
+  const bin = path.join(root, 'bin');
+  const home = path.join(root, 'home');
+  const log = path.join(root, 'args.log');
+  fs.mkdirSync(bin);
+  fs.mkdirSync(path.join(home, '.config', 'opencode'), { recursive: true });
+  fs.mkdirSync(path.join(home, 'dotfiles'));
+  fs.mkdirSync(path.join(home, '.ssh'));
+  fs.writeFileSync(path.join(home, '.ssh', 'id_test'), 'PRIVATE');
+  fs.writeFileSync(path.join(home, 'notes.txt'), 'PERSONAL');
+  fs.writeFileSync(path.join(home, '.config', 'opencode', 'opencode.jsonc'), '// mine\n{"model":"jsonc-model"}');
+  // Kept in a dotfiles repository, as many people do.
+  fs.writeFileSync(path.join(home, 'dotfiles', 'opencode.json'), '{"model":"json-model"}');
+  fs.symlinkSync(path.join(home, 'dotfiles', 'opencode.json'), path.join(home, '.config', 'opencode', 'opencode.json'));
+  const v2 = version === 2;
+  standIn(bin, 'opencode', `const fs = require('fs'); const path = require('path');
+const args = process.argv.slice(2); const home = process.env.HOME;
+const can = (...p) => { try { return fs.readFileSync(path.join(home, ...p), 'utf8').includes('model') ? 'read' : 'read'; } catch { return 'blocked'; } };
+// A Mac with no ~/.local yet: OpenCode makes its folders at start.
+const canWrite = () => { try { const d = path.join(home, '.local/state/opencode'); fs.mkdirSync(d, { recursive: true }); fs.writeFileSync(path.join(d, 'x'), '1'); return 'written'; } catch { return 'blocked'; } };
+if (args[0] === 'auth') { console.log('1 credentials'); }
+else if (args.includes('--help')) { console.log('opencode run [message..]\\n  --format\\n  --agent\\n  --session${v2 ? '\\n  --standalone  Run with a private server' : ''}'); }
+else {
+  fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + '\\n');
+  if (${!v2} && args.includes('--standalone')) { console.error('Unrecognized flag: --standalone in command opencode run'); process.exit(1); }
+  if (${v2} && !args.includes('--standalone')) { console.log(JSON.stringify({ type: 'error', sessionID: 's', error: { type: 'unknown', message: 'Agent not found: "meridian"' } })); process.exit(1); }
+  process.stdin.resume();
+  process.stdin.on('end', () => console.log(JSON.stringify({ type: 'text', sessionID: 'ses_1', part: { text: 'ANSWER jsonc=' + can('.config/opencode/opencode.jsonc') + ' json=' + can('.config/opencode/opencode.json') + ' ssh=' + can('.ssh/id_test') + ' notes=' + can('notes.txt') + ' state=' + canWrite() } })));
+}
+`);
+  const b = await launch(['about:blank'], { args: [`--meridian-agents-path=${bin}`, `--meridian-test-home=${home}`] });
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    await b.eval('app.$.tabstrip.runCommand(13, 0)');
+    await b.waitFor(`app.$.settings.open && !!${ST}.querySelector('[data-id="ai"]')`);
+    await b.click(`${ST}.querySelector('[data-id="ai"]')`);
+    await b.waitFor(`!!${ST}.getElementById('aiRows')`);
+    await b.click(`${ST}.getElementById('otherAgents')`);
+    await b.waitFor(`${ST}.getElementById('ai-opencode')?.textContent.includes('Ready')`, 15000);
+    await b.eval(`${ST}.getElementById('ai-opencode').click()`);
+    await b.waitFor(`${ST}.getElementById('ai-opencode').classList.contains('on')`);
+    await b.eval('app.$.settings.hide()');
+    await b.eval('app.$.tabstrip.runCommand(14, 0)');
+    await b.waitFor(`app.$.ask.open && !!${AK}.getElementById('input')`);
+    await b.eval(`(() => { const i = ${AK}.getElementById('input'); i.value = 'What is this page?'; ${AK}.getElementById('send').click(); })()`);
+    await b.waitFor(`/ANSWER|Agent not found|Unrecognized/.test([...${AK}.querySelectorAll('.msg.assistant')].pop()?.textContent || '')`, 20000)
+      .catch(async (e) => { throw new Error(`${e.message}\nAsk shows: ${await b.eval(`${AK}.textContent.replace(/\\s+/g, ' ').slice(-400)`)}`); });
+    const said = await b.eval(`[...${AK}.querySelectorAll('.msg.assistant')].pop().textContent`);
+    const runs = fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    return { said, runs };
+  } finally { await b.close(); fs.rmSync(root, { recursive: true, force: true }); }
+}
+
+for (const version of [1, 2]) {
+  test(`OpenCode ${version}.x answers Ask, on its own server if it has one, reading only its global config`, { skip: process.platform !== 'darwin' && 'needs the macOS sandbox' }, async () => {
+    const { said, runs } = await askOpenCode(version);
+    assert.match(said, /ANSWER/);
+    assert.match(said, /jsonc=read/, 'the global opencode.jsonc');
+    assert.match(said, /json=read/, 'the global opencode.json, through its symlink');
+    assert.match(said, /ssh=blocked/);
+    assert.match(said, /notes=blocked/);
+    assert.match(said, /state=written/, 'its own state folder, on a Mac without ~/.local');
+    assert.equal(runs[0].includes('--standalone'), version === 2);
+  });
+}
+
 test('LM Studio installed but off: Start server turns it on, then it answers', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-lms-'));
   const started = path.join(dir, 'started');
@@ -299,9 +370,14 @@ test('agent CLIs where they can’t run: “macOS only for now”, can’t be pi
     await b.click(`${ST}.querySelector('[data-id="ai"]')`);
     await b.waitFor(`!!${ST}.getElementById('aiRows')`);
     await b.click(`${ST}.getElementById('otherAgents')`);
-    for (const id of ['codex', 'opencode', 'cursor', 'qwen', 'amp', 'goose', 'droid', 'copilot']) {
-      await b.waitFor(`${ST}.getElementById('ai-${id}')?.textContent.includes('macOS only for now')`, 15000);
-      assert.equal(await b.eval(`${ST}.getElementById('ai-${id}').hasAttribute('disabled')`), true, `${id} can't be picked`);
+    // Codex, found on this computer, has its row: it says so and can't be picked.
+    await b.waitFor(`${ST}.getElementById('ai-codex')?.textContent.includes('macOS only for now')`, 15000);
+    assert.equal(await b.eval(`${ST}.getElementById('ai-codex').hasAttribute('disabled')`), true, 'codex can\'t be picked');
+    // The others aren't here: folded under More AI tools, which offers nothing to pick or install.
+    for (const id of ['opencode', 'cursor', 'qwen', 'amp', 'goose', 'droid', 'copilot']) {
+      await b.waitFor(`!!${ST}.getElementById('more-${id}')`, 15000);
+      assert.equal(await b.eval(`!!${ST}.getElementById('ai-${id}')`), false, `${id} has no row to pick`);
+      assert.equal(await b.eval(`[...${ST}.getElementById('more-${id}').querySelectorAll('button')].every((x) => x.disabled)`), true, `${id} offers no install`);
     }
     await b.eval(`${ST}.getElementById('ai-codex').click()`);
     await sleep(500);

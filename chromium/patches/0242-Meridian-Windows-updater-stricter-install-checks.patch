@@ -1,0 +1,450 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove@yandex.ru>
+Date: Tue, 24 Nov 2026 00:02:13 +0400
+Subject: [PATCH 242/297] Meridian: Windows updater: stricter install checks
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/meridian/update_check.cc       |  13 +-
+ chrome/browser/meridian/update_check.h        |  20 ++
+ .../browser/meridian/update_check_unittest.cc |  63 ++++++
+ chrome/browser/meridian/updater_win.cc        | 209 ++++++++++++++----
+ 4 files changed, 256 insertions(+), 49 deletions(-)
+
+diff --git a/chrome/browser/meridian/update_check.cc b/chrome/browser/meridian/update_check.cc
+index 55b7e123d4..fd5e4eff68 100644
+--- a/chrome/browser/meridian/update_check.cc
++++ b/chrome/browser/meridian/update_check.cc
+@@ -196,21 +196,24 @@ std::string WindowsInstallScript(int pid,
+   const std::string id = base::NumberToString(pid);
+   std::string script =
+       "@echo off\r\n"
+-      "chcp 65001 >nul\r\n"
++      "%SystemRoot%\\System32\\chcp.com 65001 >nul\r\n"
+       // ping is the wait that works without a console.
+       ":wait\r\n"
+-      "tasklist /fi \"PID eq " + id + "\" 2>nul | find \" " + id +
+-      " \" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)\r\n"
++      "%SystemRoot%\\System32\\tasklist.exe /fi \"PID eq " + id +
++      "\" 2>nul | %SystemRoot%\\System32\\find.exe \" " + id +
++      " \" >nul && (%SystemRoot%\\System32\\ping.exe -n 2 127.0.0.1 >nul & "
++      "goto wait)\r\n"
+       "set tries=0\r\n"
+       ":install\r\n"
+-      "ping -n 3 127.0.0.1 >nul\r\n" +
+-      quoted(setup) +
++      "%SystemRoot%\\System32\\ping.exe -n 3 127.0.0.1 >nul\r\n" +
++      kWindowsCheckHold + quoted(setup) +
+       " --do-not-launch-chrome\r\n"
+       "if not errorlevel 1 goto done\r\n"
+       "set /a tries+=1\r\n"
+       "if %tries% lss 5 goto install\r\n"
+       "echo the installer failed\r\n"
+       ":done\r\n";
++  script += kWindowsReleaseHold;
+   if (!browser.empty()) {
+     script += "start \"\" " + quoted(browser) + "\r\n";
+   }
+diff --git a/chrome/browser/meridian/update_check.h b/chrome/browser/meridian/update_check.h
+index 8846dadbab..6bf5c04c1b 100644
+--- a/chrome/browser/meridian/update_check.h
++++ b/chrome/browser/meridian/update_check.h
+@@ -71,6 +71,9 @@ struct Release {
+     std::string url;
+   };
+   std::map<std::string, Delta> deltas;
++  // Windows: the installer's SHA-256 from the signed checksums, once they
++  // have been verified. The installer is checked against it before it runs.
++  std::string sum;
+ };
+ 
+ // Whether the updater may download `url`: https only, or also http from a
+@@ -96,6 +99,23 @@ std::optional<Release> ParseWindowsRelease(std::string_view json,
+ // hidden with cmd.exe): waits for `pid` to exit, runs the installer `setup`
+ // (a few tries: Meridian's other processes may take a moment to go), then
+ // opens `browser` unless it is empty, and removes the installer.
++// A process (its id in MERIDIAN_UPDATE_HOLD) keeps both files open until then.
++// kWindowsCheckHold stops the script, without installing, if it has ended; the
++// next Restart to update checks the installer again. kWindowsReleaseHold ends
++// it. Windows's own tools by their full path: a `find` or `ping` from Git or
++// Cygwin may come first on PATH.
++inline constexpr char kWindowsCheckHold[] =
++    "if not defined MERIDIAN_UPDATE_HOLD exit /b 3\r\n"
++    "%SystemRoot%\\System32\\tasklist.exe "
++    "/fi \"PID eq %MERIDIAN_UPDATE_HOLD%\" "
++    "/fi \"imagename eq ping.exe\" 2>nul | "
++    "%SystemRoot%\\System32\\find.exe \" %MERIDIAN_UPDATE_HOLD% \" >nul "
++    "|| exit /b 3\r\n";
++inline constexpr char kWindowsReleaseHold[] =
++    "if defined MERIDIAN_UPDATE_HOLD (%SystemRoot%\\System32\\taskkill.exe "
++    "/f /pid %MERIDIAN_UPDATE_HOLD% /fi \"imagename eq ping.exe\" >nul 2>&1 & "
++    "%SystemRoot%\\System32\\ping.exe -n 2 127.0.0.1 >nul)\r\n"
++    "set MERIDIAN_UPDATE_HOLD=\r\n";
+ std::string WindowsInstallScript(int pid,
+                                  const base::FilePath& setup,
+                                  const base::FilePath& browser);
+diff --git a/chrome/browser/meridian/update_check_unittest.cc b/chrome/browser/meridian/update_check_unittest.cc
+index a0876a9fde..b9bdf0be3a 100644
+--- a/chrome/browser/meridian/update_check_unittest.cc
++++ b/chrome/browser/meridian/update_check_unittest.cc
+@@ -5,6 +5,8 @@
+ #include "chrome/browser/meridian/update_check.h"
+ 
+ #include <array>
++#include <optional>
++#include <string>
+ 
+ #include "base/base64.h"
+ #include "base/containers/span.h"
+@@ -14,6 +16,9 @@
+ #include "base/files/file_util.h"
+ #include "base/files/scoped_temp_dir.h"
+ #include "base/process/launch.h"
++#include "base/process/process.h"
++#include "base/scoped_environment_variable_override.h"
++#include "base/strings/string_number_conversions.h"
+ #include "build/build_config.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ #include "third_party/boringssl/src/include/openssl/curve25519.h"
+@@ -263,6 +268,18 @@ TEST(UpdateCheckTest, TheWindowsInstallScriptRunsTheInstallerAndRemovesIt) {
+   base::FilePath script = dir.GetPath().AppendASCII("update.cmd");
+   ASSERT_TRUE(base::WriteFile(
+       script, WindowsInstallScript(999999, setup, base::FilePath())));
++  base::CommandLine hold(system.AppendASCII("ping.exe"));
++  hold.AppendArg("-n");
++  hold.AppendArg("60");
++  hold.AppendArg("127.0.0.1");
++  base::LaunchOptions hold_options;
++  hold_options.start_hidden = true;
++  base::Process holder = base::LaunchProcess(hold, hold_options);
++  ASSERT_TRUE(holder.IsValid());
++  base::ScopedEnvironmentVariableOverride held(
++      "MERIDIAN_UPDATE_HOLD", base::NumberToString(holder.Pid()));
++  // It uses Windows's own tools, whatever is on PATH.
++  base::ScopedEnvironmentVariableOverride no_path("PATH", "");
+   base::CommandLine line(system.AppendASCII("cmd.exe"));
+   line.AppendArgNative(L"/d");
+   line.AppendArgNative(L"/c");
+@@ -271,6 +288,52 @@ TEST(UpdateCheckTest, TheWindowsInstallScriptRunsTheInstallerAndRemovesIt) {
+   ASSERT_TRUE(base::GetAppOutput(line, &out));
+   EXPECT_EQ(out.find("the installer failed"), std::string::npos) << out;
+   EXPECT_FALSE(base::PathExists(setup));
++  // The script ended the hold.
++  EXPECT_TRUE(holder.WaitForExitWithTimeout(base::Seconds(5), nullptr));
++}
++
++TEST(UpdateCheckTest, TheWindowsInstallScriptNeedsItsHold) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  base::FilePath system;
++  ASSERT_TRUE(base::PathService::Get(base::DIR_SYSTEM, &system));
++  // A process that has ended, for an id that is no longer a hold.
++  base::CommandLine done(system.AppendASCII("ping.exe"));
++  done.AppendArg("-n");
++  done.AppendArg("1");
++  done.AppendArg("127.0.0.1");
++  base::LaunchOptions done_options;
++  done_options.start_hidden = true;
++  base::Process ended = base::LaunchProcess(done, done_options);
++  ASSERT_TRUE(ended.IsValid());
++  ASSERT_TRUE(ended.WaitForExitWithTimeout(base::Seconds(10), nullptr));
++  const std::string ended_id = base::NumberToString(ended.Pid());
++
++  base::FilePath setup = dir.GetPath().AppendASCII("setup.cmd");
++  base::FilePath ran = dir.GetPath().AppendASCII("ran");
++  ASSERT_TRUE(base::WriteFile(
++      setup, "@echo ran> \"" + ran.AsUTF8Unsafe() + "\"\r\n"));
++  base::FilePath script = dir.GetPath().AppendASCII("update.cmd");
++  ASSERT_TRUE(base::WriteFile(
++      script, WindowsInstallScript(999999, setup, base::FilePath())));
++  base::CommandLine line(system.AppendASCII("cmd.exe"));
++  line.AppendArgNative(L"/d");
++  line.AppendArgNative(L"/c");
++  line.AppendArgPath(script);
++  for (bool has_id : {false, true}) {
++    std::optional<base::ScopedEnvironmentVariableOverride> env;
++    if (has_id) {
++      env.emplace("MERIDIAN_UPDATE_HOLD", ended_id);
++    } else {
++      env.emplace("MERIDIAN_UPDATE_HOLD");
++    }
++    std::string out;
++    int code = 0;
++    ASSERT_TRUE(base::GetAppOutputWithExitCode(line, &out, &code));
++    EXPECT_EQ(code, 3) << out;
++    EXPECT_FALSE(base::PathExists(ran));
++    EXPECT_TRUE(base::PathExists(setup));
++  }
+ }
+ #endif
+ 
+diff --git a/chrome/browser/meridian/updater_win.cc b/chrome/browser/meridian/updater_win.cc
+index e524ef5d5b..7f87588e90 100644
+--- a/chrome/browser/meridian/updater_win.cc
++++ b/chrome/browser/meridian/updater_win.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/meridian/updater.h"
+ 
++#include <windows.h>
++
+ #include <algorithm>
+ #include <array>
+ #include <utility>
+@@ -145,24 +147,15 @@ std::unique_ptr<network::SimpleURLLoader> Request(const std::string& url) {
+   return loader;
+ }
+ 
+-// On a worker: whether the downloaded installer is the one the signed
+-// checksums name. An error for the person, or none (the second of the pair
+-// is the macOS updater's code-signing requirement; there is none here).
+-std::pair<std::string, std::string> Verify(base::FilePath installer,
+-                                           std::string sum) {
+-  auto fail = [](std::string error) {
+-    return std::make_pair(std::move(error), std::string());
+-  };
+-  base::File file(installer, base::File::FLAG_OPEN | base::File::FLAG_READ);
+-  if (!file.IsValid()) {
+-    return fail("The download is missing.");
+-  }
++// The SHA-256 of what is left to read in `file`, or nothing if it can't be
++// read. Blocking.
++std::optional<std::string> HashOf(base::File& file) {
+   crypto::hash::Hasher hasher(crypto::hash::kSha256);
+   std::vector<uint8_t> buffer(1 << 20);
+   while (true) {
+     std::optional<size_t> n = file.ReadAtCurrentPos(buffer);
+     if (!n) {
+-      return fail("The download couldn’t be read.");
++      return std::nullopt;
+     }
+     if (*n == 0) {
+       break;
+@@ -171,7 +164,141 @@ std::pair<std::string, std::string> Verify(base::FilePath installer,
+   }
+   std::array<uint8_t, crypto::hash::kSha256Size> digest;
+   hasher.Finish(digest);
+-  if (base::HexEncodeLower(digest) != sum) {
++  return base::HexEncodeLower(digest);
++}
++
++// An update handed over and waiting for Meridian to quit: the script, and the
++// process that keeps the installer and the script open until it has run.
++struct PendingInstall {
++  base::Process script;
++  base::Process holder;
++  base::FilePath installer;
++};
++
++// On the UI thread.
++PendingInstall& Pending() {
++  static base::NoDestructor<PendingInstall> pending;
++  return *pending;
++}
++bool g_install_starting = false;
++
++// On a worker: checks the installer against the signed checksum and starts
++// the script. The handle it reads through stays open in a small process that
++// outlives Meridian, until the script is done. That process is a ping and not
++// the script because whatever cmd starts inherits cmd's handles, and the
++// browser it opens would then keep the installer open. An error for the
++// person, or none, and what is now pending.
++std::pair<std::string, PendingInstall> StartInstall(PendingInstall old,
++                                                    base::FilePath dir,
++                                                    base::FilePath installer,
++                                                    std::string sum,
++                                                    std::string script) {
++  auto fail = [](std::string error) {
++    return std::make_pair(std::move(error), PendingInstall());
++  };
++  // Asked again after a quit that was cancelled.
++  if (old.installer == installer && old.script.IsValid() &&
++      old.holder.IsValid() && old.script.IsRunning() &&
++      old.holder.IsRunning()) {
++    return std::make_pair(std::string(), std::move(old));
++  }
++  if (old.script.IsValid()) {
++    old.script.Terminate(0, /*wait=*/true);
++  }
++  if (old.holder.IsValid()) {
++    old.holder.Terminate(0, /*wait=*/true);
++  }
++  if (!old.installer.empty() && old.installer != installer) {
++    base::DeleteFile(old.installer);
++  }
++
++  base::File held(installer, base::File::FLAG_OPEN | base::File::FLAG_READ |
++                                 base::File::FLAG_WIN_EXCLUSIVE_WRITE);
++  if (!held.IsValid()) {
++    return fail("The update couldn’t be checked before installing.");
++  }
++  std::optional<std::string> hash = HashOf(held);
++  if (!hash || sum.empty() || *hash != sum) {
++    held.Close();
++    base::DeleteFile(installer);
++    return fail("The update couldn’t be verified, so it wasn’t installed.");
++  }
++
++  base::FilePath path = dir.AppendASCII("update.cmd");
++  base::FilePath system;
++  if (!base::DeleteFile(path) ||
++      !base::PathService::Get(base::DIR_SYSTEM, &system)) {
++    return fail("Couldn’t start the update.");
++  }
++  // Created new, through the handle that stays open.
++  base::File held_script(path, base::File::FLAG_CREATE |
++                                   base::File::FLAG_WRITE |
++                                   base::File::FLAG_WIN_EXCLUSIVE_WRITE);
++  if (!held_script.IsValid() ||
++      !held_script.WriteAtCurrentPosAndCheck(base::as_byte_span(script))) {
++    return fail("Couldn’t start the update.");
++  }
++  HANDLE handles[] = {held.GetPlatformFile(), held_script.GetPlatformFile()};
++  for (HANDLE handle : handles) {
++    if (!::SetHandleInformation(handle, HANDLE_FLAG_INHERIT,
++                                HANDLE_FLAG_INHERIT)) {
++      return fail("Couldn’t start the update.");
++    }
++  }
++
++  base::CommandLine hold(system.AppendASCII("ping.exe"));
++  hold.AppendArg("-n");
++  hold.AppendArg("86400");
++  hold.AppendArg("127.0.0.1");
++  base::LaunchOptions hold_options;
++  hold_options.start_hidden = true;
++  hold_options.current_directory = system;
++  hold_options.handles_to_inherit = {handles[0], handles[1]};
++  PendingInstall pending;
++  pending.installer = installer;
++  pending.holder = base::LaunchProcess(hold, hold_options);
++  if (!pending.holder.IsValid()) {
++    return fail("Couldn’t start the update.");
++  }
++
++  base::CommandLine line(system.AppendASCII("cmd.exe"));
++  line.AppendArgNative(L"/d");
++  line.AppendArgNative(L"/c");
++  line.AppendArgPath(path);
++  base::LaunchOptions options;
++  // No console window; the script outlives Meridian.
++  options.start_hidden = true;
++  // Not in Meridian's own folder (<version>, where the browser runs): the
++  // installer replaces that folder, and Windows doesn't let go of a folder
++  // some process is in.
++  options.current_directory = system;
++  options.environment[L"MERIDIAN_UPDATE_HOLD"] =
++      base::NumberToWString(pending.holder.Pid());
++  pending.script = base::LaunchProcess(line, options);
++  if (!pending.script.IsValid()) {
++    pending.holder.Terminate(0, /*wait=*/false);
++    return fail("Couldn’t start the update.");
++  }
++  return std::make_pair(std::string(), std::move(pending));
++}
++
++// On a worker: whether the downloaded installer is the one the signed
++// checksums name. An error for the person, or none (the second of the pair
++// is the macOS updater's code-signing requirement; there is none here).
++std::pair<std::string, std::string> Verify(base::FilePath installer,
++                                           std::string sum) {
++  auto fail = [](std::string error) {
++    return std::make_pair(std::move(error), std::string());
++  };
++  base::File file(installer, base::File::FLAG_OPEN | base::File::FLAG_READ);
++  if (!file.IsValid()) {
++    return fail("The download is missing.");
++  }
++  std::optional<std::string> hash = HashOf(file);
++  if (!hash) {
++    return fail("The download couldn’t be read.");
++  }
++  if (*hash != sum) {
+     file.Close();
+     base::DeleteFile(installer);
+     return fail("The download doesn’t match the release’s checksum.");
+@@ -404,6 +531,7 @@ void Updater::OnSig(std::optional<std::string> body) {
+     Fail("The release has no checksum for Windows.");
+     return;
+   }
++  release_.sum = *sum;
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE,
+       {base::MayBlock(), base::TaskPriority::USER_VISIBLE,
+@@ -445,6 +573,9 @@ bool Updater::Install() {
+   if (status_ != mojom::UpdateStatus::kReady) {
+     return false;
+   }
++  if (g_install_starting) {
++    return true;
++  }
+   const int pid = static_cast<int>(base::Process::Current().Pid());
+   // The ready one (a newer one may be downloading into the same folder).
+   const base::FilePath installer = dir_.AppendUTF8(ready_.zip_name);
+@@ -455,46 +586,36 @@ bool Updater::Install() {
+     base::FilePath target = TestSwitchPath("meridian-test-update-target");
+     // Once Meridian has quit, as the real script does.
+     const std::string id = base::NumberToString(pid);
+-    script = "@echo off\r\nchcp 65001 >nul\r\n:wait\r\n"
+-             "tasklist /fi \"PID eq " +
+-             id + "\" 2>nul | find \" " + id +
+-             " \" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)\r\n"
+-             "copy /y \"" +
++    script = "@echo off\r\n%SystemRoot%\\System32\\chcp.com 65001 >nul\r\n"
++             ":wait\r\n"
++             "%SystemRoot%\\System32\\tasklist.exe /fi \"PID eq " +
++             id + "\" 2>nul | %SystemRoot%\\System32\\find.exe \" " + id +
++             " \" >nul && (%SystemRoot%\\System32\\ping.exe -n 2 127.0.0.1 "
++             ">nul & goto wait)\r\n"
++             // About as long as the real one takes to start the installer.
++             "%SystemRoot%\\System32\\ping.exe -n 4 127.0.0.1 >nul\r\n" +
++             update::kWindowsCheckHold + "copy /y \"" +
+              installer.AsUTF8Unsafe() + "\" \"" + target.AsUTF8Unsafe() +
+              "\" >nul\r\n";
++    script += update::kWindowsReleaseHold;
+   } else {
+     script = update::WindowsInstallScript(pid, installer, bundle_);
+   }
++  g_install_starting = true;
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_BLOCKING},
++      base::BindOnce(&StartInstall, std::move(Pending()), dir_, installer,
++                     ready_.sum, std::move(script)),
+       base::BindOnce(
+-          [](base::FilePath dir, std::string script) {
+-            base::FilePath path = dir.AppendASCII("update.cmd");
+-            base::FilePath cmd;
+-            if (!base::WriteFile(path, script) ||
+-                !base::PathService::Get(base::DIR_SYSTEM, &cmd)) {
+-              return false;
+-            }
+-            base::CommandLine line(cmd.AppendASCII("cmd.exe"));
+-            line.AppendArgNative(L"/d");
+-            line.AppendArgNative(L"/c");
+-            line.AppendArgPath(path);
+-            base::LaunchOptions options;
+-            // No console window; the script outlives Meridian.
+-            options.start_hidden = true;
+-            // Not in Meridian's own folder (<version>, where the browser
+-            // runs): the installer replaces that folder, and Windows doesn't
+-            // let go of a folder some process is in.
+-            options.current_directory = cmd;
+-            return base::LaunchProcess(line, options).IsValid();
+-          },
+-          dir_, std::move(script)),
+-      base::BindOnce(
+-          [](base::WeakPtr<Updater> self, bool started) {
+-            if (!started) {
++          [](base::WeakPtr<Updater> self,
++             std::pair<std::string, PendingInstall> result) {
++            g_install_starting = false;
++            Pending() = std::move(result.second);
++            if (!result.first.empty()) {
++              LOG(WARNING) << "Meridian update: " << result.first;
+               if (self) {
+                 self->Set(mojom::UpdateStatus::kFailed,
+-                          "Couldn’t start the update.");
++                          std::move(result.first));
+               }
+               return;
+             }

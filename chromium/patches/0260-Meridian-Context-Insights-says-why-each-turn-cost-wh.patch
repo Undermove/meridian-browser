@@ -1,0 +1,334 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 24 Nov 2026 01:41:38 +0400
+Subject: [PATCH 260/297] Meridian: Context Insights says why each turn cost
+ what it did
+
+Each main request gets a cause only when the transcript proves it, else
+unknown. Bars carry the causes and their turns and still add up to Claude
+Code's session total.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/workbench/context_insights.cc    | 226 ++++++++++++++++--
+ .../meridian/workbench/context_insights.h     |  10 +
+ 2 files changed, 218 insertions(+), 18 deletions(-)
+
+diff --git a/chrome/browser/meridian/workbench/context_insights.cc b/chrome/browser/meridian/workbench/context_insights.cc
+index 999c7ed79a..de483171cd 100644
+--- a/chrome/browser/meridian/workbench/context_insights.cc
++++ b/chrome/browser/meridian/workbench/context_insights.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/meridian/workbench/context_insights.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <cmath>
+ #include <utility>
+ 
+@@ -162,6 +163,28 @@ std::string Pct(double share) {
+   return base::NumberToString(static_cast<int>(std::round(share * 100))) + "%";
+ }
+ 
++// Why a turn cost what it did, for the cost chart. A cause is claimed only
++// when the transcript shows it; a jump it can't explain stays kUnknown.
++enum Cause { kCold, kCompaction, kFile, kMcp, kUnknown, kNormal, kSubagents };
++constexpr int kCauseCount = 7;
++constexpr std::array<const char*, kCauseCount> kCauseNames = {
++    "cold", "compaction", "file", "mcp", "unknown", "normal", "subagents"};
++// A file or MCP load must be this large (tokens, estimated) and at least half
++// of what the request newly sent to count as what made it expensive.
++constexpr double kBigFile = 5000;
++constexpr double kBigMcp = 2000;
++// New input that counts as a jump: this many tokens and a quarter of the
++// context before it.
++constexpr double kJumpTokens = 5000;
++constexpr double kJumpShare = 0.25;
++// How many turns each bar lists; the rest are summed.
++constexpr size_t kTurnsPerBar = 12;
++
++std::string McpServerOf(const std::string& tool) {
++  const size_t sep = tool.find("__", 5);
++  return sep == std::string::npos ? tool.substr(5) : tool.substr(5, sep - 5);
++}
++
+ }  // namespace
+ 
+ ContextInsights::ContextInsights() = default;
+@@ -289,6 +312,10 @@ void ContextInsights::FeedAssistant(const base::DictValue& entry,
+           r.ts, Weighted(r.input, r.cache_read, r.cache_write - r.cache_write_1h,
+                          r.cache_write_1h, r.output));
+     } else {
++      r.mcp_loaded = pending_mcp_tokens_;
++      r.mcp_loaded_from = pending_mcp_from_;
++      pending_mcp_tokens_ = 0;
++      pending_mcp_from_.clear();
+       requests_.push_back(r);
+       if (const std::string* model = message->FindString("model")) {
+         model_ = Short(*model, 60);
+@@ -416,6 +443,9 @@ void ContextInsights::FeedAttachment(const base::DictValue& entry) {
+       for (const base::Value& block : *blocks) {
+         if (block.is_string()) {
+           mcp_instructions_chars_ += block.GetString().size();
++          if (had_shape_ && !entry.FindBool("isSidechain").value_or(false)) {
++            pending_mcp_tokens_ += Tokens(block.GetString().size());
++          }
+         }
+       }
+     }
+@@ -445,10 +475,23 @@ void ContextInsights::FeedShape(const base::DictValue& entry) {
+       }
+       const std::string* name = tool.GetDict().FindString("name");
+       if (name) {
+-        tool_chars_[Short(*name, 120)] =
+-            base::WriteJson(tool).value_or("").size();
++        const std::string key = Short(*name, 120);
++        const double chars = base::WriteJson(tool).value_or("").size();
++        tool_chars_[key] = chars;
++        // Only a tool never seen before is a load: a subagent's shorter list
++        // and back again is not.
++        if (key.starts_with("mcp__") && seen_mcp_tools_.insert(key).second &&
++            had_shape_ && !entry.FindBool("isSidechain").value_or(false)) {
++          pending_mcp_tokens_ += Tokens(chars);
++          const std::string server = McpServerOf(key);
++          if (pending_mcp_from_.find(server) == std::string::npos) {
++            pending_mcp_from_ +=
++                (pending_mcp_from_.empty() ? "" : ", ") + server;
++          }
++        }
+       }
+     }
++    had_shape_ = true;
+   }
+ }
+ 
+@@ -591,8 +634,17 @@ base::DictValue ContextInsights::Result(
+     for (const auto& [ts, w] : subagent_spend_) {
+       widen(ts);
+     }
++    struct Turn {
++      int index = 0;
++      double ts = 0, usd = 0, cause_usd = 0;
++      double read = 0, write = 0, input = 0, output = 0;
++      Cause cause = kNormal;
++      std::string why, prompt;
++    };
+     struct Bar {
+       double read = 0, write = 0, input = 0, output = 0, subagents = 0;
++      std::array<double, kCauseCount> causes = {};
++      std::vector<Turn> turns;
+     };
+     std::vector<Bar> bars(kBars);
+     auto bar_at = [&](double ts) -> Bar& {
+@@ -603,28 +655,166 @@ base::DictValue ContextInsights::Result(
+                            static_cast<int>((ts - from) / (to - from) * kBars))];
+     };
+     const double usd = total_cost_ / all_w;
+-    for (const Request& r : requests_) {
++
++    // What each request carried in: the tool results that entered it.
++    const size_t count = requests_.size();
++    std::vector<double> file_in(count), mcp_in(count);
++    std::vector<const ToolCall*> file_top(count), mcp_top(count);
++    for (const std::string& id : call_order_) {
++      const ToolCall& c = calls_.at(id);
++      if (c.sidechain || c.entered < 0 ||
++          static_cast<size_t>(c.entered) >= count) {
++        continue;
++      }
++      const size_t at = static_cast<size_t>(c.entered);
++      const bool is_file = c.name == "Read";
++      if (!is_file && !c.name.starts_with("mcp__")) {
++        continue;
++      }
++      (is_file ? file_in : mcp_in)[at] += c.tokens;
++      const ToolCall*& top = (is_file ? file_top : mcp_top)[at];
++      if (!top || c.tokens > top->tokens) {
++        top = &c;
++      }
++    }
++
++    size_t prompt_at = 0;
++    for (size_t i = 0; i < count; ++i) {
++      const Request& r = requests_[i];
++      const double before = i ? requests_[i - 1].context() : 0;
++      const double fresh = r.input + r.cache_write;
++      const double gap = i && r.ts > 0 && requests_[i - 1].ts > 0
++                             ? r.ts - requests_[i - 1].ts
++                             : 0;
++      const double ttl =
++          r.cache_write_1h > r.cache_write / 2 ? 3600 : kColdAfter;
++      const Compaction* compaction = nullptr;
++      for (const Compaction& k : compactions_) {
++        if (k.at == static_cast<int>(i)) {
++          compaction = &k;
++        }
++      }
++      const double mcp_new = mcp_in[i] + r.mcp_loaded;
++      const bool file_big = file_in[i] >= kBigFile && file_in[i] >= fresh / 2;
++      const bool mcp_big = mcp_new >= kBigMcp && mcp_new >= fresh / 2;
++
++      Turn turn;
++      turn.index = static_cast<int>(i) + 1;
++      turn.ts = r.ts;
++      if (compaction && fresh > 0) {
++        turn.cause = kCompaction;
++        turn.why = "Compacted from " + K(compaction->pre) + " to " +
++                   K(compaction->post) +
++                   " tokens, so the context was written to the cache again";
++      } else if (!i && r.cache_read == 0 && r.cache_write > 0) {
++        turn.cause = kCold;
++        turn.why = "Session start: nothing was cached yet";
++      } else if (i && before > 0 && gap >= ttl &&
++                 r.cache_read < before * 0.1 &&
++                 r.cache_write >= before * 0.5) {
++        turn.cause = kCold;
++        turn.why = "The cache expired during a " +
++                   base::NumberToString(static_cast<int>(std::round(gap / 60))) +
++                   " min pause: " + K(r.cache_write) +
++                   " tokens written again";
++      } else if (file_big && (!mcp_big || file_in[i] >= mcp_new)) {
++        turn.cause = kFile;
++        turn.why = "Read " + file_top[i]->target + ": ≈" + K(file_in[i]) +
++                   " tokens";
++      } else if (mcp_big) {
++        turn.cause = kMcp;
++        turn.why = r.mcp_loaded >= mcp_in[i]
++                       ? "MCP tools loaded" +
++                             (r.mcp_loaded_from.empty()
++                                  ? std::string()
++                                  : " from " + r.mcp_loaded_from) +
++                             ": ≈" + K(r.mcp_loaded) + " tokens"
++                       : "MCP result from " + McpServerOf(mcp_top[i]->name) +
++                             ": ≈" + K(mcp_in[i]) + " tokens";
++      } else if (fresh >= std::max(kJumpTokens, before * kJumpShare)) {
++        turn.cause = kUnknown;
++        turn.why = K(fresh) +
++                   " tokens of new input; the transcript doesn’t say why";
++      }
++
++      turn.read = r.cache_read * kRead * usd;
++      turn.write = ((r.cache_write - r.cache_write_1h) * kWrite5m +
++                    r.cache_write_1h * kWrite1h) *
++                   usd;
++      turn.input = r.input * usd;
++      turn.output = r.output * kOutput * usd;
++      turn.usd = turn.read + turn.write + turn.input + turn.output;
++      // The cause explains what was newly sent; reading the cache and
++      // writing the answer are the ordinary part of the same turn.
++      turn.cause_usd =
++          turn.cause == kNormal ? turn.usd : turn.write + turn.input;
++
++      while (prompt_at + 1 < prompts_.size() &&
++             prompts_[prompt_at + 1].first_request <= static_cast<int>(i)) {
++        prompt_at++;
++      }
++      if (!prompts_.empty() &&
++          prompts_[prompt_at].first_request <= static_cast<int>(i)) {
++        turn.prompt = prompts_[prompt_at].text;
++      }
++
+       Bar& b = bar_at(r.ts);
+-      b.read += r.cache_read * kRead * usd;
+-      b.write += ((r.cache_write - r.cache_write_1h) * kWrite5m +
+-                  r.cache_write_1h * kWrite1h) *
+-                 usd;
+-      b.input += r.input * usd;
+-      b.output += r.output * kOutput * usd;
++      b.read += turn.read;
++      b.write += turn.write;
++      b.input += turn.input;
++      b.output += turn.output;
++      b.causes[static_cast<size_t>(turn.cause)] += turn.cause_usd;
++      b.causes[static_cast<size_t>(kNormal)] += turn.usd - turn.cause_usd;
++      b.turns.push_back(std::move(turn));
+     }
+     for (const auto& [ts, w] : subagent_spend_) {
+-      bar_at(ts).subagents += w * usd;
++      Bar& b = bar_at(ts);
++      b.subagents += w * usd;
++      b.causes[static_cast<size_t>(kSubagents)] += w * usd;
+     }
+     base::ListValue list;
+     for (int i = 0; i < kBars; ++i) {
+-      const Bar& b = bars[i];
+-      list.Append(base::DictValue()
+-                      .Set("ts", from + (to - from) * i / kBars)
+-                      .Set("cacheRead", b.read)
+-                      .Set("cacheWrite", b.write)
+-                      .Set("input", b.input)
+-                      .Set("output", b.output)
+-                      .Set("subagents", b.subagents));
++      Bar& b = bars[i];
++      std::sort(b.turns.begin(), b.turns.end(),
++                [](const Turn& x, const Turn& y) { return x.usd > y.usd; });
++      base::DictValue causes;
++      for (int c = 0; c < kCauseCount; ++c) {
++        causes.Set(kCauseNames[static_cast<size_t>(c)],
++                   b.causes[static_cast<size_t>(c)]);
++      }
++      base::ListValue turns;
++      double more_usd = 0;
++      for (size_t t = 0; t < b.turns.size(); ++t) {
++        const Turn& turn = b.turns[t];
++        if (t >= kTurnsPerBar) {
++          more_usd += turn.usd;
++          continue;
++        }
++        turns.Append(base::DictValue()
++                         .Set("index", turn.index)
++                         .Set("ts", turn.ts)
++                         .Set("usd", turn.usd)
++                         .Set("cause", kCauseNames[static_cast<size_t>(turn.cause)])
++                         .Set("causeUsd", turn.cause_usd)
++                         .Set("why", turn.why)
++                         .Set("prompt", turn.prompt)
++                         .Set("cacheRead", turn.read)
++                         .Set("cacheWrite", turn.write)
++                         .Set("input", turn.input)
++                         .Set("output", turn.output));
++      }
++      list.Append(
++          base::DictValue()
++              .Set("ts", from + (to - from) * i / kBars)
++              .Set("cacheRead", b.read)
++              .Set("cacheWrite", b.write)
++              .Set("input", b.input)
++              .Set("output", b.output)
++              .Set("subagents", b.subagents)
++              .Set("causes", std::move(causes))
++              .Set("turns", std::move(turns))
++              .Set("turnCount", static_cast<int>(b.turns.size()))
++              .Set("moreUsd", more_usd));
+     }
+     out.Set("moneySeries", std::move(list));
+   }
+diff --git a/chrome/browser/meridian/workbench/context_insights.h b/chrome/browser/meridian/workbench/context_insights.h
+index 046cca35b6..c95b3aa0c6 100644
+--- a/chrome/browser/meridian/workbench/context_insights.h
++++ b/chrome/browser/meridian/workbench/context_insights.h
+@@ -47,6 +47,10 @@ class ContextInsights {
+     double cache_write = 0;
+     double cache_write_1h = 0;
+     double output = 0;
++    // MCP tools or instructions first sent with this request (estimate), and
++    // from which servers.
++    double mcp_loaded = 0;
++    std::string mcp_loaded_from;
+     double context() const { return input + cache_read + cache_write; }
+   };
+   struct ToolCall {
+@@ -97,6 +101,12 @@ class ContextInsights {
+   double skills_chars_ = 0;
+   std::map<std::string, double> memory_chars_;
+   double mcp_instructions_chars_ = 0;
++  // MCP definitions that appeared after the first request's shape and wait
++  // for the request that carries them.
++  bool had_shape_ = false;
++  std::set<std::string> seen_mcp_tools_;
++  double pending_mcp_tokens_ = 0;
++  std::string pending_mcp_from_;
+   base::DictValue model_costs_;
+   double total_cost_ = 0;
+ };

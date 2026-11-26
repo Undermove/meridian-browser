@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 06:37:13 +0400
+Subject: [PATCH 270/297] Meridian: Reader
+
+The article alone in Chromium's reading view (DOM Distiller, now always
+registered), from a Reader button in the site controls and "Reader" in
+the command bar; again (Exit Reader) takes the page back. Only pages that
+pass Chromium's readability check; others get a toast.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar.mojom         |  5 ++
+ chrome/browser/meridian/sidebar_handler.cc    | 47 +++++++++++++++++++
+ chrome/browser/meridian/sidebar_handler.h     |  1 +
+ chrome/browser/reader_mode/profile_utils.cc   |  5 +-
+ chrome/browser/resources/webui_browser/app.ts | 18 +++++++
+ .../webui_browser/meridian/command_bar.ts     |  4 ++
+ .../resources/webui_browser/meridian/icons.ts |  5 +-
+ .../webui_browser/meridian/site_control.css   |  2 +-
+ .../meridian/site_control.html.ts             |  3 ++
+ .../webui_browser/meridian/site_control.ts    |  5 ++
+ 10 files changed, 90 insertions(+), 5 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 449b7762b1..26ad61aa22 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -931,4 +931,9 @@ interface SidebarHandler {
+   // video), "capture" (camera, microphone or a share), "workbench",
+   // "asleep" (already) or "failed".
+   PutTabToSleep(tabs_api.mojom.NodeId tab_id) => (string reason);
++
++  // Reader: the active tab's article in Chromium's clean reading view (DOM
++  // Distiller), or back to the page from it. `state` is "on", "off" or
++  // "none" (nothing to read on this page).
++  ToggleReader() => (string state);
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index b3162bd37a..8f76dab94d 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -139,6 +139,8 @@
+ #include "components/sessions/content/content_serialized_navigation_builder.h"
+ #include "components/sessions/core/serialized_navigation_entry.h"
+ #include "content/public/browser/navigation_entry.h"
++#include "chrome/browser/dom_distiller/tab_utils.h"
++#include "components/dom_distiller/core/url_utils.h"
+ #include "chrome/browser/resource_coordinator/tab_lifecycle_unit_external.h"
+ #include "chrome/browser/resource_coordinator/lifecycle_unit_state.mojom.h"
+ #include "chrome/browser/media/webrtc/media_capture_devices_dispatcher.h"
+@@ -536,6 +538,51 @@ void SidebarHandler::PutTabToSleep(const tabs_api::NodeId& tab_id,
+           "" : "failed");
+ }
+ 
++void SidebarHandler::ToggleReader(ToggleReaderCallback callback) {
++  tabs::TabInterface* tab = model()->GetActiveTab();
++  if (!tab) {
++    std::move(callback).Run("none");
++    return;
++  }
++  content::WebContents* contents = tab->GetContents();
++  const GURL& url = contents->GetLastCommittedURL();
++  if (dom_distiller::url_utils::IsDistilledPage(url)) {
++    GURL original =
++        dom_distiller::url_utils::GetOriginalUrlFromDistillerUrl(url);
++    if (original.is_valid()) {
++      contents->GetController().LoadURL(original, content::Referrer(),
++                                        ui::PAGE_TRANSITION_AUTO_BOOKMARK,
++                                        std::string());
++    }
++    std::move(callback).Run("off");
++    return;
++  }
++  if (!url.SchemeIsHTTPOrHTTPS()) {
++    std::move(callback).Run("none");
++    return;
++  }
++  // Only a page that reads as an article (Chromium's readability check),
++  // so a home page or a form isn't turned into a blank sheet.
++  RunReadabilityHeuristicsOnWebContents(
++      contents,
++      base::BindOnce(
++          [](base::WeakPtr<content::WebContents> contents,
++             ToggleReaderCallback callback, bool readable) {
++            if (!readable || !contents) {
++              std::move(callback).Run("none");
++              return;
++            }
++            DistillCurrentPageAndViewIfSuccessful(
++                contents.get(),
++                base::BindOnce(
++                    [](ToggleReaderCallback callback, bool ok) {
++                      std::move(callback).Run(ok ? "on" : "none");
++                    },
++                    std::move(callback)));
++          },
++          contents->GetWeakPtr(), std::move(callback)));
++}
++
+ void SidebarHandler::ShareTabInstead(const tabs_api::NodeId& tab_id) {
+   if (tabs::TabInterface* tab = TabFor(tab_id)) {
+     TabSharingUIViews::ShareInstead(tab->GetContents());
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index e83a9cc9ac..aa536b9ed9 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -313,6 +313,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void SetTabMuted(const tabs_api::NodeId& tab_id, bool muted) override;
+   void PutTabToSleep(const tabs_api::NodeId& tab_id,
+                      PutTabToSleepCallback callback) override;
++  void ToggleReader(ToggleReaderCallback callback) override;
+   void ShareTabInstead(const tabs_api::NodeId& tab_id) override;
+   void CanShareTabInstead(const tabs_api::NodeId& tab_id,
+                           CanShareTabInsteadCallback callback) override;
+diff --git a/chrome/browser/reader_mode/profile_utils.cc b/chrome/browser/reader_mode/profile_utils.cc
+index 858f454fb4..cc49acfb87 100644
+--- a/chrome/browser/reader_mode/profile_utils.cc
++++ b/chrome/browser/reader_mode/profile_utils.cc
+@@ -19,9 +19,8 @@
+ namespace reader_mode {
+ 
+ void RegisterViewerSource(Profile* profile) {
+-  if (!web_distiller::IsWebDistillerEnabled()) {
+-    return;
+-  }
++  // Meridian: Reader (site controls, the command bar) is always there,
++  // not only with --enable-dom-distiller.
+ 
+   LazyReaderModeService* lazy_service = LazyReaderModeService::Create(profile);
+ 
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index 0342bcf6fd..dc4f0b870e 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -1260,6 +1260,9 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       case 'ask':
+         this.$.tabstrip.runCommand(Command.kAsk, 0);
+         break;
++      case 'reader':
++        this.toggleReader_();
++        break;
+       case 'page-info':
+         this.$.contentRegion.activeWebview?.openPageInfoMenu();
+         break;
+@@ -1426,9 +1429,24 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       case 'welcome-tour':
+         run(Command.kWelcomeTour);
+         break;
++      case 'reader':
++        this.toggleReader_();
++        break;
+     }
+   }
+ 
++  // Reader: the article alone, in Chromium's reading view, or back.
++  private toggleReader_() {
++    sidebarProxyFactory.getInstance().handler.toggleReader().then(
++        ({state}) => {
++          if (state === 'none') {
++            this.onMeridianMissionToast_(new CustomEvent(
++                'meridian-mission-toast',
++                {detail: {nodeId: '', title: 'No article to read on this page'}}));
++          }
++        });
++  }
++
+   protected onCopyLinkClick_(e: Event) {
+     e.stopPropagation();
+     this.$.tabstrip.copyLink();
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index d887d6c72f..04c3998134 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -143,6 +143,10 @@ export const FEATURES: CommandBarFeature[] = [
+    icon: 'folder', words: ['folder', 'group tabs']},
+   {id: 'welcome-tour', name: 'Welcome Tour', hint: '', keys: '',
+    icon: 'sparkles', words: ['tour', 'onboarding', 'getting started', 'help']},
++  {id: 'reader', name: 'Reader', hint: 'Just the article, clean',
++   keys: '', icon: 'book',
++   words: ['reader mode', 'reading mode', 'reader view', 'article',
++           'distill', 'read']},
+ ];
+ 
+ // Shown to developers only.
+diff --git a/chrome/browser/resources/webui_browser/meridian/icons.ts b/chrome/browser/resources/webui_browser/meridian/icons.ts
+index fa1d471dd6..95e543d5f2 100644
+--- a/chrome/browser/resources/webui_browser/meridian/icons.ts
++++ b/chrome/browser/resources/webui_browser/meridian/icons.ts
+@@ -93,7 +93,8 @@ export type IconName =
+     'next'|
+     'previous'|
+     'pip'|
+-    'ban';
++    'ban'|
++    'book';
+ 
+ export function icon(name: IconName, size = 16): TemplateResult {
+   switch (name) {
+@@ -209,6 +210,8 @@ export function icon(name: IconName, size = 16): TemplateResult {
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="12" r=".9"/><circle cx="12" cy="12" r=".9"/><circle cx="18" cy="12" r=".9"/></svg>`;
+     case 'sun':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3.75"/><path d="M12 3.5v1.5M12 19v1.5M3.5 12H5M19 12h1.5M6 6l1 1M17 17l1 1M6 18l1-1M17 7l1-1"/></svg>`;
++    case 'book':
++      return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 6.5C10.3 5.2 7.8 4.5 4 4.5v13c3.8 0 6.3.7 8 2 1.7-1.3 4.2-2 8-2v-13c-3.8 0-6.3.7-8 2z"/><path d="M12 6.5v13"/></svg>`;
+     case 'moon':
+       return html`<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19.5 14.5A7.5 7.5 0 0 1 9.5 4.5a7.5 7.5 0 1 0 10 10z"/></svg>`;
+     case 'monitor':
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_control.css b/chrome/browser/resources/webui_browser/meridian/site_control.css
+index 94459df879..cde5d5dc7a 100644
+--- a/chrome/browser/resources/webui_browser/meridian/site_control.css
++++ b/chrome/browser/resources/webui_browser/meridian/site_control.css
+@@ -70,7 +70,7 @@ svg {
+ 
+ .quick {
+   display: grid;
+-  grid-template-columns: repeat(4, 1fr);
++  grid-template-columns: repeat(5, 1fr);
+   gap: 6px;
+ }
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_control.html.ts b/chrome/browser/resources/webui_browser/meridian/site_control.html.ts
+index 5a4622b9c2..8745539620 100644
+--- a/chrome/browser/resources/webui_browser/meridian/site_control.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/site_control.html.ts
+@@ -24,6 +24,9 @@ export function getHtml(this: MeridianSiteControlElement) {
+     <button class="q" data-action="ask" @click="${this.onQuickClick_}">
+       ${icon('sparkles', 18)}<span>Ask AI</span>
+     </button>
++    <button class="q" data-action="reader" @click="${this.onQuickClick_}">
++      ${icon('book', 18)}<span>${this.readerLabel_()}</span>
++    </button>
+   </div>
+ 
+   <div class="sec-row">
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_control.ts b/chrome/browser/resources/webui_browser/meridian/site_control.ts
+index 1f511257d4..30d1cee4da 100644
+--- a/chrome/browser/resources/webui_browser/meridian/site_control.ts
++++ b/chrome/browser/resources/webui_browser/meridian/site_control.ts
+@@ -195,6 +195,11 @@ export class MeridianSiteControlElement extends CrLitElement {
+     return this.info_.adblock ? 'On' : 'Off for this site';
+   }
+ 
++  // In the reading view already: the button takes the page back.
++  protected readerLabel_(): string {
++    return this.url.startsWith('chrome-distiller:') ? 'Exit Reader' : 'Reader';
++  }
++
+   protected onQuickClick_(e: Event) {
+     const action = (e.currentTarget as HTMLElement).dataset['action'];
+     if (action === 'copy') {

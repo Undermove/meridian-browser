@@ -82,15 +82,19 @@ test('Workbench: opens a project, edits and saves with ⌘S, runs a terminal, st
     assert.equal(fs.existsSync(path.join(base, 'evil.txt')), false);
     assert.equal(fs.readFileSync(outside, 'utf8'), 'OUTSIDE-SECRET');
 
-    // Closing the tab ends its terminals.
+    // Closing the tab leaves its terminals running (the next Workbench takes them back); quitting ends them.
     const pid = Number((await wb.eval(`new Promise((res) => { let out = ''; const off = window.workbench.onPtyData((d) => { out += d.data; const m = /PID=(\\d+)/.exec(out); if (m) { off(); res(m[1]); } }); window.workbench.ptyWrite(S.activeTerm.id, 'echo PID=$$\\r'); })`)));
     assert.ok(pid > 0);
     wb.close(); wb = null;
     const tab = (await b.tabs()).find((t) => t.url.startsWith('chrome://workbench'));
     await b.eval(`app.$.tabstrip.tabStripService_.closeNodes([${JSON.stringify(tab.id)}])`);
+    const isAlive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    await sleep(1500);
+    assert.equal(isAlive(), true, 'the shell goes on with its tab closed');
+    await b.quit();
     let alive = true;
-    for (let i = 0; i < 40 && alive; i++) { await sleep(100); try { process.kill(pid, 0); } catch { alive = false; } }
-    assert.equal(alive, false, 'the shell ended with the tab');
+    for (let i = 0; i < 50 && alive; i++) { await sleep(100); alive = isAlive(); }
+    assert.equal(alive, false, 'quitting ends it');
   } finally {
     wb?.close();
     await b.close();

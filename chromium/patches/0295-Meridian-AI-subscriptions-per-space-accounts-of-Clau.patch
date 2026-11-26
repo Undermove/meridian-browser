@@ -1,0 +1,2184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 16:02:14 +0400
+Subject: [PATCH 295/297] Meridian: AI subscriptions per space: accounts of
+ Claude Code, Codex, Copilot CLI and Gemini CLI
+
+Each account is a config folder of the CLI, set by its own variable
+(CLAUDE_CONFIG_DIR, CODEX_HOME, COPILOT_HOME, GEMINI_CLI_HOME). Folders are
+found by file names only, never opened. A space chooses an account per CLI:
+Ask, Workbench terminals and Context Insights use it. MCP: list_ai_accounts,
+set_space_ai_account.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   5 +
+ .../browser/meridian/agent/agent_service.cc   | 114 +++++
+ chrome/browser/meridian/agent/agent_service.h |   2 +
+ .../browser/meridian/agent/agent_tools.json   |  35 ++
+ chrome/browser/meridian/ai/account_prefs.cc   | 328 +++++++++++++
+ chrome/browser/meridian/ai/account_prefs.h    |  87 ++++
+ chrome/browser/meridian/ai/accounts.cc        | 461 ++++++++++++++++++
+ chrome/browser/meridian/ai/accounts.h         | 135 +++++
+ .../browser/meridian/ai/accounts_unittest.cc  | 157 ++++++
+ chrome/browser/meridian/ai/ai_service.cc      |   3 +
+ chrome/browser/meridian/ai/ai_service.h       |   2 +
+ chrome/browser/meridian/ai/local_agents.cc    |   7 +
+ chrome/browser/meridian/ai/providers.h        |   3 +
+ chrome/browser/meridian/prefs.cc              |   3 +
+ chrome/browser/meridian/prefs.h               |  10 +
+ chrome/browser/meridian/sidebar.mojom         |  20 +
+ chrome/browser/meridian/sidebar_handler.cc    | 246 ++++++++++
+ chrome/browser/meridian/sidebar_handler.h     |  20 +
+ .../meridian/workbench/agent_insights.cc      |  39 +-
+ .../meridian/workbench/agent_insights.h       |  19 +-
+ .../meridian/workbench/workbench_handler.cc   |  42 +-
+ .../meridian/workbench/workbench_handler.h    |   4 +
+ 22 files changed, 1717 insertions(+), 25 deletions(-)
+ create mode 100644 chrome/browser/meridian/ai/account_prefs.cc
+ create mode 100644 chrome/browser/meridian/ai/account_prefs.h
+ create mode 100644 chrome/browser/meridian/ai/accounts.cc
+ create mode 100644 chrome/browser/meridian/ai/accounts.h
+ create mode 100644 chrome/browser/meridian/ai/accounts_unittest.cc
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index da462ca2aa..722df7cec8 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -158,6 +158,8 @@ source_set("ai_providers") {
+     "ai/chats.h",
+     "ai/page_text.cc",
+     "ai/page_text.h",
++    "ai/accounts.cc",
++    "ai/accounts.h",
+     "ai/process_runner.cc",
+     "ai/process_runner.h",
+     "ai/providers.cc",
+@@ -359,6 +361,8 @@ source_set("meridian") {
+     "ai/ai_service.h",
+     "ai/ai_service_factory.cc",
+     "ai/ai_service_factory.h",
++    "ai/account_prefs.cc",
++    "ai/account_prefs.h",
+     "ai/local_agents.cc",
+     "ai/local_agents.h",
+     "ai/page_fetcher.cc",
+@@ -573,6 +577,7 @@ test("meridian_unittests") {
+     "sidebar_service_unittest.cc",
+     "test_links.h",
+     "update_check_unittest.cc",
++    "ai/accounts_unittest.cc",
+     "ai/chats_unittest.cc",
+     "ai/page_text_unittest.cc",
+     "ai/process_runner_unittest.cc",
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index c0a4524ca0..4e6f95f193 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -4,6 +4,9 @@
+ 
+ #include "chrome/browser/meridian/agent/agent_service.h"
+ 
++#include "chrome/browser/meridian/ai/account_prefs.h"
++#include "chrome/browser/meridian/ai/accounts.h"
++
+ #include "chrome/browser/meridian/report.h"
+ 
+ #include "chrome/browser/meridian/mission/mission_control.h"
+@@ -1013,6 +1016,8 @@ void AgentService::Run(std::unique_ptr<Call> call) {
+       {"handle_dialog", &AgentService::HandleDialog},
+       {"set_boost", &AgentService::SetBoost},
+       {"meridian_guide", &AgentService::Guide},
++      {"list_ai_accounts", &AgentService::ListAiAccounts},
++      {"set_space_ai_account", &AgentService::SetSpaceAiAccount},
+   });
+   auto it = methods->find(call->tool);
+   if (it == methods->end()) {
+@@ -3357,6 +3362,115 @@ void AgentService::CreateSpace(std::unique_ptr<Call> call) {
+               weak_factory_.GetWeakPtr(), name));
+ }
+ 
++void AgentService::ListAiAccounts(std::unique_ptr<Call> call) {
++  ai::ListAccountsAsync(
++      profile_,
++      base::BindOnce(
++          [](base::WeakPtr<AgentService> self, std::unique_ptr<Call> call,
++             std::vector<ai::Account> list) {
++            if (!self) {
++              return;
++            }
++            // Names and spaces only: no folders, never a sign-in.
++            base::DictValue all =
++                ai::AccountsToDict(self->profile_, list, /*paths=*/false);
++            base::ListValue vendors;
++            if (base::ListValue* v = all.FindList("vendors")) {
++              for (base::Value& vendor : *v) {
++                if (base::ListValue* accounts =
++                        vendor.GetDict().FindList("accounts")) {
++                  for (base::Value& a : *accounts) {
++                    a.GetDict().Remove("found");
++                    if (base::ListValue* spaces =
++                            a.GetDict().FindList("spaces")) {
++                      spaces->EraseIf([&](const base::Value& id) {
++                        return !id.is_string() ||
++                               !self->SpaceAllowed(id.GetString());
++                      });
++                    }
++                  }
++                }
++                vendor.GetDict().Remove("short");
++                vendors.Append(std::move(vendor));
++              }
++            }
++            call->Ok(base::Value(
++                base::DictValue().Set("vendors", std::move(vendors))));
++          },
++          weak_factory_.GetWeakPtr(), std::move(call)));
++}
++
++void AgentService::SetSpaceAiAccount(std::unique_ptr<Call> call) {
++  const std::string space_id = call->StrOr("space_id", "");
++  const std::string vendor_id = call->StrOr("vendor", "");
++  const std::string account_id = call->StrOr("account_id", "");
++  SidebarService* service = SidebarServiceFactory::GetForProfile(profile_);
++  const Space* space = service->FindSpace(space_id);
++  if (!space || !SpaceAllowed(space_id)) {
++    return call->Fail("no such space (list_spaces shows the ones you can use)");
++  }
++  const ai::AccountVendor* vendor = ai::FindAccountVendor(vendor_id);
++  if (!vendor) {
++    return call->Fail(
++        "vendor is one of \"claude\", \"codex\", \"copilot\", \"gemini\"");
++  }
++  const std::string space_name = space->name;
++  ai::ListAccountsAsync(
++      profile_,
++      base::BindOnce(
++          [](base::WeakPtr<AgentService> self, std::string space_id,
++             std::string space_name, std::string vendor_id,
++             std::string account_id, std::unique_ptr<Call> call,
++             std::vector<ai::Account> list) {
++            if (!self) {
++              return;
++            }
++            const ai::AccountVendor* vendor =
++                ai::FindAccountVendor(vendor_id);
++            std::optional<ai::Account> account;
++            for (const ai::Account& a : list) {
++              if (a.vendor == vendor_id &&
++                  (account_id.empty() ? a.is_default : a.id == account_id)) {
++                account = a;
++              }
++            }
++            if (!account_id.empty() && !account) {
++              return call->Fail(
++                  "no such account (list_ai_accounts shows them)");
++            }
++            const std::string label =
++                account ? account->label : std::string("the default");
++            self->Confirm(
++                std::move(call),
++                "use " + vendor->short_label + " account “" + label +
++                    "” in the space “" + space_name + "”",
++                base::BindOnce(
++                    [](base::WeakPtr<AgentService> self, std::string space_id,
++                       std::string vendor_id,
++                       std::optional<ai::Account> account,
++                       std::unique_ptr<Call> call) {
++                      if (!self) {
++                        return;
++                      }
++                      ai::SetSpaceAccount(self->profile_, space_id, vendor_id,
++                                          account ? &*account : nullptr);
++                      call->Ok(base::Value(
++                          base::DictValue()
++                              .Set("space_id", space_id)
++                              .Set("vendor", vendor_id)
++                              .Set("account_id",
++                                   account && !account->is_default
++                                       ? account->id
++                                       : std::string())
++                              .Set("label", account ? account->label
++                                                    : std::string("Default"))));
++                    },
++                    self, space_id, vendor_id, std::move(account)));
++          },
++          weak_factory_.GetWeakPtr(), space_id, space_name, vendor_id,
++          account_id, std::move(call)));
++}
++
+ void AgentService::RunJavaScript(std::unique_ptr<Call> call) {
+   tabs::TabInterface* tab = TabFor(*call);
+   if (!tab) {
+diff --git a/chrome/browser/meridian/agent/agent_service.h b/chrome/browser/meridian/agent/agent_service.h
+index abaae7e5a1..be7b9e6a9e 100644
+--- a/chrome/browser/meridian/agent/agent_service.h
++++ b/chrome/browser/meridian/agent/agent_service.h
+@@ -155,6 +155,8 @@ class AgentService : public KeyedService {
+       base::expected<std::pair<base::FilePath, int64_t>, std::string> file);
+   void SplitView(std::unique_ptr<Call> call);
+   void CreateSpace(std::unique_ptr<Call> call);
++  void ListAiAccounts(std::unique_ptr<Call> call);
++  void SetSpaceAiAccount(std::unique_ptr<Call> call);
+   void RunJavaScript(std::unique_ptr<Call> call);
+   void GetBoost(std::unique_ptr<Call> call);
+   void HandleDialog(std::unique_ptr<Call> call);
+diff --git a/chrome/browser/meridian/agent/agent_tools.json b/chrome/browser/meridian/agent/agent_tools.json
+index 5d928f5bcf..361cb5b81e 100644
+--- a/chrome/browser/meridian/agent/agent_tools.json
++++ b/chrome/browser/meridian/agent/agent_tools.json
+@@ -740,5 +740,40 @@
+    "type": "object",
+    "properties": {}
+   }
++ },
++ {
++  "name": "list_ai_accounts",
++  "access": "read",
++  "description": "The person's AI subscriptions side by side: for each coding-agent CLI with accounts on this computer (Claude Code, Codex, Copilot CLI, Gemini CLI), its accounts by name (\"Work\", \"Personal\") and which spaces use each one. Meridian runs that CLI as the space's account for Ask and for Workbench terminals opened in the space. Returns {vendors: [{id, label, accounts: [{id, label, default, spaces: [space ids]}]}]}. No sign-ins, tokens or folders.",
++  "input_schema": {
++   "type": "object",
++   "properties": {}
++  }
++ },
++ {
++  "name": "set_space_ai_account",
++  "access": "write",
++  "description": "Choose which account of an AI tool a space uses (see list_ai_accounts): Ask and Workbench terminals opened in that space then run that tool signed in as that account. Omit account_id (or pass \"\") for the tool's default account.",
++  "input_schema": {
++   "type": "object",
++   "properties": {
++    "space_id": {
++     "type": "string",
++     "description": "Space id from list_spaces."
++    },
++    "vendor": {
++     "type": "string",
++     "description": "\"claude\", \"codex\", \"copilot\" or \"gemini\"."
++    },
++    "account_id": {
++     "type": "string",
++     "description": "Account id from list_ai_accounts; \"\" = the default."
++    }
++   },
++   "required": [
++    "space_id",
++    "vendor"
++   ]
++  }
+  }
+ ]
+diff --git a/chrome/browser/meridian/ai/account_prefs.cc b/chrome/browser/meridian/ai/account_prefs.cc
+new file mode 100644
+index 0000000000..80db869bac
+--- /dev/null
++++ b/chrome/browser/meridian/ai/account_prefs.cc
+@@ -0,0 +1,328 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/ai/account_prefs.h"
++
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/task/thread_pool.h"
++#include "chrome/browser/meridian/ai/process_runner.h"
++#include "chrome/browser/meridian/prefs.h"
++#include "chrome/browser/meridian/sidebar_service.h"
++#include "chrome/browser/meridian/sidebar_service_factory.h"
++#include "chrome/browser/meridian/space_profiles.h"
++#include "chrome/browser/meridian/test_switches.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++
++namespace meridian::ai {
++
++namespace {
++
++PrefService* Prefs(Profile* profile) {
++  Profile* main = MainProfileFor(profile);
++  return (main ? main : profile)->GetPrefs();
++}
++
++// The label kept for `dir`, else one from its name.
++std::string LabelOf(PrefService* prefs,
++                    const AccountVendor& vendor,
++                    const base::FilePath& dir) {
++  if (const base::ListValue* list =
++          prefs->GetDict(prefs::kAiAccounts).FindList(vendor.id)) {
++    for (const base::Value& entry : *list) {
++      if (!entry.is_dict()) {
++        continue;
++      }
++      const std::string* d = entry.GetDict().FindString("dir");
++      const std::string* label = entry.GetDict().FindString("label");
++      if (d && label && !label->empty() &&
++          base::FilePath::FromUTF8Unsafe(*d) == dir) {
++        return *label;
++      }
++    }
++  }
++  return AccountLabelFromDir(vendor, AccountsHome(), dir);
++}
++
++// The saved entry for `dir` (made if missing).
++base::DictValue* EntryFor(base::DictValue& accounts,
++                          const std::string& vendor_id,
++                          const base::FilePath& dir) {
++  base::ListValue* list = accounts.EnsureList(vendor_id);
++  const std::string path = dir.StripTrailingSeparators().AsUTF8Unsafe();
++  for (base::Value& entry : *list) {
++    if (entry.is_dict()) {
++      if (const std::string* d = entry.GetDict().FindString("dir");
++          d && *d == path) {
++        return &entry.GetDict();
++      }
++    }
++  }
++  list->Append(base::DictValue().Set("dir", path));
++  return &list->back().GetDict();
++}
++
++}  // namespace
++
++base::FilePath AccountsHome() {
++  base::FilePath test = TestSwitchPath("meridian-accounts-home");
++  return test.empty() ? base::GetHomeDir() : test;
++}
++
++void ListAccountsAsync(Profile* profile,
++                       base::OnceCallback<void(std::vector<Account>)> done) {
++  base::DictValue saved = Prefs(profile)->GetDict(prefs::kAiAccounts).Clone();
++  const bool test = HasTestSwitch("meridian-accounts-home");
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE,
++      {base::MayBlock(), base::WithBaseSyncPrimitives(),
++       base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
++      base::BindOnce(
++          [](base::DictValue saved, bool test) {
++            // Tests: only their own home counts, not the variables of the
++            // computer running them.
++            std::map<std::string, std::string> env;
++            if (!test) {
++              env = LoginEnvironment();
++            }
++            return ListAccounts(AccountsHome(), env, saved);
++          },
++          std::move(saved), test),
++      std::move(done));
++}
++
++std::optional<SpaceAccount> SpaceAccountFor(Profile* profile,
++                                            const std::string& space_id,
++                                            const std::string& vendor_id) {
++  const AccountVendor* vendor = FindAccountVendor(vendor_id);
++  if (!vendor || space_id.empty()) {
++    return std::nullopt;
++  }
++  PrefService* prefs = Prefs(profile);
++  const base::DictValue* space =
++      prefs->GetDict(prefs::kAiSpaceAccounts).FindDict(space_id);
++  const base::DictValue* entry = space ? space->FindDict(vendor_id) : nullptr;
++  const std::string* id = entry ? entry->FindString("id") : nullptr;
++  const std::string* dir = entry ? entry->FindString("dir") : nullptr;
++  if (!id || !dir || dir->empty()) {
++    return std::nullopt;
++  }
++  SpaceAccount out;
++  out.id = *id;
++  out.dir = base::FilePath::FromUTF8Unsafe(*dir);
++  out.label = LabelOf(prefs, *vendor, out.dir);
++  return out;
++}
++
++std::map<std::string, std::string> AccountEnvForProvider(
++    Profile* profile,
++    const std::string& space_id,
++    const std::string& provider_id,
++    std::string* label) {
++  const AccountVendor* vendor = AccountVendorForProvider(provider_id);
++  if (!vendor) {
++    return {};
++  }
++  std::optional<SpaceAccount> account =
++      SpaceAccountFor(profile, space_id, vendor->id);
++  if (!account) {
++    return {};
++  }
++  if (label) {
++    *label = account->label;
++  }
++  return AccountEnv(*vendor, AccountsHome(), account->dir);
++}
++
++std::map<std::string, std::string> AccountEnvForKind(
++    Profile* profile,
++    const std::string& space_id,
++    const std::string& kind,
++    std::string* label) {
++  std::map<std::string, std::string> out;
++  const bool shell = kind == "shell";
++  for (const AccountVendor& vendor : AccountVendors()) {
++    if (!shell &&
++        std::ranges::find(vendor.kinds, kind) == vendor.kinds.end()) {
++      continue;
++    }
++    std::optional<SpaceAccount> account =
++        SpaceAccountFor(profile, space_id, vendor.id);
++    if (!account) {
++      continue;
++    }
++    if (label && !shell) {
++      *label = account->label;
++    }
++    for (auto& [name, value] :
++         AccountEnv(vendor, AccountsHome(), account->dir)) {
++      out[name] = value;
++    }
++  }
++  return out;
++}
++
++void SetSpaceAccount(Profile* profile,
++                     const std::string& space_id,
++                     const std::string& vendor_id,
++                     const Account* account) {
++  ScopedDictPrefUpdate update(Prefs(profile), prefs::kAiSpaceAccounts);
++  base::DictValue* space = update->EnsureDict(space_id);
++  if (!account || account->is_default) {
++    space->Remove(vendor_id);
++  } else {
++    space->Set(vendor_id,
++               base::DictValue()
++                   .Set("id", account->id)
++                   .Set("dir", account->dir.AsUTF8Unsafe()));
++  }
++  if (space->empty()) {
++    update->Remove(space_id);
++  }
++}
++
++void SaveAccount(Profile* profile,
++                 const std::string& vendor_id,
++                 const base::FilePath& dir,
++                 const std::string& label) {
++  ScopedDictPrefUpdate update(Prefs(profile), prefs::kAiAccounts);
++  base::DictValue* entry = EntryFor(*update, vendor_id, dir);
++  entry->Remove("hidden");
++  if (!label.empty()) {
++    entry->Set("label", label);
++  }
++}
++
++void HideAccount(Profile* profile,
++                 const std::string& vendor_id,
++                 const base::FilePath& dir) {
++  {
++    ScopedDictPrefUpdate update(Prefs(profile), prefs::kAiAccounts);
++    base::DictValue* entry = EntryFor(*update, vendor_id, dir);
++    entry->Set("hidden", true);
++    entry->Remove("label");
++  }
++  // Spaces that used it go back to the default.
++  ScopedDictPrefUpdate spaces(Prefs(profile), prefs::kAiSpaceAccounts);
++  const std::string id = AccountId(dir);
++  std::vector<std::string> empty;
++  for (auto [space_id, value] : *spaces) {
++    if (!value.is_dict()) {
++      continue;
++    }
++    const base::DictValue* entry = value.GetDict().FindDict(vendor_id);
++    const std::string* used = entry ? entry->FindString("id") : nullptr;
++    if (used && *used == id) {
++      value.GetDict().Remove(vendor_id);
++    }
++    if (value.GetDict().empty()) {
++      empty.push_back(space_id);
++    }
++  }
++  for (const std::string& space_id : empty) {
++    spaces->Remove(space_id);
++  }
++}
++
++base::DictValue AccountsToDict(Profile* profile,
++                               const std::vector<Account>& accounts,
++                               bool paths) {
++  PrefService* prefs = Prefs(profile);
++  SidebarService* sidebar = SidebarServiceFactory::GetForProfile(profile);
++  std::vector<std::pair<std::string, std::string>> spaces;
++  if (sidebar) {
++    for (const Space& s : sidebar->spaces()) {
++      spaces.emplace_back(s.id, s.name);
++    }
++  }
++  // Each space's choice, for the accounts still listed.
++  base::DictValue chosen;
++  for (const auto& [space_id, name] : spaces) {
++    base::DictValue per;
++    for (const AccountVendor& vendor : AccountVendors()) {
++      std::optional<SpaceAccount> a =
++          SpaceAccountFor(profile, space_id, vendor.id);
++      if (a && std::ranges::any_of(accounts, [&](const Account& x) {
++            return x.vendor == vendor.id && x.id == a->id;
++          })) {
++        per.Set(vendor.id, a->id);
++      }
++    }
++    if (!per.empty()) {
++      chosen.Set(space_id, std::move(per));
++    }
++  }
++  base::ListValue vendors;
++  for (const AccountVendor& vendor : AccountVendors()) {
++    base::ListValue list;
++    for (const Account& a : accounts) {
++      if (a.vendor != vendor.id) {
++        continue;
++      }
++      base::ListValue used_by;
++      for (const auto& [space_id, name] : spaces) {
++        const base::DictValue* per = chosen.FindDict(space_id);
++        const std::string* id = per ? per->FindString(vendor.id) : nullptr;
++        if (id ? *id == a.id : a.is_default) {
++          used_by.Append(space_id);
++        }
++      }
++      base::DictValue entry;
++      entry.Set("id", a.id);
++      entry.Set("label", a.label);
++      entry.Set("default", a.is_default);
++      entry.Set("found", a.found);
++      entry.Set("spaces", std::move(used_by));
++      if (paths) {
++        const base::FilePath home = AccountsHome();
++        std::string shown = a.dir.AsUTF8Unsafe();
++        if (home.IsParent(a.dir)) {
++          base::FilePath relative;
++          home.AppendRelativePath(a.dir, &relative);
++          shown = "~/" + relative.AsUTF8Unsafe();
++        }
++        entry.Set("dir", shown);
++      }
++      list.Append(std::move(entry));
++    }
++    if (list.empty()) {
++      continue;
++    }
++    vendors.Append(base::DictValue()
++                       .Set("id", vendor.id)
++                       .Set("label", vendor.label)
++                       .Set("short", vendor.short_label)
++                       .Set("accounts", std::move(list)));
++  }
++  base::DictValue suggestion = SuggestAccounts(accounts, spaces);
++  // Only what would change something.
++  base::DictValue useful;
++  for (auto [space_id, value] : suggestion) {
++    base::DictValue per;
++    for (auto [vendor_id, id] : value.GetDict()) {
++      const base::DictValue* now = chosen.FindDict(space_id);
++      const std::string* current = now ? now->FindString(vendor_id) : nullptr;
++      const bool is_default = std::ranges::any_of(accounts, [&](const Account& a) {
++        return a.vendor == vendor_id && a.id == id.GetString() && a.is_default;
++      });
++      if (current ? *current != id.GetString() : !is_default) {
++        per.Set(vendor_id, id.GetString());
++      }
++    }
++    if (!per.empty()) {
++      useful.Set(space_id, std::move(per));
++    }
++  }
++  base::DictValue out;
++  out.Set("vendors", std::move(vendors));
++  out.Set("spaces", std::move(chosen));
++  out.Set("suggestion", std::move(useful));
++  out.Set("hint", prefs->GetString(prefs::kAiAccountsHint));
++  return out;
++}
++
++}  // namespace meridian::ai
+diff --git a/chrome/browser/meridian/ai/account_prefs.h b/chrome/browser/meridian/ai/account_prefs.h
+new file mode 100644
+index 0000000000..23ffe5fbe8
+--- /dev/null
++++ b/chrome/browser/meridian/ai/account_prefs.h
+@@ -0,0 +1,87 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_AI_ACCOUNT_PREFS_H_
++#define CHROME_BROWSER_MERIDIAN_AI_ACCOUNT_PREFS_H_
++
++#include <map>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "base/values.h"
++#include "chrome/browser/meridian/ai/accounts.h"
++
++class Profile;
++
++namespace meridian::ai {
++
++// The accounts of ai/accounts.h as Meridian keeps them, in the main
++// profile's prefs (every space's profile shares them):
++//  - prefs::kAiAccounts: what the person added, renamed or took off the list;
++//  - prefs::kAiSpaceAccounts: space id -> vendor -> {id, dir}.
++// A space that doesn't name an account for a vendor uses that CLI's default.
++
++// Where account folders are looked for: the home folder, or the tests' own
++// (--meridian-accounts-home).
++base::FilePath AccountsHome();
++
++// Lists them (blocking work off the UI thread).
++void ListAccountsAsync(Profile* profile,
++                       base::OnceCallback<void(std::vector<Account>)> done);
++
++// What space `space_id` uses for `vendor_id`: nullopt = the default.
++struct SpaceAccount {
++  std::string id;
++  std::string label;
++  base::FilePath dir;
++};
++std::optional<SpaceAccount> SpaceAccountFor(Profile* profile,
++                                            const std::string& space_id,
++                                            const std::string& vendor_id);
++
++// The environment changes (ApplyAccountEnv) to run, in space `space_id`, an
++// Ask provider or a Workbench terminal kind; `label` gets the account's name
++// ("" for the default). A plain shell gets every vendor's (what it starts
++// there runs as the space says).
++std::map<std::string, std::string> AccountEnvForProvider(
++    Profile* profile,
++    const std::string& space_id,
++    const std::string& provider_id,
++    std::string* label);
++std::map<std::string, std::string> AccountEnvForKind(
++    Profile* profile,
++    const std::string& space_id,
++    const std::string& kind,
++    std::string* label);
++
++// Space `space_id` uses `account` for its vendor (null: the default).
++void SetSpaceAccount(Profile* profile,
++                     const std::string& space_id,
++                     const std::string& vendor_id,
++                     const Account* account);
++
++// Adding, renaming and taking an account off the list (its folder stays).
++void SaveAccount(Profile* profile,
++                 const std::string& vendor_id,
++                 const base::FilePath& dir,
++                 const std::string& label);
++void HideAccount(Profile* profile,
++                 const std::string& vendor_id,
++                 const base::FilePath& dir);
++
++// For Settings, the space menu and MCP: {vendors: [{id, label, accounts:
++// [{id, label, default, found, spaces: [space ids]}]}], spaces: {space id:
++// {vendor: account id}}, suggestion: {space id: {vendor: account id}},
++// hint: "" | "dismissed" | "applied"}. With `paths`, each account's folder
++// too (Settings only; never MCP).
++base::DictValue AccountsToDict(Profile* profile,
++                               const std::vector<Account>& accounts,
++                               bool paths);
++
++}  // namespace meridian::ai
++
++#endif  // CHROME_BROWSER_MERIDIAN_AI_ACCOUNT_PREFS_H_
+diff --git a/chrome/browser/meridian/ai/accounts.cc b/chrome/browser/meridian/ai/accounts.cc
+new file mode 100644
+index 0000000000..09fb7b3e25
+--- /dev/null
++++ b/chrome/browser/meridian/ai/accounts.cc
+@@ -0,0 +1,461 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/ai/accounts.h"
++
++#include <algorithm>
++#include <set>
++
++#include "base/files/file_enumerator.h"
++#include "base/files/file_util.h"
++#include "base/hash/hash.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_util.h"
++#include "base/strings/stringprintf.h"
++#include "base/strings/utf_string_conversions.h"
++
++namespace meridian::ai {
++
++namespace {
++
++// A space's name and an account's label that go together.
++const std::vector<std::vector<std::string>>& Synonyms() {
++  static const base::NoDestructor<std::vector<std::vector<std::string>>> kSets(
++      std::vector<std::vector<std::string>>{
++          {"work", "job", "office", "company", "corp", "business", "team",
++           "client"},
++          {"personal", "home", "private", "me", "mine", "own", "life",
++           "family", "side"},
++      });
++  return *kSets;
++}
++
++std::string Lower(std::string s) {
++  return base::ToLowerASCII(s);
++}
++
++// Words of a name, lower case ("Work 🏢" -> {"work"}).
++std::set<std::string> Words(const std::string& name) {
++  std::set<std::string> out;
++  std::string word;
++  for (char c : Lower(name) + " ") {
++    if (base::IsAsciiAlphaNumeric(c)) {
++      word += c;
++    } else if (!word.empty()) {
++      out.insert(word);
++      word.clear();
++    }
++  }
++  return out;
++}
++
++// How well a space's name goes with an account's label: 2 = the same word,
++// 1 = words that mean the same, 0 = no.
++int Match(const std::string& space, const std::string& label) {
++  const std::set<std::string> a = Words(space);
++  const std::set<std::string> b = Words(label);
++  for (const std::string& w : a) {
++    if (b.contains(w)) {
++      return 2;
++    }
++  }
++  for (const std::vector<std::string>& set : Synonyms()) {
++    const auto in = [&](const std::set<std::string>& words) {
++      return std::ranges::any_of(words, [&](const std::string& w) {
++        return std::ranges::find(set, w) != set.end();
++      });
++    };
++    if (in(a) && in(b)) {
++      return 1;
++    }
++  }
++  return 0;
++}
++
++bool SameDir(const base::FilePath& a, const base::FilePath& b) {
++  return a.StripTrailingSeparators() == b.StripTrailingSeparators();
++}
++
++// A single-quoted shell word.
++std::string Quote(const std::string& s) {
++  std::string out = "'";
++  for (char c : s) {
++    if (c == '\'') {
++      out += "'\\''";
++    } else {
++      out += c;
++    }
++  }
++  return out + "'";
++}
++
++}  // namespace
++
++const std::vector<AccountVendor>& AccountVendors() {
++  static const base::NoDestructor<std::vector<AccountVendor>> kVendors(
++      std::vector<AccountVendor>{
++          {"claude",
++           "Claude Code",
++           "Claude",
++           "CLAUDE_CONFIG_DIR",
++           ".claude",
++           "",
++           {"settings.json", "projects", ".claude.json", "history.jsonl"},
++           "claude",
++           {"claude-code"},
++           {"claude"}},
++          {"codex",
++           "Codex",
++           "Codex",
++           "CODEX_HOME",
++           ".codex",
++           "",
++           {"config.toml", "sessions", "history.jsonl"},
++           "codex login",
++           {"codex"},
++           {"codex"}},
++          {"copilot",
++           "GitHub Copilot CLI",
++           "Copilot",
++           "COPILOT_HOME",
++           ".copilot",
++           "",
++           {"settings.json", "session-state", "mcp-config.json"},
++           "copilot",
++           {"copilot"},
++           {"copilot"}},
++          {"gemini",
++           "Gemini CLI",
++           "Gemini",
++           "GEMINI_CLI_HOME",
++           "",
++           ".gemini",
++           {"settings.json", "projects.json", "installation_id"},
++           "gemini",
++           {},
++           {"gemini"}},
++      });
++  return *kVendors;
++}
++
++const AccountVendor* FindAccountVendor(std::string_view id) {
++  for (const AccountVendor& v : AccountVendors()) {
++    if (v.id == id) {
++      return &v;
++    }
++  }
++  return nullptr;
++}
++
++const AccountVendor* AccountVendorForProvider(std::string_view provider_id) {
++  for (const AccountVendor& v : AccountVendors()) {
++    if (std::ranges::find(v.providers, provider_id) != v.providers.end()) {
++      return &v;
++    }
++  }
++  return nullptr;
++}
++
++const AccountVendor* AccountVendorForKind(std::string_view kind) {
++  for (const AccountVendor& v : AccountVendors()) {
++    if (std::ranges::find(v.kinds, kind) != v.kinds.end()) {
++      return &v;
++    }
++  }
++  return nullptr;
++}
++
++std::string AccountId(const base::FilePath& dir) {
++  return base::StringPrintf(
++      "%08x", base::PersistentHash(
++                  dir.StripTrailingSeparators().AsUTF8Unsafe()));
++}
++
++namespace {
++
++base::FilePath OwnDir(const AccountVendor& vendor, const base::FilePath& home) {
++  return vendor.base.empty() ? home : home.AppendASCII(vendor.base);
++}
++
++// The vendor's own folder name in a home-style folder (".gemini") or its base
++// (".claude"): what other folders' names start with.
++std::string Stem(const AccountVendor& vendor) {
++  return vendor.base.empty() ? vendor.sub : vendor.base;
++}
++
++}  // namespace
++
++std::string AccountLabelFromDir(const AccountVendor& vendor,
++                                const base::FilePath& home,
++                                const base::FilePath& dir) {
++  if (SameDir(dir, OwnDir(vendor, home))) {
++    return "Default";
++  }
++  std::string name = dir.StripTrailingSeparators().BaseName().AsUTF8Unsafe();
++  const std::string stem = Stem(vendor);
++  if (name.starts_with(stem) && name.size() > stem.size() + 1 &&
++      (name[stem.size()] == '-' || name[stem.size()] == '_' ||
++       name[stem.size()] == '.')) {
++    name = name.substr(stem.size() + 1);
++  } else if (name.starts_with(".")) {
++    name = name.substr(1);
++  }
++  for (char& c : name) {
++    if (c == '-' || c == '_') {
++      c = ' ';
++    }
++  }
++  if (name.empty()) {
++    return "Account";
++  }
++  name[0] = base::ToUpperASCII(name[0]);
++  return name;
++}
++
++base::FilePath DefaultAccountDir(
++    const AccountVendor& vendor,
++    const base::FilePath& home,
++    const std::map<std::string, std::string>& login_env) {
++  if (auto it = login_env.find(vendor.var);
++      it != login_env.end() && !it->second.empty()) {
++    base::FilePath dir = base::FilePath::FromUTF8Unsafe(it->second);
++    if (dir.IsAbsolute()) {
++      return dir;
++    }
++  }
++  return OwnDir(vendor, home);
++}
++
++bool LooksLikeAccountDir(const AccountVendor& vendor,
++                         const base::FilePath& dir) {
++  base::FilePath config =
++      vendor.sub.empty() ? dir : dir.AppendASCII(vendor.sub);
++  if (!base::DirectoryExists(config)) {
++    return false;
++  }
++  return std::ranges::any_of(vendor.markers, [&](const std::string& m) {
++    return base::PathExists(config.AppendASCII(m));
++  });
++}
++
++std::vector<Account> ListAccounts(
++    const base::FilePath& home,
++    const std::map<std::string, std::string>& login_env,
++    const base::DictValue& saved) {
++  // The folders next to the CLIs' own: one look at the home folder's names.
++  std::vector<base::FilePath> siblings;
++  base::FileEnumerator e(home, false, base::FileEnumerator::DIRECTORIES,
++                         FILE_PATH_LITERAL(".*"));
++  for (base::FilePath p = e.Next(); !p.empty(); p = e.Next()) {
++    siblings.push_back(p);
++  }
++  std::vector<Account> out;
++  for (const AccountVendor& vendor : AccountVendors()) {
++    std::vector<Account> list;
++    const base::FilePath default_dir =
++        DefaultAccountDir(vendor, home, login_env);
++    std::set<base::FilePath> hidden;
++    std::map<base::FilePath, std::string> labels;
++    std::vector<base::FilePath> added;
++    if (const base::ListValue* entries = saved.FindList(vendor.id)) {
++      for (const base::Value& entry : *entries) {
++        if (!entry.is_dict()) {
++          continue;
++        }
++        const std::string* dir = entry.GetDict().FindString("dir");
++        if (!dir || dir->empty()) {
++          continue;
++        }
++        base::FilePath path =
++            base::FilePath::FromUTF8Unsafe(*dir).StripTrailingSeparators();
++        if (entry.GetDict().FindBool("hidden").value_or(false)) {
++          hidden.insert(path);
++          continue;
++        }
++        if (const std::string* label = entry.GetDict().FindString("label");
++            label && !label->empty()) {
++          labels[path] = *label;
++        }
++        added.push_back(path);
++      }
++    }
++    auto add = [&](const base::FilePath& raw, bool is_saved) {
++      const base::FilePath dir = raw.StripTrailingSeparators();
++      if (hidden.contains(dir)) {
++        return;
++      }
++      for (Account& a : list) {
++        if (SameDir(a.dir, dir)) {
++          a.saved |= is_saved;
++          return;
++        }
++      }
++      Account a;
++      a.vendor = vendor.id;
++      a.dir = dir;
++      a.id = AccountId(dir);
++      a.is_default = SameDir(dir, default_dir);
++      a.found = LooksLikeAccountDir(vendor, dir);
++      a.saved = is_saved;
++      auto label = labels.find(dir);
++      a.label = label != labels.end()
++                    ? label->second
++                    : AccountLabelFromDir(vendor, home, dir);
++      list.push_back(std::move(a));
++    };
++    if (LooksLikeAccountDir(vendor, default_dir)) {
++      add(default_dir, false);
++    }
++    const std::string stem = Stem(vendor);
++    for (const base::FilePath& p : siblings) {
++      const std::string name = p.BaseName().AsUTF8Unsafe();
++      if (name.size() > stem.size() + 1 && name.starts_with(stem) &&
++          (name[stem.size()] == '-' || name[stem.size()] == '_') &&
++          LooksLikeAccountDir(vendor, p)) {
++        add(p, false);
++      }
++    }
++    if (!SameDir(default_dir, OwnDir(vendor, home)) &&
++        LooksLikeAccountDir(vendor, OwnDir(vendor, home))) {
++      add(OwnDir(vendor, home), false);
++    }
++    for (const base::FilePath& p : added) {
++      add(p, true);
++    }
++    // A default that isn't set up yet still counts once there are others:
++    // it is what runs when a space doesn't say.
++    if (!list.empty() &&
++        std::ranges::none_of(list, [](const Account& a) {
++          return a.is_default;
++        }) &&
++        !hidden.contains(default_dir.StripTrailingSeparators())) {
++      add(default_dir, false);
++    }
++    std::ranges::stable_sort(list, [](const Account& a, const Account& b) {
++      if (a.is_default != b.is_default) {
++        return a.is_default;
++      }
++      return Lower(a.label) < Lower(b.label);
++    });
++    for (Account& a : list) {
++      out.push_back(std::move(a));
++    }
++  }
++  return out;
++}
++
++std::map<std::string, std::string> AccountEnv(const AccountVendor& vendor,
++                                              const base::FilePath& home,
++                                              const base::FilePath& dir) {
++  if (dir.empty()) {
++    return {};
++  }
++  if (SameDir(dir, OwnDir(vendor, home))) {
++    return {{vendor.var, std::string()}};
++  }
++  return {{vendor.var, dir.StripTrailingSeparators().AsUTF8Unsafe()}};
++}
++
++void ApplyAccountEnv(const std::map<std::string, std::string>& changes,
++                     std::map<std::string, std::string>& env) {
++  for (const auto& [name, value] : changes) {
++    if (value.empty()) {
++      env.erase(name);
++    } else {
++      env[name] = value;
++    }
++  }
++}
++
++std::optional<base::FilePath> NewAccountDir(const AccountVendor& vendor,
++                                            const base::FilePath& home,
++                                            const std::string& raw,
++                                            std::string* error) {
++  std::string typed(base::TrimWhitespaceASCII(raw, base::TRIM_ALL));
++  if (typed.empty()) {
++    *error = "Give the account a name, such as Work.";
++    return std::nullopt;
++  }
++  base::FilePath dir;
++  if (typed.starts_with("~/") || typed.starts_with("/")) {
++    dir = typed.starts_with("~/")
++              ? home.AppendUTF8(typed.substr(2))
++              : base::FilePath::FromUTF8Unsafe(typed);
++    if (dir.ReferencesParent()) {
++      *error = "Use a folder without “..” in it.";
++      return std::nullopt;
++    }
++  } else {
++    std::string slug;
++    for (char c : Lower(typed)) {
++      if (base::IsAsciiAlphaNumeric(c)) {
++        slug += c;
++      } else if (!slug.empty() && slug.back() != '-') {
++        slug += '-';
++      }
++    }
++    while (!slug.empty() && slug.back() == '-') {
++      slug.pop_back();
++    }
++    if (slug.empty()) {
++      *error = "Use letters or digits in the name.";
++      return std::nullopt;
++    }
++    dir = home.AppendASCII(Stem(vendor) + "-" + slug);
++  }
++  dir = dir.StripTrailingSeparators();
++  if (!home.IsParent(dir)) {
++    *error = "Keep the account’s folder inside your home folder.";
++    return std::nullopt;
++  }
++  return dir;
++}
++
++base::DictValue SuggestAccounts(
++    const std::vector<Account>& accounts,
++    const std::vector<std::pair<std::string, std::string>>& spaces) {
++  base::DictValue out;
++  for (const AccountVendor& vendor : AccountVendors()) {
++    std::vector<const Account*> mine;
++    for (const Account& a : accounts) {
++      if (a.vendor == vendor.id) {
++        mine.push_back(&a);
++      }
++    }
++    if (mine.size() < 2) {
++      continue;
++    }
++    for (const auto& [space_id, name] : spaces) {
++      const Account* best = nullptr;
++      int score = 0;
++      for (const Account* a : mine) {
++        // "Default" says nothing about work or home.
++        int s = a->label == "Default" ? 0 : Match(name, a->label);
++        if (s > score) {
++          score = s;
++          best = a;
++        }
++      }
++      if (best) {
++        base::DictValue* space = out.EnsureDict(space_id);
++        space->Set(vendor.id, best->id);
++      }
++    }
++  }
++  return out;
++}
++
++std::string AccountLoginCommand(const AccountVendor& vendor,
++                                const base::FilePath& home,
++                                const base::FilePath& dir) {
++  std::map<std::string, std::string> env = AccountEnv(vendor, home, dir);
++  std::string prefix;
++  for (const auto& [name, value] : env) {
++    prefix += value.empty() ? "env -u " + name + " "
++                            : name + "=" + Quote(value) + " ";
++  }
++  return prefix + vendor.login;
++}
++
++}  // namespace meridian::ai
+diff --git a/chrome/browser/meridian/ai/accounts.h b/chrome/browser/meridian/ai/accounts.h
+new file mode 100644
+index 0000000000..3e31568500
+--- /dev/null
++++ b/chrome/browser/meridian/ai/accounts.h
+@@ -0,0 +1,135 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_AI_ACCOUNTS_H_
++#define CHROME_BROWSER_MERIDIAN_AI_ACCOUNTS_H_
++
++#include <map>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/values.h"
++
++namespace meridian::ai {
++
++// AI subscriptions side by side: several accounts of one coding-agent CLI
++// (Claude Code at work and at home, two Codex plans), each a config folder of
++// that CLI. Every one of these CLIs has its own documented switch for it, an
++// environment variable naming the folder it keeps its settings, sign-in and
++// sessions in:
++//  - Claude Code: CLAUDE_CONFIG_DIR (its Keychain entry is keyed to the
++//    folder too).
++//  - Codex: CODEX_HOME.
++//  - GitHub Copilot CLI: COPILOT_HOME.
++//  - Gemini CLI: GEMINI_CLI_HOME (a home: the settings are in its .gemini).
++// Meridian never signs in, and never opens, keeps or passes on a sign-in: it
++// only starts the person's own CLI with that variable, and the CLI's own
++// sign-in runs in a terminal when the person asks for it. A folder is found
++// by the names of files any config folder has (settings.json, sessions/…),
++// never by reading them.
++struct AccountVendor {
++  std::string id;     // "claude"
++  std::string label;  // "Claude Code"
++  std::string short_label;  // "Claude"
++  std::string var;    // "CLAUDE_CONFIG_DIR"
++  // The CLI's own folder under the home folder; "" = the home itself
++  // (Gemini's variable names a home).
++  std::string base;
++  // For a home-style variable: where its settings are inside ("/.gemini").
++  std::string sub;
++  // Names whose existence marks a config folder of this CLI (never opened).
++  std::vector<std::string> markers;
++  // How its own sign-in starts in a terminal.
++  std::string login;
++  // Ask providers (ai/providers.h) and Workbench terminal kinds it runs as.
++  std::vector<std::string> providers;
++  std::vector<std::string> kinds;
++};
++
++const std::vector<AccountVendor>& AccountVendors();
++const AccountVendor* FindAccountVendor(std::string_view id);
++// The vendor whose CLI an Ask provider / a Workbench terminal kind runs, or
++// null.
++const AccountVendor* AccountVendorForProvider(std::string_view provider_id);
++const AccountVendor* AccountVendorForKind(std::string_view kind);
++
++struct Account {
++  std::string vendor;
++  // Stable and opaque (from the folder), for MCP clients and the UI.
++  std::string id;
++  std::string label;
++  base::FilePath dir;
++  // The one the CLI uses when nothing says otherwise.
++  bool is_default = false;
++  // Its folder exists and looks like this CLI's.
++  bool found = false;
++  // Added (or renamed) in Meridian.
++  bool saved = false;
++};
++
++std::string AccountId(const base::FilePath& dir);
++
++// "Work" for ~/.claude-work, "Default" for ~/.claude, else the folder's name.
++std::string AccountLabelFromDir(const AccountVendor& vendor,
++                                const base::FilePath& home,
++                                const base::FilePath& dir);
++
++// The folder the CLI uses by default: its variable in the person's login
++// environment, else its own folder in `home`.
++base::FilePath DefaultAccountDir(
++    const AccountVendor& vendor,
++    const base::FilePath& home,
++    const std::map<std::string, std::string>& login_env);
++
++// Whether `dir` looks like a config folder of the vendor's CLI (by names).
++bool LooksLikeAccountDir(const AccountVendor& vendor,
++                         const base::FilePath& dir);
++
++// Blocking. Every vendor's accounts: the default one, folders next to it
++// named like it (~/.claude-work, ~/.codex_personal), and the ones the person
++// added (`saved`: vendor -> [{dir, label, hidden}]; hidden = taken off the
++// list, the folder stays). Default first, then by label.
++std::vector<Account> ListAccounts(
++    const base::FilePath& home,
++    const std::map<std::string, std::string>& login_env,
++    const base::DictValue& saved);
++
++// What to change in the environment to run the vendor's CLI as `dir`: its
++// variable set to the folder, or, for the CLI's own folder in `home`, taken
++// away (Claude Code keys its Keychain entry by the variable: set to its own
++// default folder, it would look signed out). An empty value = remove.
++std::map<std::string, std::string> AccountEnv(const AccountVendor& vendor,
++                                              const base::FilePath& home,
++                                              const base::FilePath& dir);
++void ApplyAccountEnv(const std::map<std::string, std::string>& changes,
++                     std::map<std::string, std::string>& env);
++
++// The folder for an account the person adds, from what they typed: a name
++// ("Work" -> ~/.claude-work) or a folder (absolute or ~/...) inside the home
++// folder. nullopt and why when it can't be one.
++std::optional<base::FilePath> NewAccountDir(const AccountVendor& vendor,
++                                            const base::FilePath& home,
++                                            const std::string& typed,
++                                            std::string* error);
++
++// A space -> vendor -> account id mapping by names: a space whose name goes
++// with an account's label (Work and "work", Personal and "Home") gets that
++// account. Only vendors with two accounts or more; spaces that match nothing
++// keep the default. `spaces`: {id, name}.
++base::DictValue SuggestAccounts(
++    const std::vector<Account>& accounts,
++    const std::vector<std::pair<std::string, std::string>>& spaces);
++
++// The command that starts the vendor's sign-in as `dir` in a terminal.
++std::string AccountLoginCommand(const AccountVendor& vendor,
++                                const base::FilePath& home,
++                                const base::FilePath& dir);
++
++}  // namespace meridian::ai
++
++#endif  // CHROME_BROWSER_MERIDIAN_AI_ACCOUNTS_H_
+diff --git a/chrome/browser/meridian/ai/accounts_unittest.cc b/chrome/browser/meridian/ai/accounts_unittest.cc
+new file mode 100644
+index 0000000000..a432c925c6
+--- /dev/null
++++ b/chrome/browser/meridian/ai/accounts_unittest.cc
+@@ -0,0 +1,157 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/ai/accounts.h"
++
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace meridian::ai {
++namespace {
++
++class AccountsTest : public testing::Test {
++ protected:
++  void SetUp() override {
++    ASSERT_TRUE(dir_.CreateUniqueTempDir());
++    home_ = base::MakeAbsoluteFilePath(dir_.GetPath());
++  }
++  // A config folder with a file of that name (never read).
++  base::FilePath Make(const std::string& path, const std::string& marker) {
++    base::FilePath p = home_.AppendASCII(path);
++    base::CreateDirectory(p);
++    base::WriteFile(p.AppendASCII(marker), "");
++    return p;
++  }
++  std::vector<Account> Of(const std::vector<Account>& all,
++                          const std::string& vendor) {
++    std::vector<Account> out;
++    for (const Account& a : all) {
++      if (a.vendor == vendor) {
++        out.push_back(a);
++      }
++    }
++    return out;
++  }
++  base::ScopedTempDir dir_;
++  base::FilePath home_;
++};
++
++TEST_F(AccountsTest, FindsDefaultAndSiblingsByNamesOnly) {
++  Make(".claude", "settings.json");
++  Make(".claude-work", "projects");
++  // A folder named like one but without anything Claude Code keeps: no.
++  base::CreateDirectory(home_.AppendASCII(".claude-empty"));
++  Make(".codex", "config.toml");
++  Make(".gemini-home/.gemini", "settings.json");
++  std::vector<Account> all = ListAccounts(home_, {}, base::DictValue());
++  std::vector<Account> claude = Of(all, "claude");
++  ASSERT_EQ(claude.size(), 2u);
++  EXPECT_EQ(claude[0].label, "Default");
++  EXPECT_TRUE(claude[0].is_default);
++  EXPECT_EQ(claude[1].label, "Work");
++  EXPECT_FALSE(claude[1].is_default);
++  EXPECT_EQ(Of(all, "codex").size(), 1u);
++  std::vector<Account> gemini = Of(all, "gemini");
++  // The default (the home itself) has no .gemini: still listed, as what runs
++  // when a space doesn't say.
++  ASSERT_EQ(gemini.size(), 2u);
++  EXPECT_TRUE(gemini[0].is_default);
++  EXPECT_FALSE(gemini[0].found);
++  EXPECT_EQ(gemini[1].label, "Home");
++}
++
++TEST_F(AccountsTest, LoginEnvironmentNamesTheDefault) {
++  Make(".claude", "settings.json");
++  base::FilePath personal = Make(".claude-personal", "settings.json");
++  std::vector<Account> claude = Of(
++      ListAccounts(home_, {{"CLAUDE_CONFIG_DIR", personal.AsUTF8Unsafe()}},
++                   base::DictValue()),
++      "claude");
++  ASSERT_EQ(claude.size(), 2u);
++  EXPECT_EQ(claude[0].label, "Personal");
++  EXPECT_TRUE(claude[0].is_default);
++  EXPECT_EQ(claude[1].label, "Default");
++}
++
++TEST_F(AccountsTest, SavedLabelsAddedAndHidden) {
++  Make(".claude", "settings.json");
++  base::FilePath work = Make(".claude-work", "settings.json");
++  base::FilePath client = home_.AppendASCII("acme/claude");
++  base::DictValue saved;
++  base::ListValue list;
++  list.Append(base::DictValue()
++                  .Set("dir", work.AsUTF8Unsafe())
++                  .Set("hidden", true));
++  list.Append(base::DictValue()
++                  .Set("dir", client.AsUTF8Unsafe())
++                  .Set("label", "Acme"));
++  saved.Set("claude", std::move(list));
++  std::vector<Account> claude =
++      Of(ListAccounts(home_, {}, saved), "claude");
++  ASSERT_EQ(claude.size(), 2u);
++  EXPECT_EQ(claude[1].label, "Acme");
++  EXPECT_TRUE(claude[1].saved);
++  EXPECT_FALSE(claude[1].found);
++  EXPECT_EQ(claude[1].id, AccountId(client));
++}
++
++TEST_F(AccountsTest, EnvSetsTheVariableOrTakesItAway) {
++  const AccountVendor& claude = *FindAccountVendor("claude");
++  auto env = AccountEnv(claude, home_, home_.AppendASCII(".claude-work"));
++  EXPECT_EQ(env["CLAUDE_CONFIG_DIR"],
++            home_.AppendASCII(".claude-work").AsUTF8Unsafe());
++  // Its own folder: the variable goes (the Keychain entry is keyed by it).
++  env = AccountEnv(claude, home_, home_.AppendASCII(".claude"));
++  ASSERT_TRUE(env.contains("CLAUDE_CONFIG_DIR"));
++  std::map<std::string, std::string> run = {{"CLAUDE_CONFIG_DIR", "/x"},
++                                            {"PATH", "/bin"}};
++  ApplyAccountEnv(env, run);
++  EXPECT_FALSE(run.contains("CLAUDE_CONFIG_DIR"));
++  EXPECT_EQ(run["PATH"], "/bin");
++  const AccountVendor& gemini = *FindAccountVendor("gemini");
++  env = AccountEnv(gemini, home_, home_.AppendASCII(".gemini-work"));
++  EXPECT_EQ(env["GEMINI_CLI_HOME"],
++            home_.AppendASCII(".gemini-work").AsUTF8Unsafe());
++  EXPECT_EQ(AccountLoginCommand(claude, home_,
++                                base::FilePath("/Users/me/.claude-o'k")),
++            "CLAUDE_CONFIG_DIR='/Users/me/.claude-o'\\''k' claude");
++  EXPECT_EQ(AccountLoginCommand(claude, home_, home_.AppendASCII(".claude")),
++            "env -u CLAUDE_CONFIG_DIR claude");
++}
++
++TEST_F(AccountsTest, NewAccountDirFromANameOrAFolder) {
++  const AccountVendor& codex = *FindAccountVendor("codex");
++  std::string error;
++  EXPECT_EQ(NewAccountDir(codex, home_, " My Work ", &error),
++            home_.AppendASCII(".codex-my-work"));
++  EXPECT_EQ(NewAccountDir(codex, home_, "~/plans/codex/", &error),
++            home_.AppendASCII("plans/codex"));
++  EXPECT_FALSE(NewAccountDir(codex, home_, "/etc/codex", &error));
++  EXPECT_FALSE(NewAccountDir(codex, home_, "~/../x", &error));
++  EXPECT_FALSE(NewAccountDir(codex, home_, "", &error));
++  EXPECT_FALSE(NewAccountDir(codex, home_, "!!!", &error));
++}
++
++TEST_F(AccountsTest, SuggestsBySpaceNames) {
++  Make(".claude", "settings.json");
++  Make(".claude-work", "settings.json");
++  Make(".claude-personal", "settings.json");
++  Make(".codex", "config.toml");
++  std::vector<Account> all = ListAccounts(home_, {}, base::DictValue());
++  base::DictValue s = SuggestAccounts(
++      all, {{"s1", "Work"}, {"s2", "Home 🏠"}, {"s3", "Reading"}});
++  ASSERT_TRUE(s.FindDict("s1"));
++  EXPECT_EQ(*s.FindDict("s1")->FindString("claude"),
++            AccountId(home_.AppendASCII(".claude-work")));
++  ASSERT_TRUE(s.FindDict("s2"));
++  EXPECT_EQ(*s.FindDict("s2")->FindString("claude"),
++            AccountId(home_.AppendASCII(".claude-personal")));
++  EXPECT_FALSE(s.FindDict("s3"));
++  // One Codex account: nothing to choose.
++  EXPECT_FALSE(s.FindDict("s1")->FindString("codex"));
++}
++
++}  // namespace
++}  // namespace meridian::ai
+diff --git a/chrome/browser/meridian/ai/ai_service.cc b/chrome/browser/meridian/ai/ai_service.cc
+index 9718704998..a8f54bccf0 100644
+--- a/chrome/browser/meridian/ai/ai_service.cc
++++ b/chrome/browser/meridian/ai/ai_service.cc
+@@ -21,6 +21,7 @@
+ #include "chrome/browser/meridian/agent/agent_service.h"
+ #include "chrome/browser/meridian/agent/agent_service_factory.h"
+ #include "chrome/browser/meridian/ai/chats.h"
++#include "chrome/browser/meridian/ai/account_prefs.h"
+ #include "chrome/browser/meridian/ai/local_agents.h"
+ #include "chrome/browser/meridian/ai/providers.h"
+ #include "chrome/browser/meridian/ai/page_fetcher.h"
+@@ -1205,6 +1206,8 @@ void AiService::LocalChat(const std::string& id,
+   turn.prompt += request.text;
+   turn.system = request.system.empty() ? TextOnlySystem(request.mode)
+                                        : request.system;
++  turn.account_env =
++      ai::AccountEnvForProvider(profile_, request.space_id, provider, nullptr);
+   local_->Chat(
+       id, provider, std::move(turn),
+       base::BindRepeating(
+diff --git a/chrome/browser/meridian/ai/ai_service.h b/chrome/browser/meridian/ai/ai_service.h
+index b7c6776fce..b18d69f6de 100644
+--- a/chrome/browser/meridian/ai/ai_service.h
++++ b/chrome/browser/meridian/ai/ai_service.h
+@@ -65,6 +65,8 @@ class AiService : public KeyedService {
+     std::string provider;
+     // In place of the assistant's own instructions (a boost, not a chat).
+     std::string system;
++    // The space it's asked from: its AI accounts (ai/account_prefs.h).
++    std::string space_id;
+   };
+ 
+   explicit AiService(Profile* profile);
+diff --git a/chrome/browser/meridian/ai/local_agents.cc b/chrome/browser/meridian/ai/local_agents.cc
+index 0ed7d29fc5..c0dafffb70 100644
+--- a/chrome/browser/meridian/ai/local_agents.cc
++++ b/chrome/browser/meridian/ai/local_agents.cc
+@@ -26,6 +26,7 @@
+ #include "base/task/thread_pool.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
++#include "chrome/browser/meridian/ai/accounts.h"
+ #include "chrome/browser/meridian/ai/process_runner.h"
+ #include "chrome/browser/meridian/prefs.h"
+ #include "chrome/browser/meridian/private_file.h"
+@@ -225,6 +226,10 @@ std::vector<base::FilePath> CliOwnFolders(
+       id == "codex" && it != env.end() && !it->second.empty()) {
+     out.push_back(base::FilePath::FromUTF8Unsafe(it->second));
+   }
++  if (auto it = env.find("COPILOT_HOME");
++      id == "copilot" && it != env.end() && !it->second.empty()) {
++    out.push_back(base::FilePath::FromUTF8Unsafe(it->second));
++  }
+   return out;
+ }
+ 
+@@ -407,6 +412,8 @@ CliOutcome RunCliBlocking(std::string provider_id,
+   if (!test_home.empty()) {
+     env["HOME"] = test_home.AsUTF8Unsafe();
+   }
++  // The space's account: the CLI's own variable naming its config folder.
++  ApplyAccountEnv(turn.account_env, env);
+   std::vector<base::FilePath> protected_paths = SensitivePaths(home);
+   base::FilePath user_data;
+   if (base::PathService::Get(chrome::DIR_USER_DATA, &user_data)) {
+diff --git a/chrome/browser/meridian/ai/providers.h b/chrome/browser/meridian/ai/providers.h
+index cbdd2e4827..8776353445 100644
+--- a/chrome/browser/meridian/ai/providers.h
++++ b/chrome/browser/meridian/ai/providers.h
+@@ -91,6 +91,9 @@ struct Turn {
+   // would otherwise join a background service started without this run's
+   // config and permissions.
+   bool private_server = false;
++  // The space's account of this CLI (ai/accounts.h ApplyAccountEnv: an empty
++  // value takes the variable away).
++  std::map<std::string, std::string> account_env;
+ };
+ 
+ // From the output of `opencode run --help`: whether this OpenCode needs
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index d2489350a4..729a92cea5 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -56,6 +56,9 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+     }
+   }
+   registry->RegisterListPref(kWorkbenchSecretOptOuts);
++  registry->RegisterDictionaryPref(kAiAccounts);
++  registry->RegisterDictionaryPref(kAiSpaceAccounts);
++  registry->RegisterStringPref(kAiAccountsHint, std::string());
+ }
+ 
+ }  // namespace meridian::prefs
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index 480cea35e0..4444fed57d 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -102,6 +102,16 @@ inline constexpr char kExplainedSystemAsks[] = "meridian.explained_system_asks";
+ inline constexpr char kWorkbenchSecretOptOuts[] =
+     "meridian.workbench_secret_optouts";
+ 
++// AI subscriptions side by side (ai/account_prefs.h): the accounts the person
++// added, renamed or took off the list, per vendor: [{dir, label, hidden}].
++inline constexpr char kAiAccounts[] = "meridian.ai_accounts";
++// Which account each space runs each AI tool as: space id -> vendor ->
++// {id, dir}; missing = that tool's default.
++inline constexpr char kAiSpaceAccounts[] = "meridian.ai_space_accounts";
++// The "different subscriptions in different spaces?" card: "" (offered),
++// "dismissed" or "applied".
++inline constexpr char kAiAccountsHint[] = "meridian.ai_accounts_hint";
++
+ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
+ 
+ }  // namespace meridian::prefs
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 1f8dcd8ee5..87dbd1894f 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -984,6 +984,26 @@ interface SidebarHandler {
+   // URL from now on (its first items right away); an empty URL stops it.
+   // `error` says why not ("" when it worked).
+   SetFolderLive(string item_id, url.mojom.Url url) => (string error);
++
++  // AI subscriptions side by side (ai/account_prefs.h): accounts of the
++  // coding-agent CLIs and which one each space uses, as JSON
++  // (AccountsToDict, with folders).
++  GetAiAccounts() => (string json);
++  // "Add account…": a name ("Work" -> ~/.claude-work) or a folder inside the
++  // home folder (made if missing). `error` says why not ("" when added).
++  AddAiAccount(string vendor, string typed) => (string id, string error);
++  // A new name for an account; taking one off the list (the folder stays,
++  // spaces that used it go back to the default).
++  RenameAiAccount(string vendor, string id, string label) => ();
++  RemoveAiAccount(string vendor, string id) => ();
++  // What space `space_id` runs the vendor's CLI as; "" = its default.
++  SetSpaceAiAccount(string space_id, string vendor, string account_id) => ();
++  // The CLI's own sign-in in a terminal, as that account (Meridian never
++  // sees it).
++  SignInAiAccount(string vendor, string id) => (bool ok, string error);
++  // "Different subscriptions in different spaces?": "apply" (the
++  // suggestion) or "dismiss".
++  AnswerAiAccountsHint(string answer) => ();
+ };
+ 
+ // A secret file agents may read without asking in one project.
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 264492b5bf..355070b591 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -57,6 +57,8 @@
+ #include "chrome/browser/search_engines/template_url_service_factory.h"
+ #include "components/search_engines/template_url.h"
+ #include "components/search_engines/template_url_service.h"
++#include "chrome/browser/meridian/ai/account_prefs.h"
++#include "chrome/browser/meridian/ai/accounts.h"
+ #include "chrome/browser/meridian/ai/chats.h"
+ #include "chrome/browser/meridian/ai/local_agents.h"
+ #include "chrome/browser/meridian/ai/process_runner.h"
+@@ -1566,6 +1568,7 @@ void SidebarHandler::AiChatWith(const std::string& session_id,
+   request.mode = mode == "ask" ? "ask" : "chat";
+   request.use_tools = true;
+   request.provider = provider;
++  request.space_id = service_->active_space_id();
+   content::WebContents* contents = model()->GetActiveWebContents();
+   GURL url = contents ? contents->GetLastCommittedURL() : GURL();
+   if (!with_page || !contents || !url.SchemeIsHTTPOrHTTPS()) {
+@@ -4486,4 +4489,247 @@ void SidebarHandler::TestFloatingWindowShot(
+   }
+ }
+ 
++// ------------------------------------------------------------- AI accounts
++
++namespace {
++
++// The account `id` of `vendor` in `list`, or null.
++const ai::Account* FindAccount(const std::vector<ai::Account>& list,
++                               const std::string& vendor,
++                               const std::string& id) {
++  for (const ai::Account& a : list) {
++    if (a.vendor == vendor && a.id == id) {
++      return &a;
++    }
++  }
++  return nullptr;
++}
++
++}  // namespace
++
++void SidebarHandler::GetAiAccounts(GetAiAccountsCallback callback) {
++  Profile* profile = browser_->GetProfile();
++  ai::ListAccountsAsync(
++      profile, base::BindOnce(
++                   [](base::WeakPtr<SidebarHandler> self,
++                      GetAiAccountsCallback callback,
++                      std::vector<ai::Account> list) {
++                     if (!self) {
++                       return;
++                     }
++                     std::move(callback).Run(
++                         base::WriteJson(ai::AccountsToDict(
++                                             self->browser_->GetProfile(),
++                                             list, /*paths=*/true))
++                             .value_or("{}"));
++                   },
++                   weak_factory_.GetWeakPtr(), std::move(callback)));
++}
++
++void SidebarHandler::AddAiAccount(const std::string& vendor_id,
++                                  const std::string& typed,
++                                  AddAiAccountCallback callback) {
++  const ai::AccountVendor* vendor = ai::FindAccountVendor(vendor_id);
++  if (!vendor) {
++    std::move(callback).Run("", "Unknown AI.");
++    return;
++  }
++  std::string error;
++  std::optional<base::FilePath> dir =
++      ai::NewAccountDir(*vendor, ai::AccountsHome(), typed, &error);
++  if (!dir) {
++    std::move(callback).Run("", error);
++    return;
++  }
++  // A name typed becomes the label; a folder gets one from its name.
++  std::string label(base::TrimWhitespaceASCII(typed, base::TRIM_ALL));
++  if (label.starts_with("/") || label.starts_with("~")) {
++    label.clear();
++  }
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock()},
++      base::BindOnce(
++          [](base::FilePath dir) {
++            // The CLI fills it at its first sign-in; private like its own.
++            if (base::DirectoryExists(dir)) {
++              return true;
++            }
++            return base::CreateDirectory(dir) &&
++                   base::SetPosixFilePermissions(dir, 0700);
++          },
++          *dir),
++      base::BindOnce(
++          [](base::WeakPtr<SidebarHandler> self, std::string vendor,
++             base::FilePath dir, std::string label,
++             AddAiAccountCallback callback, bool ok) {
++            if (!self || !ok) {
++              std::move(callback).Run("", "Couldn’t make the folder " +
++                                              dir.AsUTF8Unsafe() + ".");
++              return;
++            }
++            ai::SaveAccount(self->browser_->GetProfile(), vendor, dir, label);
++            std::move(callback).Run(ai::AccountId(dir), "");
++          },
++          weak_factory_.GetWeakPtr(), vendor_id, *dir, label,
++          std::move(callback)));
++}
++
++void SidebarHandler::RenameAiAccount(const std::string& vendor,
++                                     const std::string& id,
++                                     const std::string& raw,
++                                     RenameAiAccountCallback callback) {
++  std::string label(base::TrimWhitespaceASCII(raw, base::TRIM_ALL));
++  if (label.size() > 40) {
++    label.resize(40);
++  }
++  ai::ListAccountsAsync(
++      browser_->GetProfile(),
++      base::BindOnce(
++          [](base::WeakPtr<SidebarHandler> self, std::string vendor,
++             std::string id, std::string label,
++             RenameAiAccountCallback callback, std::vector<ai::Account> list) {
++            if (self && !label.empty()) {
++              if (const ai::Account* a = FindAccount(list, vendor, id)) {
++                ai::SaveAccount(self->browser_->GetProfile(), vendor, a->dir,
++                                label);
++              }
++            }
++            std::move(callback).Run();
++          },
++          weak_factory_.GetWeakPtr(), vendor, id, label, std::move(callback)));
++}
++
++void SidebarHandler::RemoveAiAccount(const std::string& vendor,
++                                     const std::string& id,
++                                     RemoveAiAccountCallback callback) {
++  ai::ListAccountsAsync(
++      browser_->GetProfile(),
++      base::BindOnce(
++          [](base::WeakPtr<SidebarHandler> self, std::string vendor,
++             std::string id, RemoveAiAccountCallback callback,
++             std::vector<ai::Account> list) {
++            if (self) {
++              if (const ai::Account* a = FindAccount(list, vendor, id)) {
++                ai::HideAccount(self->browser_->GetProfile(), vendor, a->dir);
++              }
++            }
++            std::move(callback).Run();
++          },
++          weak_factory_.GetWeakPtr(), vendor, id, std::move(callback)));
++}
++
++void SidebarHandler::SetSpaceAiAccount(const std::string& space_id,
++                                       const std::string& vendor,
++                                       const std::string& account_id,
++                                       SetSpaceAiAccountCallback callback) {
++  if (!service_->FindSpace(space_id) || !ai::FindAccountVendor(vendor)) {
++    std::move(callback).Run();
++    return;
++  }
++  ai::ListAccountsAsync(
++      browser_->GetProfile(),
++      base::BindOnce(
++          [](base::WeakPtr<SidebarHandler> self, std::string space_id,
++             std::string vendor, std::string account_id,
++             SetSpaceAiAccountCallback callback,
++             std::vector<ai::Account> list) {
++            if (self) {
++              const ai::Account* a = FindAccount(list, vendor, account_id);
++              if (a || account_id.empty()) {
++                ai::SetSpaceAccount(self->browser_->GetProfile(), space_id,
++                                    vendor, a);
++              }
++            }
++            std::move(callback).Run();
++          },
++          weak_factory_.GetWeakPtr(), space_id, vendor, account_id,
++          std::move(callback)));
++}
++
++void SidebarHandler::SignInAiAccount(const std::string& vendor_id,
++                                     const std::string& id,
++                                     SignInAiAccountCallback callback) {
++  ai::ListAccountsAsync(
++      browser_->GetProfile(),
++      base::BindOnce(
++          [](std::string vendor_id, std::string id,
++             SignInAiAccountCallback callback, std::vector<ai::Account> list) {
++            const ai::AccountVendor* vendor =
++                ai::FindAccountVendor(vendor_id);
++            const ai::Account* a = FindAccount(list, vendor_id, id);
++            if (!vendor || !a) {
++              std::move(callback).Run(false, "That account isn’t listed.");
++              return;
++            }
++            const std::string command =
++                ai::AccountLoginCommand(*vendor, ai::AccountsHome(), a->dir);
++            const std::string title =
++                "Sign in to " + vendor->short_label + " (" + a->label + ")";
++            // Tests: what would run, written down (no Terminal window).
++            base::FilePath log = TestSwitchPath("meridian-test-signin-log");
++            base::ThreadPool::PostTaskAndReplyWithResult(
++                FROM_HERE, {base::MayBlock()},
++                base::BindOnce(
++                    [](std::string command, std::string title,
++                       base::FilePath log) {
++                      if (!log.empty()) {
++                        return base::AppendToFile(log, command + "\n");
++                      }
++                      return OpenInTerminal(command, title);
++                    },
++                    command, title, log),
++                base::BindOnce(
++                    [](SignInAiAccountCallback callback, bool ok) {
++                      std::move(callback).Run(
++                          ok, ok ? "" : "Couldn’t open Terminal.");
++                    },
++                    std::move(callback)));
++          },
++          vendor_id, id, std::move(callback)));
++}
++
++void SidebarHandler::AnswerAiAccountsHint(
++    const std::string& answer,
++    AnswerAiAccountsHintCallback callback) {
++  Profile* main = MainProfileFor(browser_->GetProfile());
++  PrefService* prefs = (main ? main : browser_->GetProfile())->GetPrefs();
++  if (answer == "dismiss") {
++    prefs->SetString(prefs::kAiAccountsHint, "dismissed");
++    std::move(callback).Run();
++    return;
++  }
++  if (answer != "apply") {
++    std::move(callback).Run();
++    return;
++  }
++  ai::ListAccountsAsync(
++      browser_->GetProfile(),
++      base::BindOnce(
++          [](base::WeakPtr<SidebarHandler> self,
++             AnswerAiAccountsHintCallback callback,
++             std::vector<ai::Account> list) {
++            if (self) {
++              Profile* profile = self->browser_->GetProfile();
++              base::DictValue all =
++                  ai::AccountsToDict(profile, list, /*paths=*/false);
++              if (const base::DictValue* s = all.FindDict("suggestion")) {
++                for (auto [space_id, per] : *s) {
++                  for (auto [vendor, id] : per.GetDict()) {
++                    if (const ai::Account* a =
++                            FindAccount(list, vendor, id.GetString())) {
++                      ai::SetSpaceAccount(profile, space_id, vendor, a);
++                    }
++                  }
++                }
++              }
++              Profile* main = MainProfileFor(profile);
++              (main ? main : profile)
++                  ->GetPrefs()
++                  ->SetString(prefs::kAiAccountsHint, "applied");
++            }
++            std::move(callback).Run();
++          },
++          weak_factory_.GetWeakPtr(), std::move(callback)));
++}
++
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index f1f172c097..ad69f6b774 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -330,6 +330,26 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void SetFolderLive(const std::string& item_id,
+                      const GURL& url,
+                      SetFolderLiveCallback callback) override;
++  void GetAiAccounts(GetAiAccountsCallback callback) override;
++  void AddAiAccount(const std::string& vendor,
++                    const std::string& typed,
++                    AddAiAccountCallback callback) override;
++  void RenameAiAccount(const std::string& vendor,
++                       const std::string& id,
++                       const std::string& label,
++                       RenameAiAccountCallback callback) override;
++  void RemoveAiAccount(const std::string& vendor,
++                       const std::string& id,
++                       RemoveAiAccountCallback callback) override;
++  void SetSpaceAiAccount(const std::string& space_id,
++                         const std::string& vendor,
++                         const std::string& account_id,
++                         SetSpaceAiAccountCallback callback) override;
++  void SignInAiAccount(const std::string& vendor,
++                       const std::string& id,
++                       SignInAiAccountCallback callback) override;
++  void AnswerAiAccountsHint(const std::string& answer,
++                            AnswerAiAccountsHintCallback callback) override;
+   void ShareTabInstead(const tabs_api::NodeId& tab_id) override;
+   void CanShareTabInstead(const tabs_api::NodeId& tab_id,
+                           CanShareTabInsteadCallback callback) override;
+diff --git a/chrome/browser/meridian/workbench/agent_insights.cc b/chrome/browser/meridian/workbench/agent_insights.cc
+index a6d3de0f65..21816fcade 100644
+--- a/chrome/browser/meridian/workbench/agent_insights.cc
++++ b/chrome/browser/meridian/workbench/agent_insights.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/meridian/workbench/agent_insights.h"
+ 
++#include <map>
++
+ #include <algorithm>
+ #include <memory>
+ #include <vector>
+@@ -119,10 +121,17 @@ bool SameDir(const base::FilePath& a, const std::string& b) {
+ }
+ 
+ // An agent's own folder: its variable, else the default under home.
++// The terminal's AI account (`account_env`) comes first.
++using AccountEnv = std::map<std::string, std::string>;
+ base::FilePath AgentDir(const base::FilePath& home,
+                         bool hermetic,
+                         base::cstring_view var,
+-                        const char* fallback) {
++                        const char* fallback,
++                        const AccountEnv& account_env = {}) {
++  if (auto it = account_env.find(std::string(var)); it != account_env.end()) {
++    return it->second.empty() ? home.AppendASCII(fallback)
++                              : base::FilePath::FromUTF8Unsafe(it->second);
++  }
+   if (!hermetic) {
+     std::optional<std::string> v = base::Environment::Create()->GetVar(var);
+     if (v && !v->empty()) {
+@@ -151,9 +160,11 @@ std::vector<base::FilePath> RecentFiles(
+ std::vector<Candidate> Codex(const base::FilePath& home,
+                              bool hermetic,
+                              const base::FilePath& root,
+-                             base::Time since) {
++                             base::Time since,
++                             const AccountEnv& account_env) {
+   const base::FilePath sessions =
+-      AgentDir(home, hermetic, "CODEX_HOME", ".codex").AppendASCII("sessions");
++      AgentDir(home, hermetic, "CODEX_HOME", ".codex", account_env)
++          .AppendASCII("sessions");
+   // The day folders (local dates) from the day before the terminal started.
+   const base::Time now = base::Time::Now();
+   base::Time from = since.is_null() ? now - base::Days(7) : since - base::Days(1);
+@@ -287,9 +298,10 @@ std::vector<Candidate> Gemini(const base::FilePath& home,
+ std::vector<Candidate> Copilot(const base::FilePath& home,
+                                bool hermetic,
+                                const base::FilePath& root,
+-                               base::Time since) {
++                               base::Time since,
++                               const AccountEnv& account_env) {
+   const base::FilePath state =
+-      AgentDir(home, hermetic, "COPILOT_HOME", ".copilot")
++      AgentDir(home, hermetic, "COPILOT_HOME", ".copilot", account_env)
+           .AppendASCII("session-state");
+   std::vector<Candidate> out;
+   base::FileEnumerator e(state, false, base::FileEnumerator::DIRECTORIES);
+@@ -411,21 +423,28 @@ std::optional<AgentSession> FindAgentSession(AgentFormat format,
+                                              bool hermetic,
+                                              const base::FilePath& root,
+                                              base::Time since,
+-                                             base::Time until) {
++                                             base::Time until,
++                                             const AccountEnv& account_env) {
+   std::vector<Candidate> all;
+   base::FilePath models;
+   switch (format) {
+     case AgentFormat::kCodex:
+-      all = Codex(home, hermetic, root, since);
++      all = Codex(home, hermetic, root, since, account_env);
+       break;
+     case AgentFormat::kQwen:
+       all = Qwen(home, root, since);
+       break;
+-    case AgentFormat::kGemini:
+-      all = Gemini(home, root, since);
++    case AgentFormat::kGemini: {
++      // GEMINI_CLI_HOME names a home (its .gemini is inside).
++      auto it = account_env.find("GEMINI_CLI_HOME");
++      all = Gemini(it != account_env.end() && !it->second.empty()
++                       ? base::FilePath::FromUTF8Unsafe(it->second)
++                       : home,
++                   root, since);
+       break;
++    }
+     case AgentFormat::kCopilot:
+-      all = Copilot(home, hermetic, root, since);
++      all = Copilot(home, hermetic, root, since, account_env);
+       break;
+     case AgentFormat::kOpenCode: {
+       const base::FilePath data =
+diff --git a/chrome/browser/meridian/workbench/agent_insights.h b/chrome/browser/meridian/workbench/agent_insights.h
+index ff31e6b389..6c54107da8 100644
+--- a/chrome/browser/meridian/workbench/agent_insights.h
++++ b/chrome/browser/meridian/workbench/agent_insights.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_MERIDIAN_WORKBENCH_AGENT_INSIGHTS_H_
+ #define CHROME_BROWSER_MERIDIAN_WORKBENCH_AGENT_INSIGHTS_H_
+ 
++#include <map>
+ #include <optional>
+ #include <string>
+ #include <string_view>
+@@ -38,13 +39,17 @@ std::string InsightsUnavailableReason(std::string_view kind);
+ // agent in that project started at `until` (null: none): the newest session
+ // that began in between, else (a resumed one) the newest one written to since
+ // then. `home`: the person's home; the agents' own variables (CODEX_HOME,
+-// COPILOT_HOME, XDG_*) count unless `hermetic` (tests).
+-std::optional<AgentSession> FindAgentSession(AgentFormat format,
+-                                             const base::FilePath& home,
+-                                             bool hermetic,
+-                                             const base::FilePath& root,
+-                                             base::Time since,
+-                                             base::Time until);
++// COPILOT_HOME, XDG_*) count unless `hermetic` (tests). `account_env`: the
++// variables the terminal's AI account set (CODEX_HOME…; an empty value took
++// one away), which count before all of those, also in tests.
++std::optional<AgentSession> FindAgentSession(
++    AgentFormat format,
++    const base::FilePath& home,
++    bool hermetic,
++    const base::FilePath& root,
++    base::Time since,
++    base::Time until,
++    const std::map<std::string, std::string>& account_env = {});
+ 
+ }  // namespace meridian::workbench
+ 
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 14b5aaf1eb..f3a808201c 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -22,6 +22,8 @@
+ #include "base/task/bind_post_task.h"
+ #include "base/task/thread_pool.h"
+ #include "base/uuid.h"
++#include "chrome/browser/meridian/ai/account_prefs.h"
++#include "chrome/browser/meridian/ai/accounts.h"
+ #include "chrome/browser/meridian/ai/process_runner.h"
+ #include "chrome/browser/meridian/ai/tidy.h"
+ #include "chrome/browser/meridian/mission/mission_control_factory.h"
+@@ -30,7 +32,10 @@
+ #include "chrome/browser/meridian/private_file.h"
+ #include "chrome/browser/meridian/real_path.h"
+ #include "chrome/browser/meridian/sidebar_handler.h"
++#include "chrome/browser/meridian/sidebar_service.h"
++#include "chrome/browser/meridian/sidebar_service_factory.h"
+ #include "chrome/browser/meridian/space_profiles.h"
++#include "chrome/browser/meridian/tab_data.h"
+ #include "chrome/browser/meridian/test_switches.h"
+ #include "chrome/browser/meridian/workbench/agents.h"
+ #include "chrome/browser/meridian/ai/ai_service.h"
+@@ -2632,6 +2637,18 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+       bridge.codex_notify = mission->CodexNotifyArg();
+     }
+   }
++  // The space's AI account: the agent's own config-folder variable (a shell
++  // gets every agent's, for what's started in it).
++  std::string account;
++  std::map<std::string, std::string> account_env;
++  if (kind == "shell" || ai::AccountVendorForKind(kind)) {
++    const TabData* data = TabData::Get(web_ui()->GetWebContents());
++    std::string space = data && !data->space_id().empty()
++                            ? data->space_id()
++                            : SidebarServiceFactory::GetForProfile(profile_)
++                                  ->active_space_id();
++    account_env = ai::AccountEnvForKind(profile_, space, kind, &account);
++  }
+   files_->PostTaskAndReplyWithResult(
+       FROM_HERE,
+       base::BindOnce(
+@@ -2701,7 +2718,9 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+              int rows, mission::MissionControl::Registration registration,
+              std::map<std::string, std::string> secrets,
+              std::vector<std::string> secret_names, std::string guard_token,
+-             std::string mission_kind, bool in_shell, Reply reply,
++             std::string mission_kind, bool in_shell,
++             std::map<std::string, std::string> account_env,
++             std::string account, Reply reply,
+              std::pair<base::expected<LaunchSpec, std::string>,
+                        std::map<std::string, std::string>> made) {
+             mission::MissionControl* mission =
+@@ -2732,6 +2751,7 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+             for (const auto& [name, value] : secrets) {
+               env[name] = value;
+             }
++            ai::ApplyAccountEnv(account_env, env);
+             std::string id = "t" + base::NumberToString(++self->term_seq_);
+             Terminal::Spec run;
+             run.argv = spec->argv;
+@@ -2766,6 +2786,8 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+             term.secrets = secret_names;
+             term.mission_kind = mission_kind;
+             term.in_shell = in_shell;
++            term.account = account;
++            term.account_env = account_env;
+             if (mission && !registration.node_id.empty()) {
+               mission->AttachTerminal(registration.node_id, id);
+             }
+@@ -2784,7 +2806,8 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+           weak_factory_.GetWeakPtr(), kind, cols, rows,
+           std::move(registration), std::move(secrets), std::move(secret_names),
+           guard_token, shell_claude ? std::string("claude") : kind,
+-          shell_claude, std::move(reply)));
++          shell_claude, std::move(account_env), std::move(account),
++          std::move(reply)));
+ }
+ 
+ void WorkbenchHandler::AgentInsights(const std::string& term_id,
+@@ -2794,7 +2817,8 @@ void WorkbenchHandler::AgentInsights(const std::string& term_id,
+   // The next terminal of the same agent in this project took over from then.
+   base::Time until;
+   for (const auto& [id, other] : terms_) {
+-    if (id != term_id && other.kind == term.kind && !other.started.is_null() &&
++    if (id != term_id && other.kind == term.kind &&
++        other.account_env == term.account_env && !other.started.is_null() &&
+         other.started > term.started &&
+         (until.is_null() || other.started < until)) {
+       until = other.started;
+@@ -2828,9 +2852,10 @@ void WorkbenchHandler::AgentInsights(const std::string& term_id,
+       base::BindOnce(
+           [](std::unique_ptr<AgentReader> state, AgentFormat format,
+              base::FilePath home, bool hermetic, base::FilePath root,
+-             base::Time since, base::Time until, std::string label) -> Done {
+-            std::optional<AgentSession> session =
+-                FindAgentSession(format, home, hermetic, root, since, until);
++             base::Time since, base::Time until, std::string label,
++             std::map<std::string, std::string> account_env) -> Done {
++            std::optional<AgentSession> session = FindAgentSession(
++                format, home, hermetic, root, since, until, account_env);
+             if (!session) {
+               return {std::move(state),
+                       base::unexpected("No session data yet: it comes with " +
+@@ -2852,7 +2877,7 @@ void WorkbenchHandler::AgentInsights(const std::string& term_id,
+             return {std::move(state), base::Value(std::move(result))};
+           },
+           std::move(state), format, home, hermetic, project_->root(),
+-          term.started, until, label),
++          term.started, until, label, term.account_env),
+       base::BindOnce(
+           [](base::WeakPtr<WorkbenchHandler> self, std::string term_id,
+              Reply reply, Done done) {
+@@ -2885,7 +2910,8 @@ base::DictValue WorkbenchHandler::TermInfo(const std::string& id,
+       .Set("missionNode", term.mission_node.empty()
+                               ? base::Value()
+                               : base::Value(term.mission_node))
+-      .Set("meta", term.meta.Clone());
++      .Set("meta", term.meta.Clone())
++      .Set("account", term.account);
+ }
+ 
+ bool WorkbenchHandler::UseTermHost() const {
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.h b/chrome/browser/meridian/workbench/workbench_handler.h
+index a152c16663..2d07347e2f 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.h
++++ b/chrome/browser/meridian/workbench/workbench_handler.h
+@@ -112,6 +112,10 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+     scoped_refptr<TermSink> sink;
+     std::string root;
+     base::DictValue meta;
++    // The space's AI account it runs as (ai/account_prefs.h): its name ("" =
++    // the default) and the variables that say so, for Context Insights.
++    std::string account;
++    std::map<std::string, std::string> account_env;
+   };
+ 
+   void HandleInvoke(const base::ListValue& args);

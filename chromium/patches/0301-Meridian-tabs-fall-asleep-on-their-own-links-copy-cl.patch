@@ -1,0 +1,1643 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 01:42:55 +0400
+Subject: [PATCH] Meridian: tabs fall asleep on their own, links copy clean,
+ cookie banners hidden
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Auto-sleep: background tabs not used for a while (Settings > General:
+  30 min / 1 h (default) / 4 h / Never) are discarded, all but the 5 used
+  last. Never the open tab, split tabs, the Workbench, tabs playing,
+  capturing, or with something typed (the same check as Put to Sleep), nor a
+  pinned tab marked Keep Awake in its menu.
+- Copy clean links (Settings > Advanced, on): Copy Link in tab and pinned
+  menus, Copy Links, the site controls, the page's Copy Link Address, ⇧⌘C
+  and the link button leave out tracking parameters; also Spotify's si and
+  X's ref_src/ref_url, ttclid, srsltid, li_fat_id, epik.
+- Hide cookie banners (Settings > Advanced, on): the EasyList Cookie List
+  (CC BY 3.0) is downloaded at run time, kept in the user data folder and
+  refreshed after 4 days; its element hiding rules go into every frame.
+  --meridian-cookie-list=<file> for tests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   5 +
+ chrome/browser/meridian/clean_url.cc          |  26 +-
+ chrome/browser/meridian/clean_url_unittest.cc |  41 +++
+ chrome/browser/meridian/cookie_banners.cc     | 263 ++++++++++++++++++
+ chrome/browser/meridian/cookie_banners.h      |  95 +++++++
+ chrome/browser/meridian/cookie_list.cc        | 224 +++++++++++++++
+ chrome/browser/meridian/cookie_list.h         |  58 ++++
+ .../browser/meridian/cookie_list_unittest.cc  |  89 ++++++
+ chrome/browser/meridian/prefs.cc              |   3 +
+ chrome/browser/meridian/prefs.h               |   6 +
+ chrome/browser/meridian/sidebar.mojom         |  16 ++
+ chrome/browser/meridian/sidebar_handler.cc    | 168 +++++++++--
+ chrome/browser/meridian/sidebar_handler.h     |  11 +
+ chrome/browser/meridian/sidebar_service.cc    |  17 ++
+ chrome/browser/meridian/sidebar_service.h     |   3 +
+ chrome/browser/renderer_context_menu/BUILD.gn |   1 +
+ .../render_view_context_menu.cc               |   9 +-
+ .../webui_browser/meridian/settings.html.ts   |  37 +++
+ .../webui_browser/meridian/settings.ts        |  21 ++
+ .../webui_browser/meridian/settings_index.ts  |   7 +
+ .../webui_browser/meridian/sidebar.ts         |  21 +-
+ .../webui_browser/meridian/site_control.ts    |   2 +-
+ chrome/browser/ui/tabs/tab_features.cc        |   3 +
+ 23 files changed, 1091 insertions(+), 35 deletions(-)
+ create mode 100644 chrome/browser/meridian/cookie_banners.cc
+ create mode 100644 chrome/browser/meridian/cookie_banners.h
+ create mode 100644 chrome/browser/meridian/cookie_list.cc
+ create mode 100644 chrome/browser/meridian/cookie_list.h
+ create mode 100644 chrome/browser/meridian/cookie_list_unittest.cc
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 722df7cec8..29d2f8316b 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -106,6 +106,8 @@ source_set("model") {
+     "boosts/boost_service.h",
+     "clean_url.cc",
+     "clean_url.h",
++    "cookie_list.cc",
++    "cookie_list.h",
+     "prefs.cc",
+     "prefs.h",
+     "setup_profile.cc",
+@@ -356,6 +358,8 @@ source_set("meridian") {
+     "boosts/boost_service_factory.cc",
+     "boosts/boost_service_factory.h",
+     "boosts/boost_tab_helper.cc",
++    "cookie_banners.cc",
++    "cookie_banners.h",
+     "boosts/boost_tab_helper.h",
+     "ai/ai_service.cc",
+     "ai/ai_service.h",
+@@ -570,6 +574,7 @@ test("meridian_unittests") {
+     "boosts/boost_service_unittest.cc",
+     "atc_unittest.cc",
+     "clean_url_unittest.cc",
++    "cookie_list_unittest.cc",
+     "currency_parse_unittest.cc",
+     "report_unittest.cc",
+     "self_install_unittest.cc",
+diff --git a/chrome/browser/meridian/clean_url.cc b/chrome/browser/meridian/clean_url.cc
+index 1962df51ca..ddc68409a8 100644
+--- a/chrome/browser/meridian/clean_url.cc
++++ b/chrome/browser/meridian/clean_url.cc
+@@ -18,14 +18,27 @@ namespace {
+ 
+ bool IsTracking(std::string_view key) {
+   static constexpr auto kKeys = base::MakeFixedFlatSet<std::string_view>({
+-      "_hsenc", "_hsmi", "dclid", "fbclid", "gbraid", "gclid", "gclsrc",
+-      "igsh", "igshid", "mc_cid", "mc_eid", "mkt_tok", "msclkid", "oly_anon_id",
+-      "oly_enc_id", "rb_clickid", "s_cid", "twclid", "vero_id", "wbraid",
+-      "yclid",
++      "_hsenc", "_hsmi", "dclid", "epik", "fbclid", "gbraid", "gclid",
++      "gclsrc", "igsh", "igshid", "li_fat_id", "mc_cid", "mc_eid", "mkt_tok",
++      "msclkid", "oly_anon_id", "oly_enc_id", "rb_clickid", "s_cid",
++      "srsltid", "ttclid", "twclid", "vero_id", "wbraid", "yclid",
+   });
+   return base::StartsWith(key, "utm_") || kKeys.contains(key);
+ }
+ 
++// Parameters that track only on their own sites: YouTube's and Spotify's
++// share id ("si" says who shared the link), X's "ref_src"/"ref_url".
++bool IsSiteTracking(const GURL& url, std::string_view key) {
++  if (key == "si") {
++    return url.DomainIs("youtube.com") || url.DomainIs("youtu.be") ||
++           url.DomainIs("spotify.com");
++  }
++  if (key == "ref_src" || key == "ref_url") {
++    return url.DomainIs("twitter.com") || url.DomainIs("x.com");
++  }
++  return false;
++}
++
+ }  // namespace
+ 
+ GURL WithoutTracking(const GURL& url) {
+@@ -36,10 +49,7 @@ GURL WithoutTracking(const GURL& url) {
+   bool removed = false;
+   for (net::QueryIterator it(url); !it.IsAtEnd(); it.Advance()) {
+     std::string_view key = it.GetKey();
+-    // YouTube's share id ("si") says who shared the link.
+-    if (IsTracking(key) ||
+-        (key == "si" && (url.DomainIs("youtube.com") ||
+-                         url.DomainIs("youtu.be")))) {
++    if (IsTracking(key) || IsSiteTracking(url, key)) {
+       removed = true;
+       continue;
+     }
+diff --git a/chrome/browser/meridian/clean_url_unittest.cc b/chrome/browser/meridian/clean_url_unittest.cc
+index fbb2f8ce3b..adb4ef0b63 100644
+--- a/chrome/browser/meridian/clean_url_unittest.cc
++++ b/chrome/browser/meridian/clean_url_unittest.cc
+@@ -29,5 +29,46 @@ TEST(CleanUrlTest, DropsTrackingKeepsTheRest) {
+             "chrome://settings/?utm_source=x");
+ }
+ 
++TEST(CleanUrlTest, EveryKnownTracker) {
++  for (const char* key :
++       {"utm_source", "utm_campaign", "utm_content", "fbclid", "gclid",
++        "dclid", "msclkid", "mc_eid", "igshid", "yclid", "_hsenc", "_hsmi",
++        "mkt_tok", "ttclid", "srsltid", "li_fat_id"}) {
++    EXPECT_EQ(Clean((std::string("https://example.com/p?") + key +
++                     "=v&keep=1#frag")
++                        .c_str()),
++              "https://example.com/p?keep=1#frag")
++        << key;
++  }
++}
++
++TEST(CleanUrlTest, SiteOnlyTrackers) {
++  EXPECT_EQ(Clean("https://open.spotify.com/track/abc?si=123"),
++            "https://open.spotify.com/track/abc");
++  EXPECT_EQ(Clean("https://www.youtube.com/watch?v=abc&si=x&t=10s"),
++            "https://www.youtube.com/watch?v=abc&t=10s");
++  EXPECT_EQ(Clean("https://twitter.com/a/status/1?ref_src=twsrc%5Etfw"),
++            "https://twitter.com/a/status/1");
++  EXPECT_EQ(Clean("https://x.com/a/status/1?ref_src=x&ref_url=y&lang=en"),
++            "https://x.com/a/status/1?lang=en");
++  // Elsewhere they may mean something.
++  EXPECT_EQ(Clean("https://example.com/?ref_src=1"),
++            "https://example.com/?ref_src=1");
++}
++
++TEST(CleanUrlTest, LeavesTheRestAlone) {
++  // Nothing to take: the very same URL, its order and encoding.
++  EXPECT_EQ(Clean("https://example.com/?b=2&a=%2F&c"),
++            "https://example.com/?b=2&a=%2F&c");
++  // Only the fragment after a cleaned query.
++  EXPECT_EQ(Clean("https://example.com/?utm_medium=x#a?utm_source=y"),
++            "https://example.com/#a?utm_source=y");
++  // A key that only starts like one.
++  EXPECT_EQ(Clean("https://example.com/?utmost=1&gclidx=2"),
++            "https://example.com/?utmost=1&gclidx=2");
++  EXPECT_EQ(Clean("http://example.com/?UTM_SOURCE=x"),
++            "http://example.com/?UTM_SOURCE=x");
++}
++
+ }  // namespace
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/cookie_banners.cc b/chrome/browser/meridian/cookie_banners.cc
+new file mode 100644
+index 0000000000..97a594477c
+--- /dev/null
++++ b/chrome/browser/meridian/cookie_banners.cc
+@@ -0,0 +1,263 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/cookie_banners.h"
++
++#include <utility>
++
++#include "base/command_line.h"
++#include "base/files/file_path.h"
++#include "base/files/file_util.h"
++#include "base/files/important_file_writer.h"
++#include "base/functional/bind.h"
++#include "base/json/json_writer.h"
++#include "base/no_destructor.h"
++#include "base/path_service.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/task/thread_pool.h"
++#include "base/values.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/meridian/cookie_list.h"
++#include "chrome/browser/meridian/prefs.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/common/chrome_isolated_world_ids.h"
++#include "chrome/common/chrome_paths.h"
++#include "components/prefs/pref_service.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/web_contents.h"
++#include "net/base/load_flags.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++#include "url/gurl.h"
++
++namespace meridian {
++
++namespace {
++
++// The EasyList Cookie List (https://easylist.to): CC BY 3.0, by the EasyList
++// authors. Its own header says to look again after 9 days at most.
++constexpr char kListUrl[] =
++    "https://secure.fanboy.co.nz/fanboy-cookiemonster.txt";
++constexpr base::TimeDelta kRefreshAfter = base::Days(4);
++constexpr char kFileName[] = "Meridian Cookie List.txt";
++
++constexpr net::NetworkTrafficAnnotationTag kAnnotation =
++    net::DefineNetworkTrafficAnnotation("meridian_cookie_list", R"(
++      semantics {
++        sender: "Meridian cookie banners"
++        description: "The EasyList Cookie List, the rules Meridian hides "
++          "cookie notices on pages with."
++        trigger: "Once the browser has started when the copy on disk is "
++          "missing or older than 4 days."
++        data: "None."
++        destination: OTHER
++      }
++      policy {
++        cookies_allowed: NO
++        setting: "Settings > Advanced > Hide cookie banners."
++        policy_exception_justification: "Not implemented."
++      })");
++
++base::FilePath ListPath(bool* from_switch) {
++  const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++  *from_switch = cl->HasSwitch("meridian-cookie-list");
++  if (*from_switch) {
++    return cl->GetSwitchValuePath("meridian-cookie-list");
++  }
++  base::FilePath dir;
++  base::PathService::Get(chrome::DIR_USER_DATA, &dir);
++  return dir.AppendASCII(kFileName);
++}
++
++struct Read {
++  std::optional<base::Time> modified;
++  std::unique_ptr<CookieList> list;
++};
++
++Read ReadList(base::FilePath path) {
++  Read read;
++  base::File::Info info;
++  std::string text;
++  if (base::GetFileInfo(path, &info) && !info.is_directory &&
++      base::ReadFileToStringWithMaxSize(path, &text, 16 * 1024 * 1024)) {
++    read.modified = info.last_modified;
++    read.list = CookieList::Parse(text);
++  }
++  return read;
++}
++
++// Puts `css` (a JSON string) in the frame's own style element; "" takes it
++// away.
++constexpr char kApply[] = R"((css) => {
++  let s = document.getElementById('meridian-cookie-banners');
++  if (!css) { s?.remove(); return; }
++  if (!s) {
++    s = document.createElement('style');
++    s.id = 'meridian-cookie-banners';
++  }
++  if (s.textContent !== css) s.textContent = css;
++  if (!s.isConnected) (document.head || document.documentElement)?.appendChild(s);
++})";
++
++}  // namespace
++
++// static
++CookieBanners& CookieBanners::Get() {
++  static base::NoDestructor<CookieBanners> instance;
++  return *instance;
++}
++
++CookieBanners::CookieBanners() = default;
++CookieBanners::~CookieBanners() = default;
++
++void CookieBanners::Start() {
++  if (started_) {
++    return;
++  }
++  started_ = true;
++  bool from_switch = false;
++  base::FilePath path = ListPath(&from_switch);
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce(&ReadList, path),
++      base::BindOnce(
++          [](base::WeakPtr<CookieBanners> self, bool from_switch, Read read) {
++            if (self) {
++              self->OnRead(from_switch, read.modified, std::move(read.list));
++            }
++          },
++          weak_factory_.GetWeakPtr(), from_switch));
++}
++
++void CookieBanners::OnRead(bool from_switch,
++                           std::optional<base::Time> modified,
++                           std::unique_ptr<CookieList> list) {
++  if (list) {
++    list_ = std::move(list);
++  }
++  if (from_switch) {
++    return;  // A test's own list: never the internet.
++  }
++  downloaded_at_ = list_ && modified ? *modified : base::Time();
++  // Out of the way of the first pages, then twice a day to see whether it
++  // has grown old (the browser may stay open for weeks).
++  refresh_timer_.Start(FROM_HERE, base::Hours(12), this,
++                       &CookieBanners::MaybeDownload);
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(&CookieBanners::MaybeDownload,
++                     weak_factory_.GetWeakPtr()),
++      base::Seconds(20));
++}
++
++void CookieBanners::MaybeDownload() {
++  if (loader_ || !g_browser_process ||
++      !g_browser_process->shared_url_loader_factory() ||
++      base::Time::Now() - downloaded_at_ < kRefreshAfter) {
++    return;
++  }
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = GURL(kListUrl);
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  request->load_flags = net::LOAD_DISABLE_CACHE;
++  loader_ = network::SimpleURLLoader::Create(std::move(request), kAnnotation);
++  loader_->SetTimeoutDuration(base::Seconds(60));
++  loader_->DownloadToString(
++      g_browser_process->shared_url_loader_factory().get(),
++      base::BindOnce(&CookieBanners::OnDownloaded,
++                     weak_factory_.GetWeakPtr()),
++      16 * 1024 * 1024);
++}
++
++void CookieBanners::OnDownloaded(std::optional<std::string> body) {
++  loader_.reset();
++  if (!body) {
++    return;  // Offline: again in 12 hours.
++  }
++  bool from_switch = false;
++  base::FilePath path = ListPath(&from_switch);
++  // Parsed and saved off the UI thread; only a list with rules in it
++  // replaces the one there is.
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::BEST_EFFORT},
++      base::BindOnce(
++          [](base::FilePath path, std::string body) {
++            std::unique_ptr<CookieList> list = CookieList::Parse(body);
++            if (list) {
++              base::ImportantFileWriter::WriteFileAtomically(path, body);
++            }
++            return list;
++          },
++          path, std::move(*body)),
++      base::BindOnce(
++          [](base::WeakPtr<CookieBanners> self,
++             std::unique_ptr<CookieList> list) {
++            if (self && list) {
++              self->list_ = std::move(list);
++              self->downloaded_at_ = base::Time::Now();
++            }
++          },
++          weak_factory_.GetWeakPtr()));
++}
++
++std::string CookieBanners::CssFor(const GURL& url) const {
++  if (!list_ || !url.SchemeIsHTTPOrHTTPS()) {
++    return std::string();
++  }
++  return list_->CssFor(url.host());
++}
++
++CookieBannerTabHelper::CookieBannerTabHelper(content::WebContents* contents)
++    : content::WebContentsObserver(contents),
++      content::WebContentsUserData<CookieBannerTabHelper>(*contents) {
++  CookieBanners::Get().Start();
++  prefs_.Init(
++      Profile::FromBrowserContext(contents->GetBrowserContext())->GetPrefs());
++  prefs_.Add(prefs::kHideCookieBanners,
++             base::BindRepeating(&CookieBannerTabHelper::OnPrefChanged,
++                                 base::Unretained(this)));
++}
++
++CookieBannerTabHelper::~CookieBannerTabHelper() = default;
++
++void CookieBannerTabHelper::PrimaryMainDocumentElementAvailable() {
++  Apply(web_contents()->GetPrimaryMainFrame(), false);
++}
++
++void CookieBannerTabHelper::DOMContentLoaded(content::RenderFrameHost* frame) {
++  Apply(frame, false);
++}
++
++void CookieBannerTabHelper::OnPrefChanged() {
++  web_contents()->GetPrimaryMainFrame()->ForEachRenderFrameHost(
++      [this](content::RenderFrameHost* frame) { Apply(frame, true); });
++}
++
++void CookieBannerTabHelper::Apply(content::RenderFrameHost* frame,
++                                  bool changed) {
++  if (!frame || !frame->IsRenderFrameLive()) {
++    return;
++  }
++  const GURL& url = frame->GetLastCommittedURL();
++  if (!url.SchemeIsHTTPOrHTTPS()) {
++    return;
++  }
++  const bool on = prefs_.prefs()->GetBoolean(prefs::kHideCookieBanners);
++  const std::string css = on ? CookieBanners::Get().CssFor(url) : std::string();
++  if (css.empty() && !changed) {
++    return;  // Nothing to put, nothing put before.
++  }
++  frame->ExecuteJavaScriptInIsolatedWorld(
++      base::UTF8ToUTF16(std::string("(") + kApply + ")(" +
++                        base::WriteJson(base::Value(css)).value_or("\"\"") +
++                        ")"),
++      base::NullCallback(), ISOLATED_WORLD_ID_CHROME_INTERNAL);
++}
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(CookieBannerTabHelper);
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/cookie_banners.h b/chrome/browser/meridian/cookie_banners.h
+new file mode 100644
+index 0000000000..74cb8069e1
+--- /dev/null
++++ b/chrome/browser/meridian/cookie_banners.h
+@@ -0,0 +1,95 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_COOKIE_BANNERS_H_
++#define CHROME_BROWSER_MERIDIAN_COOKIE_BANNERS_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++
++#include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
++#include "base/time/time.h"
++#include "base/timer/timer.h"
++#include "components/prefs/pref_change_registrar.h"
++#include "content/public/browser/web_contents_observer.h"
++#include "content/public/browser/web_contents_user_data.h"
++
++class GURL;
++
++namespace network {
++class SimpleURLLoader;
++}
++
++namespace meridian {
++
++class CookieList;
++
++// Hide cookie banners (Settings > Advanced): the EasyList Cookie List
++// (https://easylist.to, by the EasyList authors, CC BY 3.0), downloaded at
++// run time to the user data folder and refreshed every few days. Only its
++// element hiding rules are used (cookie_list.h). Tests give a list of their
++// own with --meridian-cookie-list=<file> (then nothing is downloaded).
++class CookieBanners {
++ public:
++  static CookieBanners& Get();
++
++  CookieBanners(const CookieBanners&) = delete;
++  CookieBanners& operator=(const CookieBanners&) = delete;
++
++  // Loads the list the first time (from disk, else the internet).
++  void Start();
++  // The CSS hiding the notices on `url` ("" before the list is in, or when
++  // nothing applies).
++  std::string CssFor(const GURL& url) const;
++
++ private:
++  friend class base::NoDestructor<CookieBanners>;
++  CookieBanners();
++  ~CookieBanners();
++
++  void OnRead(bool from_switch,
++              std::optional<base::Time> modified,
++              std::unique_ptr<CookieList> list);
++  void MaybeDownload();
++  void OnDownloaded(std::optional<std::string> body);
++
++  bool started_ = false;
++  std::unique_ptr<CookieList> list_;
++  base::Time downloaded_at_;
++  std::unique_ptr<network::SimpleURLLoader> loader_;
++  base::RepeatingTimer refresh_timer_;
++  base::WeakPtrFactory<CookieBanners> weak_factory_{this};
++};
++
++// Puts the hiding CSS on a tab's pages (every frame) while the setting is on.
++class CookieBannerTabHelper
++    : public content::WebContentsObserver,
++      public content::WebContentsUserData<CookieBannerTabHelper> {
++ public:
++  CookieBannerTabHelper(const CookieBannerTabHelper&) = delete;
++  CookieBannerTabHelper& operator=(const CookieBannerTabHelper&) = delete;
++  ~CookieBannerTabHelper() override;
++
++ private:
++  friend class content::WebContentsUserData<CookieBannerTabHelper>;
++  explicit CookieBannerTabHelper(content::WebContents* contents);
++
++  // content::WebContentsObserver:
++  void PrimaryMainDocumentElementAvailable() override;
++  void DOMContentLoaded(content::RenderFrameHost* frame) override;
++
++  // `changed`: the setting changed (the CSS goes when it's off).
++  void Apply(content::RenderFrameHost* frame, bool changed);
++  void OnPrefChanged();
++
++  PrefChangeRegistrar prefs_;
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_COOKIE_BANNERS_H_
+diff --git a/chrome/browser/meridian/cookie_list.cc b/chrome/browser/meridian/cookie_list.cc
+new file mode 100644
+index 0000000000..cc549df9ff
+--- /dev/null
++++ b/chrome/browser/meridian/cookie_list.cc
+@@ -0,0 +1,224 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/cookie_list.h"
++
++#include <utility>
++
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "net/base/registry_controlled_domains/registry_controlled_domain.h"
++
++namespace meridian {
++
++namespace {
++
++constexpr char kHide[] = "{display:none!important}\n";
++
++// A selector CSS can match on its own, and that can't break out of its rule.
++bool PlainSelector(std::string_view selector) {
++  if (selector.empty() || selector.size() > 1000) {
++    return false;
++  }
++  for (std::string_view bad :
++       {"{", "}", "/*", "<", ":-abp-", ":has-text(", ":contains(", ":style(",
++        ":xpath(", ":matches-css", ":matches-attr(", ":matches-path(",
++        ":upward(", ":remove(", ":watch-attr(", ":min-text-length(",
++        ":others(", ":if(", ":if-not(", ":nth-ancestor(", ":remove-attr(",
++        ":remove-class(", ":matches-media(", ":matches-prop("}) {
++    if (selector.find(bad) != std::string_view::npos) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// "a.com,~b.com": the sites a rule is for, and those it isn't.
++void SplitSites(std::string_view list,
++                std::vector<std::string>* in,
++                std::vector<std::string>* out) {
++  for (std::string_view site : base::SplitStringPiece(
++           list, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++    if (site.front() == '~') {
++      site.remove_prefix(1);
++      if (!site.empty()) {
++        out->push_back(base::ToLowerASCII(site));
++      }
++    } else {
++      in->push_back(base::ToLowerASCII(site));
++    }
++  }
++}
++
++}  // namespace
++
++CookieList::CookieList() = default;
++CookieList::~CookieList() = default;
++
++// static
++std::unique_ptr<CookieList> CookieList::Parse(std::string_view text) {
++  auto list = std::make_unique<CookieList>();
++  std::set<std::string> everywhere_not;
++  std::set<std::string> seen;
++  std::vector<std::string> generic;
++  for (std::string_view line : base::SplitStringPiece(
++           text, "\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++    if (line.front() == '!' || line.front() == '[') {
++      continue;
++    }
++    // "@@||a.com^$elemhide": no hiding there; $generichide: only its own.
++    if (base::StartsWith(line, "@@||")) {
++      const size_t dollar = line.find('$');
++      if (dollar == std::string_view::npos) {
++        continue;
++      }
++      std::string_view site = line.substr(4, dollar - 4);
++      site = site.substr(0, site.find_first_of("^/*"));
++      std::string_view options = line.substr(dollar + 1);
++      if (site.empty()) {
++        continue;
++      }
++      for (std::string_view option : base::SplitStringPiece(
++               options, ",", base::TRIM_WHITESPACE,
++               base::SPLIT_WANT_NONEMPTY)) {
++        if (option == "elemhide" || option == "ehide") {
++          list->no_hiding_.insert(base::ToLowerASCII(site));
++        } else if (option == "generichide" || option == "ghide") {
++          list->no_generic_.insert(base::ToLowerASCII(site));
++        }
++      }
++      continue;
++    }
++    // Extended and scriptlet rules (#?#, #$#, #@?#, #@$#, ##+js) aren't CSS.
++    if (line.find("#?#") != std::string_view::npos ||
++        line.find("#$#") != std::string_view::npos ||
++        line.find("#@?#") != std::string_view::npos ||
++        line.find("#@$#") != std::string_view::npos ||
++        line.find("##+js") != std::string_view::npos ||
++        line.find("##^") != std::string_view::npos) {
++      continue;
++    }
++    if (const size_t at = line.find("#@#"); at != std::string_view::npos) {
++      std::string selector(line.substr(at + 3));
++      std::vector<std::string> in, out;
++      SplitSites(line.substr(0, at), &in, &out);
++      if (in.empty()) {
++        everywhere_not.insert(selector);
++      }
++      for (const std::string& site : in) {
++        list->exceptions_[site].insert(selector);
++      }
++      continue;
++    }
++    const size_t at = line.find("##");
++    if (at == std::string_view::npos) {
++      continue;  // A network rule: the ad blocker's business.
++    }
++    std::string_view selector = line.substr(at + 2);
++    if (!PlainSelector(selector)) {
++      continue;
++    }
++    std::vector<std::string> in, out;
++    SplitSites(line.substr(0, at), &in, &out);
++    for (const std::string& site : out) {
++      list->exceptions_[site].insert(std::string(selector));
++    }
++    if (in.empty()) {
++      if (seen.insert(std::string(selector)).second) {
++        generic.emplace_back(selector);
++      }
++      continue;
++    }
++    for (const std::string& site : in) {
++      list->by_site_[site].emplace_back(selector);
++    }
++  }
++  for (std::string& selector : generic) {
++    if (!everywhere_not.contains(selector)) {
++      list->generic_css_ += selector + kHide;
++      list->generic_.push_back(std::move(selector));
++    }
++  }
++  if (list->generic_.empty() && list->by_site_.empty()) {
++    return nullptr;
++  }
++  return list;
++}
++
++// static
++std::vector<std::string> CookieList::SitesOf(std::string_view host) {
++  std::vector<std::string> sites;
++  std::string h = base::ToLowerASCII(host);
++  if (!h.empty() && h.back() == '.') {
++    h.pop_back();
++  }
++  std::vector<std::string_view> labels = base::SplitStringPiece(
++      h, ".", base::KEEP_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
++  // "a.*": the same name under any public suffix (a.de, a.co.uk).
++  const size_t registry =
++      net::registry_controlled_domains::GetCanonicalHostRegistry(
++          h, net::registry_controlled_domains::INCLUDE_UNKNOWN_REGISTRIES,
++          net::registry_controlled_domains::EXCLUDE_PRIVATE_REGISTRIES)
++          .value_or(std::string_view())
++          .size();
++  for (size_t i = 0; i < labels.size(); ++i) {
++    std::vector<std::string_view> rest(labels.begin() + i, labels.end());
++    std::string site = base::JoinString(rest, ".");
++    if (registry > 0 && site.size() > registry + 1) {
++      sites.push_back(site.substr(0, site.size() - registry - 1) + ".*");
++    }
++    sites.push_back(std::move(site));
++  }
++  return sites;
++}
++
++bool CookieList::AnyIn(const std::set<std::string>& sites,
++                       const std::vector<std::string>& of) const {
++  for (const std::string& site : of) {
++    if (sites.contains(site)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++std::string CookieList::CssFor(std::string_view host) const {
++  const std::vector<std::string> sites = SitesOf(host);
++  if (sites.empty() || AnyIn(no_hiding_, sites)) {
++    return std::string();
++  }
++  std::set<std::string> skip;
++  for (const std::string& site : sites) {
++    auto it = exceptions_.find(site);
++    if (it != exceptions_.end()) {
++      skip.insert(it->second.begin(), it->second.end());
++    }
++  }
++  std::string css;
++  if (!AnyIn(no_generic_, sites)) {
++    if (skip.empty()) {
++      css = generic_css_;
++    } else {
++      for (const std::string& selector : generic_) {
++        if (!skip.contains(selector)) {
++          css += selector + kHide;
++        }
++      }
++    }
++  }
++  for (const std::string& site : sites) {
++    auto it = by_site_.find(site);
++    if (it == by_site_.end()) {
++      continue;
++    }
++    for (const std::string& selector : it->second) {
++      if (!skip.contains(selector)) {
++        css += selector + kHide;
++      }
++    }
++  }
++  return css;
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/cookie_list.h b/chrome/browser/meridian/cookie_list.h
+new file mode 100644
+index 0000000000..05ce9d7c7b
+--- /dev/null
++++ b/chrome/browser/meridian/cookie_list.h
+@@ -0,0 +1,58 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_COOKIE_LIST_H_
++#define CHROME_BROWSER_MERIDIAN_COOKIE_LIST_H_
++
++#include <map>
++#include <memory>
++#include <set>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace meridian {
++
++// The element hiding rules of a filter list in Adblock Plus syntax (the
++// EasyList Cookie List), as CSS for a site: "##sel" everywhere,
++// "a.com,b.com##sel" on those sites, "a.com#@#sel" and "~a.com" not there,
++// "@@||a.com^$elemhide" (or $generichide) nothing (or only the site's own
++// rules) there. Network rules, scriptlets and extended selectors
++// (:has-text and the like) are left out: only what CSS itself can match.
++class CookieList {
++ public:
++  // Null when `text` has no element hiding rules at all.
++  static std::unique_ptr<CookieList> Parse(std::string_view text);
++
++  CookieList();
++  CookieList(const CookieList&) = delete;
++  CookieList& operator=(const CookieList&) = delete;
++  ~CookieList();
++
++  // CSS hiding the notices on `host` ("" when nothing applies): one rule per
++  // selector, so a selector this Chromium doesn't know drops only itself.
++  std::string CssFor(std::string_view host) const;
++
++  size_t generic_count() const { return generic_.size(); }
++  size_t site_count() const { return by_site_.size(); }
++
++ private:
++  // `host` and the sites it is under: www.a.co.uk, a.co.uk, co.uk, uk, and
++  // the "www.a.*", "a.*" forms lists use for any public suffix.
++  static std::vector<std::string> SitesOf(std::string_view host);
++  bool AnyIn(const std::set<std::string>& sites,
++             const std::vector<std::string>& of) const;
++
++  std::vector<std::string> generic_;
++  std::string generic_css_;
++  std::map<std::string, std::vector<std::string>> by_site_;
++  // Site -> selectors not used there.
++  std::map<std::string, std::set<std::string>> exceptions_;
++  std::set<std::string> no_generic_;
++  std::set<std::string> no_hiding_;
++};
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_COOKIE_LIST_H_
+diff --git a/chrome/browser/meridian/cookie_list_unittest.cc b/chrome/browser/meridian/cookie_list_unittest.cc
+new file mode 100644
+index 0000000000..aafa89a16b
+--- /dev/null
++++ b/chrome/browser/meridian/cookie_list_unittest.cc
+@@ -0,0 +1,89 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/cookie_list.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace meridian {
++namespace {
++
++constexpr char kList[] = R"([Adblock Plus 2.0]
++! Title: test
++||cookie-cdn.example^$script
++##.cookie-notice
++###consent-banner
++##.cookie-notice
++news.com,~sport.news.com##.gdpr-wall
++shop.*##.shop-cookies
++##.dup-free
++news.com#@#.dup-free
++#@#.never
++##.never
++##.bad:has-text(Accept)
++##.evil{} body
++example.org#?#.x:-abp-has(.y)
++example.org##+js(cookie-remover)
++@@||quiet.com^$elemhide
++@@||own.com^$generichide
++own.com##.own-banner
++)";
++
++TEST(CookieListTest, GenericRulesEverywhere) {
++  auto list = CookieList::Parse(kList);
++  ASSERT_TRUE(list);
++  EXPECT_EQ(list->generic_count(), 3u);  // .cookie-notice, #consent-banner,
++                                         // .dup-free (once each)
++  const std::string css = list->CssFor("www.any.net");
++  EXPECT_EQ(css,
++            ".cookie-notice{display:none!important}\n"
++            "#consent-banner{display:none!important}\n"
++            ".dup-free{display:none!important}\n");
++}
++
++TEST(CookieListTest, SiteRulesAndExceptions) {
++  auto list = CookieList::Parse(kList);
++  ASSERT_TRUE(list);
++  std::string css = list->CssFor("www.news.com");
++  EXPECT_NE(css.find(".gdpr-wall{"), std::string::npos);
++  EXPECT_EQ(css.find(".dup-free"), std::string::npos);  // news.com#@#
++  EXPECT_NE(css.find(".cookie-notice{"), std::string::npos);
++  // ~sport.news.com
++  EXPECT_EQ(list->CssFor("sport.news.com").find(".gdpr-wall"),
++            std::string::npos);
++  // shop.* on any top-level domain.
++  EXPECT_NE(list->CssFor("shop.de").find(".shop-cookies"), std::string::npos);
++  EXPECT_NE(list->CssFor("www.shop.co.uk").find(".shop-cookies"),
++            std::string::npos);
++  EXPECT_EQ(list->CssFor("shop.example.de").find(".shop-cookies"),
++            std::string::npos);
++}
++
++TEST(CookieListTest, LeavesOutWhatIsNotCss) {
++  auto list = CookieList::Parse(kList);
++  ASSERT_TRUE(list);
++  const std::string css = list->CssFor("example.org");
++  EXPECT_EQ(css.find("never"), std::string::npos);
++  EXPECT_EQ(css.find("has-text"), std::string::npos);
++  EXPECT_EQ(css.find("evil"), std::string::npos);
++  EXPECT_EQ(css.find("abp"), std::string::npos);
++  EXPECT_EQ(css.find("js("), std::string::npos);
++  EXPECT_EQ(css.find("cookie-cdn"), std::string::npos);
++}
++
++TEST(CookieListTest, ElemhideAndGenerichide) {
++  auto list = CookieList::Parse(kList);
++  ASSERT_TRUE(list);
++  EXPECT_EQ(list->CssFor("quiet.com"), "");
++  EXPECT_EQ(list->CssFor("www.quiet.com"), "");
++  EXPECT_EQ(list->CssFor("own.com"), ".own-banner{display:none!important}\n");
++}
++
++TEST(CookieListTest, NothingToHide) {
++  EXPECT_FALSE(CookieList::Parse(""));
++  EXPECT_FALSE(CookieList::Parse("! only\n||a.com^\n"));
++}
++
++}  // namespace
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index 729a92cea5..7197e369e3 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -59,6 +59,9 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterDictionaryPref(kAiAccounts);
+   registry->RegisterDictionaryPref(kAiSpaceAccounts);
+   registry->RegisterStringPref(kAiAccountsHint, std::string());
++  registry->RegisterIntegerPref(kSleepAfterMinutes, 60);
++  registry->RegisterBooleanPref(kCleanLinks, true);
++  registry->RegisterBooleanPref(kHideCookieBanners, true);
+ }
+ 
+ }  // namespace meridian::prefs
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index 4444fed57d..bd85542ebc 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -111,6 +111,12 @@ inline constexpr char kAiSpaceAccounts[] = "meridian.ai_space_accounts";
+ // The "different subscriptions in different spaces?" card: "" (offered),
+ // "dismissed" or "applied".
+ inline constexpr char kAiAccountsHint[] = "meridian.ai_accounts_hint";
++// Background tabs not used for this many minutes fall asleep (0 = never).
++inline constexpr char kSleepAfterMinutes[] = "meridian.sleep_after_minutes";
++// Links copied without tracking parameters (utm_*, fbclid…).
++inline constexpr char kCleanLinks[] = "meridian.clean_links";
++// Cookie notices hidden (EasyList Cookie List's element hiding rules).
++inline constexpr char kHideCookieBanners[] = "meridian.hide_cookie_banners";
+ 
+ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
+ 
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index a44ca04337..d6fe6e65c8 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -19,6 +19,8 @@ struct Item {
+   array<Item> children;
+   // A live folder's feed (RSS/Atom or a GitHub search); empty otherwise.
+   url.mojom.Url live_url;
++  // A pinned tab that never falls asleep on its own (auto-sleep).
++  bool keep_awake;
+ };
+ 
+ struct Space {
+@@ -402,6 +404,13 @@ struct Settings {
+   // (the guard's "Don't ask again for this file in this project"). Saving
+   // only removes from it.
+   array<SecretFileOptOut> secret_file_optouts;
++  // Background tabs fall asleep after this many minutes unused: 0 (never),
++  // 30, 60 or 240.
++  int32 sleep_after_minutes;
++  // Copy Link and ⇧⌘C leave out tracking parameters (utm_*, fbclid…).
++  bool clean_links;
++  // Cookie notices hidden (EasyList Cookie List).
++  bool hide_cookie_banners;
+ };
+ 
+ // Chat view conversations (ai/chats.h).
+@@ -1011,6 +1020,13 @@ interface SidebarHandler {
+   // the sidebar), and "Stop sharing" on the shared tab or on the call.
+   CallTabs() => (array<tabs_api.mojom.NodeId> tab_ids);
+   StopTabSharing(tabs_api.mojom.NodeId tab_id);
++
++  // "Keep Awake" on a pinned tab: auto-sleep leaves it alone.
++  SetItemKeepAwake(string item_id, bool keep_awake);
++  // Copy Link: the links on the clipboard, one per line, without tracking
++  // parameters when Settings say so (else as they are); `text` is what was
++  // copied.
++  CopyLinks(array<string> urls) => (string text);
+ };
+ 
+ // A secret file agents may read without asking in one project.
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 4201978ca4..acd8b9455c 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -289,6 +289,7 @@ mojom::ItemPtr ToMojo(const Item& item) {
+   m->url = item.url;
+   m->open = item.open;
+   m->live_url = item.live_url;
++  m->keep_awake = item.keep_awake;
+   for (const Item& child : item.children) {
+     m->children.push_back(ToMojo(child));
+   }
+@@ -332,6 +333,10 @@ SidebarHandler::SidebarHandler(
+   prefs_.Add(prefs::kArchiveAfterHours,
+              base::BindRepeating(&SidebarHandler::StartArchiveTimer,
+                                  base::Unretained(this)));
++  StartSleepTimer();
++  prefs_.Add(prefs::kSleepAfterMinutes,
++             base::BindRepeating(&SidebarHandler::StartSleepTimer,
++                                 base::Unretained(this)));
+   model()->AddObserver(this);
+   Handlers()[browser_] = this;
+   AiService::SetConsentAsker(base::BindRepeating(&AskAiConsentIn));
+@@ -506,35 +511,26 @@ void SidebarHandler::SetTabMuted(const tabs_api::NodeId& tab_id, bool muted) {
+   }
+ }
+ 
+-void SidebarHandler::PutTabToSleep(const tabs_api::NodeId& tab_id,
+-                                   PutTabToSleepCallback callback) {
+-  tabs::TabInterface* tab = TabFor(tab_id);
+-  if (!tab) {
+-    std::move(callback).Run("failed");
+-    return;
+-  }
++// Why `tab` can't be put to sleep now ("" when it can): see PutTabToSleep.
++std::string SidebarHandler::WhyAwake(tabs::TabInterface* tab) {
+   content::WebContents* contents = tab->GetContents();
+   auto* unit =
+       resource_coordinator::TabLifecycleUnitExternal::FromWebContents(contents);
+   if (!unit) {
+-    std::move(callback).Run("failed");
+-    return;
++    return "failed";
+   }
+   if (unit->GetTabState() ==
+           ::mojom::LifecycleUnitState::DISCARDED ||
+       contents->WasDiscarded()) {
+-    std::move(callback).Run("asleep");
+-    return;
++    return "asleep";
+   }
+   if (tab == model()->GetActiveTab() || tab->GetSplit()) {
+-    std::move(callback).Run("active");
+-    return;
++    return "active";
+   }
+   // The Workbench runs agent sessions.
+   const GURL& url = contents->GetLastCommittedURL();
+   if (url.SchemeIs(content::kChromeUIScheme) && url.host() == "workbench") {
+-    std::move(callback).Run("workbench");
+-    return;
++    return "workbench";
+   }
+   // Meridian's own check, stricter than Chromium's: nothing typed is lost,
+   // nothing playing stops, no call or recording is cut.
+@@ -545,22 +541,36 @@ void SidebarHandler::PutTabToSleep(const tabs_api::NodeId& tab_id,
+       (capture && (capture->IsCapturingUserMedia(contents) ||
+                    capture->IsBeingMirrored(contents) ||
+                    capture->IsCapturingDisplay(contents)))) {
+-    std::move(callback).Run("capture");
+-    return;
++    return "capture";
+   }
+   if (contents->IsCurrentlyAudible() ||
+       contents->GetCurrentlyPlayingVideoCount() > 0 ||
+       contents->HasPictureInPictureVideo()) {
+-    std::move(callback).Run("media");
+-    return;
++    return "media";
+   }
+   base::WeakPtr<performance_manager::PageNode> page =
+       performance_manager::PerformanceManager::
+           GetPrimaryPageNodeForWebContents(contents);
+   if (page && (page->HadFormInteraction() || page->HadUserEdits())) {
+-    std::move(callback).Run("form");
++    return "form";
++  }
++  return std::string();
++}
++
++void SidebarHandler::PutTabToSleep(const tabs_api::NodeId& tab_id,
++                                   PutTabToSleepCallback callback) {
++  tabs::TabInterface* tab = TabFor(tab_id);
++  if (!tab) {
++    std::move(callback).Run("failed");
++    return;
++  }
++  const std::string why = WhyAwake(tab);
++  if (!why.empty()) {
++    std::move(callback).Run(why);
+     return;
+   }
++  auto* unit = resource_coordinator::TabLifecycleUnitExternal::FromWebContents(
++      tab->GetContents());
+   const bool slept =
+       unit->DiscardTab(::mojom::LifecycleUnitDiscardReason::EXTERNAL);
+   // Its sleeping look in the sidebar (a discard may not change the row).
+@@ -1009,9 +1019,13 @@ void CopyActiveLink(BrowserWindowInterface* browser) {
+   if (!tab) {
+     return;
+   }
++  const GURL& url = tab->GetContents()->GetVisibleURL();
+   ui::ScopedClipboardWriter(ui::ClipboardBuffer::kCopyPaste)
+       .WriteText(base::UTF8ToUTF16(
+-          WithoutTracking(tab->GetContents()->GetVisibleURL()).spec()));
++          (browser->GetProfile()->GetPrefs()->GetBoolean(prefs::kCleanLinks)
++               ? WithoutTracking(url)
++               : url)
++              .spec()));
+   SidebarHandler::ShowToast(browser, "Copied link");
+ }
+ 
+@@ -1211,6 +1225,86 @@ void SidebarHandler::StartArchiveTimer() {
+                        &SidebarHandler::ArchiveStaleTabs);
+ }
+ 
++base::TimeDelta SidebarHandler::SleepAfter() {
++  const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++  int seconds = 0;
++  if (base::StringToInt(cl->GetSwitchValueASCII("meridian-sleep-after-seconds"),
++                        &seconds) &&
++      seconds > 0) {
++    return base::Seconds(seconds);
++  }
++  int minutes =
++      browser_->GetProfile()->GetPrefs()->GetInteger(prefs::kSleepAfterMinutes);
++  return minutes > 0 ? base::Minutes(minutes) : base::TimeDelta();
++}
++
++void SidebarHandler::StartSleepTimer() {
++  sleep_timer_.Stop();
++  base::TimeDelta after = SleepAfter();
++  if (after.is_zero()) {
++    return;
++  }
++  sleep_timer_.Start(FROM_HERE, std::min(base::Minutes(5), after / 4), this,
++                     &SidebarHandler::SleepIdleTabs);
++}
++
++// Tabs not used for SleepAfter() fall asleep, all but the few used last
++// (Chromium's discard: the tab stays in the sidebar and loads again when
++// opened). Never the open tab, one playing, recording or sharing, one with
++// something typed in it, the Workbench, or a pinned tab kept awake.
++void SidebarHandler::SleepIdleTabs() {
++  base::TimeDelta after = SleepAfter();
++  if (after.is_zero()) {
++    return;
++  }
++  // The tabs used last stay awake however long ago that was.
++  size_t keep = 5;
++  const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++  if (cl->HasSwitch("meridian-sleep-keep-recent")) {
++    base::StringToSizeT(cl->GetSwitchValueASCII("meridian-sleep-keep-recent"),
++                        &keep);
++  }
++  std::vector<tabs::TabInterface*> tabs;
++  for (int i = 0; i < model()->count(); ++i) {
++    tabs.push_back(model()->GetTabAtIndex(i));
++  }
++  std::sort(tabs.begin(), tabs.end(),
++            [](tabs::TabInterface* a, tabs::TabInterface* b) {
++              return a->GetContents()->GetLastActiveTime() >
++                     b->GetContents()->GetLastActiveTime();
++            });
++  const base::Time cutoff = base::Time::Now() - after;
++  bool slept = false;
++  for (size_t i = keep; i < tabs.size(); ++i) {
++    tabs::TabInterface* tab = tabs[i];
++    content::WebContents* contents = tab->GetContents();
++    if (contents->GetLastActiveTime() >= cutoff || KeptAwake(tab) ||
++        !WhyAwake(tab).empty()) {
++      continue;
++    }
++    auto* unit =
++        resource_coordinator::TabLifecycleUnitExternal::FromWebContents(
++            contents);
++    if (unit &&
++        unit->DiscardTab(::mojom::LifecycleUnitDiscardReason::EXTERNAL)) {
++      slept = true;
++    }
++  }
++  if (slept) {
++    ScheduleNotify();
++  }
++}
++
++// A pinned tab whose item is marked "Keep Awake".
++bool SidebarHandler::KeptAwake(tabs::TabInterface* tab) {
++  const TabData* data = TabData::Get(tab->GetContents());
++  if (!data || data->item_id().empty()) {
++    return false;
++  }
++  const Item* item = service_->FindItem(data->item_id());
++  return item && item->keep_awake;
++}
++
+ std::vector<std::string> SidebarHandler::SpaceIds() {
+   std::vector<std::string> ids;
+   for (const Space& space : service_->spaces()) {
+@@ -2795,6 +2889,9 @@ void SidebarHandler::GetSettings(GetSettingsCallback callback) {
+   settings->member_since = browser_->GetProfile()
+                                ->GetCreationTime()
+                                .InMillisecondsFSinceUnixEpoch();
++  settings->sleep_after_minutes = prefs->GetInteger(prefs::kSleepAfterMinutes);
++  settings->clean_links = prefs->GetBoolean(prefs::kCleanLinks);
++  settings->hide_cookie_banners = prefs->GetBoolean(prefs::kHideCookieBanners);
+   settings->adblock =
+       HostContentSettingsMapFactory::GetForProfile(browser_->GetProfile())
+           ->GetDefaultContentSetting(ContentSettingsType::ADS) ==
+@@ -2835,6 +2932,12 @@ void SidebarHandler::SetSettings(mojom::SettingsPtr settings) {
+       hours == 720) {
+     prefs->SetInteger(prefs::kArchiveAfterHours, hours);
+   }
++  const int sleep = settings->sleep_after_minutes;
++  if (sleep == 0 || sleep == 30 || sleep == 60 || sleep == 240) {
++    prefs->SetInteger(prefs::kSleepAfterMinutes, sleep);
++  }
++  prefs->SetBoolean(prefs::kCleanLinks, settings->clean_links);
++  prefs->SetBoolean(prefs::kHideCookieBanners, settings->hide_cookie_banners);
+   // Agents answer to the main profile, whichever space this window shows.
+   PrefService* agent_prefs = MainProfileFor(browser_->GetProfile())->GetPrefs();
+   const std::string& access = settings->agent_access;
+@@ -3907,6 +4010,29 @@ void SidebarHandler::SetFolderOpen(const std::string& item_id, bool open) {
+   service_->SetFolderOpen(item_id, open);
+ }
+ 
++void SidebarHandler::SetItemKeepAwake(const std::string& item_id,
++                                      bool keep_awake) {
++  service_->SetKeepAwake(item_id, keep_awake);
++}
++
++void SidebarHandler::CopyLinks(const std::vector<std::string>& urls,
++                               CopyLinksCallback callback) {
++  const bool clean =
++      browser_->GetProfile()->GetPrefs()->GetBoolean(prefs::kCleanLinks);
++  std::vector<std::string> out;
++  for (const std::string& url : urls) {
++    GURL gurl(url);
++    out.push_back(clean && gurl.is_valid() ? WithoutTracking(gurl).spec()
++                                           : url);
++  }
++  std::string text = base::JoinString(out, "\n");
++  if (!text.empty()) {
++    ui::ScopedClipboardWriter(ui::ClipboardBuffer::kCopyPaste)
++        .WriteText(base::UTF8ToUTF16(text));
++  }
++  std::move(callback).Run(text);
++}
++
+ void SidebarHandler::OpenItem(const std::string& item_id) {
+   const Item* item = service_->FindItem(item_id);
+   if (!item || item->is_folder) {
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 0f1d82794d..2ec7b2b589 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -159,6 +159,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void RenameTab(const tabs_api::NodeId& tab_id,
+                  const std::string& title) override;
+   void SetFolderOpen(const std::string& item_id, bool open) override;
++  void SetItemKeepAwake(const std::string& item_id, bool keep_awake) override;
++  void CopyLinks(const std::vector<std::string>& urls,
++                 CopyLinksCallback callback) override;
+   void OpenItem(const std::string& item_id) override;
+   void ResetItemToHome(const std::string& item_id) override;
+   void GetArcExtensions(GetArcExtensionsCallback callback) override;
+@@ -490,6 +493,13 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void ArchiveStaleTabs();
+   bool IsTodayTab(tabs::TabInterface* tab);
+   void StartArchiveTimer();
++  // Auto-sleep: background tabs not used for SleepAfter() are discarded.
++  base::TimeDelta SleepAfter();
++  void StartSleepTimer();
++  void SleepIdleTabs();
++  bool KeptAwake(tabs::TabInterface* tab);
++  // Why `tab` can't be put to sleep ("" when it can).
++  std::string WhyAwake(tabs::TabInterface* tab);
+   std::vector<std::string> SpaceIds();
+ 
+   raw_ptr<BrowserWindowInterface> browser_;
+@@ -505,6 +515,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   raw_ptr<SidebarService> service_;
+   raw_ptr<ArchiveService> archive_;
+   base::RepeatingTimer archive_timer_;
++  base::RepeatingTimer sleep_timer_;
+   // New tabs opened from a pinned tab or favorite, until their URL is known:
+   // opener's URL, to decide whether they are a Peek (MaybePeek).
+   std::map<tabs::TabHandle, GURL> peek_candidates_;
+diff --git a/chrome/browser/meridian/sidebar_service.cc b/chrome/browser/meridian/sidebar_service.cc
+index fb8424bb29..8622d25676 100644
+--- a/chrome/browser/meridian/sidebar_service.cc
++++ b/chrome/browser/meridian/sidebar_service.cc
+@@ -52,6 +52,9 @@ base::DictValue ItemToValue(const Item& item) {
+     d.Set("children", std::move(children));
+   } else {
+     d.Set("url", item.url.spec());
++    if (item.keep_awake) {
++      d.Set("keep_awake", true);
++    }
+   }
+   return d;
+ }
+@@ -90,6 +93,7 @@ std::optional<Item> ItemFromValue(const base::DictValue& d) {
+     if (!item.url.is_valid()) {
+       return std::nullopt;
+     }
++    item.keep_awake = d.FindBool("keep_awake").value_or(false);
+   }
+   return item;
+ }
+@@ -655,6 +659,19 @@ bool SidebarService::SetFolderOpen(const std::string& item_id, bool open) {
+   return true;
+ }
+ 
++bool SidebarService::SetKeepAwake(const std::string& item_id,
++                                  bool keep_awake) {
++  Item* item = const_cast<Item*>(FindItem(item_id));
++  if (!item || item->is_folder) {
++    return false;
++  }
++  if (item->keep_awake != keep_awake) {
++    item->keep_awake = keep_awake;
++    Changed();
++  }
++  return true;
++}
++
+ bool SidebarService::SetFolderLive(const std::string& item_id,
+                                    const GURL& url) {
+   Item* item = const_cast<Item*>(FindItem(item_id));
+diff --git a/chrome/browser/meridian/sidebar_service.h b/chrome/browser/meridian/sidebar_service.h
+index 3fb343c5ec..62cee1025b 100644
+--- a/chrome/browser/meridian/sidebar_service.h
++++ b/chrome/browser/meridian/sidebar_service.h
+@@ -52,6 +52,8 @@ struct Item {
+   // A live folder: its children come from this feed (RSS/Atom) or GitHub
+   // search, refreshed every 30 minutes (live_folders.h).
+   GURL live_url;
++  // A pinned tab auto-sleep leaves alone.
++  bool keep_awake = false;
+ };
+ 
+ struct Space {
+@@ -153,6 +155,7 @@ class SidebarService : public KeyedService {
+   // A pinned tab's or favorite's home address (Arc's Edit Pinned Page).
+   bool SetItemUrl(const std::string& item_id, const GURL& url);
+   bool SetFolderOpen(const std::string& item_id, bool open);
++  bool SetKeepAwake(const std::string& item_id, bool keep_awake);
+   // A folder fed by `url` (empty: an ordinary folder again, its items stay).
+   bool SetFolderLive(const std::string& item_id, const GURL& url);
+   // A live folder's items now: links kept by URL keep their ids (an open
+diff --git a/chrome/browser/renderer_context_menu/BUILD.gn b/chrome/browser/renderer_context_menu/BUILD.gn
+index 691b776eb8..d2c9dc2060 100644
+--- a/chrome/browser/renderer_context_menu/BUILD.gn
++++ b/chrome/browser/renderer_context_menu/BUILD.gn
+@@ -113,6 +113,7 @@ source_set("impl") {
+     ]
+ 
+     deps += [
++      "//chrome/browser/meridian:model",
+       "//chrome/app:command_ids",
+       "//chrome/app:generated_resources",
+       "//chrome/browser:browser_features",
+diff --git a/chrome/browser/renderer_context_menu/render_view_context_menu.cc b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+index 9501047c80..500506b1a9 100644
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu.cc
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+@@ -80,6 +80,8 @@
+ #include "chrome/browser/indigo/indigo_page_action_controller.h"
+ #include "chrome/browser/indigo/resources/grit/indigo_strings.h"
+ #include "chrome/browser/language/language_model_manager_factory.h"
++#include "chrome/browser/meridian/clean_url.h"
++#include "chrome/browser/meridian/prefs.h"
+ #include "chrome/browser/media/router/media_router_feature.h"
+ #include "chrome/browser/navigation_predictor/navigation_predictor_features.h"
+ #include "chrome/browser/navigation_predictor/navigation_predictor_keyed_service.h"
+@@ -4099,7 +4101,12 @@ void RenderViewContextMenu::ExecuteCommand(int id, int event_flags) {
+       break;
+ 
+     case IDC_CONTENT_CONTEXT_COPYLINKLOCATION:
+-      WriteURLToClipboard(params_.unfiltered_link_url, id);
++      // Meridian: without tracking parameters (Settings > Copy clean links).
++      WriteURLToClipboard(
++          GetProfile()->GetPrefs()->GetBoolean(meridian::prefs::kCleanLinks)
++              ? meridian::WithoutTracking(params_.unfiltered_link_url)
++              : params_.unfiltered_link_url,
++          id);
+       break;
+ 
+     case IDC_CONTENT_CONTEXT_ADD_LINK_TO_READING_LIST: {
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index 1d38b400eb..a710545703 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -232,6 +232,22 @@ export function getHtml(this: MeridianSettingsElement) {
+                       ${c.label}</option>`)}
+                 </select>
+               </div>
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Put tabs to sleep after</div>
++                  <div class="row-desc">Tabs you haven’t used free their
++                    memory and load again when you open them. The open tab,
++                    the last few you used, and tabs playing, sharing or with
++                    something typed stay awake.</div>
++                </div>
++                <select id="sleepAfter" @change="${this.onSleepChange_}">
++                  ${this.sleepChoices_.map(c => html`
++                    <option value="${c.value}"
++                        ?selected="${c.value ===
++                            `${this.settings_?.sleepAfterMinutes ?? 60}`}">
++                      ${c.label}</option>`)}
++                </select>
++              </div>
+             </div>
+           </div>
+           <div class="group">
+@@ -920,6 +936,27 @@ export function getHtml(this: MeridianSettingsElement) {
+                     .checked="${this.settings_.adblock}"
+                     @change="${this.onAdblockChange_}"><span></span></label>
+               </div>
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Hide cookie banners</div>
++                  <div class="row-desc">Cookie notices are hidden with the
++                    EasyList Cookie List, updated every few days.</div>
++                </div>
++                <label class="switch"><input type="checkbox"
++                    id="hideCookieBanners"
++                    .checked="${this.settings_.hideCookieBanners}"
++                    @change="${this.onHideCookieBannersChange_}"><span></span></label>
++              </div>
++              <div class="row">
++                <div class="row-text">
++                  <div class="row-label">Copy clean links</div>
++                  <div class="row-desc">Copy Link and${keyText(' ⇧⌘C')} leave
++                    out tracking parameters such as utm_source and fbclid.</div>
++                </div>
++                <label class="switch"><input type="checkbox" id="cleanLinks"
++                    .checked="${this.settings_.cleanLinks}"
++                    @change="${this.onCleanLinksChange_}"><span></span></label>
++              </div>
+             </div>
+           </div>
+           <div class="group">
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 67d5ed1f86..e278db250d 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -209,6 +209,13 @@ const ARCHIVE_CHOICES: Choice[] = [
+   {value: '0', label: 'Never'},
+ ];
+ 
++const SLEEP_CHOICES: Choice[] = [
++  {value: '30', label: '30 minutes'},
++  {value: '60', label: '1 hour'},
++  {value: '240', label: '4 hours'},
++  {value: '0', label: 'Never'},
++];
++
+ export class MeridianSettingsElement extends CrLitElement {
+   static get is() {
+     return 'meridian-settings';
+@@ -300,6 +307,7 @@ export class MeridianSettingsElement extends CrLitElement {
+   protected accessor targets_: Choice[] = [];
+   protected accessor archiveChoices_: Choice[] = ARCHIVE_CHOICES;
+   protected accessor archiveValue_: string = '12';
++  protected readonly sleepChoices_: Choice[] = SLEEP_CHOICES;
+   protected accessor noRules_: boolean = true;
+   // Settings > AI.
+   protected accessor clis_: AgentCli[] = [];
+@@ -1368,6 +1376,19 @@ export class MeridianSettingsElement extends CrLitElement {
+     this.save_({adblock: (e.target as HTMLInputElement).checked});
+   }
+ 
++  protected onSleepChange_(e: Event) {
++    this.save_(
++        {sleepAfterMinutes: Number((e.target as HTMLSelectElement).value)});
++  }
++
++  protected onCleanLinksChange_(e: Event) {
++    this.save_({cleanLinks: (e.target as HTMLInputElement).checked});
++  }
++
++  protected onHideCookieBannersChange_(e: Event) {
++    this.save_({hideCookieBanners: (e.target as HTMLInputElement).checked});
++  }
++
+   protected onArchiveChange_(e: Event) {
+     this.save_(
+         {archiveAfterHours: Number((e.target as HTMLSelectElement).value)});
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings_index.ts b/chrome/browser/resources/webui_browser/meridian/settings_index.ts
+index 6d97e4dbe7..d9f3d22860 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings_index.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings_index.ts
+@@ -92,6 +92,9 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
+          'Search engine', ['google', 'duckduckgo', 'bing', 'search']),
+   option('archive-after', 'general', 'General', 'Archive Today Tabs After',
+          'Archive Today tabs after', ['auto archive', 'close old tabs']),
++  option('sleep-after', 'general', 'General', 'Put Tabs to Sleep After',
++         'Put tabs to sleep after', ['sleeping tabs', 'memory saver',
++                                     'discard', 'auto sleep']),
+   option('updates', 'general', 'General', 'Updates', 'Updates',
+          ['version', 'check for updates', 'new version']),
+ 
+@@ -102,6 +105,10 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
+ 
+   option('adblock', 'advanced', 'Advanced', 'Block Ads and Trackers',
+          'Block ads and trackers', ['adblock', 'ad blocker', 'privacy']),
++  option('cookie-banners', 'advanced', 'Advanced', 'Hide Cookie Banners',
++         'Hide cookie banners', ['cookies', 'consent', 'gdpr', 'popup']),
++  option('clean-links', 'advanced', 'Advanced', 'Copy Clean Links',
++         'Copy clean links', ['tracking', 'utm', 'fbclid', 'copy link']),
+   option('clear-archive', 'advanced', 'Advanced', 'Clear the Archive',
+          'Archive', ['delete closed tabs', 'data']),
+   option('about', 'advanced', 'Advanced', 'About Meridian', 'About',
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 6b54d3349c..07c319f196 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -2262,7 +2262,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+         label: 'Copy Link',
+         icon: 'link',
+         keys: tab.isActive ? keyText('⇧⌘C') : undefined,
+-        action: () => navigator.clipboard.writeText(tab.url),
++        action: () => this.copyLinks_([tab.url]),
+       },
+       {label: 'Duplicate', icon: 'duplicate', action: () => this.openUrl(tab.url)},
+       this.splitOf_(tab.id) ? {
+@@ -2369,8 +2369,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+         label: 'Copy Links',
+         icon: 'link',
+         action: () => {
+-          navigator.clipboard.writeText(
+-              group.map(id => this.tabs_.get(id)?.url || '').join('\n'));
++          this.copyLinks_(group.map(id => this.tabs_.get(id)?.url || ''));
+           done();
+         },
+       },
+@@ -2409,6 +2408,13 @@ export class MeridianSidebarElement extends CrLitElement implements
+     ];
+   }
+ 
++  // Copy Link: one address per line, without tracking parameters unless
++  // Settings say otherwise (written to the clipboard by the browser, so it
++  // works without the window focused).
++  private copyLinks_(urls: string[]) {
++    this.handler_.copyLinks(urls.filter(u => u));
++  }
++
+   // "Put to Sleep": Chromium discards the tab (it reloads when opened),
+   // after Meridian's own check; a toast says why when it won't.
+   private sleepMenu_(tab: Tab): MenuEntry[] {
+@@ -2554,7 +2560,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+         label: 'Copy Link',
+         icon: 'link',
+         keys: tab?.isActive ? keyText('⇧⌘C') : undefined,
+-        action: () => navigator.clipboard.writeText(url),
++        action: () => this.copyLinks_([url]),
+       },
+       {label: 'Duplicate', icon: 'duplicate', action: () => this.openUrl(url)},
+       ...(tab ? [{
+@@ -2565,6 +2571,13 @@ export class MeridianSidebarElement extends CrLitElement implements
+       }] : []),
+       ...(tab ? this.muteMenu_(tab) : []),
+       ...(tab ? this.sleepMenu_(tab) : []),
++      ...(fav ? [] : [{
++        // Auto-sleep leaves it alone (a mail or chat app).
++        label: 'Keep Awake',
++        icon: 'moon' as IconName,
++        checked: item.keepAwake,
++        action: () => this.handler_.setItemKeepAwake(item.id, !item.keepAwake),
++      }]),
+       fav ? {
+         label: 'Remove from Favorites',
+         icon: 'star',
+diff --git a/chrome/browser/resources/webui_browser/meridian/site_control.ts b/chrome/browser/resources/webui_browser/meridian/site_control.ts
+index 30d1cee4da..b109bae34a 100644
+--- a/chrome/browser/resources/webui_browser/meridian/site_control.ts
++++ b/chrome/browser/resources/webui_browser/meridian/site_control.ts
+@@ -203,7 +203,7 @@ export class MeridianSiteControlElement extends CrLitElement {
+   protected onQuickClick_(e: Event) {
+     const action = (e.currentTarget as HTMLElement).dataset['action'];
+     if (action === 'copy') {
+-      navigator.clipboard.writeText(this.url);
++      this.handler_.copyLinks([this.url]);
+       this.copied_ = true;
+       setTimeout(() => this.copied_ = false, 1400);
+       return;
+diff --git a/chrome/browser/ui/tabs/tab_features.cc b/chrome/browser/ui/tabs/tab_features.cc
+index bf4b6b9e9c..681f7df4bc 100644
+--- a/chrome/browser/ui/tabs/tab_features.cc
++++ b/chrome/browser/ui/tabs/tab_features.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/ui/tabs/public/tab_features.h"
+ 
+ #include "chrome/browser/meridian/boosts/boost_tab_helper.h"
++#include "chrome/browser/meridian/cookie_banners.h"
+ 
+ #include <stdint.h>
+ 
+@@ -454,6 +455,7 @@ void TabFeatures::Init(TabInterface& tab, Profile* profile) {
+   ChromeTranslateClient::CreateForWebContents(tab.GetContents());
+ 
+   meridian::BoostTabHelper::CreateForWebContents(tab.GetContents());
++  meridian::CookieBannerTabHelper::CreateForWebContents(tab.GetContents());
+ 
+   if (!content_settings::PageSpecificContentSettings::GetDelegateForWebContents(
+           tab.GetContents())) {
+@@ -1548,6 +1550,7 @@ void TabFeatures::WillDiscardContents(tabs::TabInterface* tab,
+   ChromeTranslateClient::CreateForWebContents(new_contents);
+ 
+   meridian::BoostTabHelper::CreateForWebContents(new_contents);
++  meridian::CookieBannerTabHelper::CreateForWebContents(new_contents);
+ 
+   if (!content_settings::PageSpecificContentSettings::GetDelegateForWebContents(
+           new_contents)) {

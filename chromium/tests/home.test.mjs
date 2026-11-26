@@ -28,7 +28,7 @@ test('a new tab shows the home page; search opens ⌘T; Make a space; it goes on
     await b.waitFor(`!!${SB}.querySelector('.space-header input.rename')`);
     await b.key('Escape', 'Escape', 27);
     // A site in this tab: the home page goes.
-    await b.eval(`app.$.tabstrip.tabStripService_.createTabAt(null, ${JSON.stringify(site.url('/p/Site'))})`);
+    await b.eval(`app.$.tabstrip.tabStripService_.createTabAt(null, ${JSON.stringify(site.url('/p/Site'))}).then(() => true)`);
     await b.waitFor(`!app.$.home.shown`);
   } finally { await b.close(); await site.close(); }
 });

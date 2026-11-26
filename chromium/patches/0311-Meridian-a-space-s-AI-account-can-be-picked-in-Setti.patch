@@ -1,0 +1,310 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <d.afonchenko@dodopizza.com>
+Date: Thu, 26 Nov 2026 11:35:08 +0400
+Subject: [PATCH 3/4] =?UTF-8?q?Meridian:=20a=20space's=20AI=20account=20ca?=
+ =?UTF-8?q?n=20be=20picked=20in=20Settings=20=E2=80=BA=20AI,=20and=20~/.cl?=
+ =?UTF-8?q?aude=20isn't=20a=20second=20"Default"?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Settings › AI showed each account as a chip ("Default · no space yet")
+whose click only opened rename / Sign in… / Remove: the one place to
+choose a space's account was the space's right-click menu, which
+Settings didn't point to. Under each AI with two accounts or more,
+Settings now has one picker per space ("Claude in Work: ~/.claude ▾"),
+the same choice as the space's menu.
+
+When the login environment points the CLI elsewhere
+(CLAUDE_CONFIG_DIR=~/.claude-personal), its own folder was labelled
+"Default" next to the real default ("Personal (default)"); it is now
+"~/.claude" until the person names it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/ai/account_prefs.cc   | 11 ++++---
+ chrome/browser/meridian/ai/accounts.cc        | 13 +++++---
+ chrome/browser/meridian/ai/accounts.h         |  8 +++--
+ .../browser/meridian/ai/accounts_unittest.cc  |  4 ++-
+ chrome/browser/meridian/ai/process_runner.cc  | 16 ++++++++++
+ chrome/browser/meridian/ai/process_runner.h   |  5 +++
+ .../webui_browser/meridian/settings.css       | 20 +++++++++++-
+ .../webui_browser/meridian/settings.html.ts   | 14 +++++++++
+ .../webui_browser/meridian/settings.ts        | 31 +++++++++++++++++++
+ 9 files changed, 108 insertions(+), 14 deletions(-)
+
+diff --git a/chrome/browser/meridian/ai/account_prefs.cc b/chrome/browser/meridian/ai/account_prefs.cc
+index 80db869bac..8f2b28e08f 100644
+--- a/chrome/browser/meridian/ai/account_prefs.cc
++++ b/chrome/browser/meridian/ai/account_prefs.cc
+@@ -45,7 +45,10 @@ std::string LabelOf(PrefService* prefs,
+       }
+     }
+   }
+-  return AccountLabelFromDir(vendor, AccountsHome(), dir);
++  // A space names an account only when it isn't the default
++  // (SetSpaceAccount), so the CLI's own folder here is "~/.claude".
++  return AccountLabelFromDir(vendor, AccountsHome(), dir,
++                             /*is_default=*/false);
+ }
+ 
+ // The saved entry for `dir` (made if missing).
+@@ -85,10 +88,8 @@ void ListAccountsAsync(Profile* profile,
+           [](base::DictValue saved, bool test) {
+             // Tests: only their own home counts, not the variables of the
+             // computer running them.
+-            std::map<std::string, std::string> env;
+-            if (!test) {
+-              env = LoginEnvironment();
+-            }
++            std::map<std::string, std::string> env =
++                test ? TestLoginEnv() : LoginEnvironment();
+             return ListAccounts(AccountsHome(), env, saved);
+           },
+           std::move(saved), test),
+diff --git a/chrome/browser/meridian/ai/accounts.cc b/chrome/browser/meridian/ai/accounts.cc
+index 09fb7b3e25..8c7ced0240 100644
+--- a/chrome/browser/meridian/ai/accounts.cc
++++ b/chrome/browser/meridian/ai/accounts.cc
+@@ -188,9 +188,10 @@ std::string Stem(const AccountVendor& vendor) {
+ 
+ std::string AccountLabelFromDir(const AccountVendor& vendor,
+                                 const base::FilePath& home,
+-                                const base::FilePath& dir) {
++                                const base::FilePath& dir,
++                                bool is_default) {
+   if (SameDir(dir, OwnDir(vendor, home))) {
+-    return "Default";
++    return is_default ? "Default" : "~/" + Stem(vendor);
+   }
+   std::string name = dir.StripTrailingSeparators().BaseName().AsUTF8Unsafe();
+   const std::string stem = Stem(vendor);
+@@ -301,7 +302,7 @@ std::vector<Account> ListAccounts(
+       auto label = labels.find(dir);
+       a.label = label != labels.end()
+                     ? label->second
+-                    : AccountLabelFromDir(vendor, home, dir);
++                    : AccountLabelFromDir(vendor, home, dir, a.is_default);
+       list.push_back(std::move(a));
+     };
+     if (LooksLikeAccountDir(vendor, default_dir)) {
+@@ -430,8 +431,10 @@ base::DictValue SuggestAccounts(
+       const Account* best = nullptr;
+       int score = 0;
+       for (const Account* a : mine) {
+-        // "Default" says nothing about work or home.
+-        int s = a->label == "Default" ? 0 : Match(name, a->label);
++        // "Default" or "~/.claude" says nothing about work or home.
++        int s = a->label == "Default" || a->label.starts_with("~/")
++                    ? 0
++                    : Match(name, a->label);
+         if (s > score) {
+           score = s;
+           best = a;
+diff --git a/chrome/browser/meridian/ai/accounts.h b/chrome/browser/meridian/ai/accounts.h
+index 3e31568500..76c9458693 100644
+--- a/chrome/browser/meridian/ai/accounts.h
++++ b/chrome/browser/meridian/ai/accounts.h
+@@ -74,10 +74,14 @@ struct Account {
+ 
+ std::string AccountId(const base::FilePath& dir);
+ 
+-// "Work" for ~/.claude-work, "Default" for ~/.claude, else the folder's name.
++// "Work" for ~/.claude-work, else the folder's name. The CLI's own folder
++// (~/.claude) is "Default" only while it is the default: when the login
++// environment points the CLI elsewhere (CLAUDE_CONFIG_DIR=~/.claude-personal)
++// it is "~/.claude", not a second "Default" next to the real one.
+ std::string AccountLabelFromDir(const AccountVendor& vendor,
+                                 const base::FilePath& home,
+-                                const base::FilePath& dir);
++                                const base::FilePath& dir,
++                                bool is_default = true);
+ 
+ // The folder the CLI uses by default: its variable in the person's login
+ // environment, else its own folder in `home`.
+diff --git a/chrome/browser/meridian/ai/accounts_unittest.cc b/chrome/browser/meridian/ai/accounts_unittest.cc
+index 9bcfb137ec..041549989a 100644
+--- a/chrome/browser/meridian/ai/accounts_unittest.cc
++++ b/chrome/browser/meridian/ai/accounts_unittest.cc
+@@ -72,7 +72,9 @@ TEST_F(AccountsTest, LoginEnvironmentNamesTheDefault) {
+   ASSERT_EQ(claude.size(), 2u);
+   EXPECT_EQ(claude[0].label, "Personal");
+   EXPECT_TRUE(claude[0].is_default);
+-  EXPECT_EQ(claude[1].label, "Default");
++  // Not a second "Default": the real default is ~/.claude-personal.
++  EXPECT_EQ(claude[1].label, "~/.claude");
++  EXPECT_FALSE(claude[1].is_default);
+ }
+ 
+ TEST_F(AccountsTest, SavedLabelsAddedAndHidden) {
+diff --git a/chrome/browser/meridian/ai/process_runner.cc b/chrome/browser/meridian/ai/process_runner.cc
+index a8b4aafeaa..731061b31d 100644
+--- a/chrome/browser/meridian/ai/process_runner.cc
++++ b/chrome/browser/meridian/ai/process_runner.cc
+@@ -419,6 +419,19 @@ bool Skipped(const std::string& name) {
+ 
+ }  // namespace
+ 
++std::map<std::string, std::string> TestLoginEnv() {
++  std::map<std::string, std::string> env;
++  for (const std::string& pair :
++       base::SplitString(TestSwitchValue("meridian-test-login-env"), ";",
++                         base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++    size_t eq = pair.find('=');
++    if (eq != std::string::npos && eq > 0) {
++      env[pair.substr(0, eq)] = pair.substr(eq + 1);
++    }
++  }
++  return env;
++}
++
+ std::map<std::string, std::string> LoginEnvironment() {
+   static base::NoDestructor<base::Lock> lock;
+   static base::NoDestructor<std::optional<std::map<std::string, std::string>>>
+@@ -487,6 +500,9 @@ std::map<std::string, std::string> LoginEnvironment() {
+     if (!test_path.empty()) {
+       env = base_env;
+       env["PATH"] = test_path + ":/usr/bin:/bin";
++      for (const auto& [name, value] : TestLoginEnv()) {
++        env[name] = value;
++      }
+     } else {
+       base_env["TERM"] = "dumb";
+       std::string out = CaptureOutput(
+diff --git a/chrome/browser/meridian/ai/process_runner.h b/chrome/browser/meridian/ai/process_runner.h
+index 8b7ddbd5eb..418f47b5dc 100644
+--- a/chrome/browser/meridian/ai/process_runner.h
++++ b/chrome/browser/meridian/ai/process_runner.h
+@@ -101,6 +101,11 @@ std::vector<std::string> SandboxedArgv(
+ // environment whose PATH is that folder first.
+ std::map<std::string, std::string> LoginEnvironment();
+ 
++// Tests: --meridian-test-login-env=NAME=value[;NAME=value…], what the
++// person's login environment has (CLAUDE_CONFIG_DIR=…), in the minimal one
++// above and where accounts are listed.
++std::map<std::string, std::string> TestLoginEnv();
++
+ }  // namespace meridian::ai
+ 
+ #endif  // CHROME_BROWSER_MERIDIAN_AI_PROCESS_RUNNER_H_
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.css b/chrome/browser/resources/webui_browser/meridian/settings.css
+index a681485fe6..3b5c56b903 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.css
++++ b/chrome/browser/resources/webui_browser/meridian/settings.css
+@@ -718,11 +718,29 @@ select:focus {
+ }
+ 
+ .row.account-add,
+-.row.account-edit {
++.row.account-edit,
++.row.account-spaces {
+   min-height: 0;
+   padding: 0 12px 10px 46px;
+ }
+ 
++.row.account-spaces::before {
++  display: none;
++}
++
++.row.account-spaces {
++  flex-wrap: wrap;
++  gap: 6px 16px;
++}
++
++.acc-space {
++  display: inline-flex;
++  align-items: center;
++  gap: 8px;
++  font-size: 12px;
++  color: var(--meridian-text-muted);
++}
++
+ .row.account-edit .text {
+   width: 180px;
+ }
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index 00cefa3c9a..7cae620aa5 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -525,6 +525,20 @@ export function getHtml(this: MeridianSettingsElement) {
+             ${icon('plus', 12)}<b>Add account</b></button>
+         </div>
+       </div>
++      ${it.group.perSpace.length ? html`
++        <div class="row account-spaces" id="accountSpaces-${it.group.vendor}">
++          ${it.group.perSpace.map(s => html`
++            <label class="acc-space">
++              <span>${it.group!.short} in ${s.name}</span>
++              <select data-vendor="${it.group!.vendor}" data-space="${s.id}"
++                  aria-label="${it.group!.short} account in ${s.name}"
++                  @change="${this.onSpaceAccountChange_}">
++                ${it.group!.choices.map(c => html`
++                  <option value="${c.value}" ?selected="${c.value === s.chosen}">
++                    ${c.label}</option>`)}
++              </select>
++            </label>`)}
++        </div>` : ''}
+       ${it.group.adding ? html`
+         <div class="row account-add" data-vendor="${it.group.vendor}">
+           <input class="text grow" spellcheck="false" autocomplete="off"
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index e278db250d..1b473d3761 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -134,6 +134,15 @@ export interface AccountGroup {
+   short: string;
+   chips: AccountChip[];
+   adding: boolean;
++  // With two accounts or more: which one each space runs as ("" = the
++  // default), picked right here as in the space's menu.
++  perSpace: SpaceAccountPick[];
++  choices: {value: string, label: string}[];
++}
++export interface SpaceAccountPick {
++  id: string;
++  name: string;
++  chosen: string;
+ }
+ 
+ // A row of "Your AI" and its accounts; `row` null for a tool that only has
+@@ -631,10 +640,21 @@ export class MeridianSettingsElement extends CrLitElement {
+         this.spaces_.find(s => s.id === id)?.name || 'Space';
+     const named = Object.values(this.accounts_?.spaces || {})
+                       .some(per => !!per[vendorId]);
++    const many = vendor.accounts.length > 1;
+     return {
+       vendor: vendorId,
+       short: vendor.short,
+       adding: this.accountAdd_ === vendorId,
++      perSpace: many ? this.spaces_.map(s => ({
++        id: s.id,
++        name: s.name || 'Space',
++        chosen: this.accounts_?.spaces[s.id]?.[vendorId] || '',
++      })) : [],
++      choices: many ? vendor.accounts.map(a => ({
++        value: a.default ? '' : a.id,
++        label: a.default && a.label !== 'Default' ? `${a.label} (default)` :
++                                                    a.label,
++      })) : [],
+       chips: vendor.accounts.map(a => {
+         let where = '';
+         if (a.default) {
+@@ -1158,6 +1178,17 @@ export class MeridianSettingsElement extends CrLitElement {
+     this.accountMessage_ = '';
+   }
+ 
++  // "Claude in Work: ~/.claude ▾": the same choice as the space's menu.
++  protected async onSpaceAccountChange_(e: Event) {
++    const select = e.target as HTMLSelectElement;
++    await this.handler_.setSpaceAiAccount(select.dataset['space'] || '',
++                                          select.dataset['vendor'] || '',
++                                          select.value);
++    await this.loadAccounts_();
++    this.accountMessage_ = '';
++    this.fire('meridian-ai-accounts-changed');
++  }
++
+   protected onAddAccountClick_(e: Event) {
+     const vendor = (e.currentTarget as HTMLElement).dataset['vendor'] || '';
+     this.accountAdd_ = this.accountAdd_ === vendor ? '' : vendor;

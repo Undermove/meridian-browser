@@ -1,0 +1,299 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 24 Nov 2026 10:32:09 +0400
+Subject: [PATCH 247/297] Meridian: Ask with OpenCode 2.x runs on its own
+ server
+
+OpenCode 2.x run joins its background service when one is up; that service
+never saw Meridian's config, so the agent was missing (Agent not found:
+"meridian") and its deny-all didn't apply. Meridian now asks run --help and
+passes --standalone where it exists (1.x doesn't know it). In the closed home
+OpenCode can read the person's global opencode.json and opencode.jsonc, also
+through a symlink and where XDG or OPENCODE_CONFIG_DIR moved them, and its own
+folders exist before it starts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/ai/local_agents.cc | 195 +++++++++++++++++++--
+ chrome/browser/meridian/ai/providers.cc    |   9 +
+ chrome/browser/meridian/ai/providers.h     |   9 +
+ 3 files changed, 194 insertions(+), 19 deletions(-)
+
+diff --git a/chrome/browser/meridian/ai/local_agents.cc b/chrome/browser/meridian/ai/local_agents.cc
+index 4776188fd8..81b0a30d60 100644
+--- a/chrome/browser/meridian/ai/local_agents.cc
++++ b/chrome/browser/meridian/ai/local_agents.cc
+@@ -10,6 +10,7 @@
+ 
+ #include "base/base64.h"
+ #include "base/environment.h"
++#include "base/files/file.h"
+ #include "base/files/file_util.h"
+ #include "base/json/json_reader.h"
+ #include "base/json/json_writer.h"
+@@ -225,6 +226,137 @@ std::vector<base::FilePath> CliOwnFolders(
+   return out;
+ }
+ 
++// Whether a folder or file named by the person's environment may be opened in
++// the sandbox: never the home folder or above it, nor anything holding, or
++// inside, what the sandbox protects.
++bool MayOpen(const base::FilePath& path,
++             const base::FilePath& home,
++             const std::vector<base::FilePath>& protected_paths) {
++  if (!path.IsAbsolute() || path.ReferencesParent()) {
++    return false;
++  }
++  const auto real = [](const base::FilePath& p) {
++    base::FilePath resolved = RealFilePath(p);
++    return resolved.empty() ? p : resolved;
++  };
++  const base::FilePath target = real(path);
++  const base::FilePath real_home = real(home);
++  if (target == real_home || target.IsParent(real_home)) {
++    return false;
++  }
++  for (const base::FilePath& p : protected_paths) {
++    const base::FilePath guarded = real(p);
++    if (target == guarded || guarded.IsParent(target) ||
++        target.IsParent(guarded)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// OpenCode's folders where the person's environment moved them.
++std::vector<base::FilePath> OpenCodeMovedFolders(
++    const base::FilePath& home,
++    const std::map<std::string, std::string>& env,
++    const std::vector<base::FilePath>& protected_paths) {
++  std::vector<base::FilePath> out;
++  const auto add = [&](const base::FilePath& path) {
++    if (MayOpen(path, home, protected_paths)) {
++      out.push_back(path);
++    }
++  };
++  for (const char* name : {"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
++                           "XDG_CACHE_HOME"}) {
++    if (auto it = env.find(name); it != env.end() && !it->second.empty()) {
++      add(base::FilePath::FromUTF8Unsafe(it->second).AppendASCII("opencode"));
++    }
++  }
++  if (auto it = env.find("OPENCODE_CONFIG_DIR");
++      it != env.end() && !it->second.empty()) {
++    add(base::FilePath::FromUTF8Unsafe(it->second));
++  }
++  return out;
++}
++
++// The global config files, read only, wherever they really are: people keep
++// them in a dotfiles repository and link them here.
++std::vector<base::FilePath> OpenCodeConfigFiles(
++    const base::FilePath& home,
++    const std::map<std::string, std::string>& env,
++    const std::vector<base::FilePath>& protected_paths) {
++  std::vector<base::FilePath> dirs = {home.AppendASCII(".config/opencode")};
++  for (const char* name : {"XDG_CONFIG_HOME", "OPENCODE_CONFIG_DIR"}) {
++    if (auto it = env.find(name); it != env.end() && !it->second.empty()) {
++      base::FilePath dir = base::FilePath::FromUTF8Unsafe(it->second);
++      dirs.push_back(std::string_view(name) == "XDG_CONFIG_HOME"
++                         ? dir.AppendASCII("opencode")
++                         : dir);
++    }
++  }
++  std::vector<base::FilePath> files;
++  for (const base::FilePath& dir : dirs) {
++    files.push_back(dir.AppendASCII("opencode.json"));
++    files.push_back(dir.AppendASCII("opencode.jsonc"));
++  }
++  if (auto it = env.find("OPENCODE_CONFIG");
++      it != env.end() && !it->second.empty()) {
++    files.push_back(base::FilePath::FromUTF8Unsafe(it->second));
++  }
++  std::vector<base::FilePath> out;
++  for (const base::FilePath& file : files) {
++    const base::FilePath real = RealFilePath(file);
++    if (!real.empty() && base::PathExists(real) &&
++        !base::DirectoryExists(real) &&
++        MayOpen(real, home, protected_paths)) {
++      out.push_back(real);
++    }
++  }
++  return out;
++}
++
++// Asks this OpenCode, in the same sandbox, whether it has a background
++// service to stay away from. Remembered per installed binary.
++bool OpenCodeWantsPrivateServer(const std::string& bin,
++                                std::vector<std::string> argv,
++                                const std::map<std::string, std::string>& env,
++                                const std::string& cwd,
++                                scoped_refptr<CancelFlag> cancel) {
++  static base::NoDestructor<base::Lock> lock;
++  static base::NoDestructor<std::map<std::string, bool>> known;
++  base::File::Info info;
++  base::GetFileInfo(RealFilePath(base::FilePath::FromUTF8Unsafe(bin)), &info);
++  const std::string key =
++      bin + "|" +
++      base::NumberToString(info.last_modified.InMillisecondsSinceUnixEpoch()) +
++      "|" + base::NumberToString(info.size);
++  {
++    base::AutoLock hold(*lock);
++    if (auto it = known->find(key); it != known->end()) {
++      return it->second;
++    }
++  }
++  ProcessSpec probe;
++  probe.argv = std::move(argv);
++  probe.env = env;
++  probe.cwd = cwd;
++  probe.stdin_text = "";
++  probe.timeout = base::Seconds(15);
++  probe.max_output = 256u << 10;
++  std::string help;
++  const ProcessResult result = RunProcess(
++      probe, cancel,
++      base::BindRepeating(
++          [](std::string* out, std::string_view chunk) { out->append(chunk); },
++          base::Unretained(&help)));
++  help += result.stderr_text;
++  const bool wants = OpenCodeNeedsPrivateServer(help);
++  if (result.started && result.exit_code == 0 && !result.killed) {
++    base::AutoLock hold(*lock);
++    (*known)[key] = wants;
++  }
++  return wants;
++}
++
+ // Where command-line tools are installed under the home folder, and the CLI
+ // itself wherever it is: read only.
+ std::vector<base::FilePath> CliToolFolders(const base::FilePath& home,
+@@ -264,33 +396,58 @@ CliOutcome RunCliBlocking(std::string provider_id,
+   base::FilePath dir = workdir.AppendUTF8(p->id);
+   base::CreateDirectory(dir);
+   MakePrivate(dir, 0700);
+-  CommandSpec command = BuildCommand(*p, turn, dir.AsUTF8Unsafe());
+-  for (const auto& [name, content] : command.files) {
+-    base::FilePath file = dir.AppendUTF8(name);
+-    base::WriteFile(file, content);
+-    MakePrivate(file, 0600);
+-  }
+-  ProcessSpec spec;
+-  spec.argv = {bin};
+-  spec.argv.insert(spec.argv.end(), command.args.begin(), command.args.end());
+   // The CLIs keep tools that read files, and the page in the prompt may try
+   // to steer them: credentials, other browsers' profiles and Meridian's own
+   // data are off limits, except the run's working directory.
+-  const base::FilePath home = base::GetHomeDir();
+-  std::vector<base::FilePath> denied = SensitivePaths(home);
+-  denied.push_back(home);
++  const base::FilePath test_home = TestSwitchPath("meridian-test-home");
++  const base::FilePath home =
++      test_home.empty() ? base::GetHomeDir() : test_home;
++  if (!test_home.empty()) {
++    env["HOME"] = test_home.AsUTF8Unsafe();
++  }
++  std::vector<base::FilePath> protected_paths = SensitivePaths(home);
+   base::FilePath user_data;
+   if (base::PathService::Get(chrome::DIR_USER_DATA, &user_data)) {
+-    denied.push_back(user_data);
++    protected_paths.push_back(user_data);
+   }
+   // The profile folder, wherever it lives.
+-  denied.push_back(workdir.DirName());
+-  if (p->sandboxed) {
+-    std::vector<base::FilePath> allowed = CliOwnFolders(p->id, home, env);
+-    allowed.push_back(dir);
+-    spec.argv =
+-        SandboxedArgv(spec.argv, denied, allowed, CliToolFolders(home, bin));
++  protected_paths.push_back(workdir.DirName());
++  std::vector<base::FilePath> denied = protected_paths;
++  denied.push_back(home);
++  std::vector<base::FilePath> allowed = CliOwnFolders(p->id, home, env);
++  std::vector<base::FilePath> readable = CliToolFolders(home, bin);
++  if (p->id == "opencode") {
++    for (base::FilePath& f : OpenCodeMovedFolders(home, env, protected_paths)) {
++      allowed.push_back(std::move(f));
++    }
++    for (base::FilePath& f : OpenCodeConfigFiles(home, env, protected_paths)) {
++      readable.push_back(std::move(f));
++    }
++    // Inside the closed home it can't make the parents of its own folders
++    // (~/.local on a Mac that has none yet), and stops at start.
++    for (const base::FilePath& f : allowed) {
++      base::CreateDirectory(f);
++    }
+   }
++  allowed.push_back(dir);
++  const auto contained = [&](std::vector<std::string> argv) {
++    return p->sandboxed ? SandboxedArgv(argv, denied, allowed, readable) : argv;
++  };
++  Turn prepared = std::move(turn);
++  if (p->id == "opencode") {
++    prepared.private_server = OpenCodeWantsPrivateServer(
++        bin, contained({bin, "run", "--help"}), env, dir.AsUTF8Unsafe(), cancel);
++  }
++  CommandSpec command = BuildCommand(*p, prepared, dir.AsUTF8Unsafe());
++  for (const auto& [name, content] : command.files) {
++    base::FilePath file = dir.AppendUTF8(name);
++    base::WriteFile(file, content);
++    MakePrivate(file, 0600);
++  }
++  ProcessSpec spec;
++  spec.argv = {bin};
++  spec.argv.insert(spec.argv.end(), command.args.begin(), command.args.end());
++  spec.argv = contained(std::move(spec.argv));
+   if (p->id == "claude-code") {
+     // Its own sign-in (the plan), not a key from the environment or the
+     // session of a Claude Code that started Meridian.
+diff --git a/chrome/browser/meridian/ai/providers.cc b/chrome/browser/meridian/ai/providers.cc
+index 759efa7805..d1b627b5c9 100644
+--- a/chrome/browser/meridian/ai/providers.cc
++++ b/chrome/browser/meridian/ai/providers.cc
+@@ -526,6 +526,10 @@ const Provider* FindProvider(const std::string& id) {
+ // can read is limited by the sandbox-exec profile local_agents.cc runs them
+ // under (no credentials, browser profiles or Meridian's data). The prompt
+ // goes on stdin where the CLI supports it, never through a shell.
++bool OpenCodeNeedsPrivateServer(const std::string& run_help) {
++  return !run_help.contains("--format") || run_help.contains("--standalone");
++}
++
+ CommandSpec BuildCommand(const Provider& p,
+                          const Turn& turn,
+                          const std::string& cwd) {
+@@ -643,6 +647,11 @@ CommandSpec BuildCommand(const Provider& p,
+     // The run's directory is the process's own (no --dir: OpenCode before
+     // 1.x doesn't know it, "Unrecognized flag: --dir").
+     spec.args = {"run", "--format", "json"};
++    // OpenCode 2.x joins its background service when one is up. That service
++    // has neither the agent nor the deny-all above.
++    if (turn.private_server) {
++      spec.args.push_back("--standalone");
++    }
+     if (!turn.system.empty()) {
+       spec.args.push_back("--agent");
+       spec.args.push_back("meridian");
+diff --git a/chrome/browser/meridian/ai/providers.h b/chrome/browser/meridian/ai/providers.h
+index 18bd652c4b..cbdd2e4827 100644
+--- a/chrome/browser/meridian/ai/providers.h
++++ b/chrome/browser/meridian/ai/providers.h
+@@ -87,8 +87,17 @@ struct Turn {
+   // The CLI's own session to continue, if it can.
+   std::string resume;
+   std::string model;
++  // OpenCode: run on a private server (--standalone), for versions that
++  // would otherwise join a background service started without this run's
++  // config and permissions.
++  bool private_server = false;
+ };
+ 
++// From the output of `opencode run --help`: whether this OpenCode needs
++// --standalone. Output that can't be read counts as yes: the run then fails
++// visibly instead of risking a service without Meridian's restrictions.
++bool OpenCodeNeedsPrivateServer(const std::string& run_help);
++
+ // `cwd`: the run's private working directory.
+ CommandSpec BuildCommand(const Provider& provider,
+                          const Turn& turn,

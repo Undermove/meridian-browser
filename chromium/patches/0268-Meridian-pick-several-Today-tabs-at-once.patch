@@ -1,0 +1,365 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 06:30:11 +0400
+Subject: [PATCH 268/297] Meridian: pick several Today tabs at once
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+⌘-click (Ctrl off macOS) and ⇧-click pick Today tabs, as in Arc; a drag
+moves the group together (Today order, pinned, a folder, favorites,
+another space), and the context menu on a picked tab pins them, adds them
+to a folder (or a new one), moves them to a space, copies their links,
+archives or closes them. Esc or a plain click lets go.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../resources/webui_browser/meridian/rows.css |   8 +
+ .../webui_browser/meridian/sidebar.html.ts    |   9 +-
+ .../webui_browser/meridian/sidebar.ts         | 185 +++++++++++++++++-
+ .../webui_browser/meridian/tab_row.ts         |   3 +
+ 4 files changed, 198 insertions(+), 7 deletions(-)
+
+diff --git a/chrome/browser/resources/webui_browser/meridian/rows.css b/chrome/browser/resources/webui_browser/meridian/rows.css
+index 5d8a6f6ef7..e25cc28c31 100644
+--- a/chrome/browser/resources/webui_browser/meridian/rows.css
++++ b/chrome/browser/resources/webui_browser/meridian/rows.css
+@@ -48,6 +48,14 @@ button {
+   box-shadow: var(--meridian-row-shadow);
+ }
+ 
++/* Picked with ⌘-click / ⇧-click: an accent tint and ring, so the group
++ * reads apart from the open tab. */
++:host([selected]) .row {
++  background: color-mix(in srgb, var(--meridian-accent, #6b6bd6) 18%, transparent);
++  box-shadow: inset 0 0 0 1.5px
++      color-mix(in srgb, var(--meridian-accent, #6b6bd6) 55%, transparent);
++}
++
+ /* A half of a split's row (sidebar.css .split-row): the row around both
+  * shows the selection; the focused half only a little. */
+ :host([half]) {
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+index e385fc269b..112bf77366 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.html.ts
+@@ -55,14 +55,17 @@ export function getHtml(this: MeridianSidebarElement) {
+         <div class="split-row ${this.splitRowActive_(r) ? 'active' : ''}"
+             data-split="${r.key}">
+           <meridian-tab-row half .tab="${r.start}" .host="${this}"
+-              .agentTab="${this.agentTab_}" .renaming="${this.renaming_}">
++              .agentTab="${this.agentTab_}" .renaming="${this.renaming_}"
++              ?selected="${this.selected_.includes(r.start.id)}">
+           </meridian-tab-row>
+           <meridian-tab-row half .tab="${r.end}" .host="${this}"
+-              .agentTab="${this.agentTab_}" .renaming="${this.renaming_}">
++              .agentTab="${this.agentTab_}" .renaming="${this.renaming_}"
++              ?selected="${this.selected_.includes(r.end.id)}">
+           </meridian-tab-row>
+         </div>` : html`
+         <meridian-tab-row .tab="${r.start}" .host="${this}"
+-            .agentTab="${this.agentTab_}" .renaming="${this.renaming_}">
++            .agentTab="${this.agentTab_}" .renaming="${this.renaming_}"
++            ?selected="${this.selected_.includes(r.start.id)}">
+         </meridian-tab-row>`}`)}
+     </div>
+   ` : ''}
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index d787884446..6d3a99924f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -38,7 +38,7 @@ import type {CommandBarTab} from './command_bar.js';
+ import {getCss} from './sidebar.css.js';
+ import {getHtml} from './sidebar.html.js';
+ import {sourceName} from './import_sources.js';
+-import {keyText} from './keys.js';
++import {isMac, keyText} from './keys.js';
+ 
+ export const FAVORITES = 'favorites';
+ 
+@@ -155,6 +155,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+       state_: {state: true, type: Object},
+       menu_: {state: true, type: Object},
+       renaming_: {state: true, type: String},
++      selected_: {state: true, type: Array},
+       rev_: {state: true, type: Number},
+       space_: {state: true, type: Object},
+       spaceTitle_: {state: true, type: String},
+@@ -186,6 +187,10 @@ export class MeridianSidebarElement extends CrLitElement implements
+   protected accessor menu_: OpenMenu|null = null;
+   // The item / space id being renamed in place.
+   protected accessor renaming_: string = '';
++  // Today tabs picked with ⌘-click / ⇧-click (Arc): dragged, closed, pinned
++  // or moved together. Esc or a plain click clears it.
++  protected accessor selected_: NodeId[] = [];
++  private selAnchor_: NodeId|null = null;
+   // Bumped on every change, so the row elements re-render with it.
+   protected accessor rev_: number = 0;
+   // Derived in willUpdate() for the template.
+@@ -328,6 +333,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+     }, 2500);
+     window.addEventListener('blur', this.closeMenu_);
+     document.addEventListener('keydown', this.onMenuKeydown_, true);
++    document.addEventListener('keydown', this.onSelectionKeydown_);
+     this.shadowRoot.addEventListener('dragstart', this.onDragStart_ as EventListener);
+     this.shadowRoot.addEventListener('dragend', this.onDragEnd_);
+     this.shadowRoot.addEventListener('dragover', this.onDragOver_ as EventListener);
+@@ -358,6 +364,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+     document.removeEventListener('mousedown', this.onDocumentMouseDown_, true);
+     window.removeEventListener('blur', this.closeMenu_);
+     document.removeEventListener('keydown', this.onMenuKeydown_, true);
++    document.removeEventListener('keydown', this.onSelectionKeydown_);
+   }
+ 
+   // ---------------------------------------------------------------- tabs
+@@ -767,7 +774,13 @@ export class MeridianSidebarElement extends CrLitElement implements
+         this.handler_.splitTabs(
+             t.el.dataset['tab'], drag.tab, t.side === 'left');
+       } else if (drag.tab) {
+-        this.moveTodayTab_(drag.tab, t.el.dataset['tab'], t.pos === 'before');
++        const target = t.el.dataset['tab'];
++        const group = this.groupOf_(drag.tab).filter(id => id !== target);
++        // The group keeps its order: each lands right next to the target.
++        const above = t.pos === 'before';
++        for (const id of above ? group : [...group].reverse()) {
++          this.moveTodayTab_(id, target, above);
++        }
+       } else if (drag.item) {
+         this.handler_.removeItem(drag.item);
+       }
+@@ -776,7 +789,10 @@ export class MeridianSidebarElement extends CrLitElement implements
+     if (t.zone === 'space') {
+       const target = t.el.dataset['space']!;
+       if (drag.tab) {
+-        this.handler_.moveTabToSpace(drag.tab, target);
++        for (const id of this.groupOf_(drag.tab)) {
++          this.handler_.moveTabToSpace(id, target);
++        }
++        this.clearSelection();
+       } else if (drag.item) {
+         this.handler_.moveItem(
+             drag.item, {container: target, parentId: '', index: -1});
+@@ -806,7 +822,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+       }
+     }
+     if (drag.tab) {
+-      this.handler_.pinTab(drag.tab, position, this.customTitle_(drag.tab));
++      const at = position;
++      this.groupOf_(drag.tab).forEach((id, i) => this.handler_.pinTab(
++          id, {...at, index: at.index < 0 ? -1 : at.index + i},
++          this.customTitle_(id)));
++      this.clearSelection();
+     } else if (drag.item && drag.item !== t.el.dataset['item']) {
+       this.handler_.moveItem(drag.item, position);
+     }
+@@ -1068,10 +1088,71 @@ export class MeridianSidebarElement extends CrLitElement implements
+         this.renaming_ === 'tab:' + tab.id) {
+       return;
+     }
++    const toggle = isMac ? e.metaKey : e.ctrlKey;
++    if (toggle || e.shiftKey) {
++      this.extendSelection_(tab.id, e.shiftKey);
++      return;
++    }
++    // A press on a picked tab keeps the group (it may be dragged); any
++    // other press lets it go.
++    if (!this.selected_.includes(tab.id)) {
++      this.clearSelection();
++    }
+     this.notePickedInView_(e, {tab: tab.id});
+     this.tabStripService_.activateTab(tab.id);
+   }
+ 
++  // ⌘-click adds or takes away one tab (the open one joins the first
++  // time, as in Arc); ⇧-click picks every Today tab from the last one picked.
++  private extendSelection_(id: NodeId, range: boolean) {
++    const order = this.today_.map(t => t.id);
++    const active = this.today_.find(t => t.isActive)?.id;
++    let sel = [...this.selected_];
++    if (!sel.length && active && active !== id) {
++      sel.push(active);
++      this.selAnchor_ = active;
++    }
++    if (range) {
++      const from = order.indexOf(this.selAnchor_ ?? active ?? id);
++      const to = order.indexOf(id);
++      if (from >= 0 && to >= 0) {
++        const [a, b] = from < to ? [from, to] : [to, from];
++        sel = [...new Set([...sel, ...order.slice(a, b + 1)])];
++      } else {
++        sel.push(id);
++      }
++    } else {
++      sel = sel.includes(id) ? sel.filter(x => x !== id) : [...sel, id];
++      this.selAnchor_ = id;
++    }
++    // Top to bottom, as Today shows them.
++    this.selected_ = order.filter(x => sel.includes(x));
++  }
++
++  clearSelection() {
++    if (this.selected_.length) {
++      this.selected_ = [];
++    }
++    this.selAnchor_ = null;
++  }
++
++  selectedTabs(): NodeId[] {
++    return this.selected_;
++  }
++
++  // The tabs a drag or a menu acts on: the group when `id` is in it.
++  private groupOf_(id: NodeId): NodeId[] {
++    return this.selected_.length > 1 && this.selected_.includes(id) ?
++        this.selected_.filter(x => this.tabs_.has(x)) :
++        [id];
++  }
++
++  private onSelectionKeydown_ = (e: KeyboardEvent) => {
++    if (e.key === 'Escape' && this.selected_.length && !this.menu_) {
++      this.clearSelection();
++    }
++  };
++
+   onItemMouseDown(e: MouseEvent, item: Item) {
+     if (e.button !== 0 || this.isButton_(e) || this.renaming_ === item.id) {
+       return;
+@@ -1836,6 +1917,13 @@ export class MeridianSidebarElement extends CrLitElement implements
+         this.state_?.offTheRecord ? 'Private' : this.space_?.name || '';
+     this.favorites_ = this.state_?.favorites || [];
+     this.today_ = this.todayTabs();
++    // Picked tabs that left Today (closed, pinned, moved) leave the group.
++    if (this.selected_.length) {
++      const here = new Set(this.today_.map(t => t.id));
++      if (this.selected_.some(id => !here.has(id))) {
++        this.selected_ = this.selected_.filter(id => here.has(id));
++      }
++    }
+     this.ghostToday_ = this.ghost_ ? this.todayTabs(this.ghost_) : [];
+     const active = this.activeTab_();
+     if (active) {
+@@ -1999,6 +2087,12 @@ export class MeridianSidebarElement extends CrLitElement implements
+   onTabContextMenu(e: MouseEvent, tab: Tab) {
+     const space = this.activeSpace();
+     assert(space);
++    const group = this.groupOf_(tab.id);
++    if (group.length > 1) {
++      this.openMenu_(e, this.selectionMenu_(group, space));
++      return;
++    }
++    this.clearSelection();
+     const move = this.moveToSpaceMenu_(id => this.handler_.moveTabToSpace(tab.id, id));
+     const at = this.today_.findIndex(t => t.id === tab.id);
+     const below = at < 0 ? [] : this.today_.slice(at + 1).map(t => t.id);
+@@ -2060,6 +2154,89 @@ export class MeridianSidebarElement extends CrLitElement implements
+     ]);
+   }
+ 
++  // The menu for several picked tabs: everything acts on all of them.
++  private selectionMenu_(group: NodeId[], space: Space): MenuEntry[] {
++    const n = group.length;
++    const done = () => this.clearSelection();
++    const pinAt = (container: string, parentId: string, index: number) => {
++      group.forEach((id, i) => this.handler_.pinTab(
++          id, {container, parentId, index: index < 0 ? -1 : index + i},
++          this.customTitle_(id)));
++      done();
++    };
++    const folders: MenuEntry[] = [];
++    const walk = (items: Item[], depth: number) => {
++      for (const it of items) {
++        if (it.isFolder) {
++          folders.push({label: '\u2003'.repeat(depth) + (it.title || 'Folder'),
++                        icon: 'folder',
++                        action: () => pinAt(space.id, it.id, -1)});
++          walk(it.children, depth + 1);
++        }
++      }
++    };
++    walk(space.pinned, 0);
++    folders.push({
++      label: 'New Folder',
++      icon: 'plus',
++      separatorBefore: folders.length > 0,
++      action: async () => {
++        const {itemId} = await this.handler_.addFolder(
++            {container: space.id, parentId: '', index: 0}, 'New Folder');
++        if (itemId) {
++          pinAt(space.id, itemId, 0);
++          this.renaming_ = itemId;
++        }
++      },
++    });
++    const move = this.moveToSpaceMenu_(id => {
++      group.forEach(t => this.handler_.moveTabToSpace(t, id));
++      done();
++    });
++    return [
++      {label: `${n} Tabs`, header: true},
++      {
++        label: 'Copy Links',
++        icon: 'link',
++        action: () => {
++          navigator.clipboard.writeText(
++              group.map(id => this.tabs_.get(id)?.url || '').join('\n'));
++          done();
++        },
++      },
++      {
++        label: 'Add to Favorites',
++        icon: 'star',
++        separatorBefore: true,
++        action: () => pinAt(FAVORITES, '', -1),
++      },
++      {label: `Pin ${n} Tabs`, icon: 'pin',
++       action: () => pinAt(space.id, '', -1)},
++      {label: 'Add to Folder', icon: 'folder', submenu: folders},
++      {label: 'Move to Space', icon: 'moveTo', enabled: move.length > 0,
++       submenu: move},
++      // Closed Today tabs go to the Archive, as in Arc.
++      {
++        label: `Archive ${n} Tabs`,
++        icon: 'archive',
++        separatorBefore: true,
++        action: () => {
++          this.tabStripService_.closeNodes(group);
++          done();
++        },
++      },
++      {
++        label: `Close ${n} Tabs`,
++        icon: 'x',
++        danger: true,
++        action: () => {
++          this.tabStripService_.closeNodes(group);
++          done();
++        },
++      },
++    ];
++  }
++
+   // Mute Tab / Unmute Tab, for a tab that plays sound or is muted.
+   private muteMenu_(tab: Tab): MenuEntry[] {
+     const alerts = tab.alertStates || [];
+diff --git a/chrome/browser/resources/webui_browser/meridian/tab_row.ts b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+index f5fe7fb0dd..e924cf4f27 100644
+--- a/chrome/browser/resources/webui_browser/meridian/tab_row.ts
++++ b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+@@ -37,6 +37,8 @@ export class MeridianTabRowElement extends CrLitElement {
+       agent: {type: Boolean, reflect: true},
+       // One of a split's two halves, in the split's row.
+       half: {type: Boolean, reflect: true},
++      // Picked with ⌘-click / ⇧-click, with others.
++      selected: {type: Boolean, reflect: true},
+       // What the sidebar is renaming in place ('tab:<id>' when it's this).
+       renaming: {type: String},
+       favicon_: {state: true, type: String},
+@@ -53,6 +55,7 @@ export class MeridianTabRowElement extends CrLitElement {
+   accessor agentTab: string = '';
+   accessor agent: boolean = false;
+   accessor half: boolean = false;
++  accessor selected: boolean = false;
+   accessor renaming: string = '';
+   accessor host: MeridianSidebarElement|null = null;
+   protected accessor favicon_: string = '';

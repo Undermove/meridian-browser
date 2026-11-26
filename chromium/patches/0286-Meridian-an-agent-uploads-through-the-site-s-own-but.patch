@@ -1,0 +1,263 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 13:46:45 +0400
+Subject: [PATCH 286/297] Meridian: an agent uploads through the site's own
+ button when the page has no file field
+
+upload_file with nothing named on a page with no <input type=file> asks
+the person as before (same per-file confirmation and Settings > AI > File
+uploads policy, "Always on <site>"), then offers the approved file to the
+tab's next file chooser for 30 seconds and tells the agent to click the
+site's upload button now. An input created on click or showOpenFilePicker
+gets the file instead of the native dialog. Declined or turned off: nothing
+is offered. Test switches: --meridian-test-cancel-file-choosers (no native
+dialog in tests), --meridian-test-upload-offer-seconds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |  1 +
+ chrome/browser/meridian/agent/agent_input.cc  | 11 ++-
+ chrome/browser/meridian/agent/agent_page.js   |  5 ++
+ .../browser/meridian/agent/agent_service.cc   | 86 ++++++++++++++++---
+ chrome/browser/meridian/agent/agent_service.h |  5 ++
+ .../browser/meridian/agent/agent_tools.json   |  2 +-
+ 6 files changed, 96 insertions(+), 14 deletions(-)
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index bb0afc7ab2..d39e12ce11 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -55,6 +55,7 @@ source_set("agent_input") {
+     "agent/agent_input.h",
+   ]
+   public_deps = [ "//base" ]
++  deps = [ ":test_switches" ]
+ }
+ 
+ # Meridian's own sheet before macOS asks something (system_asks.h): no
+diff --git a/chrome/browser/meridian/agent/agent_input.cc b/chrome/browser/meridian/agent/agent_input.cc
+index 9b8bffe8f4..682582069a 100644
+--- a/chrome/browser/meridian/agent/agent_input.cc
++++ b/chrome/browser/meridian/agent/agent_input.cc
+@@ -13,6 +13,7 @@
+ #include "base/strings/string_util.h"
+ #include "base/strings/string_split.h"
+ #include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/meridian/test_switches.h"
+ 
+ namespace meridian::agent_input {
+ 
+@@ -357,15 +358,21 @@ std::optional<base::FilePath> TakeFile(const void* tab,
+                                        std::string_view host,
+                                        Chooser kind,
+                                        bool picker) {
++  // Tests never see a native file dialog: a chooser with no offer is
++  // cancelled.
++  const std::optional<base::FilePath> none =
++      meridian::HasTestSwitch("meridian-test-cancel-file-choosers")
++          ? std::optional<base::FilePath>(base::FilePath())
++          : std::nullopt;
+   auto it = Offers().find(tab);
+   if (it == Offers().end()) {
+-    return std::nullopt;
++    return none;
+   }
+   Offer offer = std::move(it->second);
+   Offers().erase(it);
+   if (base::TimeTicks::Now() > offer.deadline) {
+     Tell(std::move(offer.done), "withdrawn");
+-    return std::nullopt;
++    return none;
+   }
+   if (!SameSite(host, offer.host)) {
+     Tell(std::move(offer.done),
+diff --git a/chrome/browser/meridian/agent/agent_page.js b/chrome/browser/meridian/agent/agent_page.js
+index d11392cb69..9d426f83bf 100644
+--- a/chrome/browser/meridian/agent/agent_page.js
++++ b/chrome/browser/meridian/agent/agent_page.js
+@@ -346,6 +346,11 @@
+         el = inner;
+       }
+       if (!el && !given) el = files.length === 1 ? files[0] : null;
++      // No field at all and nothing named: the site makes its <input
++      // type=file> (or calls showOpenFilePicker) when its own button is
++      // clicked. After approval the file is offered to this tab's next
++      // chooser, and the agent clicks that button.
++      if (!el && !given && !files.length) return {chooser: true, offer: true, label: ''};
+       if (!isFile(el)) {
+         return {error: files.length ? 'pick the file field: element_index or selector of an <input type=file> (' + files.length + ' on the page), or the button that opens the site\'s file chooser' : 'no file field on this page — give the button that opens the site\'s file chooser (element_index, selector or text), or open its attach/upload dialog first'};
+       }
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index c90e350cb9..331ae12763 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -2890,11 +2890,16 @@ void AgentService::UploadChecked(
+             }
+             // No mark: a button that opens the site's file chooser.
+             const bool chooser = t.FindBool("chooser").value_or(false);
++            // No field and nothing named: offered to the tab's next chooser,
++            // opened by the site's own upload button.
++            const bool offer = t.FindBool("offer").value_or(false);
+             std::string mark =
+                 t.FindString("mark") ? *t.FindString("mark") : std::string();
+             std::string label = t.FindString("label") && !t.FindString("label")->empty()
+                                     ? *t.FindString("label")
+-                                    : chooser ? "button" : "file field";
++                                    : offer     ? "the site's upload button"
++                                    : chooser   ? "button"
++                                                : "file field";
+             std::string mb =
+                 size >= 1024 * 1024
+                     ? base::StringPrintf("%.1f MB", size / 1024.0 / 1024.0)
+@@ -2914,8 +2919,8 @@ void AgentService::UploadChecked(
+             base::OnceCallback<void(int)> decided = base::BindOnce(
+                     [](base::WeakPtr<AgentService> self,
+                        tabs::TabHandle handle, std::unique_ptr<Call> call,
+-                       std::string mark, base::FilePath real, std::string mb,
+-                       std::string label, int choice) {
++                       std::string mark, bool offer, base::FilePath real,
++                       std::string mb, std::string label, int choice) {
+                       tabs::TabInterface* tab = handle.Get();
+                       if (!self || !tab) {
+                         return call->Fail("the tab is gone");
+@@ -2943,8 +2948,9 @@ void AgentService::UploadChecked(
+                               [](base::WeakPtr<AgentService> self,
+                                  tabs::TabHandle handle,
+                                  std::unique_ptr<Call> call, std::string mark,
+-                                 base::FilePath real, std::string mb,
+-                                 std::string label, base::FilePath copy) {
++                                 bool offer, base::FilePath real,
++                                 std::string mb, std::string label,
++                                 base::FilePath copy) {
+                                 tabs::TabInterface* tab = handle.Get();
+                                 if (!self || !tab) {
+                                   return call->Fail("the tab is gone");
+@@ -2952,6 +2958,10 @@ void AgentService::UploadChecked(
+                                 if (copy.empty()) {
+                                   return call->Fail("couldn't read the file");
+                                 }
++                                if (offer) {
++                                  return self->OfferUpload(
++                                      handle, std::move(call), real, copy, mb);
++                                }
+                                 if (mark.empty()) {
+                                   return self->StartChooserUpload(
+                                       handle, std::move(call), real, copy, mb,
+@@ -2960,10 +2970,11 @@ void AgentService::UploadChecked(
+                                 self->StartUpload(handle, std::move(call), mark,
+                                                   real, copy, mb, label);
+                               },
+-                              self, handle, std::move(call), mark, real, mb,
+-                              label));
++                              self, handle, std::move(call), mark, offer, real,
++                              mb, label));
+                     },
+-                    self, handle, std::move(call), mark, real, mb, label);
++                    self, handle, std::move(call), mark, offer, real, mb,
++                    label);
+             PrefService* prefs = self->profile_->GetPrefs();
+             const std::string& mode = prefs->GetString(prefs::kAgentUploads);
+             if (mode == "never") {
+@@ -2979,9 +2990,12 @@ void AgentService::UploadChecked(
+                 "Upload a file from your computer to " + host + "?",
+                 who + " wants to upload:\n" + real.AsUTF8Unsafe() +
+                     "\nSize: " + mb +
+-                    (chooser ? "\nThrough the file chooser that “" + label +
+-                                   "” opens (it clicks it)"
+-                             : "\nInto: “" + label + "”"),
++                    (offer ? std::string("\nThrough the file chooser the "
++                                         "site’s own upload button opens next "
++                                         "(for 30 seconds)")
++                     : chooser ? "\nThrough the file chooser that “" + label +
++                                     "” opens (it clicks it)"
++                               : "\nInto: “" + label + "”"),
+                 {"Don’t upload", "Upload this file", "Always on " + host},
+                 base::BindOnce(
+                     [](base::WeakPtr<AgentService> self, std::string host,
+@@ -3117,6 +3131,56 @@ void AgentService::StartChooserUpload(tabs::TabHandle handle,
+           label));
+ }
+ 
++// upload_file on a page with no file field, nothing named: the site makes
++// its <input type=file> (or calls showOpenFilePicker) when its own button is
++// clicked. The approved file waits for this tab's next chooser on this site
++// for 30 seconds and the agent is told to click that button now; the chooser
++// then gets the file in place of the native dialog. Nothing is offered
++// without the person's approval (asked above, like any upload).
++void AgentService::OfferUpload(tabs::TabHandle handle,
++                               std::unique_ptr<Call> call,
++                               base::FilePath real,
++                               base::FilePath copy,
++                               std::string mb) {
++  tabs::TabInterface* tab = handle.Get();
++  if (!tab) {
++    return call->Fail("the tab is gone");
++  }
++  if (!call->StillOnSameDocument()) {
++    return call->Fail(
++        "The page changed while waiting for approval, so nothing was "
++        "uploaded. Look at it again.");
++  }
++  content::WebContents* contents = tab->GetContents();
++  const std::string host(contents->GetLastCommittedURL().host());
++  int seconds = 30;
++  if (int s = 0; base::StringToInt(
++                     meridian::TestSwitchValue("meridian-test-upload-offer-seconds"), &s) &&
++                 s > 0) {
++    seconds = s;
++  }
++  const base::TimeDelta ttl = base::Seconds(seconds);
++  int id = agent_input::OfferFile(contents, host, copy, real, ttl,
++                                  base::DoNothing());
++  // Gone after the time is up, used or not.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce([](const void* tab, int id) { agent_input::Withdraw(tab, id); },
++                     static_cast<const void*>(contents), id),
++      ttl);
++  call->Ok(base::Value(
++      base::DictValue()
++          .Set("offered", real.BaseName().AsUTF8Unsafe())
++          .Set("size", mb)
++          .Set("next",
++               "Click the site's upload button now (click with its "
++               "element_index, selector or text): the file chooser it opens "
++               "in this tab within " +
++                   base::NumberToString(seconds) +
++                   " seconds gets this file instead of a dialog. After that "
++                   "nothing is offered.")));
++}
++
+ void AgentService::SplitView(std::unique_ptr<Call> call) {
+   Call& c = *call;
+   auto tab_by_id = [&](const char* key) -> tabs::TabInterface* {
+diff --git a/chrome/browser/meridian/agent/agent_service.h b/chrome/browser/meridian/agent/agent_service.h
+index 55f70795a9..39aa2e7e04 100644
+--- a/chrome/browser/meridian/agent/agent_service.h
++++ b/chrome/browser/meridian/agent/agent_service.h
+@@ -136,6 +136,11 @@ class AgentService : public KeyedService {
+                           base::FilePath copy,
+                           std::string mb,
+                           std::string label);
++  void OfferUpload(tabs::TabHandle handle,
++                   std::unique_ptr<Call> call,
++                   base::FilePath real,
++                   base::FilePath copy,
++                   std::string mb);
+   void UploadChecked(
+       tabs::TabHandle handle,
+       std::unique_ptr<Call> call,
+diff --git a/chrome/browser/meridian/agent/agent_tools.json b/chrome/browser/meridian/agent/agent_tools.json
+index 965b97f201..5d928f5bcf 100644
+--- a/chrome/browser/meridian/agent/agent_tools.json
++++ b/chrome/browser/meridian/agent/agent_tools.json
+@@ -566,7 +566,7 @@
+  {
+   "name": "upload_file",
+   "access": "write",
+-  "description": "Attach a local file (e.g. an image or video for a post) to a file field on the page: an <input type=file> by element_index or selector; with neither, the only file field on the page. Open the site's attach/upload dialog first if needed. The user always confirms the exact file in a native dialog; files with keys or credentials are refused.",
++  "description": "Attach a local file (e.g. an image or video for a post) to a file field on the page: an <input type=file> by element_index or selector; with neither, the only file field on the page. A button that opens the site's file chooser works too (element_index or selector). On a page with no file field and nothing given, the approved file is offered to the next file chooser this tab opens within 30 seconds: then click the site's own upload button. The user always confirms the exact file in a native dialog; files with keys or credentials are refused.",
+   "input_schema": {
+    "type": "object",
+    "properties": {

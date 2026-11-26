@@ -1,0 +1,1988 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 04:26:19 +0400
+Subject: [PATCH 264/297] Meridian: agents press key chords, right- and
+ double-click, hover, and Enter works in background tabs
+
+Key chords go to the page, never the browser's shortcuts. Enter and typing
+now reach a chat composer in a tab in the background. Right click fires the
+page's own menu, double click and hover reach its handlers. The groundwork
+for handing an approved file to a chooser a site button opens is in place
+but not yet used by upload_file.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/BUILD.gn                       |   1 +
+ chrome/browser/file_select_helper.cc          |  25 +
+ chrome/browser/file_system_access/BUILD.gn    |   1 +
+ ...e_file_system_access_permission_context.cc |  14 +
+ ...me_file_system_access_permission_context.h |   2 +
+ chrome/browser/meridian/BUILD.gn              |  13 +
+ chrome/browser/meridian/agent/agent_input.cc  | 400 ++++++++++++
+ chrome/browser/meridian/agent/agent_input.h   |  90 +++
+ .../meridian/agent/agent_input_unittest.cc    | 159 +++++
+ chrome/browser/meridian/agent/agent_page.js   |  60 +-
+ .../browser/meridian/agent/agent_service.cc   | 598 +++++++++++++-----
+ chrome/browser/meridian/agent/agent_service.h |   8 +
+ .../browser/meridian/agent/agent_tools.json   |  46 +-
+ .../meridian/mission/mission_control.cc       |  11 +-
+ chrome/browser/ui/views/tab_contents/BUILD.gn |   1 +
+ ...chrome_web_contents_view_delegate_views.cc |   6 +
+ ...me_web_contents_view_delegate_views_mac.mm |   6 +
+ .../file_system_access_manager_impl.cc        |  28 +
+ .../file_system_access_permission_context.h   |   8 +
+ 19 files changed, 1316 insertions(+), 161 deletions(-)
+ create mode 100644 chrome/browser/meridian/agent/agent_input.cc
+ create mode 100644 chrome/browser/meridian/agent/agent_input.h
+ create mode 100644 chrome/browser/meridian/agent/agent_input_unittest.cc
+
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index 9b7a115ba4..6ff4d2fdf6 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1063,6 +1063,7 @@ source_set("core") {
+     ":defaults",
+     ":expired_flags_list",
+     ":file_select_helper",
++    "//chrome/browser/meridian:agent_input",
+     ":file_util_service",
+     ":flags",
+     ":font_pref",
+diff --git a/chrome/browser/file_select_helper.cc b/chrome/browser/file_select_helper.cc
+index a4371ce077..f7b5294d8a 100644
+--- a/chrome/browser/file_select_helper.cc
++++ b/chrome/browser/file_select_helper.cc
+@@ -31,6 +31,7 @@
+ #include "chrome/browser/profiles/profile_manager.h"
+ #include "chrome/browser/ui/dialogs/browser_dialogs.h"
+ #include "chrome/browser/ui/select_file_policy/chrome_select_file_policy.h"
++#include "chrome/browser/meridian/agent/agent_input.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/enterprise/buildflags/buildflags.h"
+ #include "components/enterprise/common/proto/connectors.pb.h"
+@@ -656,6 +657,30 @@ void FileSelectHelper::RunFileChooser(
+     content::RenderFrameHost* render_frame_host,
+     scoped_refptr<content::FileSelectListener> listener,
+     const FileChooserParams& params) {
++  // Meridian: the file an agent's upload_file was approved to give this
++  // tab's next chooser (a button that opens one), in place of the dialog.
++  if (std::optional<base::FilePath> agent_file = meridian::agent_input::TakeFile(
++          content::WebContents::FromRenderFrameHost(render_frame_host),
++          render_frame_host->GetLastCommittedOrigin().host(),
++          params.mode == FileChooserParams::Mode::kOpen
++              ? meridian::agent_input::Chooser::kOpen
++          : params.mode == FileChooserParams::Mode::kOpenMultiple
++              ? meridian::agent_input::Chooser::kOpenMultiple
++              : meridian::agent_input::Chooser::kOther,
++          /*picker=*/false)) {
++    if (agent_file->empty()) {
++      listener->FileSelectionCanceled();
++      return;
++    }
++    std::vector<FileChooserFileInfoPtr> files;
++    files.push_back(
++        FileChooserFileInfo::NewNativeFile(blink::mojom::NativeFileInfo::New(
++            *agent_file, agent_file->BaseName().AsUTF16Unsafe(),
++            std::vector<std::u16string>())));
++    listener->FileSelected(std::move(files), base::FilePath(), params.mode);
++    return;
++  }
++
+   // An actor task acting on this tab may have staged files for upload, in
+   // which case the request is answered with those files and no file picker is
+   // shown.
+diff --git a/chrome/browser/file_system_access/BUILD.gn b/chrome/browser/file_system_access/BUILD.gn
+index a72d5994e3..1f3038f812 100644
+--- a/chrome/browser/file_system_access/BUILD.gn
++++ b/chrome/browser/file_system_access/BUILD.gn
+@@ -52,6 +52,7 @@ source_set("impl") {
+     "//chrome/browser/content_settings",
+     "//chrome/browser/content_settings:content_settings_factory",
+     "//chrome/browser/download",
++    "//chrome/browser/meridian:agent_input",
+     "//chrome/browser/profiles:profile_manager",
+     "//chrome/browser/safe_browsing",
+     "//chrome/browser/ui/file_system_access",
+diff --git a/chrome/browser/file_system_access/chrome_file_system_access_permission_context.cc b/chrome/browser/file_system_access/chrome_file_system_access_permission_context.cc
+index 3f742f231f..bddfed1f7c 100644
+--- a/chrome/browser/file_system_access/chrome_file_system_access_permission_context.cc
++++ b/chrome/browser/file_system_access/chrome_file_system_access_permission_context.cc
+@@ -36,6 +36,7 @@
+ #include "base/types/expected.h"
+ #include "base/values.h"
+ #include "build/build_config.h"
++#include "chrome/browser/meridian/agent/agent_input.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+ #include "chrome/browser/download/download_prefs.h"
+@@ -2824,6 +2825,19 @@ void ChromeFileSystemAccessPermissionContext::PerformAfterWriteChecks(
+ #endif
+ }
+ 
++std::optional<base::FilePath>
++ChromeFileSystemAccessPermissionContext::TakeAgentFile(
++    content::RenderFrameHost* rfh,
++    bool open_file) {
++  // Meridian: an agent's approved upload_file (agent_input.h).
++  return meridian::agent_input::TakeFile(
++      content::WebContents::FromRenderFrameHost(rfh),
++      rfh->GetLastCommittedOrigin().host(),
++      open_file ? meridian::agent_input::Chooser::kOpen
++                : meridian::agent_input::Chooser::kOther,
++      /*picker=*/true);
++}
++
+ base::expected<void, std::string>
+ ChromeFileSystemAccessPermissionContext::CanShowFilePicker(
+     content::RenderFrameHost* rfh) {
+diff --git a/chrome/browser/file_system_access/chrome_file_system_access_permission_context.h b/chrome/browser/file_system_access/chrome_file_system_access_permission_context.h
+index 7d3717f7b1..0992ad00f5 100644
+--- a/chrome/browser/file_system_access/chrome_file_system_access_permission_context.h
++++ b/chrome/browser/file_system_access/chrome_file_system_access_permission_context.h
+@@ -307,6 +307,8 @@ class ChromeFileSystemAccessPermissionContext
+   bool IsFileTypeDangerous(const base::FilePath& path) override;
+   base::expected<void, std::string> CanShowFilePicker(
+       content::RenderFrameHost* rfh) override;
++  std::optional<base::FilePath> TakeAgentFile(content::RenderFrameHost* rfh,
++                                              bool open_file) override;
+   bool CanObtainReadPermission(const url::Origin& origin) override;
+   bool CanObtainWritePermission(const url::Origin& origin) override;
+   void SetLastPickedDirectory(const url::Origin& origin,
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 9c3c0e6c29..d83ff113a9 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -47,6 +47,16 @@ source_set("test_switches") {
+   ]
+ }
+ 
++# What agents' input needs from Chromium's file chooser and context menu
++# code (agent/agent_input.h): no browser deps.
++source_set("agent_input") {
++  sources = [
++    "agent/agent_input.cc",
++    "agent/agent_input.h",
++  ]
++  public_deps = [ "//base" ]
++}
++
+ # Meridian's own sheet before macOS asks something (system_asks.h): no
+ # browser deps, so Chromium's permission code can call it.
+ source_set("system_asks") {
+@@ -439,6 +449,7 @@ source_set("meridian") {
+     "//components/javascript_dialogs",
+     "//ui/views",
+     ":agent_embed",
++    ":agent_input",
+     ":arc_staged",
+     "//chrome/browser/autofill",
+     "//chrome/browser/webdata_services",
+@@ -535,6 +546,7 @@ test("meridian_unittests") {
+     "mission/mission_hook_unittest.cc",
+     "mission/secrets_unittest.cc",
+     "agent/agent_cli_unittest.cc",
++    "agent/agent_input_unittest.cc",
+     "workbench/agent_insights_unittest.cc",
+     "workbench/agents_unittest.cc",
+     "workbench/customizations_unittest.cc",
+@@ -547,6 +559,7 @@ test("meridian_unittests") {
+   ]
+   deps = [
+     ":agent_cli",
++    ":agent_input",
+     ":ai_providers",
+     ":guard_hook",
+     ":mission_hook",
+diff --git a/chrome/browser/meridian/agent/agent_input.cc b/chrome/browser/meridian/agent/agent_input.cc
+new file mode 100644
+index 0000000000..9b8bffe8f4
+--- /dev/null
++++ b/chrome/browser/meridian/agent/agent_input.cc
+@@ -0,0 +1,400 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/agent/agent_input.h"
++
++#include <map>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_util.h"
++#include "base/strings/string_split.h"
++#include "base/task/sequenced_task_runner.h"
++
++namespace meridian::agent_input {
++
++namespace {
++
++struct Named {
++  const char* name;
++  const char* key;
++  const char* code;
++  int key_code;
++  const char* text;
++};
++
++constexpr Named kNamed[] = {
++    {"Enter", "Enter", "Enter", 13, "\r"},
++    {"Return", "Enter", "Enter", 13, "\r"},
++    {"Tab", "Tab", "Tab", 9, "\t"},
++    {"Backspace", "Backspace", "Backspace", 8, ""},
++    {"Delete", "Delete", "Delete", 46, ""},
++    {"Del", "Delete", "Delete", 46, ""},
++    {"Escape", "Escape", "Escape", 27, ""},
++    {"Esc", "Escape", "Escape", 27, ""},
++    {"ArrowUp", "ArrowUp", "ArrowUp", 38, ""},
++    {"Up", "ArrowUp", "ArrowUp", 38, ""},
++    {"ArrowDown", "ArrowDown", "ArrowDown", 40, ""},
++    {"Down", "ArrowDown", "ArrowDown", 40, ""},
++    {"ArrowLeft", "ArrowLeft", "ArrowLeft", 37, ""},
++    {"Left", "ArrowLeft", "ArrowLeft", 37, ""},
++    {"ArrowRight", "ArrowRight", "ArrowRight", 39, ""},
++    {"Right", "ArrowRight", "ArrowRight", 39, ""},
++    {"PageUp", "PageUp", "PageUp", 33, ""},
++    {"PageDown", "PageDown", "PageDown", 34, ""},
++    {"Home", "Home", "Home", 36, ""},
++    {"End", "End", "End", 35, ""},
++    {"Insert", "Insert", "Insert", 45, ""},
++    {"Space", " ", "Space", 32, " "},
++    {"Spacebar", " ", "Space", 32, " "},
++    {"F1", "F1", "F1", 112, ""},
++    {"F2", "F2", "F2", 113, ""},
++    {"F3", "F3", "F3", 114, ""},
++    {"F4", "F4", "F4", 115, ""},
++    {"F5", "F5", "F5", 116, ""},
++    {"F6", "F6", "F6", 117, ""},
++    {"F7", "F7", "F7", 118, ""},
++    {"F8", "F8", "F8", 119, ""},
++    {"F9", "F9", "F9", 120, ""},
++    {"F10", "F10", "F10", 121, ""},
++    {"F11", "F11", "F11", 122, ""},
++    {"F12", "F12", "F12", 123, ""},
++};
++
++// A US keyboard's other printing keys: the character, its key code, its
++// code, and the character with Shift.
++struct Printing {
++  char plain;
++  char shifted;
++  const char* code;
++  int key_code;
++};
++
++constexpr Printing kPrinting[] = {
++    {'0', ')', "Digit0", 48}, {'1', '!', "Digit1", 49},
++    {'2', '@', "Digit2", 50}, {'3', '#', "Digit3", 51},
++    {'4', '$', "Digit4", 52}, {'5', '%', "Digit5", 53},
++    {'6', '^', "Digit6", 54}, {'7', '&', "Digit7", 55},
++    {'8', '*', "Digit8", 56}, {'9', '(', "Digit9", 57},
++    {'-', '_', "Minus", 189}, {'=', '+', "Equal", 187},
++    {'[', '{', "BracketLeft", 219}, {']', '}', "BracketRight", 221},
++    {'\\', '|', "Backslash", 220}, {';', ':', "Semicolon", 186},
++    {'\'', '"', "Quote", 222}, {',', '<', "Comma", 188},
++    {'.', '>', "Period", 190}, {'/', '?', "Slash", 191},
++    {'`', '~', "Backquote", 192},
++};
++
++struct Modifier {
++  int bit;
++  const char* key;
++  const char* code;
++  int key_code;
++};
++
++constexpr Modifier kModifiers[] = {
++    {kAlt, "Alt", "AltLeft", 18},
++    {kControl, "Control", "ControlLeft", 17},
++    {kMeta, "Meta", "MetaLeft", 91},
++    {kShift, "Shift", "ShiftLeft", 16},
++};
++
++// 0 when `name` isn't a modifier.
++int ModifierBit(std::string_view name, bool mac) {
++  std::string n = base::ToLowerASCII(name);
++  if (n == "alt" || n == "option" || n == "opt") {
++    return kAlt;
++  }
++  if (n == "control" || n == "ctrl") {
++    return kControl;
++  }
++  if (n == "meta" || n == "cmd" || n == "command") {
++    return kMeta;
++  }
++  if (n == "shift") {
++    return kShift;
++  }
++  if (n == "controlormeta" || n == "cmdorctrl" || n == "commandorcontrol" ||
++      n == "mod") {
++    return mac ? kMeta : kControl;
++  }
++  return 0;
++}
++
++const Modifier& ModifierFor(int bit) {
++  for (const Modifier& m : kModifiers) {
++    if (m.bit == bit) {
++      return m;
++    }
++  }
++  return kModifiers[0];
++}
++
++std::optional<Key> KeyFor(std::string_view name, int modifiers) {
++  const bool shift = modifiers & kShift;
++  const bool typing_off = modifiers & (kAlt | kControl | kMeta);
++  for (const Named& n : kNamed) {
++    if (base::EqualsCaseInsensitiveASCII(name, n.name) ||
++        (name == " " && n.key_code == 32)) {
++      return Key{n.key, n.code, n.key_code, typing_off ? "" : n.text};
++    }
++  }
++  if (int bit = ModifierBit(name, /*mac=*/true)) {
++    const Modifier& m = ModifierFor(bit);
++    return Key{m.key, m.code, m.key_code, ""};
++  }
++  if (name.size() != 1) {
++    return std::nullopt;
++  }
++  const char c = name[0];
++  if (base::IsAsciiAlpha(c)) {
++    const char lower = base::ToLowerASCII(c);
++    const char upper = base::ToUpperASCII(c);
++    // As written when it's typed alone ("A" types A); with a modifier the
++    // way a keyboard reports it (Cmd+A is "a", Shift+A is "A").
++    char shown = modifiers ? (shift ? upper : lower) : c;
++    return Key{std::string(1, shown), std::string("Key") + upper, upper,
++               typing_off ? "" : std::string(1, shown)};
++  }
++  for (const Printing& p : kPrinting) {
++    if (c == p.plain || c == p.shifted) {
++      char shown = c == p.shifted ? c : (shift ? p.shifted : p.plain);
++      return Key{std::string(1, shown), p.code, p.key_code,
++                 typing_off ? "" : std::string(1, shown)};
++    }
++  }
++  return std::nullopt;
++}
++
++// What a Mac's text system makes of the chords Blink leaves to it.
++std::vector<std::string> MacCommands(int modifiers, const std::string& code) {
++  struct Entry {
++    int modifiers;
++    const char* code;
++    const char* command;
++  };
++  static constexpr Entry kEntries[] = {
++      {kMeta, "KeyA", "SelectAll"},
++      {kMeta, "KeyZ", "Undo"},
++      {kMeta | kShift, "KeyZ", "Redo"},
++      {kMeta, "ArrowLeft", "MoveToLeftEndOfLine"},
++      {kMeta | kShift, "ArrowLeft", "MoveToLeftEndOfLineAndModifySelection"},
++      {kMeta, "ArrowRight", "MoveToRightEndOfLine"},
++      {kMeta | kShift, "ArrowRight", "MoveToRightEndOfLineAndModifySelection"},
++      {kMeta, "ArrowUp", "MoveToBeginningOfDocument"},
++      {kMeta | kShift, "ArrowUp", "MoveToBeginningOfDocumentAndModifySelection"},
++      {kMeta, "ArrowDown", "MoveToEndOfDocument"},
++      {kMeta | kShift, "ArrowDown", "MoveToEndOfDocumentAndModifySelection"},
++      {kAlt, "ArrowLeft", "MoveWordLeft"},
++      {kAlt | kShift, "ArrowLeft", "MoveWordLeftAndModifySelection"},
++      {kAlt, "ArrowRight", "MoveWordRight"},
++      {kAlt | kShift, "ArrowRight", "MoveWordRightAndModifySelection"},
++      {kAlt, "Backspace", "DeleteWordBackward"},
++      {kMeta, "Backspace", "DeleteToBeginningOfLine"},
++      {kAlt, "Delete", "DeleteWordForward"},
++  };
++  for (const Entry& e : kEntries) {
++    if (e.modifiers == modifiers && code == e.code) {
++      return {e.command};
++    }
++  }
++  return {};
++}
++
++constexpr char kKnown[] =
++    "Use a key such as Enter, Escape, Tab, Backspace, Delete, "
++    "ArrowUp/Down/Left/Right, PageUp, PageDown, Home, End, Space, F1–F12, a "
++    "letter, digit or punctuation mark, optionally after modifiers joined "
++    "with +: Meta (Cmd), Control, Alt (Option), Shift, ControlOrMeta. For "
++    "example Meta+A, Control+Shift+Tab, Alt+ArrowLeft.";
++
++struct Offer {
++  int id = 0;
++  std::string host;
++  base::FilePath for_input;
++  base::FilePath for_picker;
++  base::TimeTicks deadline;
++  base::OnceCallback<void(std::string)> done;
++};
++
++std::map<const void*, Offer>& Offers() {
++  static base::NoDestructor<std::map<const void*, Offer>> offers;
++  return *offers;
++}
++
++std::map<const void*, base::TimeTicks>& Menus() {
++  static base::NoDestructor<std::map<const void*, base::TimeTicks>> menus;
++  return *menus;
++}
++
++void Tell(base::OnceCallback<void(std::string)> done, std::string what) {
++  if (done) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(done), std::move(what)));
++  }
++}
++
++// The same site, or one inside the other (upload.example.com on
++// example.com).
++bool SameSite(std::string_view a, std::string_view b) {
++  return a == b || (a.size() > b.size() && a.ends_with(b) &&
++                    a[a.size() - b.size() - 1] == '.') ||
++         (b.size() > a.size() && b.ends_with(a) &&
++          b[b.size() - a.size() - 1] == '.');
++}
++
++}  // namespace
++
++base::expected<Chord, std::string> ParseChord(std::string_view text,
++                                              bool mac) {
++  std::string_view rest = base::TrimWhitespaceASCII(text, base::TRIM_ALL);
++  if (text == " ") {
++    rest = text;
++  }
++  if (rest.empty()) {
++    return base::unexpected(std::string("give a key. ") + kKnown);
++  }
++  // The + key itself: "+", "Shift++".
++  std::string_view key_name;
++  if (rest == "+") {
++    key_name = rest;
++    rest = std::string_view();
++  } else if (rest.ends_with("++")) {
++    key_name = "+";
++    rest = rest.substr(0, rest.size() - 2);
++  } else if (size_t plus = rest.rfind('+'); plus != std::string_view::npos) {
++    key_name = rest.substr(plus + 1);
++    rest = rest.substr(0, plus);
++  } else {
++    key_name = rest;
++    rest = std::string_view();
++  }
++  if (key_name != " ") {
++    key_name = base::TrimWhitespaceASCII(key_name, base::TRIM_ALL);
++  }
++  Chord chord;
++  std::vector<std::string> names;
++  if (!rest.empty()) {
++    for (std::string_view part : base::SplitStringPiece(
++             rest, "+", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL)) {
++      int bit = ModifierBit(part, mac);
++      if (!bit) {
++        return base::unexpected("unknown modifier “" + std::string(part) +
++                                "” in “" + std::string(text) + "”. " + kKnown);
++      }
++      if (!(chord.modifiers & bit)) {
++        chord.modifiers |= bit;
++        const Modifier& m = ModifierFor(bit);
++        chord.modifier_keys.push_back(Key{m.key, m.code, m.key_code, ""});
++        names.push_back(m.key);
++      }
++    }
++  }
++  if (key_name.empty()) {
++    return base::unexpected("no key after the modifiers in “" +
++                            std::string(text) + "”. " + kKnown);
++  }
++  // A modifier on its own ("Shift") is a key too, held as itself.
++  if (int bit = ModifierBit(key_name, mac); bit && key_name.size() > 1) {
++    chord.modifiers |= bit;
++    const Modifier& m = ModifierFor(bit);
++    chord.key = Key{m.key, m.code, m.key_code, ""};
++  } else if (std::optional<Key> key = KeyFor(key_name, chord.modifiers)) {
++    chord.key = *key;
++  } else {
++    return base::unexpected("unknown key “" + std::string(key_name) +
++                            "”. " + kKnown);
++  }
++  // Pasting would put the clipboard (the person's, maybe a password) into
++  // a page the agent then reads.
++  const bool command_or_control = chord.modifiers & (kMeta | kControl);
++  if ((command_or_control && chord.key.code == "KeyV") ||
++      ((chord.modifiers & kShift) && chord.key.code == "Insert")) {
++    return base::unexpected(
++        "press_key doesn't paste: the clipboard may hold the person's "
++        "passwords. Type the text with type_text instead.");
++  }
++  if (mac) {
++    chord.commands = MacCommands(chord.modifiers, chord.key.code);
++  }
++  names.push_back(key_name == " " ? std::string("Space")
++                  : key_name.size() == 1 && chord.modifiers
++                      ? base::ToUpperASCII(std::string(key_name))
++                      : std::string(key_name));
++  chord.name = base::JoinString(names, "+");
++  return chord;
++}
++
++int OfferFile(const void* tab,
++              std::string host,
++              base::FilePath for_input,
++              base::FilePath for_picker,
++              base::TimeDelta ttl,
++              base::OnceCallback<void(std::string error)> done) {
++  static int last_id = 0;
++  Withdraw(tab);
++  Offers()[tab] = Offer{++last_id,
++                        std::move(host),
++                        std::move(for_input),
++                        std::move(for_picker),
++                        base::TimeTicks::Now() + ttl,
++                        std::move(done)};
++  return last_id;
++}
++
++void Withdraw(const void* tab, int id) {
++  auto it = Offers().find(tab);
++  if (it == Offers().end() || (id && it->second.id != id)) {
++    return;
++  }
++  Tell(std::move(it->second.done), "withdrawn");
++  Offers().erase(it);
++}
++
++std::optional<base::FilePath> TakeFile(const void* tab,
++                                       std::string_view host,
++                                       Chooser kind,
++                                       bool picker) {
++  auto it = Offers().find(tab);
++  if (it == Offers().end()) {
++    return std::nullopt;
++  }
++  Offer offer = std::move(it->second);
++  Offers().erase(it);
++  if (base::TimeTicks::Now() > offer.deadline) {
++    Tell(std::move(offer.done), "withdrawn");
++    return std::nullopt;
++  }
++  if (!SameSite(host, offer.host)) {
++    Tell(std::move(offer.done),
++         "the file chooser opened in a frame of " + std::string(host) +
++             ", not " + offer.host + "; nothing was uploaded");
++    return base::FilePath();
++  }
++  if (kind == Chooser::kOther) {
++    Tell(std::move(offer.done),
++         "the site opened a folder or save dialog, not a file to open; "
++         "nothing was uploaded");
++    return base::FilePath();
++  }
++  Tell(std::move(offer.done), std::string());
++  return picker ? offer.for_picker : offer.for_input;
++}
++
++void ExpectContextMenu(const void* tab) {
++  Menus()[tab] = base::TimeTicks::Now() + base::Seconds(3);
++}
++
++bool TakeContextMenu(const void* tab) {
++  auto it = Menus().find(tab);
++  if (it == Menus().end()) {
++    return false;
++  }
++  bool fresh = base::TimeTicks::Now() <= it->second;
++  Menus().erase(it);
++  return fresh;
++}
++
++}  // namespace meridian::agent_input
+diff --git a/chrome/browser/meridian/agent/agent_input.h b/chrome/browser/meridian/agent/agent_input.h
+new file mode 100644
+index 0000000000..53be7a0d3e
+--- /dev/null
++++ b/chrome/browser/meridian/agent/agent_input.h
+@@ -0,0 +1,90 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_AGENT_AGENT_INPUT_H_
++#define CHROME_BROWSER_MERIDIAN_AGENT_AGENT_INPUT_H_
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/functional/callback.h"
++#include "base/time/time.h"
++#include "base/types/expected.h"
++
++// What agents' input needs from the rest of the browser, with no browser
++// deps (Chromium's file chooser and context menu code call it): key chords
++// for press_key, the file an approved upload_file gives the next file
++// chooser of a tab, and right clicks that are the page's alone. A tab is its
++// WebContents, as a pointer that is only compared.
++namespace meridian::agent_input {
++
++// A key as the DevTools protocol (Input.dispatchKeyEvent) sends it.
++struct Key {
++  std::string key;   // KeyboardEvent.key: "a", "A", "Enter", "ArrowLeft"
++  std::string code;  // KeyboardEvent.code: "KeyA", "Enter"
++  int key_code = 0;  // Windows virtual key code
++  std::string text;  // what it types, if anything
++};
++
++// press_key: "Enter", "a", "Meta+A", "Control+Shift+Tab", "Alt+ArrowLeft",
++// "ControlOrMeta+Z" (Meta on a Mac).
++struct Chord {
++  // Input.dispatchKeyEvent's: Alt 1, Control 2, Meta 4, Shift 8.
++  int modifiers = 0;
++  // The modifier keys pressed first (in order), then `key`.
++  std::vector<Key> modifier_keys;
++  Key key;
++  // Editing commands the Mac gets from the system for this chord (Cmd+A is
++  // SelectAll): the renderer runs them unless the page handles the key.
++  std::vector<std::string> commands;
++  // As the person reads it: "Meta+A".
++  std::string name;
++};
++
++inline constexpr int kAlt = 1, kControl = 2, kMeta = 4, kShift = 8;
++
++// An unknown key, modifier or a chord that pastes the clipboard (it may hold
++// the person's passwords) is an error that says what works.
++base::expected<Chord, std::string> ParseChord(std::string_view text,
++                                              bool mac);
++
++// upload_file through the file chooser a page opens from a button: for a few
++// seconds after the person approved the upload, the next chooser the tab's
++// page on `host` opens gets the file (`for_input` for an <input type=file>,
++// `for_picker` for showOpenFilePicker) without the native dialog. `done`
++// learns what happened: an empty string when the file was given, else why
++// not (a folder or save picker, another site's frame). Offering again or
++// Withdraw drops an earlier offer (its `done` hears "withdrawn"). Returns
++// the offer's id, for Withdraw.
++int OfferFile(const void* tab,
++               std::string host,
++               base::FilePath for_input,
++               base::FilePath for_picker,
++               base::TimeDelta ttl,
++               base::OnceCallback<void(std::string error)> done);
++// `id`: only that offer (0: any).
++void Withdraw(const void* tab, int id = 0);
++
++enum class Chooser { kOpen, kOpenMultiple, kOther };
++// For the chooser code: nullopt when there's no offer (show the native
++// chooser); an empty path to cancel the chooser (the offer couldn't go
++// there); else the file to give. `picker`: showOpenFilePicker's.
++std::optional<base::FilePath> TakeFile(const void* tab,
++                                       std::string_view host,
++                                       Chooser kind,
++                                       bool picker);
++
++// An agent's right click: the page's own contextmenu handlers get it, and
++// the native context menu it would show next is dropped.
++void ExpectContextMenu(const void* tab);
++// For the context menu code: true when the menu comes from an agent's right
++// click (don't show it).
++bool TakeContextMenu(const void* tab);
++
++}  // namespace meridian::agent_input
++
++#endif  // CHROME_BROWSER_MERIDIAN_AGENT_AGENT_INPUT_H_
+diff --git a/chrome/browser/meridian/agent/agent_input_unittest.cc b/chrome/browser/meridian/agent/agent_input_unittest.cc
+new file mode 100644
+index 0000000000..e8ffd57ed6
+--- /dev/null
++++ b/chrome/browser/meridian/agent/agent_input_unittest.cc
+@@ -0,0 +1,159 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/agent/agent_input.h"
++
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/run_loop.h"
++#include "base/test/task_environment.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace meridian::agent_input {
++namespace {
++
++TEST(AgentInputTest, PlainKeysAsBefore) {
++  auto enter = ParseChord("Enter", true);
++  ASSERT_TRUE(enter.has_value());
++  EXPECT_EQ(enter->modifiers, 0);
++  EXPECT_EQ(enter->key.key, "Enter");
++  EXPECT_EQ(enter->key.code, "Enter");
++  EXPECT_EQ(enter->key.key_code, 13);
++  EXPECT_EQ(enter->key.text, "\r");
++  EXPECT_TRUE(enter->commands.empty());
++  EXPECT_EQ(enter->name, "Enter");
++  EXPECT_EQ(ParseChord("escape", true)->key.key, "Escape");
++  EXPECT_EQ(ParseChord("Space", false)->key.text, " ");
++  EXPECT_EQ(ParseChord(" ", false)->key.code, "Space");
++  EXPECT_EQ(ParseChord("PageDown", false)->key.key_code, 34);
++  EXPECT_EQ(ParseChord("a", false)->key.text, "a");
++  EXPECT_EQ(ParseChord("A", false)->key.text, "A");
++  EXPECT_EQ(ParseChord("?", false)->key.code, "Slash");
++}
++
++TEST(AgentInputTest, Chords) {
++  auto all = ParseChord("Meta+A", true);
++  ASSERT_TRUE(all.has_value());
++  EXPECT_EQ(all->modifiers, kMeta);
++  EXPECT_EQ(all->key.key, "a");
++  EXPECT_EQ(all->key.code, "KeyA");
++  EXPECT_EQ(all->key.key_code, 'A');
++  EXPECT_EQ(all->key.text, "");
++  ASSERT_EQ(all->commands.size(), 1u);
++  EXPECT_EQ(all->commands[0], "SelectAll");
++  EXPECT_EQ(all->name, "Meta+A");
++  ASSERT_EQ(all->modifier_keys.size(), 1u);
++  EXPECT_EQ(all->modifier_keys[0].key, "Meta");
++  // Elsewhere Blink selects all by itself.
++  EXPECT_TRUE(ParseChord("Meta+A", false)->commands.empty());
++
++  auto tab = ParseChord("Control+Shift+Tab", false);
++  ASSERT_TRUE(tab.has_value());
++  EXPECT_EQ(tab->modifiers, kControl | kShift);
++  EXPECT_EQ(tab->key.code, "Tab");
++  EXPECT_EQ(tab->key.text, "");
++  EXPECT_EQ(tab->name, "Control+Shift+Tab");
++  ASSERT_EQ(tab->modifier_keys.size(), 2u);
++
++  auto word = ParseChord("Alt+ArrowLeft", true);
++  ASSERT_TRUE(word.has_value());
++  EXPECT_EQ(word->modifiers, kAlt);
++  EXPECT_EQ(word->commands, std::vector<std::string>{"MoveWordLeft"});
++
++  EXPECT_EQ(ParseChord("cmd+shift+z", true)->commands,
++            std::vector<std::string>{"Redo"});
++  EXPECT_EQ(ParseChord("ControlOrMeta+Z", true)->modifiers, kMeta);
++  EXPECT_EQ(ParseChord("ControlOrMeta+Z", false)->modifiers, kControl);
++  auto shifted = ParseChord("Shift+a", false);
++  EXPECT_EQ(shifted->key.key, "A");
++  EXPECT_EQ(shifted->key.text, "A");
++  EXPECT_EQ(ParseChord("Shift+Enter", false)->key.text, "\r");
++  EXPECT_EQ(ParseChord("Control++", false)->key.code, "Equal");
++  EXPECT_EQ(ParseChord("Shift", false)->modifiers, kShift);
++}
++
++TEST(AgentInputTest, ClearErrors) {
++  auto bad = ParseChord("Hyper+A", true);
++  ASSERT_FALSE(bad.has_value());
++  EXPECT_NE(bad.error().find("unknown modifier “Hyper”"), std::string::npos);
++  EXPECT_NE(bad.error().find("Meta+A"), std::string::npos);
++  auto key = ParseChord("Meta+Foo", true);
++  ASSERT_FALSE(key.has_value());
++  EXPECT_NE(key.error().find("unknown key “Foo”"), std::string::npos);
++  EXPECT_FALSE(ParseChord("", true).has_value());
++  EXPECT_FALSE(ParseChord("Meta+", true).has_value());
++  // No pasting the clipboard into a page.
++  for (const char* paste : {"Meta+V", "Control+v", "Shift+Insert",
++                            "Control+Shift+V"}) {
++    auto p = ParseChord(paste, true);
++    ASSERT_FALSE(p.has_value()) << paste;
++    EXPECT_NE(p.error().find("doesn't paste"), std::string::npos);
++  }
++}
++
++TEST(AgentInputTest, OfferedFileGoesToTheNextChooserOnce) {
++  base::test::SingleThreadTaskEnvironment env;
++  int tab = 0;
++  std::string heard = "-";
++  OfferFile(&tab, "studio.example.com", base::FilePath("/copy/a.png"),
++            base::FilePath("/real/a.png"), base::Seconds(5),
++            base::BindOnce([](std::string* out, std::string e) { *out = e; },
++                           &heard));
++  // Another tab has nothing.
++  int other = 0;
++  EXPECT_FALSE(TakeFile(&other, "studio.example.com", Chooser::kOpen, false));
++  auto file = TakeFile(&tab, "upload.studio.example.com", Chooser::kOpen,
++                       false);
++  ASSERT_TRUE(file.has_value());
++  EXPECT_EQ(*file, base::FilePath("/copy/a.png"));
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(heard, "");
++  // Once.
++  EXPECT_FALSE(TakeFile(&tab, "studio.example.com", Chooser::kOpen, false));
++
++  // Another site's frame, or a folder: cancelled, and said why.
++  OfferFile(&tab, "example.com", base::FilePath("/copy/a.png"),
++            base::FilePath("/real/a.png"), base::Seconds(5),
++            base::BindOnce([](std::string* out, std::string e) { *out = e; },
++                           &heard));
++  auto cancel = TakeFile(&tab, "evil.test", Chooser::kOpen, false);
++  ASSERT_TRUE(cancel.has_value());
++  EXPECT_TRUE(cancel->empty());
++  base::RunLoop().RunUntilIdle();
++  EXPECT_NE(heard.find("evil.test"), std::string::npos);
++  OfferFile(&tab, "example.com", base::FilePath("/copy/a.png"),
++            base::FilePath("/real/a.png"), base::Seconds(5),
++            base::BindOnce([](std::string* out, std::string e) { *out = e; },
++                           &heard));
++  EXPECT_TRUE(TakeFile(&tab, "example.com", Chooser::kOther, true)->empty());
++  base::RunLoop().RunUntilIdle();
++  EXPECT_NE(heard.find("folder"), std::string::npos);
++  // The picker gets the approved file itself.
++  OfferFile(&tab, "example.com", base::FilePath("/copy/a.png"),
++            base::FilePath("/real/a.png"), base::Seconds(5),
++            base::DoNothing());
++  EXPECT_EQ(*TakeFile(&tab, "example.com", Chooser::kOpenMultiple, true),
++            base::FilePath("/real/a.png"));
++  // Withdrawn: the native chooser again.
++  OfferFile(&tab, "example.com", base::FilePath("/copy/a.png"),
++            base::FilePath("/real/a.png"), base::Seconds(5),
++            base::BindOnce([](std::string* out, std::string e) { *out = e; },
++                           &heard));
++  Withdraw(&tab);
++  base::RunLoop().RunUntilIdle();
++  EXPECT_EQ(heard, "withdrawn");
++  EXPECT_FALSE(TakeFile(&tab, "example.com", Chooser::kOpen, false));
++}
++
++TEST(AgentInputTest, ContextMenuOfAnAgentsRightClick) {
++  int tab = 0, other = 0;
++  EXPECT_FALSE(TakeContextMenu(&tab));
++  ExpectContextMenu(&tab);
++  EXPECT_FALSE(TakeContextMenu(&other));
++  EXPECT_TRUE(TakeContextMenu(&tab));
++  EXPECT_FALSE(TakeContextMenu(&tab));
++}
++
++}  // namespace
++}  // namespace meridian::agent_input
+diff --git a/chrome/browser/meridian/agent/agent_page.js b/chrome/browser/meridian/agent/agent_page.js
+index 75b2779d67..d11392cb69 100644
+--- a/chrome/browser/meridian/agent/agent_page.js
++++ b/chrome/browser/meridian/agent/agent_page.js
+@@ -202,10 +202,38 @@
+       return {ok: true, x, y};
+     },
+ 
+-    clickFallback() {
++    // The element's own events when the mouse can't reach it (covered):
++    // a click, double click, right click (contextmenu) or hover.
++    clickFallback(kind) {
+       const el = window.__meridianTarget;
+-      if (el) { el.click(); return true; }
+-      return false;
++      if (!el) return false;
++      const r = el.getBoundingClientRect();
++      const at = {bubbles: true, cancelable: true, composed: true, view: window,
++                  clientX: r.left + r.width / 2, clientY: r.top + r.height / 2};
++      const fire = (type, extra = {}) => el.dispatchEvent(
++          new (type.startsWith('pointer') ? PointerEvent : MouseEvent)(type, {...at, ...extra}));
++      if (kind === 'hover') {
++        for (const t of ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'pointermove', 'mousemove']) {
++          fire(t, t.endsWith('enter') ? {bubbles: false} : {});
++        }
++      } else if (kind === 'right') {
++        fire('pointerdown', {button: 2, buttons: 2});
++        fire('mousedown', {button: 2, buttons: 2});
++        fire('contextmenu', {button: 2, buttons: 2});
++        fire('pointerup', {button: 2});
++        fire('mouseup', {button: 2});
++      } else if (kind === 'double') {
++        el.click();
++        el.click();
++        fire('dblclick', {detail: 2});
++      } else if (kind === 'middle') {
++        fire('mousedown', {button: 1, buttons: 4});
++        fire('mouseup', {button: 1});
++        fire('auxclick', {button: 1});
++      } else {
++        el.click();
++      }
++      return true;
+     },
+ 
+     // type_text into a <select>: the option whose text (or value) it names.
+@@ -289,21 +317,37 @@
+ 
+     // upload_file: marks the <input type=file> to fill (by index, selector,
+     // or the only one on the page) for the browser to find through DevTools.
++    // Another element (a button that opens the site's file chooser): {chooser}
++    // with it located, for the browser to click it and answer the chooser.
+     markFileInput(spec) {
+       let el = null;
+-      if (Number.isInteger(spec.element_index)) el = (window.__meridianEls || [])[spec.element_index];
+-      else if (spec.selector) {
++      const given = Number.isInteger(spec.element_index) || !!spec.selector || !!spec.text;
++      if (Number.isInteger(spec.element_index)) {
++        el = (window.__meridianEls || [])[spec.element_index];
++        if (!el || !el.isConnected) return {error: 'element_index is stale — call get_interactive_elements again'};
++      } else if (spec.selector) {
+         try { el = deepOne(spec.selector); } catch (e) { return {error: 'invalid selector'}; }
++        if (!el) return {error: 'nothing on the page matches that selector'};
++      } else if (spec.text) {
++        const found = find({text: spec.text});
++        if (found.error) return found;
++        el = found.el;
+       }
+       const files = deepAll('input[type=file]');
+       const isFile = (e) => e && e.tagName === 'INPUT' && e.type === 'file';
+       if (el && !isFile(el)) {
+-        el = (el.shadowRoot && el.shadowRoot.querySelector('input[type=file]')) || (el.querySelector && el.querySelector('input[type=file]')) ||
++        const inner = (el.shadowRoot && el.shadowRoot.querySelector('input[type=file]')) || (el.querySelector && el.querySelector('input[type=file]')) ||
+             (el.closest && el.closest('label') && el.closest('label').querySelector('input[type=file]')) || null;
++        if (!inner) {
++          const target = this.locate(Number.isInteger(spec.element_index) ? {element_index: spec.element_index} : spec);
++          if (target.error) return target;
++          return {chooser: true, label: target.label || target.tag};
++        }
++        el = inner;
+       }
+-      if (!el && !spec.selector && !Number.isInteger(spec.element_index)) el = files.length === 1 ? files[0] : null;
++      if (!el && !given) el = files.length === 1 ? files[0] : null;
+       if (!isFile(el)) {
+-        return {error: files.length ? 'pick the file field: element_index or selector of an <input type=file> (' + files.length + ' on the page)' : 'no file field on this page — open the attach/upload dialog first'};
++        return {error: files.length ? 'pick the file field: element_index or selector of an <input type=file> (' + files.length + ' on the page), or the button that opens the site\'s file chooser' : 'no file field on this page — give the button that opens the site\'s file chooser (element_index, selector or text), or open its attach/upload dialog first'};
+       }
+       if (el.disabled) return {error: 'that file field is disabled'};
+       const mark = Math.random().toString(36).slice(2);
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index 4ac9b8a47a..49fb635a72 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -33,7 +33,9 @@
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/time/time.h"
+ #include "chrome/browser/history/history_service_factory.h"
++#include "build/build_config.h"
+ #include "chrome/browser/meridian/agent/agent_embed.h"  // generated
++#include "chrome/browser/meridian/agent/agent_input.h"
+ #include "chrome/browser/meridian/agent/agent_server.h"
+ #include "chrome/browser/meridian/archive_service.h"
+ #include "chrome/browser/meridian/boosts/boost_service.h"
+@@ -60,7 +62,6 @@
+ #include "chrome/common/chrome_isolated_world_ids.h"
+ #include "components/browser_apis/tab_strip/types/node_id.h"
+ #include "components/history/core/browser/history_service.h"
+-#include "components/input/native_web_keyboard_event.h"
+ #include "components/prefs/pref_service.h"
+ #include "components/search_engines/template_url.h"
+ #include "components/search_engines/template_url_service.h"
+@@ -81,9 +82,6 @@
+ #include "content/public/browser/web_contents_observer.h"
+ #include "third_party/blink/public/common/input/web_mouse_event.h"
+ #include "third_party/blink/public/common/page/page_zoom.h"
+-#include "ui/events/keycodes/dom/dom_code.h"
+-#include "ui/events/keycodes/dom/dom_key.h"
+-#include "ui/events/keycodes/keyboard_codes.h"
+ #include "ui/gfx/codec/jpeg_codec.h"
+ #include "ui/gfx/image/image_skia_operations.h"
+ #include "url/gurl.h"
+@@ -196,26 +194,6 @@ std::string Validate(const base::DictValue& tool, const base::DictValue& in) {
+   return std::string();
+ }
+ 
+-void SendKey(content::RenderWidgetHost* widget,
+-             ui::KeyboardCode code,
+-             ui::DomCode dom_code,
+-             ui::DomKey dom_key,
+-             char16_t text) {
+-  using Type = blink::WebInputEvent::Type;
+-  for (Type type : {Type::kRawKeyDown, Type::kChar, Type::kKeyUp}) {
+-    if (type == Type::kChar && !text) {
+-      continue;
+-    }
+-    input::NativeWebKeyboardEvent event(type, 0, base::TimeTicks::Now());
+-    event.windows_key_code = code;
+-    event.dom_code = static_cast<int>(dom_code);
+-    event.dom_key = dom_key;
+-    event.text[0] = text;
+-    event.unmodified_text[0] = text;
+-    widget->ForwardKeyboardEvent(event);
+-  }
+-}
+-
+ // upload_file: the file the person is asked about, or why it can't go.
+ // Blocking.
+ base::expected<std::pair<base::FilePath, int64_t>, std::string> CheckUpload(
+@@ -423,6 +401,216 @@ class FileInputSetter : public content::DevToolsAgentHostClient {
+   std::string search_;
+ };
+ 
++// Sends input to a tab's page through DevTools (Input.insertText,
++// Input.dispatchKeyEvent), one command after the other, each after the page
++// took the one before (a key: once the page handled it), then detaches.
++// Deletes itself.
++//
++// Not WebContents::Replace and RenderWidgetHost::ForwardKeyboardEvent: the
++// browser UI (chrome://webui-browser) embeds tabs as surfaces, and a tab
++// that doesn't hold the window's focus (one in the background, or any while
++// the person types in the sidebar) has no focused frame tree, so Replace
++// dropped the text without a word; the Enter after it then sent an empty
++// message, which chat sites ignore ("Enter didn't send"). DevTools gives the
++// page focus and puts text and keys into its focused frame whether the tab
++// is shown or not, and keys it sends never reach the browser's own shortcuts.
++bool AgentCanUse(content::WebContents* contents);
++
++class PageInput : public content::DevToolsAgentHostClient {
++ public:
++  using Command = std::pair<std::string, base::DictValue>;
++
++  static void Run(content::WebContents* contents,
++                  std::vector<Command> commands,
++                  base::OnceCallback<void(std::string error)> done) {
++    auto* self = new PageInput(std::move(commands), std::move(done));
++    // Checked at the last moment: the tab may have moved since the call
++    // began.
++    if (!AgentCanUse(contents)) {
++      return self->Finish("Agents only work on web pages.");
++    }
++    self->host_ = content::DevToolsAgentHost::GetOrCreateFor(contents);
++    if (!self->host_->AttachClient(self)) {
++      self->host_ = nullptr;
++      return self->Finish("couldn't reach the page");
++    }
++    // A page that never takes the input (frozen, or stuck in a loop).
++    base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(&PageInput::Finish, self->weak_factory_.GetWeakPtr(),
++                       "the page didn't take the input within 15 seconds"),
++        base::Seconds(15));
++    self->Next();
++  }
++
++  // content::DevToolsAgentHostClient:
++  void DispatchProtocolMessage(content::DevToolsAgentHost*,
++                               base::span<const uint8_t> message) override {
++    std::optional<base::Value> v = base::JSONReader::Read(
++        std::string_view(reinterpret_cast<const char*>(message.data()),
++                         message.size()),
++        0);
++    if (!v || !v->is_dict() || v->GetDict().FindInt("id") != id_) {
++      return;  // events
++    }
++    if (const base::DictValue* error = v->GetDict().FindDict("error")) {
++      const std::string* m = error->FindString("message");
++      return Finish(m ? *m : "DevTools error");
++    }
++    // Not from inside the host's dispatch.
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(&PageInput::Next, weak_factory_.GetWeakPtr()));
++  }
++  void AgentHostClosed(content::DevToolsAgentHost*) override {
++    host_ = nullptr;
++    Finish("the tab is gone");
++  }
++
++ private:
++  friend class base::DeleteHelper<PageInput>;
++
++  PageInput(std::vector<Command> commands,
++            base::OnceCallback<void(std::string)> done)
++      : commands_(std::move(commands)), done_(std::move(done)) {}
++  ~PageInput() override = default;
++
++  void Next() {
++    if (!done_) {
++      return;
++    }
++    if (next_ >= commands_.size()) {
++      return Finish(std::string());
++    }
++    Command& c = commands_[next_++];
++    std::string json =
++        base::WriteJson(base::DictValue()
++                            .Set("id", ++id_)
++                            .Set("method", c.first)
++                            .Set("params", std::move(c.second)))
++            .value_or("{}");
++    host_->DispatchProtocolMessage(this, base::as_byte_span(json));
++  }
++
++  void Finish(std::string error) {
++    // Once (a reply, the timeout and the host closing can each finish it).
++    if (!done_) {
++      return;
++    }
++    if (host_) {
++      host_->DetachClient(this);
++      host_ = nullptr;
++    }
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(done_), std::move(error)));
++    weak_factory_.InvalidateWeakPtrs();
++    base::SequencedTaskRunner::GetCurrentDefault()->DeleteSoon(FROM_HERE,
++                                                               this);
++  }
++
++  std::vector<Command> commands_;
++  size_t next_ = 0;
++  base::OnceCallback<void(std::string)> done_;
++  scoped_refptr<content::DevToolsAgentHost> host_;
++  int id_ = 0;
++  base::WeakPtrFactory<PageInput> weak_factory_{this};
++};
++
++// Input.dispatchKeyEvent commands for a key chord: the modifiers down, the
++// key down and up, the modifiers up.
++std::vector<PageInput::Command> KeyCommands(
++    const agent_input::Chord& chord) {
++  std::vector<PageInput::Command> out;
++  auto event = [&](const char* type, const agent_input::Key& key,
++                   int modifiers) {
++    base::DictValue p;
++    p.Set("type", type);
++    p.Set("modifiers", modifiers);
++    p.Set("key", key.key);
++    p.Set("code", key.code);
++    p.Set("windowsVirtualKeyCode", key.key_code);
++    if (!key.text.empty() && std::string_view(type) == "keyDown") {
++      p.Set("text", key.text);
++      p.Set("unmodifiedText", key.text);
++    }
++    return p;
++  };
++  int held = 0;
++  for (const agent_input::Key& m : chord.modifier_keys) {
++    held |= agent_input::ParseChord(m.key, false)->modifiers;
++    out.emplace_back("Input.dispatchKeyEvent", event("rawKeyDown", m, held));
++  }
++  base::DictValue down = event(chord.key.text.empty() ? "rawKeyDown" : "keyDown",
++                               chord.key, chord.modifiers);
++  if (!chord.commands.empty()) {
++    base::ListValue commands;
++    for (const std::string& c : chord.commands) {
++      commands.Append(c);
++    }
++    down.Set("commands", std::move(commands));
++  }
++  out.emplace_back("Input.dispatchKeyEvent", std::move(down));
++  out.emplace_back("Input.dispatchKeyEvent",
++                   event("keyUp", chord.key, chord.modifiers));
++  for (auto m = chord.modifier_keys.rbegin(); m != chord.modifier_keys.rend();
++       ++m) {
++    held &= ~agent_input::ParseChord(m->key, false)->modifiers;
++    out.emplace_back("Input.dispatchKeyEvent", event("keyUp", *m, held));
++  }
++  return out;
++}
++
++bool IsMac() {
++#if BUILDFLAG(IS_MAC)
++  return true;
++#else
++  return false;
++#endif
++}
++
++// The mouse at `css` (the page's CSS pixels): a move, then for a click the
++// button down and up (twice for a double click). A right click's native
++// context menu isn't shown: the page's own contextmenu handlers have it.
++// false when the page has no widget to send it to.
++bool SendMouse(content::WebContents* contents,
++               gfx::PointF css,
++               const std::string& kind) {
++  content::RenderWidgetHost* widget =
++      contents->GetPrimaryMainFrame()->GetRenderWidgetHost();
++  if (!widget) {
++    return false;
++  }
++  double zoom = blink::ZoomLevelToZoomFactor(
++      zoom::ZoomController::GetZoomLevelForWebContents(contents));
++  gfx::PointF p(css.x() * zoom, css.y() * zoom);
++  using Type = blink::WebInputEvent::Type;
++  using Button = blink::WebPointerProperties::Button;
++  widget->ForwardMouseEvent(blink::WebMouseEvent(
++      Type::kMouseMove, p, p, Button::kNoButton, 0,
++      blink::WebInputEvent::kNoModifiers, base::TimeTicks::Now()));
++  if (kind == "hover") {
++    return true;
++  }
++  Button button = kind == "right"    ? Button::kRight
++                  : kind == "middle" ? Button::kMiddle
++                                     : Button::kLeft;
++  int down = kind == "right"    ? blink::WebInputEvent::kRightButtonDown
++             : kind == "middle" ? blink::WebInputEvent::kMiddleButtonDown
++                                : blink::WebInputEvent::kLeftButtonDown;
++  if (kind == "right") {
++    agent_input::ExpectContextMenu(contents);
++  }
++  for (int count = 1; count <= (kind == "double" ? 2 : 1); ++count) {
++    widget->ForwardMouseEvent(blink::WebMouseEvent(
++        Type::kMouseDown, p, p, button, count, down, base::TimeTicks::Now()));
++    widget->ForwardMouseEvent(
++        blink::WebMouseEvent(Type::kMouseUp, p, p, button, count,
++                             blink::WebInputEvent::kNoModifiers,
++                             base::TimeTicks::Now()));
++  }
++  return true;
++}
++
+ // The page's own dialog (alert, confirm, prompt, or "Leave site?") that the
+ // tab shows or waits to show: the renderer stands still until it's answered.
+ // Permission prompts, file pickers and sign-in dialogs aren't these.
+@@ -790,6 +978,7 @@ void AgentService::Run(std::unique_ptr<Call> call) {
+       {"activate_tab", &AgentService::ActivateTab},
+       {"close_tab", &AgentService::CloseTab},
+       {"click", &AgentService::Click},
++      {"hover", &AgentService::Hover},
+       {"type_text", &AgentService::TypeText},
+       {"press_key", &AgentService::PressKey},
+       {"scroll", &AgentService::Scroll},
+@@ -1673,6 +1862,25 @@ void AgentService::CloseTab(std::unique_ptr<Call> call) {
+ }
+ 
+ void AgentService::Click(std::unique_ptr<Call> call) {
++  const std::string button = call->StrOr("button", "left");
++  const bool twice = call->input.FindBool("double").value_or(false);
++  if (twice && button != "left") {
++    return call->Fail("double works with the left button only");
++  }
++  Pointer(std::move(call), twice              ? "double"
++                           : button == "right"  ? "right"
++                           : button == "middle" ? "middle"
++                                                : "left");
++}
++
++void AgentService::Hover(std::unique_ptr<Call> call) {
++  Pointer(std::move(call), "hover");
++}
++
++// click (left, right, middle, double) and hover: the mouse at the element's
++// centre, as a person's, after the person approved it (ask) and the element
++// is still the one there.
++void AgentService::Pointer(std::unique_ptr<Call> call, std::string kind) {
+   tabs::TabInterface* tab = TabFor(*call);
+   if (!tab) {
+     return call->Fail(kNoTab);
+@@ -1694,7 +1902,8 @@ void AgentService::Click(std::unique_ptr<Call> call) {
+       contents, expr,
+       base::BindOnce(
+           [](base::WeakPtr<AgentService> self, tabs::TabHandle handle,
+-             std::unique_ptr<Call> call, base::Value target) {
++             std::string kind, std::unique_ptr<Call> call,
++             base::Value target) {
+             if (!self || !target.is_dict()) {
+               return call->Fail("couldn't look at the page");
+             }
+@@ -1705,7 +1914,12 @@ void AgentService::Click(std::unique_ptr<Call> call) {
+             std::string label = t.FindString("label") ? *t.FindString("label")
+                                                      : std::string();
+             std::string what = label.empty() ? *t.FindString("tag") : label;
+-            std::string summary = "click “" + what + "”";
++            std::string verb = kind == "hover"    ? "hover over"
++                               : kind == "right"  ? "right-click"
++                               : kind == "double" ? "double-click"
++                               : kind == "middle" ? "middle-click"
++                                                  : "click";
++            std::string summary = verb + " “" + what + "”";
+             if (const std::string* href = t.FindString("href")) {
+               summary += "\nLink: " + *href;
+             }
+@@ -1714,7 +1928,7 @@ void AgentService::Click(std::unique_ptr<Call> call) {
+                 base::BindOnce(
+                     [](base::WeakPtr<AgentService> self,
+                        tabs::TabHandle handle, std::string what,
+-                       std::unique_ptr<Call> call) {
++                       std::string kind, std::unique_ptr<Call> call) {
+                       tabs::TabInterface* tab = handle.Get();
+                       if (!self || !tab) {
+                         return call->Fail("the tab is gone");
+@@ -1726,71 +1940,76 @@ void AgentService::Click(std::unique_ptr<Call> call) {
+                           base::BindOnce(
+                               [](base::WeakPtr<AgentService> self,
+                                  base::WeakPtr<content::WebContents> contents,
+-                                 std::string what, std::unique_ptr<Call> call,
+-                                 base::Value hit) {
++                                 std::string what, std::string kind,
++                                 std::unique_ptr<Call> call, base::Value hit) {
+                                 if (!self || !contents) {
+                                   return call->Fail("the tab is gone");
+                                 }
+                                 const base::DictValue* h = hit.GetIfDict();
+                                 bool ok = h && h->FindBool("ok").value_or(false);
+-                                content::RenderWidgetHost* widget =
+-                                    contents->GetPrimaryMainFrame()
+-                                        ->GetRenderWidgetHost();
+-                                if (ok && widget) {
+-                                  double zoom = blink::ZoomLevelToZoomFactor(
+-                                      zoom::ZoomController::GetZoomLevelForWebContents(
+-                                          contents.get()));
+-                                  gfx::PointF p(*h->FindDouble("x") * zoom,
+-                                                *h->FindDouble("y") * zoom);
+-                                  using Type = blink::WebInputEvent::Type;
+-                                  for (Type type : {Type::kMouseMove,
+-                                                    Type::kMouseDown,
+-                                                    Type::kMouseUp}) {
+-                                    bool move = type == Type::kMouseMove;
+-                                    blink::WebMouseEvent event(
+-                                        type, p, p,
+-                                        move ? blink::WebPointerProperties::Button::kNoButton
+-                                             : blink::WebPointerProperties::Button::kLeft,
+-                                        move ? 0 : 1,
+-                                        type == Type::kMouseDown
+-                                            ? blink::WebInputEvent::kLeftButtonDown
+-                                            : blink::WebInputEvent::kNoModifiers,
+-                                        base::TimeTicks::Now());
+-                                    widget->ForwardMouseEvent(event);
+-                                  }
+-                                } else {
+-                                  // Covered or gone: the element's own click.
+-                                  self->RunInPage(contents.get(),
+-                                                  "__meridianAgent.clickFallback()",
+-                                                  base::DoNothing());
++                                bool sent = false;
++                                if (ok) {
++                                  sent = SendMouse(
++                                      contents.get(),
++                                      gfx::PointF(*h->FindDouble("x"),
++                                                  *h->FindDouble("y")),
++                                      kind);
+                                 }
++                                if (!sent) {
++                                  // Covered or gone: the element's own
++                                  // events (no :hover, no native menu).
++                                  self->RunInPage(
++                                      contents.get(),
++                                      "__meridianAgent.clickFallback(" +
++                                          base::WriteJson(base::Value(kind))
++                                              .value_or("\"left\"") +
++                                          ")",
++                                      base::DoNothing());
++                                }
++                                std::string done_key =
++                                    kind == "hover"    ? "hovered"
++                                    : kind == "right"  ? "right_clicked"
++                                    : kind == "double" ? "double_clicked"
++                                                       : "clicked";
+                                 base::SequencedTaskRunner::GetCurrentDefault()
+                                     ->PostDelayedTask(
+                                         FROM_HERE,
+                                         base::BindOnce(
+                                             [](std::unique_ptr<Call> call,
+                                                std::string what,
++                                               std::string done_key, bool sent,
+                                                base::WeakPtr<content::WebContents>
+                                                    contents) {
+-                                              call->Ok(base::Value(
+-                                                  base::DictValue()
+-                                                      .Set("clicked", what)
+-                                                      .Set("url",
+-                                                           contents
+-                                                               ? contents
+-                                                                     ->GetLastCommittedURL()
+-                                                                     .spec()
+-                                                               : std::string())));
++                                              base::DictValue out;
++                                              out.Set(done_key, what);
++                                              if (!sent) {
++                                                out.Set(
++                                                    "note",
++                                                    "the element was covered: "
++                                                    "its own events were "
++                                                    "sent instead of the "
++                                                    "mouse");
++                                              }
++                                              out.Set(
++                                                  "url",
++                                                  contents
++                                                      ? contents
++                                                            ->GetLastCommittedURL()
++                                                            .spec()
++                                                      : std::string());
++                                              call->Ok(
++                                                  base::Value(std::move(out)));
+                                             },
+-                                            std::move(call), what, contents),
++                                            std::move(call), what, done_key,
++                                            sent, contents),
+                                         base::Milliseconds(400));
+                               },
+-                              self, contents->GetWeakPtr(), what,
++                              self, contents->GetWeakPtr(), what, kind,
+                               std::move(call)));
+                     },
+-                    self, handle, what));
++                    self, handle, what, kind));
+           },
+-          weak_factory_.GetWeakPtr(), handle, std::move(call)));
++          weak_factory_.GetWeakPtr(), handle, kind, std::move(call)));
+ }
+ 
+ void AgentService::TypeText(std::unique_ptr<Call> call) {
+@@ -1876,25 +2095,41 @@ void AgentService::TypeText(std::unique_ptr<Call> call) {
+                                 if (!self || !contents) {
+                                   return call->Fail("the tab is gone");
+                                 }
+-                                content::RenderWidgetHost* widget =
+-                                    contents->GetPrimaryMainFrame()
+-                                        ->GetRenderWidgetHost();
+-                                if (value.empty() && clear && widget) {
+-                                  SendKey(widget, ui::VKEY_BACK,
+-                                          ui::DomCode::BACKSPACE,
+-                                          ui::DomKey::BACKSPACE, 0);
+-                                } else {
+-                                  // Into the focused field, as typing or a
+-                                  // paste does (replaces a selection).
+-                                  contents->Replace(base::UTF8ToUTF16(value));
++                                // Into the focused field, as typing or a
++                                // paste does (replaces a selection); clearing
++                                // to nothing is a Backspace. Then Enter, as
++                                // a key the page's keydown handlers see.
++                                std::vector<PageInput::Command> input;
++                                if (value.empty() && clear) {
++                                  input = KeyCommands(
++                                      *agent_input::ParseChord("Backspace",
++                                                               IsMac()));
++                                } else if (!value.empty()) {
++                                  input.emplace_back(
++                                      "Input.insertText",
++                                      base::DictValue().Set("text", value));
+                                 }
+-                                if (submit && widget) {
+-                                  SendKey(widget, ui::VKEY_RETURN,
+-                                          ui::DomCode::ENTER,
+-                                          ui::DomKey::ENTER, '\r');
++                                if (submit) {
++                                  for (auto& c : KeyCommands(
++                                           *agent_input::ParseChord("Enter",
++                                                                    IsMac()))) {
++                                    input.push_back(std::move(c));
++                                  }
+                                 }
+-                                base::SequencedTaskRunner::GetCurrentDefault()
+-                                    ->PostDelayedTask(
++                                PageInput::Run(
++                                    contents.get(), std::move(input),
++                                    base::BindOnce(
++                                        [](base::WeakPtr<AgentService> self,
++                                           base::WeakPtr<content::WebContents>
++                                               contents,
++                                           std::unique_ptr<Call> call,
++                                           std::string error) {
++                                          if (!error.empty()) {
++                                            return call->Fail(error);
++                                          }
++                                          base::SequencedTaskRunner::
++                                              GetCurrentDefault()
++                                                  ->PostDelayedTask(
+                                         FROM_HERE,
+                                         base::BindOnce(
+                                             [](base::WeakPtr<AgentService> self,
+@@ -1925,6 +2160,8 @@ void AgentService::TypeText(std::unique_ptr<Call> call) {
+                                             },
+                                             self, contents, std::move(call)),
+                                         base::Milliseconds(300));
++                                        },
++                                        self, contents, std::move(call)));
+                               },
+                               self, contents->GetWeakPtr(), value, submit,
+                               clear, std::move(call)));
+@@ -1974,47 +2211,10 @@ void AgentService::ChooseOption(tabs::TabHandle handle,
+ }
+ 
+ void AgentService::PressKey(std::unique_ptr<Call> call) {
+-  struct Key {
+-    const char* name;
+-    ui::KeyboardCode code;
+-    ui::DomCode dom_code;
+-    ui::DomKey dom_key;
+-    char16_t text;
+-  };
+-  static constexpr Key kKeys[] = {
+-      {"Enter", ui::VKEY_RETURN, ui::DomCode::ENTER, ui::DomKey::ENTER, '\r'},
+-      {"Escape", ui::VKEY_ESCAPE, ui::DomCode::ESCAPE, ui::DomKey::ESCAPE, 0},
+-      {"Tab", ui::VKEY_TAB, ui::DomCode::TAB, ui::DomKey::TAB, '\t'},
+-      {"Backspace", ui::VKEY_BACK, ui::DomCode::BACKSPACE,
+-       ui::DomKey::BACKSPACE, 0},
+-      {"Delete", ui::VKEY_DELETE, ui::DomCode::DEL, ui::DomKey::DEL, 0},
+-      {"ArrowUp", ui::VKEY_UP, ui::DomCode::ARROW_UP, ui::DomKey::ARROW_UP, 0},
+-      {"ArrowDown", ui::VKEY_DOWN, ui::DomCode::ARROW_DOWN,
+-       ui::DomKey::ARROW_DOWN, 0},
+-      {"ArrowLeft", ui::VKEY_LEFT, ui::DomCode::ARROW_LEFT,
+-       ui::DomKey::ARROW_LEFT, 0},
+-      {"ArrowRight", ui::VKEY_RIGHT, ui::DomCode::ARROW_RIGHT,
+-       ui::DomKey::ARROW_RIGHT, 0},
+-      {"PageUp", ui::VKEY_PRIOR, ui::DomCode::PAGE_UP, ui::DomKey::PAGE_UP, 0},
+-      {"PageDown", ui::VKEY_NEXT, ui::DomCode::PAGE_DOWN,
+-       ui::DomKey::PAGE_DOWN, 0},
+-      {"Home", ui::VKEY_HOME, ui::DomCode::HOME, ui::DomKey::HOME, 0},
+-      {"End", ui::VKEY_END, ui::DomCode::END, ui::DomKey::END, 0},
+-      {"Space", ui::VKEY_SPACE, ui::DomCode::SPACE,
+-       ui::DomKey::FromCharacter(' '), ' '},
+-  };
+-  std::string name = call->StrOr("key", "");
+-  const Key* key = nullptr;
+-  for (const Key& k : kKeys) {
+-    if (base::EqualsCaseInsensitiveASCII(name, k.name) ||
+-        (name == " " && k.text == ' ')) {
+-      key = &k;
+-    }
+-  }
+-  if (!key) {
+-    return call->Fail("unknown key; use Enter, Escape, Tab, Backspace, Delete, "
+-                      "ArrowUp/Down/Left/Right, PageUp, PageDown, Home, End or "
+-                      "Space");
++  base::expected<agent_input::Chord, std::string> chord =
++      agent_input::ParseChord(call->StrOr("key", ""), IsMac());
++  if (!chord.has_value()) {
++    return call->Fail(chord.error());
+   }
+   tabs::TabInterface* tab = TabFor(*call);
+   if (!tab) {
+@@ -2023,27 +2223,36 @@ void AgentService::PressKey(std::unique_ptr<Call> call) {
+   call->capture = tab->GetContents()->IncrementCapturerCount(gfx::Size(), true,
+                                                              true, false);
+   tabs::TabHandle handle = tab->GetHandle();
+-  Confirm(std::move(call), std::string("press ") + key->name,
++  std::string name = chord->name;
++  Confirm(std::move(call), "press " + name,
+           base::BindOnce(
+               [](base::WeakPtr<AgentService> self, tabs::TabHandle handle,
+-                 const Key* key, std::unique_ptr<Call> call) {
++                 agent_input::Chord chord, std::unique_ptr<Call> call) {
+                 tabs::TabInterface* tab = handle.Get();
+                 if (!self || !tab) {
+                   return call->Fail("the tab is gone");
+                 }
+                 self->Activity(*call, tab);
+-                content::RenderWidgetHost* widget =
+-                    tab->GetContents()->GetPrimaryMainFrame()
+-                        ->GetRenderWidgetHost();
+-                if (!widget) {
+-                  return call->Fail("the page isn't ready");
++                if (!AgentCanUse(tab->GetContents())) {
++                  return call->Fail("Agents only work on web pages.");
+                 }
+-                SendKey(widget, key->code, key->dom_code, key->dom_key,
+-                        key->text);
+-                call->Ok(base::Value(base::DictValue().Set("pressed",
+-                                                           key->name)));
++                std::string name = chord.name;
++                // To the page's focused element, never the browser's
++                // shortcuts (Meta+W doesn't close the tab).
++                PageInput::Run(
++                    tab->GetContents(), KeyCommands(chord),
++                    base::BindOnce(
++                        [](std::unique_ptr<Call> call, std::string name,
++                           std::string error) {
++                          if (!error.empty()) {
++                            return call->Fail(error);
++                          }
++                          call->Ok(base::Value(
++                              base::DictValue().Set("pressed", name)));
++                        },
++                        std::move(call), name));
+               },
+-              weak_factory_.GetWeakPtr(), handle, key));
++              weak_factory_.GetWeakPtr(), handle, std::move(*chord)));
+ }
+ 
+ void AgentService::Scroll(std::unique_ptr<Call> call) {
+@@ -2634,7 +2843,7 @@ void AgentService::UploadChecked(
+     return call->Fail(file.error());
+   }
+   base::DictValue spec;
+-  for (const char* key : {"element_index", "selector"}) {
++  for (const char* key : {"element_index", "selector", "text"}) {
+     if (const base::Value* v = call->input.Find(key)) {
+       spec.Set(key, v->Clone());
+     }
+@@ -2655,10 +2864,13 @@ void AgentService::UploadChecked(
+             if (const std::string* error = t.FindString("error")) {
+               return call->Fail(*error);
+             }
+-            std::string mark = *t.FindString("mark");
++            // No mark: a button that opens the site's file chooser.
++            const bool chooser = t.FindBool("chooser").value_or(false);
++            std::string mark =
++                t.FindString("mark") ? *t.FindString("mark") : std::string();
+             std::string label = t.FindString("label") && !t.FindString("label")->empty()
+                                     ? *t.FindString("label")
+-                                    : "file field";
++                                    : chooser ? "button" : "file field";
+             std::string mb =
+                 size >= 1024 * 1024
+                     ? base::StringPrintf("%.1f MB", size / 1024.0 / 1024.0)
+@@ -2716,6 +2928,11 @@ void AgentService::UploadChecked(
+                                 if (copy.empty()) {
+                                   return call->Fail("couldn't read the file");
+                                 }
++                                if (mark.empty()) {
++                                  return self->StartChooserUpload(
++                                      handle, std::move(call), real, copy, mb,
++                                      label);
++                                }
+                                 self->StartUpload(handle, std::move(call), mark,
+                                                   real, copy, mb, label);
+                               },
+@@ -2737,7 +2954,10 @@ void AgentService::UploadChecked(
+                 contents,
+                 "Upload a file from your computer to " + host + "?",
+                 who + " wants to upload:\n" + real.AsUTF8Unsafe() +
+-                    "\nSize: " + mb + "\nInto: “" + label + "”",
++                    "\nSize: " + mb +
++                    (chooser ? "\nThrough the file chooser that “" + label +
++                                   "” opens (it clicks it)"
++                             : "\nInto: “" + label + "”"),
+                 {"Don’t upload", "Upload this file", "Always on " + host},
+                 base::BindOnce(
+                     [](base::WeakPtr<AgentService> self, std::string host,
+@@ -2787,6 +3007,92 @@ void AgentService::StartUpload(tabs::TabHandle handle,
+           label));
+ }
+ 
++// upload_file with a button that opens the site's file chooser (a hidden
++// <input type=file> made on click, or showOpenFilePicker): after the
++// person's approval, the button is clicked and the chooser it opens in this
++// tab gets the approved file in place of the native dialog. Nothing else is
++// offered it, and only for a few seconds.
++void AgentService::StartChooserUpload(tabs::TabHandle handle,
++                                      std::unique_ptr<Call> call,
++                                      base::FilePath real,
++                                      base::FilePath copy,
++                                      std::string mb,
++                                      std::string label) {
++  tabs::TabInterface* tab = handle.Get();
++  if (!tab) {
++    return call->Fail("the tab is gone");
++  }
++  if (!call->StillOnSameDocument()) {
++    return call->Fail(
++        "The page changed while waiting for approval, so nothing was "
++        "uploaded. Look at it again.");
++  }
++  // The button still there, not covered?
++  RunInPage(
++      tab->GetContents(), "__meridianAgent.verifyHit()",
++      base::BindOnce(
++          [](base::WeakPtr<AgentService> self, tabs::TabHandle handle,
++             std::unique_ptr<Call> call, base::FilePath real,
++             base::FilePath copy, std::string mb, std::string label,
++             base::Value hit) {
++            tabs::TabInterface* tab = handle.Get();
++            if (!self || !tab) {
++              return call->Fail("the tab is gone");
++            }
++            const base::DictValue* h = hit.GetIfDict();
++            if (!h || !h->FindBool("ok").value_or(false)) {
++              const std::string* why = h ? h->FindString("why") : nullptr;
++              return call->Fail("couldn't click “" + label + "”: " +
++                                (why ? *why : std::string("it's gone")) +
++                                "; nothing was uploaded");
++            }
++            content::WebContents* contents = tab->GetContents();
++            const std::string host(contents->GetLastCommittedURL().host());
++            const std::string name = real.BaseName().AsUTF8Unsafe();
++            constexpr base::TimeDelta kWait = base::Seconds(10);
++            int offer = agent_input::OfferFile(
++                contents, host, copy, real, kWait,
++                base::BindOnce(
++                    [](std::unique_ptr<Call> call, std::string name,
++                       std::string mb, std::string label, std::string error) {
++                      if (error == "withdrawn") {
++                        return call->Fail(
++                            "clicking “" + label +
++                            "” didn't open a file chooser within 10 seconds; "
++                            "nothing was uploaded. Open the site's upload "
++                            "dialog first, or give its <input type=file> "
++                            "(get_interactive_elements lists it).");
++                      }
++                      if (!error.empty()) {
++                        return call->Fail(error);
++                      }
++                      call->Ok(base::Value(base::DictValue()
++                                               .Set("uploaded", name)
++                                               .Set("size", mb)
++                                               .Set("into", label)
++                                               .Set("through",
++                                                    "the site's file chooser")));
++                    },
++                    std::move(call), name, mb, label));
++            if (!SendMouse(contents, gfx::PointF(*h->FindDouble("x"),
++                                                 *h->FindDouble("y")),
++                           "left")) {
++              agent_input::Withdraw(contents, offer);
++              return;
++            }
++            base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++                FROM_HERE,
++                base::BindOnce(
++                    [](const void* tab, int offer) {
++                      agent_input::Withdraw(tab, offer);
++                    },
++                    static_cast<const void*>(contents), offer),
++                kWait);
++          },
++          weak_factory_.GetWeakPtr(), handle, std::move(call), real, copy, mb,
++          label));
++}
++
+ void AgentService::SplitView(std::unique_ptr<Call> call) {
+   Call& c = *call;
+   auto tab_by_id = [&](const char* key) -> tabs::TabInterface* {
+diff --git a/chrome/browser/meridian/agent/agent_service.h b/chrome/browser/meridian/agent/agent_service.h
+index e36498667b..9c07dcddc7 100644
+--- a/chrome/browser/meridian/agent/agent_service.h
++++ b/chrome/browser/meridian/agent/agent_service.h
+@@ -109,6 +109,8 @@ class AgentService : public KeyedService {
+   void ActivateTab(std::unique_ptr<Call> call);
+   void CloseTab(std::unique_ptr<Call> call);
+   void Click(std::unique_ptr<Call> call);
++  void Hover(std::unique_ptr<Call> call);
++  void Pointer(std::unique_ptr<Call> call, std::string kind);
+   void TypeText(std::unique_ptr<Call> call);
+   void ChooseOption(tabs::TabHandle handle, std::unique_ptr<Call> call,
+                     const std::string& label, const std::string& value);
+@@ -128,6 +130,12 @@ class AgentService : public KeyedService {
+                    base::FilePath copy,
+                    std::string mb,
+                    std::string label);
++  void StartChooserUpload(tabs::TabHandle handle,
++                          std::unique_ptr<Call> call,
++                          base::FilePath real,
++                          base::FilePath copy,
++                          std::string mb,
++                          std::string label);
+   void UploadChecked(
+       tabs::TabHandle handle,
+       std::unique_ptr<Call> call,
+diff --git a/chrome/browser/meridian/agent/agent_tools.json b/chrome/browser/meridian/agent/agent_tools.json
+index d5e4567434..965b97f201 100644
+--- a/chrome/browser/meridian/agent/agent_tools.json
++++ b/chrome/browser/meridian/agent/agent_tools.json
+@@ -223,7 +223,7 @@
+  {
+   "name": "click",
+   "access": "write",
+-  "description": "Click an element. Identify it by element_index (from get_interactive_elements), selector, or visible text.",
++  "description": "Click an element: left (default), right (opens the page's own menu, as a right click does) or a double click. Identify it by element_index (from get_interactive_elements), selector, or visible text.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+@@ -242,6 +242,45 @@
+     "text": {
+      "type": "string",
+      "description": "Visible text of the element to act on (exact or partial match)."
++    },
++    "button": {
++     "type": "string",
++     "enum": [
++      "left",
++      "right",
++      "middle"
++     ],
++     "description": "Default left."
++    },
++    "double": {
++     "type": "boolean",
++     "description": "Double-click (left button only)."
++    }
++   }
++  }
++ },
++ {
++  "name": "hover",
++  "access": "write",
++  "description": "Move the mouse over an element, e.g. to open a menu that appears on hover. Identify it by element_index (from get_interactive_elements), selector, or visible text.",
++  "input_schema": {
++   "type": "object",
++   "properties": {
++    "tab_id": {
++     "type": "string",
++     "description": "Tab id from list_tabs. Omit to use the agent's current tab (the last one it opened or used, else the active tab)."
++    },
++    "element_index": {
++     "type": "integer",
++     "description": "Index from get_interactive_elements (preferred)."
++    },
++    "selector": {
++     "type": "string",
++     "description": "CSS selector, if no index is available."
++    },
++    "text": {
++     "type": "string",
++     "description": "Visible text of the element (exact or partial match)."
+     }
+    }
+   }
+@@ -289,7 +328,7 @@
+  {
+   "name": "press_key",
+   "access": "write",
+-  "description": "Press a key in the page, e.g. Enter, Escape, Tab, ArrowDown, PageDown.",
++  "description": "Press a key or a key chord in the page (never the browser's own shortcuts), e.g. Enter, Escape, Tab, ArrowDown, PageDown, Meta+A, Control+Shift+Tab, Alt+ArrowLeft, Shift+Enter. Works in background tabs.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+@@ -298,7 +337,8 @@
+      "description": "Tab id from list_tabs. Omit to use the agent's current tab (the last one it opened or used, else the active tab)."
+     },
+     "key": {
+-     "type": "string"
++     "type": "string",
++     "description": "A key, or modifiers (Meta, Control, Alt, Shift) and a key joined with +."
+     }
+    },
+    "required": [
+diff --git a/chrome/browser/meridian/mission/mission_control.cc b/chrome/browser/meridian/mission/mission_control.cc
+index a7f33a69e3..88d4b41587 100644
+--- a/chrome/browser/meridian/mission/mission_control.cc
++++ b/chrome/browser/meridian/mission/mission_control.cc
+@@ -90,14 +90,17 @@ std::string BrowserSummary(const std::string& name, const base::DictValue& i) {
+            " characters" +
+            (i.FindBool("submit").value_or(false) ? " + Enter" : "");
+   }
+-  if (name == "click") {
++  if (name == "click" || name == "hover") {
++    std::string how = i.FindBool("double").value_or(false) ? "double: "
++                      : str("button", 10) == "right"      ? "right: "
++                                                          : "";
+     if (std::optional<int> index = i.FindInt("element_index")) {
+-      return "element #" + base::NumberToString(*index);
++      return how + "element #" + base::NumberToString(*index);
+     }
+     if (const std::string* text = i.FindString("text")) {
+-      return "“" + text->substr(0, 40) + "”";
++      return how + "“" + text->substr(0, 40) + "”";
+     }
+-    return i.Find("selector") ? "selector" : "";
++    return i.Find("selector") ? how + "selector" : how;
+   }
+   if (name == "search_tabs" || name == "search_history") {
+     return i.FindString("query") ? "“" + str("query", 50) + "”" : "";
+diff --git a/chrome/browser/ui/views/tab_contents/BUILD.gn b/chrome/browser/ui/views/tab_contents/BUILD.gn
+index 91392bb9fc..6c5908fa30 100644
+--- a/chrome/browser/ui/views/tab_contents/BUILD.gn
++++ b/chrome/browser/ui/views/tab_contents/BUILD.gn
+@@ -22,6 +22,7 @@ source_set("tab_contents") {
+   ]
+ 
+   deps = [
++    "//chrome/browser/meridian:agent_input",
+     "//chrome/browser/meridian:test_switches",
+     "//chrome/browser/ui:browser_element_identifiers",
+     "//chrome/browser/ui:sad_tab",
+diff --git a/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views.cc b/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views.cc
+index c4e75a1699..9830ca77be 100644
+--- a/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views.cc
++++ b/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "base/strings/string_number_conversions.h"
+ #include "chrome/browser/defaults.h"
++#include "chrome/browser/meridian/agent/agent_input.h"
+ #include "chrome/browser/meridian/test_switches.h"
+ #include "chrome/browser/renderer_context_menu/render_view_context_menu.h"
+ #include "chrome/browser/ui/aura/tab_contents/web_drag_bookmark_handler_aura.h"
+@@ -127,6 +128,11 @@ void ChromeWebContentsViewDelegateViews::ShowMenu(
+ void ChromeWebContentsViewDelegateViews::ShowContextMenu(
+     content::RenderFrameHost& render_frame_host,
+     const content::ContextMenuParams& params) {
++  // Meridian: an agent's right click is for the page's own menu; the native
++  // one would open on the person's screen (agent_input.h).
++  if (meridian::agent_input::TakeContextMenu(web_contents_)) {
++    return;
++  }
+   BuildMenuAsync(render_frame_host, params,
+                  base::BindOnce(&ChromeWebContentsViewDelegateViews::ShowMenu,
+                                 weak_ptr_factory_.GetWeakPtr()));
+diff --git a/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views_mac.mm b/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views_mac.mm
+index 9ba6552502..840f4fbcb0 100644
+--- a/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views_mac.mm
++++ b/chrome/browser/ui/views/tab_contents/chrome_web_contents_view_delegate_views_mac.mm
+@@ -9,6 +9,7 @@
+ 
+ #import "chrome/browser/renderer_host/chrome_render_widget_host_view_mac_delegate.h"
+ #include "base/strings/string_number_conversions.h"
++#include "chrome/browser/meridian/agent/agent_input.h"
+ #include "chrome/browser/meridian/test_switches.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
+@@ -73,6 +74,11 @@ ChromeWebContentsViewDelegateViewsMac::GetDragDestDelegate() {
+ void ChromeWebContentsViewDelegateViewsMac::ShowContextMenu(
+     content::RenderFrameHost& render_frame_host,
+     const content::ContextMenuParams& params) {
++  // Meridian: an agent's right click is for the page's own menu; the native
++  // one would open on the person's screen (agent_input.h).
++  if (meridian::agent_input::TakeContextMenu(web_contents_)) {
++    return;
++  }
+   BuildMenuAsync(
+       render_frame_host, params,
+       base::BindOnce(&ChromeWebContentsViewDelegateViewsMac::ShowMenu,
+diff --git a/content/browser/file_system_access/file_system_access_manager_impl.cc b/content/browser/file_system_access/file_system_access_manager_impl.cc
+index 494de82d1b..ef26ab73d8 100644
+--- a/content/browser/file_system_access/file_system_access_manager_impl.cc
++++ b/content/browser/file_system_access/file_system_access_manager_impl.cc
+@@ -299,6 +299,28 @@ void ShowFilePickerOnUIThread(
+     outermost_rfh = re_resolved->outermost_rfh;
+   }
+ 
++  // Meridian: an agent's approved upload answers the picker (see
++  // FileSystemAccessPermissionContext::TakeAgentFile).
++  if (permission_context) {
++    const bool open_file =
++        options.type() == ui::SelectFileDialog::SELECT_OPEN_FILE ||
++        options.type() == ui::SelectFileDialog::SELECT_OPEN_MULTI_FILE;
++    if (std::optional<base::FilePath> agent_file =
++            permission_context->TakeAgentFile(rfh, open_file)) {
++      if (agent_file->empty()) {
++        std::move(callback).Run(file_system_access_error::FromStatus(
++                                    FileSystemAccessStatus::kOperationAborted),
++                                {});
++        return;
++      }
++      std::vector<PathInfo> picked;
++      picked.emplace_back(*agent_file);
++      std::move(callback).Run(file_system_access_error::Ok(),
++                              std::move(picked));
++      return;
++    }
++  }
++
+ #if BUILDFLAG(IS_ANDROID)
+   // Allow android WebView to handle chooser.
+   WebContentsDelegate* delegate = web_contents->GetDelegate();
+@@ -2659,4 +2681,10 @@ bool FileSystemAccessManagerImpl::IsSafePathComponent(
+   return true;
+ }
+ 
++std::optional<base::FilePath> FileSystemAccessPermissionContext::TakeAgentFile(
++    RenderFrameHost* rfh,
++    bool open_file) {
++  return std::nullopt;
++}
++
+ }  // namespace content
+diff --git a/content/public/browser/file_system_access_permission_context.h b/content/public/browser/file_system_access_permission_context.h
+index 9897a0eeb6..d5bc892ddf 100644
+--- a/content/public/browser/file_system_access_permission_context.h
++++ b/content/public/browser/file_system_access_permission_context.h
+@@ -5,6 +5,7 @@
+ #ifndef CONTENT_PUBLIC_BROWSER_FILE_SYSTEM_ACCESS_PERMISSION_CONTEXT_H_
+ #define CONTENT_PUBLIC_BROWSER_FILE_SYSTEM_ACCESS_PERMISSION_CONTEXT_H_
+ 
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+@@ -211,6 +212,13 @@ class FileSystemAccessPermissionContext {
+   virtual base::expected<void, std::string> CanShowFilePicker(
+       RenderFrameHost* rfh) = 0;
+ 
++  // Meridian: a file an agent's approved upload gives `rfh`'s file picker in
++  // place of the dialog (showOpenFilePicker after the agent clicked the
++  // site's button). std::nullopt shows the picker; an empty path aborts it.
++  // `open_file`: the picker opens files (not a folder or a save picker).
++  virtual std::optional<base::FilePath> TakeAgentFile(RenderFrameHost* rfh,
++                                                      bool open_file);
++
+   // Returns whether the give |origin| already allows read permission, or it is
+   // possible to request one. This is used to block file dialogs from being
+   // shown if permission won't be granted anyway.

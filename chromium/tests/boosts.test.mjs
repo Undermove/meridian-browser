@@ -11,7 +11,8 @@ import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { launch, APP } from './harness.mjs';
+import { launch, APP, SB } from './harness.mjs';
+import { standIn } from './stand_in.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const SC = 'app.$.siteControl.shadowRoot';
@@ -101,10 +102,12 @@ test('Boost editor, as Arc’s: a colour on the pad, a font, size, case, dark, c
     assert.equal(await b.eval(`${BE}.getElementById('name').value`), 'My Boost');
 
     // A colour on the pad, as Arc's: the hue is the angle from the middle (red at the top, clockwise),
-    // the amount how far out. Right of the middle, 3/5 of the way out: a yellow-green, over the whole
-    // page as a colour layer; the knob glides there, the small dark one opposite.
+    // the amount how far out. Right of the middle, 3/5 of the way out: a yellow-green: the page is
+    // painted in it; the knob glides there, the small one (the second colour) opposite.
     await clickPad(b, 0.8, 0.5);
-    await page.waitFor(`getComputedStyle(document.documentElement, '::after').mixBlendMode === 'color'`, 5000);
+    await page.waitFor(`!!document.getElementById('meridian-boost-paint') && document.body.hasAttribute('data-mb-fg')`, 5000);
+    assert.equal(await page.eval(`getComputedStyle(document.documentElement).filter`), 'none', 'no filter over the page');
+    assert.notEqual(await page.eval(`getComputedStyle(document.documentElement, '::after').mixBlendMode`), 'color', 'no colour layer over the whole page');
     const { state } = await b.eval(`${H}.getBoost()`);
     assert.ok(state.boost.tint >= 85 && state.boost.tint <= 95, `tint ${state.boost.tint}`);
     assert.ok(state.boost.tintStrength >= 55 && state.boost.tintStrength <= 65, `strength ${state.boost.tintStrength}`);
@@ -331,6 +334,90 @@ test('Improve with Claude: the page outline goes to Claude, its CSS becomes the 
   } finally { await b.close(); s.server.close(); api.server.close(); }
 });
 
+// A stand-in `claude` (Claude Code), signed in: it answers a boost with `answer` and writes down the
+// CLAUDE_CONFIG_DIR each run got (the space's account).
+function fakeClaudeCode(dir, answer) {
+  const log = path.join(dir, 'log');
+  fs.mkdirSync(log);
+  standIn(dir, 'claude', `const fs = require('fs'), path = require('path');
+const log = ${JSON.stringify(log)};
+const args = process.argv.slice(2);
+if (args[0] === 'auth' && args[1] === 'status') { console.log(JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' })); process.exit(0); }
+const n = fs.readdirSync(log).length;
+fs.writeFileSync(path.join(log, n + '.env'), process.env.CLAUDE_CONFIG_DIR ?? '<unset>');
+let stdin = '';
+process.stdin.on('data', (d) => { stdin += d; });
+process.stdin.on('end', () => {
+  const out = (o) => console.log(JSON.stringify(o));
+  const text = ${JSON.stringify(JSON.stringify(answer))};
+  out({ type: 'system', subtype: 'init', session_id: 's-' + n, model: 'claude-opus-5-5' });
+  out({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'content_block_delta', delta: { type: 'text_delta', text } } });
+  out({ type: 'result', subtype: 'success', is_error: false, result: text });
+});
+`);
+  return () => fs.readdirSync(log).sort((a, c) => parseInt(a) - parseInt(c)).map((f) => fs.readFileSync(path.join(log, f), 'utf8'));
+}
+
+test('Improve with Claude Code when nothing is picked in Settings › AI: in the default space and in a space with its own profile (as its AI account)', async () => {
+  const s = await site();
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
+  const runs = fakeClaudeCode(bin, { name: 'Calm News', css: '#promo { display: none !important; }', summary: 'Hid the banner.' });
+  // Claude Code's accounts: its own folder and a Work one.
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-accounts-')));
+  for (const dir of ['.claude', '.claude-work']) { fs.mkdirSync(path.join(home, dir)); fs.writeFileSync(path.join(home, dir, 'settings.json'), ''); }
+  // No AI picked, no key: "Automatic".
+  const b = await launch([s.url], { args: [`--meridian-agents-path=${bin}`, `--meridian-accounts-home=${home}`] });
+  try {
+    const page = await b.page(s.url);
+    await page.waitFor(`document.readyState === 'complete'`);
+    await b.waitFor(`!!app?.$?.tabstrip?.handler_`);
+    assert.equal((await b.eval(`${H}.getSettings()`)).settings.aiProvider, '');
+
+    // (a) The default space: Claude Code, found on this computer, improves the boost.
+    await openEditor(b);
+    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
+    await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
+    await clickEditor(b, `${BE}.getElementById('improve')`);
+    await b.waitFor(`${BE}.getElementById('note')?.textContent.includes('Hid the banner.')`, 20000, `${BE}.getElementById('note')?.textContent`);
+    await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
+    assert.deepEqual(runs(), ['<unset>'], 'one run, as Claude Code’s own account');
+    await b.eval('app.$.boostEditor.open = false');
+    page.close();
+
+    // (b) A space in its own profile, with the Work account for Claude: the same button, and the
+    // run goes as Work.
+    const { profileId } = await b.eval(`${H}.addProfile('Work')`);
+    const { spaceId } = await b.eval(`${H}.createSpace('Client', '', '', '')`);
+    await b.eval(`${H}.setSpaceProfile(${JSON.stringify(spaceId)}, ${JSON.stringify(profileId)})`);
+    const accounts = JSON.parse((await b.eval(`${H}.getAiAccounts()`)).json);
+    const work = accounts.vendors.find((v) => v.id === 'claude').accounts.find((a) => a.label === 'Work').id;
+    await b.eval(`${H}.setSpaceAiAccount(${JSON.stringify(spaceId)}, 'claude', ${JSON.stringify(work)})`);
+    await b.eval(`${H}.activateSpace(${JSON.stringify(spaceId)})`);
+    await b.waitFor(`app.$.tabstrip.state_.activeSpaceId === ${JSON.stringify(spaceId)} && app.$.tabstrip.state_.profileId === ${JSON.stringify(profileId)}`);
+    const there = `${s.url}?client`;
+    await b.eval(`app.$.tabstrip.openUrl(${JSON.stringify(there)})`);
+    const page2 = await b.page(there);
+    await page2.waitFor(`document.readyState === 'complete'`);
+    // The site's boost from (a), improved again here.
+    // On Windows the new page can bring a mouse move of its own (the OS cursor is elsewhere):
+    // the sidebar's mouseleave closes the site controls 450 ms later. Then again, as a person would.
+    await openEditor(b, '.boost-edit').catch(async (e) => {
+      if (process.platform !== 'win32' || await b.eval('app.$.siteControl.open')) throw e;
+      await openEditor(b, '.boost-edit');
+    });
+    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
+    await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
+    await clickEditor(b, `${BE}.getElementById('improve')`);
+    await b.waitFor(`${BE}.getElementById('note')?.textContent.includes('Hid the banner.')`, 20000, `${BE}.getElementById('note')?.textContent`);
+    await page2.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
+    assert.deepEqual(runs(), ['<unset>', path.join(home, '.claude-work')], 'the space’s Work account');
+    page2.close();
+  } finally {
+    await b.close(); s.server.close();
+    fs.rmSync(bin, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // An MCP client talking to the bridge.
 function bridge(profile) {
   const proc = spawn(APP, ['--mcp-bridge', `--user-data-dir=${profile}`], { stdio: ['pipe', 'pipe', 'inherit'] });
@@ -423,4 +510,161 @@ test('Arc’s boosts come over with Arc’s data and work on their sites', async
     assert.equal(await shown(page, '#promo'), 'none');
     page.close();
   } finally { await b.close(); s.server.close(); fs.rmSync(arcDir, { recursive: true, force: true }); }
+});
+
+// Colour helpers, in the page: WCAG contrast of each text element on what's under it.
+const CONTRAST = `(() => {
+  const p = (c) => { const m = c.match(/[\\d.]+/g).map(Number); return m.length > 3 && m[3] === 0 ? null : m.slice(0, 3); };
+  const lin = (v) => { v /= 255; return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; };
+  const lum = (c) => 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]);
+  const ratio = (a, b) => { const x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+  const bg = (el) => { for (let e = el; e; e = e.parentElement) { const c = p(getComputedStyle(e).backgroundColor); if (c) return c; } return [255, 255, 255]; };
+  let worst = 99, at = '';
+  for (const el of document.querySelectorAll('body *')) {
+    if (![...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim())) continue;
+    const cs = getComputedStyle(el);
+    const need = parseFloat(cs.fontSize) >= 24 ? 3 : 4.5;
+    const r = ratio(p(cs.color), bg(el)) / need;
+    if (r < worst) { worst = r; at = el.tagName + ' ' + el.textContent.trim().slice(0, 20); }
+  }
+  return { worst, at };
+})()`;
+const HUE = (expr, prop) => `(() => { const m = getComputedStyle(${expr}).${prop}.match(/[\\d.]+/g).map((v) => v / 255); const [r, g, b] = m, hi = Math.max(r, g, b), lo = Math.min(r, g, b), d = hi - lo; if (!d) return -1; const h = hi === r ? ((g - b) / d + 6) % 6 : hi === g ? (b - r) / d + 2 : (r - g) / d + 4; return Math.round(h * 60); })()`;
+const near = (a, b, tol) => Math.abs((((a - b) % 360) + 540) % 360 - 180) <= tol;
+
+test('a colour paints the page, Arc’s way: a tinted background, the accent turned, text still readable, a picture untouched; undone at once', async () => {
+  const PAGE = `<!doctype html><title>Accent</title><style>body{margin:0;background:#fff;color:#222;font:16px system-ui}header{height:90px;background:#1565c0;color:#fff}a{color:#1565c0}button{background:#1565c0;color:#fff;border:0;padding:6px}img{width:90px;height:90px;display:block}</style><header>Site</header><p>Plain text <a href="#x">a link</a> <button>Go</button></p><img id="pic" src="data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="90" height="90"><rect width="90" height="90" fill="#e53935"/></svg>')}">`;
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(PAGE); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}/`;
+  const b = await launch([url]);
+  try {
+    const page = await b.page(url);
+    await page.waitFor(`document.readyState === 'complete'`);
+    await openControls(b);
+    await b.click(`${SC}.getElementById('boostRow')`);
+    await b.waitFor(`app.$.boostEditor.open && !!${BE}.getElementById('pad')`);
+    await clickPad(b, 1, 0.5);  // the right edge: hue 90, full colour
+    await page.waitFor(`!!document.getElementById('meridian-boost-paint') && document.querySelector('header').hasAttribute('data-mb-bg')`, 5000);
+    // No filter: not on the page, not on the picture; the picture is as it was.
+    assert.equal(await page.eval(`getComputedStyle(document.documentElement).filter`), 'none');
+    assert.equal(await page.eval(`getComputedStyle(document.getElementById('pic')).filter`), 'none');
+    // The white page takes a tint of the colour (still light); the blue header turns to it.
+    const bodyBg = await page.eval(`getComputedStyle(document.documentElement).backgroundColor`);
+    assert.notEqual(bodyBg, 'rgb(255, 255, 255)');
+    assert.ok(near(await page.eval(HUE('document.documentElement', 'backgroundColor')), 90, 30), bodyBg);
+    assert.ok(near(await page.eval(HUE(`document.querySelector('header')`, 'backgroundColor')), 90, 30));
+    assert.ok(near(await page.eval(HUE(`document.querySelector('a')`, 'color')), 90, 30), 'the link takes the colour');
+    // Readable everywhere: AA (4.5:1, 3:1 for large text).
+    const { worst, at } = await page.eval(CONTRAST);
+    assert.ok(worst >= 1, `contrast ${worst} at ${at}`);
+
+    // The second colour: the small knob dragged round to the bottom (hue 180) paints the accents.
+    const from = await b.eval(`(() => { const r = ${BE}.getElementById('shade').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+    const to = await b.eval(`(() => { const r = ${BE}.querySelector('#pad .field').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height * 0.95 }; })()`);
+    await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y, button: 'none' });
+    await b.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', clickCount: 1 });
+    for (let i = 1; i <= 8; i++) {
+      await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x + (to.x - from.x) * i / 8, y: from.y + (to.y - from.y) * i / 8, button: 'left', buttons: 1 });
+      await sleep(30);
+    }
+    await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', clickCount: 1 });
+    await b.waitFor(`(async () => { const { state } = await ${H}.getBoost(); return state.boost.tint2 >= 170 && state.boost.tint2 <= 190 && state.boost.tint === 90; })()`, 5000);
+    await page.waitFor(`${HUE(`document.querySelector('button')`, 'backgroundColor')} > 150`, 5000);
+    assert.ok(near(await page.eval(HUE(`document.querySelector('button')`, 'backgroundColor')), 180, 30), 'the button takes the second colour');
+    assert.ok(near(await page.eval(HUE(`document.querySelector('header')`, 'backgroundColor')), 90, 30), 'the header keeps the main one');
+    assert.ok((await page.eval(CONTRAST)).worst >= 1);
+    if (process.env.MERIDIAN_SHOT) {
+      const { data } = await page.cdp.send('Page.captureScreenshot', { format: 'png' });
+      fs.writeFileSync(process.env.MERIDIAN_SHOT, Buffer.from(data, 'base64'));
+    }
+    // "No colour": back to the site's own colours at once, nothing of ours left in the page.
+    await clickEditor(b, `${BE}.getElementById('noColour')`);
+    await page.waitFor(`!document.getElementById('meridian-boost-paint') && !document.querySelector('[data-mb-bg],[data-mb-fg]')`, 5000);
+    assert.equal(await page.eval(`getComputedStyle(document.querySelector('header')).backgroundColor`), 'rgb(21, 101, 192)');
+    page.close();
+  } finally { await b.close(); server.close(); }
+});
+
+// Before and after on three kinds of page: a light article, a dark app, a colourful landing. Each
+// stays readable (AA) and its own kind (light stays light, dark stays dark); pictures untouched.
+// MERIDIAN_SHOT_DIR keeps the screenshots.
+const KINDS = {
+  article: `<!doctype html><title>Article</title><style>body{margin:0 auto;max-width:640px;padding:24px;background:#fff;color:#1f2328;font:17px/1.6 Georgia,serif}h1{font:700 32px system-ui}a{color:#0969da}.meta{color:#6e7781;font:14px system-ui}blockquote{border-left:4px solid #d0d7de;margin:0;padding:4px 14px;color:#57606a;background:#f6f8fa}nav{display:flex;gap:16px;font:15px system-ui;border-bottom:1px solid #d0d7de;padding-bottom:10px}.pic{width:100%;height:120px;display:block;object-fit:cover}</style><nav><a href="#">Home</a><a href="#">Tech</a><a href="#">About</a></nav><h1>Why tabs pile up</h1><p class="meta">5 min read · by A. Writer</p><img class="pic" src="data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="640" height="120"><rect width="640" height="120" fill="#ff9800"/><circle cx="320" cy="60" r="40" fill="#3f51b5"/></svg>')}"><p>Every tab is a small promise. <a href="#">Research</a> says most of them are never kept, and the browser keeps <b>all of them</b> anyway.</p><blockquote>A tab you don't need today is a bookmark you won't need tomorrow.</blockquote><p>So the sidebar tidies the day away at night.</p>`,
+  dark: `<!doctype html><title>Dark app</title><style>body{margin:0;background:#0d1117;color:#c9d1d9;font:14px system-ui;display:flex;min-height:100vh}aside{width:180px;background:#161b22;border-right:1px solid #30363d;padding:12px}aside div{padding:6px 8px;border-radius:6px;color:#8b949e}aside .on{background:#1f6feb;color:#fff}main{flex:1;padding:20px}.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;margin-bottom:12px}.btn{background:#238636;color:#fff;border:0;border-radius:6px;padding:6px 12px}a{color:#58a6ff}.tag{background:#3fb95033;color:#3fb950;border-radius:10px;padding:2px 8px;font-size:12px}.muted{color:#6e7681}</style><aside><div class="on">Inbox</div><div>Issues</div><div>Pull requests</div><div>Settings</div></aside><main><div class="card"><b>Fix the share ring</b> <span class="tag">open</span><p class="muted">opened 2 hours ago by someone</p><a href="#">#212</a> <button class="btn">Merge</button></div><div class="card"><b>Boost colours</b> <span class="tag">review</span><p>A palette from two colours, not a filter.</p></div></main>`,
+  landing: `<!doctype html><title>Landing</title><style>body{margin:0;font:16px system-ui;color:#1a1a2e;background:#fff}.hero{background:linear-gradient(135deg,#ff6b6b,#f9c74f);color:#fff;padding:48px 32px}.hero h1{font:800 40px system-ui;margin:0 0 8px}.cta{background:#1a1a2e;color:#fff;border:0;border-radius:24px;padding:12px 22px;font-weight:700}.cols{display:flex;gap:12px;padding:24px}.col{flex:1;border-radius:14px;padding:16px}.a{background:#e0f7fa;color:#006064}.b{background:#f3e5f5;color:#4a148c}.c{background:#fff3e0;color:#e65100}footer{background:#4cc9f0;color:#03045e;padding:16px 32px}.logo{width:60px;height:60px}</style><div class="hero"><img class="logo" src="data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="60" height="60"><circle cx="30" cy="30" r="28" fill="#7209b7"/></svg>')}"><h1>Ship it faster</h1><p>The tool your team will actually like.</p><button class="cta">Start free</button></div><div class="cols"><div class="col a"><b>Fast</b><p>Under a second.</p></div><div class="col b"><b>Kind</b><p>No dark patterns.</p></div><div class="col c"><b>Yours</b><p>Export anything.</p></div></div><footer>Made with care · <a href="#">Contact</a></footer>`,
+};
+
+test('colours on a light article, a dark app and a colourful landing: readable, still light or dark, pictures untouched', async () => {
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(KINDS[req.url.slice(1)] || ''); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const b = await launch([`${base}/article`]);
+  const dir = process.env.MERIDIAN_SHOT_DIR;
+  const shot = async (page, name) => {
+    if (!dir) return;
+    const { data } = await page.cdp.send('Page.captureScreenshot', { format: 'png' });
+    fs.writeFileSync(path.join(dir, `${name}.png`), Buffer.from(data, 'base64'));
+  };
+  const PIC = `(() => { const i = document.querySelector('img'); return i ? getComputedStyle(i).filter + '|' + (i.getAttribute('data-mb-bg') || '') : 'none|'; })()`;
+  const L = `(() => { for (const e of [document.documentElement, document.body]) { const m = getComputedStyle(e).backgroundColor.match(/[\\d.]+/g).map(Number); if (m.length < 4 || m[3] > 0) return (0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2]) / 255; } return 1; })()`;
+  try {
+    let page = await b.page(`${base}/article`);
+    for (const [kind, tint, tint2] of [['article', 260, 330], ['dark', 150, 30], ['landing', 200, 280]]) {
+      if (kind !== 'article') {
+        await b.eval(`app.$.tabstrip.openUrl(${JSON.stringify(`${base}/${kind}`)})`);
+        page = await b.page(`${base}/${kind}`);
+      }
+      await page.waitFor(`document.readyState === 'complete'`);
+      await sleep(200);
+      await shot(page, `${kind}-before`);
+      const before = await page.eval(CONTRAST);
+      const light = await page.eval(L);
+      await b.waitFor(`(async () => (await ${H}.getBoost()).state.host === '127.0.0.1')()`);
+      const old = (await b.eval(`${H}.getBoost()`)).state.boost;
+      const boost = { id: old?.id || '', host: '127.0.0.1', name: 'Colours', enabled: true, css: '', js: '', zaps: [], hue: 0, font: '', tint, tintStrength: 70, tint2, dark: false, brightness: 100, contrast: 100, saturation: 100, size: 100, textCase: '' };
+      await b.eval(`${H}.setBoost(${JSON.stringify(boost)})`);
+      await page.waitFor(`!!document.getElementById('meridian-boost-paint') && document.body.hasAttribute('data-mb-fg')`, 5000);
+      await sleep(200);
+      await shot(page, `${kind}-after`);
+      const { worst, at } = await page.eval(CONTRAST);
+      assert.ok(worst >= Math.min(1, before.worst), `${kind}: contrast ${worst} at ${at} (before ${before.worst})`);
+      assert.equal(await page.eval(`getComputedStyle(document.documentElement).filter`), 'none', kind);
+      assert.equal(await page.eval(PIC), 'none|', `${kind}: the picture keeps its colours`);
+      const now = await page.eval(L);
+      assert.equal(now > 0.5, light > 0.5, `${kind}: stays ${light > 0.5 ? 'light' : 'dark'} (${light} -> ${now})`);
+      assert.notEqual(await page.eval(`getComputedStyle(document.documentElement).backgroundColor`), 'rgb(255, 255, 255)', kind);
+    }
+    page.close();
+  } finally { await b.close(); server.close(); }
+});
+
+test('an agent\'s boost shows its code when asked, and its JavaScript has no reach into Meridian\'s page helpers', async () => {
+  const s = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<title>Plain</title><p>page</p>'); });
+  await new Promise((r) => s.listen(0, '127.0.0.1', r));
+  const profile = profileWith({ agent_access: 'ask', agent_allow_js: true });
+  const b = await launch([`http://127.0.0.1:${s.address().port}/`], { profile });
+  const mcp = bridge(profile);
+  const AG = 'app.$.agent.shadowRoot';
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { clientInfo: { name: 'test-client' } });
+    await mcp.call('read_page');
+    const js = "document.title = 'boost:' + typeof window.__meridianAgent";
+    const pending = mcp.call('set_boost', { js });
+    await b.waitFor(`!!${AG}.getElementById('ask')`);
+    const said = await b.eval(`${AG}.querySelector('.summary').textContent`);
+    assert.ok(said.includes(js), said);
+    assert.match(said, /subdomains/);
+    await sleep(700);
+    await b.click(`${AG}.getElementById('allow')`);
+    assert.equal((await pending).error, null);
+    const reload = mcp.call('history_nav', { action: 'reload' });
+    await b.waitFor(`!!${AG}.getElementById('ask')`);
+    await sleep(700);
+    await b.click(`${AG}.getElementById('allow')`);
+    await reload;
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'boost:undefined')`);
+  } finally { mcp.close(); await b.close(); s.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });

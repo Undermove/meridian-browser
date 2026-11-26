@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Meridian <meridian@localhost>
+Date: Thu, 26 Nov 2026 14:39:06 +0400
+Subject: [PATCH] Meridian: Windows: Sign in to Claude runs in the command
+ prompt as it reads it, and Claude Code's own install folder is looked in
+
+"Sign in to Claude" and an account's sign-in open a command prompt
+(OpenInTerminal) with the command written for a POSIX shell:
+'C:\...\claude.exe' and CLAUDE_CONFIG_DIR='...' / env -u, which cmd.exe
+doesn't read, so nothing signed in. On Windows the program is in double
+quotes and an account's variables are set "NAME=value" && (set "NAME="
+takes one away).
+
+Claude Code's own Windows installer puts claude.exe in
+%USERPROFILE%\.local\bin; a Meridian started before it reached the PATH
+didn't find it. That folder is looked in too (not in tests).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/meridian/ai/accounts.cc          | 14 +++++++++++++-
+ chrome/browser/meridian/ai/accounts_unittest.cc | 14 ++++++++++++++
+ chrome/browser/meridian/ai/cli_versions.cc      | 12 +++++++++++-
+ 3 files changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/chrome/browser/meridian/ai/accounts.cc b/chrome/browser/meridian/ai/accounts.cc
+index c90592b9b6..86c121e048 100644
+--- a/chrome/browser/meridian/ai/accounts.cc
++++ b/chrome/browser/meridian/ai/accounts.cc
+@@ -14,6 +14,7 @@
+ #include "base/strings/string_util.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "build/build_config.h"
+ 
+ namespace meridian::ai {
+ 
+@@ -77,8 +78,13 @@ bool SameDir(const base::FilePath& a, const base::FilePath& b) {
+   return a.StripTrailingSeparators() == b.StripTrailingSeparators();
+ }
+ 
+-// A single-quoted shell word.
++// A single-quoted shell word; on Windows a double-quoted one, for the
++// command prompt the command runs in (OpenInTerminal), which reads no single
++// quotes (a path can't hold a double quote there).
+ std::string Quote(const std::string& s) {
++#if BUILDFLAG(IS_WIN)
++  return "\"" + s + "\"";
++#else
+   std::string out = "'";
+   for (char c : s) {
+     if (c == '\'') {
+@@ -88,6 +94,7 @@ std::string Quote(const std::string& s) {
+     }
+   }
+   return out + "'";
++#endif
+ }
+ 
+ }  // namespace
+@@ -466,8 +473,13 @@ std::string AccountLoginCommand(const AccountVendor& vendor,
+   std::map<std::string, std::string> env = AccountEnv(vendor, home, dir);
+   std::string prefix;
+   for (const auto& [name, value] : env) {
++#if BUILDFLAG(IS_WIN)
++    // The command prompt's way: set "NAME=" takes it away.
++    prefix += "set \"" + name + "=" + value + "\" && ";
++#else
+     prefix += value.empty() ? "env -u " + name + " "
+                             : name + "=" + Quote(value) + " ";
++#endif
+   }
+   return prefix + WithProgram(vendor.login, program);
+ }
+diff --git a/chrome/browser/meridian/ai/accounts_unittest.cc b/chrome/browser/meridian/ai/accounts_unittest.cc
+index 041549989a..539e23a8db 100644
+--- a/chrome/browser/meridian/ai/accounts_unittest.cc
++++ b/chrome/browser/meridian/ai/accounts_unittest.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "base/files/file_util.h"
+ #include "base/files/scoped_temp_dir.h"
++#include "build/build_config.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+ namespace meridian::ai {
+@@ -116,12 +117,25 @@ TEST_F(AccountsTest, EnvSetsTheVariableOrTakesItAway) {
+   env = AccountEnv(gemini, home_, home_.AppendASCII(".gemini-work"));
+   EXPECT_EQ(env["GEMINI_CLI_HOME"],
+             home_.AppendASCII(".gemini-work").AsUTF8Unsafe());
++#if BUILDFLAG(IS_WIN)
++  // The command prompt's words (it reads no single quotes, no env -u).
++  EXPECT_EQ(AccountLoginCommand(
++                claude, home_,
++                base::FilePath::FromASCII("C:\\Users\\me\\.claude-o'k")),
++            "set \"CLAUDE_CONFIG_DIR=C:\\Users\\me\\.claude-o'k\" && claude");
++  EXPECT_EQ(AccountLoginCommand(claude, home_, home_.AppendASCII(".claude")),
++            "set \"CLAUDE_CONFIG_DIR=\" && claude");
++  EXPECT_EQ(WithProgram("claude auth login",
++                        "C:\\Program Files\\Claude\\claude.exe"),
++            "\"C:\\Program Files\\Claude\\claude.exe\" auth login");
++#else
+   EXPECT_EQ(AccountLoginCommand(
+                 claude, home_,
+                 base::FilePath::FromASCII("/Users/me/.claude-o'k")),
+             "CLAUDE_CONFIG_DIR='/Users/me/.claude-o'\\''k' claude");
+   EXPECT_EQ(AccountLoginCommand(claude, home_, home_.AppendASCII(".claude")),
+             "env -u CLAUDE_CONFIG_DIR claude");
++#endif
+ }
+ 
+ TEST_F(AccountsTest, NewAccountDirFromANameOrAFolder) {
+diff --git a/chrome/browser/meridian/ai/cli_versions.cc b/chrome/browser/meridian/ai/cli_versions.cc
+index c06a93f248..043349e71e 100644
+--- a/chrome/browser/meridian/ai/cli_versions.cc
++++ b/chrome/browser/meridian/ai/cli_versions.cc
+@@ -34,7 +34,17 @@ std::vector<std::string> Folders(const std::string& search_path,
+   std::vector<std::string> out =
+       base::SplitString(search_path, kSeparator, base::TRIM_WHITESPACE,
+                         base::SPLIT_WANT_NONEMPTY);
+-#if !BUILDFLAG(IS_WIN)
++#if BUILDFLAG(IS_WIN)
++  // Where Claude Code's own installer puts it on Windows, which a Meridian
++  // started before that installer added it to the PATH doesn't see yet. (npm's
++  // claude.cmd isn't a program Meridian runs: .exe only.)
++  if (!TestSwitchesAllowed()) {
++    auto profile = env.find("USERPROFILE");
++    if (profile != env.end() && !profile->second.empty()) {
++      out.push_back(profile->second + "\\.local\\bin");
++    }
++  }
++#else
+   // A test sees its stand-ins only, never the computer's real CLIs.
+   if (TestSwitchesAllowed()) {
+     return out;
+-- 
+2.52.0.windows.1
+

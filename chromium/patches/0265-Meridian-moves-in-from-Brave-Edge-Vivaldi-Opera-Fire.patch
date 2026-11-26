@@ -1,0 +1,2030 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 04:56:07 +0400
+Subject: [PATCH 265/297] Meridian: moves in from Brave, Edge, Vivaldi, Opera,
+ Firefox and Safari
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Brave, Edge, Vivaldi and Opera are read as Chrome is (a space per profile,
+bookmarks as pinned tabs, open tabs from the session file, history and the
+rest, passwords and sign-ins with the browser's own "<Name> Safe Storage"
+keychain item); Opera's one profile lives right in its folder. Firefox
+(profiles.ini, places.sqlite) and Safari (Bookmarks.plist, History.db) bring
+bookmarks and history only, and the step says so; Safari kept private by
+macOS (Full Disk Access) says how to allow Meridian. The first run lists
+every browser found to pick from; Meridian > Import from Another Browser…,
+the command bar and the app menu ("Import from <Browser>…") open the same
+step. Tests point each browser at its own folder (--meridian-<kind>-dir).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/app/chrome_command_ids.h               |   1 +
+ chrome/app/meridian_strings.grdp              |   3 +
+ chrome/browser/meridian/BUILD.gn              |   3 +
+ .../browser/meridian/agent/agent_service.cc   |   1 +
+ chrome/browser/meridian/ai/ai_service.cc      |   3 +
+ chrome/browser/meridian/arc_data.cc           |  24 +-
+ chrome/browser/meridian/arc_import.cc         |  16 +-
+ .../browser/meridian/arc_import_unittest.cc   |  93 ++++
+ chrome/browser/meridian/arc_logins.cc         |  14 +-
+ chrome/browser/meridian/chrome_import.cc      |  30 +-
+ chrome/browser/meridian/import_source.cc      | 181 ++++++-
+ chrome/browser/meridian/import_source.h       |  41 +-
+ chrome/browser/meridian/other_import.cc       | 472 ++++++++++++++++++
+ chrome/browser/meridian/other_import.h        |  55 ++
+ chrome/browser/meridian/other_import_mac.mm   |  69 +++
+ chrome/browser/meridian/prefs.cc              |   8 +
+ chrome/browser/meridian/sidebar.mojom         |  19 +-
+ chrome/browser/meridian/sidebar_handler.cc    |  68 ++-
+ chrome/browser/meridian/sidebar_handler.h     |   1 +
+ .../browser/resources/webui_browser/BUILD.gn  |   1 +
+ chrome/browser/resources/webui_browser/app.ts |   3 +
+ .../webui_browser/meridian/command_bar.ts     |   4 +
+ .../webui_browser/meridian/import_sources.ts  |  31 ++
+ .../webui_browser/meridian/onboarding.css     |  12 +-
+ .../webui_browser/meridian/onboarding.html.ts |  38 +-
+ .../webui_browser/meridian/onboarding.ts      | 103 ++--
+ .../webui_browser/meridian/sidebar.ts         |  18 +-
+ .../browser/ui/browser_command_controller.cc  |   2 +-
+ chrome/browser/ui/cocoa/main_menu_builder.mm  |   3 +
+ 29 files changed, 1182 insertions(+), 135 deletions(-)
+ create mode 100644 chrome/browser/meridian/other_import.cc
+ create mode 100644 chrome/browser/meridian/other_import.h
+ create mode 100644 chrome/browser/meridian/other_import_mac.mm
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/import_sources.ts
+
+diff --git a/chrome/app/chrome_command_ids.h b/chrome/app/chrome_command_ids.h
+index af9ad121d9..b1775f5874 100644
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -135,6 +135,7 @@
+ #define IDC_MERIDIAN_LITTLE_WINDOW    39727
+ // The page's context menu: opens Ask (⌘J toggles it).
+ #define IDC_MERIDIAN_ASK_PAGE         39728
++#define IDC_MERIDIAN_IMPORT_OTHER     39729
+ // Spaces 1-9: IDC_MERIDIAN_SPACE_1 + n.
+ #define IDC_MERIDIAN_SPACE_1          39710
+ #define IDC_MERIDIAN_SPACE_9          39718
+diff --git a/chrome/app/meridian_strings.grdp b/chrome/app/meridian_strings.grdp
+index 0407233f3a..1262636250 100644
+--- a/chrome/app/meridian_strings.grdp
++++ b/chrome/app/meridian_strings.grdp
+@@ -31,6 +31,9 @@
+   <message name="IDS_MERIDIAN_IMPORT_ARC_MAC" desc="App menu item: bring spaces, tabs and sign-ins over from the Arc browser.">
+     Import from Arc…
+   </message>
++  <message name="IDS_MERIDIAN_IMPORT_OTHER_MAC" desc="App menu item: bring bookmarks, tabs and history over from another browser on this Mac (Chrome, Brave, Edge, Vivaldi, Opera, Firefox, Safari).">
++    Import from Another Browser…
++  </message>
+   <message name="IDS_MERIDIAN_ASK_MAC" desc="View menu item: open the Ask panel (the built-in AI) beside the page.">
+     Ask Meridian
+   </message>
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index d83ff113a9..ac686f0abc 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -373,6 +373,8 @@ source_set("meridian") {
+     "arc_data.h",
+     "arc_logins.cc",
+     "arc_logins.h",
++    "other_import.cc",
++    "other_import.h",
+     "downloads_tracker.cc",
+     "downloads_tracker.h",
+     "little_window.cc",
+@@ -400,6 +402,7 @@ source_set("meridian") {
+     sources += [
+       "arc_logins_mac.mm",
+       "mission/mission_platform_mac.mm",
++      "other_import_mac.mm",
+       "sidebar_handler_mac.mm",
+       "update_delta.cc",
+       "update_delta.h",
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index 49fb635a72..0519a4756f 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -1310,6 +1310,7 @@ MAKE ANY SITE YOURS: BOOST
+ 
+ MOVING IN
+ - Import from Arc (in the Meridian menu) brings spaces, pinned tabs, folders and favorites, and can keep you signed in to your sites. Arc stays untouched.
++- Import from Another Browser (in the Meridian menu): Chrome, Brave, Edge, Vivaldi and Opera bring each profile as a space (bookmarks as pinned tabs, open tabs, history, optionally passwords and sign-ins); Firefox and Safari bring bookmarks and history only. The person starts it there; agents can't.
+ - The Welcome Tour (Help menu) runs the first-run setup again.
+ 
+ SMALL THINGS
+diff --git a/chrome/browser/meridian/ai/ai_service.cc b/chrome/browser/meridian/ai/ai_service.cc
+index 60801443f1..9718704998 100644
+--- a/chrome/browser/meridian/ai/ai_service.cc
++++ b/chrome/browser/meridian/ai/ai_service.cc
+@@ -80,6 +80,9 @@ constexpr char kGuide[] =
+     "- Import from Arc (File > Import from Arc, or the welcome tour in the "
+     "Help menu): spaces, pinned tabs, folders, favorites, Today tabs and "
+     "logins.\n"
++    "- Import from Another Browser (Meridian menu): Chrome, Brave, Edge, "
++    "Vivaldi, Opera (profiles as spaces, bookmarks, open tabs, history, "
++    "passwords); Firefox and Safari (bookmarks and history only).\n"
+     "- Built-in ad and tracker blocking (Settings > Advanced). Passwords, "
+     "passkeys and Google sign-in work as in Chrome.\n"
+     "- AI: Cmd+J opens the Ask panel. Settings > AI picks who answers: Claude "
+diff --git a/chrome/browser/meridian/arc_data.cc b/chrome/browser/meridian/arc_data.cc
+index c4f25d6fcb..8f830565d1 100644
+--- a/chrome/browser/meridian/arc_data.cc
++++ b/chrome/browser/meridian/arc_data.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "chrome/browser/meridian/chrome_import.h"
+ #include "chrome/browser/meridian/import_source.h"
++#include "chrome/browser/meridian/other_import.h"
+ 
+ #include <algorithm>
+ #include <functional>
+@@ -729,6 +730,17 @@ ArcDataRead ReadArcData(ImportSource source,
+   if (source.user_data.empty() || !base::DirectoryExists(source.user_data)) {
+     return out;
+   }
++  // Firefox and Safari: their history, into the main profile.
++  if (source.format != ImportSource::Format::kChromium) {
++    ProfileRead& p = out.profiles[std::string()];
++    p.since_pref = DataImportedAtPref(source.kind);
++    p.history = ReadOtherHistory(source);
++    out.found = !p.history.empty();
++    if (!out.found) {
++      out.profiles.clear();
++    }
++    return out;
++  }
+   std::map<std::string, std::map<GURL, std::u16string>> sidebar_pages;
+   // Arc's own files: its sidebar (for the favicons of pinned pages), the
+   // archive, Air Traffic Control's rules, boosts.
+@@ -746,17 +758,11 @@ ArcDataRead ReadArcData(ImportSource source,
+     sidebar_pages = SidebarPages(*sidebar);
+   }
+ 
+-  base::FileEnumerator dirs(source.user_data, false,
+-                            base::FileEnumerator::DIRECTORIES);
+-  for (base::FilePath dir = dirs.Next(); !dir.empty(); dir = dirs.Next()) {
+-    std::string name = dir.BaseName().AsUTF8Unsafe();
+-    if (!IsProfileDir(name)) {
+-      continue;
+-    }
++  for (const auto& [name, dir] : ProfileDirsOf(source)) {
+     std::string id = ProfileIdFor(source, name);
+     ProfileRead& p = out.profiles[id];
+-    if (source.kind == "chrome") {
+-      p.since_pref = prefs::kChromeDataImportedAt;
++    if (source.kind != "arc") {
++      p.since_pref = DataImportedAtPref(source.kind);
+     }
+     ReadHistory(dir.AppendASCII("History"), p.history);
+     {
+diff --git a/chrome/browser/meridian/arc_import.cc b/chrome/browser/meridian/arc_import.cc
+index e1dd71fb3b..74412f5a2e 100644
+--- a/chrome/browser/meridian/arc_import.cc
++++ b/chrome/browser/meridian/arc_import.cc
+@@ -431,20 +431,8 @@ std::vector<ArcExtension> ReadExtensionsOf(const ImportSource& source) {
+   if (source.user_data.empty()) {
+     return out;
+   }
+-  base::FileEnumerator profiles(source.user_data, false,
+-                                base::FileEnumerator::DIRECTORIES);
+-  std::vector<base::FilePath> dirs;
+-  for (base::FilePath dir = profiles.Next(); !dir.empty();
+-       dir = profiles.Next()) {
+-    const std::string name = dir.BaseName().AsUTF8Unsafe();
+-    if (IsProfileDir(name)) {
+-      dirs.push_back(dir);
+-    }
+-  }
+-  std::ranges::sort(dirs);
+-  for (const base::FilePath& profile : dirs) {
+-    const std::string profile_id =
+-        ProfileIdFor(source, profile.BaseName().AsUTF8Unsafe());
++  for (const auto& [name, profile] : ProfileDirsOf(source)) {
++    const std::string profile_id = ProfileIdFor(source, name);
+     std::set<std::string> seen;
+     base::FileEnumerator ids(profile.AppendASCII("Extensions"), false,
+                              base::FileEnumerator::DIRECTORIES);
+diff --git a/chrome/browser/meridian/arc_import_unittest.cc b/chrome/browser/meridian/arc_import_unittest.cc
+index 5cf1a152b1..07662a402b 100644
+--- a/chrome/browser/meridian/arc_import_unittest.cc
++++ b/chrome/browser/meridian/arc_import_unittest.cc
+@@ -10,6 +10,8 @@
+ #include "base/strings/strcat.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/test/task_environment.h"
++#include "chrome/browser/meridian/chrome_import.h"
++#include "chrome/browser/meridian/import_source.h"
+ #include "chrome/browser/meridian/sidebar_service.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+@@ -226,5 +228,96 @@ TEST(ArcImportTest, NoArcMeansNoExtensions) {
+   EXPECT_TRUE(ReadArcExtensionsIn(arc.GetPath()).empty());
+ }
+ 
++// Each Chromium browser: its own keychain item, its own Meridian profiles,
++// its own test switch.
++TEST(ImportSourceTest, EachBrowserItsOwn) {
++  struct {
++    const char* kind;
++    const char* keychain;
++    const char* account;
++    const char* prefix;
++  } kCases[] = {
++      {"chrome", "Chrome Safe Storage", "Chrome", "Meridian Profile Chrome "},
++      {"brave", "Brave Safe Storage", "Brave", "Meridian Profile Brave "},
++      {"edge", "Microsoft Edge Safe Storage", "Microsoft Edge",
++       "Meridian Profile Edge "},
++      {"vivaldi", "Vivaldi Safe Storage", "Vivaldi",
++       "Meridian Profile Vivaldi "},
++      {"opera", "Opera Safe Storage", "Opera", "Meridian Profile Opera "},
++  };
++  for (const auto& c : kCases) {
++    ImportSource s = ImportSourceFor(c.kind);
++    EXPECT_EQ(s.kind, c.kind);
++    EXPECT_EQ(s.format, ImportSource::Format::kChromium);
++    EXPECT_EQ(s.keychain_service, c.keychain);
++    EXPECT_EQ(s.keychain_account, c.account);
++    EXPECT_EQ(s.profile_prefix, c.prefix);
++    EXPECT_EQ(s.dir_switch, base::StrCat({"meridian-", c.kind, "-dir"}));
++  }
++  EXPECT_EQ(ImportSourceFor("firefox").format, ImportSource::Format::kFirefox);
++  EXPECT_EQ(ImportSourceFor("safari").format, ImportSource::Format::kSafari);
++  EXPECT_TRUE(ImportSourceFor("firefox").keychain_service.empty());
++  EXPECT_EQ(ImportSourceFor("nonsense").kind, "arc");
++  EXPECT_EQ(ImportKinds().front(), "arc");
++  EXPECT_EQ(ImportKinds().size(), 8u);
++  EXPECT_EQ(ImportedPref("chrome"), "meridian.chrome_imported");
++  EXPECT_EQ(DataImportedAtPref("chrome"), "meridian.chrome_data_imported_at");
++  EXPECT_EQ(DataImportedAtPref("arc"), "meridian.arc_data_imported_at");
++}
++
++TEST(ImportSourceTest, ProfileFolders) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  for (const char* name : {"Profile 10", "Default", "Profile 2",
++                           "System Profile", "Guest Profile", "Crashpad"}) {
++    ASSERT_TRUE(base::CreateDirectory(dir.GetPath().AppendASCII(name)));
++  }
++  ImportSource brave = ImportSourceFor("brave");
++  brave.user_data = dir.GetPath();
++  std::vector<std::string> names;
++  for (const auto& [name, path] : ProfileDirsOf(brave)) {
++    names.push_back(name);
++    EXPECT_EQ(path, dir.GetPath().AppendASCII(name));
++  }
++  EXPECT_EQ(names,
++            (std::vector<std::string>{"Default", "Profile 2", "Profile 10"}));
++  EXPECT_EQ(ProfileIdFor(brave, "Profile 2"), "Meridian Profile Brave 2");
++  EXPECT_EQ(ProfileIdFor(brave, "Default"), "");
++
++  // Opera: the folder itself is the one profile.
++  ImportSource opera = ImportSourceFor("opera");
++  opera.user_data = dir.GetPath();
++  auto dirs = ProfileDirsOf(opera);
++  ASSERT_EQ(dirs.size(), 1u);
++  EXPECT_EQ(dirs[0].first, "Default");
++  EXPECT_EQ(dirs[0].second, dir.GetPath());
++
++  // Firefox and Safari keep no Chromium profiles.
++  ImportSource firefox = ImportSourceFor("firefox");
++  firefox.user_data = dir.GetPath();
++  EXPECT_TRUE(ProfileDirsOf(firefox).empty());
++}
++
++// A profile Opera's way: Bookmarks right in the folder, the space named
++// "Opera".
++TEST(ImportSourceTest, OperaSidebar) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  ASSERT_TRUE(base::WriteFile(
++      dir.GetPath().AppendASCII("Bookmarks"),
++      R"({"roots": {"bookmark_bar": {"type": "folder", "children": [
++           {"type": "url", "name": "Dial", "url": "https://dial.example/"}]},
++         "other": {"type": "folder", "children": []}}})"));
++  ImportSource opera = ImportSourceFor("opera");
++  opera.user_data = dir.GetPath();
++  std::optional<ArcSidebar> sidebar = ReadChromeSidebar(opera);
++  ASSERT_TRUE(sidebar);
++  ASSERT_EQ(sidebar->spaces.size(), 1u);
++  EXPECT_EQ(sidebar->spaces[0].name, "Opera");
++  EXPECT_EQ(sidebar->spaces[0].profile, "");
++  ASSERT_EQ(sidebar->spaces[0].pinned.size(), 1u);
++  EXPECT_EQ(sidebar->spaces[0].pinned[0].title, "Dial");
++}
++
+ }  // namespace
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/arc_logins.cc b/chrome/browser/meridian/arc_logins.cc
+index b7debd260b..d303c26bf1 100644
+--- a/chrome/browser/meridian/arc_logins.cc
++++ b/chrome/browser/meridian/arc_logins.cc
+@@ -132,13 +132,7 @@ std::vector<ArcProfile> FindArcProfiles(const ImportSource& source) {
+   if (source.user_data.empty()) {
+     return out;
+   }
+-  base::FileEnumerator dirs(source.user_data, false,
+-                            base::FileEnumerator::DIRECTORIES);
+-  for (base::FilePath dir = dirs.Next(); !dir.empty(); dir = dirs.Next()) {
+-    std::string name = dir.BaseName().AsUTF8Unsafe();
+-    if (!IsProfileDir(name)) {
+-      continue;
+-    }
++  for (const auto& [name, dir] : ProfileDirsOf(source)) {
+     ArcProfile p{name};
+     for (const char* rel : {"Network/Cookies", "Cookies"}) {
+       if (base::PathExists(dir.AppendUTF8(rel))) {
+@@ -158,12 +152,6 @@ std::vector<ArcProfile> FindArcProfiles(const ImportSource& source) {
+       out.push_back(std::move(p));
+     }
+   }
+-  auto rank = [](const ArcProfile& p) {
+-    int n = 0;
+-    base::StringToInt(p.dir.substr(std::min<size_t>(8, p.dir.size())), &n);
+-    return p.dir == "Default" ? -1 : n;
+-  };
+-  std::ranges::sort(out, {}, rank);
+   return out;
+ }
+ 
+diff --git a/chrome/browser/meridian/chrome_import.cc b/chrome/browser/meridian/chrome_import.cc
+index cdff422f17..0ec7841390 100644
+--- a/chrome/browser/meridian/chrome_import.cc
++++ b/chrome/browser/meridian/chrome_import.cc
+@@ -204,34 +204,30 @@ std::optional<ArcSidebar> ReadChromeSidebar(const ImportSource& source) {
+       local_state ? local_state->FindDictByDottedPath("profile.info_cache")
+                   : nullptr;
+   std::vector<std::string> dirs;
+-  base::FileEnumerator found(source.user_data, false,
+-                             base::FileEnumerator::DIRECTORIES);
+-  for (base::FilePath dir = found.Next(); !dir.empty(); dir = found.Next()) {
+-    std::string name = dir.BaseName().AsUTF8Unsafe();
+-    if (IsProfileDir(name) &&
+-        (base::PathExists(dir.AppendASCII("Bookmarks")) ||
+-         base::DirectoryExists(dir.AppendASCII("Sessions")) ||
+-         base::PathExists(dir.AppendASCII("History")))) {
++  for (const auto& [name, dir] : ProfileDirsOf(source)) {
++    if (base::PathExists(dir.AppendASCII("Bookmarks")) ||
++        base::DirectoryExists(dir.AppendASCII("Sessions")) ||
++        base::PathExists(dir.AppendASCII("History"))) {
+       dirs.push_back(name);
+     }
+   }
+-  std::ranges::sort(dirs, {}, [](const std::string& d) {
+-    int n = 0;
+-    base::StringToInt(d.substr(std::min<size_t>(8, d.size())), &n);
+-    return d == "Default" ? -1 : n;
+-  });
+   if (dirs.empty()) {
+     return std::nullopt;
+   }
+   ArcSidebar out;
+   for (const std::string& dir : dirs) {
+-    base::FilePath path = source.user_data.AppendUTF8(dir);
++    base::FilePath path = source.root_is_profile
++                              ? source.user_data
++                              : source.user_data.AppendUTF8(dir);
+     const std::string* name =
+         info ? info->FindStringByDottedPath(dir + ".name") : nullptr;
+     Space space;
+-    space.name = name && !name->empty() ? name->substr(0, 60) : "Chrome";
+-    if (dirs.size() == 1 && space.name.starts_with("Person ")) {
+-      space.name = "Chrome";
++    space.name =
++        name && !name->empty() ? name->substr(0, 60) : source.short_name;
++    // Chrome's and Edge's own names for an unnamed profile.
++    if (dirs.size() == 1 && (space.name.starts_with("Person ") ||
++                             space.name.starts_with("Profile "))) {
++      space.name = source.short_name;
+     }
+     space.icon = "🌐";
+     space.profile = ProfileIdFor(source, dir);
+diff --git a/chrome/browser/meridian/import_source.cc b/chrome/browser/meridian/import_source.cc
+index 39a43b0592..10e3185666 100644
+--- a/chrome/browser/meridian/import_source.cc
++++ b/chrome/browser/meridian/import_source.cc
+@@ -4,7 +4,12 @@
+ 
+ #include "chrome/browser/meridian/import_source.h"
+ 
++#include <algorithm>
++
+ #include "base/base_paths.h"
++#include "base/files/file_enumerator.h"
++#include "base/files/file_util.h"
++#include "base/no_destructor.h"
+ #include "base/path_service.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "build/build_config.h"
+@@ -22,6 +27,7 @@ ImportSource ArcSource() {
+   ImportSource s;
+   s.kind = "arc";
+   s.name = "Arc";
++  s.short_name = "Arc";
+   s.app_data = ArcDataDir();
+   if (!s.app_data.empty()) {
+     s.user_data = s.app_data.AppendASCII("User Data");
+@@ -34,43 +40,182 @@ ImportSource ArcSource() {
+   return s;
+ }
+ 
+-ImportSource ChromeSource() {
++namespace {
++
++struct Known {
++  const char* kind;
++  const char* name;
++  const char* short_name;
++  ImportSource::Format format;
++  // The keychain item (macOS): "<service> Safe Storage", account.
++  const char* keychain;
++  const char* account;
++  // Where it keeps its profiles, from Application Support (macOS), the local
++  // (or, `roaming`, the roaming) app data folder (Windows), home (Linux).
++  const char* mac;
++  const char* win;
++  bool roaming;
++  const char* lin;
++  bool root_is_profile;
++};
++
++constexpr Known kKnown[] = {
++    {"chrome", "Google Chrome", "Chrome", ImportSource::Format::kChromium,
++     "Chrome", "Chrome", "Google/Chrome", "Google\\Chrome\\User Data", false,
++     ".config/google-chrome", false},
++    {"brave", "Brave", "Brave", ImportSource::Format::kChromium, "Brave",
++     "Brave", "BraveSoftware/Brave-Browser",
++     "BraveSoftware\\Brave-Browser\\User Data", false,
++     ".config/BraveSoftware/Brave-Browser", false},
++    {"edge", "Microsoft Edge", "Edge", ImportSource::Format::kChromium,
++     "Microsoft Edge", "Microsoft Edge", "Microsoft Edge",
++     "Microsoft\\Edge\\User Data", false, ".config/microsoft-edge", false},
++    {"vivaldi", "Vivaldi", "Vivaldi", ImportSource::Format::kChromium,
++     "Vivaldi", "Vivaldi", "Vivaldi", "Vivaldi\\User Data", false,
++     ".config/vivaldi", false},
++    {"opera", "Opera", "Opera", ImportSource::Format::kChromium, "Opera",
++     "Opera", "com.operasoftware.Opera", "Opera Software\\Opera Stable", true,
++     ".config/opera", true},
++    {"firefox", "Firefox", "Firefox", ImportSource::Format::kFirefox, "", "",
++     "Firefox", "Mozilla\\Firefox", true, ".mozilla/firefox", false},
++    // Safari keeps its files in ~/Library/Safari (macOS only).
++    {"safari", "Safari", "Safari", ImportSource::Format::kSafari, "", "", "",
++     "", false, "", false},
++};
++
++ImportSource SourceOf(const Known& k) {
+   ImportSource s;
+-  s.kind = "chrome";
+-  s.name = "Google Chrome";
+-  s.keychain_service = "Chrome Safe Storage";
+-  s.keychain_account = "Chrome";
+-  s.key_switch = "meridian-chrome-safe-storage";
+-  s.dir_switch = "meridian-chrome-dir";
+-  s.profile_prefix = "Meridian Profile Chrome ";
+-  // Tests: a fake Chrome user data folder.
++  s.kind = k.kind;
++  s.name = k.name;
++  s.short_name = k.short_name;
++  s.format = k.format;
++  s.root_is_profile = k.root_is_profile;
++  if (*k.keychain) {
++    s.keychain_service = std::string(k.keychain) + " Safe Storage";
++    s.keychain_account = k.account;
++  }
++  s.key_switch = std::string("meridian-") + k.kind + "-safe-storage";
++  s.dir_switch = std::string("meridian-") + k.kind + "-dir";
++  s.profile_prefix = std::string("Meridian Profile ") + k.short_name + " ";
++  // Tests: a fake folder, never the real one.
+   if (HasTestSwitch(s.dir_switch)) {
+     s.user_data = TestSwitchPath(s.dir_switch);
+     return s;
+   }
+ #if BUILDFLAG(IS_WIN)
+-  base::FilePath local;
+-  if (base::PathService::Get(base::DIR_LOCAL_APP_DATA, &local)) {
+-    s.user_data = local.AppendASCII("Google")
+-                      .AppendASCII("Chrome")
+-                      .AppendASCII("User Data");
++  base::FilePath base;
++  if (*k.win &&
++      base::PathService::Get(k.roaming ? base::DIR_ROAMING_APP_DATA
++                                       : base::DIR_LOCAL_APP_DATA,
++                             &base)) {
++    s.user_data = base.Append(base::FilePath::FromASCII(k.win));
+   }
+ #elif BUILDFLAG(IS_MAC)
+   base::FilePath home;
+   if (base::PathService::Get(base::DIR_HOME, &home)) {
+-    s.user_data = home.AppendASCII("Library/Application Support/Google/Chrome");
++    s.user_data = s.format == ImportSource::Format::kSafari
++                      ? home.AppendASCII("Library/Safari")
++                      : home.AppendASCII("Library/Application Support")
++                            .AppendASCII(k.mac);
+   }
+ #else
+   base::FilePath home;
+-  if (base::PathService::Get(base::DIR_HOME, &home)) {
+-    s.user_data = home.AppendASCII(".config/google-chrome");
++  if (*k.lin && base::PathService::Get(base::DIR_HOME, &home)) {
++    s.user_data = home.AppendASCII(k.lin);
+   }
+ #endif
+   return s;
+ }
+ 
++}  // namespace
++
++ImportSource ChromeSource() {
++  return SourceOf(kKnown[0]);
++}
++
+ ImportSource ImportSourceFor(const std::string& kind) {
+-  return kind == "chrome" ? ChromeSource() : ArcSource();
++  for (const Known& k : kKnown) {
++    if (kind == k.kind) {
++      return SourceOf(k);
++    }
++  }
++  return ArcSource();
++}
++
++const std::vector<std::string>& ImportKinds() {
++  static const base::NoDestructor<std::vector<std::string>> kinds([] {
++    std::vector<std::string> out = {"arc"};
++    for (const Known& k : kKnown) {
++      out.push_back(k.kind);
++    }
++    return out;
++  }());
++  return *kinds;
++}
++
++std::string DataImportedAtPref(const std::string& kind) {
++  return "meridian." + kind + "_data_imported_at";
++}
++
++std::string ImportedPref(const std::string& kind) {
++  return "meridian." + kind + "_imported";
++}
++
++bool SourceFound(const ImportSource& source) {
++  if (source.user_data.empty() && source.app_data.empty()) {
++    return false;
++  }
++  const base::FilePath& dir = source.user_data;
++  switch (source.format) {
++    case ImportSource::Format::kFirefox:
++      return base::PathExists(dir.AppendASCII("profiles.ini"));
++    case ImportSource::Format::kSafari:
++      // Only whether they're there (macOS may keep what's in them private).
++      return base::PathExists(dir.AppendASCII("Bookmarks.plist")) ||
++             base::PathExists(dir.AppendASCII("History.db"));
++    case ImportSource::Format::kChromium:
++      break;
++  }
++  // Arc's own sidebar, or a profile.
++  if (!source.app_data.empty() &&
++      base::PathExists(source.app_data.AppendASCII("StorableSidebar.json"))) {
++    return true;
++  }
++  if (source.root_is_profile) {
++    return base::PathExists(dir.AppendASCII("Local State")) ||
++           base::PathExists(dir.AppendASCII("Bookmarks")) ||
++           base::PathExists(dir.AppendASCII("History"));
++  }
++  return !ProfileDirsOf(source).empty();
++}
++
++std::vector<std::pair<std::string, base::FilePath>> ProfileDirsOf(
++    const ImportSource& source) {
++  std::vector<std::pair<std::string, base::FilePath>> out;
++  if (source.format != ImportSource::Format::kChromium ||
++      source.user_data.empty()) {
++    return out;
++  }
++  if (source.root_is_profile) {
++    if (base::DirectoryExists(source.user_data)) {
++      out.emplace_back("Default", source.user_data);
++    }
++    return out;
++  }
++  base::FileEnumerator dirs(source.user_data, false,
++                            base::FileEnumerator::DIRECTORIES);
++  for (base::FilePath dir = dirs.Next(); !dir.empty(); dir = dirs.Next()) {
++    std::string name = dir.BaseName().AsUTF8Unsafe();
++    if (IsProfileDir(name)) {
++      out.emplace_back(name, dir);
++    }
++  }
++  std::ranges::sort(out, {}, [](const auto& d) {
++    int n = 0;
++    base::StringToInt(d.first.substr(std::min<size_t>(8, d.first.size())), &n);
++    return d.first == "Default" ? -1 : n;
++  });
++  return out;
+ }
+ 
+ bool IsProfileDir(const std::string& name) {
+diff --git a/chrome/browser/meridian/import_source.h b/chrome/browser/meridian/import_source.h
+index 2ba7ef939f..41cf660a5b 100644
+--- a/chrome/browser/meridian/import_source.h
++++ b/chrome/browser/meridian/import_source.h
+@@ -6,25 +6,37 @@
+ #define CHROME_BROWSER_MERIDIAN_IMPORT_SOURCE_H_
+ 
+ #include <string>
++#include <utility>
++#include <vector>
+ 
+ #include "base/files/file_path.h"
+ 
+ namespace meridian {
+ 
+-// A Chromium browser Meridian moves in from: Arc or Google Chrome. Both keep
+-// their profiles the same way ("Default", "Profile N" with History, Cookies,
+-// Login Data…), encrypted with a key from the keychain (macOS) or from
+-// "Local State" (Windows), so one import reads either.
++// A browser Meridian moves in from. The Chromium ones (Arc, Google Chrome,
++// Brave, Microsoft Edge, Vivaldi, Opera) keep their profiles the same way
++// ("Default", "Profile N" with History, Cookies, Login Data…), encrypted with
++// a key from the keychain ("<Name> Safe Storage", macOS) or from "Local State"
++// (Windows), so one import reads any of them. Firefox and Safari keep theirs
++// their own way: Meridian brings their bookmarks and history (other_import.h).
+ struct ImportSource {
+   ImportSource();
+   ImportSource(const ImportSource&);
+   ImportSource& operator=(const ImportSource&);
+   ~ImportSource();
+ 
+-  // "arc" or "chrome".
++  enum class Format { kChromium, kFirefox, kSafari };
++
++  // "arc", "chrome", "brave", "edge", "vivaldi", "opera", "firefox" or
++  // "safari".
+   std::string kind;
+   // For people: "Arc", "Google Chrome".
+   std::string name;
++  // In a sentence and as a space's name: "Chrome", "Edge".
++  std::string short_name;
++  Format format = Format::kChromium;
++  // Opera keeps its one profile right in its folder, not in "Default".
++  bool root_is_profile = false;
+   // Where the profile folders and "Local State" are.
+   base::FilePath user_data;
+   // Where Arc's own files are (its sidebar, archive, rules); empty for
+@@ -43,8 +55,25 @@ struct ImportSource {
+ 
+ ImportSource ArcSource();
+ ImportSource ChromeSource();
+-// "arc" or "chrome" (anything else: Arc).
++// `kind` as above (anything else: Arc).
+ ImportSource ImportSourceFor(const std::string& kind);
++// Every kind Meridian moves in from, in the order the first run offers them.
++const std::vector<std::string>& ImportKinds();
++// Whether that browser is on this computer: its profiles (Firefox's
++// profiles.ini, Safari's files) are there. Blocking: file IO.
++bool SourceFound(const ImportSource& source);
++
++// The prefs for moving in from `kind`: when its history was last brought
++// over ("meridian.<kind>_data_imported_at"), and whether its sidebar came
++// ("meridian.<kind>_imported"); Arc's and Chrome's as before.
++std::string DataImportedAtPref(const std::string& kind);
++std::string ImportedPref(const std::string& kind);
++
++// A Chromium browser's profile folders, "Default" first, then "Profile N" in
++// order: (folder name, path). Opera's own folder counts as "Default". Empty
++// for Firefox and Safari.
++std::vector<std::pair<std::string, base::FilePath>> ProfileDirsOf(
++    const ImportSource& source);
+ 
+ // The Meridian profile for one of its profile folders: "" (the main one) for
+ // "Default", "<prefix>3" for "Profile 3". The same every time, so each part of
+diff --git a/chrome/browser/meridian/other_import.cc b/chrome/browser/meridian/other_import.cc
+new file mode 100644
+index 0000000000..aad9e4f541
+--- /dev/null
++++ b/chrome/browser/meridian/other_import.cc
+@@ -0,0 +1,472 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/other_import.h"
++
++#include <algorithm>
++#include <map>
++#include <utility>
++
++#include "base/files/file.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
++#include "base/time/time.h"
++#include "build/build_config.h"
++#include "chrome/browser/meridian/arc_logins.h"
++#include "chrome/browser/meridian/chrome_import.h"
++#include "chrome/browser/meridian/import_source.h"
++#include "sql/database.h"
++#include "sql/statement.h"
++#include "url/gurl.h"
++
++namespace meridian {
++
++namespace {
++
++constexpr size_t kMaxItems = 5000;
++constexpr size_t kMaxHistory = 200000;
++
++// A web page worth a pinned tab or a history row.
++bool IsWebPage(const GURL& url) {
++  return url.is_valid() && url.SchemeIsHTTPOrHTTPS();
++}
++
++// Firefox's times: microseconds since 1970.
++base::Time FromPRTime(int64_t us) {
++  return us > 0 ? base::Time::UnixEpoch() + base::Microseconds(us)
++                : base::Time();
++}
++
++// Safari's: seconds since 2001.
++base::Time FromAppleTime(double s) {
++  return s > 0 ? base::Time::FromSecondsSinceUnixEpoch(s + 978307200)
++               : base::Time();
++}
++
++base::FilePath PlacesOf(const base::FilePath& profile) {
++  return profile.AppendASCII("places.sqlite");
++}
++
++// ------------------------------------------------------------- Firefox
++
++struct FirefoxNode {
++  int64_t id = 0;
++  int type = 0;  // 1 a page, 2 a folder, 3 a separator
++  std::string title;
++  std::string url;
++};
++
++void ConvertFirefox(
++    const std::map<int64_t, std::vector<FirefoxNode>>& children,
++    int64_t parent,
++    int depth,
++    size_t& count,
++    std::vector<Item>& out) {
++  auto it = children.find(parent);
++  if (it == children.end()) {
++    return;
++  }
++  for (const FirefoxNode& node : it->second) {
++    if (count >= kMaxItems) {
++      return;
++    }
++    if (node.type == 1) {
++      GURL url(node.url);
++      if (!IsWebPage(url)) {
++        continue;
++      }
++      Item item;
++      item.url = url;
++      item.title = node.title.empty() ? url.spec() : node.title;
++      ++count;
++      out.push_back(std::move(item));
++    } else if (node.type == 2 && depth < 32) {
++      Item folder;
++      folder.is_folder = true;
++      folder.open = false;
++      folder.title = node.title.empty() ? "Folder" : node.title;
++      ConvertFirefox(children, node.id, depth + 1, count, folder.children);
++      if (!folder.children.empty()) {
++        ++count;
++        out.push_back(std::move(folder));
++      }
++    }
++  }
++}
++
++std::vector<Item> FirefoxBookmarks(sql::Database& db) {
++  std::vector<Item> out;
++  if (!db.DoesTableExist("moz_bookmarks") ||
++      !db.DoesTableExist("moz_places")) {
++    return out;
++  }
++  std::map<std::string, int64_t> roots;
++  {
++    sql::Statement s(db.GetUniqueStatement(
++        "SELECT id, guid FROM moz_bookmarks WHERE guid IN ('toolbar_____', "
++        "'menu________', 'unfiled_____', 'mobile______')"));
++    while (s.Step()) {
++      roots[s.ColumnString(1)] = s.ColumnInt64(0);
++    }
++  }
++  std::map<int64_t, std::vector<FirefoxNode>> children;
++  {
++    sql::Statement s(db.GetUniqueStatement(
++        "SELECT b.id, b.type, b.parent, b.title, p.url FROM moz_bookmarks b "
++        "LEFT JOIN moz_places p ON b.fk = p.id ORDER BY b.parent, b.position"));
++    while (s.Step()) {
++      children[s.ColumnInt64(2)].push_back(
++          {s.ColumnInt64(0), s.ColumnInt(1), s.ColumnString(3),
++           s.ColumnString(4)});
++    }
++  }
++  size_t count = 0;
++  // The toolbar's on top; the menu, other and mobile bookmarks as folders.
++  if (auto it = roots.find("toolbar_____"); it != roots.end()) {
++    ConvertFirefox(children, it->second, 0, count, out);
++  }
++  for (const auto& [guid, title] :
++       {std::pair<const char*, const char*>{"menu________", "Bookmarks menu"},
++        {"unfiled_____", "Other bookmarks"},
++        {"mobile______", "Mobile bookmarks"}}) {
++    auto it = roots.find(guid);
++    if (it == roots.end()) {
++      continue;
++    }
++    Item folder;
++    folder.is_folder = true;
++    folder.open = false;
++    folder.title = title;
++    ConvertFirefox(children, it->second, 1, count, folder.children);
++    if (!folder.children.empty()) {
++      out.push_back(std::move(folder));
++    }
++  }
++  return out;
++}
++
++void ReadFirefoxHistory(const base::FilePath& places, history::URLRows& out) {
++  base::ScopedTempDir tmp;
++  sql::Database db(sql::Database::Tag("History"));
++  if (!internal::OpenCopy(places, tmp, db) ||
++      !db.DoesTableExist("moz_places")) {
++    return;
++  }
++  sql::Statement s(db.GetUniqueStatement(
++      "SELECT url, title, visit_count, typed, last_visit_date, hidden "
++      "FROM moz_places WHERE last_visit_date > 0 "
++      "ORDER BY last_visit_date DESC"));
++  while (s.Step() && out.size() < kMaxHistory) {
++    GURL url(s.ColumnString(0));
++    base::Time last = FromPRTime(s.ColumnInt64(4));
++    if (!IsWebPage(url) || last.is_null()) {
++      continue;
++    }
++    history::URLRow row(url);
++    row.set_title(s.ColumnString16(1));
++    row.set_visit_count(std::max(1, s.ColumnInt(2)));
++    row.set_typed_count(s.ColumnInt(3) ? 1 : 0);
++    row.set_last_visit(last);
++    row.set_hidden(s.ColumnInt(5) != 0);
++    out.push_back(std::move(row));
++  }
++}
++
++// ------------------------------------------------------------- Safari
++
++base::FilePath SafariBookmarksFile(const ImportSource& source) {
++  return source.user_data.AppendASCII("Bookmarks.plist");
++}
++
++base::FilePath SafariHistoryFile(const ImportSource& source) {
++  return source.user_data.AppendASCII("History.db");
++}
++
++void ConvertSafari(const base::ListValue& children,
++                   int depth,
++                   size_t& count,
++                   std::vector<Item>& out) {
++  for (const base::Value& v : children) {
++    if (!v.is_dict() || count >= kMaxItems) {
++      continue;
++    }
++    const base::DictValue& node = v.GetDict();
++    const std::string* type = node.FindString("WebBookmarkType");
++    if (!type) {
++      continue;
++    }
++    if (*type == "WebBookmarkTypeLeaf") {
++      const std::string* spec = node.FindString("URLString");
++      GURL url = spec ? GURL(*spec) : GURL();
++      if (!IsWebPage(url)) {
++        continue;
++      }
++      const std::string* title = node.FindStringByDottedPath("URIDictionary.title");
++      Item item;
++      item.url = url;
++      item.title = title && !title->empty() ? *title : url.spec();
++      ++count;
++      out.push_back(std::move(item));
++    } else if (*type == "WebBookmarkTypeList" && depth < 32) {
++      const base::ListValue* kids = node.FindList("Children");
++      const std::string* title = node.FindString("Title");
++      Item folder;
++      folder.is_folder = true;
++      folder.open = false;
++      folder.title = title && !title->empty() ? *title : "Folder";
++      if (kids) {
++        ConvertSafari(*kids, depth + 1, count, folder.children);
++      }
++      if (!folder.children.empty()) {
++        ++count;
++        out.push_back(std::move(folder));
++      }
++    }
++  }
++}
++
++}  // namespace
++
++namespace internal {
++
++std::vector<std::pair<std::string, base::FilePath>> FirefoxProfiles(
++    const base::FilePath& root) {
++  std::vector<std::pair<std::string, base::FilePath>> out;
++  std::string ini;
++  if (!base::ReadFileToStringWithMaxSize(root.AppendASCII("profiles.ini"),
++                                         &ini, 1024 * 1024)) {
++    return out;
++  }
++  struct Section {
++    std::string name, path;
++    bool relative = true;
++    bool is_default = false;
++  };
++  std::vector<Section> sections;
++  bool in_profile = false;
++  for (std::string_view line : base::SplitStringPiece(
++           ini, "\r\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++    if (line.starts_with("[")) {
++      in_profile = line.starts_with("[Profile");
++      if (in_profile) {
++        sections.emplace_back();
++      }
++      continue;
++    }
++    size_t eq = line.find('=');
++    if (!in_profile || eq == std::string_view::npos) {
++      continue;
++    }
++    std::string_view key = line.substr(0, eq);
++    std::string value(line.substr(eq + 1));
++    Section& s = sections.back();
++    if (key == "Name") {
++      s.name = value;
++    } else if (key == "Path") {
++      s.path = value;
++    } else if (key == "IsRelative") {
++      s.relative = value != "0";
++    } else if (key == "Default") {
++      s.is_default = value == "1";
++    }
++  }
++  // The default profile first.
++  std::ranges::stable_sort(sections, [](const Section& a, const Section& b) {
++    return a.is_default > b.is_default;
++  });
++  for (const Section& s : sections) {
++    if (s.path.empty() || s.path.find("..") != std::string::npos) {
++      continue;
++    }
++    base::FilePath dir = s.relative ? root.Append(base::FilePath::FromUTF8Unsafe(s.path))
++                                    : base::FilePath::FromUTF8Unsafe(s.path);
++    if (base::PathExists(PlacesOf(dir))) {
++      out.emplace_back(s.name, dir);
++    }
++  }
++  return out;
++}
++
++std::vector<Item> SafariBookmarks(const base::DictValue& root) {
++  std::vector<Item> out;
++  const base::ListValue* top = root.FindList("Children");
++  if (!top) {
++    return out;
++  }
++  size_t count = 0;
++  // The favorites bar on top; the menu and the reading list as folders.
++  std::vector<Item> rest;
++  for (const base::Value& v : *top) {
++    if (!v.is_dict()) {
++      continue;
++    }
++    const base::DictValue& node = v.GetDict();
++    const std::string* title = node.FindString("Title");
++    const base::ListValue* kids = node.FindList("Children");
++    const std::string* type = node.FindString("WebBookmarkType");
++    if (title && *title == "BookmarksBar" && kids) {
++      ConvertSafari(*kids, 0, count, out);
++    } else if (title && kids &&
++               (*title == "BookmarksMenu" ||
++                *title == "com.apple.ReadingList")) {
++      Item folder;
++      folder.is_folder = true;
++      folder.open = false;
++      folder.title =
++          *title == "BookmarksMenu" ? "Bookmarks menu" : "Reading List";
++      ConvertSafari(*kids, 1, count, folder.children);
++      if (!folder.children.empty()) {
++        rest.push_back(std::move(folder));
++      }
++    } else if (type && *type != "WebBookmarkTypeProxy") {
++      base::ListValue one;
++      one.Append(v.Clone());
++      ConvertSafari(one, 1, count, rest);
++    }
++  }
++  std::ranges::move(rest, std::back_inserter(out));
++  return out;
++}
++
++#if !BUILDFLAG(IS_MAC)
++std::optional<base::Value> ReadPlist(const base::FilePath& file) {
++  return std::nullopt;
++}
++#endif
++
++}  // namespace internal
++
++std::optional<ArcSidebar> ReadFirefoxSidebar(const ImportSource& source) {
++  if (!SourceFound(source)) {
++    return std::nullopt;
++  }
++  auto profiles = internal::FirefoxProfiles(source.user_data);
++  ArcSidebar out;
++  for (const auto& [name, dir] : profiles) {
++    Space space;
++    space.name = profiles.size() == 1 || name.empty() ||
++                         name.starts_with("default")
++                     ? source.short_name
++                     : name.substr(0, 60);
++    space.icon = "🦊";
++    base::ScopedTempDir tmp;
++    sql::Database db(sql::Database::Tag("History"));
++    if (internal::OpenCopy(PlacesOf(dir), tmp, db)) {
++      space.pinned = FirefoxBookmarks(db);
++    }
++    // Two "Firefox" spaces would be one too many: the name of the profile.
++    if (std::ranges::any_of(out.spaces, [&](const Space& s) {
++          return s.name == space.name;
++        })) {
++      space.name = name.substr(0, 60);
++    }
++    out.spaces.push_back(std::move(space));
++    out.today.emplace_back();
++  }
++  if (out.spaces.empty()) {
++    return std::nullopt;
++  }
++  return out;
++}
++
++std::optional<ArcSidebar> ReadSafariSidebar(const ImportSource& source) {
++  if (!SourceFound(source)) {
++    return std::nullopt;
++  }
++  std::optional<base::Value> plist =
++      internal::ReadPlist(SafariBookmarksFile(source));
++  bool history = base::PathExists(SafariHistoryFile(source));
++  if ((!plist || !plist->is_dict()) && !history) {
++    return std::nullopt;
++  }
++  ArcSidebar out;
++  Space space;
++  space.name = source.short_name;
++  space.icon = "🧭";
++  if (plist && plist->is_dict()) {
++    space.pinned = internal::SafariBookmarks(plist->GetDict());
++  }
++  out.spaces.push_back(std::move(space));
++  out.today.emplace_back();
++  return out;
++}
++
++std::optional<ArcSidebar> ReadSidebarOf(const ImportSource& source) {
++  switch (source.format) {
++    case ImportSource::Format::kFirefox:
++      return ReadFirefoxSidebar(source);
++    case ImportSource::Format::kSafari:
++      return ReadSafariSidebar(source);
++    case ImportSource::Format::kChromium:
++      return source.kind == "arc" ? ReadArcSidebar()
++                                  : ReadChromeSidebar(source);
++  }
++}
++
++history::URLRows ReadOtherHistory(const ImportSource& source) {
++  history::URLRows out;
++  if (!SourceFound(source)) {
++    return out;
++  }
++  if (source.format == ImportSource::Format::kFirefox) {
++    for (const auto& [name, dir] : internal::FirefoxProfiles(source.user_data)) {
++      ReadFirefoxHistory(PlacesOf(dir), out);
++    }
++    return out;
++  }
++  if (source.format != ImportSource::Format::kSafari) {
++    return out;
++  }
++  base::ScopedTempDir tmp;
++  sql::Database db(sql::Database::Tag("History"));
++  if (!internal::OpenCopy(SafariHistoryFile(source), tmp, db) ||
++      !db.DoesTableExist("history_items") ||
++      !db.DoesTableExist("history_visits")) {
++    return out;
++  }
++  sql::Statement s(db.GetUniqueStatement(
++      "SELECT i.url, i.visit_count, MAX(v.visit_time), "
++      "(SELECT title FROM history_visits WHERE history_item = i.id "
++      "ORDER BY visit_time DESC LIMIT 1) "
++      "FROM history_items i JOIN history_visits v ON v.history_item = i.id "
++      "GROUP BY i.id ORDER BY MAX(v.visit_time) DESC"));
++  while (s.Step() && out.size() < kMaxHistory) {
++    GURL url(s.ColumnString(0));
++    base::Time last = FromAppleTime(s.ColumnDouble(2));
++    if (!IsWebPage(url) || last.is_null()) {
++      continue;
++    }
++    history::URLRow row(url);
++    row.set_title(s.ColumnString16(3));
++    row.set_visit_count(std::max(1, s.ColumnInt(1)));
++    row.set_last_visit(last);
++    out.push_back(std::move(row));
++  }
++  return out;
++}
++
++int CountOtherHistory(const ImportSource& source) {
++  return static_cast<int>(ReadOtherHistory(source).size());
++}
++
++bool SafariNeedsAccess(const ImportSource& source) {
++  if (source.format != ImportSource::Format::kSafari || !SourceFound(source)) {
++    return false;
++  }
++  for (const base::FilePath& file :
++       {SafariBookmarksFile(source), SafariHistoryFile(source)}) {
++    base::File f(file, base::File::FLAG_OPEN | base::File::FLAG_READ);
++    if (f.IsValid()) {
++      return false;
++    }
++    if (f.error_details() == base::File::FILE_ERROR_ACCESS_DENIED) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace meridian
+diff --git a/chrome/browser/meridian/other_import.h b/chrome/browser/meridian/other_import.h
+new file mode 100644
+index 0000000000..77eaa51bf7
+--- /dev/null
++++ b/chrome/browser/meridian/other_import.h
+@@ -0,0 +1,55 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_OTHER_IMPORT_H_
++#define CHROME_BROWSER_MERIDIAN_OTHER_IMPORT_H_
++
++#include <optional>
++#include <vector>
++
++#include "base/files/file_path.h"
++#include "base/values.h"
++#include "chrome/browser/meridian/arc_import.h"
++#include "components/history/core/browser/url_row.h"
++
++namespace meridian {
++
++struct ImportSource;
++
++// Moving in from Firefox and Safari, which don't keep their profiles the way
++// Chromium browsers do. Meridian brings their bookmarks (pinned tabs and
++// folders in a space, the toolbar's / favorites bar's on top) and their
++// history; their open tabs, passwords and sign-ins stay where they are.
++// Their files are only read, from private copies; blocking (file IO).
++
++// Firefox: a space per profile listed in its profiles.ini (all in Meridian's
++// main profile), from each one's places.sqlite.
++std::optional<ArcSidebar> ReadFirefoxSidebar(const ImportSource& source);
++// Safari: one space, from ~/Library/Safari/Bookmarks.plist.
++std::optional<ArcSidebar> ReadSafariSidebar(const ImportSource& source);
++
++// The sidebar of any browser Meridian moves in from.
++std::optional<ArcSidebar> ReadSidebarOf(const ImportSource& source);
++
++// Firefox's or Safari's history (web pages only).
++history::URLRows ReadOtherHistory(const ImportSource& source);
++// How many pages that is, without reading them all.
++int CountOtherHistory(const ImportSource& source);
++
++// Safari is here but macOS keeps its files from Meridian (Full Disk Access).
++bool SafariNeedsAccess(const ImportSource& source);
++
++namespace internal {
++// Firefox's profile folders, from profiles.ini in `root`: (name, folder).
++std::vector<std::pair<std::string, base::FilePath>> FirefoxProfiles(
++    const base::FilePath& root);
++// Safari's Bookmarks.plist, as values -> pinned items.
++std::vector<Item> SafariBookmarks(const base::DictValue& root);
++// A property list file as values (macOS); nullopt elsewhere or unreadable.
++std::optional<base::Value> ReadPlist(const base::FilePath& file);
++}  // namespace internal
++
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_OTHER_IMPORT_H_
+diff --git a/chrome/browser/meridian/other_import_mac.mm b/chrome/browser/meridian/other_import_mac.mm
+new file mode 100644
+index 0000000000..30bf40b91d
+--- /dev/null
++++ b/chrome/browser/meridian/other_import_mac.mm
+@@ -0,0 +1,69 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/other_import.h"
++
++#import <Foundation/Foundation.h>
++
++#include "base/apple/foundation_util.h"
++#include "base/strings/sys_string_conversions.h"
++
++namespace meridian::internal {
++
++namespace {
++
++std::optional<base::Value> ToValue(id object, int depth) {
++  if (depth > 64) {
++    return std::nullopt;
++  }
++  if (NSString* s = base::apple::ObjCCast<NSString>(object)) {
++    return base::Value(base::SysNSStringToUTF8(s));
++  }
++  if (NSNumber* n = base::apple::ObjCCast<NSNumber>(object)) {
++    return base::Value(n.doubleValue);
++  }
++  if (NSArray* a = base::apple::ObjCCast<NSArray>(object)) {
++    base::ListValue list;
++    for (id item in a) {
++      if (std::optional<base::Value> v = ToValue(item, depth + 1)) {
++        list.Append(std::move(*v));
++      }
++    }
++    return base::Value(std::move(list));
++  }
++  if (NSDictionary* d = base::apple::ObjCCast<NSDictionary>(object)) {
++    base::DictValue dict;
++    for (id key in d) {
++      NSString* k = base::apple::ObjCCast<NSString>(key);
++      if (!k) {
++        continue;
++      }
++      if (std::optional<base::Value> v = ToValue(d[key], depth + 1)) {
++        dict.Set(base::SysNSStringToUTF8(k), std::move(*v));
++      }
++    }
++    return base::Value(std::move(dict));
++  }
++  return std::nullopt;
++}
++
++}  // namespace
++
++std::optional<base::Value> ReadPlist(const base::FilePath& file) {
++  @autoreleasepool {
++    NSData* data = [NSData
++        dataWithContentsOfFile:base::apple::FilePathToNSString(file)];
++    if (!data || data.length > 64 * 1024 * 1024) {
++      return std::nullopt;
++    }
++    id plist = [NSPropertyListSerialization
++        propertyListWithData:data
++                     options:NSPropertyListImmutable
++                      format:nil
++                       error:nil];
++    return plist ? ToValue(plist, 0) : std::nullopt;
++  }
++}
++
++}  // namespace meridian::internal
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index 9cace191a4..12bdf2c2d1 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -7,6 +7,7 @@
+ #include <string>
+ 
+ #include "base/time/time.h"
++#include "chrome/browser/meridian/import_source.h"
+ #include "components/pref_registry/pref_registry_syncable.h"
+ 
+ namespace meridian::prefs {
+@@ -45,6 +46,13 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterBooleanPref(kMissionNotifyIntro, false);
+   registry->RegisterListPref(kArcExtensionsAdded);
+   registry->RegisterBooleanPref(kArcImported, false);
++  // The other browsers Meridian moves in from: the same two each.
++  for (const std::string& kind : ImportKinds()) {
++    if (kind != "arc" && kind != "chrome") {
++      registry->RegisterTimePref(DataImportedAtPref(kind), base::Time());
++      registry->RegisterBooleanPref(ImportedPref(kind), false);
++    }
++  }
+ }
+ 
+ }  // namespace meridian::prefs
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index e2da8e2619..aa20d2d5d8 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -158,6 +158,12 @@ struct ArcPreview {
+   int32 password_count;
+   // Arc's history and the rest are there (ImportArcData).
+   bool data_available;
++  // Firefox and Safari: the pages of history that come over (their open
++  // tabs don't).
++  int32 history_count;
++  // Safari is here but macOS keeps its files from Meridian until it gets
++  // Full Disk Access (the counts are then 0).
++  bool needs_access;
+ };
+ 
+ // What ImportArcData brought over (arc_data.h).
+@@ -236,6 +242,9 @@ enum Command {
+   kMission,
+   // ⇧⌘J: the Downloads popover.
+   kDownloads,
++  // Meridian > Import from Another Browser…: the moving-in step with every
++  // browser found here to pick from. (Last: tests run commands by number.)
++  kImportOther,
+ };
+ 
+ // The sidebar's mini player: media in a tab other than the active one.
+@@ -716,9 +725,13 @@ interface SidebarHandler {
+   // Little window: its page again in `space_id` (Arc's space picker).
+   SetLittleSpace(string space_id);
+ 
+-  // Moving in from another browser: `source` is "arc" or "chrome" (Google
+-  // Chrome: a space per profile, bookmarks as pinned tabs, its open tabs).
+-  // Its sidebar on this computer (null if there is none).
++  // Moving in from another browser: `source` is "arc", or "chrome", "brave",
++  // "edge", "vivaldi", "opera" (a space per profile, bookmarks as pinned
++  // tabs, its open tabs), or "firefox", "safari" (bookmarks and history
++  // only). Its sidebar on this computer (null if there is none).
++  // The browsers on this computer Meridian can move in from (their folders
++  // are there), Arc first; only names.
++  FindImportSources() => (array<string> kinds);
+   // macOS's System Settings at the pane for `kind` (system_asks.h), to change
+   // an answer given there ("pressed the wrong button?").
+   OpenSystemSettingsFor(string kind);
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 9e4c457f48..890af3d6e7 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -71,6 +71,8 @@
+ #include "chrome/browser/meridian/arc_data.h"
+ #include "chrome/browser/meridian/arc_logins.h"
+ #include "chrome/browser/meridian/chrome_import.h"
++#include "chrome/browser/meridian/other_import.h"
++#include "chrome/browser/platform_util.h"
+ #include "chrome/browser/meridian/import_source.h"
+ #include "mojo/public/cpp/bindings/callback_helpers.h"
+ #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
+@@ -862,6 +864,9 @@ bool SidebarHandler::HandleCommand(BrowserWindowInterface* browser,
+       case IDC_MERIDIAN_IMPORT_ARC:
+         command = mojom::Command::kImportArc;
+         break;
++      case IDC_MERIDIAN_IMPORT_OTHER:
++        command = mojom::Command::kImportOther;
++        break;
+       case IDC_MERIDIAN_ASK:
+         command = mojom::Command::kAsk;
+         break;
+@@ -1067,6 +1072,21 @@ void SidebarHandler::ExplainSystemAsk(const std::string& kind,
+       kind, mojo::WrapCallbackWithDefaultInvokeIfNotRun(std::move(done)));
+ }
+ 
++void SidebarHandler::FindImportSources(FindImportSourcesCallback callback) {
++  base::ThreadPool::PostTaskAndReplyWithResult(
++      FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++      base::BindOnce([] {
++        std::vector<std::string> found;
++        for (const std::string& kind : ImportKinds()) {
++          if (SourceFound(ImportSourceFor(kind))) {
++            found.push_back(kind);
++          }
++        }
++        return found;
++      }),
++      std::move(callback));
++}
++
+ void SidebarHandler::OpenSystemSettingsFor(const std::string& kind) {
+ #if BUILDFLAG(IS_MAC)
+   // Tests: said, never opened.
+@@ -1087,6 +1107,13 @@ void SidebarHandler::OpenSystemSettingsFor(const std::string& kind) {
+     return;
+   }
+   using Pane = base::mac::SystemSettingsPane;
++  // Safari's files: Privacy & Security > Full Disk Access.
++  if (kind == "full-disk") {
++    platform_util::OpenExternal(GURL(
++        "x-apple.systempreferences:com.apple.preference.security?Privacy_"
++        "AllFiles"));
++    return;
++  }
+   if (kind == "notifications") {
+     base::mac::OpenSystemSettingsPane(Pane::kNotifications,
+                                       base::apple::MainBundleIdentifier());
+@@ -1815,6 +1842,8 @@ struct ArcRead {
+   bool passwords = false;
+   bool data = false;
+   int password_count = 0;
++  int history_count = 0;
++  bool needs_access = false;
+ };
+ }  // namespace
+ 
+@@ -1825,23 +1854,35 @@ void SidebarHandler::GetArcPreview(const std::string& kind,
+       base::BindOnce(
+           [](std::string kind) {
+             ImportSource source = ImportSourceFor(kind);
+-            return ArcRead{kind == "chrome" ? ReadChromeSidebar(source)
+-                                            : ReadArcSidebar(),
+-                           ArcLoginsAvailable(source),
+-                           ArcPasswordsAvailable(source),
+-                           DataAvailable(source),
+-                           CountSavedPasswords(source)};
++            ArcRead read{ReadSidebarOf(source),
++                         ArcLoginsAvailable(source),
++                         ArcPasswordsAvailable(source),
++                         DataAvailable(source),
++                         CountSavedPasswords(source)};
++            if (source.format != ImportSource::Format::kChromium) {
++              read.history_count = CountOtherHistory(source);
++            }
++            read.needs_access = SafariNeedsAccess(source);
++            return read;
+           },
+           kind),
+       base::BindOnce(
+           [](GetArcPreviewCallback callback,
+              ArcRead read) {
+             std::optional<ArcSidebar>& arc = read.sidebar;
++            if (read.needs_access && (!arc || arc->spaces.empty())) {
++              auto blocked = mojom::ArcPreview::New();
++              blocked->needs_access = true;
++              std::move(callback).Run(std::move(blocked));
++              return;
++            }
+             if (!arc || arc->spaces.empty()) {
+               std::move(callback).Run(nullptr);
+               return;
+             }
+             auto preview = mojom::ArcPreview::New();
++            preview->history_count = read.history_count;
++            preview->needs_access = read.needs_access;
+             preview->space_count = arc->spaces.size();
+             preview->favorite_count = arc->favorites.size();
+             for (const auto& [id, list] : arc->profile_favorites) {
+@@ -1883,8 +1924,7 @@ void SidebarHandler::ImportArc(const std::string& kind,
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+       base::BindOnce(
+           [](std::string kind) {
+-            return kind == "chrome" ? ReadChromeSidebar(ChromeSource())
+-                                    : ReadArcSidebar();
++            return ReadSidebarOf(ImportSourceFor(kind));
+           },
+           kind),
+       base::BindOnce(&SidebarHandler::OnArcRead, weak_factory_.GetWeakPtr(),
+@@ -2660,9 +2700,7 @@ void SidebarHandler::OnArcRead(std::string kind,
+   }
+   MainProfileFor(browser_->GetProfile())
+       ->GetPrefs()
+-      ->SetBoolean(kind == "chrome" ? prefs::kChromeImported
+-                                    : prefs::kArcImported,
+-                   true);
++      ->SetBoolean(ImportedPref(ImportSourceFor(kind).kind), true);
+   AddArcExtensions(/*again=*/true, kind);
+   ActivateSpace(service_->active_space_id());
+   ScheduleNotify();
+@@ -3609,8 +3647,12 @@ Profile* SidebarHandler::ActiveSpaceProfile() {
+ void SidebarHandler::AddArcExtensions(bool again, const std::string& kind) {
+   base::ThreadPool::PostTaskAndReplyWithResult(
+       FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
+-      kind == "chrome"
+-          ? base::BindOnce([] { return ReadExtensionsOf(ChromeSource()); })
++      kind != "arc"
++          ? base::BindOnce(
++                [](std::string kind) {
++                  return ReadExtensionsOf(ImportSourceFor(kind));
++                },
++                kind)
+           : base::BindOnce(&ReadArcExtensions),
+       base::BindOnce(&SidebarHandler::OnArcExtensionsRead,
+                      weak_factory_.GetWeakPtr(), again));
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index af33184b38..3fe5b25aee 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -205,6 +205,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void OpenInMeridian() override;
+   void SetLittleSpace(const std::string& space_id) override;
+   void OpenSystemSettingsFor(const std::string& kind) override;
++  void FindImportSources(FindImportSourcesCallback callback) override;
+   void GetArcPreview(const std::string& source,
+                      GetArcPreviewCallback callback) override;
+   void ImportArc(const std::string& source,
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index 0d11869110..6ca231649e 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -57,6 +57,7 @@ build_webui("build") {
+     "meridian/command_bar.html.ts",
+     "meridian/command_bar.ts",
+     "meridian/quick_answers.ts",
++    "meridian/import_sources.ts",
+     "meridian/keys.ts",
+     "meridian/layout_fix.ts",
+     "meridian/fav.html.ts",
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index a0a659abd3..f857933764 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -1399,6 +1399,9 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       case 'import-arc':
+         run(Command.kImportArc);
+         break;
++      case 'import-other':
++        run(Command.kImportOther);
++        break;
+     }
+   }
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/command_bar.ts b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+index 11727a6880..026bf8e9bf 100644
+--- a/chrome/browser/resources/webui_browser/meridian/command_bar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/command_bar.ts
+@@ -113,6 +113,10 @@ export const FEATURES: CommandBarFeature[] = [
+    words: ['logins', 'keychain']},
+   {id: 'import-arc', name: 'Import from Arc', hint: '', keys: '',
+    icon: 'restore', words: ['arc', 'move in']},
++  {id: 'import-other', name: 'Import from Another Browser', hint: '',
++   keys: '', icon: 'restore',
++   words: ['chrome', 'brave', 'edge', 'vivaldi', 'opera', 'firefox', 'safari',
++           'bookmarks', 'move in']},
+   {id: 'report', name: 'Send a report…',
+    hint: 'Tell the developer what went wrong', keys: '', icon: 'info',
+    words: ['bug', 'report', 'feedback', 'problem', 'error', 'issue',
+diff --git a/chrome/browser/resources/webui_browser/meridian/import_sources.ts b/chrome/browser/resources/webui_browser/meridian/import_sources.ts
+new file mode 100644
+index 0000000000..2a20be524d
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/import_sources.ts
+@@ -0,0 +1,31 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The browsers Meridian moves in from, in the order the first run offers
++// them: the name said, the keychain item macOS asks about ("<keychain> Safe
++// Storage"; none for Firefox and Safari, which bring bookmarks and history
++// only).
++export interface ImportSourceInfo {
++  name: string;
++  keychain: string;
++  // Bookmarks and history only: no open tabs, passwords or sign-ins.
++  limited: boolean;
++}
++
++export const IMPORT_SOURCES: Record<string, ImportSourceInfo> = {
++  arc: {name: 'Arc', keychain: 'Arc', limited: false},
++  chrome: {name: 'Chrome', keychain: 'Chrome', limited: false},
++  brave: {name: 'Brave', keychain: 'Brave', limited: false},
++  edge: {name: 'Edge', keychain: 'Microsoft Edge', limited: false},
++  vivaldi: {name: 'Vivaldi', keychain: 'Vivaldi', limited: false},
++  opera: {name: 'Opera', keychain: 'Opera', limited: false},
++  firefox: {name: 'Firefox', keychain: '', limited: true},
++  safari: {name: 'Safari', keychain: '', limited: true},
++};
++
++export const IMPORT_KINDS: string[] = Object.keys(IMPORT_SOURCES);
++
++export function sourceName(kind: string): string {
++  return IMPORT_SOURCES[kind]?.name || kind;
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.css b/chrome/browser/resources/webui_browser/meridian/onboarding.css
+index 4566296f66..b429f62ea1 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.css
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.css
+@@ -213,6 +213,13 @@ h2 {
+   margin: 0 0 30px;
+ }
+ 
++/* Firefox, Safari: what stays behind, under what comes. */
++.whisper.limited {
++  margin: -18px 0 24px;
++  font-size: 13.5px;
++  color: rgba(255, 255, 255, 0.6);
++}
++
+ kbd {
+   color: #fff;
+   background: rgba(255, 255, 255, 0.16);
+@@ -1136,10 +1143,13 @@ kbd {
+ /* Both Arc and Chrome are here: where to move in from. */
+ .sources {
+   display: inline-flex;
++  flex-wrap: wrap;
++  justify-content: center;
++  max-width: 560px;
+   gap: 4px;
+   padding: 4px;
+   margin-bottom: 14px;
+-  border-radius: 999px;
++  border-radius: 20px;
+   background: rgba(255, 255, 255, 0.12);
+   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16);
+ }
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+index 2cf5eb4e49..b958a7539e 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+@@ -67,14 +67,32 @@ export function getHtml(this: MeridianOnboardingElement) {
+                 <button class="source ${k === this.source_ ? 'on' : ''}"
+                     role="radio" aria-checked="${k === this.source_}"
+                     data-source="${k}" @click="${this.onSourceClick_}">
+-                  From ${k === 'chrome' ? 'Chrome' : 'Arc'}</button>`)}
++                  From ${this.nameOf_(k)}</button>`)}
+             </div>` : ''}
+           <h2>Bring everything from ${this.sourceName_}</h2>
+-          <p class="whisper top">${this.source_ === 'chrome' ?
+-              'Each Chrome profile becomes a space: its bookmarks as pinned ' +
+-                  'tabs, the tabs you had open in Today. Chrome stays untouched.' :
++          ${this.arc_.needsAccess ? html`
++            <p class="whisper top">macOS keeps ${this.sourceName_}’s
++              bookmarks and history private. Turn on Meridian in System
++              Settings › Privacy & Security › Full Disk Access, then open
++              Import from Another Browser again.</p>
++            <button id="fullDisk" class="pill"
++                @click="${this.onFullDiskClick_}">Open System Settings</button>
++          ` : html`
++          <p class="whisper top">${
++              this.source_ === 'arc' ?
+               'Your spaces, pinned tabs and favorites move over as they are. ' +
+-                  'Arc stays untouched.'}</p>
++                  'Arc stays untouched.' :
++              this.limited_ ?
++              `Your ${this.sourceName_} bookmarks become pinned tabs in a ` +
++                  `space, and your history comes too. ${this.sourceName_} ` +
++                  'stays untouched.' :
++              `Each ${this.sourceName_} profile becomes a space: its ` +
++                  'bookmarks as pinned tabs, the tabs you had open in Today. ' +
++                  `${this.sourceName_} stays untouched.`}</p>
++          ${this.limited_ ? html`
++            <p class="whisper limited" id="limited">Only bookmarks and history
++              come from ${this.sourceName_}: its open tabs, passwords and
++              sign-ins stay there.</p>` : ''}
+           <div class="arc-move">
+             <div class="arc-stats">
+               ${this.stats_.map(x => html`<b>${x}</b>`)}
+@@ -95,7 +113,7 @@ export function getHtml(this: MeridianOnboardingElement) {
+                     to log in everywhere again</em></span>
+                 <span class="tick">${icon('check', 13)}</span>
+               </button>` : ''}
+-          </div>
++          </div>`}
+           ${this.canStartFresh_ ? html`
+             <button id="fresh" class="link" @click="${this.onFreshClick_}">
+               Start fresh instead</button>` : ''}
+@@ -103,7 +121,8 @@ export function getHtml(this: MeridianOnboardingElement) {
+         ` : ''}
+ 
+         ${this.step_ === 'arc' && !this.arc_ ? html`
+-          <h2>${this.sourceName_} isn’t on this computer</h2>
++          <h2>${this.anyBrowser_ ? html`No other browser on this computer` :
++                                  html`${this.sourceName_} isn’t on this computer`}</h2>
+           <p class="whisper">There is nothing to bring over.</p>` : ''}
+ 
+         ${this.step_ === 'tailor' ? html`
+@@ -297,13 +316,12 @@ export function getHtml(this: MeridianOnboardingElement) {
+           you unlock your Mac with and click <b>Allow</b>. Meridian needs this
+           only now, so there’s no need for Always Allow.</p>
+         <div class="mac-ask">
+-          <meridian-mac-ask kind="keychain" .app="${this.sourceName_}">
++          <meridian-mac-ask kind="keychain" .app="${this.keychainName_}">
+           </meridian-mac-ask>
+         </div>
+         <p class="small">Nothing leaves your computer, and ${this.sourceName_}
+           stays as it is. Pressed Deny? Your tabs and bookmarks still come
+-          over; bring the sign-ins later from File › Import from
+-          ${this.sourceName_}.</p>
++          over; bring the sign-ins later from ${this.importPath_()}.</p>
+         <div class="card-actions">
+           <button id="confirmCancel" class="btn ghost"
+               @click="${this.onConfirmCancelClick_}">Cancel</button>
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+index f7fb122f5f..d04014bd23 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+@@ -23,6 +23,7 @@ import './allow_mock.js';
+ import './mac_ask.js';
+ import './showcase.js';
+ 
++import {IMPORT_KINDS, IMPORT_SOURCES, sourceName} from './import_sources.js';
+ import {getCss} from './onboarding.css.js';
+ import {getHtml} from './onboarding.html.js';
+ 
+@@ -70,10 +71,20 @@ function count(n: number, one: string, many = `${one}s`): string {
+   return `${n.toLocaleString()} ${n === 1 ? one : many}`;
+ }
+ 
+-// The moving-in step's counts. Chrome: its profiles, the tabs it has open,
+-// bookmarks and saved passwords; Arc: spaces, tabs and favorites.
++// The moving-in step's counts. Chrome and the other Chromium browsers: their
++// profiles, the tabs they have open, bookmarks and saved passwords; Firefox
++// and Safari: bookmarks and pages of history; Arc: spaces, tabs and
++// favorites.
+ export function statsOf(kind: string, p: ArcPreview): string[] {
+-  if (kind === 'chrome') {
++  if (IMPORT_SOURCES[kind]?.limited) {
++    return [
++      p.spaceCount > 1 ? count(p.spaceCount, 'profile') : '',
++      count(p.pinnedCount, 'bookmark'),
++      p.historyCount ? count(p.historyCount, 'page', 'pages') + ' of history' :
++                       '',
++    ].filter(x => x);
++  }
++  if (kind !== 'arc') {
+     return [
+       count(p.spaceCount, 'profile'),
+       p.todayCount ? count(p.todayCount, 'open tab') : '',
+@@ -150,6 +161,9 @@ export class MeridianOnboardingElement extends CrLitElement {
+       persona_: {state: true, type: String},
+       source_: {state: true, type: String},
+       sourceName_: {state: true, type: String},
++      keychainName_: {state: true, type: String},
++      limited_: {state: true, type: Boolean},
++      anyBrowser_: {state: true, type: Boolean},
+       canStartFresh_: {state: true, type: Boolean},
+       aiFound_: {state: true, type: Array},
+       aiYes_: {state: true, type: Boolean},
+@@ -169,10 +183,16 @@ export class MeridianOnboardingElement extends CrLitElement {
+   protected accessor step_: StepName = 'hello';
+   protected accessor steps_: StepName[] = [];
+   protected accessor arc_: ArcPreview|null = null;
+-  // Where Meridian moves in from: 'arc' or 'chrome'.
++  // Where Meridian moves in from: one of IMPORT_KINDS.
+   protected accessor source_: string = 'arc';
+-  // "Arc" or "Chrome", as the step says it.
++  // "Arc", "Chrome", "Edge", …, as the step says it.
+   protected accessor sourceName_: string = 'Arc';
++  // Its keychain item's name ("Microsoft Edge" Safe Storage).
++  protected accessor keychainName_: string = 'Arc';
++  // Firefox, Safari: bookmarks and history only.
++  protected accessor limited_: boolean = false;
++  // Import from Another Browser: any of them, none in particular.
++  protected accessor anyBrowser_: boolean = false;
+   protected accessor withLogins_: boolean = true;
+   protected accessor confirmLogins_: boolean = false;
+   protected accessor proposal_: SetupProposal|null = null;
+@@ -215,8 +235,8 @@ export class MeridianOnboardingElement extends CrLitElement {
+   protected readonly canRestartClaude_: boolean =
+       !navigator.userAgent.includes('Windows');
+   protected accessor canUndo_: boolean = false;
+-  // Both Arc and Chrome are here: the moving-in step lets the person pick
+-  // ('arc', 'chrome'); empty when there's one or none.
++  // More than one browser is here: the moving-in step lets the person pick
++  // (IMPORT_KINDS found here); empty when there's one or none.
+   protected accessor sources_: string[] = [];
+   // The moving-in step's real counts ("2 spaces", "84 bookmarks", …).
+   protected accessor stats_: string[] = [];
+@@ -229,29 +249,34 @@ export class MeridianOnboardingElement extends CrLitElement {
+   private fresh_: boolean = false;
+   private helloTimer_: number|null = null;
+ 
+-  // `start`: 'arc' or 'chrome' opens straight at the moving-in step (File >
+-  // Import from Arc / Chrome); 'preset' shows the setup for `persona` (the
+-  // home page's "Set up for me"). The tour moves in from Arc, else Chrome.
+-  async show(start: 'tour'|'arc'|'chrome'|'preset' = 'tour', persona = '') {
++  // `start`: a browser ('arc', 'chrome', 'edge', …) opens straight at the
++  // moving-in step (File > Import from Arc / Chrome / …); 'other' there with
++  // every browser but Arc to pick from (Import from Another Browser…);
++  // 'preset' shows the setup for `persona` (the home page's "Set up for
++  // me"). The tour moves in from Arc, else the first browser found.
++  async show(start = 'tour', persona = '') {
+     if (this.open) {
+       return;
+     }
+-    this.source_ = start === 'chrome' ? 'chrome' : 'arc';
+-    // The tour reads both: Arc first, else Chrome, and a choice when both are
+-    // here.
+-    const kinds = start === 'tour' ? ['arc', 'chrome'] : [this.source_];
++    const one = !!IMPORT_SOURCES[start];
++    this.anyBrowser_ = start === 'other';
++    // The tour and 'other' read every browser, and offer a choice when more
++    // than one is here.
++    const kinds = one             ? [start] :
++        start === 'other'         ? IMPORT_KINDS.filter(k => k !== 'arc') :
++        start === 'tour'          ? IMPORT_KINDS :
++                                    ['arc'];
+     const [previews, {isDefault}] = await Promise.all([
+       Promise.all(kinds.map(k => this.handler_.getArcPreview(k))),
+       this.handler_.isDefaultBrowser(),
+     ]);
+     this.previews_ = {};
+     kinds.forEach((k, i) => this.previews_[k] = previews[i]!.preview);
+-    if (!this.previews_[this.source_] && this.previews_['chrome']) {
+-      this.source_ = 'chrome';
+-    }
+-    this.sources_ = kinds.length > 1 && kinds.every(k => this.previews_[k]) ?
+-        kinds :
+-        [];
++    const found = kinds.filter(k => this.previews_[k]);
++    // The first one with something to bring (Safari may need access first).
++    this.source_ = found.find(k => !this.previews_[k]!.needsAccess) ||
++        found[0] || kinds[0]!;
++    this.sources_ = found.length > 1 ? found : [];
+     this.useSource_(this.source_);
+     this.isDefault_ = isDefault;
+     this.fresh_ = false;
+@@ -281,24 +306,42 @@ export class MeridianOnboardingElement extends CrLitElement {
+       this.pickedFavorites_ = proposal.favorites.map(() => true);
+       this.steps_ = ['preview', 'done'];
+     } else {
+-      this.steps_ = start === 'arc' || start === 'chrome' ? ['arc', 'done'] :
+-                                                            this.tourSteps_();
++      this.steps_ = one || start === 'other' ? ['arc', 'done'] :
++                                               this.tourSteps_();
+     }
+     this.step_ = this.steps_[0]!;
+     this.open = true;
+     this.startHello_();
+   }
+ 
+-  // Moving in from `kind` ('arc' or 'chrome'): its preview and counts.
++  // Moving in from `kind`: its preview and counts.
+   private useSource_(kind: string) {
+     const preview = this.previews_[kind] || null;
+     this.source_ = kind;
+-    this.sourceName_ = kind === 'chrome' ? 'Chrome' : 'Arc';
++    this.sourceName_ = sourceName(kind);
++    this.keychainName_ = IMPORT_SOURCES[kind]?.keychain || this.sourceName_;
++    this.limited_ = !!IMPORT_SOURCES[kind]?.limited;
+     this.arc_ = preview;
+     this.withLogins_ = !!preview?.loginsAvailable;
+     this.stats_ = preview ? statsOf(kind, preview) : [];
+   }
+ 
++  protected nameOf_(kind: string): string {
++    return sourceName(kind);
++  }
++
++  // Where to move in from this browser again, as the menu says it.
++  protected importPath_(): string {
++    return this.source_ === 'arc' ?
++        'File › Import from Arc' :
++        `Meridian › Import from Another Browser (${this.sourceName_})`;
++  }
++
++  // Safari: macOS's Full Disk Access, where Meridian can be allowed.
++  protected onFullDiskClick_() {
++    this.handler_.openSystemSettingsFor('full-disk');
++  }
++
+   protected onSourceClick_(e: Event) {
+     const kind = (e.currentTarget as HTMLElement).dataset['source']!;
+     if (!this.busy_ && kind !== this.source_) {
+@@ -363,7 +406,8 @@ export class MeridianOnboardingElement extends CrLitElement {
+     this.nextLabel_ = this.busy_ || {
+       hello: '',
+       ai: '',
+-      arc: this.arc_ ? 'Bring everything' : 'Continue',
++      arc: this.arc_ && !this.arc_.needsAccess ? 'Bring everything' :
++                                                 'Continue',
+       tailor: 'Suggest a setup',
+       preview: 'Looks great',
+       claude: '',
+@@ -515,7 +559,8 @@ export class MeridianOnboardingElement extends CrLitElement {
+     }
+     switch (this.step_) {
+       case 'arc':
+-        return this.arc_ ? this.bringArc_() : this.advance_();
++        return this.arc_ && !this.arc_.needsAccess ? this.bringArc_() :
++                                                     this.advance_();
+       case 'tailor':
+         return this.suggest_();
+       case 'preview':
+@@ -704,11 +749,11 @@ export class MeridianOnboardingElement extends CrLitElement {
+       ].filter(x => x);
+       const name = this.sourceName_;
+       this.note_ = error === 'denied' ?
+-          `Sign-ins weren’t brought over. You can try again from File > Import from ${name}.` :
++          `Sign-ins weren’t brought over. You can try again from ${this.importPath_()}.` :
+           error === 'app-bound' ?
+           `${name} keeps its sign-ins locked to itself on Windows, so sign in to your sites once more${more.length ? ` (${more.join(', ')} came over)` : ''}.` :
+           error === 'busy' ?
+-          `Sign-ins weren’t brought over: ${name} is open. Quit ${name}, then try again from File > Import from ${name}.` :
++          `Sign-ins weren’t brought over: ${name} is open. Quit ${name}, then try again from ${this.importPath_()}.` :
+           error ? `${name}’s sign-ins couldn’t be read.` :
+                   `You’re still signed in to your sites (${
+                       [count(imported, 'sign-in'), ...more].join(
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 57ec0c775f..d787884446 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -37,6 +37,7 @@ import type {MeridianMenuElement, MenuEntry, MenuRowEvent} from './menu.js';
+ import type {CommandBarTab} from './command_bar.js';
+ import {getCss} from './sidebar.css.js';
+ import {getHtml} from './sidebar.html.js';
++import {sourceName} from './import_sources.js';
+ import {keyText} from './keys.js';
+ 
+ export const FAVORITES = 'favorites';
+@@ -251,6 +252,9 @@ export class MeridianSidebarElement extends CrLitElement implements
+   private nextOrder_ = 0;
+   private readonly tabStripService_: TabStripServiceRemote;
+   private readonly handler_: SidebarHandlerInterface;
++  // The other browsers on this computer to move in from (the app menu's
++  // "Import from …" items).
++  private importSources_: string[] = [];
+   private observation_: TabStripObservation|undefined;
+   private listenerId_: number|null = null;
+   private toastListenerId_: number|null = null;
+@@ -304,6 +308,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+ 
+   override connectedCallback() {
+     super.connectedCallback();
++    this.handler_.findImportSources().then(
++        ({kinds}) => this.importSources_ = kinds);
+     this.observation_ = new TabStripObservation(this);
+     this.load_(this.observation_);
+     this.handler_.getState().then(({state}) => this.setState_(state));
+@@ -1024,6 +1030,9 @@ export class MeridianSidebarElement extends CrLitElement implements
+       case Command.kImportArc:
+         this.fire('meridian-onboarding', 'arc');
+         break;
++      case Command.kImportOther:
++        this.fire('meridian-onboarding', 'other');
++        break;
+       case Command.kShowSettings:
+         this.fire('meridian-show-settings');
+         break;
+@@ -1660,6 +1669,9 @@ export class MeridianSidebarElement extends CrLitElement implements
+       this.menu_ = null;
+       return;
+     }
++    // For the next time: which browsers are here may change.
++    this.handler_.findImportSources().then(
++        ({kinds}) => this.importSources_ = kinds);
+     const run = (command: Command) => () => this.runCommand(command, 0);
+     this.menu_ = {
+       x,
+@@ -1678,7 +1690,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+         {label: 'Archive', icon: 'archive', keys: keyText('⌥⌘A'), separatorBefore: true, action: run(Command.kShowArchive)},
+         {label: 'Downloads', icon: 'download', action: run(Command.kDownloads)},
+         {label: 'Import from Arc…', icon: 'layers', separatorBefore: true, action: run(Command.kImportArc)},
+-        {label: 'Import from Chrome…', icon: 'layers', action: () => this.fire('meridian-onboarding', 'chrome')},
++        // Each other browser found here (only names: nothing is read until
++        // the person picks one).
++        ...this.importSources_.filter(k => k !== 'arc').map(k => ({
++          label: `Import from ${sourceName(k)}…`, icon: 'layers' as IconName,
++          action: () => this.fire('meridian-onboarding', k)})),
+         {label: 'Welcome Tour', icon: 'sparkles', action: run(Command.kWelcomeTour)},
+         {label: 'Settings', icon: 'settings', keys: keyText('⌘,'), separatorBefore: true, action: run(Command.kShowSettings)},
+       ]),
+diff --git a/chrome/browser/ui/browser_command_controller.cc b/chrome/browser/ui/browser_command_controller.cc
+index fcaa584a4b..7c21434a3e 100644
+--- a/chrome/browser/ui/browser_command_controller.cc
++++ b/chrome/browser/ui/browser_command_controller.cc
+@@ -2106,7 +2106,7 @@ void BrowserCommandController::InitCommandState() {
+         IDC_MERIDIAN_PREVIOUS_TAB, IDC_MERIDIAN_SPLIT, IDC_MERIDIAN_UNSPLIT,
+         IDC_MERIDIAN_ARCHIVE, IDC_MERIDIAN_CLEAR_TODAY,
+         IDC_MERIDIAN_WELCOME_TOUR, IDC_MERIDIAN_IMPORT_ARC,
+-        IDC_MERIDIAN_ASK, IDC_MERIDIAN_CHAT, IDC_MERIDIAN_WORKBENCH,
++        IDC_MERIDIAN_IMPORT_OTHER, IDC_MERIDIAN_ASK, IDC_MERIDIAN_CHAT, IDC_MERIDIAN_WORKBENCH,
+         IDC_MERIDIAN_MISSION, IDC_MERIDIAN_COPY_MARKDOWN,
+         IDC_MERIDIAN_LITTLE_WINDOW}) {
+     command_updater_->UpdateCommandEnabled(meridian_command, supports_tabs);
+diff --git a/chrome/browser/ui/cocoa/main_menu_builder.mm b/chrome/browser/ui/cocoa/main_menu_builder.mm
+index 62e31ac619..f0a8f0f769 100644
+--- a/chrome/browser/ui/cocoa/main_menu_builder.mm
++++ b/chrome/browser/ui/cocoa/main_menu_builder.mm
+@@ -75,6 +75,9 @@ NSMenuItem* BuildAppMenu(NSApplication* nsapp,
+               Item(IDS_MERIDIAN_IMPORT_ARC_MAC)
+                   .command_id(IDC_MERIDIAN_IMPORT_ARC)
+                   .remove_if(is_pwa),
++              Item(IDS_MERIDIAN_IMPORT_OTHER_MAC)
++                  .command_id(IDC_MERIDIAN_IMPORT_OTHER)
++                  .remove_if(is_pwa),
+               Item().is_separator(),
+               Item(IDS_SERVICES_MAC)
+                   .tag(-1)
