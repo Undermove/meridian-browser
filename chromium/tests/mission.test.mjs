@@ -81,8 +81,9 @@ test('Mission Control: a Workbench session with a subagent, a wait, browser tool
     await wb.waitFor('!!S.project');
     await wb.eval(`launch('claude').then((t) => !!t)`);
 
-    // The first agent session: a heads-up that macOS will ask about notifications.
-    await b.waitFor(`app.shadowRoot.getElementById('missionToast')?.textContent.includes('Your Mac will ask once')`);
+    // The first agent session: a heads-up about notifications, and on the Mac that macOS will ask.
+    await b.waitFor(`app.shadowRoot.getElementById('missionToast')?.textContent.includes(${JSON.stringify(process.platform === 'darwin' ? 'Your Mac will ask once' : 'with a notification.')})`);
+    if (process.platform !== 'darwin') assert.ok(!(await b.eval(`app.shadowRoot.getElementById('missionToast').textContent`)).includes('Mac'));
     const s = await waitState((x) => x.nodes.some((n) => n.status === 'waiting'), 'the wait');
     const root = s.nodes.find((n) => n.kind === 'session');
     assert.equal(root.label, 'Claude Code');
