@@ -1,10 +1,13 @@
 #!/bin/bash
-# Moves Meridian to the newest Chromium of its branch (or to another branch), then builds, tests,
-# packages (signed) and drafts a GitHub release for the next version. Stops at the first problem
-# (a patch that no longer applies, a failing test), leaving everything as it was before.
+# Moves Meridian to the newest Chromium of its branch (or to another branch), then builds, tests
+# and packages (signed) the next version, and opens a pull request to main with it: the patches on
+# a new branch chromium-<Chromium version>. Never a push to main, never a release: the release is
+# made from main after the PR is reviewed and merged (chromium/RELEASE_CHECKLIST.md). Stops at the
+# first problem (a patch that no longer applies, a failing test), leaving everything as it was.
 #   chromium/update_chromium.sh                    newest build of the current branch
 #   chromium/update_chromium.sh --branch 8160      move to branch 8160 (a new Chrome milestone)
-#   options: --version 0.5.2 (default: the next patch version), --no-release (stop after packaging)
+#   options: --version 0.5.2 (default: the next patch version), --no-pr (stop after packaging,
+#   committed on the new branch but not pushed)
 set -Eeuo pipefail
 DIR="${CHROMIUM_DIR:-$HOME/repos/chromium}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -12,12 +15,14 @@ REPO_ROOT="$(cd "$HERE/.." && pwd)"
 . "$HERE/tools/platform.sh"
 command -v gclient >/dev/null 2>&1 || export PATH="$DIR/depot_tools:$PATH"
 SRC="$DIR/src"
-BRANCH=""; VERSION=""; RELEASE=1
+BRANCH=""; VERSION=""; PR=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --branch) BRANCH="$2"; shift 2 ;;
     --version) VERSION="$2"; shift 2 ;;
-    --no-release) RELEASE=0; shift ;;
+    --no-pr) PR=0; shift ;;
+    # (The old option: there is no release to skip any more.)
+    --no-release) shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -80,16 +85,17 @@ echo "$NEW_VER" > "$HERE/CHROMIUM_VERSION"
 "$HERE/export.sh" >/dev/null
 say "Packaging (signed)…"
 "$HERE/package.sh"
+# On a branch of its own (from the checkout's main, as the workflow pulls it): a pull request,
+# never a push to main.
+UPDATE_BRANCH="chromium-$NEW_VER"
+git -C "$REPO_ROOT" checkout -q -b "$UPDATE_BRANCH"
 git -C "$REPO_ROOT" add -A chromium
-git -C "$REPO_ROOT" commit -q -m "Chromium port: Chromium $NEW_VER, Meridian $VERSION"
-git -C "$REPO_ROOT" push -q origin HEAD
-
-if [ "$RELEASE" = 1 ]; then
-  say "Drafting the release (publish it on GitHub when you're happy)…"
-  D="$HERE/dist"
-  gh release create "v$VERSION" -R Undermove/meridian-browser --draft \
-    --target "$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)" --title "Meridian $VERSION" \
-    --notes "Chromium $NEW_VER (from $OLD_VER): the latest fixes from Chrome, including security fixes." \
-    "$D/Meridian-$VERSION-mac-"*.dmg "$D/Meridian-$VERSION-mac-"*.zip "$D/SHA256SUMS.txt" "$D/SHA256SUMS.txt.sig"
+git -C "$REPO_ROOT" commit -q -m "Chromium $NEW_VER, Meridian $VERSION"
+if [ "$PR" = 1 ]; then
+  say "Opening the pull request…"
+  git -C "$REPO_ROOT" push -q -u origin "$UPDATE_BRANCH"
+  (cd "$REPO_ROOT" && gh pr create -R Undermove/meridian-browser --base main --head "$UPDATE_BRANCH" \
+    --title "Chromium $NEW_VER, Meridian $VERSION" \
+    --body "Chromium $NEW_VER (from $OLD_VER): the latest fixes from Chrome, including security fixes. Built, tested (chromium/tests/run.sh) and packaged by chromium/update_chromium.sh. Before merging and releasing: chromium/RELEASE_CHECKLIST.md.")
 fi
-say "Done: Meridian $VERSION on Chromium $NEW_VER."
+say "Done: Meridian $VERSION on Chromium $NEW_VER, on branch $UPDATE_BRANCH. The release is made from main once the PR is merged."

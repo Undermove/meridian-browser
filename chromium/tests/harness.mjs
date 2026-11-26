@@ -1,10 +1,29 @@
 // Drives the built Meridian (Chromium) over the DevTools protocol. The browser's own UI is the page
 // chrome://webui-browser, so tests evaluate in it and send real mouse/keyboard input to it.
-import { afterEach } from 'node:test';
+import { afterEach, beforeEach } from 'node:test';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { installGuard } from './isolation.mjs';
+import { startSpaceWatch, screenTaken, SPACE_GUARD_MODE } from './space_guard.mjs';
+
+// Every test file: the owner's login environment out of every process it starts, and his real AI
+// configs hashed before and after (isolation.mjs); on macOS, no test may switch his Space or put
+// a test browser in front (space_guard.mjs).
+installGuard();
+startSpaceWatch();
+const testPids = new Set();
+let testStarted = Date.now();
+beforeEach(() => { testStarted = Date.now(); });
+afterEach(async (t) => {
+  await new Promise((r) => setTimeout(r, 400));  // the watcher's last look
+  const taken = screenTaken(testStarted, Date.now(), testPids);
+  if (!taken.length) return;
+  const why = `reached past the test, onto the person's screen (a window background mode missed, or an app macOS started):\n  ${taken.join('\n  ')}`;
+  if (SPACE_GUARD_MODE === 'warn') console.error(`SPACE GUARD (${t.name}): ${why}`);
+  else throw new Error(`SPACE GUARD: this test ${why}`);
+});
 
 const DIR = process.env.CHROMIUM_DIR || path.join(os.homedir(), 'repos/chromium');
 // MERIDIAN_APP: another Meridian binary, such as an installed release (CI checks every release).
@@ -127,8 +146,9 @@ const running = new Set();
 process.on('exit', () => { for (const p of running) { try { p.kill('SIGKILL'); } catch {} } });
 
 // `firstRun`: start like the very first launch (without --no-first-run). `app`: another binary
-// for this launch (an older release, to test updating from it).
-export async function launch(urls = [], { profile: keep, args = [], firstRun = false, app = APP } = {}) {
+// for this launch (an older release, to test updating from it). `env`: variables over the test
+// process's own (already without the owner's, isolation.mjs), such as a fixture's HOME.
+export async function launch(urls = [], { profile: keep, args = [], firstRun = false, app = APP, env } = {}) {
   const profile = keep || fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
   const port = 9400 + Math.floor(Math.random() * 500);
   // Never the real Arc, Chrome or any other browser: an empty folder unless a test gives its own.
@@ -166,14 +186,17 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
     ...args, ...urls,
     // MERIDIAN_LOG=<file>: the browser's log there (debugging).
   ].concat(process.env.MERIDIAN_LOG ? ['--enable-logging=stderr'] : []),
-  { stdio: process.env.MERIDIAN_LOG ? ['ignore', 'ignore', fs.openSync(process.env.MERIDIAN_LOG, 'a')] : 'ignore' });
+  { stdio: process.env.MERIDIAN_LOG ? ['ignore', 'ignore', fs.openSync(process.env.MERIDIAN_LOG, 'a')] : 'ignore',
+    ...(env ? { env: { ...process.env, ...env } } : {}) });
   running.add(proc);
+  testPids.add(proc.pid);
   proc.once('exit', () => running.delete(proc));
   const base = `http://127.0.0.1:${port}`;
   let ui;
   for (let i = 0; i < 100 && !ui; i++) {
     await sleep(200);
-    try { ui = (await (await fetch(`${base}/json/list`)).json()).find((t) => t.url.startsWith('chrome://webui-browser')); } catch {}
+    // (A bounded wait: a hung browser left on this port by another run never answers.)
+    try { ui = (await (await fetch(`${base}/json/list`, { signal: AbortSignal.timeout(2000) })).json()).find((t) => t.url.startsWith('chrome://webui-browser')); } catch {}
   }
   if (!ui) { proc.kill(); throw new Error('browser UI target never appeared'); }
   const cdp = await new Cdp(ui.webSocketDebuggerUrl).open();
@@ -379,7 +402,11 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
     async close() {
       b.closed = true;
       b.cdp.close();
-      if (proc.exitCode === null && proc.signalCode === null) { proc.kill(); await exited(); }
+      if (proc.exitCode === null && proc.signalCode === null) {
+        proc.kill();
+        // A browser stuck on an exception doesn't end on SIGTERM.
+        if (await Promise.race([exited().then(() => true), sleep(10000).then(() => false)]) === false) { proc.kill('SIGKILL'); await exited(); }
+      }
       if (!keep) fs.rmSync(profile, { recursive: true, force: true });
       fs.rmSync(empty, { recursive: true, force: true });
       // What the browser left in the temp folder (downloads in progress, sockets) when killed.

@@ -447,7 +447,8 @@ function renderScmPanel(el) {
   const msg = h('textarea', 'scm-message');
   msg.id = 'scm-message';
   msg.rows = 3;
-  msg.placeholder = SCM.staged.length ? 'Message (⌘↩ to commit the staged changes)' : 'Message (⌘↩ to commit all changes)';
+  const enter = wb.platform === 'darwin' ? '⌘↩' : 'Ctrl+Enter';
+  msg.placeholder = SCM.staged.length ? `Message (${enter} to commit the staged changes)` : `Message (${enter} to commit all changes)`;
   msg.value = SCM.message || '';
   msg.addEventListener('input', () => { SCM.message = msg.value; });
   msg.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); scmCommit(); } });
