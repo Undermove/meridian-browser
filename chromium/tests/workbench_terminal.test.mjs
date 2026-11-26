@@ -103,7 +103,10 @@ test('Workbench terminal: a web address opens in a tab; a project file at its li
   const { b, wb } = await workbench(project);
   try {
     await run(wb, WIN ? `clear; echo 'see ${url}. and src/app.ts:3 too'` : `clear; printf 'see ${url}. and src/app.ts:3 too\\n'`);
-    await wb.waitFor(`${TEXT}.includes('src/app.ts:3 too')`, 5000);
+    // The printed line, not the command as typed (it names the same address and file): until
+    // `clear` and printf ran the screen still changed under the pointer, and the click could land
+    // on the command's row just before `clear` wiped it (the file then never opened).
+    await wb.waitFor(`/(^|\\n)see http\\S+ and src\\/app\\.ts:3 too/.test(${TEXT})`, 10000, TEXT);
     await click(wb, await cell(wb, 'http://127.0.0.1'));
     await b.waitFor(`[...${T}.tabs_.values()].some((t) => t.title === 'Docs page')`, 8000);
     assert.equal(await b.eval(`[...${T}.tabs_.values()].find((t) => t.title === 'Docs page').url`), url, 'the address without the full stop');
