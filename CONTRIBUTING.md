@@ -1,13 +1,13 @@
 # Contributing
 
 `main` is the only long-lived branch. Everything ships from it: the browser (`chromium/`), the
-Workbench and MCP sources (`src/`, `mcp/`), tests and the website (`site/`, `docs/`).
+Workbench sources the build copies in (`src/`), the stand-alone MCP bridge (`mcp/`), tests and the website (`site/`, `docs/`).
 
 ## Changes
 
 1. Branch from `main` (`feat/…`, `fix/…`, `site/…`).
 2. Open a pull request to `main`.
-3. Wait for the checks (CI, Chromium checks, code scanning) to pass.
+3. Wait for the checks (Chromium checks, code scanning) to pass.
 4. Merge. Delete the feature branch.
 
 No other long-lived branches. A branch that lives longer than its pull request gets merged or closed.
@@ -33,3 +33,5 @@ No other long-lived branches. A branch that lives longer than its pull request g
 - Dependabot security pull requests are merged as soon as their checks are green.
 - Version updates (npm, GitHub Actions, Docker) come weekly from `.github/dependabot.yml`, grouped.
 - Reporting a vulnerability: see [SECURITY.md](SECURITY.md).
+
+The Electron version (0.4.x) is no longer on `main`; it lives at the tag `legacy-electron`.

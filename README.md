@@ -196,7 +196,7 @@ Scorecard checks that stay low by design:
 
 ## Build from source
 
-Meridian is a set of patches on Chromium plus its own UI. The code and build steps are in [`chromium/`](chromium/) (about 60 GB free space and a few hours for the first build). The Chromium build still copies the Workbench page and some UI sources from `src/`; the rest of `src/` and the root `package.json` are the earlier Electron version (0.4.x). How changes and releases go: [CONTRIBUTING.md](CONTRIBUTING.md).
+Meridian is a set of patches on Chromium plus its own UI. The code and build steps are in [`chromium/`](chromium/) (about 60 GB free space and a few hours for the first build). `src/` holds the Workbench page and the few UI sources the Chromium build copies in; `mcp/` is the stand-alone MCP bridge for MCP directories. The earlier Electron version (0.4.x) is kept at the tag [`legacy-electron`](https://github.com/Undermove/meridian-browser/tree/legacy-electron). How changes and releases go: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Privacy
 
