@@ -3,6 +3,7 @@
 # open Dependabot, code scanning and secret scanning alerts, Dependabot PRs waiting for a person,
 # and the open Chromium update issue. Needs GH_TOKEN (issues: write) and, for the alerts,
 # ALERTS_TOKEN (or GH_TOKEN) that may read them. Usage: security-digest.sh [--dry-run]
+# shellcheck disable=SC2016 # the single-quoted strings are jq programs
 set -euo pipefail
 repo="${GITHUB_REPOSITORY:-Undermove/meridian-browser}"
 alerts_token="${ALERTS_TOKEN:-${GH_TOKEN:-}}"

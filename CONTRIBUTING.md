@@ -31,7 +31,11 @@ No other long-lived branches. A branch that lives longer than its pull request g
 - Dependabot alerts and code scanning findings are reviewed weekly: fixed, or dismissed with a written
   reason.
 - Dependabot security pull requests are merged as soon as their checks are green.
-- Version updates (npm, GitHub Actions, Docker) come weekly from `.github/dependabot.yml`, grouped.
+- Version updates (npm, GitHub Actions, Docker) come weekly from `.github/dependabot.yml`, grouped,
+  for releases at least 7 days old.
+- Every PR must pass dependency review (no new dependency with a moderate-or-worse advisory, licenses
+  from the allow-list in `dependency-review.yml`) and zizmor on the workflows; actionlint, ShellCheck
+  and gitleaks run on every PR too.
 - Reporting a vulnerability: see [SECURITY.md](SECURITY.md).
 
 The Electron version (0.4.x) is no longer on `main`; it lives at the tag `legacy-electron`.

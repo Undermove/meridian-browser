@@ -47,6 +47,7 @@ newest="$(printf '%s\n%s\n' "$cur" "$ver" | sort -V | tail -n1)"
 
 sed -i '' -E "s/^  version \"[^\"]+\"$/  version \"$ver\"/" "$CASK"
 sed -i '' -E "s/^  sha256 \"[0-9a-f]+\"$/  sha256 \"$sha\"/" "$CASK"
+# shellcheck disable=SC2015 # fails when either grep does
 grep -q "^  version \"$ver\"$" "$CASK" && grep -q "^  sha256 \"$sha\"$" "$CASK" \
   || { echo "could not update $CASK" >&2; exit 1; }
 

@@ -157,7 +157,7 @@ Found a vulnerability? Please report it privately, as [SECURITY.md](SECURITY.md)
 
 ### How the repository is checked
 
-- **What runs:** [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/Undermove/meridian-browser) weekly (the badge above), CodeQL code scanning, Dependabot alerts and security updates, GitHub secret scanning, and signed release checksums with build attestations (see [Verifying a download](#verifying-a-download)).
+- **What runs:** [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/Undermove/meridian-browser) weekly (the badge above), CodeQL code scanning, OSV-Scanner and npm audit, Dependabot alerts and security updates, dependency review on every PR (new vulnerable dependencies and disallowed licenses fail), zizmor and actionlint on the workflows, ShellCheck, GitHub secret scanning with push protection plus gitleaks, and signed release checksums with build attestations (see [Verifying a download](#verifying-a-download)).
 - **Findings:** reviewed weekly; each one is fixed, or dismissed with a written reason.
 
 Scorecard checks that stay low by design:

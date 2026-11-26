@@ -17,7 +17,8 @@ for sub in "${SUBREPOS[@]}"; do
       base="$(gclient getdep -r "src/$sub")"
       git -C "$sub" checkout -q -B meridian "$base"
       git -C "$sub" -c user.email=meridian@localhost -c user.name=Meridian am -q --3way "$HERE/patches/$sub"/*.patch
-      echo "Applied $(ls "$HERE/patches/$sub"/*.patch | wc -l | tr -d ' ') patches to $sub." ;;
+      sub_patches=("$HERE/patches/$sub"/*.patch)
+      echo "Applied ${#sub_patches[@]} patches to $sub." ;;
     export)
       base="$(gclient getdep -r "src/$sub")"
       mkdir -p "$HERE/patches/$sub"

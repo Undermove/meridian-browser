@@ -41,6 +41,7 @@ rm -f "$DIST/SHA256SUMS-win.txt" "$DIST/SHA256SUMS-win.txt.sig" "$DIST/SHA256SUM
 (cd "$DIST" && sha256sum "$NAME" | sed 's/ \*/  /' > SHA256SUMS-win.txt)
 KEY_FILE="${MERIDIAN_RELEASE_KEY:-$HOME/.config/meridian/release-ed25519.pem}"
 if [ -f "$KEY_FILE" ]; then
+  # shellcheck disable=SC2016 # a JavaScript program, not shell
   KEY_FILE="$(native_path "$KEY_FILE")" SUMS="$(native_path "$DIST/SHA256SUMS-win.txt")" \
   HEADER="$(native_path "$DIR/src/chrome/browser/meridian/update_check.h")" \
   node --input-type=module -e '

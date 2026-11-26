@@ -41,7 +41,7 @@ sign_all() {
   local id="$1" ent="$OUT/stage/entitlements" fw ver vd ts=()
   mkdir -p "$ent"
   fw="$APP/Contents/Frameworks/Meridian Framework.framework"
-  ver="$(ls "$fw/Versions" | grep -v Current | head -1)"
+  ver="$(find "$fw/Versions" -mindepth 1 -maxdepth 1 ! -name Current -exec basename {} \; | head -1)"
   vd="$fw/Versions/$ver"
   cp "$DIR/src/chrome/app/app-entitlements.plist" "$ent/app.plist"
   cp "$DIR/src/chrome/app/helper-renderer-entitlements.plist" "$ent/jit.plist"

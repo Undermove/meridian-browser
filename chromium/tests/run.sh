@@ -15,7 +15,7 @@ trap 'pbcopy < "$clip" 2>/dev/null; pbcopy -pboard find < "$find_clip" 2>/dev/nu
 # The Workbench page (chrome://workbench) from the current UI sources.
 "$HERE/../tools/workbench_assets.sh" "$(meridian_resources "$OUT")/workbench" >/dev/null || fail=1
 "$OUT/meridian_unittests" --gtest_brief=1 2>&1 | tail -2 || fail=1
-cd "$HERE"
+cd "$HERE" || exit 1
 args=(--test --test-force-exit --test-concurrency=1 --test-timeout=90000)
 [ $# -gt 0 ] && args+=(--test-name-pattern="$1")
 node "${args[@]}" ./*.test.mjs || fail=1
