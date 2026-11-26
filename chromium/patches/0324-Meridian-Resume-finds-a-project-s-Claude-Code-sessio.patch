@@ -1,0 +1,380 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 14:41:52 +0400
+Subject: [PATCH] Meridian: Resume finds a project's Claude Code sessions under
+ every account
+
+Claude Code keeps its sessions per config folder. Once the owner's Work
+space ran ~/.claude, Resume (Claude Code's own list) was empty there:
+his 143 sessions of the project were under ~/.claude-personal.
+
+The Workbench now asks for the project's sessions under each of the
+person's Claude accounts (claudeAccountSessions: names, titles and times,
+never a folder). With sessions under another account, Resume lists them
+all: the space's account first, then "Earlier sessions under Personal
+Claude". A session picked there runs with its own account's
+CLAUDE_CONFIG_DIR, its tab named after it, "Resumed with Personal
+Claude" in the terminal, and it reopens under that account after a
+restart. With one account, Claude Code's own list as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/workbench/agent_insights.cc      |  92 ++++++++++++++++
+ .../meridian/workbench/agent_insights.h       |  17 +++
+ .../workbench/agent_insights_unittest.cc      |  41 +++++++
+ .../meridian/workbench/workbench_handler.cc   | 104 +++++++++++++++++-
+ .../meridian/workbench/workbench_handler.h    |   6 +
+ 5 files changed, 254 insertions(+), 6 deletions(-)
+
+diff --git a/chrome/browser/meridian/workbench/agent_insights.cc b/chrome/browser/meridian/workbench/agent_insights.cc
+index 21816fcade..f4abfd45fc 100644
+--- a/chrome/browser/meridian/workbench/agent_insights.cc
++++ b/chrome/browser/meridian/workbench/agent_insights.cc
+@@ -17,6 +17,7 @@
+ #include "base/files/file_util.h"
+ #include "base/json/json_reader.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/cstring_view.h"
+ #include "base/strings/string_view_util.h"
+@@ -471,4 +472,95 @@ std::optional<AgentSession> FindAgentSession(AgentFormat format,
+   return s;
+ }
+ 
++std::vector<ClaudeSessionFile> ClaudeSessionsIn(const base::FilePath& config,
++                                                const base::FilePath& root,
++                                                size_t limit) {
++  std::vector<base::FilePath> dirs;
++  for (const base::FilePath& r : {root, base::MakeAbsoluteFilePath(root)}) {
++    if (r.empty()) {
++      continue;
++    }
++    // Claude Code's own name for the project's folder (as Qwen's).
++    base::FilePath dir =
++        config.AppendASCII("projects").AppendASCII(QwenProjectName(r));
++    if (std::ranges::find(dirs, dir) == dirs.end()) {
++      dirs.push_back(dir);
++    }
++  }
++  std::vector<ClaudeSessionFile> out;
++  for (const base::FilePath& dir : dirs) {
++    base::FileEnumerator e(dir, false, base::FileEnumerator::FILES,
++                           FILE_PATH_LITERAL("*.jsonl"));
++    for (base::FilePath p = e.Next(); !p.empty(); p = e.Next()) {
++      std::string id = p.BaseName().RemoveFinalExtension().AsUTF8Unsafe();
++      if (id.empty() || id.size() > 80 ||
++          !std::ranges::all_of(id, [](char c) {
++            return base::IsAsciiAlphaNumeric(c) || c == '-' || c == '_';
++          })) {
++        continue;
++      }
++      out.push_back({std::move(id), e.GetInfo().GetLastModifiedTime(), ""});
++    }
++  }
++  std::ranges::sort(out, [](const ClaudeSessionFile& a,
++                            const ClaudeSessionFile& b) {
++    return a.modified > b.modified;
++  });
++  if (out.size() > limit) {
++    out.resize(limit);
++  }
++  // A title: the first thing the person typed (from the file's start only).
++  for (ClaudeSessionFile& s : out) {
++    for (const base::FilePath& dir : dirs) {
++      base::File file(dir.AppendASCII(s.id + ".jsonl"),
++                      base::File::FLAG_OPEN | base::File::FLAG_READ);
++      if (!file.IsValid()) {
++        continue;
++      }
++      std::string head(64 * 1024, '\0');
++      std::optional<size_t> n =
++          file.Read(0, base::as_writable_byte_span(head));
++      head.resize(n.value_or(0));
++      for (std::string_view line : base::SplitStringPiece(
++               head, "\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++        std::optional<base::Value> v = base::JSONReader::Read(line, base::JSON_PARSE_RFC);
++        const base::DictValue* d = v && v->is_dict() ? &v->GetDict() : nullptr;
++        const std::string* type = d ? d->FindString("type") : nullptr;
++        if (!type || *type != "user" || d->FindBool("isMeta").value_or(false)) {
++          continue;
++        }
++        const base::DictValue* message = d->FindDict("message");
++        const std::string* text =
++            message ? message->FindString("content") : nullptr;
++        std::string found = text ? *text : std::string();
++        if (!text && message) {
++          if (const base::ListValue* parts = message->FindList("content")) {
++            for (const base::Value& part : *parts) {
++              const std::string* t =
++                  part.is_dict() ? part.GetDict().FindString("text") : nullptr;
++              if (t) {
++                found = *t;
++                break;
++              }
++            }
++          }
++        }
++        found = std::string(base::TrimWhitespaceASCII(found, base::TRIM_ALL));
++        // Claude Code's own wrappers (<command-name>…) aren't a question.
++        if (found.empty() || found.starts_with("<")) {
++          continue;
++        }
++        if (found.size() > 120) {
++          found.resize(117);
++          found += "…";
++        }
++        s.title = std::move(found);
++        break;
++      }
++      break;
++    }
++  }
++  return out;
++}
++
+ }  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/agent_insights.h b/chrome/browser/meridian/workbench/agent_insights.h
+index 6c54107da8..0245c41fbb 100644
+--- a/chrome/browser/meridian/workbench/agent_insights.h
++++ b/chrome/browser/meridian/workbench/agent_insights.h
+@@ -9,6 +9,7 @@
+ #include <optional>
+ #include <string>
+ #include <string_view>
++#include <vector>
+ 
+ #include "base/files/file_path.h"
+ #include "base/time/time.h"
+@@ -51,6 +52,22 @@ std::optional<AgentSession> FindAgentSession(
+     base::Time until,
+     const std::map<std::string, std::string>& account_env = {});
+ 
++// A Claude Code session to pick up: its id (the file's name), when it was
++// last written, and its first thing the person asked (a title, or "").
++struct ClaudeSessionFile {
++  std::string id;
++  base::Time modified;
++  std::string title;
++};
++
++// Blocking. Claude Code's sessions of project `root` kept in one account's
++// config folder (`config`/projects/<root, non-alphanumerics as ->/*.jsonl),
++// the newest first, at most `limit`. Sessions are per config folder, so a
++// space that switched accounts finds its earlier ones under the other one.
++std::vector<ClaudeSessionFile> ClaudeSessionsIn(const base::FilePath& config,
++                                                const base::FilePath& root,
++                                                size_t limit);
++
+ }  // namespace meridian::workbench
+ 
+ #endif  // CHROME_BROWSER_MERIDIAN_WORKBENCH_AGENT_INSIGHTS_H_
+diff --git a/chrome/browser/meridian/workbench/agent_insights_unittest.cc b/chrome/browser/meridian/workbench/agent_insights_unittest.cc
+index 4d078c036b..6ed9de27c3 100644
+--- a/chrome/browser/meridian/workbench/agent_insights_unittest.cc
++++ b/chrome/browser/meridian/workbench/agent_insights_unittest.cc
+@@ -116,6 +116,47 @@ bool AnyContains(const std::vector<std::string>& list, std::string_view s) {
+ 
+ // ---------------------------------------------------------------- readers
+ 
++// Sessions are per config folder: each account's own list for a project,
++// newest first, with the first thing asked as a title.
++TEST(AgentInsightsTest, ClaudeSessionsPerAccountFolder) {
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath root = temp.GetPath().AppendASCII("work.shop");
++  base::CreateDirectory(root);
++  std::string slug = base::MakeAbsoluteFilePath(root).AsUTF8Unsafe();
++  for (char& c : slug) {
++    if (!base::IsAsciiAlphaNumeric(c)) {
++      c = '-';
++    }
++  }
++  const base::FilePath personal = temp.GetPath().AppendASCII(".claude-personal");
++  const base::FilePath dir = personal.AppendASCII("projects").AppendASCII(slug);
++  ASSERT_TRUE(base::CreateDirectory(dir));
++  ASSERT_TRUE(base::WriteFile(
++      dir.AppendASCII("aaa-1.jsonl"),
++      R"({"type":"summary"})" "\n"
++      R"({"type":"user","isMeta":true,"message":{"content":"<command>"}})" "\n"
++      R"({"type":"user","message":{"role":"user","content":"Fix the checkout"}})" "\n"));
++  ASSERT_TRUE(base::WriteFile(
++      dir.AppendASCII("bbb-2.jsonl"),
++      R"({"type":"user","message":{"content":[{"type":"text","text":"Add tests"}]}})" "\n"));
++  ASSERT_TRUE(base::WriteFile(dir.AppendASCII("not a session.txt"), ""));
++  const base::Time now = base::Time::Now();
++  base::TouchFile(dir.AppendASCII("aaa-1.jsonl"), now - base::Hours(2),
++                  now - base::Hours(2));
++  base::TouchFile(dir.AppendASCII("bbb-2.jsonl"), now, now);
++  std::vector<ClaudeSessionFile> list = ClaudeSessionsIn(personal, root, 10);
++  ASSERT_EQ(list.size(), 2u);
++  EXPECT_EQ(list[0].id, "bbb-2");
++  EXPECT_EQ(list[0].title, "Add tests");
++  EXPECT_EQ(list[1].id, "aaa-1");
++  EXPECT_EQ(list[1].title, "Fix the checkout");
++  EXPECT_EQ(ClaudeSessionsIn(personal, root, 1).size(), 1u);
++  // Another account's folder: none of these.
++  EXPECT_TRUE(
++      ClaudeSessionsIn(temp.GetPath().AppendASCII(".claude"), root, 10).empty());
++}
++
+ TEST(AgentInsightsTest, CodexRollout) {
+   ContextInsights ci(AgentFormat::kCodex);
+   ci.ReadMore(Fixture("codex-rollout.jsonl"));
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 0a185745c5..be34c5b0e6 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -883,6 +883,75 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+   }
+   // The project's Claude Code sessions to reopen after a restart. Written
+   // to disk right away: the browser may quit (an update) a moment later.
++  if (method == "claudeAccountSessions") {
++    // Claude Code's sessions of this project in every one of the person's
++    // Claude accounts (sessions are per config folder): {current: account
++    // id the space runs as, accounts: [{id, label, current, sessions: [{id,
++    // modified (ms), title}]}]}. Only names and titles: never a folder.
++    if (!project_) {
++      return std::move(reply).Run(base::Value(base::DictValue()));
++    }
++    std::optional<ai::SpaceAccount> chosen =
++        ai::SpaceAccountFor(profile_, SpaceForTerminals(), "claude");
++    ai::ListAccountsAsync(
++        profile_,
++        base::BindOnce(
++            [](base::WeakPtr<WorkbenchHandler> self, base::FilePath root,
++               std::optional<ai::SpaceAccount> chosen, Reply reply,
++               std::vector<ai::Account> list) {
++              if (!self) {
++                return;
++              }
++              std::vector<ai::Account> claude;
++              std::string current;
++              for (ai::Account& a : list) {
++                if (a.vendor != "claude") {
++                  continue;
++                }
++                if (chosen ? a.id == chosen->id : a.is_default) {
++                  current = a.id;
++                }
++                self->session_accounts_[a.id] = {a.dir, a.label};
++                claude.push_back(std::move(a));
++              }
++              base::ThreadPool::PostTaskAndReplyWithResult(
++                  FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++                  base::BindOnce(
++                      [](std::vector<ai::Account> claude, base::FilePath root,
++                         std::string current) {
++                        base::ListValue accounts;
++                        for (const ai::Account& a : claude) {
++                          base::ListValue sessions;
++                          for (const ClaudeSessionFile& f :
++                               ClaudeSessionsIn(a.dir, root, 30)) {
++                            sessions.Append(
++                                base::DictValue()
++                                    .Set("id", f.id)
++                                    .Set("modified",
++                                         f.modified.InMillisecondsFSinceUnixEpoch())
++                                    .Set("title", f.title));
++                          }
++                          accounts.Append(base::DictValue()
++                                              .Set("id", a.id)
++                                              .Set("label", a.label)
++                                              .Set("current", a.id == current)
++                                              .Set("sessions", std::move(sessions)));
++                        }
++                        return base::Value(base::DictValue()
++                                               .Set("current", current)
++                                               .Set("accounts", std::move(accounts)));
++                      },
++                      std::move(claude), root, current),
++                  base::BindOnce(
++                      [](Reply reply, base::Value v) {
++                        std::move(reply).Run(std::move(v));
++                      },
++                      std::move(reply)));
++            },
++            weak_factory_.GetWeakPtr(), project_->root(), std::move(chosen),
++            std::move(reply)));
++    return;
++  }
+   if (method == "claudeSessions" || method == "saveClaudeSessions") {
+     if (!project_) {
+       return std::move(reply).Run(base::Value(base::ListValue()));
+@@ -925,6 +994,12 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+         if (v.GetDict().FindBool("remote").value_or(false)) {
+           entry.Set("remote", true);
+         }
++        // Resumed under another account than the space's: that one again.
++        if (const std::string* account = v.GetDict().FindString("account");
++            account && account->size() == 8 &&
++            std::ranges::all_of(*account, base::IsHexDigit<char>)) {
++          entry.Set("account", *account);
++        }
+         list.Append(std::move(entry));
+       }
+     }
+@@ -2448,6 +2523,13 @@ void WorkbenchHandler::OnProject(
+       std::move(reply));
+ }
+ 
++std::string WorkbenchHandler::SpaceForTerminals() {
++  const TabData* data = TabData::Get(web_ui()->GetWebContents());
++  return data && !data->space_id().empty()
++             ? data->space_id()
++             : SidebarServiceFactory::GetForProfile(profile_)->active_space_id();
++}
++
+ void WorkbenchHandler::CreateTerminal(base::DictValue opts, Reply reply) {
+   ContinueTerminal(std::move(opts), TerminalSteps(), std::move(reply));
+ }
+@@ -2642,12 +2724,22 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+   std::string account;
+   std::map<std::string, std::string> account_env;
+   if (kind == "shell" || ai::AccountVendorForKind(kind)) {
+-    const TabData* data = TabData::Get(web_ui()->GetWebContents());
+-    std::string space = data && !data->space_id().empty()
+-                            ? data->space_id()
+-                            : SidebarServiceFactory::GetForProfile(profile_)
+-                                  ->active_space_id();
+-    account_env = ai::AccountEnvForKind(profile_, space, kind, &account);
++    account_env =
++        ai::AccountEnvForKind(profile_, SpaceForTerminals(), kind, &account);
++  }
++  // A session picked from another account's list (Resume): it goes on
++  // under that account, where its history is, not the space's.
++  if (const std::string* id = opts.FindString("accountId");
++      id && kind == "claude" && !resume_id.empty()) {
++    if (auto it = session_accounts_.find(*id); it != session_accounts_.end()) {
++      account_env = ai::AccountEnv(*ai::FindAccountVendor("claude"),
++                                   ai::AccountsHome(), it->second.first);
++      // An empty change list: the variable taken away (its own folder).
++      if (account_env.empty()) {
++        account_env["CLAUDE_CONFIG_DIR"] = std::string();
++      }
++      account = it->second.second;
++    }
+   }
+   files_->PostTaskAndReplyWithResult(
+       FROM_HERE,
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.h b/chrome/browser/meridian/workbench/workbench_handler.h
+index 2d07347e2f..bed44f4751 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.h
++++ b/chrome/browser/meridian/workbench/workbench_handler.h
+@@ -235,6 +235,12 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+   bool picking_hub_parent_ = false;
+   // The hub parent picked in the native dialog.
+   base::FilePath hub_parent_;
++  // The Claude Code accounts the last "claudeAccountSessions" listed (id ->
++  // folder, name): a session picked from that list runs as its own account.
++  std::map<std::string, std::pair<base::FilePath, std::string>>
++      session_accounts_;
++  // The space this page's terminals run in.
++  std::string SpaceForTerminals();
+   base::CallbackListSubscription custom_subscription_;
+   base::ScopedObservation<mission::MissionControl,
+                           mission::MissionControl::Observer>
+-- 
+2.36.1
+

@@ -124,13 +124,14 @@ test('Two Claude accounts: Meridian offers Work in Work and Personal in Personal
     await b.eval(`${H}.updateSpace(${JSON.stringify(first)}, 'Work', '', '#8a8fe0', '#8a8fe0')`);
     const { spaceId: personal } = await b.eval(`${H}.createSpace('Personal', '', '', '')`);
 
-    // Found by folder names: Default, Work and Personal for Claude (not the empty backup folder); two Codex.
+    // Found by folder names, never called a bare "Default" (not the empty backup folder); two Codex.
     let all = await accounts();
-    assert.deepEqual(all.vendors.find((v) => v.id === 'claude').accounts.map((a) => a.label), ['Default', 'Personal', 'Work']);
-    assert.deepEqual(all.vendors.find((v) => v.id === 'codex').accounts.map((a) => a.label), ['Default', 'Work']);
+    assert.deepEqual(all.vendors.find((v) => v.id === 'claude').accounts.map((a) => a.label), ['Claude (~/.claude)', 'Claude Personal', 'Claude Work']);
+    assert.deepEqual(all.vendors.find((v) => v.id === 'codex').accounts.map((a) => a.label), ['Codex (~/.codex)', 'Codex Work']);
     assert.equal(all.vendors.find((v) => v.id === 'claude').accounts[0].default, true);
-    const work = idOf(all, 'claude', 'Work');
-    const pers = idOf(all, 'claude', 'Personal');
+    const work = idOf(all, 'claude', 'Claude Work');
+    const pers = idOf(all, 'claude', 'Claude Personal');
+    const own = idOf(all, 'claude', 'Claude (~/.claude)');
 
     // Settings › AI: only what's here, with its accounts; the rest folded; the offer on top.
     await openAi();
@@ -139,8 +140,8 @@ test('Two Claude accounts: Meridian offers Work in Work and Personal in Personal
     await b.eval(`${ST}.getElementById('ai-claude-code').click()`);
     await b.waitFor(`${ST}.getElementById('ai-claude-code').classList.contains('on') && ${ST}.getElementById('askWith').value === 'claude-code'`);
     await b.waitFor(`!!${ST}.getElementById('accounts-claude') && !!${ST}.getElementById('accountsHint')`);
-    const chips = await b.eval(`[...${ST}.querySelectorAll('#accounts-claude .acc:not(.add) b')].map((e) => e.textContent)`);
-    assert.deepEqual(chips, ['Default', 'Personal', 'Work']);
+    const chips = await b.eval(`[...${ST}.querySelectorAll('#accounts-claude .sub-name')].map((e) => e.textContent.trim())`);
+    assert.deepEqual(chips, ['Claude (~/.claude)', 'Claude Personal', 'Claude Work']);
     assert.equal(await b.eval(`!!${ST}.getElementById('ai-cursor')`), false, 'not installed: not a row');
     assert.equal(await b.eval(`${ST}.getElementById('moreAi').open`), false, 'More AI tools is folded');
     assert.match(await b.eval(`${ST}.getElementById('moreAi').textContent`), /Cursor/);
@@ -157,8 +158,9 @@ test('Two Claude accounts: Meridian offers Work in Work and Personal in Personal
     assert.equal(all.spaces[first].claude, work);
     assert.equal(all.spaces[personal].claude, pers);
     assert.equal(all.hint, 'applied');
-    const where = await b.eval(`[...${ST}.querySelectorAll('#accounts-claude .acc:not(.add)')].map((e) => e.querySelector('b').textContent + ': ' + e.querySelector('small').textContent)`);
-    assert.deepEqual(where, ['Default: Claude account · Used in your other spaces', 'Personal: Claude account · Used in Personal', 'Work: Claude account · Used in Work'], 'in plain words');
+    await b.waitFor(`${ST}.querySelector('#accounts-claude .row.sub .row-desc')?.textContent.trim() === 'New spaces'`);
+    const where = await b.eval(`[...${ST}.querySelectorAll('#accounts-claude .row.sub')].map((e) => e.querySelector('.sub-name').textContent.trim() + ': ' + e.querySelector('.row-desc').textContent.trim())`);
+    assert.deepEqual(where, ['Claude (~/.claude): New spaces', 'Claude Personal: Used in Personal', 'Claude Work: Used in Work'], 'in plain words');
     await b.eval('app.$.settings.hide()');
 
     // Ask in Work: Claude Code started with the Work folder; in Personal, the Personal one.
@@ -169,11 +171,11 @@ test('Two Claude accounts: Meridian offers Work in Work and Personal in Personal
     assert.match(await ask('And here?'), /from \.claude-personal/);
     assert.equal(lastEnv(), path.join(home, '.claude-personal'));
 
-    // The space's menu: AI Accounts ▸ Claude: Default. The default is Claude Code's own folder:
-    // the variable is taken away (its Keychain entry is keyed to it), not set to ~/.claude.
+    // The space's menu: AI Accounts ▸ Claude (~/.claude), Claude Code's own folder: the variable is
+    // taken away (its Keychain entry is keyed to it), not set to ~/.claude.
     await sleep(300);
-    await b.menu(`${SB}.querySelector('.space-header')`, 'AI Accounts > Default');
-    await b.waitFor(`${H}.getAiAccounts().then((r) => !JSON.parse(r.json).spaces[${JSON.stringify(personal)}]?.claude)`);
+    await b.menu(`${SB}.querySelector('.space-header')`, 'AI Accounts > Claude (~/.claude)');
+    await b.waitFor(`${H}.getAiAccounts().then((r) => JSON.parse(r.json).spaces[${JSON.stringify(personal)}]?.claude === ${JSON.stringify(own)})`);
     assert.match(await ask('Default now?'), /from default/);
     assert.equal(lastEnv(), '<unset>');
     // The menu shows the choice.
@@ -186,41 +188,49 @@ test('Two Claude accounts: Meridian offers Work in Work and Personal in Personal
     await b.waitFor(`!!${SB}.querySelector('#submenu meridian-menu')`);
     await shot(b, 'acc-space-menu');
     const sub = await b.eval(`[...${SB}.querySelector('#submenu meridian-menu').shadowRoot.querySelectorAll('.menu-header, .menu-item')].map((m) => m.textContent.replace(/\\s+/g, ' ').trim())`);
-    assert.deepEqual(sub.slice(0, 4), ['Claude', 'Default', 'Personal', 'Work']);
+    assert.deepEqual(sub.slice(0, 4), ['Claude', 'Claude (~/.claude)', 'Claude Personal', 'Claude Work']);
     const checked = await b.eval(`[...${SB}.querySelector('#submenu meridian-menu').shadowRoot.querySelectorAll('.menu-item')].filter((m) => m.querySelector('.menu-check')).map((m) => m.textContent.trim())`);
-    assert.deepEqual(checked, ['Default', 'Default'], 'Claude and Codex: the default');
+    assert.deepEqual(checked, ['Claude (~/.claude)', 'Codex (~/.codex)'], 'Claude: its choice; Codex: the main one');
     assert.ok(sub.includes('Codex') && sub.includes('Manage AI Accounts…'), sub.join(' | '));
     await b.eval(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
     await sleep(300);
 
-    // Add an account: a name becomes ~/.claude-<name>, made private; sign in runs Claude Code's own
-    // sign-in with that folder (in Terminal; here written down); Remove takes it off the list only.
+    // + Add Claude: a name only. Meridian makes a private folder of its own (beside its profiles, under
+    // AI Accounts) and opens Claude Code's own sign-in for it right away (in Terminal; here written
+    // down); Remove takes it off the list only.
     await openAi();
     await b.waitFor(`!!${ST}.getElementById('addAccount-claude')`);
     await b.click(`${ST}.getElementById('addAccount-claude')`);
     await b.waitFor(`!!${ST}.querySelector('.account-add input')`);
     await b.eval(`(() => { const i = ${ST}.querySelector('.account-add input'); i.value = 'Client A'; i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' })); })()`);
-    const client = path.join(home, '.claude-client-a');
-    await b.waitFor(`[...${ST}.querySelectorAll('#accounts-claude .acc b')].some((e) => e.textContent === 'Client A')`);
+    await b.waitFor(`[...${ST}.querySelectorAll('#accounts-claude .sub-name')].some((e) => e.textContent.trim() === 'Client A')`);
+    const client = path.join(fs.realpathSync(profile), 'AI Accounts', 'claude-client-a');
     assert.ok(fs.statSync(client).isDirectory());
     if (process.platform !== 'win32') assert.equal(fs.statSync(client).mode & 0o777, 0o700); // no POSIX modes on Windows
-    await b.waitFor(`!!${ST}.querySelector('.account-edit')`);
-    assert.match(await b.eval(`${ST}.querySelector('.account-edit').textContent`), /~\/\.claude-client-a/);
+    assert.ok(!fs.existsSync(path.join(home, '.claude-client-a')), 'nothing new in the home folder');
     await shot(b, 'acc-settings-add');
-    await b.click(`[...${ST}.querySelectorAll('.account-edit .btn')].find((e) => e.textContent.includes('Sign in'))`);
     for (let i = 0; i < 50 && !fs.existsSync(signins); i++) await sleep(100);
     // In the command prompt's words on Windows (it reads no single quotes).
     assert.equal(fs.readFileSync(signins, 'utf8').trim(), process.platform === 'win32'
       ? `set "CLAUDE_CONFIG_DIR=${client}" && "${path.join(bin, 'claude.exe')}"`
       : `CLAUDE_CONFIG_DIR='${client}' '${path.join(bin, 'claude')}'`, 'the copy Meridian runs');
-    // Renamed.
-    await b.eval(`(() => { const i = ${ST}.querySelector('.account-edit input'); i.value = 'Acme'; i.dispatchEvent(new Event('change')); })()`);
-    await b.waitFor(`[...${ST}.querySelectorAll('#accounts-claude .acc b')].some((e) => e.textContent === 'Acme')`);
-    await b.click(`[...${ST}.querySelectorAll('.account-edit .btn')].find((e) => e.textContent.includes('Remove'))`);
-    await b.waitFor(`![...${ST}.querySelectorAll('#accounts-claude .acc b')].some((e) => e.textContent === 'Acme')`);
+    // Renamed in place: a click on its name.
+    await b.click(`[...${ST}.querySelectorAll('#accounts-claude .sub-name')].find((e) => e.textContent.trim() === 'Client A')`);
+    await b.waitFor(`!!${ST}.querySelector('.sub-name-input')`);
+    await b.eval(`(() => { const i = ${ST}.querySelector('.sub-name-input'); i.value = 'Acme'; i.dispatchEvent(new Event('change')); })()`);
+    await b.waitFor(`[...${ST}.querySelectorAll('#accounts-claude .sub-name')].some((e) => e.textContent.trim() === 'Acme')`);
+    // ⋯ › Remove from Meridian — the folder stays.
+    const acmeRow = `[...${ST}.querySelectorAll('#accounts-claude .row.sub')].find((r) => r.querySelector('.sub-name')?.textContent.trim() === 'Acme')`;
+    await b.click(`${acmeRow}.querySelector('.sub-more')`);
+    await b.waitFor(`!!${acmeRow}.querySelector('.sub-menu .danger')`);
+    assert.match(await b.eval(`${acmeRow}.querySelector('.sub-menu .danger').textContent.replace(/\\s+/g, ' ').trim()`), /^Remove from Meridian — the folder stays$/);
+    await b.click(`${acmeRow}.querySelector('.sub-menu .danger')`);
+    await b.waitFor(`![...${ST}.querySelectorAll('#accounts-claude .sub-name')].some((e) => e.textContent.trim() === 'Acme')`);
     assert.ok(fs.existsSync(client), 'its folder stays');
     // Not under a hidden name: a folder outside the home is refused.
-    await b.click(`${ST}.getElementById('addAccount-codex')`);
+    await b.waitFor(`!!${ST}.getElementById('addAccount-codex')`);
+    await b.eval(`${ST}.getElementById('addAccount-codex').click()`);
+    await b.waitFor(`!!${ST}.querySelector('.account-add[data-vendor="codex"] input')`);
     await b.eval(`(() => { const i = ${ST}.querySelector('.account-add input'); i.value = '/etc/codex'; i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' })); })()`);
     await b.waitFor(`${ST}.getElementById('aiMessage').textContent.includes('inside your home folder')`);
     await b.eval('app.$.settings.hide()');
@@ -234,12 +244,12 @@ test('Two Claude accounts: Meridian offers Work in Work and Personal in Personal
     const listed = await mcp.call('list_ai_accounts');
     assert.equal(listed.error, null);
     const text = JSON.stringify(listed.value);
-    assert.doesNotMatch(text, /\/|claude-work|"dir"/, 'no folders or paths');
+    assert.doesNotMatch(text, /claude-work|"dir"|\/Users\/|\/private\/|\/var\//, 'no folders or paths');
     const claude = listed.value.vendors.find((v) => v.id === 'claude');
-    assert.deepEqual(claude.accounts.find((a) => a.label === 'Work').spaces, [first]);
+    assert.deepEqual(claude.accounts.find((a) => a.label === 'Claude Work').spaces, [first]);
     const set = await mcp.call('set_space_ai_account', { space_id: personal, vendor: 'claude', account_id: work });
     assert.equal(set.error, null, set.error);
-    assert.equal(set.value.label, 'Work');
+    assert.equal(set.value.label, 'Claude Work');
     assert.match(await ask('Via MCP?'), /from \.claude-work/);
     const bad = await mcp.call('set_space_ai_account', { space_id: personal, vendor: 'claude', account_id: 'nope' });
     assert.match(bad.error, /no such account/);
@@ -285,7 +295,7 @@ test('Workbench: a Codex terminal in a space with a Codex account runs with its 
     const { state } = await b.eval(`${H}.getState()`);
     const space = state.activeSpaceId;
     const all = JSON.parse((await b.eval(`${H}.getAiAccounts()`)).json);
-    const workId = all.vendors.find((v) => v.id === 'codex').accounts.find((a) => a.label === 'Work').id;
+    const workId = all.vendors.find((v) => v.id === 'codex').accounts.find((a) => a.label === 'Codex Work').id;
     await b.eval(`${H}.setSpaceAiAccount(${JSON.stringify(space)}, 'codex', ${JSON.stringify(workId)})`);
 
     await b.eval('app.$.tabstrip.runCommand(16, 0)');
@@ -297,7 +307,7 @@ test('Workbench: a Codex terminal in a space with a Codex account runs with its 
     await wb.eval(`launch('codex').then((t) => !!t)`);
     await wb.waitFor(`S.activeTerm?.kind === 'codex' && ${termText}.includes('ready CODEX_HOME=')`, 15000);
     assert.match((await wb.eval(termText)).replace(/\n/g, ''), new RegExp(`ready CODEX_HOME=${path.join(home, '.codex-work').replace(/[.]/g, '\\.')}`));
-    assert.equal(await wb.eval(`document.querySelector('#term-tab-list .ttab.active .acct')?.textContent`), 'Work');
+    assert.equal(await wb.eval(`document.querySelector('#term-tab-list .ttab.active .acct')?.textContent`), 'Codex Work');
 
     // Its session is read from the Work account's folder, and the panel says whose it is.
     const panel = `(document.querySelector('#side-body')?.innerText || '')`;
@@ -311,11 +321,11 @@ test('Workbench: a Codex terminal in a space with a Codex account runs with its 
     assert.match((await wb.eval(termText)).replace(/\n/g, ''), /ready CODEX_HOME=<none>/);
     assert.equal(await wb.eval(`!!document.querySelector('#term-tab-list .ttab.active .acct')`), false);
     // Two accounts among the sessions: a filter. "Work" shows the Work session.
-    await wb.waitFor(`!!document.querySelector('.ci-accounts [data-account="Work"]')`, 20000);
+    await wb.waitFor(`!!document.querySelector('.ci-accounts [data-account="Codex Work"]')`, 20000);
     if (SHOTS) { await sleep(400); const { data } = await wb.cdp.send('Page.captureScreenshot', { format: 'png' }); fs.writeFileSync(path.join(SHOTS, 'acc-insights.png'), Buffer.from(data, 'base64')); }
-    await wb.eval(`document.querySelector('.ci-accounts [data-account="Work"]').click()`);
+    await wb.eval(`document.querySelector('.ci-accounts [data-account="Codex Work"]').click()`);
     await wb.waitFor(`${panel}.includes('Work account') && ${panel}.includes('Tokens over time')`, 20000);
-    assert.equal(await wb.eval('CI.account'), 'Work');
+    assert.equal(await wb.eval('CI.account'), 'Codex Work');
   } finally {
     wb?.close();
     await b.close();
@@ -368,11 +378,12 @@ process.stdin.on('end', () => {
     await b.eval(`${H}.updateSpace(${JSON.stringify(work)}, 'Work', '', '#8a8fe0', '#8a8fe0')`);
     const { spaceId: personal } = await b.eval(`${H}.createSpace('Personal', '', '', '')`);
 
-    // The default is ~/.claude-personal ("Personal"); ~/.claude is "~/.claude", not "Default".
+    // The default is ~/.claude-personal ("Claude Personal"); ~/.claude is "Claude (~/.claude)", not "Default".
     const all = JSON.parse((await b.eval(`${H}.getAiAccounts()`)).json);
     const claude = all.vendors.find((v) => v.id === 'claude').accounts;
-    assert.deepEqual(claude.map((a) => [a.label, a.default]), [['Personal', true], ['~/.claude', false]]);
-    const own = claude.find((a) => a.label === '~/.claude').id;
+    assert.deepEqual(claude.map((a) => [a.label, a.default]), [['Claude Personal', true], ['Claude (~/.claude)', false]]);
+    const own = claude.find((a) => a.label === 'Claude (~/.claude)').id;
+    const pers = claude.find((a) => a.label === 'Claude Personal').id;
 
     // Settings › AI: a picker per space under Claude's accounts; Work picks ~/.claude.
     await b.eval('app.$.tabstrip.runCommand(13, 0)');
@@ -380,11 +391,11 @@ process.stdin.on('end', () => {
     await b.eval(`${ST}.querySelector('[data-id="ai"]').click()`);
     const pick = (space) => `${ST}.querySelector('#accountSpaces-claude select[data-space="${space}"]')`;
     await b.waitFor(`!!${pick(work)} && !!${pick(personal)}`, 15000);
-    assert.deepEqual(await b.eval(`[...${pick(work)}.options].map((o) => o.textContent.trim())`), ['Personal (default)', '~/.claude']);
-    assert.equal(await b.eval(`${pick(work)}.value`), '');
+    assert.deepEqual(await b.eval(`[...${pick(work)}.options].map((o) => o.textContent.trim())`), ['Claude Personal', 'Claude (~/.claude)']);
+    assert.equal(await b.eval(`${pick(work)}.value`), pers, 'never chose: the main one');
     await b.eval(`(() => { const s = ${pick(work)}; s.value = ${JSON.stringify(own)}; s.dispatchEvent(new Event('change')); return true; })()`);
     await b.waitFor(`${H}.getAiAccounts().then((r) => JSON.parse(r.json).spaces[${JSON.stringify(work)}]?.claude === ${JSON.stringify(own)})`);
-    await b.waitFor(`${pick(work)}.value === ${JSON.stringify(own)} && ${pick(personal)}.value === ''`);
+    await b.waitFor(`${pick(work)}.value === ${JSON.stringify(own)} && ${pick(personal)}.value === ${JSON.stringify(pers)}`);
     await b.eval('app.$.settings.hide()');
 
     // Ask in Work: Claude Code without CLAUDE_CONFIG_DIR (its own ~/.claude); in Personal, the default.

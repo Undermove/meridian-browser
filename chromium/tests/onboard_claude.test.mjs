@@ -345,7 +345,7 @@ test('Settings › Connect shows what each config really has: Connected, per Cla
     assert.equal(await state('claude-desktop'), 'Connected');
     assert.equal(await state('opencode'), 'Connected');
     assert.equal(await state('codex'), 'Not installed');
-    assert.match(await b.eval(`${ST}.querySelector('#connect-claude .connect-desc').textContent`), /Connected for Default, not for Work\./);
+    assert.match(await b.eval(`${ST}.querySelector('#connect-claude .connect-desc').textContent`), /Connected for Claude \(~\/\.claude\), not for Claude Work\./);
     // Plain words first; the file or command only behind Details.
     assert.equal(await b.eval(`${ST}.querySelector('#connect-claude-desktop details')?.open`), false);
     assert.equal(await b.eval(`${ST}.querySelector('#connect-claude-desktop .row-desc.mono')?.textContent`), desktop);
@@ -363,9 +363,11 @@ test('Settings › Connect shows what each config really has: Connected, per Cla
     assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(desktop, 'utf8')).mcpServers), ['files']);
     assert.equal(await b.eval(`${ST}.querySelector('#connect-claude-desktop .btn').textContent.trim()`), 'Connect…');
 
-    // Each account chip: signed in or needs a sign-in, with its own button.
-    const chips = await b.eval(`[...${ST}.querySelectorAll('#accounts-claude .acc-wrap')].map((w) => w.textContent.replace(/\\s+/g, ' ').trim())`);
-    assert.ok(chips.some((c) => /Default ?Signed in/.test(c) && /Claude account · Used in every space/.test(c)), chips.join(' | '));
-    assert.ok(chips.some((c) => /Work ?Needs sign-in/.test(c) && /Sign in$/.test(c)), chips.join(' | '));
+    // Each subscription's row: one true status (the Sign in on the one that needs it) and its
+    // browser tools, the same as Connect's.
+    await b.waitFor(`[...${ST}.querySelectorAll('#accounts-claude .row.sub')].every((r) => !!r.querySelector('.sub-state'))`, 15000);
+    const rows = await b.eval(`[...${ST}.querySelectorAll('#accounts-claude .row.sub')].map((w) => w.textContent.replace(/\\s+/g, ' ').trim())`);
+    assert.ok(rows.some((c) => /^Claude \(~\/\.claude\) .*New spaces ✓ Signed in Browser tools: connected/.test(c)), rows.join(' | '));
+    assert.ok(rows.some((c) => /^Claude Work Not used in a space yet Needs sign-in Sign in Browser tools: connected/.test(c)), rows.join(' | '));
   } finally { await b.close(); fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
 });

@@ -1,0 +1,823 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 14:35:32 +0400
+Subject: [PATCH] Meridian: Connect writes the config files itself, so an
+ editor extension alone connects
+
+Someone with only VS Code and its GitHub Copilot or Codex extension, and no
+`code`, `codex` or `copilot` on the PATH, couldn't connect: Connect ran
+`code --add-mcp` and `codex mcp add`. Connect now writes the files those
+tools read (merged with what's there, the first old file kept as
+.meridian-backup), and the rows read the same files back:
+
+- VS Code (Copilot's agent mode): "servers" of the profile's mcp.json
+  (~/Library/Application Support/Code/User, %APPDATA%\Code\User,
+  ~/.config/Code/User). Found by the app, `code`, its profile folder or
+  the Copilot extension in ~/.vscode/extensions.
+- Codex (CLI, VS Code extension, app): [mcp_servers.meridian] in
+  config.toml of CODEX_HOME / each Codex account; only that table is
+  written or taken out. Found by the extension as "Codex (VS Code
+  extension)", or by the app.
+- GitHub Copilot: "mcpServers" of $COPILOT_HOME/mcp-config.json, else
+  ~/.copilot.
+- Visual Studio 2022 17.14+ (Windows): "servers" of %USERPROFILE%\.mcp.json.
+
+A row found only through an extension or an app says so, and that Ask and
+Improve with AI need Claude Code, with an Install button.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/agent/agent_cli.cc    | 377 +++++++++++++++---
+ chrome/browser/meridian/agent/agent_cli.h     |  42 +-
+ .../meridian/agent/agent_cli_unittest.cc      | 102 +++++
+ chrome/browser/meridian/sidebar.mojom         |   4 +
+ chrome/browser/meridian/sidebar_handler.cc    |   1 +
+ .../webui_browser/meridian/settings.html.ts   |   8 +-
+ .../webui_browser/meridian/settings.ts        |  21 +
+ 7 files changed, 498 insertions(+), 57 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_cli.cc b/chrome/browser/meridian/agent/agent_cli.cc
+index 08996cdb11..b6e0d4217b 100644
+--- a/chrome/browser/meridian/agent/agent_cli.cc
++++ b/chrome/browser/meridian/agent/agent_cli.cc
+@@ -8,6 +8,7 @@
+ 
+ #include "base/command_line.h"
+ #include "base/environment.h"
++#include "base/files/file_enumerator.h"
+ #include "base/files/file_util.h"
+ #include "base/files/important_file_writer.h"
+ #include "base/json/json_reader.h"
+@@ -66,21 +67,10 @@ std::vector<std::string> GeminiArgs(const std::string& program) {
+           "--mcp-bridge"};
+ }
+ 
+-// code --add-mcp '{"name":"meridian",…}': into the VS Code user profile's
+-// mcp.json, which Copilot's agent mode reads. Same name again replaces it.
+-std::vector<std::string> VsCodeArgs(const std::string& program) {
+-  return {"--add-mcp", "{\"name\":\"meridian\",\"type\":\"stdio\","
+-                       "\"command\":" +
+-                           JsonString(program) +
+-                           ",\"args\":[\"--mcp-bridge\"]}"};
+-}
+-
+ const std::vector<Known>& KnownClis() {
+   static const base::NoDestructor<std::vector<Known>> clis(std::vector<Known>{
+       {"claude", "Claude Code", "claude", &ClaudeArgs},
+       {"codex", "Codex", "codex", &DashDashArgs},
+-      {"vscode", "VS Code", "code", &VsCodeArgs},
+-      {"copilot", "GitHub Copilot CLI", "copilot", &DashDashArgs},
+       {"gemini", "Gemini CLI", "gemini", &GeminiArgs},
+       {"qwen", "Qwen Code", "qwen", &GeminiArgs},
+   });
+@@ -159,14 +149,37 @@ std::string App(const std::string& bundle, const std::string& inside = "") {
+   return std::string();
+ }
+ 
+-// The CLI on the login PATH. VS Code's `code` is often not there (it's an
+-// extra step in VS Code), but it's always inside the app.
++// The CLI on the login PATH.
+ std::string Locate(const Known& cli, const std::string& path) {
+-  std::string bin = Which(cli.bin, path);
+-  if (bin.empty() && std::string_view(cli.id) == "vscode") {
+-    bin = App("Visual Studio Code.app", "Contents/Resources/app/bin/code");
++  return Which(cli.bin, path);
++}
++
++// An editor extension in VS Code's extensions folder ("github.copilot",
++// "openai.chatgpt"): its folder, or "". A test sees only its own folder.
++std::string VsCodeExtension(const std::string& prefix) {
++  const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++  base::FilePath dir;
++  if (cl->HasSwitch(kVsCodeExtensionsSwitch)) {
++    dir = cl->GetSwitchValuePath(kVsCodeExtensionsSwitch);
++  } else if (TestSwitchesAllowed()) {
++    return std::string();
++  } else {
++    dir = base::GetHomeDir().AppendASCII(".vscode").AppendASCII("extensions");
++  }
++  base::FileEnumerator e(dir, false, base::FileEnumerator::DIRECTORIES);
++  for (base::FilePath p = e.Next(); !p.empty(); p = e.Next()) {
++    const std::string name =
++        base::ToLowerASCII(p.BaseName().AsUTF8Unsafe());
++    // "github.copilot-1.2.3", "github.copilot-chat-0.30.0".
++    if (name.starts_with(prefix) &&
++        (name.size() == prefix.size() || name[prefix.size()] == '-')) {
++      return p.AsUTF8Unsafe();
++    }
++    if (prefix == "github.copilot" && name.starts_with("github.copilot-chat")) {
++      return p.AsUTF8Unsafe();
++    }
+   }
+-  return bin;
++  return std::string();
+ }
+ 
+ std::string Program() {
+@@ -440,6 +453,13 @@ const std::vector<FileAgent>& FileAgents() {
+            "settings.json", {"amp"}, {}},
+           {"droid", "Factory Droid", kDroidConfigSwitch, false, ".factory",
+            "mcp.json", {"droid"}, {}},
++          // (Its folder is per system: ConfigDir.)
++          {"vscode", "VS Code", kVsCodeConfigSwitch, false, "", "mcp.json",
++           {"code"}, {"Visual Studio Code.app"}},
++          {"copilot", "GitHub Copilot", kCopilotConfigSwitch, false,
++           ".copilot", "mcp-config.json", {"copilot"}, {}},
++          {"visualstudio", "Visual Studio", kVisualStudioConfigSwitch, false,
++           "", ".mcp.json", {}, {}},
+       });
+   return *agents;
+ }
+@@ -483,6 +503,27 @@ base::FilePath ConfigDir(const FileAgent& agent, const std::string& xdg_home) {
+   if (cl->HasSwitch(agent.config_switch)) {
+     return cl->GetSwitchValuePath(agent.config_switch);
+   }
++  const std::string_view id(agent.id);
++  if (id == "vscode") {
++#if BUILDFLAG(IS_MAC)
++    return base::GetHomeDir().Append("Library/Application Support/Code/User");
++#elif BUILDFLAG(IS_WIN)
++    base::FilePath roaming;
++    if (!base::PathService::Get(base::DIR_ROAMING_APP_DATA, &roaming)) {
++      roaming = base::GetHomeDir().AppendASCII("AppData").AppendASCII(
++          "Roaming");
++    }
++    return roaming.AppendASCII("Code").AppendASCII("User");
++#else
++    return base::GetHomeDir().Append(".config/Code/User");
++#endif
++  }
++  if (id == "copilot") {
++    const std::string copilot_home = LoginVar("COPILOT_HOME");
++    if (!copilot_home.empty()) {
++      return base::FilePath::FromUTF8Unsafe(copilot_home);
++    }
++  }
+   if (agent.xdg) {
+     base::FilePath base = xdg_home.empty()
+                               ? base::GetHomeDir().AppendASCII(".config")
+@@ -518,6 +559,24 @@ JsonEntry EntryFor(const std::string& id, const std::string& program) {
+     e.new_file.Set("$schema", "https://opencode.ai/config.json");
+     return e;
+   }
++  // VS Code and Visual Studio: "servers", each with its type.
++  if (id == "vscode" || id == "visualstudio") {
++    e.key = "servers";
++    e.fields.emplace_back("type", base::Value("stdio"));
++    e.fields.emplace_back("command", base::Value(program));
++    e.fields.emplace_back("args", args());
++    e.new_file.Set("servers", base::DictValue());
++    return e;
++  }
++  // Copilot: a local server with all its tools.
++  if (id == "copilot") {
++    e.key = "mcpServers";
++    e.fields.emplace_back("type", base::Value("local"));
++    e.fields.emplace_back("command", base::Value(program));
++    e.fields.emplace_back("args", args());
++    e.fields.emplace_back("tools", base::Value(base::ListValue().Append("*")));
++    return e;
++  }
+   e.key = id == "amp" ? "amp.mcpServers" : "mcpServers";
+   if (id == "droid") {
+     e.fields.emplace_back("type", base::Value("stdio"));
+@@ -946,34 +1005,12 @@ std::string CliState(const std::string& id) {
+                ? "connected"
+                : "not-connected";
+   }
+-  if (id == "copilot") {
+-    return JsonState(DefaultDir("COPILOT_HOME", ".copilot", home)
+-                         .AppendASCII("mcp-config.json"),
+-                     "mcpServers");
+-  }
+   if (id == "gemini") {
+     return JsonState(home.AppendASCII(".gemini/settings.json"), "mcpServers");
+   }
+   if (id == "qwen") {
+     return JsonState(home.AppendASCII(".qwen/settings.json"), "mcpServers");
+   }
+-  if (id == "vscode") {
+-#if BUILDFLAG(IS_MAC)
+-    return JsonState(
+-        home.AppendASCII("Library/Application Support/Code/User/mcp.json"),
+-        "servers");
+-#elif BUILDFLAG(IS_WIN)
+-    base::FilePath roaming;
+-    if (TestSwitchesAllowed() ||
+-        !base::PathService::Get(base::DIR_ROAMING_APP_DATA, &roaming)) {
+-      return JsonState(home.AppendASCII("Code/User/mcp.json"), "servers");
+-    }
+-    return JsonState(roaming.AppendASCII("Code/User/mcp.json"), "servers");
+-#else
+-    return JsonState(home.AppendASCII(".config/Code/User/mcp.json"),
+-                     "servers");
+-#endif
+-  }
+   return std::string();
+ }
+ 
+@@ -1017,14 +1054,197 @@ AgentCli DetectFileAgent(const FileAgent& agent,
+       out.path = App(app);
+     }
+   }
++  if (std::string_view(agent.id) == "vscode") {
++    // Copilot's agent mode is the extension: VS Code without `code` on
++    // the PATH (or without the app found) still has it.
++    const std::string copilot = VsCodeExtension("github.copilot");
++    if (!copilot.empty()) {
++      out.via = "GitHub Copilot in VS Code";
++      if (out.path.empty()) {
++        out.path = copilot;
++      }
++    }
++  }
++  if (std::string_view(agent.id) == "visualstudio") {
++    // Found by its install (the home folder is always there), or a test's
++    // folder.
++#if BUILDFLAG(IS_WIN)
++    base::FilePath program_files;
++    if (out.path.empty() &&
++        base::PathService::Get(base::DIR_PROGRAM_FILES, &program_files)) {
++      for (const char* version : {"2022", "18"}) {
++        base::FilePath vs = program_files.AppendASCII("Microsoft Visual Studio")
++                                .AppendASCII(version);
++        if (base::DirectoryExists(vs)) {
++          out.path = vs.AsUTF8Unsafe();
++          break;
++        }
++      }
++    }
++#endif
++    if (out.path.empty() && base::CommandLine::ForCurrentProcess()->HasSwitch(
++                                agent.config_switch)) {
++      out.path = dir.AsUTF8Unsafe();
++    }
++    return out;
++  }
+   if (out.path.empty() && base::DirectoryExists(dir)) {
+     out.path = dir.AsUTF8Unsafe();
+   }
+   return out;
+ }
+ 
++// ---- Codex's config.toml, line by line: only Meridian's own table is
++// written or taken out; every other line stays as it is.
++
++// "[mcp_servers.meridian]", "[mcp_servers.\"meridian\".env]".
++bool IsMeridianTable(std::string_view trimmed) {
++  return RE2::FullMatch(
++      trimmed,
++      "\\[\\s*mcp_servers\\s*\\.\\s*(meridian|\"meridian\")(\\s*\\.[^\\]]*)?\\s*\\]\\s*(#.*)?");
++}
++
++// A table header ("[x]", "[[x]]"), not a line of a multi-line array.
++bool IsTableHeader(std::string_view trimmed) {
++  return RE2::FullMatch(trimmed,
++                        "\\[\\[?\\s*[A-Za-z0-9_\"'.\\- ]+\\]\\]?\\s*(#.*)?");
++}
++
++std::string CodexTable(const std::string& program) {
++  return "[mcp_servers.meridian]\ncommand = " + JsonString(program) +
++         "\nargs = [\"--mcp-bridge\"]\n";
++}
++
++
++// Codex's home for an account's environment changes (ai::AccountEnv):
++// its CODEX_HOME, else the default one (the login environment's, else
++// ~/.codex). "" in a test without its own home.
++base::FilePath CodexDir(const std::map<std::string, std::string>& env) {
++  if (auto it = env.find("CODEX_HOME");
++      it != env.end() && !it->second.empty()) {
++    return base::FilePath::FromUTF8Unsafe(it->second);
++  }
++  const base::FilePath home = StateHome();
++  if (home.empty()) {
++    return base::FilePath();
++  }
++  // Taken away (the CLI's own folder): ~/.codex, whatever the login says.
++  if (env.contains("CODEX_HOME")) {
++    return home.AppendASCII(".codex");
++  }
++  return DefaultDir("CODEX_HOME", ".codex", home);
++}
++
++// Copilot's folder for an account's environment changes, as for Codex.
++base::FilePath CopilotDir(const std::map<std::string, std::string>& env) {
++  if (auto it = env.find("COPILOT_HOME");
++      it != env.end() && !it->second.empty()) {
++    return base::FilePath::FromUTF8Unsafe(it->second);
++  }
++  const FileAgent& agent = *FindFileAgent("copilot");
++  if (TestWithoutConfig(agent)) {
++    return base::FilePath();
++  }
++  return env.contains("COPILOT_HOME")
++             ? StateHome().AppendASCII(".copilot")
++             : ConfigDir(agent, std::string());
++}
++
+ }  // namespace
+ 
++std::string WithoutCodexServer(const std::string& toml, bool* removed) {
++  *removed = false;
++  std::vector<std::string> out;
++  bool skipping = false;
++  for (const std::string& line : base::SplitString(
++           toml, "\n", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL)) {
++    const std::string_view trimmed =
++        base::TrimWhitespaceASCII(line, base::TRIM_ALL);
++    if (IsTableHeader(trimmed)) {
++      skipping = IsMeridianTable(trimmed);
++      *removed |= skipping;
++    }
++    if (!skipping) {
++      out.push_back(line);
++    }
++  }
++  // No run of blank lines where the table was, none at the end.
++  std::vector<std::string> tidy;
++  for (std::string& line : out) {
++    const bool blank = base::TrimWhitespaceASCII(line, base::TRIM_ALL).empty();
++    if (blank && (tidy.empty() ||
++                  base::TrimWhitespaceASCII(tidy.back(), base::TRIM_ALL)
++                      .empty())) {
++      continue;
++    }
++    tidy.push_back(std::move(line));
++  }
++  while (!tidy.empty() &&
++         base::TrimWhitespaceASCII(tidy.back(), base::TRIM_ALL).empty()) {
++    tidy.pop_back();
++  }
++  return tidy.empty() ? std::string() : base::JoinString(tidy, "\n") + "\n";
++}
++
++std::string WithCodexServer(const std::string& toml,
++                            const std::string& program,
++                            bool* changed) {
++  const std::string table = CodexTable(program);
++  bool had = false;
++  const std::string rest = WithoutCodexServer(toml, &had);
++  if (had && toml.find(table) != std::string::npos) {
++    *changed = false;
++    return toml;
++  }
++  *changed = true;
++  return rest.empty() ? table : rest + "\n" + table;
++}
++
++bool AddCodexServer(const base::FilePath& dir,
++                    const std::string& program,
++                    std::string* output) {
++  base::FilePath config = dir.AppendASCII("config.toml");
++  if (!FollowLink(&config, output)) {
++    return false;
++  }
++  const bool existed = base::PathExists(config);
++  std::string text;
++  if (existed && !base::ReadFileToString(config, &text)) {
++    *output = "couldn’t read " + config.AsUTF8Unsafe();
++    return false;
++  }
++  bool changed = false;
++  const std::string next = WithCodexServer(text, program, &changed);
++  if (!changed) {
++    *output = "already connected";
++    return true;
++  }
++  return WriteConfig(config, existed, next, output);
++}
++
++bool RemoveCodexServer(const base::FilePath& dir, std::string* output) {
++  base::FilePath config = dir.AppendASCII("config.toml");
++  if (!FollowLink(&config, output)) {
++    return false;
++  }
++  std::string text;
++  if (!base::PathExists(config)) {
++    *output = "not connected";
++    return true;
++  }
++  if (!base::ReadFileToString(config, &text)) {
++    *output = "couldn’t read " + config.AsUTF8Unsafe();
++    return false;
++  }
++  bool removed = false;
++  const std::string next = WithoutCodexServer(text, &removed);
++  if (!removed) {
++    *output = "not connected";
++    return true;
++  }
++  return WriteConfig(config, true, next, output);
++}
++
+ bool AddAgentServer(const std::string& id,
+                     const base::FilePath& dir,
+                     const std::string& program,
+@@ -1078,19 +1298,42 @@ std::vector<AgentCli> DetectAgentClis() {
+   auto file = [&](const char* id) {
+     return DetectFileAgent(*FindFileAgent(id), path, xdg_home);
+   };
+-  return {cli("claude"),
+-          cli("codex"),
+-          desktop,
+-          file("opencode"),
+-          file("cursor"),
+-          cli("vscode"),
+-          file("windsurf"),
+-          cli("copilot"),
+-          cli("gemini"),
+-          cli("qwen"),
+-          file("goose"),
+-          file("amp"),
+-          file("droid")};
++  // Codex: the CLI, its VS Code extension and its app share config.toml,
++  // which Connect writes itself (no `codex` needed).
++  AgentCli codex = cli("codex");
++  const base::FilePath codex_dir = CodexDir({});
++  codex.command = CodexTable(Program());
++  codex.file = codex_dir.empty()
++                   ? "~/.codex/config.toml"
++                   : DisplayPath(codex_dir.AppendASCII("config.toml"));
++  if (codex.path.empty()) {
++    if (std::string ext = VsCodeExtension("openai.chatgpt"); !ext.empty()) {
++      codex.path = ext;
++      codex.name = "Codex (VS Code extension)";
++      codex.via = "the Codex extension in VS Code";
++    } else if (std::string app = App("Codex.app"); !app.empty()) {
++      codex.path = app;
++      codex.name = "Codex (app)";
++      codex.via = "the Codex app";
++    }
++  }
++  std::vector<AgentCli> out = {cli("claude"),
++                               std::move(codex),
++                               desktop,
++                               file("opencode"),
++                               file("cursor"),
++                               file("vscode"),
++                               file("windsurf"),
++                               file("copilot"),
++                               cli("gemini"),
++                               cli("qwen"),
++                               file("goose"),
++                               file("amp"),
++                               file("droid")};
++#if BUILDFLAG(IS_WIN)
++  out.push_back(file("visualstudio"));
++#endif
++  return out;
+ }
+ 
+ // Meridian started from a disk image or from a copy macOS made to run a
+@@ -1120,6 +1363,9 @@ bool ConnectAgentCli(const std::string& id, std::string* output) {
+   if (id == kDesktopId) {
+     return ConnectDesktop(output);
+   }
++  if (id == "codex") {
++    return ConnectAgentCliAs(id, {}, output);
++  }
+   if (const FileAgent* agent = FindFileAgent(id)) {
+     if (TestWithoutConfig(*agent)) {
+       *output = "no test config";
+@@ -1171,6 +1417,16 @@ bool ConnectAgentCliAs(const std::string& id,
+     *output = unstable;
+     return false;
+   }
++  // Written straight into the account's own file: no CLI needed.
++  if (id == "codex" || id == "copilot") {
++    const base::FilePath dir = id == "codex" ? CodexDir(env) : CopilotDir(env);
++    if (dir.empty()) {
++      *output = "no test config";
++      return false;
++    }
++    return id == "codex" ? AddCodexServer(dir, Program(), output)
++                         : AddAgentServer(id, dir, Program(), output);
++  }
+   const Known* cli = FindKnown(id);
+   if (!cli) {
+     *output = "unknown agent";
+@@ -1227,6 +1483,21 @@ bool DisconnectAgentCli(const std::string& id,
+     }
+     return RemoveJsonEntry(DesktopConfig(), "mcpServers", output);
+   }
++  if (id == "codex" || id == "copilot") {
++    const base::FilePath dir = id == "codex" ? CodexDir(env) : CopilotDir(env);
++    if (dir.empty()) {
++      *output = "no test config";
++      return false;
++    }
++    if (id == "codex") {
++      return RemoveCodexServer(dir, output);
++    }
++    base::FilePath file = dir.AppendASCII("mcp-config.json");
++    if (!FollowLink(&file, output)) {
++      return false;
++    }
++    return RemoveJsonEntry(file, "mcpServers", output);
++  }
+   if (const FileAgent* agent = FindFileAgent(id)) {
+     if (TestWithoutConfig(*agent) || id == "goose") {
+       *output = id == "goose" ? "Take meridian out of Goose’s extensions "
+@@ -1247,7 +1518,7 @@ bool DisconnectAgentCli(const std::string& id,
+     return RemoveJsonEntry(file, EntryFor(id, Program()).key, output);
+   }
+   const Known* cli = FindKnown(id);
+-  if (!cli || id == "vscode" || id == "copilot") {
++  if (!cli) {
+     *output = "Meridian can’t take itself out of this one; remove "
+               "\"meridian\" from its MCP servers there.";
+     return false;
+diff --git a/chrome/browser/meridian/agent/agent_cli.h b/chrome/browser/meridian/agent/agent_cli.h
+index 68dcb058f9..07ed749c7f 100644
+--- a/chrome/browser/meridian/agent/agent_cli.h
++++ b/chrome/browser/meridian/agent/agent_cli.h
+@@ -15,8 +15,11 @@ namespace meridian {
+ 
+ // "Connect Claude Code / Codex / Cursor / …": registers Meridian's MCP server
+ // (`Meridian --mcp-bridge`) with a coding agent, for the person (user level).
+-// Agents with an "mcp add" command get it run; the others get "meridian"
+-// added to their config file. CLIs are found on the login shell's PATH (apps
++// Claude Code, Gemini CLI and Qwen get their "mcp add" run; every other agent
++// gets "meridian" written into its config file (kept merged, backed up), so
++// an editor extension without its CLI connects too: VS Code's Copilot (its
++// profile's mcp.json), Codex in any form (config.toml), Copilot's portable
++// mcp-config.json, Visual Studio's ~/.mcp.json (Windows). CLIs are found on the login shell's PATH (apps
+ // started from the Dock don't inherit it); the person sees the exact command
+ // or entry first. Both functions block (they run processes).
+ struct AgentCli {
+@@ -30,6 +33,10 @@ struct AgentCli {
+   std::string state;
+   // Meridian can take its entry out again (Disconnect).
+   bool can_disconnect = false;
++  // Found by an app or an editor extension rather than its CLI ("the Codex
++  // extension in VS Code"): it gets the browser tools, but Meridian's own
++  // Ask and Improve with AI can't run it.
++  std::string via;
+ };
+ 
+ std::vector<AgentCli> DetectAgentClis();
+@@ -71,6 +78,34 @@ inline constexpr char kGooseConfigSwitch[] = "meridian-goose-config";
+ inline constexpr char kAmpConfigSwitch[] = "meridian-amp-config";
+ // Factory Droid: "mcpServers" of ~/.factory/mcp.json.
+ inline constexpr char kDroidConfigSwitch[] = "meridian-droid-config";
++// VS Code (Copilot's agent mode): "servers" of the profile's mcp.json, in
++// ~/Library/Application Support/Code/User (macOS), %APPDATA%\Code\User
++// (Windows), ~/.config/Code/User (Linux).
++inline constexpr char kVsCodeConfigSwitch[] = "meridian-vscode-config";
++// VS Code's extensions folder (~/.vscode/extensions): GitHub Copilot
++// (github.copilot*) and Codex (openai.chatgpt*) are found there.
++inline constexpr char kVsCodeExtensionsSwitch[] = "meridian-vscode-extensions";
++// GitHub Copilot's portable user file: "mcpServers" of mcp-config.json in
++// $COPILOT_HOME, else ~/.copilot (Copilot CLI and the tools that share it).
++inline constexpr char kCopilotConfigSwitch[] = "meridian-copilot-config";
++// Visual Studio 2022 17.14+ (Windows): "servers" of %USERPROFILE%\.mcp.json.
++inline constexpr char kVisualStudioConfigSwitch[] =
++    "meridian-visualstudio-config";
++
++// Codex's config.toml with Meridian as [mcp_servers.meridian] (command,
++// args = ["--mcp-bridge"]), every other line kept; `changed` false when it
++// was already that. Without: the table (and its subtables) taken out.
++std::string WithCodexServer(const std::string& toml,
++                            const std::string& program,
++                            bool* changed);
++std::string WithoutCodexServer(const std::string& toml, bool* removed);
++
++// Writes / takes Meridian out of `dir`/config.toml (a Codex home), keeping
++// the first old file as config.toml.meridian-backup.
++bool AddCodexServer(const base::FilePath& dir,
++                    const std::string& program,
++                    std::string* output);
++bool RemoveCodexServer(const base::FilePath& dir, std::string* output);
+ 
+ // Adds `program --mcp-bridge` as "meridian" to the config file of agent `id`
+ // (one of the file agents above) in its config folder `dir`, creating both if
+@@ -105,7 +140,8 @@ bool AgentConnectedForAccount(const std::string& vendor_id,
+ 
+ // Connects / disconnects agent `id` for one account: its "mcp add" / "mcp
+ // remove" run with `env` (ai::AccountEnv: the account's variable, or taken
+-// away for the default folder).
++// away for the default folder); Codex and Copilot: the file in the folder
++// `env` names.
+ bool ConnectAgentCliAs(const std::string& id,
+                        const std::map<std::string, std::string>& env,
+                        std::string* output);
+diff --git a/chrome/browser/meridian/agent/agent_cli_unittest.cc b/chrome/browser/meridian/agent/agent_cli_unittest.cc
+index 24aa1d552f..3551f76dcf 100644
+--- a/chrome/browser/meridian/agent/agent_cli_unittest.cc
++++ b/chrome/browser/meridian/agent/agent_cli_unittest.cc
+@@ -202,6 +202,108 @@ TEST_F(AgentConfigTest, CursorAndWindsurfUseMcpServers) {
+   }
+ }
+ 
++// VS Code (Copilot's agent mode) and Visual Studio: "servers", a stdio
++// entry; everything else in the file stays, the old file kept.
++TEST_F(AgentConfigTest, VsCodeAndVisualStudioUseServers) {
++  for (const char* id : {"vscode", "visualstudio"}) {
++    const char* name =
++        std::string_view(id) == "vscode" ? "mcp.json" : ".mcp.json";
++    base::CreateDirectory(dir_);
++    ASSERT_TRUE(base::WriteFile(
++        file(name),
++        R"({"servers": {"github": {"type": "http", "url": "https://x"}},)"
++        R"( "inputs": [{"id": "token"}]})"));
++    std::string output;
++    ASSERT_TRUE(AddAgentServer(id, dir_, kProgram, &output)) << output;
++    base::DictValue root = ReadConfig(file(name));
++    const base::DictValue* server = root.FindDictByDottedPath("servers.meridian");
++    ExpectCommandArgs(server);
++    EXPECT_EQ(*server->FindString("type"), "stdio");
++    EXPECT_TRUE(root.FindDictByDottedPath("servers.github"));
++    EXPECT_TRUE(root.FindList("inputs"));
++    EXPECT_TRUE(base::PathExists(dir_.AppendASCII(std::string(name) +
++                                                  ".meridian-backup")));
++    ASSERT_TRUE(AddAgentServer(id, dir_, kProgram, &output));
++    EXPECT_EQ(output, "already connected");
++    base::DeleteFile(file(name));
++    base::DeleteFile(dir_.AppendASCII(std::string(name) + ".meridian-backup"));
++  }
++}
++
++// Copilot's portable mcp-config.json: a local server with all its tools.
++TEST_F(AgentConfigTest, CopilotIsALocalServerWithItsTools) {
++  std::string output;
++  ASSERT_TRUE(AddAgentServer("copilot", dir_, kProgram, &output)) << output;
++  base::DictValue root = ReadConfig(file("mcp-config.json"));
++  const base::DictValue* server =
++      root.FindDictByDottedPath("mcpServers.meridian");
++  ExpectCommandArgs(server);
++  EXPECT_EQ(*server->FindString("type"), "local");
++  ASSERT_TRUE(server->FindList("tools"));
++  EXPECT_EQ((*server->FindList("tools"))[0].GetString(), "*");
++}
++
++// Codex's config.toml: Meridian's table added, replaced or taken out; every
++// other line (comments, other servers, their subtables) as it was.
++TEST(CodexTomlTest, AddsReplacesAndRemovesOnlyItsTable) {
++  const std::string before =
++      "# my settings\n"
++      "model = \"gpt-5\"\n"
++      "\n"
++      "[mcp_servers.files]\n"
++      "command = \"npx\"\n"
++      "args = [\n"
++      "  \"-y\",\n"
++      "  \"files\",\n"
++      "]\n";
++  bool changed = false;
++  std::string with = WithCodexServer(before, kProgram, &changed);
++  EXPECT_TRUE(changed);
++  EXPECT_EQ(with, before + "\n[mcp_servers.meridian]\ncommand = \"" +
++                      std::string(kProgram) +
++                      "\"\nargs = [\"--mcp-bridge\"]\n");
++  // Again: nothing to do.
++  EXPECT_EQ(WithCodexServer(with, kProgram, &changed), with);
++  EXPECT_FALSE(changed);
++  // An old entry (another path, an env subtable) is replaced, the rest stays.
++  const std::string old = before +
++                          "\n[mcp_servers.\"meridian\"]\n"
++                          "command = \"/Volumes/Meridian/Meridian\"\n"
++                          "[mcp_servers.meridian.env]\nX = \"1\"\n"
++                          "\n[profiles.work]\nmodel = \"o3\"\n";
++  std::string replaced = WithCodexServer(old, kProgram, &changed);
++  EXPECT_TRUE(changed);
++  EXPECT_EQ(replaced.find("/Volumes/"), std::string::npos);
++  EXPECT_EQ(replaced.find("X = \"1\""), std::string::npos);
++  EXPECT_NE(replaced.find("[profiles.work]\nmodel = \"o3\"\n"),
++            std::string::npos);
++  EXPECT_NE(replaced.find("[mcp_servers.files]"), std::string::npos);
++  // Taken out: exactly what was there before.
++  bool removed = false;
++  EXPECT_EQ(WithoutCodexServer(with, &removed), before);
++  EXPECT_TRUE(removed);
++  EXPECT_EQ(WithoutCodexServer(before, &removed), before);
++  EXPECT_FALSE(removed);
++  // A new file is just the table.
++  EXPECT_EQ(WithCodexServer("", kProgram, &changed),
++            "[mcp_servers.meridian]\ncommand = \"" + std::string(kProgram) +
++                "\"\nargs = [\"--mcp-bridge\"]\n");
++}
++
++TEST_F(AgentConfigTest, CodexFileWrittenWithABackup) {
++  base::CreateDirectory(dir_);
++  ASSERT_TRUE(base::WriteFile(file("config.toml"), "model = \"gpt-5\"\n"));
++  std::string output;
++  ASSERT_TRUE(AddCodexServer(dir_, kProgram, &output)) << output;
++  EXPECT_NE(Read("config.toml").find("[mcp_servers.meridian]"),
++            std::string::npos);
++  EXPECT_EQ(Read("config.toml.meridian-backup"), "model = \"gpt-5\"\n");
++  ASSERT_TRUE(AddCodexServer(dir_, kProgram, &output));
++  EXPECT_EQ(output, "already connected");
++  ASSERT_TRUE(RemoveCodexServer(dir_, &output)) << output;
++  EXPECT_EQ(Read("config.toml"), "model = \"gpt-5\"\n");
++}
++
+ TEST_F(AgentConfigTest, CursorKeepsOtherServersAndKeys) {
+   ASSERT_TRUE(base::CreateDirectory(dir_));
+   const std::string before =
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 8d119b0eea..35fb19e7be 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -544,6 +544,10 @@ struct AgentCli {
+   // "not-connected" or "" (can't tell).
+   string state;
+   bool can_disconnect;
++  // Found by an app or an editor extension, not its CLI ("the Codex
++  // extension in VS Code"), else "": it gets the browser tools, but Ask and
++  // Improve with AI can't run it.
++  string via;
+ };
+ 
+ // A starting setup for the welcome tour (setup_profile.h).
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index ea202820bb..ddc75c991e 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -1560,6 +1560,7 @@ void SidebarHandler::GetAgentClis(GetAgentClisCallback callback) {
+               m->file = cli.file;
+               m->state = cli.state;
+               m->can_disconnect = cli.can_disconnect;
++              m->via = cli.via;
+               out.push_back(std::move(m));
+             }
+             std::move(callback).Run(std::move(out));
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.html.ts b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+index 3b22e02f57..07ca1191c7 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.html.ts
+@@ -579,7 +579,7 @@ export function getHtml(this: MeridianSettingsElement) {
+                     Rename</button>
+                   <button role="menuitem" data-vendor="${c.vendor}"
+                       data-id="${c.id}" data-action="signin"
+-                      @click="${this.onSignInAccountClick_}">Sign in again</button>
++                      @click="${this.onSignInAccountClick_}">Sign in</button>
+                   ${!c.isDefault ? html`
+                     <button role="menuitem" class="danger" data-vendor="${c.vendor}"
+                         data-id="${c.id}" @click="${this.onRemoveAccountClick_}">
+@@ -963,6 +963,12 @@ export function getHtml(this: MeridianSettingsElement) {
+                               html`${icon('check', 11)} ` : ''}${cli.status}</span>` :
+                           ''}</div>
+                     <div class="row-desc connect-desc">${cli.desc}</div>
++                    ${cli.needsCli ? html`
++                      <div class="row-desc connect-needs-cli">To use Ask and
++                        Improve with AI, install Claude Code.
++                        <button class="btn small" data-id="${cli.id}"
++                            @click="${this.onInstallClaudeCodeClick_}">
++                          Install Claude Code</button></div>` : ''}
+                     <details class="connect-details">
+                       <summary>Details</summary>
+                       <div class="row-desc mono">${cli.details}</div>
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 1917a0950a..22feb73925 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -176,6 +176,9 @@ export interface ConnectRow {
+   // Claude Code / Codex: each account's own state.
+   accounts: {id: string, label: string, connected: boolean}[];
+   menu: boolean;
++  // Found only as an app or an editor extension: Ask and Improve with AI
++  // need a CLI ("To use Ask and Improve with AI, install Claude Code").
++  needsCli: boolean;
+ }
+ // A vendor's subscriptions under its row in "Your AI".
+ export interface AccountGroup {
+@@ -1224,6 +1227,9 @@ export class MeridianSettingsElement extends CrLitElement {
+     let desc = c.id === 'claude-desktop' ?
+         'Claude Desktop can see and use your tabs.' :
+         `${c.name} can see and use your tabs while it works.`;
++    if (c.via) {
++      desc = `Through ${c.via}: it can see and use your tabs while it works.`;
++    }
+     if (perAccount.length) {
+       const on = perAccount.filter(a => a.connected).map(a => a.label);
+       const off = perAccount.filter(a => !a.connected).map(a => a.label);
+@@ -1246,9 +1252,24 @@ export class MeridianSettingsElement extends CrLitElement {
+       details: c.file || c.command,
+       accounts: perAccount,
+       menu: this.connectMenu_ === c.id,
++      needsCli: !!c.via && c.found && !this.providers_.some(
++          p => p.id === 'claude-code' && p.installed),
+     };
+   }
+ 
++  // Only an editor extension or an app here: Meridian's own Ask and Improve
++  // with AI run Claude Code, offered the way "More AI tools" offers it.
++  protected onInstallClaudeCodeClick_() {
++    const p = this.providers_.find(x => x.id === 'claude-code');
++    if (p?.installCommand) {
++      this.setup_ = {id: p.id, what: 'install', label: p.label,
++                     command: p.installCommand};
++    } else if (p) {
++      this.fire('meridian-open-url', p.docs);
++      this.hide();
++    }
++  }
++
+   protected onConnectMenuClick_(e: Event) {
+     const id = (e.currentTarget as HTMLElement).dataset['id'] || '';
+     this.connectMenu_ = this.connectMenu_ === id ? '' : id;
+-- 
+2.36.1
+
