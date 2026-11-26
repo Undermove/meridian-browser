@@ -153,4 +153,34 @@ if os.path.exists(studio):
         return once(t, '    info.Set("enabled", on);\n',
                     '    info.Set("enabled", on);\n    if (IsBeta()) {\n      info.Set("beta", true);\n    }\n')
     edit('chrome/browser/meridian/workbench/studio.cc', st)
+
+# The browser's WebUI (sidebar, Boost editor…) learns it is the beta: loadTimeData 'meridianBeta'.
+def webui(t):
+    t = add_include(t, 'chrome/browser/meridian/beta.h')
+    return once(t, '  source->AddInteger("tabStripInset",',
+                '  source->AddBoolean("meridianBeta", meridian::IsBeta());\n'
+                '  source->AddInteger("tabStripInset",')
+edit('chrome/browser/ui/webui_browser/webui_browser_ui.cc', webui)
+
+# Remix (when it is in the tree): on in the beta unless turned off.
+remix = os.path.join(SRC, 'chrome/browser/resources/webui_browser/meridian/remix.ts')
+if os.path.exists(remix):
+    def rx(t):
+        t = once(t, "const FLAG_KEY = 'meridian.remix';\n",
+                 "const FLAG_KEY = 'meridian.remix';\n")
+        t = re.sub(r'^(// Copyright[^\n]*\n(?://[^\n]*\n)*)', r"\1\nimport {loadTimeData} from '//resources/js/load_time_data.js';\n", t, count=1)
+        return once(t, '  return DEFAULT_ON;\n}',
+                    "  // Meridian Beta: on unless turned off.\n"
+                    "  return DEFAULT_ON ||\n"
+                    "      (loadTimeData.valueExists('meridianBeta') &&\n"
+                    "       loadTimeData.getBoolean('meridianBeta'));\n}")
+    edit('chrome/browser/resources/webui_browser/meridian/remix.ts', rx)
+
+# Designer toolkit (when it is in the tree): on in the beta.
+tk = os.path.join(M, 'toolkit/toolkit_tab_helper.cc')
+if os.path.exists(tk):
+    def tkf(t):
+        t = add_include(t, 'chrome/browser/meridian/beta.h')
+        return guard_body(t, 'bool Enabled(Profile* profile', '  if (IsBeta()) {\n    return true;\n  }\n')
+    edit('chrome/browser/meridian/toolkit/toolkit_tab_helper.cc', tkf)
 print('glue applied')
