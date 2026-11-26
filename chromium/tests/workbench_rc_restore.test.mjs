@@ -41,9 +41,14 @@ def say_rc():
 status()
 print('READY ' + sid, flush=True)
 if rc: say_rc()
+# Claude Code's footer, as a session started with Remote Control on shows it (no long line).
+if os.path.exists('footer.txt'): print(open('footer.txt').read().rstrip('\\n'), flush=True)
 for line in sys.stdin:
   line = line.strip()
   open('typed.log', 'a').write(line + '\\n')
+  if line.startswith('say '):
+    print(line[4:], flush=True)
+    continue
   if line == '/remote-control':
     rc = not rc
     say_rc()
@@ -78,7 +83,7 @@ async function setup() {
   const runs = () => fs.readFileSync(path.join(project, 'argv.log'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
   const typed = () => { try { return fs.readFileSync(path.join(project, 'typed.log'), 'utf8'); } catch { return ''; } };
   const done = async () => { wb.close(); await b.close(); for (const d of [project, bin]) fs.rmSync(d, { recursive: true, force: true }); };
-  return { wb, runs, typed, done };
+  return { wb, project, runs, typed, done };
 }
 
 const tab = `document.querySelector('#term-tab-list .ttab.active')`;
@@ -115,6 +120,34 @@ test('Remote Control shows on the tab and is switched on and off from the tab\'s
     // What Claude Code prints wins over a stale line (here, after the hold: still off).
     await sleep(500);
     assert.equal(await wb.eval(`S.activeTerm.rc`), 'off');
+  } finally { await done(); }
+});
+
+// Claude Code 2.1.332 keeps a badge in its footer while Remote Control is on ("/rc active",
+// "/rc connecting…", …); a session started with it on may never print "/remote-control is active".
+test('the RC mark follows Claude Code\'s /rc footer badge, from the start', { skip: process.platform === 'win32' && 'the stand-in is a POSIX script' }, async () => {
+  const { wb, project, done } = await setup();
+  try {
+    fs.writeFileSync(path.join(project, 'footer.txt'), '  ? for shortcuts                                    /rc active\n');
+    await wb.eval(`launch('claude').then((t) => !!t)`);
+    // Nothing toggled: the footer alone lights it up.
+    await wb.waitFor(`S.activeTerm?.sessionId === 's1' && !!${tab}?.querySelector('.tab-rc.on') && S.activeTerm.remote === true`, 15000);
+    const cls = (state) => ({ on: 'tab-rc on', pending: 'tab-rc pending', off: 'tab-rc off' })[state];
+    const steps = [
+      ['/rc reconnecting', 'pending', true],
+      ['/rc failed', 'off', false],
+      ['New /remote-control session is active', 'on', true],
+      ['/remote-control is no longer active', 'off', false],
+      ['/rc connecting\u2026', 'pending', true],
+      ['Remote Control not started here', 'off', false],
+      ['/rc active', 'on', true],
+      ['Remote Control disabled after repeated failures \u00b7 restart to retry', 'off', false],
+    ];
+    for (const [text, state, remote] of steps) {
+      await wb.eval(`(() => { wb.ptyWrite(S.activeTerm.id, ${JSON.stringify('say ' + text)}); setTimeout(() => wb.ptyWrite(S.activeTerm.id, '\\r'), 100); return true; })()`);
+      await wb.waitFor(`${tab}?.querySelector('.tab-rc')?.className === ${JSON.stringify(cls(state))} && S.activeTerm.remote === ${remote}`, 10000)
+        .catch(async (e) => { throw new Error(`"${text}" should be ${state}: ${await wb.eval(`${tab}?.querySelector('.tab-rc')?.className + ' remote=' + S.activeTerm.remote`)} (${e.message})`); });
+    }
   } finally { await done(); }
 });
 
