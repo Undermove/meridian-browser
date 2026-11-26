@@ -1,0 +1,369 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Meridian <meridian@localhost>
+Date: Thu, 26 Nov 2026 14:50:19 +0400
+Subject: [PATCH] Meridian: Windows: npm's claude.cmd and codex.cmd are found
+ and run, and an account's variables reach the CLI
+
+Claude Code and Codex installed with npm on Windows are claude.cmd and
+codex.cmd in %APPDATA%\npm (no .exe): Meridian looked for .exe only, so
+for many people it found neither. FindProgram now takes name.cmd where
+there is no name.exe, and %APPDATA%\npm is looked in as
+%USERPROFILE%\.local\bin is (not in tests).
+
+A .cmd is a batch file: CreateProcess doesn't start it with arguments of
+its own. WindowsCommandLine() puts it behind cmd.exe /d /s /c the way npm's
+own tools (cross-spawn) do: every argument quoted for the program, then the
+command prompt's special characters behind carets twice (the line is read
+once, and the wrapper's %* reads the arguments again), so & | < > % ! ^ ( )
+and quotes arrive as they were. RunProcess (Ask, Improve, versions) and the
+Workbench's terminals use it; a unit test runs a real .cmd and reads its
+arguments back.
+
+Connect for an account ran the CLI without the account's variables on
+Windows ("macOS and Linux only for now"), so Connect for Work wrote into the
+default account. RunCli now hands Meridian's environment with the account's
+variables (an empty one taken away) to the program itself, no shell, and
+takes its exit code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/meridian/agent/agent_cli.cc    | 20 +++---
+ chrome/browser/meridian/ai/cli_versions.cc    | 21 ++++--
+ chrome/browser/meridian/ai/process_runner.cc  |  8 +++
+ chrome/browser/meridian/ai/process_runner.h   | 14 +++-
+ .../meridian/ai/process_runner_unittest.cc    | 49 ++++++++++++++
+ .../browser/meridian/ai/process_runner_win.cc | 67 ++++++++++++++++---
+ .../meridian/workbench/terminal_win.cc        |  8 +--
+ 7 files changed, 156 insertions(+), 31 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_cli.cc b/chrome/browser/meridian/agent/agent_cli.cc
+index 594c599fd4..08996cdb11 100644
+--- a/chrome/browser/meridian/agent/agent_cli.cc
++++ b/chrome/browser/meridian/agent/agent_cli.cc
+@@ -200,15 +200,17 @@ bool RunCli(const Known& cli,
+       custom_args ? *custom_args : cli.args(Program());
+   int exit_code = -1;
+ #if BUILDFLAG(IS_WIN)
+-  base::CommandLine command(base::FilePath::FromUTF8Unsafe(bin));
+-  for (const std::string& arg : args) {
+-    command.AppendArgNative(base::UTF8ToWide(arg));
+-  }
+-  // (An account's variables: macOS and Linux only for now.)
+-  base::GetAppOutputAndError(command, output);
+-  // (Only the output says how it went there.)
+-  exit_code =
+-      base::ToLowerASCII(*output).find("error") == std::string::npos ? 0 : 1;
++  // Meridian's environment with the account's variables (an empty one taken
++  // away), handed to the program itself: no shell (npm's .cmd wrapper goes
++  // through the command prompt, its arguments escaped: WindowsCommandLine).
++  std::map<std::string, std::string> run_env = ai::LoginEnvironment();
++  ai::ApplyAccountEnv(env, run_env);
++  std::vector<std::string> argv = {bin};
++  argv.insert(argv.end(), args.begin(), args.end());
++  auto home = run_env.find("USERPROFILE");
++  *output = ai::CaptureOutput(
++      argv, run_env, home != run_env.end() ? home->second : std::string(),
++      base::Seconds(30), &exit_code);
+ #else
+   if (TestSwitchesAllowed()) {
+     // A test's stand-in runs in the tests' own minimal environment, never
+diff --git a/chrome/browser/meridian/ai/cli_versions.cc b/chrome/browser/meridian/ai/cli_versions.cc
+index 043349e71e..ab68ace7ff 100644
+--- a/chrome/browser/meridian/ai/cli_versions.cc
++++ b/chrome/browser/meridian/ai/cli_versions.cc
+@@ -7,6 +7,7 @@
+ #include <algorithm>
+ #include <set>
+ 
++#include "base/environment.h"
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
+ #include "base/no_destructor.h"
+@@ -35,13 +36,21 @@ std::vector<std::string> Folders(const std::string& search_path,
+       base::SplitString(search_path, kSeparator, base::TRIM_WHITESPACE,
+                         base::SPLIT_WANT_NONEMPTY);
+ #if BUILDFLAG(IS_WIN)
+-  // Where Claude Code's own installer puts it on Windows, which a Meridian
+-  // started before that installer added it to the PATH doesn't see yet. (npm's
+-  // claude.cmd isn't a program Meridian runs: .exe only.)
++  // Where Claude Code's own installer puts it on Windows, and npm's global
++  // folder (its claude.cmd, codex.cmd), which a Meridian started before they
++  // reached the PATH doesn't see yet.
+   if (!TestSwitchesAllowed()) {
+-    auto profile = env.find("USERPROFILE");
+-    if (profile != env.end() && !profile->second.empty()) {
+-      out.push_back(profile->second + "\\.local\\bin");
++    auto var = [&env](const std::string& name) {
++      auto it = env.find(name);
++      return it != env.end() && !it->second.empty()
++                 ? it->second
++                 : base::Environment::Create()->GetVar(name).value_or("");
++    };
++    if (const std::string profile = var("USERPROFILE"); !profile.empty()) {
++      out.push_back(profile + "\\.local\\bin");
++    }
++    if (const std::string roaming = var("APPDATA"); !roaming.empty()) {
++      out.push_back(roaming + "\\npm");
+     }
+   }
+ #else
+diff --git a/chrome/browser/meridian/ai/process_runner.cc b/chrome/browser/meridian/ai/process_runner.cc
+index 731061b31d..eda157a9bb 100644
+--- a/chrome/browser/meridian/ai/process_runner.cc
++++ b/chrome/browser/meridian/ai/process_runner.cc
+@@ -280,6 +280,14 @@ std::string FindProgram(const std::string& name,
+     base::FilePath candidate =
+         base::FilePath::FromUTF8Unsafe(dir).AppendUTF8(file);
+ #if BUILDFLAG(IS_WIN)
++    // npm's wrapper (claude.cmd, codex.cmd) where there is no .exe.
++    if (file != name && !base::PathExists(candidate)) {
++      base::FilePath wrapper =
++          base::FilePath::FromUTF8Unsafe(dir).AppendUTF8(name + ".cmd");
++      if (base::PathExists(wrapper)) {
++        candidate = wrapper;
++      }
++    }
+     if (base::PathExists(candidate) && !base::DirectoryExists(candidate)) {
+ #else
+     if (!base::DirectoryExists(candidate) &&
+diff --git a/chrome/browser/meridian/ai/process_runner.h b/chrome/browser/meridian/ai/process_runner.h
+index 418f47b5dc..c9a5041a51 100644
+--- a/chrome/browser/meridian/ai/process_runner.h
++++ b/chrome/browser/meridian/ai/process_runner.h
+@@ -15,6 +15,7 @@
+ #include "base/functional/callback.h"
+ #include "base/memory/ref_counted.h"
+ #include "base/time/time.h"
++#include "build/build_config.h"
+ 
+ namespace meridian::ai {
+ 
+@@ -72,11 +73,20 @@ std::string CaptureOutput(const std::vector<std::string>& argv,
+                           int* exit_code = nullptr);
+ 
+ // `name` in the folders of `search_path` (the PATH variable as this system
+-// writes it); empty when it isn't there. On Windows that is "name.exe": the
+-// kind of program RunProcess() starts (a .cmd wrapper needs a shell).
++// writes it); empty when it isn't there. On Windows that is "name.exe", else
++// "name.cmd" in the same folder (npm's wrapper: RunProcess() starts it
++// through the command prompt).
+ std::string FindProgram(const std::string& name,
+                         const std::string& search_path);
+ 
++#if BUILDFLAG(IS_WIN)
++// The command line that starts `argv` on Windows: each argument as
++// CommandLineToArgvW reads it back; a .cmd or .bat (npm's claude.cmd,
++// codex.cmd) through cmd.exe /d /s /c, with the command prompt's special
++// characters escaped so an argument arrives as it was.
++std::wstring WindowsCommandLine(const std::vector<std::string>& argv);
++#endif
++
+ // Where a CLI agent answering about a page may neither read nor write, under
+ // `home`: credentials (~/.ssh, ~/.aws, ~/.config/gh, ~/.netrc…), the
+ // keychains and other browsers' profiles. The caller adds Meridian's own
+diff --git a/chrome/browser/meridian/ai/process_runner_unittest.cc b/chrome/browser/meridian/ai/process_runner_unittest.cc
+index f5d73182fd..95981eccda 100644
+--- a/chrome/browser/meridian/ai/process_runner_unittest.cc
++++ b/chrome/browser/meridian/ai/process_runner_unittest.cc
+@@ -4,15 +4,23 @@
+ 
+ #include "chrome/browser/meridian/ai/process_runner.h"
+ 
++#include "base/compiler_specific.h"
+ #include "base/environment.h"
+ #include "base/files/file_util.h"
+ #include "base/files/scoped_temp_dir.h"
+ #include "base/functional/bind.h"
+ #include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
+ #include "base/test/task_environment.h"
+ #include "build/build_config.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
++#if BUILDFLAG(IS_WIN)
++#include <windows.h>
++
++#include <shellapi.h>
++#endif
++
+ namespace meridian::ai {
+ namespace {
+ 
+@@ -83,6 +91,47 @@ TEST_F(ProcessRunnerTest, FeedsStdinAndReadsStdout) {
+   EXPECT_EQ(out.size(), 300000u);
+ }
+ 
++#if BUILDFLAG(IS_WIN)
++// npm's claude.cmd: found where there is no claude.exe, and run through the
++// command prompt with every argument arriving as it was: the wrapper's %*
++// line (what it hands its program) reads back to the same arguments.
++TEST_F(ProcessRunnerTest, NpmCmdWrapperFoundAndItsArgumentsArriveAsTheyWere) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  base::FilePath folder = dir.GetPath().AppendASCII("npm folder");
++  ASSERT_TRUE(base::CreateDirectory(folder));
++  ASSERT_TRUE(base::WriteFile(folder.AppendASCII("claude.cmd"),
++                              "@echo off\r\necho(%*\r\n"));
++  const std::string found = FindProgram("claude", folder.AsUTF8Unsafe());
++  EXPECT_EQ(found, folder.AppendASCII("claude.cmd").AsUTF8Unsafe());
++  const std::vector<std::string> args = {
++      "plain", "two words", "a&b|c<d>e", "100%", "^caret", "quote\"in",
++      "x!y",   "(paren)",   "semi;comma,", "%PATH%", "trailing\\"};
++  ProcessSpec spec;
++  spec.argv = {found};
++  spec.argv.insert(spec.argv.end(), args.begin(), args.end());
++  spec.env = {{"SystemRoot", base::Environment::Create()
++                                 ->GetVar("SystemRoot")
++                                 .value_or("C:\\Windows")}};
++  std::string out;
++  ProcessResult result = Run(spec, &out);
++  ASSERT_TRUE(result.started);
++  EXPECT_EQ(result.exit_code, 0);
++  base::TrimWhitespaceASCII(out, base::TRIM_ALL, &out);
++  int count = 0;
++  LPWSTR* parsed = ::CommandLineToArgvW(
++      base::UTF8ToWide("program " + out).c_str(), &count);
++  ASSERT_TRUE(parsed);
++  std::vector<std::string> back;
++  for (int i = 1; i < count; ++i) {
++    // SAFETY: CommandLineToArgvW returns `count` strings.
++    back.push_back(base::WideToUTF8(UNSAFE_BUFFERS(parsed[i])));
++  }
++  ::LocalFree(parsed);
++  EXPECT_EQ(back, args) << out;
++}
++#endif
++
+ TEST_F(ProcessRunnerTest, KeepsStderrAndTheExitCode) {
+   ProcessSpec spec;
+ #if BUILDFLAG(IS_WIN)
+diff --git a/chrome/browser/meridian/ai/process_runner_win.cc b/chrome/browser/meridian/ai/process_runner_win.cc
+index 157e276d70..f66f022987 100644
+--- a/chrome/browser/meridian/ai/process_runner_win.cc
++++ b/chrome/browser/meridian/ai/process_runner_win.cc
+@@ -16,6 +16,7 @@
+ #include "base/files/file_path.h"
+ #include "base/process/launch.h"
+ #include "base/process/process.h"
++#include "base/strings/string_util.h"
+ #include "base/strings/string_view_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/threading/platform_thread.h"
+@@ -54,8 +55,9 @@ bool MakePipe(bool child_reads,
+ // One argument as CommandLineToArgvW (and so the C runtime) reads it back.
+ // base::CommandLine leaves an empty argument out (`--tools ""` arrived as
+ // `--tools --permission-mode`), so the line is put together here.
+-std::wstring Quoted(const std::wstring& arg) {
+-  if (!arg.empty() && arg.find_first_of(L" \t\n\v\"") == std::wstring::npos) {
++std::wstring Quoted(const std::wstring& arg, bool always = false) {
++  if (!always && !arg.empty() &&
++      arg.find_first_of(L" \t\n\v\"") == std::wstring::npos) {
+     return arg;
+   }
+   std::wstring out(1, L'"');
+@@ -76,8 +78,61 @@ std::wstring Quoted(const std::wstring& arg) {
+   return out;
+ }
+ 
++// A batch file (npm's claude.cmd): the command prompt runs it.
++bool IsBatch(const std::string& program) {
++  const std::wstring ext = base::ToLowerASCII(
++      base::FilePath::FromUTF8Unsafe(program).Extension());
++  return ext == L".cmd" || ext == L".bat";
++}
++
++// Every character the command prompt treats specially, behind a caret, so
++// it is read as itself (quotes too: then nothing is a quoted span).
++std::wstring CaretEscaped(const std::wstring& s) {
++  static constexpr std::wstring_view kSpecial = L"()[]%!^\"`<>&|;, *?";
++  std::wstring out;
++  for (wchar_t c : s) {
++    if (kSpecial.find(c) != std::wstring_view::npos) {
++      out.push_back(L'^');
++    }
++    out.push_back(c);
++  }
++  return out;
++}
++
+ }  // namespace
+ 
++std::wstring WindowsCommandLine(const std::vector<std::string>& argv) {
++  std::wstring command;
++  if (argv.empty()) {
++    return command;
++  }
++  if (!IsBatch(argv[0])) {
++    for (const std::string& arg : argv) {
++      if (!command.empty()) {
++        command.push_back(L' ');
++      }
++      command += Quoted(base::UTF8ToWide(arg));
++    }
++    return command;
++  }
++  // As npm's own tools (cross-spawn) do it: cmd.exe reads the line once, and
++  // the wrapper's %* hands the arguments to a second reading, so each
++  // argument is quoted for the program, then escaped twice; the program's
++  // path once.
++  command = CaretEscaped(base::UTF8ToWide(argv[0]));
++  for (size_t i = 1; i < argv.size(); ++i) {
++    const std::wstring arg = base::UTF8ToWide(argv[i]);
++    // Always quoted: then nothing in it is a word break for the wrapper.
++    command += L" " + CaretEscaped(CaretEscaped(Quoted(arg, /*always=*/true)));
++  }
++  wchar_t system[MAX_PATH];
++  const UINT length = ::GetSystemDirectoryW(system, MAX_PATH);
++  std::wstring shell = length && length < MAX_PATH
++                           ? std::wstring(system, length) + L"\\cmd.exe"
++                           : std::wstring(L"cmd.exe");
++  return L"\"" + shell + L"\" /d /s /c \"" + command + L"\"";
++}
++
+ ProcessResult RunProcess(
+     const ProcessSpec& spec,
+     scoped_refptr<CancelFlag> cancel,
+@@ -100,13 +155,7 @@ ProcessResult RunProcess(
+                                     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)) {
+     return result;
+   }
+-  std::wstring command;
+-  for (const std::string& arg : spec.argv) {
+-    if (!command.empty()) {
+-      command.push_back(L' ');
+-    }
+-    command += Quoted(base::UTF8ToWide(arg));
+-  }
++  std::wstring command = WindowsCommandLine(spec.argv);
+   base::LaunchOptions options;
+   options.stdin_handle = in_read.get();
+   options.stdout_handle = out_write.get();
+diff --git a/chrome/browser/meridian/workbench/terminal_win.cc b/chrome/browser/meridian/workbench/terminal_win.cc
+index d01fadc6d2..5d4c878687 100644
+--- a/chrome/browser/meridian/workbench/terminal_win.cc
++++ b/chrome/browser/meridian/workbench/terminal_win.cc
+@@ -23,6 +23,7 @@
+ #include "base/task/thread_pool.h"
+ #include "base/threading/scoped_blocking_call.h"
+ #include "base/win/scoped_handle.h"
++#include "chrome/browser/meridian/ai/process_runner.h"
+ 
+ // The Workbench's terminals on Windows (terminal.cc is the POSIX one): a
+ // pseudoconsole (ConPTY) where POSIX has a pty. The program runs in a job,
+@@ -249,11 +250,8 @@ std::unique_ptr<Terminal> Terminal::Start(const Spec& spec,
+     ::ClosePseudoConsole(console);
+     return nullptr;
+   }
+-  base::CommandLine command(base::FilePath::FromUTF8Unsafe(spec.argv[0]));
+-  for (size_t i = 1; i < spec.argv.size(); ++i) {
+-    command.AppendArgNative(base::UTF8ToWide(spec.argv[i]));
+-  }
+-  std::wstring command_line = command.GetCommandLineString();
++  // (npm's claude.cmd, codex.cmd through the command prompt.)
++  std::wstring command_line = ai::WindowsCommandLine(spec.argv);
+   std::wstring environment = EnvironmentBlock(spec.env);
+   std::wstring cwd = base::UTF8ToWide(spec.cwd);
+   // The folder may be gone: the shell then starts where Meridian is.
+-- 
+2.52.0.windows.1
+
