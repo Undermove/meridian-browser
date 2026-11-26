@@ -8,9 +8,10 @@
  * the terminal then shows just that one's tab. The states come from SessionStatus (session-status.js):
  * hooks only, nothing guessed.
  */
-const CHATS = { on: false, open: true, timer: 0, dom: null };
+const CHATS = { on: false, open: true, timer: 0, dom: null, beta: false };
 
-function chatsEnabled() { return load('chatsList') === '1'; }
+// Meridian Beta: on unless turned off here (wb.studioInfo().beta).
+function chatsEnabled() { const v = load('chatsList'); return v === '1' || (v === null && CHATS.beta === true); }
 
 function chatsSetEnabled(on) {
   store('chatsList', on ? '1' : '');
@@ -209,7 +210,12 @@ function chatsRender() {
   }));
 }
 
-document.addEventListener('DOMContentLoaded', () => { if (chatsEnabled()) chatsStart(); });
+document.addEventListener('DOMContentLoaded', async () => {
+  if (chatsEnabled()) return chatsStart();
+  if (load('chatsList') !== null || typeof wb?.studioInfo !== 'function') return;
+  try { CHATS.beta = (await wb.studioInfo())?.beta === true; } catch { return; }
+  if (chatsEnabled()) chatsStart();
+});
 
 // Studio went out of sight: the list says what is on screen again.
 addEventListener('studio-hidden', () => chatsReport());
