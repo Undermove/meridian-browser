@@ -668,3 +668,26 @@ test('an agent\'s boost shows its code when asked, and its JavaScript has no rea
     await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'boost:undefined')`);
   } finally { mcp.close(); await b.close(); s.close(); fs.rmSync(profile, { recursive: true, force: true }); }
 });
+
+// A Windows contrast theme (forced colours): the pad keeps its rim of hues and its field (the
+// knobs stay on it), and the colour picked paints the page: without that, Windows took the
+// rim and the field away and put its own colours over the page.
+test('under a Windows contrast theme the pad has its rim and field, and the colour picked paints the page', { skip: process.platform !== 'win32' && 'a Windows contrast theme' }, async () => {
+  const s = await site();
+  const b = await launch([s.url], { args: ['--force-high-contrast'] });
+  try {
+    const page = await b.page(s.url);
+    await page.waitFor(`document.readyState === 'complete'`);
+    assert.equal(await page.eval(`matchMedia('(forced-colors: active)').matches`), true, 'forced colours on');
+    const before = await page.eval(`getComputedStyle(document.documentElement).backgroundColor`);
+    await openEditor(b);
+    assert.match(await b.eval(`getComputedStyle(${BE}.getElementById('pad')).backgroundImage`), /conic-gradient/, 'the rim of hues');
+    assert.match(await b.eval(`getComputedStyle(${BE}.querySelector('#pad .field')).backgroundImage`), /radial-gradient/, 'the dotted field');
+    await clickPad(b, 0.8, 0.5);
+    await page.waitFor(`!!document.getElementById('meridian-boost-paint')`, 5000);
+    // The knob where it was clicked, on the field.
+    await b.waitFor(`(() => { const f = ${BE}.querySelector('#pad .field').getBoundingClientRect(), r = ${BE}.getElementById('knob').getBoundingClientRect(); return Math.abs((r.x + r.width / 2 - f.x) / f.width - 0.8) < 0.03 && Math.abs((r.y + r.height / 2 - f.y) / f.height - 0.5) < 0.03; })()`, 3000);
+    assert.equal(await page.eval(`getComputedStyle(document.documentElement).forcedColorAdjust`), 'none');
+    await page.waitFor(`getComputedStyle(document.documentElement).backgroundColor !== ${JSON.stringify(before)}`, 5000);
+  } finally { await b.close(); s.server.close(); }
+});
