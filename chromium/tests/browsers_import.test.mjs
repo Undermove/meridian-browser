@@ -188,11 +188,16 @@ test('Brave: a space per profile with its bookmarks, open tabs and sign-ins; mac
     assert.match(await b.eval(`${OB}.querySelector('.whisper.top').textContent.replace(/\\s+/g, ' ')`), /Each Brave profile becomes a space/);
     assert.equal(await b.eval(`!!${OB}.getElementById('limited')`), false);
     await b.click(`${OB}.getElementById('next')`);
-    await b.waitFor(`!!${OB}.querySelector('.confirm')`);
-    const mock = `${OB}.querySelector('.confirm meridian-mac-ask').shadowRoot`;
-    assert.match(await b.eval(`${mock}.querySelector('.title').textContent`), /“Brave Safe Storage”/);
-    assert.match(await b.eval(`${OB}.querySelector('.confirm').textContent.replace(/\\s+/g, ' ')`), /copies Brave’s sign-ins.*Pressed Deny\? Your tabs and bookmarks still come over/);
-    await b.click(`${OB}.getElementById('confirmContinue')`);
+    // macOS asks before Meridian reads the keychain; Windows asks nothing.
+    if (process.platform === 'darwin') {
+      await b.waitFor(`!!${OB}.querySelector('.confirm')`);
+      const mock = `${OB}.querySelector('.confirm meridian-mac-ask').shadowRoot`;
+      assert.match(await b.eval(`${mock}.querySelector('.title').textContent`), /“Brave Safe Storage”/);
+      assert.match(await b.eval(`${OB}.querySelector('.confirm').textContent.replace(/\\s+/g, ' ')`), /copies Brave’s sign-ins.*Pressed Deny\? Your tabs and bookmarks still come over/);
+      await b.click(`${OB}.getElementById('confirmContinue')`);
+    } else {
+      assert.equal(await b.eval(`!!${OB}.querySelector('.confirm')`), false, 'no Mac dialog');
+    }
     await b.waitFor(`app.$.tabstrip.state_.spaces.map((s) => s.name).join() === 'Home,Work'`, 15000);
     const pinned = await b.pinned();
     assert.deepEqual(pinned.filter((p) => p.depth === 0).map((p) => [p.title, p.folder]), [['Mail', false], ['Docs', true], ['Other bookmarks', true]]);
@@ -220,15 +225,21 @@ test('Edge asks about “Microsoft Edge Safe Storage”; Deny still brings tabs 
     await b.waitFor(`app.$.onboarding.open && ${OB}.querySelector('h2')?.textContent.includes('Bring everything from Edge')`);
     assert.deepEqual(await stats(b), ['1 profile', '1 bookmark', '1 password']);
     await b.click(`${OB}.getElementById('next')`);
-    await b.waitFor(`!!${OB}.querySelector('.confirm')`);
-    const mock = `${OB}.querySelector('.confirm meridian-mac-ask').shadowRoot`;
-    assert.match(await b.eval(`${mock}.querySelector('.title').textContent`), /“Microsoft Edge Safe Storage”/);
-    await b.click(`${OB}.getElementById('confirmContinue')`);
+    // macOS asks before Meridian reads the keychain; Windows asks nothing.
+    if (process.platform === 'darwin') {
+      await b.waitFor(`!!${OB}.querySelector('.confirm')`);
+      const mock = `${OB}.querySelector('.confirm meridian-mac-ask').shadowRoot`;
+      assert.match(await b.eval(`${mock}.querySelector('.title').textContent`), /“Microsoft Edge Safe Storage”/);
+      await b.click(`${OB}.getElementById('confirmContinue')`);
+    } else {
+      assert.equal(await b.eval(`!!${OB}.querySelector('.confirm')`), false, 'no Mac dialog');
+    }
     // Edge's own name for an unnamed profile ("Profile 1") gives way to "Edge".
     await b.waitFor(`app.$.tabstrip.state_.spaces.map((s) => s.name).join() === 'Edge'`, 15000);
     assert.deepEqual((await b.pinned()).map((p) => p.title), ['Outlook']);
     await b.waitFor(`[...${OB}.querySelectorAll('.whisper')].some((e) => e.textContent.includes('weren’t brought over'))`, 10000);
-    assert.match(await b.eval(`[...${OB}.querySelectorAll('.whisper')].map((e) => e.textContent).join(' ')`), /Import from Another Browser \(Edge\)/);
+    assert.match(await b.eval(`[...${OB}.querySelectorAll('.whisper')].map((e) => e.textContent).join(' ')`),
+      process.platform === 'darwin' ? /Import from Another Browser \(Edge\)/ : /from the Meridian menu › Import from Edge\./);
   } finally { await b.close(); s.server.close(); fs.rmSync(edge, { recursive: true, force: true }); }
 });
 

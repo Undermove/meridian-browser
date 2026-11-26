@@ -85,8 +85,13 @@ test('with Arc: Bring everything, after saying macOS will ask; File > Import fro
     assert.ok(await b.eval(`${OB}.getElementById('logins').classList.contains('on')`));
     await b.click(`${OB}.getElementById('next')`); // Bring everything
     // First: macOS will ask for permission.
-    await b.waitFor(`!!${OB}.querySelector('.confirm')`);
-    await b.click(`${OB}.getElementById('confirmContinue')`);
+    // macOS asks before Meridian reads the keychain; Windows asks nothing.
+    if (process.platform === 'darwin') {
+      await b.waitFor(`!!${OB}.querySelector('.confirm')`);
+      await b.click(`${OB}.getElementById('confirmContinue')`);
+    } else {
+      assert.equal(await b.eval(`!!${OB}.querySelector('.confirm')`), false, 'no Mac dialog');
+    }
     await b.waitFor(`${step} === 'default'`, 15000);
     assert.deepEqual((await b.state()).spaces.map((s) => s.name), ['Work', 'Home']);
     const work = (await b.state()).spaces.find((s) => s.name === 'Work');
@@ -418,8 +423,13 @@ test('first run with Arc and Claude: honest about what is sent, moved-in spaces 
     await b.click(`${OB}.getElementById('next')`);
     await b.waitFor(`${step} === 'arc'`, 10000);
     await b.click(`${OB}.getElementById('next')`);
-    await b.waitFor(`!!${OB}.querySelector('.confirm')`);
-    await b.click(`${OB}.getElementById('confirmContinue')`);
+    // macOS asks before Meridian reads the keychain; Windows asks nothing.
+    if (process.platform === 'darwin') {
+      await b.waitFor(`!!${OB}.querySelector('.confirm')`);
+      await b.click(`${OB}.getElementById('confirmContinue')`);
+    } else {
+      assert.equal(await b.eval(`!!${OB}.querySelector('.confirm')`), false, 'no Mac dialog');
+    }
     await b.waitFor(`${step} === 'ai'`, 15000);
     await b.click(`${OB}.getElementById('aiYes')`);
     await b.waitFor(`${step} === 'tailor'`, 15000);
