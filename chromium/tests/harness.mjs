@@ -20,7 +20,7 @@ afterEach(async (t) => {
   await new Promise((r) => setTimeout(r, 400));  // the watcher's last look
   const taken = screenTaken(testStarted, Date.now(), testPids);
   if (!taken.length) return;
-  const why = `took the screen from the person at this Mac (background mode missed a window):\n  ${taken.join('\n  ')}`;
+  const why = `reached past the test, onto the person's screen (a window background mode missed, or an app macOS started):\n  ${taken.join('\n  ')}`;
   if (SPACE_GUARD_MODE === 'warn') console.error(`SPACE GUARD (${t.name}): ${why}`);
   else throw new Error(`SPACE GUARD: this test ${why}`);
 });
@@ -195,7 +195,8 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
   let ui;
   for (let i = 0; i < 100 && !ui; i++) {
     await sleep(200);
-    try { ui = (await (await fetch(`${base}/json/list`)).json()).find((t) => t.url.startsWith('chrome://webui-browser')); } catch {}
+    // (A bounded wait: a hung browser left on this port by another run never answers.)
+    try { ui = (await (await fetch(`${base}/json/list`, { signal: AbortSignal.timeout(2000) })).json()).find((t) => t.url.startsWith('chrome://webui-browser')); } catch {}
   }
   if (!ui) { proc.kill(); throw new Error('browser UI target never appeared'); }
   const cdp = await new Cdp(ui.webSocketDebuggerUrl).open();
@@ -401,7 +402,11 @@ export async function launch(urls = [], { profile: keep, args = [], firstRun = f
     async close() {
       b.closed = true;
       b.cdp.close();
-      if (proc.exitCode === null && proc.signalCode === null) { proc.kill(); await exited(); }
+      if (proc.exitCode === null && proc.signalCode === null) {
+        proc.kill();
+        // A browser stuck on an exception doesn't end on SIGTERM.
+        if (await Promise.race([exited().then(() => true), sleep(10000).then(() => false)]) === false) { proc.kill('SIGKILL'); await exited(); }
+      }
       if (!keep) fs.rmSync(profile, { recursive: true, force: true });
       fs.rmSync(empty, { recursive: true, force: true });
       // What the browser left in the temp folder (downloads in progress, sockets) when killed.

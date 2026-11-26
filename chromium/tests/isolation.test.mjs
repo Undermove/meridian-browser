@@ -67,3 +67,25 @@ test('a stand-in refuses to run when it sees a path outside the test home, and s
     } catch (e) { if (e.code === 'ERR_ASSERTION') throw e; assert.match(String(e.stdout), /"loggedIn":false/); } finally { old.clean(); }
   } finally { m.clean(); }
 });
+
+test('a browser app started outside the build under test (as the Dock or LaunchServices would) is named', { skip: process.platform !== 'darwin' && 'macOS' }, async () => {
+  const { startSpaceWatch, screenTaken, forget } = await import('./space_guard.mjs');
+  startSpaceWatch();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-guard-app-'));
+  const exe = path.join(dir, 'Arc.app', 'Contents', 'MacOS', 'Arc');
+  fs.mkdirSync(path.dirname(exe), { recursive: true });
+  // (node under that name: a copied system binary isn't allowed to run.)
+  fs.symlinkSync(process.execPath, exe);
+  const from = Date.now();
+  // Its parent goes away at once: launchd adopts it, as it does an app the Dock opens.
+  execFileSync('/bin/sh', ['-c', '"$0" -e "setTimeout(() => {}, 4000)" >/dev/null 2>&1 &', exe]);
+  try {
+    let taken = [];
+    for (let i = 0; i < 30 && !taken.length; i++) { await new Promise((r) => setTimeout(r, 200)); taken = screenTaken(from, Date.now(), new Set()); }
+    assert.ok(taken.some((t) => t.includes(exe)), JSON.stringify(taken));
+  } finally {
+    try { execFileSync('/usr/bin/pkill', ['-f', exe]); } catch {}
+    forget((e) => e.alien?.exe === exe);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -49,7 +49,7 @@ const TMP = ${JSON.stringify(tmp)};
 const norm = (p) => { let r = path.resolve(p); try { r = fs.realpathSync(r); } catch {} return ${WIN ? 'r.toLowerCase()' : 'r'}; };
 const inside = (p, dir) => { const a = norm(p), b = norm(dir); return a === b || a.startsWith(b + path.sep); };
 const allowed = (p) => OK.some((d) => inside(p, d)) ||
-    TMP.some((t) => inside(p, t) && /^meridian-/.test(path.relative(norm(t), norm(p)).split(path.sep)[0]));
+    TMP.some((t) => inside(p, t) && /^(dev\.meridian\.browser\.)?meridian-/.test(path.relative(norm(t), norm(p)).split(path.sep)[0]));
 const seen = [['cwd', process.cwd()]];
 for (const v of ['HOME', 'USERPROFILE', 'APPDATA', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'COPILOT_HOME', 'XDG_CONFIG_HOME', 'ZDOTDIR']) {
   if (process.env[v]) seen.push([v, process.env[v]]);
