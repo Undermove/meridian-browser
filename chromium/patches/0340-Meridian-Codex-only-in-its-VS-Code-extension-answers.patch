@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Meridian <meridian@localhost>
+Date: Thu, 26 Nov 2026 19:31:03 +0400
+Subject: [PATCH] Meridian: Codex only in its VS Code extension answers Ask and
+ Improve with AI with the extension's own codex
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Someone with Codex only as the VS Code extension ("Codex – OpenAI's coding
+agent") had no codex on the PATH, so Ask and Improve with AI didn't count
+Codex, and its Connect row sent them off to install Claude Code. The
+extension brings the same Codex CLI (bin/<platform>/codex, codex.exe on
+Windows), signed in the same way (~/.codex). When there is no codex on the
+PATH, Meridian uses the one in the newest copy of the extension
+(--meridian-vscode-extensions for tests), and the row no longer offers
+Claude Code where Codex can answer Ask. (On Windows agent CLIs don't answer
+Ask yet, so there it still does.)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chrome/browser/meridian/ai/cli_versions.cc    | 47 +++++++++++++++++++
+ chrome/browser/meridian/ai/cli_versions.h     |  8 ++++
+ chrome/browser/meridian/ai/local_agents.cc    |  7 +++
+ .../webui_browser/meridian/settings.ts        |  5 +-
+ 4 files changed, 66 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/meridian/ai/cli_versions.cc b/chrome/browser/meridian/ai/cli_versions.cc
+index 14ef6b37d4..3186459a94 100644
+--- a/chrome/browser/meridian/ai/cli_versions.cc
++++ b/chrome/browser/meridian/ai/cli_versions.cc
+@@ -8,12 +8,15 @@
+ #include <optional>
+ #include <set>
+ 
++#include "base/command_line.h"
+ #include "base/environment.h"
++#include "base/files/file_enumerator.h"
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
+ #include "base/no_destructor.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
+ #include "base/synchronization/lock.h"
+ #include "base/time/time.h"
+ #include "build/build_config.h"
+@@ -222,6 +225,50 @@ std::string FindNewestCli(const std::string& name,
+   return FindNewestProgram(name, search_path, env, copies);
+ }
+ 
++std::string CodexInVsCodeExtension() {
++  // (agent_cli.h's kVsCodeExtensionsSwitch: the same folder Connect looks in.)
++  constexpr char kSwitch[] = "meridian-vscode-extensions";
++  const base::CommandLine* cl = base::CommandLine::ForCurrentProcess();
++  base::FilePath dir;
++  if (cl->HasSwitch(kSwitch)) {
++    dir = cl->GetSwitchValuePath(kSwitch);
++  } else if (TestSwitchesAllowed()) {
++    return std::string();
++  } else {
++    dir = base::GetHomeDir().AppendASCII(".vscode").AppendASCII("extensions");
++  }
++#if BUILDFLAG(IS_WIN)
++  constexpr char kProgram[] = "codex.exe";
++#else
++  constexpr char kProgram[] = "codex";
++#endif
++  constexpr std::string_view kPrefix = "openai.chatgpt-";
++  std::string best, best_version;
++  base::FileEnumerator e(dir, false, base::FileEnumerator::DIRECTORIES);
++  for (base::FilePath p = e.Next(); !p.empty(); p = e.Next()) {
++    const std::string name = base::ToLowerASCII(p.BaseName().AsUTF8Unsafe());
++    if (!name.starts_with(kPrefix)) {
++      continue;
++    }
++    // "26.1120.50957-win32-x64": the version, then the platform.
++    std::string version = name.substr(kPrefix.size());
++    version = version.substr(0, version.find('-'));
++    // bin/<platform>/codex: one platform folder per build of the extension.
++    base::FileEnumerator platforms(p.AppendASCII("bin"), false,
++                                   base::FileEnumerator::DIRECTORIES);
++    for (base::FilePath b = platforms.Next(); !b.empty();
++         b = platforms.Next()) {
++      const base::FilePath program = b.AppendASCII(kProgram);
++      if (base::PathExists(program) && !base::DirectoryExists(program) &&
++          (best.empty() || CompareCliVersions(version, best_version) > 0)) {
++        best = program.AsUTF8Unsafe();
++        best_version = version;
++      }
++    }
++  }
++  return best;
++}
++
+ void SetInstallerFoldersForTesting(const std::vector<std::string>* folders) {
+   if (folders) {
+     InstallerFoldersForTesting() = *folders;
+diff --git a/chrome/browser/meridian/ai/cli_versions.h b/chrome/browser/meridian/ai/cli_versions.h
+index 36fa674dfc..1678162d3b 100644
+--- a/chrome/browser/meridian/ai/cli_versions.h
++++ b/chrome/browser/meridian/ai/cli_versions.h
+@@ -55,6 +55,14 @@ std::string FindNewestCli(const std::string& name,
+                           const std::string& search_path,
+                           std::vector<CliCopy>* copies = nullptr);
+ 
++// The codex program inside the newest "Codex – OpenAI's coding agent" VS Code
++// extension (~/.vscode/extensions/openai.chatgpt-<version>-<platform>/bin/
++// <platform>/codex, codex.exe on Windows): the same Codex CLI, signed in the
++// same way (~/.codex), for someone who has only the extension. Empty when
++// there is none. --meridian-vscode-extensions=<dir> (tests) is the extensions
++// folder; in a test without it, none. Blocking.
++std::string CodexInVsCodeExtension();
++
+ // Unit tests: the folders installers put CLIs in, in place of the real ones
+ // (~/.local/bin, /usr/local/bin, …); nullptr puts the real ones back.
+ void SetInstallerFoldersForTesting(const std::vector<std::string>* folders);
+diff --git a/chrome/browser/meridian/ai/local_agents.cc b/chrome/browser/meridian/ai/local_agents.cc
+index 81f51c9781..e09fb2406b 100644
+--- a/chrome/browser/meridian/ai/local_agents.cc
++++ b/chrome/browser/meridian/ai/local_agents.cc
+@@ -125,6 +125,13 @@ std::string FindBin(const Provider& p,
+   if (!direct.empty()) {
+     return direct;
+   }
++  // Codex only inside its VS Code extension: the extension's own codex, the
++  // same CLI signed in the same way.
++  if (p.bin == "codex") {
++    if (std::string bundled = CodexInVsCodeExtension(); !bundled.empty()) {
++      return bundled;
++    }
++  }
+   for (const std::string& alt : p.alt_bins) {
+     std::string bin = Which(alt, path);
+     if (!bin.empty() &&
+diff --git a/chrome/browser/resources/webui_browser/meridian/settings.ts b/chrome/browser/resources/webui_browser/meridian/settings.ts
+index 22feb73925..58a43c4f09 100644
+--- a/chrome/browser/resources/webui_browser/meridian/settings.ts
++++ b/chrome/browser/resources/webui_browser/meridian/settings.ts
+@@ -1252,8 +1252,11 @@ export class MeridianSettingsElement extends CrLitElement {
+       details: c.file || c.command,
+       accounts: perAccount,
+       menu: this.connectMenu_ === c.id,
++      // (Codex's extension brings its own codex, which answers Ask where it
++      // can: then nothing more to install.)
+       needsCli: !!c.via && c.found && !this.providers_.some(
+-          p => p.id === 'claude-code' && p.installed),
++          p => (p.id === 'claude-code' || p.id === c.id) && p.installed &&
++              !p.unavailable),
+     };
+   }
+ 
+-- 
+2.52.0.windows.1
+
