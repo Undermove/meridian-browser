@@ -24,7 +24,8 @@ const fs = require('fs');
 const path = require('path');
 
 const done = () => process.exit(0);
-setTimeout(done, 1500).unref?.();
+const MAIN = require.main === module;
+if (MAIN) setTimeout(done, 1500).unref?.();
 
 const str = (v, n) => (typeof v === 'string' ? v.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, n) : undefined);
 
@@ -104,6 +105,7 @@ function fromClaude(ev) {
 function fromCodex(arg) {
   let ev = {};
   try { ev = JSON.parse(arg); } catch {}
+  if (!ev || typeof ev !== 'object') ev = {}; // `null`, a number or a string is JSON too
   return { kind: 'codex', event: ev.type === 'agent-turn-complete' ? 'TurnComplete' : str(ev.type, 40) || 'Notify', session_id: str(ev['thread-id'], 80), turn_id: str(ev['turn-id'], 80), cwd_name: typeof ev.cwd === 'string' ? path.basename(ev.cwd).slice(0, 80) : undefined };
 }
 
@@ -134,4 +136,6 @@ async function main() {
   send(fromClaude(ev));
 }
 
-main().catch(done);
+// Required (by the fuzz targets in fuzz/) it only exports the parsers.
+if (MAIN) main().catch(done);
+else module.exports = { fromClaude, fromCodex, summarize };

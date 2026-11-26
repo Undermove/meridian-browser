@@ -371,3 +371,6 @@ function termExtras(t, provider) {
   t.xterm.onWriteParsed(() => termScanSoon(t));
   termMenus(t, provider);
 }
+
+// Node (the fuzz targets in fuzz/): the pure parsers. In the page `module` is undefined.
+if (typeof module === 'object' && module.exports) module.exports = { imagePathsIn, longestImages };

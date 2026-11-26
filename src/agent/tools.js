@@ -141,7 +141,8 @@ function validateInput(tool, input) {
   if (tool.name === 'type_text' && input.value === undefined && typeof input.text === 'string') return 'type_text needs value: the text to type. (text finds the field by its visible text.)';
   for (const key of required) if (input[key] === undefined || input[key] === null || (input[key] === '' && !(tool.name === 'type_text' && key === 'value'))) return `missing required field: ${key}`;
   for (const [key, value] of Object.entries(input)) {
-    const spec = properties[key];
+    // Own keys only: properties['constructor'] or ['valueOf'] would otherwise find Object.prototype's.
+    const spec = Object.hasOwn(properties, key) ? properties[key] : undefined;
     if (!spec) return `unknown field: ${key}`;
     const t = spec.type;
     if (t === 'string' && typeof value !== 'string') return `${key} must be a string`;
