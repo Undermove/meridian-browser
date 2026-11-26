@@ -220,3 +220,78 @@ test('Workbench terminal tabs: dragged along the strip, a tab takes its new plac
     fs.rmSync(project, { recursive: true, force: true });
   }
 });
+
+// Claude Code prints ✅ 🔧 ⚙️ as two columns wide, as today's terminals do. xterm's own table
+// (Unicode 6) counted some as one: the cursor ran behind and the next letter landed on the emoji
+// ("✅ПОнбординг"), until minimizing the window redrew it.
+test('Workbench terminal: emoji take two columns and the text after them stays in place', async () => {
+  const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-wbe-')));
+  // [text, columns]: emoji (VS16, a flag, a skin tone), Cyrillic, CJK and box drawing.
+  const parts = [['✅', 2], [' Онбординг ', 11], ['🔧', 2], [' Клик ', 6], ['⚙️', 2], [' переключение ', 14],
+    ['🇬🇪', 2], [' Грузия ', 8], ['👍🏽', 2], [' 中文', 5], [' ─│┌┐ ', 6], ['END', 3]];
+  const line = parts.map((p) => p[0]).join('');
+  fs.writeFileSync(path.join(project, 'emoji.js'), `process.stdout.write('\\x1b[2J\\x1b[H' + ${JSON.stringify(line)} + '\\r\\nDONE\\r\\n');\n`);
+  const { b, wb } = await workbench(project);
+  try {
+    await run(wb, `${NODE} emoji.js`);
+    await wb.waitFor(`${TEXT}.includes('\\nDONE')`, 10000, TEXT);
+    // The row in xterm's buffer: each part where its columns put it.
+    const row = await wb.eval(`(() => {
+      const b = S.activeTerm.xterm.buffer.active;
+      for (let y = 0; y < b.length; y++) {
+        const l = b.getLine(y);
+        if (!(l?.translateToString(true) || '').includes('END')) continue;
+        const cells = [];
+        for (let x = 0; x < S.activeTerm.xterm.cols; x++) { const c = l.getCell(x); cells.push([c.getChars(), c.getWidth()]); }
+        return { y: y - b.viewportY, text: l.translateToString(true), cells, version: S.activeTerm.xterm.unicode.activeVersion };
+      }
+      return null;
+    })()`);
+    assert.ok(row, 'the line is in the terminal');
+    assert.equal(row.version, '15-graphemes');
+    assert.equal(row.text, line, 'the text reads back as printed, nothing over the emoji');
+    let col = 0;
+    for (const [text, width] of parts) {
+      if (width === 2 && [...text].length <= 4 && /\p{Extended_Pictographic}|\p{Regional_Indicator}/u.test(text)) {
+        assert.deepEqual(row.cells[col], [text, 2], `${text} at column ${col} is one cell two wide`);
+        assert.equal(row.cells[col + 1][1], 0, `${text}: its second column is its own`);
+        assert.equal(row.cells[col + 2][0], ' ', `${text}: the space after it is right after it`);
+      }
+      col += width;
+    }
+    assert.deepEqual(row.cells.slice(col - 3, col).map((c) => c[0]), ['E', 'N', 'D'], 'END where the columns add up to');
+
+    // On screen too: the letter after each emoji is drawn at its own column, at either pixel ratio.
+    const drawn = () => wb.eval(`(() => {
+      const t = S.activeTerm, screen = t.el.querySelector('.xterm-screen').getBoundingClientRect();
+      const cw = t.xterm._core._renderService.dimensions.css.cell.width;
+      const rowEl = t.el.querySelectorAll('.xterm-rows > div')[${row.y}];
+      const walker = document.createTreeWalker(rowEl, NodeFilter.SHOW_TEXT);
+      const at = (needle) => {
+        for (let n = walker.currentNode = rowEl; (n = walker.nextNode());) {
+          const i = n.data.indexOf(needle);
+          if (i < 0) continue;
+          const r = document.createRange(); r.setStart(n, i); r.setEnd(n, i + 1);
+          return (r.getBoundingClientRect().left - screen.left) / cw;
+        }
+        return null;
+      };
+      return { О: at('Онб'), К: at('Кли'), п: at('пере'), Г: at('Гру'), 中: at('中'), E: at('END') };
+    })()`);
+    const want = { О: 3, К: 16, п: 24, Г: 40, 中: 50, E: 60 };
+    const check = async (label) => {
+      await sleep(300);
+      const got = await drawn();
+      for (const [k, c] of Object.entries(want)) assert.ok(got[k] !== null && Math.abs(got[k] - c) < 0.35, `${label}: ${k} drawn at column ${got[k]?.toFixed(2)}, wants ${c}`);
+    };
+    await check('as opened');
+    await wb.cdp.send('Emulation.setDeviceMetricsOverride', { width: 0, height: 0, deviceScaleFactor: 1, mobile: false });
+    await check('at 1x');
+    await wb.cdp.send('Emulation.setDeviceMetricsOverride', { width: 0, height: 0, deviceScaleFactor: 2, mobile: false });
+    await check('at 2x');
+    await wb.cdp.send('Emulation.clearDeviceMetricsOverride');
+    // Hidden and shown again (the window minimized and back): still in place.
+    await wb.eval(`(() => { document.dispatchEvent(new Event('visibilitychange')); return true; })()`);
+    await check('after visibility change');
+  } finally { wb.close(); await b.close(); fs.rmSync(project, { recursive: true, force: true }); }
+});
