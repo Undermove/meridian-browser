@@ -21,8 +21,8 @@ function profileWith(meridian) {
 }
 
 // An MCP client talking to the bridge.
-function bridge(profile) {
-  const proc = spawn(APP, ['--mcp-bridge', `--user-data-dir=${profile}`], { stdio: ['pipe', 'pipe', 'inherit'] });
+function bridge(profile, extra = [], env = process.env) {
+  const proc = spawn(APP, ['--mcp-bridge', `--user-data-dir=${profile}`, ...extra], { stdio: ['pipe', 'pipe', 'inherit'], env });
   const waiting = new Map();
   let next = 1;
   readline.createInterface({ input: proc.stdout }).on('line', (line) => {
@@ -56,6 +56,9 @@ function site() {
       // A native dropdown: its list opens outside the page, so clicks and keys can't pick from it.
       res.end(`<title>Filter</title><label for=cat>Category</label>
         <select id=cat onchange="document.title = 'Filter: ' + this.value"><option value="">All (30)</option><option>Winter</option><option>Summer</option><option value="k">Kitchen</option><option disabled>Archived</option></select>`);
+    } else if (req.url === '/long') {
+      // A shop's catalogue: more text than one tool result should carry.
+      res.end(`<title>Long</title>${'<p>Кроссовки беговые, 4 990 ₽, доставка завтра</p>'.repeat(4000)}`);
     } else res.end('<title>Home</title><p>Welcome to the test site</p>');
   });
   return new Promise((r) => server.listen(0, '127.0.0.1', () => r({ server, url: (p) => `http://127.0.0.1:${server.address().port}${p}` })));
@@ -147,6 +150,42 @@ test('run_javascript: an IIFE, a body, a bad one and the next one each give thei
     const [a, c] = await Promise.all([js(`new Promise((r) => setTimeout(() => r('slow'), 400))`), js(`'fast'`)]);
     assert.deepEqual([a.value, c.value], ['slow', 'fast']);
   } finally { mcp.close(); await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true }); }
+});
+
+// A model behind an OpenAI-compatible endpoint that takes no images: one screenshot in the conversation
+// and the provider answers every later turn with HTTP 400. `--text-only` keeps images out; every
+// result is compact JSON and cut, with a note, at 100 KB.
+test('text-only bridge: no screenshot tool, no images, long results cut with a note', async () => {
+  const s = await site();
+  const profile = profileWith({ agent_access: 'full' });
+  const b = await launch([s.url('/long')], { profile });
+  const plain = bridge(profile);
+  const flag = bridge(profile, ['--text-only']);
+  const env = bridge(profile, [], { ...process.env, MERIDIAN_MCP_TEXT_ONLY: '1' });
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    const names = async (mcp) => (await mcp.request('tools/list')).result.tools.map((t) => t.name);
+    assert.ok((await names(plain)).includes('screenshot'), 'a plain bridge offers screenshots');
+    for (const mcp of [flag, env]) {
+      const list = await names(mcp);
+      assert.ok(!list.includes('screenshot') && list.includes('read_page'), `text-only lists no screenshot: ${list}`);
+      const shot = await mcp.request('tools/call', { name: 'screenshot', arguments: {} });
+      assert.deepEqual(shot.result.content.map((c) => c.type), ['text'], 'no image even when asked');
+      assert.match(shot.result.content[0].text, /read_page/);
+    }
+    const raw = (await plain.request('tools/call', { name: 'read_page', arguments: { max_chars: 100000 } })).result;
+    const text = raw.content[0].text;
+    assert.ok(!text.includes('\n   '), 'compact JSON, not indented');
+    assert.ok(Buffer.byteLength(text) < 100000 + 400, `cut at 100 KB: ${Buffer.byteLength(text)} bytes`);
+    assert.match(text, /\[Cut here: this result was \d+ KB[\s\S]*max_chars/);
+    assert.ok(!text.includes('�'), 'cut on a whole character');
+    const short = await plain.call('list_tabs');
+    assert.equal(short.value.find((t) => t.zone === 'today').title, 'Long', 'short results stay whole JSON');
+  } finally {
+    plain.close(); flag.close(); env.close();
+    await b.close(); s.server.close(); fs.rmSync(profile, { recursive: true, force: true });
+  }
 });
 
 test('full access: an MCP client lists, opens, reads, clicks, types, screenshots and runs JS', async () => {
