@@ -118,6 +118,7 @@ function stShow(view) {
   }
   try { const u = new URL(location.href); u.searchParams.set('view', view); history.replaceState(history.state, '', u.href); } catch {}
   if (!studio) window.dispatchEvent(new Event('studio-hidden'));
+  stFavicon(studio);
   stReport();
   if (studio) {
     document.title = (stCurrent() && stTitle(stCurrent())) || STW().studio;
@@ -141,6 +142,17 @@ function stReport() {
   if (key === stReported) return;
   stReported = key;
   try { SessionStatus.report(msg); } catch {}
+}
+
+// The tab's icon: Studio's sparkle while Studio shows, the Workbench's </> otherwise.
+let stWorkbenchIcon = null;
+function stFavicon(studio) {
+  const link = document.querySelector('link[rel="icon"]');
+  if (!link) return;
+  if (stWorkbenchIcon === null) stWorkbenchIcon = link.getAttribute('href');
+  link.setAttribute('href', studio
+    ? "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%237c7fe0'/%3E%3Cpath d='M16 7.5l2.2 5.6 5.6 2.2-5.6 2.2L16 23.1l-2.2-5.6-5.6-2.2 5.6-2.2z' fill='white'/%3E%3C/svg%3E"
+    : stWorkbenchIcon);
 }
 
 function stSwitchHtml() {
@@ -357,6 +369,12 @@ function stRenderFeed(t) {
     for (const a of answeredHere.filter((x) => x.after >= turn.items.length)) parts.push(answeredHtml(a));
   });
   for (const q of k.queue) parts.push(`<div class="st-msg-user queued" data-key="q${esc(q.id)}">${esc(q.text)}<span class="st-queued">${esc(w.queued)}</span></div>`);
+  if (k.trust) {
+    parts.push(`<div class="st-ask" data-key="trust" data-title="${esc(w.trustTitle)}">
+      <div class="st-ask-q">${stDot('needs')}<span>${esc(w.trustTitle)}</span></div>
+      <div class="st-ask-d">${esc(w.trustDetail(S.project?.name || ''))}</div>
+      <div class="st-ask-btns"><button class="st-btn pri" data-trust="yes">${esc(w.allow)}</button><button class="st-btn" data-trust="no">${esc(w.no)}</button></div></div>`);
+  }
   for (const ask of mission.asks || []) parts.push(stAskHtml(ask));
   if (status === 'work' && !(mission.asks || []).length && !stHasRunningStep(m)) {
     parts.push(`<div class="st-thinking" data-key="thinking"><span class="st-shimmer">${esc(progress?.now || w.working)}</span></div>`);
@@ -634,6 +652,27 @@ async function stOnFeedClick(e) {
     return;
   }
   if (e.target.closest('[data-go="workbench"]')) return stShow('workbench');
+  const trust = e.target.closest('[data-trust]');
+  if (trust) {
+    const t = stCurrent();
+    const k = t && stTask(t);
+    if (!k?.trust) return;
+    const text = k.trust;
+    k.trust = '';
+    if (trust.dataset.trust === 'yes') {
+      // Claude Code's own choice: the first one is "Yes, proceed".
+      wb.ptyWrite(t.id, '\r');
+      stRender();
+      for (let i = 0; i < 40 && stTrustAsked(t); i++) await new Promise((r) => setTimeout(r, 150));
+      await stWhenReady(t);
+      stType(t, text);
+    } else {
+      wb.ptyWrite(t.id, '\x1b');
+      $('#st-input').value = text;
+    }
+    stRender();
+    return;
+  }
   const btn = e.target.closest('[data-answer]');
   if (!btn) return;
   const card = btn.closest('.st-ask');
@@ -679,6 +718,12 @@ async function stSubmit() {
       stShow('studio');
       input.value = '';
       await stWhenReady(t);
+      if (stTrustAsked(t)) {
+        // Asked in plain words first; the message goes once the folder is trusted.
+        stTask(t).trust = text;
+        stRender();
+        return;
+      }
       stType(t, text);
       stTask(t).seen = true;
       stRender();
@@ -696,11 +741,25 @@ async function stSubmit() {
   } finally { ST.sending = false; }
 }
 
-// Claude Code is ready for a message once its session has started (Mission Control saw it).
+// The terminal's screen as text (the last rows), for the questions Claude Code asks there itself.
+function stScreen(t, rows = 40) {
+  try {
+    const b = t.xterm.buffer.active;
+    const out = [];
+    for (let i = Math.max(0, b.length - rows); i < b.length; i++) out.push(b.getLine(i)?.translateToString(true) || '');
+    return out.join('\n');
+  } catch { return ''; }
+}
+// Claude Code's first question in a new folder: whether to trust it.
+const stTrustAsked = (t) => /Do you trust the files in this folder|trust this folder|Is this a project you/i.test(stScreen(t));
+
+// Claude Code is ready for a message once its session has started (Mission Control saw it), or
+// when it asks about the folder first.
 async function stWhenReady(t) {
   for (let i = 0; i < 100; i++) {
     const m = ST.mission[t.id];
     if (m && m.status && m.status !== 'starting') break;
+    if (stTrustAsked(t)) return;
     if (t.exited) return;
     await new Promise((r) => setTimeout(r, 150));
   }

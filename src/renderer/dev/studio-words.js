@@ -33,6 +33,7 @@
       openFile: 'Показать в папке', taskFallback: 'Новая задача', notStarted: 'Не удалось запустить Claude',
       details: 'Подробнее', consent: 'Задачи выполняет Claude от Anthropic: то, что вы пишете, и файлы, которые он смотрит, уходят в Anthropic.',
       consentOk: 'Понятно, начать',
+      trustTitle: 'Разрешить Claude работать в этой папке?', trustDetail: (n) => `Claude будет смотреть файлы в папке ${n} и спрашивать, прежде чем что-то поменять.`,
     },
     en: {
       studio: 'Studio', workbench: 'Workbench', tasks: 'Tasks', newTask: 'New task',
@@ -61,6 +62,7 @@
       openFile: 'Show in folder', taskFallback: 'New task', notStarted: 'Couldn’t start Claude',
       details: 'Details', consent: 'Tasks are done by Claude from Anthropic: what you write and the files it looks at go to Anthropic.',
       consentOk: 'Got it, start',
+      trustTitle: 'Let Claude work in this folder?', trustDetail: (n) => `Claude will look at the files in ${n} and ask before it changes anything.`,
     },
   };
 
