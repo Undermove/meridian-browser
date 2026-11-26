@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { launch } from './harness.mjs';
+import { standIn } from './stand_in.mjs';
 
 const ST = 'app.$.settings.shadowRoot';
 const H = 'app.$.tabstrip.handler_';
@@ -84,4 +85,40 @@ test('Only editor extensions: VS Code (Copilot), Codex (VS Code extension) and C
     await b.close();
     for (const d of [home, bin]) fs.rmSync(d, { recursive: true, force: true });
   }
+});
+
+// Codex only inside its VS Code extension, which brings its own codex (bin/<platform>/codex): Ask
+// and Improve with AI use that one, from the newest copy of the extension, as they would a codex
+// on the PATH (signed in the same way, ~/.codex). Then the Codex row doesn't send the person off to
+// install Claude Code, where Codex can answer Ask (macOS; on Windows agent CLIs don't answer Ask
+// yet, so there it still does).
+test('Codex only in its VS Code extension: Ask uses the extension\'s own codex, the newest copy', async () => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-ext-')));
+  const extensions = path.join(home, '.vscode', 'extensions');
+  const platform = process.platform === 'win32' ? 'windows-x86_64' : `${process.platform === 'darwin' ? 'macos' : 'linux'}-${process.arch === 'arm64' ? 'aarch64' : 'x86_64'}`;
+  const codexIn = (version) => {
+    const dir = path.join(extensions, `openai.chatgpt-${version}-${process.platform}-${process.arch}`, 'bin', platform);
+    fs.mkdirSync(dir, { recursive: true });
+    return standIn(dir, 'codex', `if (process.argv[2] === '--version') { console.log('codex-cli ${version}'); process.exit(0); }
+if (process.argv[2] === 'login' && process.argv[3] === 'status') { console.log('Logged in using ChatGPT'); process.exit(0); }
+process.exit(0);`);
+  };
+  codexIn('26.1001.1');
+  const newest = codexIn('26.1120.50957');
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
+  const b = await launch(['about:blank'], { args: [`--meridian-agents-path=${bin}`, `--meridian-accounts-home=${home}`,
+    `--meridian-vscode-extensions=${extensions}`] });
+  try {
+    await b.waitFor(`!!app?.$?.tabstrip?.handler_`);
+    const { providers } = await b.eval(`${H}.getAiProviders(true)`);
+    const codex = providers.find((p) => p.id === 'codex');
+    assert.equal(codex.installed, true, 'the extension\'s codex counts as Codex installed');
+    assert.equal(codex.path, newest, 'the newest copy of the extension');
+    await b.eval('app.$.tabstrip.runCommand(13, 0)');
+    await b.waitFor(`app.$.settings.open && !!${ST}.querySelector('[data-id="ai"]')`);
+    await b.click(`${ST}.querySelector('[data-id="ai"]')`);
+    await b.waitFor(`!!${ST}.getElementById('connect-codex')`, 20000);
+    const hint = await b.eval(`!!${ST}.querySelector('#connect-codex .connect-needs-cli')`);
+    assert.equal(hint, !!codex.unavailable, codex.unavailable ? 'Ask can\'t run Codex here: Claude Code is still offered' : 'no Claude Code to install: Codex answers Ask');
+  } finally { await b.close(); fs.rmSync(home, { recursive: true, force: true }); fs.rmSync(bin, { recursive: true, force: true }); }
 });
