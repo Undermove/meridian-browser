@@ -89,3 +89,30 @@ test('a browser app started outside the build under test (as the Dock or LaunchS
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('the Space guard: the person switching Spaces himself passes; a switch with no input, a test browser in front or seen fails', () => {
+  return import('./space_guard.mjs').then(({ classify }) => {
+    const pids = new Set([4242]);
+    const run = (list) => classify(list, 1000, 9000, pids);
+    const start = { t: 900, space: 1, front: 77, idle: 30 };
+    // 26.11: the owner moved between his Spaces (a swipe, ⌘⇥) about once a minute, each right after
+    // his own input; and back again, and the frontmost app changed on the other Space.
+    let r = run([start, { t: 2000, space: 423, front: 88, idle: 0.6 }, { t: 2500, space: 423, front: 99, idle: 4 }, { t: 3000, space: 1, front: 77, idle: 1.1 }]);
+    assert.deepEqual(r.taken, []);
+    assert.equal(r.own.length, 2);
+    // An app switched it, nobody touched anything.
+    r = run([start, { t: 2000, space: 18, front: 77, idle: 12.5 }]);
+    assert.match(r.taken.join(), /Space switched \(1 → 18\).*no input from the person \(last 12.5 s before\)/);
+    // A test browser in front, or one of its windows seen: fails whatever the person did.
+    r = run([start, { t: 2000, space: 1, front: 4242, idle: 0.2 }]);
+    assert.match(r.taken.join(), /pid 4242\) became the frontmost/);
+    r = run([start, { t: 2000, shown: 4242, window: 7 }, { t: 2100, shown: 5555, window: 8 }]);
+    assert.equal(r.taken.length, 1);
+    assert.match(r.taken[0], /window of a test browser \(pid 4242, window 7\) could be seen/);
+    // Old watcher lines (no idle): a switch counts, as before.
+    r = run([start, { t: 2000, space: 2, front: 77 }]);
+    assert.equal(r.taken.length, 1);
+    // Events outside the test's time don't count.
+    assert.deepEqual(run([start, { t: 9500, space: 2, front: 77, idle: 50 }]).taken, []);
+  });
+});
