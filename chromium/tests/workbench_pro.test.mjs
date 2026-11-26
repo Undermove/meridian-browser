@@ -7,25 +7,30 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { launch, SB } from './harness.mjs';
+import { standIn } from './stand_in.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const KEY = 'sk-ant-api03-REALLOOKINGKEY0123456789abcdef';
 
-// A stand-in Claude Code that runs its PreToolUse hooks for "Read .env" like the real one would.
-const FAKE_CLAUDE = `#!/usr/bin/python3
-import json, os, subprocess, sys
-settings = json.load(open(sys.argv[sys.argv.index('--settings') + 1]))
-event = {'hook_event_name': 'PreToolUse', 'tool_name': 'Read', 'tool_input': {'file_path': '.env'}, 'cwd': os.getcwd()}
-for entry in settings['hooks']['PreToolUse']:
-    if 'Read' not in entry.get('matcher', '*').split('|') and entry.get('matcher') != '*':
-        continue
-    for h in entry['hooks']:
-        if h.get('async'):
-            continue
-        out = subprocess.run(h['command'], shell=True, input=json.dumps(event), text=True, capture_output=True).stdout
-        print('HOOK SAID ' + out, flush=True)
-print('SECRETS ' + os.environ.get('MERIDIAN_VAULT_SECRETS', ''), flush=True)
-sys.stdin.readline()
+// A stand-in Claude Code that runs its PreToolUse hooks for "Read .env" like the real one would
+// (each hook's command through the system's shell, the event on its stdin). JavaScript, so the
+// same stand-in runs on Windows too (stand_in.mjs).
+const FAKE_CLAUDE = `const fs = require('fs'), { execSync } = require('child_process');
+const args = process.argv.slice(2);
+const settings = JSON.parse(fs.readFileSync(args[args.indexOf('--settings') + 1], 'utf8'));
+const event = { hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '.env' }, cwd: process.cwd() };
+for (const entry of settings.hooks.PreToolUse) {
+  const matcher = entry.matcher || '*';
+  if (!matcher.split('|').includes('Read') && matcher !== '*') continue;
+  for (const h of entry.hooks) {
+    if (h.async) continue;
+    let out = '';
+    try { out = execSync(h.command, { input: JSON.stringify(event), encoding: 'utf8' }); } catch (e) { out = e.stdout || ''; }
+    console.log('HOOK SAID ' + out);
+  }
+}
+console.log('SECRETS ' + (process.env.MERIDIAN_VAULT_SECRETS || ''));
+process.stdin.once('data', () => process.exit(0));
 `;
 
 async function openProject(b) {
@@ -47,7 +52,7 @@ test('Workbench Pro: vault, .env migration, secrets in terminals, the secret-fil
   fs.mkdirSync(path.join(project, '.git'));
   fs.writeFileSync(path.join(project, '.env'), `PORT=3000\nANTHROPIC_API_KEY=${KEY}\n`);
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
-  fs.writeFileSync(path.join(bin, 'claude'), FAKE_CLAUDE, { mode: 0o755 });
+  standIn(bin, 'claude', FAKE_CLAUDE);
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
   const args = [`--meridian-test-project=${project}`, `--meridian-agents-path=${bin}`, '--meridian-no-notify'];
   let b = await launch(['about:blank'], { profile, args: [...args, '--meridian-test-dialog-answer=Move keys to vault'] });
@@ -83,7 +88,11 @@ test('Workbench Pro: vault, .env migration, secrets in terminals, the secret-fil
     await wb.eval(`launch('shell').then((t) => !!t)`);
     await wb.waitFor('S.activeTerm?.kind === "shell"');
     assert.deepEqual(await wb.eval('S.activeTerm.info?.secrets || S.terms.at(-1).secrets'), ['ANTHROPIC_API_KEY', 'DEPLOY_TOKEN']);
-    await wb.eval(`(() => { window.workbench.ptyWrite(S.activeTerm.id, 'echo "got:$ANTHROPIC_API_KEY"\\r'); return true; })()`);
+    // (Windows: cmd.exe's way, then PowerShell's: one of them is the shell, the other prints itself.)
+    const echo = process.platform === 'win32'
+      ? 'echo got:%ANTHROPIC_API_KEY%\\r echo "got:$env:ANTHROPIC_API_KEY"\\r'
+      : 'echo "got:$ANTHROPIC_API_KEY"\\r';
+    await wb.eval(`(() => { window.workbench.ptyWrite(S.activeTerm.id, '${echo}'); return true; })()`);
     await wb.waitFor(`(${termText}).includes('got:${KEY}')`, 10000);
 
     // Nothing in the profile holds a value in plain text.
