@@ -81,6 +81,8 @@ test('Beta: Studio and the chats list are on without any switch', { skip }, asyn
     await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length >= 1`);
     await b.eval('app.$.tabstrip.runCommand(16, 0)');
     const wb = await b.page('chrome://workbench');
+    await wb.waitFor(`!!S.project || (document.querySelector('#welcome') && !document.querySelector('#welcome').hidden)`, 15000);
+    if (!(await wb.eval('!!S.project'))) await wb.eval(`document.querySelector('#open-folder').click(), true`);
     await wb.waitFor('!!S.project', 15000);
     const info = await wb.eval('window.workbench.studioInfo()');
     assert.equal(info.enabled, true);

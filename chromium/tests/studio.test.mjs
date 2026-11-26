@@ -49,7 +49,7 @@ if os.environ.get('STAND_IN_TRUST') or os.path.exists(os.path.join(cwd, '.ask-tr
     print('Do you trust the files in this folder?', flush=True)
     print(' > 1. Yes, proceed   2. No, exit', flush=True)
     got = ''
-    while '\r' not in got and '\n' not in got:
+    while '\\r' not in got and '\\n' not in got:
         got += os.read(0, 4096).decode('utf8', 'replace')
     open(os.path.join(cwd, '.trusted'), 'w').write(got)
 hook('SessionStart', model='claude-opus-5-5', source='startup')
@@ -91,7 +91,7 @@ async function setup() {
   fs.writeFileSync(path.join(project, 'Brand', 'colors.css'), ':root { --main: green; }\n');
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
   fs.writeFileSync(path.join(bin, 'claude'), FAKE_CLAUDE, { mode: 0o755 });
-  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  const profile = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-')));
   return { project, bin, profile, args: [`--meridian-test-project=${project}`, `--meridian-agents-path=${bin}`, '--meridian-no-notify', '--meridian-test-persona=designer'] };
 }
 
@@ -99,6 +99,8 @@ async function openWorkbench(b) {
   await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length >= 1`);
   await b.eval('app.$.tabstrip.runCommand(16, 0)');
   const wb = await b.page('chrome://workbench');
+  await wb.waitFor(`!!S.project || (document.querySelector('#welcome') && !document.querySelector('#welcome').hidden)`, 15000);
+  if (!(await wb.eval('!!S.project'))) await wb.eval(`document.querySelector('#open-folder').click(), true`);
   await wb.waitFor('!!S.project', 15000);
   return wb;
 }
