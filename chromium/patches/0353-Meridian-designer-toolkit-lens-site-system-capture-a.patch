@@ -1,0 +1,2208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <d.afonchenko@dodopizza.com>
+Date: Fri, 27 Nov 2026 00:08:32 +0400
+Subject: [PATCH] =?UTF-8?q?Meridian:=20designer=20toolkit=20=E2=80=94=20le?=
+ =?UTF-8?q?ns,=20site=20system,=20capture=20as=20a=20bug,=20images=20as=20?=
+ =?UTF-8?q?PNG,=20stress=20text,=20contrast,=20brand=20check=20(behind=20a?=
+ =?UTF-8?q?=20flag,=20off)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+One portable page script (toolkit/toolkit_core.js, no Meridian APIs: it can
+ship as an MV3 extension later) plus Meridian's adapter (toolkit_meridian.js),
+injected into an isolated world of the tab's main frame on DOMContentLoaded
+when meridian.toolkit.enabled (or --enable-meridian-toolkit) is on.
+ToolkitTabHelper polls the page's queue (60 ms while a tool is up, 400 ms
+idle, only for a visible tab) and does what the page can't: the clipboard
+(text, HTML, PNG), real pixels of the tab (CopyFromSurface, CSS px x zoom),
+the toolkit's store (pref meridian.toolkit.store). The page menu gets four
+items with the flag on (IDC_MERIDIAN_TOOLKIT_*), declared in :model
+(toolkit_menu.h) so the menu needs no new GN dep. Synthetic events from the
+page don't drive the toolkit (isTrusted).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/app/chrome_command_ids.h               |    5 +
+ chrome/browser/meridian/BUILD.gn              |   21 +
+ chrome/browser/meridian/prefs.cc              |    2 +
+ chrome/browser/meridian/prefs.h               |    6 +
+ .../browser/meridian/toolkit/toolkit_core.js  | 1377 +++++++++++++++++
+ .../browser/meridian/toolkit/toolkit_menu.h   |   35 +
+ .../meridian/toolkit/toolkit_meridian.js      |   84 +
+ .../meridian/toolkit/toolkit_tab_helper.cc    |  298 ++++
+ .../meridian/toolkit/toolkit_tab_helper.h     |   71 +
+ .../render_view_context_menu.cc               |   61 +-
+ .../render_view_context_menu.h                |    2 +
+ chrome/browser/ui/tabs/tab_features.cc        |    3 +
+ 12 files changed, 1963 insertions(+), 2 deletions(-)
+ create mode 100644 chrome/browser/meridian/toolkit/toolkit_core.js
+ create mode 100644 chrome/browser/meridian/toolkit/toolkit_menu.h
+ create mode 100644 chrome/browser/meridian/toolkit/toolkit_meridian.js
+ create mode 100644 chrome/browser/meridian/toolkit/toolkit_tab_helper.cc
+ create mode 100644 chrome/browser/meridian/toolkit/toolkit_tab_helper.h
+
+diff --git a/chrome/app/chrome_command_ids.h b/chrome/app/chrome_command_ids.h
+index b1775f5874..e14968c149 100644
+--- a/chrome/app/chrome_command_ids.h
++++ b/chrome/app/chrome_command_ids.h
+@@ -136,6 +136,11 @@
+ // The page's context menu: opens Ask (⌘J toggles it).
+ #define IDC_MERIDIAN_ASK_PAGE         39728
+ #define IDC_MERIDIAN_IMPORT_OTHER     39729
++// The page's context menu, designer toolkit (behind its flag).
++#define IDC_MERIDIAN_TOOLKIT_LENS     39730
++#define IDC_MERIDIAN_TOOLKIT_SHOT     39731
++#define IDC_MERIDIAN_TOOLKIT_PNG      39732
++#define IDC_MERIDIAN_TOOLKIT_IMAGES   39733
+ // Spaces 1-9: IDC_MERIDIAN_SPACE_1 + n.
+ #define IDC_MERIDIAN_SPACE_1          39710
+ #define IDC_MERIDIAN_SPACE_9          39718
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 85d531d0b8..f671613e66 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -112,6 +112,7 @@ source_set("model") {
+     "cookie_list.h",
+     "prefs.cc",
+     "prefs.h",
++    "toolkit/toolkit_menu.h",
+     "setup_profile.cc",
+     "setup_profile.h",
+     "sidebar_service.cc",
+@@ -264,6 +265,23 @@ action("agent_embed") {
+   ]
+ }
+ 
++# The designer toolkit's page scripts (toolkit/): the portable core and
++# Meridian's adapter, as C++ string constants.
++action("toolkit_embed") {
++  script = "agent/embed.py"
++  inputs = [
++    "toolkit/toolkit_core.js",
++    "toolkit/toolkit_meridian.js",
++  ]
++  outputs = [ "$target_gen_dir/toolkit/toolkit_embed.h" ]
++  args = [
++    rebase_path(outputs[0], root_build_dir),
++    "kToolkitCoreJs=" + rebase_path("toolkit/toolkit_core.js", root_build_dir),
++    "kToolkitMeridianJs=" +
++        rebase_path("toolkit/toolkit_meridian.js", root_build_dir),
++  ]
++}
++
+ # `Meridian --secret-guard` (chrome/app/chrome_main.cc): no browser deps.
+ source_set("guard_hook") {
+   sources = [
+@@ -441,6 +459,8 @@ source_set("meridian") {
+     "status_bubble.h",
+     "tab_data.cc",
+     "tab_data.h",
++    "toolkit/toolkit_tab_helper.cc",
++    "toolkit/toolkit_tab_helper.h",
+     "updater.h",
+   ]
+   if (is_mac) {
+@@ -500,6 +520,7 @@ source_set("meridian") {
+     "//components/javascript_dialogs",
+     "//ui/views",
+     ":agent_embed",
++    ":toolkit_embed",
+     ":agent_input",
+     ":arc_staged",
+     "//chrome/browser/autofill",
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index ddc0c6eb59..d332682e31 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -64,6 +64,8 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterBooleanPref(kSleepNeverMigrated, false);
+   registry->RegisterBooleanPref(kCleanLinks, true);
+   registry->RegisterBooleanPref(kHideCookieBanners, true);
++  registry->RegisterBooleanPref(kToolkitEnabled, false);
++  registry->RegisterDictionaryPref(kToolkitStore);
+ }
+ 
+ }  // namespace meridian::prefs
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index 3f96419170..a61e445fa6 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -126,6 +126,12 @@ inline constexpr char kSleepNeverMigrated[] = "meridian.sleep_never_migrated";
+ inline constexpr char kCleanLinks[] = "meridian.clean_links";
+ // Cookie notices hidden (EasyList Cookie List's element hiding rules).
+ inline constexpr char kHideCookieBanners[] = "meridian.hide_cookie_banners";
++// The designer toolkit (lens, site system, capture as a bug, stress text,
++// contrast, brand check): off until turned on.
++inline constexpr char kToolkitEnabled[] = "meridian.toolkit.enabled";
++// The toolkit's own store: {brand, prefs} the page keeps (copy format, last
++// bug target, the brand's colours/fonts).
++inline constexpr char kToolkitStore[] = "meridian.toolkit.store";
+ 
+ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry);
+ 
+diff --git a/chrome/browser/meridian/toolkit/toolkit_core.js b/chrome/browser/meridian/toolkit/toolkit_core.js
+new file mode 100644
+index 0000000000..e689647671
+--- /dev/null
++++ b/chrome/browser/meridian/toolkit/toolkit_core.js
+@@ -0,0 +1,1377 @@
++// Meridian designer toolkit — portable core.
++// Plain page-level JS (content-script style): no Meridian-only APIs here. Everything the host
++// browser does better (clipboard without a gesture, real pixels, Brand storage per Space, the
++// agent) comes through an adapter passed to create(). The same file can ship in an MV3 extension.
++//
++//   const tk = window.__meridianToolkitCore.create(adapter);
++//   adapter = {
++//     copy(items) -> Promise<bool>        items: {text?, html?, png?: Blob}; default: navigator.clipboard
++//     capture(rect) -> Promise<Blob|null>  rect in CSS px, viewport-relative; null = no pixels (preview only)
++//     fetchImage(url) -> Promise<Blob|null> bytes of a cross-origin image (CORS-free fetch)
++//     store: {get(key) -> Promise<any>, set(key, value) -> Promise}
++//     sendToAgent?(payload), sendTo?(target, payload), connectedTargets?() -> string[]
++//     extraTools?: [{id, label, icon, key, run()}]   e.g. Meridian's "Телефон"
++//     ownContextMenu?: bool   true = right-click on the page shows the toolkit menu (prototype/extension)
++//     platform?: 'mac'|'win'|'linux'
++//   }
++(() => {
++'use strict';
++if (window.__meridianToolkitCore) return;
++
++// ------------------------------------------------------------------ colour maths
++const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
++function parseColor(s) {
++  if (!s) return null;
++  let m = s.match(/rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:\s*[,/]\s*([\d.]+%?))?\s*\)/);
++  if (m) {
++    let a = m[4] === undefined ? 1 : m[4].endsWith('%') ? parseFloat(m[4]) / 100 : +m[4];
++    return { r: +m[1], g: +m[2], b: +m[3], a };
++  }
++  m = s.match(/^#([0-9a-f]{3,8})$/i);
++  if (m) {
++    let h = m[1]; if (h.length <= 4) h = [...h].map(c => c + c).join('');
++    return { r: parseInt(h.slice(0, 2), 16), g: parseInt(h.slice(2, 4), 16), b: parseInt(h.slice(4, 6), 16), a: h.length === 8 ? parseInt(h.slice(6, 8), 16) / 255 : 1 };
++  }
++  // colour() / oklch() etc: let the browser normalise through a canvas
++  try {
++    const c = parseColor.ctx || (parseColor.ctx = document.createElement('canvas').getContext('2d', { willReadFrequently: true }));
++    c.clearRect(0, 0, 1, 1); c.fillStyle = '#000'; c.fillStyle = s; c.fillRect(0, 0, 1, 1);
++    const d = c.getImageData(0, 0, 1, 1).data; return { r: d[0], g: d[1], b: d[2], a: d[3] / 255 };
++  } catch { return null; }
++}
++const hex2 = v => Math.round(clamp(v, 0, 255)).toString(16).padStart(2, '0');
++const toHex = c => ('#' + hex2(c.r) + hex2(c.g) + hex2(c.b) + (c.a < 1 ? hex2(c.a * 255) : '')).toUpperCase();
++const over = (top, bot) => { const a = top.a + bot.a * (1 - top.a); if (!a) return { r: 0, g: 0, b: 0, a: 0 };
++  return { r: (top.r * top.a + bot.r * bot.a * (1 - top.a)) / a, g: (top.g * top.a + bot.g * bot.a * (1 - top.a)) / a, b: (top.b * top.a + bot.b * bot.a * (1 - top.a)) / a, a }; };
++const lin = v => { v /= 255; return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; };
++const lum = c => 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
++const contrast = (a, b) => { const x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
++function oklab(c) {
++  const r = lin(c.r), g = lin(c.g), b = lin(c.b);
++  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
++  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
++  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
++  return { L: 0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s, a: 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s, b: 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s };
++}
++const oklch = c => { const o = oklab(c); return { L: o.L, C: Math.hypot(o.a, o.b), h: (Math.atan2(o.b, o.a) * 180 / Math.PI + 360) % 360 }; };
++const dE = (x, y) => { const a = oklab(x), b = oklab(y); return Math.hypot(a.L - b.L, a.a - b.a, a.b - b.b); };
++function fromOklch(L, C, h) {
++  const a = C * Math.cos(h * Math.PI / 180), b = C * Math.sin(h * Math.PI / 180);
++  const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3, m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3, s = (L - 0.0894841775 * a - 1.2914855480 * b) ** 3;
++  const g = v => 255 * (v <= 0.0031308 ? 12.92 * v : 1.055 * v ** (1 / 2.4) - 0.055);
++  return { r: clamp(g(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s), 0, 255), g: clamp(g(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s), 0, 255), b: clamp(g(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s), 0, 255), a: 1 };
++}
++// Names without AI: hue/lightness words.
++function colorName(c) {
++  const { L, C, h } = oklch(c);
++  if (C < 0.03) {
++    if (L > 0.97) return 'Белый'; if (L < 0.2) return 'Чёрный';
++    if (L > 0.86 && h > 40 && h < 110 && C > 0.008) return 'Сливочный';
++    return L > 0.75 ? 'Светло-серый' : L > 0.5 ? 'Серый' : 'Тёмно-серый';
++  }
++  if (C < 0.07 && L > 0.8 && h > 40 && h < 100) return 'Бежевый';
++  if (C < 0.09 && L < 0.55 && h > 30 && h < 90) return 'Коричневый';
++  const names = [[20, 'Розовый'], [40, 'Красный'], [70, 'Оранжевый'], [100, 'Охра'], [115, 'Жёлтый'], [140, 'Лаймовый'], [165, 'Зелёный'], [200, 'Бирюзовый'], [235, 'Голубой'], [275, 'Синий'], [305, 'Фиолетовый'], [335, 'Пурпурный'], [361, 'Розовый']];
++  let n = names.find(([lim]) => h < lim)[1];
++  if (L > 0.82) n = 'Светло-' + n.toLowerCase(); else if (L < 0.4) n = 'Тёмно-' + n.toLowerCase();
++  return n;
++}
++// Tailwind v3 palette (subset of hues used most often), shade 50..950.
++const TW_SHADES = [50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 950];
++const TW = {
++  slate: 'f8fafc f1f5f9 e2e8f0 cbd5e1 94a3b8 64748b 475569 334155 1e293b 0f172a 020617', gray: 'f9fafb f3f4f6 e5e7eb d1d5db 9ca3af 6b7280 4b5563 374151 1f2937 111827 030712',
++  stone: 'fafaf9 f5f5f4 e7e5e4 d6d3d1 a8a29e 78716c 57534e 44403c 292524 1c1917 0c0a09', red: 'fef2f2 fee2e2 fecaca fca5a5 f87171 ef4444 dc2626 b91c1c 991b1b 7f1d1d 450a0a',
++  orange: 'fff7ed ffedd5 fed7aa fdba74 fb923c f97316 ea580c c2410c 9a3412 7c2d12 431407', amber: 'fffbeb fef3c7 fde68a fcd34d fbbf24 f59e0b d97706 b45309 92400e 78350f 451a03',
++  yellow: 'fefce8 fef9c3 fef08a fde047 facc15 eab308 ca8a04 a16207 854d0e 713f12 422006', green: 'f0fdf4 dcfce7 bbf7d0 86efac 4ade80 22c55e 16a34a 15803d 166534 14532d 052e16',
++  emerald: 'ecfdf5 d1fae5 a7f3d0 6ee7b7 34d399 10b981 059669 047857 065f46 064e3b 022c22', teal: 'f0fdfa ccfbf1 99f6e4 5eead4 2dd4bf 14b8a6 0d9488 0f766e 115e59 134e4a 042f2e',
++  sky: 'f0f9ff e0f2fe bae6fd 7dd3fc 38bdf8 0ea5e9 0284c7 0369a1 075985 0c4a6e 082f49', blue: 'eff6ff dbeafe bfdbfe 93c5fd 60a5fa 3b82f6 2563eb 1d4ed8 1e40af 1e3a8a 172554',
++  indigo: 'eef2ff e0e7ff c7d2fe a5b4fc 818cf8 6366f1 4f46e5 4338ca 3730a3 312e81 1e1b4b', violet: 'f5f3ff ede9fe ddd6fe c4b5fd a78bfa 8b5cf6 7c3aed 6d28d9 5b21b6 4c1d95 2e1065',
++  purple: 'faf5ff f3e8ff e9d5ff d8b4fe c084fc a855f7 9333ea 7e22ce 6b21a8 581c87 3b0764', pink: 'fdf2f8 fce7f3 fbcfe8 f9a8d4 f472b6 ec4899 db2777 be185d 9d174d 831843 500724',
++  rose: 'fff1f2 ffe4e6 fecdd3 fda4af fb7185 f43f5e e11d48 be123c 9f1239 881337 4c0519',
++};
++function nearestTailwind(c) {
++  if (c.r > 250 && c.g > 250 && c.b > 250) return { name: 'white', d: 0 };
++  if (c.r < 5 && c.g < 5 && c.b < 5) return { name: 'black', d: 0 };
++  let best = null;
++  for (const [hue, list] of Object.entries(TW)) list.split(' ').forEach((h, i) => {
++    const d = dE(c, parseColor('#' + h)); if (!best || d < best.d) best = { name: hue + '-' + TW_SHADES[i], d };
++  });
++  return best;
++}
++
++// ------------------------------------------------------------------ DOM helpers
++const cssPath = el => {
++  if (!(el instanceof Element)) return '';
++  if (el.id && /^[a-zA-Z][\w-]*$/.test(el.id) && document.querySelectorAll('#' + el.id).length === 1) return '#' + el.id;
++  const parts = [];
++  for (let e = el; e && e.nodeType === 1 && e !== document.documentElement && parts.length < 5; e = e.parentElement) {
++    if (e.id && /^[a-zA-Z][\w-]*$/.test(e.id)) { parts.unshift('#' + e.id); break; }
++    let p = e.tagName.toLowerCase();
++    const cls = [...e.classList].filter(c => /^[a-zA-Z][\w-]{1,30}$/.test(c) && !/^(is-|has-|js-)/.test(c)).slice(0, 2);
++    if (cls.length) p += '.' + cls.join('.');
++    const par = e.parentElement;
++    if (par) { const same = [...par.children].filter(x => x.tagName === e.tagName); if (same.length > 1) p += `:nth-of-type(${same.indexOf(e) + 1})`; }
++    parts.unshift(p);
++  }
++  return parts.join(' > ');
++};
++const isEditable = el => !!el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
++const ownText = el => [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.nodeValue).join('').trim();
++function effectiveBg(el) {
++  const stack = [];
++  for (let e = el; e && e.nodeType === 1; e = e.parentElement) {
++    const cs = getComputedStyle(e);
++    if (cs.backgroundImage && cs.backgroundImage !== 'none') return { color: null, image: true, el: e, stack };
++    const c = parseColor(cs.backgroundColor);
++    if (c && c.a > 0) { stack.push(c); if (c.a >= 1) break; }
++  }
++  let res = { r: 255, g: 255, b: 255, a: 1 };
++  for (let i = stack.length - 1; i >= 0; i--) res = over(stack[i], res);
++  return { color: res, image: false };
++}
++function textColor(el) {
++  const cs = getComputedStyle(el); let c = parseColor(cs.color) || { r: 0, g: 0, b: 0, a: 1 };
++  let op = 1; for (let e = el; e && e.nodeType === 1; e = e.parentElement) op *= +getComputedStyle(e).opacity || 1;
++  return { ...c, a: c.a * op };
++}
++const fontAvail = (() => { const cache = new Map(); let ctx;
++  return fam => {
++    if (cache.has(fam)) return cache.get(fam);
++    ctx = ctx || document.createElement('canvas').getContext('2d');
++    const t = 'mmmmmmmmmlliWWW Аа Жж 0123'; let ok = false;
++    for (const g of ['monospace', 'serif', 'sans-serif']) { ctx.font = `40px ${g}`; const w0 = ctx.measureText(t).width; ctx.font = `40px "${fam}", ${g}`; if (ctx.measureText(t).width !== w0) { ok = true; break; } }
++    cache.set(fam, ok); return ok;
++  }; })();
++function renderedFont(cs) {
++  const fams = cs.fontFamily.split(',').map(f => f.trim().replace(/^["']|["']$/g, ''));
++  for (const f of fams) {
++    if (/^(-apple-system|BlinkMacSystemFont|system-ui)$/i.test(f)) return { family: /Mac/.test(navigator.platform) ? 'SF Pro' : /Win/.test(navigator.platform) ? 'Segoe UI' : 'системный', source: 'системный' };
++    if (/^(serif|sans-serif|monospace|cursive|fantasy|ui-\w+)$/i.test(f)) return { family: f, source: 'по умолчанию' };
++    if (fontAvail(f)) {
++      let source = 'установлен';
++      try { for (const ff of document.fonts) if (ff.family.replace(/["']/g, '') === f) { source = 'веб-шрифт'; break; } } catch {}
++      if (source === 'веб-шрифт') {
++        const links = [...document.querySelectorAll('link[rel=stylesheet]')].map(l => l.href).join(' ');
++        if (/fonts\.googleapis/.test(links)) source = 'Google Fonts'; else if (/typekit|use\.adobe/.test(links)) source = 'Adobe Fonts';
++      }
++      return { family: f, source };
++    }
++  }
++  return { family: fams[0], source: '?' };
++}
++const WEIGHTS = { 100: 'Thin', 200: 'ExtraLight', 300: 'Light', 400: 'Regular', 500: 'Medium', 600: 'Semibold', 700: 'Bold', 800: 'ExtraBold', 900: 'Black' };
++const px = v => Math.round(parseFloat(v) * 10) / 10;
++const fmtNum = v => (Math.round(v * 10) / 10).toString().replace('.', ',');
++
++// ------------------------------------------------------------------ styles of the UI
++// Craft tokens (S/toolkit/craft/craft-tokens.css): one accent = the Space colour, red only for
++// measurements, radii 4/6/8/12/16/pill, hairline rings instead of borders, 120/160/240 ms.
++const CSS = `
++:host { all: initial; }
++* { box-sizing: border-box; }
++.root { position: fixed; inset: 0; pointer-events: none; z-index: 2147483647;
++  font: 12px/1.35 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif; color: var(--m-text);
++  --m-space: #6d6fd6; --m-space-ink: #4b4db8; --m-space-wash: color-mix(in srgb, var(--m-space) 14%, transparent);
++  --m-measure: #f24822; --m-danger: #e5484d; --m-ok: #30a46c; --m-warn: #e0a400;
++  --m-text: #1d1d22; --m-text-2: rgba(29,29,34,.62); --m-text-3: rgba(29,29,34,.42); --m-surface: #fff; --m-surface-2: #f4f4f6;
++  --m-hair: 0 0 0 .5px rgba(0,0,0,.12); --m-hud: rgba(28,28,33,.86); --m-hud-text: #f2f2f5; --m-hud-2: rgba(242,242,245,.6);
++  --r-xs: 4px; --r-sm: 6px; --r-md: 8px; --r-lg: 12px; --r-xl: 16px; --r-pill: 999px;
++  --e1: 0 0 0 .5px rgba(0,0,0,.10), 0 1px 2px rgba(0,0,0,.06);
++  --e2: 0 0 0 .5px rgba(0,0,0,.10), 0 4px 12px -2px rgba(0,0,0,.10), 0 1px 2px rgba(0,0,0,.06);
++  --e3: 0 0 0 .5px rgba(0,0,0,.12), 0 12px 32px -6px rgba(0,0,0,.20), 0 2px 6px rgba(0,0,0,.06);
++  --e4: 0 0 0 .5px rgba(0,0,0,.14), 0 24px 60px -12px rgba(0,0,0,.30), 0 4px 12px rgba(0,0,0,.08);
++  --ease-out: cubic-bezier(.2,.8,.2,1); --ease-spring: cubic-bezier(.3,1.35,.5,1); --ease-inout: cubic-bezier(.6,0,.2,1); --ease-in: cubic-bezier(.4,0,1,1); }
++.int { pointer-events: auto; }
++button { font: inherit; color: inherit; }
++.num { font-variant-numeric: tabular-nums; }
++/* selection: four crop corners, size on the bottom edge */
++.sel { position: absolute; left: 0; top: 0; }
++.sel i { position: absolute; width: 9px; height: 9px; border: 0 solid var(--m-space); }
++.sel i:nth-child(1) { left: -2px; top: -2px; border-width: 1.5px 0 0 1.5px; border-top-left-radius: 3px; }
++.sel i:nth-child(2) { right: -2px; top: -2px; border-width: 1.5px 1.5px 0 0; border-top-right-radius: 3px; }
++.sel i:nth-child(3) { left: -2px; bottom: -2px; border-width: 0 0 1.5px 1.5px; border-bottom-left-radius: 3px; }
++.sel i:nth-child(4) { right: -2px; bottom: -2px; border-width: 0 1.5px 1.5px 0; border-bottom-right-radius: 3px; }
++.hov { position: absolute; left: 0; top: 0; box-shadow: 0 0 0 1px color-mix(in srgb, var(--m-space) 70%, transparent); border-radius: 2px; transition: transform var(--t, 90ms) var(--ease-out), width var(--t, 90ms) var(--ease-out), height var(--t, 90ms) var(--ease-out); }
++.size { position: absolute; left: 50%; bottom: 0; transform: translate(-50%, 50%); height: 16px; padding: 0 5px; border-radius: var(--r-xs); background: rgba(255,255,255,.92); color: var(--m-space-ink); font: 600 10px/16px -apple-system, system-ui, sans-serif; box-shadow: var(--e1); white-space: nowrap; font-variant-numeric: tabular-nums; }
++.pad { position: absolute; background: repeating-linear-gradient(-45deg, color-mix(in srgb, var(--m-space) 22%, transparent) 0 3px, color-mix(in srgb, var(--m-space) 6%, transparent) 3px 6px); }
++/* measurements: 1px red, 7px ticks, number on the break with a halo of the page colour */
++.ml { position: absolute; background: var(--m-measure); }
++.ml.h { height: 1px; transform-origin: 50% 50%; animation: drawx 140ms var(--ease-out) both; }
++.ml.v { width: 1px; transform-origin: 50% 50%; animation: drawy 140ms var(--ease-out) both; }
++@keyframes drawx { from { transform: scaleX(0); } } @keyframes drawy { from { transform: scaleY(0); } }
++.ml.h::before, .ml.h::after { content: ''; position: absolute; top: -3px; width: 1px; height: 7px; background: var(--m-measure); animation: tick 60ms 140ms both; }
++.ml.h::before { left: 0; } .ml.h::after { right: 0; }
++.ml.v::before, .ml.v::after { content: ''; position: absolute; left: -3px; width: 7px; height: 1px; background: var(--m-measure); animation: tick 60ms 140ms both; }
++.ml.v::before { top: 0; } .ml.v::after { bottom: 0; }
++@keyframes tick { from { opacity: 0; } }
++.mn { position: absolute; color: var(--m-measure); font: 600 10.5px/1 -apple-system, system-ui, sans-serif; font-variant-numeric: tabular-nums; padding: 1px 2px; white-space: nowrap; animation: tick 80ms 80ms both; }
++.stem { position: absolute; width: 0; border-left: 1px dashed color-mix(in srgb, var(--m-measure) 55%, transparent); }
++/* the loupe: real pixels ×12, steel rim, colour on the rim */
++.loupe { position: absolute; width: 184px; height: 184px; border-radius: 50%; animation: loupeIn 160ms var(--ease-spring) both; }
++@keyframes loupeIn { from { opacity: 0; transform: scale(.92); } }
++.loupe .rim { position: absolute; inset: 0; border-radius: 50%; background: conic-gradient(from 200deg, #fdfdfd, #dcdce3, #f7f7fa, #cfcfd8, #fdfdfd); box-shadow: inset 0 1px 0 #fff, 0 14px 34px -8px rgba(0,0,0,.35), 0 0 0 .5px rgba(0,0,0,.18); }
++.loupe .lens { position: absolute; inset: 14px; border-radius: 50%; overflow: hidden; background: #fff; box-shadow: inset 0 0 0 .5px rgba(0,0,0,.25), inset 0 2px 6px rgba(0,0,0,.18); }
++.loupe canvas { position: absolute; inset: 0; width: 100%; height: 100%; image-rendering: pixelated; }
++.loupe .grid { position: absolute; inset: 0; background-image: linear-gradient(rgba(0,0,0,.09) 1px, transparent 1px), linear-gradient(90deg, rgba(0,0,0,.09) 1px, transparent 1px); background-size: 12px 12px; background-position: center; }
++.loupe .ctr { position: absolute; left: 50%; top: 50%; width: 14px; height: 14px; transform: translate(-50%, -50%); box-shadow: 0 0 0 1.5px #fff, 0 0 0 2.5px #1d1d22; }
++.loupe .sample { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; white-space: nowrap; overflow: hidden; }
++.loupe svg.arc { position: absolute; inset: 0; overflow: visible; }
++.loupe svg.arc text { font: 650 7.5px -apple-system, system-ui, sans-serif; letter-spacing: 1.1px; fill: var(--m-space-ink); text-transform: uppercase; }
++.loupe svg.arc text.lo { fill: var(--m-text-2); }
++/* readout capsule (also the only toast): key turns into a check on success */
++.cap { position: absolute; display: inline-flex; align-items: center; gap: 8px; height: 30px; padding: 0 5px 0 5px; border-radius: var(--r-pill); background: var(--m-hud); color: var(--m-hud-text); backdrop-filter: blur(24px) saturate(1.6); box-shadow: var(--e3); white-space: nowrap; font-size: 12px; }
++.cap .dot { width: 20px; height: 20px; border-radius: 50%; box-shadow: inset 0 0 0 1px rgba(255,255,255,.25); flex: none; }
++.cap code { font: 600 12px/1 -apple-system, system-ui, sans-serif; font-variant-numeric: tabular-nums; letter-spacing: .01em; }
++.cap .tk { color: #b8b9f5; font-size: 11.5px; } .cap .tk.off { color: #f3c969; }
++.cap .seg2 { display: inline-flex; gap: 2px; } .cap .seg2 span { padding: 0 8px; height: 22px; line-height: 22px; border-radius: var(--r-pill); color: var(--m-hud-2); } .cap .seg2 span b { color: var(--m-hud-text); font-weight: 500; margin-left: 4px; }
++.cap .seg2 span:first-child { background: rgba(255,255,255,.08); }
++.kbd { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; padding: 0 5px; border-radius: var(--r-xs); background: rgba(255,255,255,.12); color: var(--m-hud-text); font: 600 10.5px/1 -apple-system, system-ui, sans-serif; box-shadow: inset 0 -1px 0 rgba(0,0,0,.25); transition: background 160ms; }
++.kbd.done { background: var(--m-ok); }
++.light .kbd { background: var(--m-surface-2); color: var(--m-text); box-shadow: var(--e1); }
++.toast { position: absolute; left: 50%; transform: translateX(-50%); padding: 0 12px 0 6px; animation: capIn 160ms var(--ease-spring) both; }
++.toast.out { animation: capOut 120ms var(--ease-in) both; }
++@keyframes capIn { from { opacity: 0; transform: translate(-50%, 6px) scale(.96); } } @keyframes capOut { to { opacity: 0; transform: translate(-50%, -4px); } }
++.ck { width: 18px; height: 18px; border-radius: 50%; background: var(--m-ok); display: inline-flex; align-items: center; justify-content: center; flex: none; }
++.ck.bad { background: var(--m-danger); color: #fff; font-weight: 700; font-size: 11px; }
++.ck svg { width: 10px; height: 10px; } .ck path { stroke-dasharray: 20; stroke-dashoffset: 20; animation: draw 200ms 60ms var(--ease-out) forwards; }
++@keyframes draw { to { stroke-dashoffset: 0; } }
++/* full card (Space) */
++.hud { position: absolute; width: 300px; background: var(--m-hud); color: var(--m-hud-text); border-radius: var(--r-lg); box-shadow: var(--e4); backdrop-filter: blur(24px) saturate(1.6); overflow: hidden; animation: tick 120ms both; }
++.hud .hh { display: flex; align-items: center; gap: 8px; padding: 10px 12px 4px; }
++.hud .tag { font: 600 11px/1 ui-monospace, "SF Mono", Menlo, monospace; color: #b8b9f5; }
++.hud .nm { font-weight: 600; font-size: 12.5px; } .hud .dim { margin-left: auto; color: var(--m-hud-2); font-variant-numeric: tabular-nums; }
++.hud .crumbs { padding: 0 12px 8px; color: var(--m-hud-2); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
++.hud .rows { padding: 2px 4px 4px; box-shadow: inset 0 .5px 0 rgba(255,255,255,.1); }
++.hud .r { display: grid; grid-template-columns: 70px 1fr 20px; align-items: center; gap: 8px; height: 28px; padding: 0 8px; border-radius: var(--r-sm); cursor: pointer; }
++.hud .r:hover { background: rgba(255,255,255,.07); }
++.hud .r.flash { animation: rflash 300ms var(--ease-out); } @keyframes rflash { 30% { background: color-mix(in srgb, var(--m-space) 45%, transparent); } }
++.hud .k { color: var(--m-hud-2); font-size: 11.5px; }
++.hud .v { display: flex; align-items: center; gap: 7px; min-width: 0; white-space: nowrap; overflow: hidden; font-variant-numeric: tabular-nums; }
++.hud .v .m { color: var(--m-hud-2); }
++.hud .sw { width: 14px; height: 14px; border-radius: var(--r-xs); box-shadow: inset 0 0 0 .5px rgba(255,255,255,.3); flex: none; }
++.hud .plus { width: 20px; height: 20px; border-radius: var(--r-sm); border: 0; padding: 0; background: var(--m-space); color: #fff; font-size: 14px; line-height: 1; cursor: pointer; opacity: 0; transition: opacity 120ms; }
++.hud .r:hover .plus { opacity: 1; }
++.badge { display: inline-flex; align-items: center; gap: 3px; height: 16px; padding: 0 5px; border-radius: var(--r-xs); font: 650 10px/16px -apple-system, system-ui, sans-serif; background: color-mix(in srgb, var(--c) 14%, transparent); color: var(--c); }
++.hud .badge { background: color-mix(in srgb, var(--c) 24%, transparent); color: color-mix(in srgb, var(--c) 60%, #fff); }
++.hud .ft { padding: 6px 8px 8px; display: flex; align-items: center; gap: 6px; box-shadow: inset 0 .5px 0 rgba(255,255,255,.1); }
++.fmt { display: inline-flex; background: rgba(255,255,255,.07); border-radius: var(--r-md); padding: 2px; gap: 1px; }
++.fmt button { font: 600 10.5px/1 -apple-system, system-ui, sans-serif; padding: 5px 7px; border-radius: var(--r-sm); color: var(--m-hud-2); background: none; border: 0; cursor: pointer; }
++.fmt button.on { background: rgba(255,255,255,.16); color: #fff; }
++.light .fmt { background: var(--m-surface-2); } .light .fmt button { color: var(--m-text-2); } .light .fmt button.on { background: #fff; color: var(--m-text); box-shadow: var(--e1); }
++/* panels */
++.panel { position: absolute; background: var(--m-surface); color: var(--m-text); border-radius: var(--r-xl); box-shadow: var(--e4); pointer-events: auto; font-size: 13px; }
++.panel.in { animation: panelIn 160ms var(--ease-out) both; } @keyframes panelIn { from { opacity: 0; transform: translateY(6px) scale(.98); } }
++.panel.sheet.in { animation: sheetIn 240ms var(--ease-out) both; } @keyframes sheetIn { from { opacity: 0; transform: translateX(24px); } }
++.ph { display: flex; align-items: center; gap: 8px; padding: 14px 16px 10px; } .ph b { font-size: 14.5px; letter-spacing: -.01em; } .ph .m { color: var(--m-text-2); font-size: 12px; }
++.x { margin-left: auto; width: 24px; height: 24px; border-radius: var(--r-sm); border: 0; background: none; color: var(--m-text-3); cursor: pointer; font-size: 15px; } .x:hover { background: var(--m-surface-2); }
++.sec { padding: 6px 16px 10px; }
++.sl { font-size: 11.5px; font-weight: 600; color: var(--m-text-2); margin: 4px 0 8px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; } .sl .c { font-weight: 400; }
++.btn { height: 28px; padding: 0 11px; border-radius: var(--r-md); font: 500 12.5px/1 -apple-system, system-ui, sans-serif; display: inline-flex; align-items: center; gap: 6px; background: var(--m-surface-2); border: 0; box-shadow: none; white-space: nowrap; cursor: pointer; color: var(--m-text); transition: transform 150ms var(--ease-out); }
++.btn:hover { background: color-mix(in srgb, var(--m-surface-2) 85%, #000); }
++.btn.pri { background: var(--m-space); color: #fff; } .btn.pri:hover { background: color-mix(in srgb, var(--m-space) 90%, #000); }
++.btn.ghost { background: none; color: var(--m-text-2); }
++.btn:active, .dock .t:active, .chip:active { transform: scale(.97); transition-duration: 80ms; }
++.dark .btn { background: rgba(255,255,255,.1); color: var(--m-hud-text); } .dark .btn.pri { background: var(--m-space); color: #fff; } .dark .btn.ghost { background: none; color: var(--m-hud-2); }
++.seg { display: inline-flex; padding: 2px; gap: 2px; border-radius: var(--r-md); background: var(--m-surface-2); }
++.seg button { height: 24px; padding: 0 9px; border: 0; border-radius: var(--r-sm); background: none; color: var(--m-text-2); font: 500 12px/1 -apple-system, system-ui, sans-serif; cursor: pointer; white-space: nowrap; }
++.seg button.on { background: #fff; color: var(--m-text); box-shadow: var(--e1); }
++.dark .seg { background: rgba(255,255,255,.08); } .dark .seg button { color: var(--m-hud-2); } .dark .seg button.on { background: rgba(255,255,255,.18); color: #fff; box-shadow: none; }
++.chip { height: 24px; padding: 0 9px; border-radius: var(--r-pill); font: 12px/1 -apple-system, system-ui, sans-serif; display: inline-flex; align-items: center; gap: 6px; background: var(--m-surface-2); color: var(--m-text-2); white-space: nowrap; border: 0; cursor: pointer; }
++.chip.on { background: var(--m-space-wash); color: var(--m-space-ink); font-weight: 500; }
++/* paint-chip fan deck */
++.fan { position: relative; height: 196px; margin: 0 16px; }
++.fan .chipc { position: absolute; left: 50%; bottom: 8px; width: 68px; height: 170px; margin-left: -34px; border-radius: var(--r-sm); background: #fff; box-shadow: var(--e2); transform-origin: 50% 160px; overflow: hidden; cursor: pointer; transition: transform 240ms var(--ease-spring); }
++.fan .chipc i { display: block; height: 118px; }
++.fan .chipc span { display: block; padding: 6px 6px 0; font: 600 9.5px/1.2 -apple-system, system-ui, sans-serif; letter-spacing: .04em; color: var(--m-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
++.fan .chipc small { display: block; padding: 0 6px; font-size: 9px; color: var(--m-text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
++.fan .chipc::after { content: ''; position: absolute; left: 50%; bottom: 6px; width: 7px; height: 7px; margin-left: -3.5px; border-radius: 50%; background: #e9e9ee; box-shadow: inset 0 1px 1px rgba(0,0,0,.2); }
++.fan .chipc.top { box-shadow: 0 0 0 1.5px var(--m-space), var(--e3); }
++.fan .rivet { position: absolute; left: 50%; bottom: 13px; width: 12px; height: 12px; margin-left: -6px; border-radius: 50%; background: radial-gradient(circle at 35% 30%, #fff, #c9a64a 55%, #8d6c1e); box-shadow: 0 1px 2px rgba(0,0,0,.3); z-index: 50; }
++.ccard { display: flex; align-items: center; gap: 10px; padding: 10px 16px 6px; }
++.ccard .big { width: 40px; height: 40px; border-radius: 50%; box-shadow: 0 0 0 3px #fff, var(--e2); flex: none; }
++.ccard b { font-size: 14px; } .ccard small { display: block; color: var(--m-text-2); font-size: 12px; font-variant-numeric: tabular-nums; }
++.newb { font: 650 10px/16px -apple-system, system-ui, sans-serif; padding: 0 6px; border-radius: var(--r-xs); background: var(--m-space-wash); color: var(--m-space-ink); margin-left: 6px; vertical-align: 2px; }
++.fontrow { border-radius: var(--r-md); background: var(--m-surface-2); padding: 10px 12px; display: flex; align-items: flex-end; gap: 8px; margin-bottom: 6px; }
++.fontrow .sp { position: relative; white-space: nowrap; overflow: hidden; } .fontrow .sp::after { content: ''; position: absolute; left: 0; right: 0; bottom: .18em; border-bottom: 1px dashed color-mix(in srgb, var(--m-space) 30%, transparent); }
++.fontrow small { margin-left: auto; text-align: right; font-size: 11px; color: var(--m-text-2); white-space: nowrap; } .fontrow small b { display: block; color: var(--m-text); font-weight: 600; font-size: 11.5px; }
++.bars { display: grid; grid-template-columns: 28px 1fr; gap: 4px 8px; align-items: center; font-size: 10.5px; color: var(--m-text-2); font-variant-numeric: tabular-nums; }
++.bars span { text-align: right; } .bars i { height: 6px; border-radius: 2px; background: color-mix(in srgb, var(--m-space) 35%, transparent); }
++.bars i.off { background: color-mix(in srgb, var(--m-warn) 60%, transparent); }
++.corner { width: 40px; height: 40px; border-top: 1.5px solid var(--m-text); border-left: 1.5px solid var(--m-text); margin-bottom: 4px; }
++.qr { display: flex; gap: 12px; font-size: 10.5px; color: var(--m-text-2); text-align: center; }
++/* palette tiles (system sheet) */
++.pal { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
++.pal .s { border-radius: var(--r-md); overflow: hidden; background: var(--m-surface); box-shadow: var(--m-hair); cursor: pointer; }
++.pal .s i { display: block; height: 34px; }
++.pal .s div { padding: 5px 7px 6px; font-size: 11.5px; line-height: 1.3; }
++.pal .s div > * { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
++.pal .s small { color: var(--m-text-2); font-size: 10.5px; font-variant-numeric: tabular-nums; }
++/* dock: one HUD; the active tool becomes a pill, mode panels grow out of it */
++.dock { position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%); display: flex; flex-direction: column; align-items: stretch; border-radius: var(--r-xl); background: var(--m-hud); color: var(--m-hud-text); backdrop-filter: blur(24px) saturate(1.6); box-shadow: var(--e4); pointer-events: auto; animation: dockIn 160ms var(--ease-spring) both; max-width: calc(100vw - 24px); }
++@keyframes dockIn { from { opacity: 0; transform: translate(-50%, 8px); } }
++.dock .dp { overflow: hidden; }
++.dock .dpi { padding: 10px 12px 4px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; animation: tick 120ms 80ms both; max-width: 760px; }
++.dock .dpi .ttl { font-weight: 600; } .dock .dpi .m { color: var(--m-hud-2); }
++.dock .tools { display: flex; align-items: center; gap: 2px; padding: 5px; justify-content: center; }
++.dock .t { height: 36px; min-width: 36px; padding: 0 9px; border-radius: var(--r-lg); display: inline-flex; align-items: center; justify-content: center; gap: 0; color: var(--m-hud-2); position: relative; border: 0; background: none; cursor: pointer; font: 500 12.5px/1 -apple-system, system-ui, sans-serif; transition: transform 150ms var(--ease-out), background 120ms; }
++.dock .t svg { stroke-width: 1.5; }
++.dock .t:hover { background: rgba(255,255,255,.07); color: var(--m-hud-text); }
++.dock .t .lab { max-width: 0; overflow: hidden; white-space: nowrap; transition: max-width 240ms var(--ease-spring), margin 240ms var(--ease-spring); }
++.dock .t.on { background: var(--m-space); color: #fff; } .dock .t.on .lab { max-width: 120px; margin-left: 7px; }
++.dock .t .tipx { position: absolute; bottom: 46px; left: 50%; transform: translateX(-50%); background: var(--m-hud); color: var(--m-hud-text); padding: 6px 9px; border-radius: var(--r-md); white-space: nowrap; font-weight: 500; font-size: 11.5px; opacity: 0; pointer-events: none; transition: opacity 120ms; box-shadow: var(--e3); }
++.dock .t:hover .tipx { opacity: 1; transition-delay: var(--tipdelay, 450ms); }
++.dock.haspanel .t .tipx { display: none; }
++.dock .sep { width: 1px; height: 20px; background: rgba(255,255,255,.14); margin: 0 4px; }
++.dock .cnt { position: absolute; top: 3px; right: 3px; width: 7px; height: 7px; border-radius: 50%; background: var(--m-space); box-shadow: 0 0 0 1.5px rgba(28,28,33,1); }
++.dock .t.bump { animation: bump 240ms var(--ease-spring); } @keyframes bump { 50% { transform: scale(1.15); } }
++.dock .cnum { min-width: 22px; height: 20px; padding: 0 7px; border-radius: var(--r-pill); background: color-mix(in srgb, var(--m-danger) 22%, transparent); color: #ff9ea1; font-weight: 600; display: inline-flex; align-items: center; font-variant-numeric: tabular-nums; }
++.dock .cnum.ok { background: color-mix(in srgb, var(--m-ok) 22%, transparent); color: #8fe2b6; }
++.dock .cnum.w { background: color-mix(in srgb, var(--m-warn) 22%, transparent); color: #f3d36b; }
++.ib { width: 24px; height: 24px; border-radius: var(--r-sm); border: 0; background: none; color: inherit; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; } .ib:hover { background: rgba(255,255,255,.1); }
++/* drop pins on the margin */
++.drop { position: absolute; width: 22px; height: 22px; pointer-events: auto; cursor: pointer; animation: dropIn 240ms var(--ease-spring) both; }
++.drop .b { position: absolute; inset: 0; border-radius: 50% 50% 50% 3px; background: var(--m-text); box-shadow: 0 0 0 1.5px #fff, 0 4px 10px -2px rgba(0,0,0,.35); }
++.drop.l .b { transform: rotate(45deg); } .drop.r .b { transform: rotate(-135deg); }
++.drop .n { position: absolute; inset: 0; color: #fff; font: 700 11px/22px -apple-system, system-ui, sans-serif; text-align: center; }
++.drop .w { position: absolute; right: -2px; top: -2px; width: 8px; height: 8px; border-radius: 50%; background: var(--m-warn); box-shadow: 0 0 0 1.5px #fff; }
++.drop.ok .b { background: var(--m-ok); }
++@keyframes dropIn { from { opacity: 0; transform: scale(.6); } }
++.ring { position: absolute; border-radius: var(--r-sm); box-shadow: 0 0 0 1px var(--c, var(--m-warn)), 0 0 0 4px color-mix(in srgb, var(--c, var(--m-warn)) 15%, transparent); transition: opacity 240ms; }
++.lead { position: absolute; border-left: 1px dashed var(--m-text-3); width: 0; }
++.leadh { position: absolute; border-top: 1px dashed var(--m-text-3); height: 0; }
++/* contrast: wavy underline + number capsule to the right */
++.wavy { position: absolute; height: 5px; overflow: visible; }
++.num-c { position: absolute; height: 16px; padding: 0 5px; border-radius: var(--r-pill); background: var(--m-surface); box-shadow: var(--e2); color: var(--m-danger); font: 650 10px/16px -apple-system, system-ui, sans-serif; font-variant-numeric: tabular-nums; pointer-events: auto; cursor: pointer; white-space: nowrap; }
++.okline { position: absolute; height: 1.5px; background: color-mix(in srgb, var(--m-ok) 70%, transparent); border-radius: 1px; }
++.opt { display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 8px; border-radius: var(--r-md); cursor: pointer; }
++.opt:hover { background: var(--m-surface-2); } .opt.best { box-shadow: 0 0 0 1px color-mix(in srgb, var(--m-ok) 60%, transparent); }
++.opt i { width: 16px; height: 16px; border-radius: var(--r-xs); flex: none; box-shadow: var(--m-hair); } .opt .n { margin-left: auto; font-variant-numeric: tabular-nums; }
++/* capture: marching ants + shutter */
++.ants { position: absolute; overflow: visible; }
++.ants rect.w { fill: none; stroke: #fff; stroke-width: 2; } .ants rect.a { fill: none; stroke: var(--m-text); stroke-width: 1; stroke-dasharray: 4 4; animation: march 600ms linear infinite; }
++@keyframes march { to { stroke-dashoffset: -8; } }
++.ants .lbl { position: absolute; left: 0; top: -24px; height: 18px; padding: 0 6px; border-radius: var(--r-xs); background: rgba(255,255,255,.94); color: var(--m-text); font: 600 10.5px/18px -apple-system, system-ui, sans-serif; box-shadow: var(--e1); white-space: nowrap; font-variant-numeric: tabular-nums; }
++.shutter { position: absolute; background: #fff; pointer-events: none; }
++.card { position: absolute; right: 16px; bottom: 96px; width: 340px; overflow: hidden; }
++.card .thumb { margin: 0 14px; border-radius: var(--r-md); overflow: hidden; background: repeating-conic-gradient(#f2f2f5 0 25%, #fff 0 50%) 0 0 / 14px 14px; box-shadow: var(--m-hair); display: flex; align-items: center; justify-content: center; max-height: 200px; position: relative; cursor: grab; }
++.card .thumb img { max-width: 100%; max-height: 200px; display: block; }
++.card .meta { padding: 8px 14px 0; font-size: 11.5px; color: var(--m-text-2); line-height: 1.45; }
++.card .meta div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
++.card .acts { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 14px 14px; align-items: center; }
++.card textarea { width: calc(100% - 28px); margin: 10px 14px 0; height: 40px; resize: none; border-radius: var(--r-md); border: 0; box-shadow: var(--e1); padding: 7px 9px; font: 12.5px/1.35 -apple-system, system-ui, sans-serif; }
++.card textarea:focus { outline: none; box-shadow: 0 0 0 1px var(--m-space), 0 0 0 3px var(--m-space-wash); }
++.menu { position: absolute; width: 270px; padding: 5px; border-radius: var(--r-lg); font-size: 13px; }
++.menu .it { height: 26px; padding: 0 10px; display: flex; align-items: center; gap: 8px; border-radius: var(--r-sm); cursor: pointer; white-space: nowrap; }
++.menu .it:hover { background: var(--m-space); color: #fff; } .menu .sepl { height: .5px; background: rgba(0,0,0,.15); margin: 4px 6px; }
++.imgs .im { display: flex; gap: 9px; align-items: center; padding: 5px; border-radius: var(--r-md); }
++.imgs .im:hover { background: var(--m-surface-2); }
++.imgs .im .th { width: 44px; height: 44px; border-radius: var(--r-sm); flex: none; background: var(--m-surface-2) center/contain no-repeat; box-shadow: var(--m-hair); }
++.imgs .im .meta { flex: 1; min-width: 0; line-height: 1.3; font-size: 12px; } .imgs .im .meta b { font-weight: 500; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .imgs .im .meta span { color: var(--m-text-2); }
++.cmp { border-radius: var(--r-md); background: var(--m-surface-2); min-height: 72px; display: flex; flex-direction: column; align-items: center; gap: 7px; padding: 10px 6px 7px; font-size: 10.5px; color: var(--m-text-2); overflow: hidden; } .cmp > :last-child { margin-top: auto; }
++.scale { display: flex; align-items: baseline; gap: 10px; padding: 3px 0; box-shadow: inset 0 -.5px 0 rgba(0,0,0,.08); }
++.scale .n { width: 34px; font-size: 11px; color: var(--m-text-2); font-variant-numeric: tabular-nums; flex: none; } .scale .s { white-space: nowrap; overflow: hidden; } .scale .w { margin-left: auto; font-size: 11px; color: var(--m-text-2); white-space: nowrap; } .scale .w.off { color: #a77f00; }
++pre.code { margin: 0 16px; max-height: 330px; overflow: auto; background: var(--m-surface-2); border-radius: var(--r-md); padding: 10px 12px; font: 11px/1.5 ui-monospace, "SF Mono", Menlo, monospace; white-space: pre-wrap; }
++.fly { position: absolute; width: 26px; height: 26px; border-radius: var(--r-sm); box-shadow: 0 0 0 2px #fff, 0 6px 16px rgba(40,20,90,.35); left: 0; top: 0; will-change: transform; z-index: 60; }
++.flypath { position: absolute; inset: 0; overflow: visible; pointer-events: none; }
++.sweep { position: absolute; left: 0; right: 0; top: 0; height: 41px; background: linear-gradient(to top, var(--m-space) 0 1px, color-mix(in srgb, var(--m-space) 10%, transparent) 1px, transparent); }
++.dim { position: absolute; inset: 0; background: rgba(30,20,60,.08); animation: tick 200ms both; }
++/* stress text: red tape beyond the container's edge */
++.tape { position: absolute; background: repeating-linear-gradient(45deg, color-mix(in srgb, var(--m-danger) 18%, transparent) 0 6px, transparent 6px 12px); }
++.edge { position: absolute; background: var(--m-danger); }
++.sring { position: absolute; border-radius: var(--r-xs); box-shadow: 0 0 0 1px var(--m-danger); }
++.why { position: absolute; max-width: 260px; padding: 8px 10px; border-radius: var(--r-md); background: var(--m-surface); box-shadow: var(--e3); font-size: 12px; pointer-events: none; }
++@media (prefers-reduced-motion: reduce) { .root * { animation-duration: 120ms !important; animation-name: tick !important; transition: opacity 120ms !important; } .ants rect.a { animation: none !important; } }
++`;
++
++const ICON = {
++  lens: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L20 20M10.5 7.5v6M7.5 10.5h6"/>',
++  system: '<rect x="3.5" y="3.5" width="7" height="7" rx="2"/><circle cx="17" cy="7" r="3.5"/><path d="M3.5 17h7M3.5 20.5h4.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="3.5"/>',
++  camera: '<path d="M4.5 8.5a2 2 0 0 1 2-2h1.8l1.5-2h4.4l1.5 2h1.8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2z"/><circle cx="12" cy="13" r="3.3"/>',
++  text: '<path d="M5 7V5h14v2M12 5v14M9 19h6"/>',
++  contrast: '<circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v17a8.5 8.5 0 0 0 0-17z" fill="currentColor" stroke="none"/>',
++  brandchk: '<path d="M12 3l7.5 3v5.5c0 4.5-3.2 8-7.5 9.5-4.3-1.5-7.5-5-7.5-9.5V6z"/><path d="M8.5 12l2.5 2.5 4.5-5"/>',
++  palette: '<path d="M12 3.5a8.5 8.5 0 1 0 0 17c1.2 0 1.8-.9 1.4-1.9-.4-1 .2-2.1 1.3-2.1H17a3.5 3.5 0 0 0 3.5-3.5c0-5.2-3.8-9.5-8.5-9.5z"/><circle cx="7.5" cy="11" r="1.2"/><circle cx="10" cy="7.5" r="1.2"/><circle cx="14.5" cy="7.5" r="1.2"/>',
++  phone: '<rect x="6.5" y="2.5" width="11" height="19" rx="2.5"/><path d="M10.5 5h3"/>',
++  chevL: '<path d="M14.5 6l-6 6 6 6"/>', chevR: '<path d="M9.5 6l6 6-6 6"/>', undo: '<path d="M9 14.5L4.5 10 9 5.5"/><path d="M4.5 10h10a5 5 0 0 1 0 10h-3"/>',
++};
++const ic = (n, s = 18) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICON[n] || ''}</svg>`;
++const CHECK = '<svg viewBox="0 0 12 12"><path d="M2.5 6.2l2.3 2.3 4.7-5" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
++const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
++const KEY = { mac: { mod: '⌘', alt: '⌥' }, other: { mod: 'Ctrl', alt: 'Alt' } };
++
++// ------------------------------------------------------------------ create
++function create(adapter = {}) {
++  const A = adapter;
++  const K = KEY[(A.platform || (/Mac/.test(navigator.platform) ? 'mac' : 'other')) === 'mac' ? 'mac' : 'other'];
++  const reduced = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
++  const SCOPE = () => (A.root && A.root()) || document.body;
++  const mem = {};
++  const store = A.store || { get: async k => mem[k], set: async (k, v) => { mem[k] = v; } };
++
++  // ---------- host: top layer, closed shadow root
++  const host = document.createElement('meridian-toolkit');
++  host.setAttribute('popover', 'manual');
++  host.style.cssText = 'all:initial;position:fixed;inset:0;width:100vw;height:100vh;margin:0;padding:0;border:0;background:transparent;overflow:visible;pointer-events:none;z-index:2147483647;display:block';
++  const sh = host.attachShadow({ mode: 'closed' });
++  sh.innerHTML = `<style>${CSS}</style><div class="root"></div>`;
++  const root = sh.querySelector('.root');
++  if (A.accent) { root.style.setProperty('--m-space', A.accent); if (A.accentInk) root.style.setProperty('--m-space-ink', A.accentInk); }
++  function mount() {
++    if (!host.isConnected) document.documentElement.appendChild(host);
++    try { if (host.matches(':popover-open')) host.hidePopover(); host.showPopover(); } catch {}
++  }
++  function unmountIfIdle() { if (!S.active && !S.mode && !S.peek && !root.querySelector('.card,.panel,.toast,.dock')) { try { host.hidePopover(); } catch {} host.remove(); } }
++  const H = (html, cls) => { const d = document.createElement('div'); if (cls) d.className = cls; d.innerHTML = html; return d; };
++  const add = (html, cls, parent = root) => { const n = H(html, cls); parent.appendChild(n); return n; };
++  const layer = name => { let l = root.querySelector(`[data-l="${name}"]`); if (!l) { l = document.createElement('div'); l.dataset.l = name; root.insertBefore(l, root.firstChild); } return l; };
++  const clear = name => { const l = root.querySelector(`[data-l="${name}"]`); if (l) l.innerHTML = ''; };
++  const place = (n, x, y) => { n.style.left = Math.round(x) + 'px'; n.style.top = Math.round(y) + 'px'; };
++  const box = (n, r, g = 0) => Object.assign(n.style, { left: r.left - g + 'px', top: r.top - g + 'px', width: r.width + 2 * g + 'px', height: r.height + 2 * g + 'px' });
++
++  // one placement rule: below → right → above → left, never on page text or controls
++  const textRects = () => { const now = performance.now(); if (textRects.t && now - textRects.t < 400) return textRects.v; textRects.t = now;
++    const out = []; for (const el of SCOPE().querySelectorAll('a,button,input,h1,h2,h3,h4,h5,h6,p,li,span,label,img,svg')) { const r = el.getBoundingClientRect(); if (r.width && r.height && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth && r.width < innerWidth * .9) out.push(r); if (out.length > 400) break; }
++    textRects.v = out; return out; };
++  function placeFree(n, r, opts = {}) {
++    const w = n.offsetWidth, h = n.offsetHeight, gap = opts.gap ?? 10;
++    const cands = [[r.left, r.bottom + gap], [r.right + gap, r.top], [r.left, r.top - h - gap], [r.left - w - gap, r.top], [r.right - w, r.bottom + gap], [r.left, r.bottom + gap + 40]];
++    const hits = (x, y) => { let s = 0; for (const t of textRects()) if (x < t.right && x + w > t.left && y < t.bottom && y + h > t.top) s += Math.min(x + w, t.right) - Math.max(x, t.left); return s; };
++    let best = null;
++    for (const [x0, y0] of cands) { const x = clamp(x0, 8, innerWidth - w - 8), y = clamp(y0, 8, innerHeight - h - (opts.bottom ?? 96)); const s = hits(x, y) + (x !== x0 || y !== y0 ? 30 : 0); if (!best || s < best.s) best = { x, y, s }; if (s === 0) break; }
++    place(n, best.x, best.y); return best;
++  }
++
++  // ---------- state
++  const S = { active: false, mode: null, peek: false, hover: null, sel: null, full: false, mouse: { x: innerWidth / 2, y: innerHeight / 2 },
++    fmt: 'HEX', brand: { name: 'Бренд', colors: [], fonts: [], spacing: [], radii: [] }, lastBugTarget: 'slack', topChip: -1 };
++  const FMTS = ['HEX', 'RGB', 'OKLCH', 'var', 'TW', 'Figma'];
++  Promise.resolve(store.get('prefs')).then(p => { if (p) { S.fmt = p.fmt || S.fmt; S.lastBugTarget = p.bug || S.lastBugTarget; } }).catch(() => {});
++  Promise.resolve(store.get('brand')).then(b => { if (b && b.colors) S.brand = b; }).catch(() => {});
++  const savePrefs = () => Promise.resolve(store.set('prefs', { fmt: S.fmt, bug: S.lastBugTarget })).catch(() => {});
++  const saveBrand = () => Promise.resolve(store.set('brand', S.brand)).catch(() => {});
++
++  // ---------- clipboard: confirmation only after a real success
++  async function copy(items) {
++    try {
++      if (A.copy) return !!(await A.copy(items));
++      if (items.png || items.html) {
++        const data = {};
++        if (items.text) data['text/plain'] = new Blob([items.text], { type: 'text/plain' });
++        if (items.html) data['text/html'] = new Blob([items.html], { type: 'text/html' });
++        if (items.png) data['image/png'] = items.png;
++        await navigator.clipboard.write([new ClipboardItem(data)]); return true;
++      }
++      await navigator.clipboard.writeText(items.text); return true;
++    } catch {
++      if (items.text && !items.png) { try { const t = document.createElement('textarea'); t.value = items.text; t.style.cssText = 'position:fixed;left:-9999px'; document.body.appendChild(t); t.select(); const ok = document.execCommand('copy'); t.remove(); return ok; } catch {} }
++      return false;
++    }
++  }
++  // the only toast: a HUD capsule centred above the dock
++  function toast(html, ok = true) {
++    root.querySelectorAll('.toast').forEach(t => t.remove());
++    const t = add(`<span class="ck ${ok ? '' : 'bad'}">${ok ? CHECK : '!'}</span>${html}`, 'cap toast');
++    const d = root.querySelector('.dock'); t.style.top = 'auto'; t.style.bottom = (d ? innerHeight - d.getBoundingClientRect().top + 10 : 24) + 'px';
++    setTimeout(() => { t.classList.add('out'); setTimeout(() => { t.remove(); unmountIfIdle(); }, 130); }, 1400);
++  }
++  const keyDone = n => { const k = n?.querySelector?.('.kbd'); if (!k) return; const old = k.innerHTML; k.classList.add('done'); k.innerHTML = CHECK.replace('<svg', '<svg width="10" height="10"'); setTimeout(() => { k.classList.remove('done'); k.innerHTML = old; }, 900); };
++
++  // ---------- formats
++  function brandFor(c) { let best = null; for (const t of S.brand.colors) { const d = dE(c, parseColor(t.hex)); if (!best || d < best.d) best = { t, d }; } return best; }
++  const slug = s => s.toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/gi, '-').replace(/^-|-$/g, '');
++  let siteVars = null;
++  function siteVarFor(hex) {
++    if (!siteVars) { siteVars = new Map(); try { const cs = getComputedStyle(document.documentElement); for (const p of cs) if (p.startsWith('--')) { const raw = cs.getPropertyValue(p).trim(); if (/^(#|rgb|hsl|oklch|color\()/.test(raw)) { const c = parseColor(raw); if (c) { const h = toHex(c); if (!siteVars.has(h)) siteVars.set(h, p); } } } } catch {} }
++    return siteVars.get(hex);
++  }
++  function fmtColor(c, prop = 'bg', f = S.fmt) {
++    const hex = toHex(c);
++    if (f === 'RGB') return c.a < 1 ? `rgb(${Math.round(c.r)} ${Math.round(c.g)} ${Math.round(c.b)} / ${+c.a.toFixed(2)})` : `rgb(${Math.round(c.r)} ${Math.round(c.g)} ${Math.round(c.b)})`;
++    if (f === 'OKLCH') { const o = oklch(c); return `oklch(${(o.L * 100).toFixed(1)}% ${o.C.toFixed(3)} ${o.h.toFixed(1)})`; }
++    if (f === 'var') { const b = brandFor(c); if (b && b.d < 0.02) return `var(--${slug(b.t.name)})`; const v = siteVarFor(hex); return v ? `var(${v})` : hex; }
++    if (f === 'TW') { const p = { bg: 'bg', text: 'text', border: 'border' }[prop] || 'bg'; const t = nearestTailwind(c); return t && t.d < 0.02 ? `${p}-${t.name}` : `${p}-[${hex.toLowerCase()}]`; }
++    if (f === 'Figma') { const b = brandFor(c); return b && b.d < 0.02 ? b.t.name : hex.slice(1); }
++    return hex;
++  }
++  function fmtType(cs, f = S.fmt) {
++    const fam = renderedFont(cs).family, w = +cs.fontWeight || 400, size = px(cs.fontSize), lh = cs.lineHeight === 'normal' ? 'normal' : px(cs.lineHeight), ls = cs.letterSpacing === 'normal' ? 0 : px(cs.letterSpacing);
++    if (f === 'TW') { const wn = { 100: 'thin', 200: 'extralight', 300: 'light', 400: 'normal', 500: 'medium', 600: 'semibold', 700: 'bold', 800: 'extrabold', 900: 'black' }[w] || 'normal'; return `text-[${size}px] leading-[${lh}${lh === 'normal' ? '' : 'px'}] font-${wn}${ls ? ` tracking-[${ls}px]` : ''}`; }
++    if (f === 'Figma') return `${fam} ${WEIGHTS[w] || w} ${size}/${lh}`;
++    return `font-family: ${cs.fontFamily};\nfont-size: ${size}px;\nfont-weight: ${w};\nline-height: ${lh}${lh === 'normal' ? '' : 'px'};\nletter-spacing: ${ls}${ls ? 'px' : ''};`;
++  }
++  const fmtLen = (v, kind, f = S.fmt) => f === 'TW' ? ({ p: `p-[${v.replace(/ /g, '_')}]`, r: `rounded-[${v}]` }[kind] || v) : f === 'Figma' ? v.replace(/px/g, '') : v;
++
++  // ---------- inspection
++  function inspect(el) {
++    const cs = getComputedStyle(el), r = el.getBoundingClientRect();
++    const bgInfo = effectiveBg(el), own = parseColor(cs.backgroundColor);
++    const hasText = !!ownText(el) || (el.children.length === 0 && !!el.textContent.trim());
++    const fg = textColor(el), font = renderedFont(cs);
++    const bgc = bgInfo.color || { r: 255, g: 255, b: 255, a: 1 };
++    const ratio = hasText ? contrast(over(fg, bgc), bgc) : null;
++    const size = parseFloat(cs.fontSize), large = size >= 24 || ((+cs.fontWeight || 400) >= 700 && size >= 18.66);
++    const pad = [cs.paddingTop, cs.paddingRight, cs.paddingBottom, cs.paddingLeft].map(px);
++    const padS = pad[0] === pad[2] && pad[1] === pad[3] ? (pad[0] === pad[1] ? `${pad[0]}` : `${pad[0]} ${pad[1]}`) : pad.join(' ');
++    const border = parseFloat(cs.borderTopWidth) > 0 && cs.borderTopStyle !== 'none' ? parseColor(cs.borderTopColor) : null;
++    return { el, cs, r, own: own && own.a > 0 ? own : null, bg: bgc, bgImage: bgInfo.image, fg, hasText, font, ratio, large, pad, padS, rad: px(cs.borderTopLeftRadius), border,
++      gap: /flex|grid/.test(cs.display) ? px(cs.columnGap === 'normal' ? 0 : cs.columnGap) : null, shadow: cs.boxShadow !== 'none' ? cs.boxShadow : null };
++  }
++  const kindName = el => {
++    const t = el.tagName.toLowerCase(), role = el.getAttribute('role'), cs = getComputedStyle(el), txt = el.textContent.trim();
++    if (t === 'button' || role === 'button' || (t === 'a' && /btn|button/.test(el.className))) return 'Кнопка';
++    if (txt && txt.length < 40 && el.children.length <= 2 && parseFloat(cs.borderTopLeftRadius) > 0 && /inline-flex|inline-block|flex/.test(cs.display) && ((parseColor(cs.backgroundColor)?.a || 0) > 0 || parseFloat(cs.borderTopWidth) > 0 || /inset/.test(cs.boxShadow))) return 'Кнопка';
++    if (t === 'a') return 'Ссылка'; if (/^h[1-6]$/.test(t)) return 'Заголовок ' + t[1]; if (t === 'p') return 'Абзац';
++    if (t === 'img') return 'Картинка'; if (t === 'svg') return 'Вектор'; if (t === 'input' || t === 'textarea') return 'Поле'; if (t === 'nav') return 'Навигация';
++    if (el.children.length === 0 && txt) return 'Текст';
++    if (/card|prod|item|tile/.test(el.className)) return 'Карточка';
++    return 'Блок';
++  };
++  function primaryColor(info) {
++    if (info.hasText && !info.own) return { c: over(info.fg, info.bg), prop: 'text', label: 'Текст' };
++    if (info.own) return { c: { ...info.own, a: 1 }, prop: 'bg', label: 'Фон' };
++    if (info.border) return { c: info.border, prop: 'border', label: 'Обводка' };
++    return { c: info.bg, prop: 'bg', label: 'Фон' };
++  }
++
++  // ---------- pixels for the loupe (adapter snapshot of the viewport; refreshed after scroll/changes)
++  let snap = null, snapBusy = false, snapAt = 0;
++  async function refreshSnap() {
++    if (!A.snapshot || snapBusy) return; snapBusy = true;
++    try { const s = await A.snapshot(); if (s) { snap = s; snapAt = performance.now(); } } catch {} snapBusy = false;
++  }
++  const pixelAt = (x, y) => { if (!snap) return null; try { const k = snap.scale || 1; const d = snap.ctx.getImageData(Math.round(x * k), Math.round(y * k), 1, 1).data; return { r: d[0], g: d[1], b: d[2], a: 1 }; } catch { return null; } };
++
++  // ---------- lens drawing
++  let selEl = null, hovEl = null, capEl = null, hudEl = null, loupeEl = null;
++  const padL = () => layer('pad'), measL = () => layer('meas');
++  function drawSel(r, label) {
++    if (!selEl) { selEl = add('<i></i><i></i><i></i><i></i><span class="size"></span>', 'sel'); }
++    selEl.style.display = ''; box(selEl, r); selEl.querySelector('.size').textContent = label;
++  }
++  function drawHov(r) { if (!hovEl) hovEl = add('', 'hov'); hovEl.style.display = ''; Object.assign(hovEl.style, { transform: `translate(${r.left}px, ${r.top}px)`, width: r.width + 'px', height: r.height + 'px' }); }
++  function drawPad(info) {
++    const L = padL(); L.innerHTML = ''; const { r, pad } = info; const [t, rt, b, l] = pad;
++    const p = (x, y, w, h) => { if (w > 0 && h > 0) { const d = H('', 'pad'); Object.assign(d.style, { left: x + 'px', top: y + 'px', width: w + 'px', height: h + 'px' }); L.appendChild(d); } };
++    p(r.left, r.top, l, r.height); p(r.right - rt, r.top, rt, r.height); p(r.left + l, r.top, r.width - l - rt, t); p(r.left + l, r.bottom - b, r.width - l - rt, b);
++  }
++  let haloColor = '#fff';
++  function mline(x1, y1, x2, y2) {
++    const L = measL(), horiz = y1 === y2, len = horiz ? x2 - x1 : y2 - y1; if (len < 1) return;
++    const ln = H('', 'ml ' + (horiz ? 'h' : 'v')); Object.assign(ln.style, horiz ? { left: x1 + 'px', top: y1 + 'px', width: len + 'px' } : { left: x1 + 'px', top: y1 + 'px', height: len + 'px' }); L.appendChild(ln);
++    const n = H(String(Math.round(len)), 'mn'); n.style.textShadow = `0 0 1.5px ${haloColor}, 0 0 1.5px ${haloColor}, 0 0 1.5px ${haloColor}`; n.style.background = haloColor; L.appendChild(n);
++    const w = n.offsetWidth, h = n.offsetHeight;
++    if (len >= 24) place(n, horiz ? (x1 + x2) / 2 - w / 2 : x1 - w / 2, horiz ? y1 - h / 2 : (y1 + y2) / 2 - h / 2);
++    else { // short gap: number above (or left) with a dashed stem
++      n.style.background = 'none';
++      if (horiz) { place(n, (x1 + x2) / 2 - w / 2, y1 - 26); const s = H('', 'stem'); Object.assign(s.style, { left: (x1 + x2) / 2 + 'px', top: y1 - 12 + 'px', height: '11px' }); L.appendChild(s); }
++      else { place(n, x1 + 14, (y1 + y2) / 2 - h / 2); const s = H('', 'leadh'); Object.assign(s.style, { left: x1 + 2 + 'px', top: (y1 + y2) / 2 + 'px', width: '11px', borderTopColor: 'color-mix(in srgb, #f24822 55%, transparent)' }); L.appendChild(s); }
++    }
++  }
++  function drawDistances(a, b) {
++    measL().innerHTML = '';
++    const inside = (p, q) => p.left >= q.left && p.right <= q.right && p.top >= q.top && p.bottom <= q.bottom;
++    if (inside(a, b) || inside(b, a)) { const [i, o] = inside(a, b) ? [a, b] : [b, a]; const cy = Math.round(i.top + i.height / 2), cx = Math.round(i.left + i.width / 2);
++      mline(o.left, cy, i.left, cy); mline(i.right, cy, o.right, cy); mline(cx, o.top, cx, i.top); mline(cx, i.bottom, cx, o.bottom); return; }
++    if (a.right <= b.left || b.right <= a.left) { const [l, r] = a.right <= b.left ? [a, b] : [b, a]; const top = Math.max(l.top, r.top), bot = Math.min(l.bottom, r.bottom); const y = Math.round(top < bot ? (top + bot) / 2 : a.top + a.height / 2); mline(l.right, y, r.left, y); }
++    if (a.bottom <= b.top || b.bottom <= a.top) { const [t, bb] = a.bottom <= b.top ? [a, b] : [b, a]; const left = Math.max(t.left, bb.left), right = Math.min(t.right, bb.right); const x = Math.round(left < right ? (left + right) / 2 : a.left + a.width / 2); mline(x, t.bottom, x, bb.top); }
++  }
++  function drawGap(el, x, y) {
++    measL().innerHTML = '';
++    const pr = el.getBoundingClientRect(), kids = [...el.children].map(k => k.getBoundingClientRect()).filter(k => k.width > 0 && k.height > 0);
++    let L = pr.left, R = pr.right, T = pr.top, B = pr.bottom;
++    for (const k of kids) { if (y >= k.top && y <= k.bottom) { if (k.right <= x) L = Math.max(L, k.right); if (k.left >= x) R = Math.min(R, k.left); }
++      if (x >= k.left && x <= k.right) { if (k.bottom <= y) T = Math.max(T, k.bottom); if (k.top >= y) B = Math.min(B, k.top); } }
++    if (R - L < innerWidth * 0.9) mline(Math.round(L), Math.round(y), Math.round(R), Math.round(y));
++    if (B - T < innerHeight * 0.9) mline(Math.round(x), Math.round(T), Math.round(x), Math.round(B));
++  }
++  // the loupe: real pixels when the adapter gives a snapshot; else the element's own colour/text
++  function drawLoupe(x, y, info, opts = {}) {
++    if (!loupeEl) {
++      loupeEl = add(`<div class="rim"></div><div class="lens"><canvas width="15" height="15"></canvas><div class="sample"></div><div class="grid"></div><div class="ctr"></div></div>
++        <svg class="arc" viewBox="0 0 184 184"><defs><path id="mtk-top" d="M 20 92 A 72 72 0 0 1 164 92"/><path id="mtk-bot" d="M 26 104 A 68 68 0 0 0 158 104"/></defs>
++        <text><textPath href="#mtk-top" startOffset="50%" text-anchor="middle" class="t1"></textPath></text><text class="lo"><textPath href="#mtk-bot" startOffset="50%" text-anchor="middle" class="t2"></textPath></text></svg>`, 'loupe');
++    }
++    const cv = loupeEl.querySelector('canvas'), sample = loupeEl.querySelector('.sample'), grid = loupeEl.querySelector('.grid'), ctr = loupeEl.querySelector('.ctr');
++    let colour = opts.colour;
++    if (snap) {
++      const k = snap.scale || 1, g = cv.getContext('2d'); g.imageSmoothingEnabled = false;
++      try { g.clearRect(0, 0, 15, 15); g.drawImage(snap.canvas, Math.round(x * k) - 7, Math.round(y * k) - 7, 15, 15, 0, 0, 15, 15); } catch {}
++      cv.style.display = ''; grid.style.display = ''; ctr.style.display = ''; sample.style.display = 'none';
++      if (!colour) colour = pixelAt(x, y);
++    } else {
++      cv.style.display = 'none'; grid.style.display = 'none'; ctr.style.display = 'none'; sample.style.display = '';
++      const cs = info.cs; sample.style.background = toHex(info.bg); sample.style.color = toHex(over(info.fg, info.bg));
++      sample.style.font = `${cs.fontStyle} ${cs.fontWeight} ${Math.min(parseFloat(cs.fontSize) * 2.4, 40)}px ${cs.fontFamily}`; sample.style.letterSpacing = cs.letterSpacing; sample.style.textTransform = cs.textTransform;
++      sample.textContent = info.hasText ? info.el.textContent.trim().slice(0, 16) : '';
++      if (!info.hasText && info.own) sample.style.background = toHex(info.own);
++    }
++    const px0 = snap ? pixelAt(x, y) : null;
++    if (!opts.colour) colour = (info.bgImage || /^(IMG|CANVAS|VIDEO|svg)$/i.test(info.el.tagName)) && px0 ? px0 : primaryColor(info).c;
++    const b = S.brand.colors.length ? brandFor(colour) : null;
++    loupeEl.querySelector('.t1').textContent = `${toHex({ ...colour, a: 1 })} · ${b && b.d < 0.02 ? b.t.name + ' · бренд' : colorName(colour)}`;
++    loupeEl.querySelector('.t2').textContent = opts.bottom || (px0 ? `пиксель ${toHex(px0)} · 12×` : `X ${Math.round(x)} · Y ${Math.round(y)}`);
++    loupeEl.style.display = '';
++    let lx = x + 24, ly = y + 24; if (lx + 184 > innerWidth - 8) lx = x - 24 - 184; if (ly + 184 + 44 > innerHeight - 8) ly = y - 24 - 184 - 44;
++    place(loupeEl, lx, ly);
++    return { colour, lx, ly, b };
++  }
++  function drawReadout(info, at, colour, b) {
++    if (!capEl) capEl = add('', 'cap int');
++    const p = primaryColor(info); const c = colour || p.c;
++    const tok = !S.brand.colors.length ? '' : b && b.d < 0.02 ? `<span class="tk">= ${esc(b.t.name)}</span>` : b && b.d < 0.06 ? `<span class="tk off">≈ ${esc(b.t.name)}</span>` : '<span class="tk off">не из бренда</span>';
++    capEl.innerHTML = `<i class="dot" style="background:${toHex(c)}"></i><code>${esc(fmtColor(c, p.prop))}</code>${tok}<span class="kbd">${K.mod}C</span>`;
++    capEl.style.display = '';
++    if (at) place(capEl, at.x, at.y); return capEl;
++  }
++  function drawStrip(info) { // the collapsed card: font · size · radius, next to the selection
++    if (!hudEl) { hudEl = add('', 'cap int'); hudEl.dataset.strip = '1'; }
++    if (hudEl.classList.contains('hud')) { hudEl.className = 'cap int'; }
++    const cs = info.cs, parts = [];
++    if (info.hasText) { parts.push(['Шрифт', `${esc(info.font.family)} ${+cs.fontWeight || 400}`]); parts.push(['Кегль', `${px(cs.fontSize)}/${cs.lineHeight === 'normal' ? 'auto' : px(cs.lineHeight)}`]); }
++    if (info.pad.some(Boolean)) parts.push(['Отступы', info.padS]); if (info.rad) parts.push(['Радиус', info.rad]);
++    if (info.ratio) parts.push(['Контраст', info.ratio.toFixed(1)]);
++    hudEl.innerHTML = `<span class="seg2">${parts.slice(0, 4).map(([k, v]) => `<span>${k}<b class="num">${v}</b></span>`).join('')}</span><span class="kbd" title="полная карточка">Space</span>`;
++    hudEl.style.display = ''; placeFree(hudEl, info.r, { gap: 14 });
++  }
++  function rowsFor(info) {
++    const rows = [];
++    const tokB = c => { if (!S.brand.colors.length) return ''; const b = brandFor(c); return b && b.d < 0.02 ? `<span class="badge" style="--c:#30a46c">= ${esc(b.t.name)}</span>` : `<span class="badge" style="--c:#e0a400">${b && b.d < 0.06 ? '≈ ' + esc(b.t.name) : 'не из бренда'}</span>`; };
++    const colorRow = (k, c, prop) => ({ k, v: `<i class="sw" style="background:${toHex(c)}"></i><span class="num">${esc(fmtColor(c, prop))}</span>${tokB(c)}`, copy: () => fmtColor(c, prop), brand: { type: 'color', hex: toHex({ ...c, a: 1 }) } });
++    if (info.own) rows.push(colorRow('Фон', info.own, 'bg')); else if (info.bgImage) rows.push({ k: 'Фон', v: '<span class="m">картинка или градиент</span>' });
++    if (info.hasText) rows.push(colorRow('Текст', over(info.fg, info.bg), 'text'));
++    if (info.border) rows.push(colorRow('Обводка', info.border, 'border'));
++    if (info.hasText) { const cs = info.cs, w = +cs.fontWeight || 400;
++      rows.push({ k: 'Шрифт', v: `${esc(info.font.family)} · ${w} <span class="m">${esc(info.font.source)}</span>`, copy: () => fmtType(cs), brand: { type: 'font', family: info.font.family, weight: w, size: px(cs.fontSize) } });
++      rows.push({ k: 'Кегль', v: `<span class="num">${px(cs.fontSize)} / ${cs.lineHeight === 'normal' ? 'auto' : px(cs.lineHeight)}</span> <span class="m">трекинг ${cs.letterSpacing === 'normal' ? 0 : px(cs.letterSpacing)}</span>`, copy: () => fmtType(cs) }); }
++    if (info.pad.some(v => v) || info.gap) rows.push({ k: 'Отступы', v: `<span class="num">${info.padS}</span>${info.gap ? ` <span class="m">гэп ${info.gap}</span>` : ''}`, copy: () => fmtLen(info.pad.map(v => v + 'px').join(' '), 'p'), brand: { type: 'spacing', values: [...new Set(info.pad.filter(Boolean).concat(info.gap || []))] } });
++    if (info.rad) rows.push({ k: 'Радиус', v: `<span class="num">${info.rad}</span>${info.rad * 2 >= info.r.height - 1 ? ' <span class="m">капсула</span>' : ''}`, copy: () => fmtLen(info.rad + 'px', 'r'), brand: { type: 'radius', value: info.rad } });
++    if (info.shadow) rows.push({ k: 'Тень', v: `<span class="m">${esc(info.shadow.slice(0, 34))}${info.shadow.length > 34 ? '…' : ''}</span>`, copy: () => 'box-shadow: ' + info.shadow + ';' });
++    if (info.ratio) { const ok = info.ratio >= (info.large ? 3 : 4.5), aaa = info.ratio >= (info.large ? 4.5 : 7);
++      rows.push({ k: 'Контраст', v: `<span class="num">${info.ratio.toFixed(1)} : 1</span><span class="badge" style="--c:${ok ? '#30a46c' : '#e5484d'}">${aaa ? 'AAA' : ok ? 'AA' : 'не AA'}</span>` }); }
++    return rows;
++  }
++  function drawFull(info) {
++    if (!hudEl) hudEl = add('', 'hud int');
++    hudEl.className = 'hud int'; delete hudEl.dataset.strip;
++    const rows = rowsFor(info); info.rows = rows;
++    const crumbs = []; for (let e = info.el, i = 0; e && e !== document.body && i < 4; e = e.parentElement, i++) crumbs.unshift(e.tagName.toLowerCase() + (e.classList[0] ? '.' + e.classList[0] : ''));
++    hudEl.innerHTML = `<div class="hh"><span class="tag">${info.el.tagName.toLowerCase()}</span><span class="nm">${kindName(info.el)}</span><span class="dim">${Math.round(info.r.width)} × ${Math.round(info.r.height)}</span></div>
++      <div class="crumbs">${esc(crumbs.join(' › '))}</div><div class="rows">${rows.map((r, i) => `<div class="r" data-i="${i}"><span class="k">${r.k}</span><span class="v">${r.v}</span>${r.brand ? `<button class="plus" data-add="${i}" title="В бренд">+</button>` : '<span></span>'}</div>`).join('')}</div>
++      <div class="ft"><span class="fmt">${FMTS.map(f => `<button data-f="${f}" class="${f === S.fmt ? 'on' : ''}">${f}</button>`).join('')}</span><span class="kbd" style="margin-left:auto">F</span></div>`;
++    placeFree(hudEl, info.r, { gap: 14 });
++  }
++  function hideLens() { [selEl, hovEl, capEl, hudEl, loupeEl].forEach(n => n && n.remove()); selEl = hovEl = capEl = hudEl = loupeEl = null; clear('pad'); clear('meas'); S.hover = S.sel = null; S.full = false; }
++
++  function pick(x, y) { let el = document.elementFromPoint(x, y); if (!el || el === host) return null; if (el === document.documentElement) el = document.body; return el; }
++  function lensMove(x, y) {
++    const el = pick(x, y); if (!el) return;
++    if (S.sel) {
++      const r = el.getBoundingClientRect();
++      if (el === S.sel.el || el === document.body) { measL().innerHTML = ''; if (hovEl) hovEl.style.display = 'none'; return; }
++      drawHov(r); haloColor = toHex(effectiveBg(el.parentElement || el).color || { r: 255, g: 255, b: 255, a: 1 }); drawDistances(S.sel.el.getBoundingClientRect(), r); return;
++    }
++    const info = inspect(el); S.hover = info;
++    drawHov(info.r); drawPad(info);
++    haloColor = toHex(info.bg);
++    const inKid = [...el.children].some(k => { const r = k.getBoundingClientRect(); return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom; });
++    if (el.children.length && !inKid && !ownText(el)) drawGap(el, x, y); else measL().innerHTML = '';
++    const lo = drawLoupe(x, y, info);
++    drawReadout(info, { x: lo.lx + 92 - 110, y: lo.ly + 190 }, lo.colour, lo.b);
++    if (capEl) place(capEl, clamp(lo.lx + 92 - capEl.offsetWidth / 2, 8, innerWidth - capEl.offsetWidth - 8), lo.ly + 192);
++  }
++  async function selectEl(el, doCopy = true) {
++    const info = inspect(el); S.sel = info; S.hover = null;
++    if (hovEl) hovEl.style.display = 'none'; measL().innerHTML = ''; drawPad(info);
++    drawSel(info.r, `${Math.round(info.r.width)} × ${Math.round(info.r.height)}`);
++    loupeEl?.remove(); loupeEl = null;
++    S.full ? drawFull(info) : drawStrip(info);
++    const p = primaryColor(info);
++    const pix = (info.bgImage || /^(IMG|CANVAS|VIDEO|svg)$/i.test(el.tagName)) ? pixelAt(S.mouse.x, S.mouse.y) : null; if (pix) { p.c = pix; p.prop = 'bg'; }
++    const b = S.brand.colors.length ? brandFor(p.c) : null;
++    const cap = drawReadout(info, null, p.c, b); placeFree(cap, hudEl ? hudEl.getBoundingClientRect() : info.r, { gap: 8 });
++    if (doCopy) {
++      const text = fmtColor(p.c, p.prop), ok = await copy({ text });
++      if (ok) keyDone(cap); else toast('Не удалось скопировать', false);
++    }
++  }
++
++  // ---------- Brand drawer: a fan deck of paint chips
++  let drawer = null;
++  const brandBtn = () => root.querySelector('.dock [data-t="brand"]');
++  function renderDrawer(fanOut) {
++    if (!drawer) return;
++    const b = S.brand, n = b.colors.length, top = S.topChip >= 0 && S.topChip < n ? S.topChip : n - 1;
++    const step = n > 1 ? Math.min(13, 52 / (n - 1)) : 0, a0 = -step * (n - 1) / 2;
++    const chips = b.colors.map((c, i) => { const ang = a0 + i * step; return `<div class="chipc ${i === top ? 'top' : ''}" data-ci="${i}" style="transform:rotate(${ang}deg) translateY(${i === top ? -8 : 0}px);z-index:${i === top ? 40 : i}" data-ang="${ang}"><i style="background:${c.hex}"></i><span>${esc(c.hex.slice(1))}</span><small>${esc(c.name)}</small></div>`; }).join('');
++    const sel = b.colors[top];
++    drawer.innerHTML = `<div class="ph"><b>Бренд</b><span class="m">· ${esc(b.name)}</span><button class="x" data-close>×</button></div>
++      <div style="overflow:auto;flex:1">
++      ${n ? `<div class="fan">${chips}<span class="rivet"></span></div>
++      <div class="ccard"><i class="big" style="background:${sel.hex}"></i><div style="min-width:0"><b>${esc(sel.name)}</b>${sel.isNew ? '<span class="newb">новый</span>' : ''}<small>${sel.hex}${sel.source ? ' · с ' + esc(sel.source) : ''}${sel.role ? ' · ' + esc(sel.role) : ''}</small></div><button class="btn ghost" data-rm="${top}" style="margin-left:auto">Убрать</button></div>
++      <div style="padding:4px 16px 8px" class="light"><span class="fmt" style="display:flex">${FMTS.map(f => `<button data-bf="${f}" class="${f === S.fmt ? 'on' : ''}" style="flex:1">${f === 'TW' ? 'Tailwind' : f}</button>`).join('')}</span></div>`
++      : '<div class="sec" style="color:var(--m-text-2)">Пока пусто. «+» в линзе или «Система» положат сюда цвета, шрифты и отступы.</div>'}
++      ${b.fonts.length ? `<div class="sec"><div class="sl">Шрифты</div>${b.fonts.map(f => `<div class="fontrow"><span class="sp" style="font-family:'${esc(f.family)}';font-weight:${f.weight};font-size:${(f.size || 16) >= 20 ? 26 : 17}px">Аа ${(f.size || 16) >= 20 ? 'Свежий' : 'Небольшими'}</span><small><b>${esc(f.family)}</b>${f.weight}${f.role ? ' · ' + esc(f.role) : ''}</small></div>`).join('')}</div>` : ''}
++      ${b.spacing.length ? `<div class="sec"><div class="sl">Отступы</div><div class="bars">${b.spacing.map(v => `<span>${v}</span><i style="width:${Math.min(v * 2, 220)}px"></i>`).join('')}</div></div>` : ''}
++      ${b.radii.length ? `<div class="sec"><div class="sl">Радиусы</div><div class="qr">${b.radii.map(v => `<div><div class="corner" style="border-top-left-radius:${Math.min(v, 40)}px"></div>${v >= 999 ? 'капсула' : v}</div>`).join('')}</div></div>` : ''}
++      </div>
++      <div style="padding:10px 16px 12px;display:flex;gap:6px;flex-wrap:wrap;box-shadow:inset 0 .5px 0 rgba(0,0,0,.1)"><button class="btn pri" data-exp="md">DESIGN.md</button><span class="seg"><button data-exp="css">CSS</button><button data-exp="tw">Tailwind</button><button data-exp="json">Tokens</button></span></div>`;
++    if (fanOut && !reduced()) drawer.querySelectorAll('.chipc').forEach((c, i) => c.animate([{ transform: 'rotate(0deg)' }, { transform: c.style.transform }], { duration: 450, delay: i * 30, easing: 'cubic-bezier(.3,1.35,.5,1)', fill: 'backwards' }));
++  }
++  function openDrawer(toggle, fanOut) {
++    if (drawer && toggle) { drawer.remove(); drawer = null; return; }
++    if (!drawer) { drawer = H('', 'panel sheet in int'); Object.assign(drawer.style, { right: '12px', top: '12px', bottom: '84px', width: '320px', display: 'flex', flexDirection: 'column' }); root.appendChild(drawer); fanOut = true; }
++    renderDrawer(fanOut);
++  }
++  function fly(fromRect, color, targetFn, done) {
++    const to = targetFn(); if (!to || reduced()) { done && done(); return; }
++    const f = H('', 'fly'); f.style.background = color; root.appendChild(f);
++    const x0 = fromRect.left + fromRect.width / 2 - 13, y0 = fromRect.top + fromRect.height / 2 - 13;
++    const t = to.getBoundingClientRect(), x1 = t.left + t.width / 2 - 13, y1 = t.top + Math.min(t.height / 2, 60) - 13;
++    const cx = (x0 + x1) / 2, cy = Math.min(y0, y1) - 140, frames = [];
++    const path = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); path.setAttribute('class', 'flypath');
++    path.innerHTML = `<path d="M${x0 + 13} ${y0 + 13} Q${cx + 13} ${cy + 13} ${x1 + 13} ${y1 + 13}" fill="none" stroke="color-mix(in srgb, var(--m-space) 45%, transparent)" stroke-width="1.5" stroke-dasharray="3 5"/>`; root.appendChild(path);
++    for (let i = 0; i <= 16; i++) { const u = i / 16, x = (1 - u) ** 2 * x0 + 2 * (1 - u) * u * cx + u * u * x1, y = (1 - u) ** 2 * y0 + 2 * (1 - u) * u * cy + u * u * y1;
++      frames.push({ transform: `translate(${x}px, ${y}px) scale(${1 - u * 0.45}) rotate(${Math.sin(u * Math.PI) * 8}deg)`, offset: u }); }
++    f.animate(frames, { duration: 480, easing: 'cubic-bezier(.2,.8,.2,1)' }).onfinish = () => { f.remove(); path.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 120 }).onfinish = () => path.remove(); done && done(); };
++  }
++  function addToBrand(tok, fromRect) {
++    const b = S.brand;
++    if (tok.type === 'color') {
++      const c = parseColor(tok.hex), dup = b.colors.findIndex(t => dE(parseColor(t.hex), c) < 0.02);
++      if (dup >= 0) { S.topChip = dup; renderDrawer(); toast(`Уже в бренде: ${esc(b.colors[dup].name)}`); return; }
++      let name = colorName(c); if (b.colors.some(t => t.name === name)) name += ' ' + (b.colors.filter(t => t.name.startsWith(name)).length + 1);
++      b.colors.forEach(x => delete x.isNew); b.colors.push({ name, hex: tok.hex, source: location.hostname.replace(/^www\./, ''), isNew: true }); S.topChip = b.colors.length - 1;
++    } else if (tok.type === 'font') { if (b.fonts.some(f => f.family === tok.family && f.weight === tok.weight)) { toast('Этот шрифт уже в бренде'); return; } b.fonts.push({ family: tok.family, weight: tok.weight, size: tok.size, role: tok.size >= 20 ? 'заголовки' : 'текст' }); }
++    else if (tok.type === 'spacing') b.spacing = [...new Set(b.spacing.concat(tok.values))].sort((x, y) => x - y);
++    else if (tok.type === 'radius') b.radii = [...new Set(b.radii.concat(tok.value))].sort((x, y) => x - y);
++    saveBrand();
++    const landing = () => {
++      if (drawer) renderDrawer();
++      const bb = brandBtn(); if (bb) { bb.classList.remove('bump'); void bb.offsetWidth; bb.classList.add('bump'); if (!bb.querySelector('.cnt')) bb.insertAdjacentHTML('beforeend', '<span class="cnt"></span>'); }
++      try { A.onBrandChanged?.(b); } catch {}
++    };
++    fly(fromRect, tok.hex || 'var(--m-space)', () => drawer ? (drawer.querySelector('.fan') || drawer) : brandBtn(), landing);
++  }
++
++  // ---------- exports (no AI)
++  function exportBrand(kind, sys = S.brand) {
++    const cols = sys.colors, fonts = sys.fonts || [];
++    if (kind === 'css') return `:root {\n${cols.map(c => `  --${slug(c.name)}: ${c.hex};`).join('\n')}\n${fonts.map((f, i) => `  --font-${i ? 'text' : 'heading'}: "${f.family}";`).join('\n')}\n${(sys.spacing || []).map(v => `  --space-${v}: ${v}px;`).join('\n')}\n${(sys.radii || []).map(v => `  --radius-${v}: ${v}px;`).join('\n')}\n}`;
++    if (kind === 'tw') return `@theme {\n${cols.map(c => `  --color-${slug(c.name)}: ${c.hex};`).join('\n')}\n${fonts.map((f, i) => `  --font-${i ? 'sans' : 'display'}: "${f.family}";`).join('\n')}\n${(sys.radii || []).map(v => `  --radius-${v}: ${v}px;`).join('\n')}\n}`;
++    if (kind === 'json') { const o = { color: {}, font: {}, spacing: {}, radius: {} };
++      cols.forEach(c => o.color[slug(c.name)] = { $type: 'color', $value: c.hex, ...(c.role ? { $description: c.role } : {}) }); fonts.forEach(f => o.font[slug(f.family)] = { $type: 'fontFamily', $value: f.family });
++      (sys.spacing || []).forEach(v => o.spacing[v] = { $type: 'dimension', $value: v + 'px' }); (sys.radii || []).forEach(v => o.radius[v] = { $type: 'dimension', $value: v + 'px' }); return JSON.stringify(o, null, 2); }
++    return `---\nname: ${sys.name}\nsource: ${location.href}\ncaptured: ${new Date().toISOString().slice(0, 10)}\n---\n\n# ${sys.name}\n\n## Colors\n\n| Token | Value | Role |\n|---|---|---|\n${cols.map(c => `| ${slug(c.name)} | ${c.hex} | ${c.role || ''} |`).join('\n')}\n\n## Typography\n\n${fonts.map(f => `- **${f.family}** ${f.weight}${f.role ? ' — ' + f.role : ''}`).join('\n') || '-'}\n${sys.scale ? `\nScale (px): ${sys.scale.map(s => s.size).join(' / ')}\n` : ''}\n## Spacing\n\n${(sys.spacing || []).join(', ') || '-'} px${sys.base ? ` (base ${sys.base})` : ''}\n\n## Radii\n\n${(sys.radii || []).join(', ') || '-'} px\n${sys.components ? `\n## Components\n\n${sys.components.map(c => `- ${c.name} ×${c.count}: \`${c.sel}\``).join('\n')}\n` : ''}\n## Rules\n\n- Use only the colors above; text on the background must pass WCAG AA.\n- Keep spacing on the ${sys.base || 4}px grid.\n`;
++  }
++
++  // ---------- the site's system
++  function scanSystem() {
++    const els = [...SCOPE().querySelectorAll('*')].filter(e => !e.closest?.('meridian-toolkit')).slice(0, 5000);
++    const colors = new Map(), sizes = new Map(), fams = new Map(), spacing = new Map(), radii = new Map(), shadows = new Map(), sigs = new Map();
++    const addC = (c, w, role, el) => { if (!c || c.a < 0.5) return; const h = toHex({ ...c, a: 1 }); const o = colors.get(h) || { c: { ...c, a: 1 }, w: 0, roles: {}, el }; o.w += w; o.roles[role] = (o.roles[role] || 0) + w; colors.set(h, o); };
++    for (const e of els) {
++      const cs = getComputedStyle(e); if (cs.display === 'none' || cs.visibility === 'hidden') continue;
++      const r = e.getBoundingClientRect(), area = r.width * r.height; if (!area) continue;
++      const interactive = /^(A|BUTTON)$/.test(e.tagName) || e.getAttribute('role') === 'button' || /btn|button|cta|cart/.test(e.className);
++      addC(parseColor(cs.backgroundColor), Math.sqrt(area) * (interactive ? 6 : 1), interactive ? 'accent' : 'bg', e);
++      const t = ownText(e);
++      if (t) { const n = Math.min(t.length, 400); addC(parseColor(cs.color), n, 'text', e); const sz = px(cs.fontSize); const k = sz + '|' + cs.fontWeight; sizes.set(k, (sizes.get(k) || 0) + n); const f = renderedFont(cs).family; fams.set(f, (fams.get(f) || 0) + n * (sz >= 20 ? 3 : 1)); }
++      if (parseFloat(cs.borderTopWidth) > 0 && cs.borderTopStyle !== 'none') addC(parseColor(cs.borderTopColor), 4, 'border', e);
++      for (const p of ['paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft', 'marginTop', 'marginBottom', 'rowGap', 'columnGap']) { const v = Math.round(parseFloat(cs[p])); if (v > 0 && v <= 128) spacing.set(v, (spacing.get(v) || 0) + 1); }
++      const rd = Math.round(parseFloat(cs.borderTopLeftRadius)); if (rd > 0) { const k = rd >= r.height / 2 - 1 && r.height < 80 ? 'pill' : rd; radii.set(k, (radii.get(k) || 0) + 1); }
++      if (cs.boxShadow !== 'none') shadows.set(cs.boxShadow, (shadows.get(cs.boxShadow) || 0) + 1);
++      if (e.children.length >= 2 && area > 600) { const sig = e.tagName + '.' + [...e.classList].sort().join('.') + '/' + [...e.children].map(k => k.tagName).join(','); const o = sigs.get(sig) || { n: 0, el: e, area }; o.n++; sigs.set(sig, o); }
++      if (kindName(e) === 'Кнопка') { const sig = 'BTN' + e.tagName + '.' + [...e.classList].sort().join('.'); const o = sigs.get(sig) || { n: 0, el: e, area, btn: true }; o.n++; sigs.set(sig, o); }
++    }
++    const sorted = [...colors.values()].sort((a, b) => b.w - a.w), clusters = [];
++    for (const c of sorted) { const k = clusters.find(x => dE(x.c, c.c) < 0.03); if (k) { k.w += c.w; for (const r in c.roles) k.roles[r] = (k.roles[r] || 0) + c.roles[r]; } else clusters.push({ ...c, roles: { ...c.roles } }); }
++    const top = clusters.slice(0, 10), total = top.reduce((s, c) => s + c.w, 0) || 1;
++    const byRole = role => top.slice().sort((a, b) => (b.roles[role] || 0) - (a.roles[role] || 0))[0];
++    const bg = byRole('bg'), text = byRole('text');
++    const accent = top.filter(c => c !== bg && c !== text).sort((a, b) => ((b.roles.accent || 0) * (oklch(b.c).C + .02)) - ((a.roles.accent || 0) * (oklch(a.c).C + .02)))[0];
++    const roleOf = c => c === bg ? 'фон' : c === text ? 'текст' : c === accent ? 'акцент' : c.roles.text > c.w / 2 ? 'подписи' : c.roles.border > c.w / 2 ? 'линии' : 'поверхность';
++    const used = new Set();
++    const pal = top.map(c => { let name = colorName(c.c), k = 2; while (used.has(name)) name = colorName(c.c) + ' ' + k++; used.add(name); return { name, hex: toHex(c.c), role: roleOf(c), share: Math.round(c.w / total * 100), el: c.el }; });
++    const sz = [...sizes.entries()].map(([k, n]) => { const [s, w] = k.split('|'); return { size: +s, weight: +w, n }; });
++    const uniq = [...new Map(sz.sort((a, b) => b.n - a.n).map(s => [s.size, s])).values()].sort((a, b) => b.size - a.size).slice(0, 9);
++    const base = (sz.sort((a, b) => b.n - a.n)[0] || { size: 16 }).size;
++    let best = { r: 1.25, err: 1e9 };
++    for (const r of [1.125, 1.2, 1.25, 1.333, 1.414, 1.5, 1.618]) { let err = 0; for (const s of uniq) { const k = Math.log(s.size / base) / Math.log(r); err += Math.abs(k - Math.round(k)); } if (err < best.err) best = { r, err }; }
++    uniq.forEach(s => { const k = Math.log(s.size / base) / Math.log(best.r); s.off = Math.abs(k - Math.round(k)) > 0.18; });
++    const famList = [...fams.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([f]) => f);
++    const sp = [...spacing.entries()].sort((a, b) => a[0] - b[0]).filter(([, n]) => n >= 2);
++    const allN = sp.reduce((s, [, n]) => s + n, 0) || 1, on4 = sp.filter(([v]) => v % 4 === 0).reduce((s, [, n]) => s + n, 0), on8 = sp.filter(([v]) => v % 8 === 0).reduce((s, [, n]) => s + n, 0);
++    const rad = [...radii.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([v]) => v);
++    const comps = [...sigs.values()].filter(s => s.n >= 2 || s.btn).sort((a, b) => b.n * Math.sqrt(b.area) - a.n * Math.sqrt(a.area)).slice(0, 4).map(s => ({ name: s.btn ? 'Кнопка' : kindName(s.el), count: s.n, sel: cssPath(s.el), el: s.el }));
++    return { name: document.title.split(/[—|·-]/)[0].trim() || location.hostname, host: location.hostname.replace(/^www\./, ''), n: els.length,
++      colors: pal, fonts: famList.map((f, i) => ({ family: f, weight: i ? 400 : 600, role: i ? 'текст' : 'заголовки' })), scale: uniq, ratio: best.r, base: on8 / allN > 0.8 ? 8 : 4,
++      spacingFreq: sp, spacing: sp.map(([v]) => v), on4: Math.round(on4 / allN * 100), radii: rad.map(v => v === 'pill' ? 999 : v), radiiLabels: rad, shadows: [...shadows.keys()].slice(0, 3), components: comps };
++  }
++  function grabSystem() {
++    exitModes(); drawer?.remove(); drawer = null; S.mode = 'system'; mount(); setDockOn('system');
++    const t0 = performance.now(), sys = scanSystem(), ms = Math.round(performance.now() - t0);
++    const L = layer('sys'); L.innerHTML = ''; L.appendChild(H('', 'dim'));
++    const sheet = H('', 'panel sheet in int'); Object.assign(sheet.style, { right: '12px', top: '10px', bottom: '10px', width: '470px', display: 'flex', flexDirection: 'column', overflow: 'hidden' });
++    sheet.dataset.tab = 'cards';
++    const sp = sys.spacingFreq, maxN = Math.max(...sp.map(([, n]) => n), 1), off = sp.filter(([v]) => v % 4).map(([v]) => v);
++    const cardsHtml = () => `
++      <div class="sec"><div class="sl">Палитра <span class="c">· ${sys.colors.length} · роли по площади и тексту</span></div><div class="pal">${sys.colors.map((c, i) => `<div class="s" data-si="${i}"><i style="background:${c.hex}"></i><div><span>${esc(c.name)}</span><small>${c.hex}</small><small>${c.role}</small></div></div>`).join('')}</div></div>
++      <div class="sec"><div class="sl">Шрифты <span class="c">· ${sys.fonts.map(f => esc(f.family)).join(' + ')} · шкала ≈ ${sys.ratio}</span></div>${sys.scale.map(s => `<div class="scale"><span class="n">${s.size}</span><span class="s" style="font-size:${Math.min(s.size, 22)}px;font-weight:${s.weight}">Аа Бб Вв 123</span><span class="w ${s.off ? 'off' : ''}">${s.weight}${s.off ? ' · вне шкалы' : ''}</span></div>`).join('')}</div>
++      <div class="sec"><div class="sl">Отступы <span class="c">· шаг ${sys.base} px у ${sys.on4}% значений · <span style="color:var(--m-text-3)">■</span> в сетке <span style="color:var(--m-warn)">■</span> вне сетки${off.length ? ': ' + off.slice(0, 6).join(', ') : ''}</span></div>
++        <div style="display:flex;gap:10px;align-items:flex-end;height:50px">${sp.slice(0, 14).map(([v, n]) => `<div style="display:flex;flex-direction:column;align-items:center;gap:3px;font-size:10.5px;color:var(--m-text-2)"><i style="width:10px;height:${Math.max(3, n / maxN * 34)}px;border-radius:2px;background:${v % 4 ? 'var(--m-warn)' : 'var(--m-text-3)'}"></i><span class="num">${v}</span></div>`).join('')}</div></div>
++      <div class="sec" style="display:flex;gap:26px"><div><div class="sl">Радиусы</div><div class="qr">${sys.radiiLabels.map(v => `<div><div class="corner" style="border-top-left-radius:${v === 'pill' ? 40 : Math.min(v, 40)}px"></div>${v === 'pill' ? 'капсула' : v}</div>`).join('')}</div></div>
++        <div><div class="sl">Тени <span class="c">· ${sys.shadows.length}</span></div><div style="display:flex;gap:10px;padding:8px;border-radius:var(--r-md);background:var(--m-surface-2)">${sys.shadows.map(s => `<i style="width:44px;height:30px;border-radius:var(--r-sm);background:#fff;box-shadow:${s}"></i>`).join('')}</div></div></div>
++      <div class="sec"><div class="sl">Компоненты <span class="c">· повторы с одинаковой структурой</span></div><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px">${sys.components.map(c => { const cs = getComputedStyle(c.el); return `<div class="cmp"><span style="background:${cs.backgroundColor};color:${cs.color};border-radius:${Math.min(parseFloat(cs.borderTopLeftRadius) || 0, 12)}px;padding:4px 8px;font-size:10.5px;font-weight:600;max-width:100%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;box-shadow:${cs.boxShadow === 'none' ? 'var(--m-hair)' : cs.boxShadow}">${esc((c.el.textContent || '').trim().slice(0, 14) || c.name)}</span><span>${esc(c.name)} ×${c.count}</span></div>`; }).join('')}</div></div>`;
++    const forExport = { name: sys.name, colors: sys.colors, fonts: sys.fonts, spacing: sys.spacing.filter(v => v % 4 === 0).slice(0, 10), radii: sys.radii.filter(v => v < 999), scale: sys.scale, base: sys.base, components: sys.components };
++    const renderSheet = () => {
++      const t = sheet.dataset.tab;
++      sheet.innerHTML = `<div class="ph"><b>Система сайта</b><span class="m">${esc(sys.host)} · ${sys.n} элементов · ${ms} мс</span><button class="x" data-close>×</button></div>
++        <div style="padding:0 16px 8px"><span class="seg">${[['cards', 'Карточки'], ['md', 'DESIGN.md'], ['css', 'CSS'], ['tw', 'Tailwind'], ['json', 'Tokens']].map(([k, n]) => `<button class="${k === t ? 'on' : ''}" data-tab="${k}">${n}</button>`).join('')}</span></div>
++        <div style="flex:1;overflow:auto">${t === 'cards' ? cardsHtml() : `<pre class="code">${esc(exportBrand(t, forExport))}</pre>`}</div>
++        <div style="padding:12px 16px 14px;box-shadow:inset 0 .5px 0 rgba(0,0,0,.1);display:flex;gap:8px;align-items:center">
++          <button class="btn pri" data-save>Сохранить как бренд</button><span class="seg"><button data-copyexp="${t === 'cards' ? 'md' : t}">Копировать ${t === 'cards' ? 'DESIGN.md' : ''}</button>${A.sendToAgent ? '<button data-agent>В агента</button>' : ''}</span></div>`;
++    };
++    renderSheet();
++    sheet.addEventListener('click', async e => {
++      const b = e.target.closest('button,[data-si]'); if (!b) return;
++      if (b.dataset.close !== undefined) return exitModes();
++      if (b.dataset.tab) { sheet.dataset.tab = b.dataset.tab; renderSheet(); return; }
++      if (b.dataset.si !== undefined) { const t = fmtColor(parseColor(sys.colors[+b.dataset.si].hex)); toast((await copy({ text: t })) ? `Скопировано <code>${esc(t)}</code>` : 'Не удалось скопировать'); return; }
++      if (b.dataset.copyexp) { toast((await copy({ text: exportBrand(b.dataset.copyexp, forExport) })) ? 'Скопировано' : 'Не удалось скопировать'); return; }
++      if (b.dataset.agent !== undefined) { A.sendToAgent({ kind: 'design-system', designMd: exportBrand('md', forExport), url: location.href }); toast('Отправлено агенту'); return; }
++      if (b.dataset.save !== undefined) {
++        S.brand = { name: sys.name, colors: sys.colors.map(c => ({ name: c.name, hex: c.hex, role: c.role, source: sys.host })), fonts: sys.fonts.map((f, i) => ({ ...f, size: i ? sys.scale.at(-1)?.size : sys.scale[0]?.size })), spacing: forExport.spacing, radii: forExport.radii };
++        S.topChip = 0; saveBrand(); try { A.onBrandChanged?.(S.brand); } catch {}
++        exitModes(); openDrawer(false, true); toast(`Бренд «${esc(sys.name)}» сохранён`);
++      }
++    });
++    if (!reduced()) { const sw = H('', 'sweep'); L.appendChild(sw); sw.animate([{ transform: 'translateY(-41px)' }, { transform: `translateY(${innerHeight}px)` }], { duration: 700, easing: 'cubic-bezier(.6,0,.2,1)' }).onfinish = () => sw.remove(); }
++    setTimeout(() => {
++      if (S.mode !== 'system') return;
++      L.appendChild(sheet); if (reduced()) return;
++      const slots = sheet.querySelectorAll('[data-si]');
++      sys.colors.slice(0, 10).forEach((c, i) => { const r = c.el?.getBoundingClientRect(); if (!r || r.bottom < 0 || r.top > innerHeight) return;
++        setTimeout(() => fly({ left: clamp(r.left + r.width / 2, 0, innerWidth), top: clamp(r.top + r.height / 2, 0, innerHeight), width: 0, height: 0 }, c.hex, () => slots[i], () => slots[i]?.animate([{ transform: 'scale(1.06)' }, { transform: 'scale(1)' }], { duration: 240, easing: 'cubic-bezier(.3,1.35,.5,1)' })), i * 40); });
++    }, reduced() ? 0 : 560);
++    return sys;
++  }
++
++  // ---------- dock with panels that grow out of it
++  let dock = null;
++  const TOOLS = () => [['lens', 'Линза', 'L', 'цвет, шрифт, отступы'], ['system', 'Система', 'G', 'палитра и шрифты сайта'], ['camera', 'Снимок', 'S', 'блок или область → как баг'], ['text', 'Стресс-текст', 'T', 'длинные тексты ломают вёрстку?'], ['contrast', 'Контраст', 'C', 'что трудно читать'], ['brandchk', 'Бренд', 'B', 'что не из бренда']]
++    .concat((A.extraTools || []).map(t => [t.id, t.label, t.key, t.hint || '']));
++  function showDock() {
++    if (dock) return; mount();
++    dock = H(`<div class="dp"></div><div class="tools">${TOOLS().map(([k, n, key, hint]) => `<button class="t" data-t="${k}">${ic(ICON[k] ? k : 'lens')}<span class="lab">${n}</span><span class="tipx">${n} <span style="opacity:.6">— ${hint}</span> <span class="kbd">${key}</span></span></button>`).join('')}<span class="sep"></span><button class="t" data-t="brand">${ic('palette')}<span class="lab">Бренд</span><span class="tipx">Бренд — палитра, шрифты, экспорт</span></button></div>`, 'dock');
++    root.appendChild(dock);
++    let shown = false; dock.addEventListener('mouseover', () => { if (shown) dock.style.setProperty('--tipdelay', '0ms'); shown = true; }); dock.addEventListener('mouseleave', () => { shown = false; dock.style.removeProperty('--tipdelay'); });
++    dock.querySelector('.tools').addEventListener('click', e => { const t = e.target.closest('[data-t]')?.dataset.t; if (t) runTool(t); });
++  }
++  function setDockOn(t) { dock?.querySelectorAll('.t').forEach(b => b.classList.toggle('on', b.dataset.t === (t === 'capture' ? 'camera' : t === 'stress' ? 'text' : t === 'brandcheck' ? 'brandchk' : t))); }
++  // fill the dock's panel (grows 240ms); returns the inner node
++  function dockPanel(html) {
++    showDock(); const dp = dock.querySelector('.dp'); const before = dp.offsetHeight;
++    dp.innerHTML = html ? `<div class="dpi dark">${html}</div>` : ''; dock.classList.toggle('haspanel', !!html);
++    const after = dp.offsetHeight;
++    if (!reduced() && before !== after) dp.animate([{ height: before + 'px' }, { height: after + 'px' }], { duration: 240, easing: 'cubic-bezier(.3,1.35,.5,1)' });
++    return dp.firstChild;
++  }
++  function runTool(t) {
++    if (t === 'brand') return openDrawer(true);
++    const cur = { lens: 'lens', system: 'system', camera: 'capture', text: 'stress', contrast: 'contrast', brandchk: 'brandcheck' }[t];
++    if (cur && S.mode === cur) { exitModes(); return; }
++    if (t === 'lens') setMode('lens'); if (t === 'system') grabSystem(); if (t === 'camera') startCapture(); if (t === 'text') stress('long');
++    if (t === 'contrast') contrastMode(); if (t === 'brandchk') brandCheck();
++    const x = (A.extraTools || []).find(e => e.id === t); if (x) x.run();
++  }
++  function setMode(m) { exitModes(); S.mode = m; mount(); setDockOn(m); if (m === 'lens') { refreshSnap(); lensMove(S.mouse.x, S.mouse.y); } }
++  function exitModes(keepStress) {
++    if (S.mode === 'lens' || S.peek) hideLens();
++    if (S.mode === 'contrast') { clear('con'); loupeEl?.remove(); loupeEl = null; capEl?.remove(); capEl = null; if (S.vision && S.vision !== 'none') vision('none'); }
++    if (S.mode === 'capture') { clear('cap'); S.cap = null; }
++    if (S.mode === 'system') clear('sys');
++    if (S.mode === 'brandcheck') clear('bc');
++    if (S.mode === 'stress' && !keepStress) restoreText(false);
++    closeMenus(); S.mode = null; S.peek = false; setDockOn(null); if (dock) dockPanel('');
++  }
++  function activate() { S.active = true; mount(); showDock(); }
++  function deactivate() { exitModes(); dock?.remove(); dock = null; drawer?.remove(); drawer = null; S.active = false; unmountIfIdle(); }
++
++  // ---------- capture: marching ants → shutter → card
++  const BUG_TARGETS = { slack: 'Slack', jira: 'Jira', time: 'Time', kaiten: 'Kaiten', linear: 'Linear', md: 'Markdown' };
++  function bugInfo(rect, el, note) {
++    const ua = navigator.userAgentData?.brands?.find(b => !/Not.?A.?Brand|Chromium/i.test(b.brand)) || navigator.userAgentData?.brands?.[0];
++    const browser = ua ? `${ua.brand} ${ua.version}` : (navigator.userAgent.match(/(Chrome|Firefox|Safari)\/[\d.]+/) || [''])[0];
++    const os = /Mac/.test(navigator.platform) ? 'macOS' : /Win/.test(navigator.platform) ? 'Windows' : navigator.platform;
++    const info = el ? inspect(el) : null;
++    return { note: note || '', url: location.href, title: document.title, viewport: `${innerWidth}×${innerHeight}`, dpr: devicePixelRatio, browser: `${A.browserName || browser} · ${os}`, when: new Date().toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' }),
++      selector: el ? cssPath(el) : '', rect: `${Math.round(rect.width)}×${Math.round(rect.height)} @ ${Math.round(rect.left + scrollX)},${Math.round(rect.top + scrollY)}`,
++      styles: info ? [info.own ? 'фон ' + toHex(info.own) : '', info.hasText ? 'текст ' + toHex(over(info.fg, info.bg)) : '', info.hasText ? `${info.font.family} ${info.cs.fontWeight} ${px(info.cs.fontSize)}/${info.cs.lineHeight === 'normal' ? 'auto' : px(info.cs.lineHeight)}` : '', info.pad.some(Boolean) ? 'отступы ' + info.padS : ''].filter(Boolean).join(', ') : '' };
++  }
++  function bugText(b, target) {
++    let u; try { u = new URL(b.url); } catch { u = { hostname: b.url, pathname: '' }; }
++    const title = b.note || `Проблема на ${u.hostname}${u.pathname}`;
++    const lines = [['Страница', b.url], ['Окно', `${b.viewport} @${b.dpr}x`], ['Браузер', b.browser], ['Когда', b.when], b.selector && ['Элемент', b.selector], ['Область', b.rect], b.styles && ['Стили', b.styles]].filter(Boolean);
++    if (target === 'slack') return `*${title}*\n${lines.map(([k, v]) => `• ${k}: ${k === 'Элемент' ? '`' + v + '`' : k === 'Страница' ? `<${v}|${b.title || v}>` : v}`).join('\n')}`;
++    if (target === 'jira') return `h3. ${title}\n${lines.map(([k, v]) => `*${k}:* ${k === 'Элемент' ? '{{' + v + '}}' : k === 'Страница' ? `[${b.title || v}|${v}]` : v}`).join('\n')}\n\n!screenshot.png|thumbnail!`;
++    if (target === 'kaiten') return `${title}\n\n${lines.map(([k, v]) => `**${k}:** ${k === 'Элемент' ? '`' + v + '`' : k === 'Страница' ? `[${b.title || v}](${v})` : v}`).join('  \n')}\n\nСнимок — во вложении.`;
++    return `**${title}**\n\n| | |\n|---|---|\n${lines.map(([k, v]) => `| ${k} | ${k === 'Элемент' ? '`' + v + '`' : k === 'Страница' ? `[${b.title || v}](${v})` : v} |`).join('\n')}`;
++  }
++  const bugHtml = (b, dataUrl) => `<p><b>${esc(b.note || 'Проблема на странице')}</b></p><ul>${[['Страница', `<a href="${esc(b.url)}">${esc(b.title || b.url)}</a>`], ['Окно', `${b.viewport} @${b.dpr}x`], ['Браузер', esc(b.browser)], b.selector && ['Элемент', `<code>${esc(b.selector)}</code>`], b.styles && ['Стили', esc(b.styles)]].filter(Boolean).map(([k, v]) => `<li>${k}: ${v}</li>`).join('')}</ul>${dataUrl ? `<img src="${dataUrl}">` : ''}`;
++  const blobToDataUrl = b => new Promise(r => { const f = new FileReader(); f.onload = () => r(f.result); f.onerror = () => r(null); f.readAsDataURL(b); });
++  function ants(r, label) {
++    const n = H(`<svg class="ants" width="${r.width + 4}" height="${r.height + 4}" style="position:absolute;left:-2px;top:-2px;overflow:visible"><rect class="w" x="1.5" y="1.5" width="${Math.max(0, r.width + 1)}" height="${Math.max(0, r.height + 1)}" rx="2"/><rect class="a" x="1.5" y="1.5" width="${Math.max(0, r.width + 1)}" height="${Math.max(0, r.height + 1)}" rx="2"/></svg>${label ? `<span class="lbl">${esc(label)}</span>` : ''}`, 'ants');
++    box(n, r); if (r.top < 30) { const l = n.querySelector('.lbl'); if (l) { l.style.top = 'auto'; l.style.bottom = '-24px'; } } return n;
++  }
++  function startCapture() {
++    exitModes(); S.mode = 'capture'; mount(); setDockOn('capture');
++    dockPanel(`<span class="ttl">Снимок</span><span class="m">наведите на блок и кликните — или обведите область</span><span class="kbd">Esc</span>`);
++    S.cap = { L: layer('cap'), start: null, el: null };
++  }
++  function capMove(x, y) {
++    const c = S.cap; if (!c) return; c.L.innerHTML = '';
++    if (c.start) { const r = { left: Math.min(c.start.x, x), top: Math.min(c.start.y, y), width: Math.abs(x - c.start.x), height: Math.abs(y - c.start.y) }; c.L.appendChild(ants(r, `${Math.round(r.width)} × ${Math.round(r.height)}`)); c.el = null; return; }
++    const el = pick(x, y); if (!el) return; c.el = el; const r = el.getBoundingClientRect();
++    c.L.appendChild(ants(r, `${kindName(el)} · ${Math.round(r.width)} × ${Math.round(r.height)}`));
++  }
++  async function finishCapture(rect, el) {
++    const L = S.cap?.L; S.cap = null; S.mode = null; setDockOn(null); if (dock) dockPanel('');
++    if (L) L.innerHTML = '';
++    if (!reduced()) { const f = H('', 'shutter'); box(f, rect); root.appendChild(f); f.animate([{ opacity: 0 }, { opacity: .6 }, { opacity: 0 }], { duration: 180 }).onfinish = () => f.remove(); }
++    let blob = null; try { await new Promise(r => setTimeout(r, reduced() ? 0 : 190)); blob = A.capture ? await A.capture({ x: rect.left, y: rect.top, width: rect.width, height: rect.height, dpr: devicePixelRatio, element: el ? cssPath(el) : null }) : null; } catch {}
++    showCaptureCard(rect, el, blob);
++  }
++  function showCaptureCard(rect, el, blob) {
++    root.querySelector('.card')?.remove(); showDock();
++    const card = H('', 'panel card in int'); root.appendChild(card);
++    const url = blob ? URL.createObjectURL(blob) : null;
++    let preview;
++    if (url) preview = `<img src="${url}" draggable="true">`;
++    else if (el) { const r = el.getBoundingClientRect(), k = Math.min(1, 312 / r.width, 190 / r.height); preview = `<div style="width:${r.width * k}px;height:${r.height * k}px;overflow:hidden;position:relative"><div class="clone" style="width:${r.width}px;height:${r.height}px;transform:scale(${k});transform-origin:0 0;position:absolute"></div></div>`; }
++    else preview = `<div style="padding:40px 10px;color:var(--m-text-2);font-size:12px;text-align:center">${Math.round(rect.width)} × ${Math.round(rect.height)}<br>картинка — в Meridian</div>`;
++    const t = S.lastBugTarget, b0 = bugInfo(rect, el, ''), connected = (A.connectedTargets?.() || []);
++    card.innerHTML = `<div class="ph"><b>${el ? esc(kindName(el)) : 'Область'}</b><span class="m num">${Math.round(rect.width)} × ${Math.round(rect.height)} · @${devicePixelRatio}x</span><button class="x" data-close>×</button></div>
++      <div class="thumb">${preview}</div>
++      <div class="meta"><div>${esc(b0.url)}</div><div>${esc(b0.viewport)} · ${esc(b0.browser)}</div>${b0.selector ? `<div>${esc(b0.selector)}</div>` : ''}</div>
++      <textarea placeholder="Что не так? Попадёт в заголовок"></textarea>
++      <div class="acts"><button class="btn pri" data-a="bug">Как баг → <span data-tn>${BUG_TARGETS[t]}</span></button><span class="seg">${Object.entries(BUG_TARGETS).filter(([k]) => k !== 'md').map(([k, n]) => `<button data-bug="${k}" class="${k === t ? 'on' : ''}">${n}</button>`).join('')}</span>
++      <button class="btn" data-a="img">Скопировать картинку</button><button class="btn ghost" data-a="save">PNG</button>${A.sendToAgent ? '<button class="btn ghost" data-a="agent">В агента</button>' : ''}${connected.map(k => `<button class="btn ghost" data-send="${k}">Отправить в ${BUG_TARGETS[k] || k}</button>`).join('')}</div>`;
++    if (!url && el) { const c = el.cloneNode(true); c.style.margin = '0'; c.style.width = getComputedStyle(el).width; const h2 = card.querySelector('.clone'); const bg = effectiveBg(el).color; h2.style.background = bg ? toHex(bg) : '#fff'; h2.appendChild(c); }
++    if (!reduced()) { const r = card.getBoundingClientRect();
++      card.animate([{ transform: `translate(${rect.left - r.left}px, ${rect.top - r.top}px) scale(${Math.min(rect.width / r.width, 3)}, ${Math.min(rect.height / r.height, 3)})`, transformOrigin: '0 0', opacity: .4 }, { transform: 'none', transformOrigin: '0 0', opacity: 1 }], { duration: 380, easing: 'cubic-bezier(.6,0,.2,1)' }); }
++    const img = card.querySelector('.thumb img'); if (img && blob) img.addEventListener('dragstart', e => { try { e.dataTransfer.setData('DownloadURL', `image/png:${location.hostname}-snimok.png:${url}`); e.dataTransfer.setData('text/uri-list', url); } catch {} });
++    const note = () => card.querySelector('textarea').value.trim();
++    const doBug = async (target) => {
++      S.lastBugTarget = target; savePrefs(); card.querySelector('[data-tn]').textContent = BUG_TARGETS[target];
++      card.querySelectorAll('[data-bug]').forEach(x => x.classList.toggle('on', x.dataset.bug === target));
++      const b = bugInfo(rect, el, note()), text = bugText(b, target), dataUrl = blob ? await blobToDataUrl(blob) : null;
++      const textOnly = target === 'jira' || target === 'kaiten';
++      const ok = await copy({ text, html: textOnly ? undefined : bugHtml(b, dataUrl), png: textOnly ? undefined : blob || undefined });
++      toast(ok ? `Баг для ${BUG_TARGETS[target]} в буфере${blob && textOnly ? ' · картинку — второй кнопкой' : ''}` : 'Не удалось скопировать', ok);
++    };
++    card.addEventListener('click', async e => {
++      const b = e.target.closest('button'); if (!b) return;
++      if (b.dataset.close !== undefined) { card.remove(); if (url) setTimeout(() => URL.revokeObjectURL(url), 1000); unmountIfIdle(); return; }
++      if (b.dataset.a === 'bug') doBug(S.lastBugTarget);
++      if (b.dataset.bug) doBug(b.dataset.bug);
++      if (b.dataset.a === 'img') { const ok = blob ? await copy({ png: blob }) : false; toast(ok ? 'Картинка в буфере — в Figma и Slack без пересжатия' : blob ? 'Не удалось скопировать' : 'Картинка — в Meridian', ok); }
++      if (b.dataset.send) { const bi = bugInfo(rect, el, note()); const ok = await A.sendTo?.(b.dataset.send, { ...bi, text: bugText(bi, b.dataset.send), png: blob }); toast(ok ? 'Отправлено' : 'Не отправилось', !!ok); }
++      if (b.dataset.a === 'save') { if (blob) { download(blob, `${location.hostname || 'page'}-${el ? kindName(el).toLowerCase() : 'oblast'}.png`); toast('Сохранено'); } else toast('Файл картинкой — в Meridian', false); }
++      if (b.dataset.a === 'agent') { A.sendToAgent({ kind: 'bug', ...bugInfo(rect, el, note()), png: blob }); toast('Отправлено агенту'); }
++    });
++  }
++  function download(blob, name) { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.style.display = 'none'; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000); }
++
++  // ---------- images under the cursor + save as PNG
++  function imagesAt(x, y) {
++    const found = [], seen = new Set();
++    const addU = (url, kind, el) => { if (!url || seen.has(url)) return; seen.add(url); found.push({ url, kind, el }); };
++    const bestOfSrcset = ss => { let best = null; for (const part of ss.split(/,\s+/)) { const [u, d] = part.trim().split(/\s+/); const v = d ? parseFloat(d) * (d.endsWith('x') ? 1000 : 1) : 1; if (u && (!best || v > best.v)) best = { u, v }; } return best?.u; };
++    const abs = u => { try { return new URL(u, location.href).href; } catch { return u; } };
++    for (const el of document.elementsFromPoint(x, y)) {
++      if (el === host) continue;
++      if (el.tagName === 'IMG') { const ss = el.getAttribute('srcset') || el.dataset.srcset; const big = ss ? abs(bestOfSrcset(ss)) : null; addU(big || el.currentSrc || el.src || abs(el.dataset.src || ''), big ? 'srcset, самый крупный' : el.dataset.src && !el.src ? 'ленивая' : 'картинка', el); }
++      if (el.tagName === 'VIDEO' && el.poster) addU(el.poster, 'постер видео', el);
++      if (el.tagName === 'CANVAS') { try { addU(el.toDataURL('image/png'), 'canvas', el); } catch {} }
++      const svg = el.closest && el.closest('svg'); if (svg && !seen.has(svg)) { seen.add(svg); const s = new XMLSerializer().serializeToString(svg); found.push({ url: 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(s.includes('xmlns') ? s : s.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"')), kind: 'SVG', el: svg }); }
++      for (const pseudo of [null, '::before', '::after']) { const bi = getComputedStyle(el, pseudo).backgroundImage;
++        if (bi && bi !== 'none') { const urls = [...bi.matchAll(/url\(["']?(.*?)["']?\)/g)].map(m => m[1]); urls.forEach(u => addU(abs(u), pseudo ? 'фон ' + pseudo : 'фон CSS', el)); if (!urls.length && /gradient/.test(bi) && !seen.has(bi)) { seen.add(bi); found.push({ url: null, gradient: bi, kind: 'CSS-градиент', el }); } } }
++      if (el.tagName === 'PICTURE') el.querySelectorAll('source').forEach(s => addU(abs(bestOfSrcset(s.srcset)), 'source', el));
++    }
++    return found.slice(0, 8);
++  }
++  const loadImg = src => new Promise((res, rej) => { const i = new Image(); i.crossOrigin = 'anonymous'; i.onload = () => res(i); i.onerror = rej; i.src = src; });
++  async function toPng(item) {
++    if (item.gradient) { const r = item.el.getBoundingClientRect(), c = document.createElement('canvas'); c.width = Math.round(r.width * 2); c.height = Math.round(r.height * 2);
++      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${c.width}" height="${c.height}"><foreignObject width="100%" height="100%"><div xmlns="http://www.w3.org/1999/xhtml" style="width:100%;height:100%;background:${item.gradient.replace(/"/g, "'")}"></div></foreignObject></svg>`;
++      try { const img = await loadImg('data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg)); c.getContext('2d').drawImage(img, 0, 0); return await new Promise(r => c.toBlob(r, 'image/png')); } catch { return null; } }
++    let src = item.url, objUrl = null;
++    if (!/^(data|blob):/.test(src)) { let blob = null; try { const res = await fetch(src, { mode: 'cors', credentials: 'omit' }); if (res.ok) blob = await res.blob(); } catch {}
++      if (!blob && A.fetchImage) blob = await A.fetchImage(src); if (!blob) return null; if (blob.type === 'image/png') return blob; objUrl = src = URL.createObjectURL(blob); }
++    try { const img = await loadImg(src); const c = document.createElement('canvas'), k = item.kind === 'SVG' ? 2 : 1; c.width = (img.naturalWidth || 300) * k; c.height = (img.naturalHeight || 150) * k; c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); return await new Promise(r => c.toBlob(r, 'image/png')); }
++    catch { return null; } finally { if (objUrl) URL.revokeObjectURL(objUrl); }
++  }
++  const extOf = it => !it.url ? 'градиент' : (it.url.match(/^data:image\/([\w+]+)/) || it.url.match(/\.(\w{3,4})(?:[?#]|$)/) || [, it.kind === 'SVG' ? 'svg' : 'img'])[1].replace('svg+xml', 'svg');
++  const fileName = (item, ext = 'png') => { if (!item.url || item.url.startsWith('data:')) return `${location.hostname || 'page'}-${item.kind === 'SVG' ? 'vector' : 'image'}.${ext}`; const b = item.url.split(/[?#]/)[0].split('/').pop() || 'image'; return b.replace(/\.(webp|avif|jpe?g|gif|png|svg|bmp)$/i, '') + '.' + ext; };
++  async function showImages(x, y) {
++    mount(); closeMenus();
++    const items = imagesAt(x, y), p = H('', 'panel menu imgs in int'); p.dataset.menu = '1'; root.appendChild(p);
++    p.innerHTML = !items.length ? '<div style="padding:10px;color:var(--m-text-2)">Под курсором нет картинок</div>' : `<div style="padding:6px 6px 4px;font-weight:600;font-size:12px;color:var(--m-text-2)">Картинки под курсором · ${items.length}</div>` + items.map((it, i) => `<div class="im"><span class="th" style="background-image:${it.gradient ? it.gradient : `url('${it.url.replace(/'/g, '%27')}')`}"></span><span class="meta"><b>${esc(it.url ? fileName(it, extOf(it)) : 'градиент')}</b><span data-dim="${i}">${esc(it.kind)}</span></span><button class="btn" data-png="${i}" style="height:24px">PNG</button><button class="btn ghost" data-cp="${i}" style="height:24px" title="Копировать как PNG">⧉</button></div>`).join('') + (items.length > 1 ? `<div style="padding:6px"><button class="btn pri" data-all>Сохранить все как PNG</button></div>` : '');
++    p.style.width = '300px'; place(p, clamp(x + 6, 8, innerWidth - 308), clamp(y + 6, 8, innerHeight - p.offsetHeight - 8));
++    items.forEach((it, i) => { if (!it.url) return; const im = new Image(); im.onload = () => { const d = p.querySelector(`[data-dim="${i}"]`); if (d) d.textContent = `${im.naturalWidth}×${im.naturalHeight} · ${it.kind}`; }; im.src = it.url; });
++    p.addEventListener('click', async e => { const b = e.target.closest('button'); if (!b) return;
++      const one = async it => { const png = await toPng(it); if (png) download(png, fileName(it)); return !!png; };
++      if (b.dataset.png) { const ok = await one(items[+b.dataset.png]); toast(ok ? 'Сохранено как PNG' : 'Сайт не отдаёт эту картинку', ok); }
++      if (b.dataset.cp) { const png = await toPng(items[+b.dataset.cp]); const ok = png ? await copy({ png }) : false; toast(ok ? 'PNG в буфере — без сжатия' : 'Не удалось скопировать', ok); }
++      if (b.dataset.all !== undefined) { let n = 0; for (const it of items) if (await one(it)) n++; toast(`Сохранено: ${n} из ${items.length}`, n > 0); } });
++  }
++  async function savePngAt(x, y) { mount(); const it = imagesAt(x, y)[0]; if (!it) { toast('Под курсором нет картинки', false); return; } const png = await toPng(it); if (png) { download(png, fileName(it)); toast('Сохранено как PNG'); } else toast('Сайт не отдаёт эту картинку', false); }
++  function closeMenus() { root.querySelectorAll('[data-menu]').forEach(n => n.remove()); clear('lead'); }
++  function contextMenu(x, y) {
++    mount(); closeMenus();
++    const el = pick(x, y), nImg = imagesAt(x, y).length;
++    const m = H('', 'panel menu in int'); m.dataset.menu = '1'; root.appendChild(m);
++    const items = [['lens', 'Линза: этот элемент'], ['shot', 'Снимок элемента → как баг'], nImg && ['png', 'Сохранить картинку как PNG'], nImg && ['imgs', `Картинки под курсором · ${nImg}`], ['color', 'Цвет → в бренд'], ['-'], ['stress', 'Стресс-текст']].filter(Boolean);
++    m.innerHTML = items.map(([k, n]) => k === '-' ? '<div class="sepl"></div>' : `<div class="it" data-k="${k}">${n}</div>`).join('');
++    place(m, clamp(x, 8, innerWidth - 278), clamp(y, 8, innerHeight - m.offsetHeight - 8));
++    m.addEventListener('click', e => { const k = e.target.closest('[data-k]')?.dataset.k; if (!k || !el) return; m.remove(); contextAction(k, x, y, el); });
++  }
++  function contextAction(k, x, y, el = pick(x, y)) {
++    if (!el) return; mount();
++    if (k === 'lens') { activate(); setMode('lens'); selectEl(el, false); }
++    if (k === 'shot') finishCapture(el.getBoundingClientRect(), el);
++    if (k === 'png') savePngAt(x, y);
++    if (k === 'imgs') showImages(x, y);
++    if (k === 'color') { const p = primaryColor(inspect(el)); activate(); addToBrand({ type: 'color', hex: toHex({ ...p.c, a: 1 }) }, { left: x, top: y, width: 1, height: 1 }); }
++    if (k === 'stress') { activate(); stress('long'); }
++  }
++
++  // ---------- stress text: red tape where text doesn't fit
++  const LONG_WORDS = ['дополнительно', 'обязательно', 'предварительно', 'индивидуально', 'круглосуточно', 'ежедневно', 'бесплатно'];
++  function textNodes() {
++    const out = [], w = document.createTreeWalker(SCOPE(), NodeFilter.SHOW_TEXT, { acceptNode: n => { const p = n.parentElement; if (!p || !n.nodeValue.trim() || /^(SCRIPT|STYLE|NOSCRIPT|TEXTAREA|CODE|PRE)$/.test(p.tagName) || p.closest('meridian-toolkit')) return NodeFilter.FILTER_REJECT; return NodeFilter.FILTER_ACCEPT; } });
++    while (w.nextNode()) out.push(w.currentNode); return out;
++  }
++  const lineCount = el => { const cs = getComputedStyle(el), lh = parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.25, r = el.getBoundingClientRect(); return Math.max(1, Math.round((r.height - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom)) / lh)); };
++  function stress(kind) {
++    if (S.stress) restoreText(false);
++    exitModes(true); S.mode = 'stress'; mount(); showDock(); setDockOn('stress');
++    const nodes = textNodes(), orig = new Map(), before = new Map(), blocks = new Set(nodes.map(n => n.parentElement));
++    blocks.forEach(b => before.set(b, lineCount(b)));
++    let i = 0;
++    for (const n of nodes) { const t = n.nodeValue; orig.set(n, t);
++      if (kind === 'long') { const target = Math.ceil(t.trim().length * 1.4); let s = t.trimEnd(); while (s.trim().length < target) s += ' ' + LONG_WORDS[i++ % LONG_WORDS.length]; n.nodeValue = s + t.match(/\s*$/)[0]; }
++      if (kind === 'words') n.nodeValue = t.replace(/[A-Za-zА-Яа-яЁё]{5,}/, w => w + 'обжаривающе' + w.toLowerCase());
++      if (kind === 'empty') n.nodeValue = '';
++      if (kind === 'numbers') n.nodeValue = t.replace(/\d[\d\s]*/g, d => (parseInt(d.replace(/\s/g, ''), 10) * 1000).toLocaleString('ru-RU') + (/\s$/.test(d) ? ' ' : ''));
++      if (kind === 'rtl') n.nodeValue = t.replace(/[A-Za-zА-Яа-яЁё]+/g, w => 'مرحبابكمفيالمتجر'.slice(0, Math.max(2, Math.ceil(w.length * 1.1))).padEnd(w.length, 'ا')); }
++    if (kind === 'rtl') { S.rtlPrev = document.documentElement.getAttribute('dir'); document.documentElement.setAttribute('dir', 'rtl'); }
++    S.stress = { orig, kind, before };
++    requestAnimationFrame(() => requestAnimationFrame(() => detectBreaks(blocks, before, kind)));
++  }
++  function detectBreaks(blocks, before, kind) {
++    const issues = [], seen = new Set();
++    const addI = (el, why, extra = {}) => { const key = cssPath(el); if (seen.has(key)) return; seen.add(key); issues.push({ el, why, ...extra }); };
++    for (const el of blocks) {
++      if (!el.isConnected) continue;
++      const cs = getComputedStyle(el), r = el.getBoundingClientRect(); if (!r.width) continue;
++      if (cs.textOverflow === 'ellipsis' && el.scrollWidth > el.clientWidth + 1) { addI(el, 'текст обрезан многоточием', { box: el, over: { right: el.scrollWidth - el.clientWidth } }); continue; }
++      if ((cs.overflowX === 'hidden' || cs.overflow === 'hidden') && (el.scrollWidth > el.clientWidth + 1 || el.scrollHeight > el.clientHeight + 2)) { addI(el, 'текст обрезан', { box: el, over: { right: Math.max(0, el.scrollWidth - el.clientWidth), bottom: Math.max(0, el.scrollHeight - el.clientHeight) } }); continue; }
++      for (let p = el.parentElement, d = 0; p && p !== document.body && d < 4; p = p.parentElement, d++) {
++        const pr = p.getBoundingClientRect(), pcs = getComputedStyle(p); if (pcs.display === 'contents' || !pr.width) continue;
++        const out = Math.round(r.right - pr.right);
++        if (out > 2 && pr.width < innerWidth - 4) { addI(el, `вылезло за ${p.tagName.toLowerCase()}${p.classList[0] ? '.' + p.classList[0] : ''} на ${out} px`, { box: p, content: el }); break; }
++        if (/block|flex|grid/.test(pcs.display) && pcs.position !== 'static') break;
++      }
++      if (seen.has(cssPath(el))) continue;
++      const inter = /^(A|BUTTON|LABEL)$/.test(el.tagName) || /inline-flex|inline-block/.test(cs.display) || el.closest('nav,button,[role=button]');
++      if (inter && before.get(el) === 1 && lineCount(el) > 1 && kind !== 'empty') addI(el, 'перенос на 2 строки там, где была одна', { box: el });
++      if (kind === 'empty' && r.height < 2 && /^(H\d|P|A|BUTTON|SPAN)$/.test(el.tagName)) addI(el.parentElement, 'пустой блок схлопнулся', { box: el.parentElement });
++    }
++    const inters = [...SCOPE().querySelectorAll('a,button,[role=button]')].filter(e => !e.closest('meridian-toolkit')).slice(0, 300).map(e => ({ e, r: e.getBoundingClientRect() })).filter(o => o.r.width);
++    for (let i = 0; i < inters.length; i++) for (let j = i + 1; j < inters.length; j++) { const a = inters[i].r, b = inters[j].r;
++      if (a.left < b.right - 2 && b.left < a.right - 2 && a.top < b.bottom - 2 && b.top < a.bottom - 2 && !inters[i].e.contains(inters[j].e) && !inters[j].e.contains(inters[i].e)) addI(inters[j].e, 'наезжает на соседнюю кнопку', { box: inters[j].e }); }
++    S.stress.issues = issues.slice(0, 20); renderStress();
++  }
++  function dropAt(r, n, cls = '', side) { // a drop pin on the element's free margin, pointing at it
++    const right = side ? side === 'r' : r.right + 30 < innerWidth;
++    const d = H(`<span class="b"></span><span class="n">${n}</span>`, 'drop ' + (right ? 'l ' : 'r ') + cls);
++    place(d, right ? r.right + 6 : r.left - 28, clamp(r.top + r.height / 2 - 11, 4, innerHeight - 26)); return d;
++  }
++  function renderStress() {
++    const L = layer('stress'); L.innerHTML = ''; const st = S.stress; if (!st) return;
++    st.issues.forEach((it, i) => {
++      const br = it.box.getBoundingClientRect(), ring = H('', 'sring'); box(ring, br); L.appendChild(ring);
++      // the part that doesn't fit: diagonal tape beyond the container's edge + a 1px edge
++      const cr = it.content ? it.content.getBoundingClientRect() : null;
++      if (cr && cr.right > br.right) { const tp = H('', 'tape'); box(tp, { left: br.right, top: cr.top, width: cr.right - br.right, height: cr.height }); L.appendChild(tp); const ed = H('', 'edge'); box(ed, { left: br.right, top: cr.top, width: 1, height: cr.height }); L.appendChild(ed); }
++      if (it.over?.right) { const tp = H('', 'tape'); box(tp, { left: br.right, top: br.top, width: Math.min(it.over.right, 160), height: br.height }); L.appendChild(tp); }
++      if (it.over?.bottom) { const tp = H('', 'tape'); box(tp, { left: br.left, top: br.bottom, width: br.width, height: Math.min(it.over.bottom, 80) }); L.appendChild(tp); }
++      const d = dropAt({ left: br.left, right: Math.max(br.right, cr ? cr.right : 0), top: br.top, height: br.height }, i + 1); L.appendChild(d);
++      d.addEventListener('mouseenter', () => { const w = H(`<b>${i + 1}</b> · ${esc(it.why)}`, 'why'); L.appendChild(w); placeFree(w, d.getBoundingClientRect(), { gap: 6 }); d._w = w; });
++      d.addEventListener('mouseleave', () => d._w?.remove());
++      d.addEventListener('click', () => finishCapture(it.box.getBoundingClientRect(), it.box));
++    });
++    const kinds = [['long', '+40%'], ['words', 'Длинные слова'], ['rtl', 'RTL'], ['empty', 'Пусто'], ['numbers', 'Цены ×1000']];
++    const n = st.issues.length;
++    const p = dockPanel(`<span class="ttl">Стресс-текст</span><span class="seg">${kinds.map(([k, t]) => `<button class="${k === st.kind ? 'on' : ''}" data-sk="${k}">${t}</button>`).join('')}</span>
++      <span class="cnum ${n ? '' : 'ok'}">${n ? `${n} ${plural(n, 'место сломалось', 'места сломались', 'мест сломалось')}` : 'ничего не сломалось'}</span>
++      ${n ? `<button class="ib" data-sp title="Предыдущее">${ic('chevL', 15)}</button><span class="num m">${(st.cur ?? 0) + 1}/${n}</span><button class="ib" data-sn title="Следующее">${ic('chevR', 15)}</button>` : ''}
++      <button class="btn ghost" data-sbug>Как баг</button><button class="btn pri" data-srev>Вернуть текст</button>`);
++    p.addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return;
++      if (b.dataset.sk) stress(b.dataset.sk);
++      if (b.dataset.srev !== undefined) restoreText(true);
++      if (b.dataset.sn !== undefined || b.dataset.sp !== undefined) { st.cur = ((st.cur ?? 0) + (b.dataset.sn !== undefined ? 1 : -1) + n) % n; st.issues[st.cur].box.scrollIntoView({ block: 'center', behavior: reduced() ? 'auto' : 'smooth' }); setTimeout(renderStress, 450); }
++      if (b.dataset.sbug !== undefined) { const it = st.issues[st.cur || 0]; if (it) finishCapture(it.box.getBoundingClientRect(), it.box); } });
++  }
++  const plural = (n, a, b, c) => { const m10 = n % 10, m100 = n % 100; return m10 === 1 && m100 !== 11 ? a : m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20) ? b : c; };
++  function restoreText(exit) {
++    const st = S.stress; if (!st) return;
++    for (const [n, t] of st.orig) if (n.isConnected) n.nodeValue = t;
++    if (st.kind === 'rtl') { if (S.rtlPrev == null) document.documentElement.removeAttribute('dir'); else document.documentElement.setAttribute('dir', S.rtlPrev); }
++    S.stress = null; clear('stress'); if (exit) { S.mode = null; setDockOn(null); dockPanel(''); }
++  }
++
++  // ---------- contrast: wavy underline, number capsule, the same loupe
++  const undoStack = [];
++  function setStyle(el, prop, val) { undoStack.push({ el, prop, val: el.style.getPropertyValue(prop), pri: el.style.getPropertyPriority(prop) }); el.style.setProperty(prop, val, 'important'); }
++  function undo() { const u = undoStack.pop(); if (!u) return false; if (u.val) u.el.style.setProperty(u.prop, u.val, u.pri); else u.el.style.removeProperty(u.prop); return true; }
++  const textEls = () => [...new Set(textNodes().map(n => n.parentElement))].filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; }).slice(0, 1500);
++  function checkText(el) {
++    const cs = getComputedStyle(el), fg = textColor(el), bgI = effectiveBg(el), bg = bgI.color || { r: 255, g: 255, b: 255, a: 1 };
++    const size = parseFloat(cs.fontSize), w = +cs.fontWeight || 400, large = size >= 24 || (w >= 700 && size >= 18.66);
++    const ratio = contrast(over(fg, bg), bg), need = S.level === 'AAA' ? (large ? 4.5 : 7) : (large ? 3 : 4.5);
++    return { el, fg: over(fg, bg), bg, ratio, need, ok: ratio >= need, large, image: bgI.image, size, w };
++  }
++  function textBox(el) { const rg = document.createRange(); rg.selectNodeContents(el); const rs = [...rg.getClientRects()].filter(r => r.width > 1); return rs.length ? rs : [el.getBoundingClientRect()]; }
++  function contrastMode() { exitModes(); S.mode = 'contrast'; S.level = S.level || 'AA'; mount(); showDock(); setDockOn('contrast'); refreshSnap(); renderContrast(); }
++  function renderContrast() {
++    const L = layer('con'); L.innerHTML = '';
++    const res = textEls().map(checkText), bad = res.filter(r => !r.ok && !r.image);
++    for (const r of res) { if (r.image) continue; const lines = textBox(r.el); const last = lines[lines.length - 1]; if (last.bottom < 0 || last.top > innerHeight) continue;
++      if (!r.ok) { for (const b of lines) { const w = H(`<svg width="${b.width}" height="5" style="overflow:visible"><path d="${wave(b.width)}" fill="none" stroke="#e5484d" stroke-width="1.5"/></svg>`, 'wavy'); place(w, b.left, b.bottom + 1); L.appendChild(w); }
++        const n = H(r.ratio.toFixed(1), 'num-c'); L.appendChild(n); place(n, Math.min(last.right + 6, innerWidth - 40), last.top + last.height / 2 - 8); n.addEventListener('click', () => fixPanel(r)); }
++      else { const g = H('', 'okline'); Object.assign(g.style, { left: lines[0].left + 'px', top: lines[0].bottom + 2 + 'px', width: Math.min(lines[0].width, 24) + 'px' }); L.appendChild(g); } }
++    const vis = [['none', 'Обычное'], ['protanopia', 'Протанопия'], ['deuteranopia', 'Дейтеранопия'], ['tritanopia', 'Тританопия'], ['blur', 'Размытость']];
++    const p = dockPanel(`<span class="ttl">Контраст</span><span class="seg"><button data-lv="AA" class="${S.level === 'AA' ? 'on' : ''}">AA</button><button data-lv="AAA" class="${S.level === 'AAA' ? 'on' : ''}">AAA</button></span>
++      <span class="cnum ${bad.length ? '' : 'ok'}">${bad.length ? `${bad.length} ${plural(bad.length, 'текст', 'текста', 'текстов')} трудно читать` : 'всё читается'}</span>
++      <span class="seg">${vis.map(([k, t]) => `<button data-vis="${k}" class="${(S.vision || 'none') === k ? 'on' : ''}">${t}</button>`).join('')}</span>
++      ${bad.length ? `<button class="btn pri" data-fixall>Исправить все${S.brand.colors.length ? ' из бренда' : ''}</button>` : ''}${undoStack.length ? `<button class="ib" data-undo title="Отменить (${K.mod}Z)">${ic('undo', 15)}</button>` : ''}`);
++    p.addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return;
++      if (b.dataset.lv) { S.level = b.dataset.lv; renderContrast(); }
++      if (b.dataset.vis) { vision(b.dataset.vis); renderContrast(); }
++      if (b.dataset.fixall !== undefined) { bad.forEach(r => { const o = fixOptions(r)[0]; if (o) setStyle(r.el, 'color', o.hex); }); setTimeout(renderContrast, 30); }
++      if (b.dataset.undo !== undefined) { undo(); renderContrast(); } });
++  }
++  const wave = w => { let d = 'M0 2.5'; for (let x = 0; x < w; x += 4) d += ` q1 -2.5 2 0 q1 2.5 2 0`; return d; };
++  function vision(kind) {
++    S.vision = kind; const M = { protanopia: '0.567 0.433 0 0 0 0.558 0.442 0 0 0 0 0.242 0.758 0 0 0 0 0 1 0', deuteranopia: '0.625 0.375 0 0 0 0.7 0.3 0 0 0 0 0.3 0.7 0 0 0 0 0 1 0', tritanopia: '0.95 0.05 0 0 0 0 0.433 0.567 0 0 0 0.475 0.525 0 0 0 0 0 1 0' };
++    document.getElementById('__mtk-vision')?.remove(); document.documentElement.style.removeProperty('filter');
++    if (kind === 'none') { A.emulateVision?.('none'); return; }
++    if (A.emulateVision && A.emulateVision(kind)) return;
++    if (kind === 'blur') { document.documentElement.style.setProperty('filter', 'blur(1.5px)'); return; }
++    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); svg.id = '__mtk-vision'; svg.setAttribute('style', 'position:absolute;width:0;height:0');
++    svg.innerHTML = `<filter id="__mtk-f"><feColorMatrix type="matrix" values="${M[kind]}"/></filter>`; document.body.appendChild(svg); document.documentElement.style.setProperty('filter', 'url(#__mtk-f)');
++  }
++  function fixOptions(r) {
++    const opts = [];
++    for (const t of S.brand.colors) { const c = parseColor(t.hex), ratio = contrast(c, r.bg); opts.push({ name: t.name, hex: t.hex, ratio, ok: ratio >= r.need, brand: true, d: dE(c, r.fg) }); }
++    const o = oklch(r.fg), dark = lum(r.bg) > 0.18;
++    for (let L = o.L; L >= 0 && L <= 1; L += dark ? -0.01 : 0.01) { const c = fromOklch(L, o.C, o.h), ratio = contrast(c, r.bg); if (ratio >= r.need) { opts.push({ name: 'Тот же оттенок', hex: toHex(c), ratio, ok: true, brand: false, d: dE(c, r.fg) }); break; } }
++    return opts.filter(x => x.ok).sort((a, b) => (b.brand - a.brand) || a.d - b.d);
++  }
++  function fixPanel(r) {
++    closeMenus(); const p = H('', 'panel in int'); p.dataset.menu = '1'; p.style.width = '280px'; root.appendChild(p);
++    const opts = fixOptions(r).slice(0, 4), bd = (ok, t) => `<span class="badge" style="--c:${ok ? '#30a46c' : '#e5484d'}">${t}</span>`;
++    p.innerHTML = `<div class="ph" style="padding-bottom:4px"><b style="font-size:13px;max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">«${esc(r.el.textContent.trim().slice(0, 40))}»</b><span class="m num">${px(r.size)} px</span><button class="x" data-close>×</button></div>
++      <div class="sec" style="display:flex;flex-direction:column;gap:2px">
++      <div class="opt"><i style="background:${toHex(r.fg)}"></i>Сейчас<span class="n">${r.ratio.toFixed(2)}</span>${bd(false, S.level + ' ✗')}</div>
++      ${opts.map((o, i) => `<div class="opt ${i ? '' : 'best'}" data-o="${i}"><i style="background:${o.hex}"></i>${o.brand ? `<b>${esc(o.name)}</b>` : `${esc(o.name)}`}<span class="n">${o.ratio.toFixed(2)}</span>${bd(true, (o.ratio >= (r.large ? 4.5 : 7) ? 'AAA' : 'AA') + ' ✓')}</div>`).join('') || '<div style="color:var(--m-text-2);font-size:12px">Нет подходящего цвета.</div>'}
++      <div style="font-size:11.5px;color:var(--m-text-2);margin:6px 2px 0">Наведите — страница покажет сразу. Клик — применить, ${K.mod}Z — отменить.</div></div>`;
++    placeFree(p, r.el.getBoundingClientRect(), { gap: 12 });
++    const prev = r.el.style.getPropertyValue('color'), prevP = r.el.style.getPropertyPriority('color'); let committed = false;
++    const restore = () => { if (committed) return; if (prev) r.el.style.setProperty('color', prev, prevP); else r.el.style.removeProperty('color'); };
++    p.addEventListener('mouseover', e => { const o = e.target.closest('[data-o]'); if (o) r.el.style.setProperty('color', opts[+o.dataset.o].hex, 'important'); });
++    p.addEventListener('mouseleave', restore);
++    p.addEventListener('click', e => { if (e.target.closest('[data-close]')) { restore(); p.remove(); return; } const o = e.target.closest('[data-o]'); if (!o) return; restore(); committed = true; setStyle(r.el, 'color', opts[+o.dataset.o].hex); p.remove(); renderContrast(); });
++  }
++  function contrastLoupe(x, y) {
++    const el = pick(x, y), t = el && (ownText(el) || (el.children.length === 0 && el.textContent.trim())) ? el : null;
++    if (!t) { loupeEl?.remove(); loupeEl = null; capEl?.remove(); capEl = null; return; }
++    const r = checkText(t), info = inspect(t);
++    const lo = drawLoupe(x, y, info, { colour: r.fg, bottom: `${r.ratio.toFixed(2)} : 1 · ${r.ok ? 'читается' : 'нужно ' + r.need}` });
++    if (!capEl) capEl = add('', 'cap int');
++    capEl.innerHTML = `<i class="dot" style="background:${toHex(r.fg)};box-shadow:0 0 0 3px ${toHex(r.bg)}, inset 0 0 0 1px rgba(255,255,255,.25)"></i><code>${r.ratio.toFixed(2)} : 1</code><span class="badge" style="--c:${r.ok ? '#30a46c' : '#e5484d'};background:color-mix(in srgb, ${r.ok ? '#30a46c' : '#e5484d'} 26%, transparent);color:${r.ok ? '#8fe2b6' : '#ff9ea1'}">${S.level} ${r.ok ? '✓' : '✗'}</span>`;
++    place(capEl, clamp(lo.lx + 92 - capEl.offsetWidth / 2, 8, innerWidth - capEl.offsetWidth - 8), lo.ly + 192);
++  }
++
++  // ---------- brand check: drop pins on the margin, one ring style
++  function brandCheck() {
++    exitModes(); S.mode = 'brandcheck'; mount(); showDock(); setDockOn('brandcheck');
++    const L = layer('bc'); L.innerHTML = '';
++    if (!S.brand.colors.length) { const p = dockPanel(`<span class="ttl">Проверка бренда</span><span class="m">Бренд пуст — заберите систему сайта или добавьте цвета линзой</span><button class="btn pri" data-g>Забрать систему</button>`); p.querySelector('[data-g]').onclick = grabSystem; return; }
++    const groups = new Map(), fonts = new Map(), brandFams = S.brand.fonts.map(f => f.family.toLowerCase());
++    for (const el of SCOPE().querySelectorAll('*')) {
++      if (el.closest('meridian-toolkit')) continue;
++      const r = el.getBoundingClientRect(); if (!r.width || !r.height) continue;
++      const cs = getComputedStyle(el); if (cs.visibility === 'hidden' || cs.display === 'none') continue;
++      const check = (val, prop) => { const c = parseColor(val); if (!c || c.a < 0.5) return; const h = toHex({ ...c, a: 1 }); if (h === '#FFFFFF' || h === '#000000') return;
++        const b = brandFor(c); if (!b || b.d < 0.012) return; if (oklch(c).C < 0.02 && b.d > 0.08) return;
++        const key = prop + h, g = groups.get(key) || { prop, hex: h, c, best: b, els: [] }; g.els.push(el); groups.set(key, g); };
++      check(cs.backgroundColor, 'background-color'); if (ownText(el)) check(cs.color, 'color');
++      if (parseFloat(cs.borderTopWidth) > 0 && cs.borderTopStyle !== 'none') check(cs.borderTopColor, 'border-color');
++      if (brandFams.length && ownText(el)) { const f = renderedFont(cs).family; if (!brandFams.includes(f.toLowerCase())) { const g = fonts.get(f) || { family: f, els: [] }; g.els.push(el); fonts.set(f, g); } }
++    }
++    const issues = [...groups.values()].sort((a, b) => a.best.d - b.best.d).slice(0, 12).map(g => ({ ...g, kind: 'color' })).concat([...fonts.values()].slice(0, 4).map(f => ({ kind: 'font', ...f })));
++    issues.sort((a, b) => a.els[0].getBoundingClientRect().top - b.els[0].getBoundingClientRect().top);
++    S.bc = { issues, fixed: 0, cur: 0 };
++    const render = () => {
++      L.innerHTML = ''; const left = issues.filter(i => !i.fixed);
++      issues.forEach((it, n) => { const r0 = it.els[0].getBoundingClientRect();
++        if (!it.fixed) it.els.slice(0, 20).forEach(el => { const ring = H('', 'ring'); box(ring, el.getBoundingClientRect(), 2); L.appendChild(ring); });
++        const d = dropAt(r0, it.fixed ? '✓' : n + 1, it.fixed ? 'ok' : ''); d.style.animationDelay = Math.min(n, 12) * 30 + 'ms'; L.appendChild(d);
++        d.addEventListener('click', () => issuePanel(it, n, d)); });
++      const p = dockPanel(`<span class="ttl">Проверка бренда</span><span class="m">по «${esc(S.brand.name)}»</span>
++        <span class="cnum ${left.length ? 'w' : 'ok'}">${left.length ? `${left.length} ${plural(left.length, 'отличие', 'отличия', 'отличий')}` : 'всё из бренда'}</span>${S.bc.fixed ? `<span class="m">${S.bc.fixed} исправлено</span>` : ''}
++        ${left.length ? `<button class="ib" data-p>${ic('chevL', 15)}</button><span class="num m">${S.bc.cur + 1}/${issues.length}</span><button class="ib" data-n>${ic('chevR', 15)}</button>` : ''}
++        ${left.some(i => i.kind === 'color') ? '<button class="btn pri" data-all>Заменить все</button>' : ''}${undoStack.length ? `<button class="ib" data-undo title="Отменить (${K.mod}Z)">${ic('undo', 15)}</button>` : ''}`);
++      p.addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return;
++        if (b.dataset.all !== undefined) { left.filter(i => i.kind === 'color').forEach((it, k) => setTimeout(() => fixIssue(it, true), reduced() ? 0 : k * 40)); setTimeout(render, reduced() ? 10 : left.length * 40 + 260); }
++        if (b.dataset.n !== undefined || b.dataset.p !== undefined) { S.bc.cur = (S.bc.cur + (b.dataset.n !== undefined ? 1 : -1) + issues.length) % issues.length; const it = issues[S.bc.cur]; it.els[0].scrollIntoView({ block: 'center', behavior: reduced() ? 'auto' : 'smooth' }); setTimeout(() => { render(); const d = L.querySelectorAll('.drop')[S.bc.cur]; if (d) issuePanel(it, S.bc.cur, d); }, 420); }
++        if (b.dataset.undo !== undefined) { const it = [...issues].reverse().find(i => i.fixed); if (it) { for (let k = 0; k < it.fixed; k++) undo(); it.fixed = 0; S.bc.fixed--; } render(); } });
++    };
++    const fixIssue = (it, quiet) => { if (it.fixed) return; let n = 0;
++      it.els.forEach(el => { if (!reduced()) { el.style.setProperty('transition', `${it.prop} 240ms cubic-bezier(.2,.8,.2,1)`); setTimeout(() => el.style.removeProperty('transition'), 300); } setStyle(el, it.prop, it.best.t.hex); n++; });
++      it.fixed = n; S.bc.fixed++; if (!quiet) render(); };
++    const issuePanel = (it, n, d) => {
++      closeMenus(); const p = H('', 'panel in int'); p.dataset.menu = '1'; p.style.width = '300px'; root.appendChild(p);
++      const head = `<div class="ph" style="padding:14px 14px 6px"><span class="drop l" style="position:static;display:inline-block;animation:none;flex:none"><span class="b"></span><span class="n">${n + 1}</span></span><b style="font-size:13.5px">`;
++      if (it.kind === 'font') p.innerHTML = `${head}Шрифт ${esc(it.family)}</b><button class="x" data-close>×</button></div><div class="sec" style="font-size:12.5px;color:var(--m-text-2);padding:0 14px 14px">В бренде: ${S.brand.fonts.map(f => esc(f.family)).join(', ')}. ${it.els.length} ${plural(it.els.length, 'место', 'места', 'мест')}.<div style="display:flex;gap:6px;margin-top:10px"><button class="btn pri" data-ff>Заменить на ${esc(S.brand.fonts.at(-1).family)}</button><button class="btn ghost" data-skip>Пропустить</button></div></div>`;
++      else p.innerHTML = `${head}${esc(kindName(it.els[0]))} · ${{ 'background-color': 'фон', color: 'текст', 'border-color': 'обводка' }[it.prop]}</b><button class="x" data-close>×</button></div>
++        <div class="sec" style="padding:4px 14px 14px"><div style="display:flex;align-items:center;gap:10px"><div style="text-align:center;font-size:11px;color:var(--m-text-2)"><i style="display:block;width:52px;height:34px;border-radius:var(--r-sm);background:${it.hex};margin-bottom:4px;box-shadow:var(--m-hair)"></i>${it.hex}</div><span style="color:var(--m-text-3)">→</span>
++        <div style="text-align:center;font-size:11px;color:var(--m-text-2)"><i style="display:block;width:52px;height:34px;border-radius:var(--r-sm);background:${it.best.t.hex};margin-bottom:4px;box-shadow:0 0 0 2px #fff,0 0 0 3px var(--m-space)"></i>${esc(it.best.t.name)}</div>
++        <div style="font-size:12px;line-height:1.4;color:var(--m-text-2)">ΔE ${(it.best.d * 100).toFixed(1).replace('.', ',')} — ${it.best.d < 0.04 ? 'на глаз почти то же, но не цвет бренда' : 'заметно другой цвет'}. <b style="color:var(--m-text)">${it.els.length} ${plural(it.els.length, 'место', 'места', 'мест')}</b></div></div>
++        <div style="display:flex;gap:6px;margin-top:12px"><button class="btn pri" data-fix>Заменить</button><button class="btn" data-keep>Это цвет бренда</button><button class="btn ghost" data-skip>Пропустить</button></div></div>`;
++      const dr = d.getBoundingClientRect(); placeFree(p, dr, { gap: 18 });
++      const pr = p.getBoundingClientRect(), lead = layer('lead'); lead.innerHTML = '';
++      const ln = H('', Math.abs(pr.top - dr.bottom) > Math.abs(pr.left - dr.right) ? 'lead' : 'leadh'); const cx = dr.left + dr.width / 2, cy = dr.top + dr.height / 2;
++      if (ln.className === 'lead') Object.assign(ln.style, { left: cx + 'px', top: Math.min(cy, pr.top) + 'px', height: Math.abs(pr.top - cy) + 'px' }); else Object.assign(ln.style, { left: Math.min(cx, pr.left) + 'px', top: cy + 'px', width: Math.abs(pr.left - cx) + 'px' });
++      lead.appendChild(ln);
++      p.addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; p.remove(); lead.innerHTML = '';
++        if (b.dataset.fix !== undefined) fixIssue(it);
++        if (b.dataset.ff !== undefined) { it.els.forEach(el => setStyle(el, 'font-family', `"${S.brand.fonts.at(-1).family}"`)); it.fixed = it.els.length; S.bc.fixed++; render(); }
++        if (b.dataset.keep !== undefined) { addToBrand({ type: 'color', hex: it.hex }, b.getBoundingClientRect()); issues.splice(issues.indexOf(it), 1); render(); }
++        if (b.dataset.skip !== undefined) { issues.splice(issues.indexOf(it), 1); render(); } });
++    };
++    render();
++  }
++
++  // ---------- events (capture phase: while a tool owns the pointer, the page doesn't get clicks)
++  const ours = e => e.composedPath().includes(host);
++  const owning = () => S.mode === 'lens' || S.peek || S.mode === 'capture';
++  let raf = 0;
++  const untrusted = e => A.trustedOnly && !e.isTrusted;
++  addEventListener('pointermove', e => {
++    if (untrusted(e)) return;
++    S.mouse = { x: e.clientX, y: e.clientY };
++    if (raf) return; raf = requestAnimationFrame(() => { raf = 0;
++      if (ours(e)) return;
++      if (S.mode === 'lens' || S.peek) lensMove(S.mouse.x, S.mouse.y);
++      else if (S.mode === 'capture') capMove(S.mouse.x, S.mouse.y);
++      else if (S.mode === 'contrast') contrastLoupe(S.mouse.x, S.mouse.y);
++    });
++  }, true);
++  for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'dblclick', 'auxclick']) addEventListener(t, e => {
++    if (untrusted(e) || ours(e)) return;
++    if (!owning()) { if (t === 'pointerdown') closeMenus(); return; }
++    e.preventDefault(); e.stopImmediatePropagation();
++    if (S.mode === 'capture') {
++      if (t === 'pointerdown' && e.button === 0) S.cap.start = { x: e.clientX, y: e.clientY };
++      if (t === 'pointerup' && S.cap?.start) { const s = S.cap.start, w = Math.abs(e.clientX - s.x), h = Math.abs(e.clientY - s.y);
++        if (w > 6 && h > 6) finishCapture({ left: Math.min(s.x, e.clientX), top: Math.min(s.y, e.clientY), width: w, height: h, right: Math.max(s.x, e.clientX), bottom: Math.max(s.y, e.clientY) }, null);
++        else if (S.cap.el) finishCapture(S.cap.el.getBoundingClientRect(), S.cap.el); }
++      return;
++    }
++    if (t === 'click' && e.button === 0) { const el = pick(e.clientX, e.clientY); if (el) selectEl(el, true); }
++  }, true);
++  addEventListener('contextmenu', e => { if (untrusted(e)) return; if (ours(e)) { e.preventDefault(); return; } if (A.ownContextMenu || owning()) { e.preventDefault(); e.stopImmediatePropagation(); contextMenu(e.clientX, e.clientY); } }, true);
++  let scrollT = 0;
++  addEventListener('scroll', () => {
++    if (S.sel) { const r = S.sel.el.getBoundingClientRect(); drawSel(r, `${Math.round(r.width)} × ${Math.round(r.height)}`); clear('pad'); clear('meas'); hudEl && placeFree(hudEl, r, { gap: 14 }); }
++    snap = null; clearTimeout(scrollT); scrollT = setTimeout(() => { if (S.mode === 'lens' || S.mode === 'contrast' || S.peek) refreshSnap(); if (S.mode === 'stress') renderStress(); if (S.mode === 'contrast') renderContrast(); if (S.mode === 'brandcheck') brandCheck(); }, 160);
++  }, { capture: true, passive: true });
++
++  // ⌥ held = peek, ⌥⌥ = latch (the Figma/xScope habit); Ctrl+Alt on Windows/Linux
++  let altDown = 0, altClean = false, altTimer = 0, lastAltUp = 0;
++  const isAltKey = e => e.key === 'Alt' || e.key === 'AltGraph';
++  addEventListener('keydown', e => {
++    if (untrusted(e)) return;
++    const editable = isEditable(document.activeElement) || isEditable(e.target);
++    if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.code === 'KeyX' && !editable) { e.preventDefault(); e.stopImmediatePropagation(); S.active ? deactivate() : activate(); return; }
++    if (isAltKey(e) && !e.repeat) {
++      altClean = !e.metaKey && !e.shiftKey && (K.mod === '⌘' ? !e.ctrlKey : true); altDown = performance.now();
++      if (altClean && !editable && !S.mode) altTimer = setTimeout(() => { if (!altClean) return; S.peek = true; mount(); refreshSnap().then(() => S.peek && lensMove(S.mouse.x, S.mouse.y)); lensMove(S.mouse.x, S.mouse.y); }, 180);
++      return;
++    }
++    if (!isAltKey(e)) { altClean = false; clearTimeout(altTimer); }
++    if (editable) return;
++    if (!(S.active || S.mode || S.peek)) return;
++    const k = e.key.toLowerCase(), plain = !e.metaKey && !e.ctrlKey && !e.altKey, eat = () => { e.preventDefault(); e.stopImmediatePropagation(); };
++    if (e.key === 'Escape') { eat(); if (root.querySelector('[data-menu]')) return closeMenus(); if (S.sel) { S.sel = null; [selEl, hudEl, capEl].forEach(n => n && n.remove()); selEl = hudEl = capEl = null; clear('pad'); clear('meas'); return; } if (S.mode) return exitModes(); if (drawer) { drawer.remove(); drawer = null; return; } const cd = root.querySelector('.card'); if (cd) { cd.remove(); return; } return deactivate(); }
++    if ((e.metaKey || e.ctrlKey) && k === 'z' && undoStack.length && (S.mode === 'contrast' || S.mode === 'brandcheck')) { eat(); undo(); S.mode === 'contrast' ? renderContrast() : brandCheck(); return; }
++    if ((e.metaKey || e.ctrlKey) && k === 'c' && (S.sel || S.hover) && (S.mode === 'lens' || S.peek)) { eat(); selectEl((S.sel || S.hover).el, true); return; }
++    if (!plain) return;
++    const map = { l: 'lens', g: 'system', s: 'camera', t: 'text', c: 'contrast', b: 'brandchk' }; for (const x of A.extraTools || []) if (x.key) map[x.key.toLowerCase()] = x.id;
++    const lensOn = S.mode === 'lens' || S.peek;
++    if (lensOn && e.code === 'KeyF') { eat(); S.fmt = FMTS[(FMTS.indexOf(S.fmt) + 1) % FMTS.length]; savePrefs(); const info = S.sel || S.hover; if (S.sel) { S.full ? drawFull(info) : drawStrip(info); const p = primaryColor(info); drawReadout(info, null, p.c, S.brand.colors.length ? brandFor(p.c) : null); } else if (info) lensMove(S.mouse.x, S.mouse.y); if (drawer) renderDrawer(); return; }
++    if (lensOn && k === ' ' && S.sel) { eat(); S.full = !S.full; S.full ? drawFull(S.sel) : drawStrip(S.sel); return; }
++    if (lensOn && (k === '+' || k === '=')) { eat(); const info = S.sel || S.hover; if (info) { const p = primaryColor(info); addToBrand({ type: 'color', hex: toHex({ ...p.c, a: 1 }) }, info.r); } return; }
++    if (S.sel && e.key === 'Enter') { eat(); const n = e.shiftKey ? S.sel.el.parentElement : S.sel.el.firstElementChild; if (n && n !== document.documentElement) selectEl(n, false); return; }
++    if (S.sel && e.key === 'Tab') { eat(); const n = e.shiftKey ? S.sel.el.previousElementSibling : S.sel.el.nextElementSibling; if (n) selectEl(n, false); return; }
++    if (e.code === 'KeyI') { eat(); showImages(S.mouse.x, S.mouse.y); return; }
++    const byCode = { KeyL: 'l', KeyG: 'g', KeyS: 's', KeyT: 't', KeyC: 'c', KeyB: 'b', KeyP: 'p' }[e.code] || k;
++    if (map[byCode]) { eat(); if (!S.active) activate(); runTool(map[byCode]); }
++  }, true);
++  addEventListener('keyup', e => {
++    if (untrusted(e)) return;
++    if (!isAltKey(e)) return;
++    clearTimeout(altTimer); const now = performance.now(), quick = now - altDown < 250;
++    if (S.peek) { if (S.sel) { S.peek = false; S.mode = 'lens'; activate(); setDockOn('lens'); } else { hideLens(); S.peek = false; unmountIfIdle(); } }
++    if (altClean && quick) { if (now - lastAltUp < 350) { lastAltUp = 0; activate(); setMode('lens'); return; } lastAltUp = now; }
++  }, true);
++  addEventListener('blur', () => { clearTimeout(altTimer); if (S.peek && !S.sel) { hideLens(); S.peek = false; unmountIfIdle(); } });
++  addEventListener('resize', () => { if (S.mode === 'contrast') renderContrast(); });
++
++  root.addEventListener('click', async e => {
++    const b = e.target.closest('button');
++    if (b && hudEl && hudEl.contains(b)) {
++      if (b.dataset.f) { S.fmt = b.dataset.f; savePrefs(); drawFull(S.sel || S.hover); return; }
++      if (b.dataset.add !== undefined) { const info = S.sel || S.hover; addToBrand(info.rows[+b.dataset.add].brand, b.getBoundingClientRect()); return; }
++    }
++    if (b && hudEl && hudEl.dataset.strip && hudEl.contains(b) && S.sel) { S.full = true; drawFull(S.sel); return; }
++    if (drawer && drawer.contains(e.target)) {
++      const chip = e.target.closest('[data-ci]'); if (chip) { S.topChip = +chip.dataset.ci; renderDrawer(); const c = S.brand.colors[S.topChip]; const t = fmtColor(parseColor(c.hex)); const ok = await copy({ text: t }); toast(ok ? `Скопировано <code>${esc(t)}</code>` : 'Не удалось скопировать', ok); return; }
++      if (!b) return;
++      if (b.dataset.close !== undefined) { drawer.remove(); drawer = null; return; }
++      if (b.dataset.bf) { S.fmt = b.dataset.bf; savePrefs(); renderDrawer(); return; }
++      if (b.dataset.rm !== undefined) { S.brand.colors.splice(+b.dataset.rm, 1); S.topChip = -1; saveBrand(); renderDrawer(); return; }
++      if (b.dataset.exp) { const ok = await copy({ text: exportBrand(b.dataset.exp) }); toast(ok ? `${esc(b.textContent)} — скопировано` : 'Не удалось скопировать', ok); }
++      return;
++    }
++    const row = e.target.closest('.hud .r'); if (row && !b && S.sel) {
++      const r = S.sel.rows?.[+row.dataset.i]; if (!r?.copy) return; const text = r.copy(), ok = await copy({ text });
++      row.classList.remove('flash'); void row.offsetWidth; row.classList.add('flash'); toast(ok ? `Скопировано <code>${esc(text.split('\n')[0])}${text.includes('\n') ? '…' : ''}</code>` : 'Не удалось скопировать', ok);
++    }
++    if (capEl && capEl.contains(e.target) && S.sel) { const p = primaryColor(S.sel), ok = await copy({ text: fmtColor(p.c, p.prop) }); if (ok) keyDone(capEl); else toast('Не удалось скопировать', false); }
++  });
++
++  return {
++    toggle() { S.active ? deactivate() : activate(); }, activate, deactivate, run: runTool, contextMenu, contextAction, showImages, savePngAt, stress, grabSystem,
++    captureElementAt(x, y) { const el = pick(x, y); if (el) finishCapture(el.getBoundingClientRect(), el); },
++    get state() { return { active: S.active, mode: S.mode, brand: S.brand, fmt: S.fmt, peek: S.peek }; },
++    setBrand(b) { if (b && b.colors) { S.brand = b; renderDrawer(); } },
++    _test: { parseColor, toHex, contrast, dE, colorName, nearestTailwind, fmtColor, scanSystem, imagesAt, bugText, bugInfo, cssPath, textNodes },
++  };
++}
++window.__meridianToolkitCore = { create, version: '0.2' };
++})();
+diff --git a/chrome/browser/meridian/toolkit/toolkit_menu.h b/chrome/browser/meridian/toolkit/toolkit_menu.h
+new file mode 100644
+index 0000000000..f5996920f4
+--- /dev/null
++++ b/chrome/browser/meridian/toolkit/toolkit_menu.h
+@@ -0,0 +1,35 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_TOOLKIT_TOOLKIT_MENU_H_
++#define CHROME_BROWSER_MERIDIAN_TOOLKIT_TOOLKIT_MENU_H_
++
++#include <string>
++
++class Profile;
++
++namespace content {
++class WebContents;
++}
++
++// What the page's context menu needs of the designer toolkit (declared in
++// :model, which the menu depends on; defined in toolkit_tab_helper.cc).
++namespace meridian::toolkit {
++
++// The toolkit's flag: the pref meridian.toolkit.enabled of the main profile,
++// --enable-meridian-toolkit, or the test switch --meridian-test-meridian-toolkit.
++bool Enabled(Profile* profile);
++
++// The page in `contents` has the toolkit: a context menu item at (x, y)
++// (DIP of the main frame's view) runs `kind` ("lens", "shot", "png", "imgs").
++// False when the tab has no toolkit (flag off, not a web page).
++bool HasToolkit(content::WebContents* contents);
++bool ContextAction(content::WebContents* contents,
++                   const std::string& kind,
++                   int x,
++                   int y);
++
++}  // namespace meridian::toolkit
++
++#endif  // CHROME_BROWSER_MERIDIAN_TOOLKIT_TOOLKIT_MENU_H_
+diff --git a/chrome/browser/meridian/toolkit/toolkit_meridian.js b/chrome/browser/meridian/toolkit/toolkit_meridian.js
+new file mode 100644
+index 0000000000..46577374bd
+--- /dev/null
++++ b/chrome/browser/meridian/toolkit/toolkit_meridian.js
+@@ -0,0 +1,84 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The designer toolkit's Meridian adapter (runs in an isolated world after
++// toolkit_core.js, which stays portable). What only the browser can do goes
++// through a queue the browser polls (ToolkitTabHelper): the clipboard without
++// a gesture and for images, real pixels of the tab, the toolkit's store.
++// Config comes in window.__meridianToolkitConfig: {store, platform, accent}.
++(() => {
++  'use strict';
++  if (window.__meridianToolkit || !window.__meridianToolkitCore) return;
++  const cfg = window.__meridianToolkitConfig || {};
++  const out = [];
++  const waits = new Map();
++  let seq = 0;
++  const call = (op, args) => new Promise(resolve => {
++    const id = ++seq;
++    waits.set(id, resolve);
++    out.push({id, op, args});
++    setTimeout(() => { if (waits.has(id)) { waits.delete(id); resolve(null); } }, 10000);
++  });
++  const toB64 = blob => new Promise(resolve => {
++    const r = new FileReader();
++    r.onload = () => resolve(String(r.result).replace(/^data:[^,]*,/, ''));
++    r.onerror = () => resolve(null);
++    r.readAsDataURL(blob);
++  });
++  const fromB64 = (b64, type = 'image/png') => {
++    const bin = atob(b64);
++    const bytes = new Uint8Array(bin.length);
++    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
++    return new Blob([bytes], {type});
++  };
++  const store = cfg.store || {};
++  let active = false;
++  const adapter = {
++    platform: cfg.platform,
++    trustedOnly: true,  // the page can't drive the toolkit with synthetic events
++    accent: cfg.accent,
++    browserName: cfg.browserName || 'Meridian',
++    async copy(items) {
++      const png = items.png ? await toB64(items.png) : '';
++      return !!(await call('copy', {text: items.text || '', html: items.html || '', png}));
++    },
++    async capture(r) {
++      const b64 = await call('capture', {x: r.x, y: r.y, width: r.width, height: r.height});
++      return b64 ? fromB64(b64) : null;
++    },
++    async snapshot() {
++      const b64 = await call('capture', {x: 0, y: 0, width: innerWidth, height: innerHeight});
++      if (!b64) return null;
++      const bmp = await createImageBitmap(fromB64(b64));
++      const canvas = document.createElement('canvas');
++      canvas.width = bmp.width;
++      canvas.height = bmp.height;
++      const ctx = canvas.getContext('2d', {willReadFrequently: true});
++      ctx.drawImage(bmp, 0, 0);
++      return {canvas, ctx, scale: bmp.width / innerWidth};
++    },
++    store: {
++      async get(key) { return store[key]; },
++      async set(key, value) { store[key] = value; call('store', {key, value}); },
++    },
++  };
++  const tk = window.__meridianToolkitCore.create(adapter);
++  window.__meridianToolkit = {
++    tk,
++    // The browser takes the queue; `busy` makes it poll faster while a tool
++    // is up.
++    take() {
++      const st = tk.state;
++      active = !!(st.active || st.mode || st.peek || waits.size);
++      return {ops: out.splice(0), busy: active};
++    },
++    answer(id, value) {
++      const f = waits.get(id);
++      waits.delete(id);
++      if (f) f(value);
++    },
++    ctx(kind, x, y) { tk.contextAction(kind, x, y); },
++    toggle() { tk.toggle(); },
++  };
++})();
+diff --git a/chrome/browser/meridian/toolkit/toolkit_tab_helper.cc b/chrome/browser/meridian/toolkit/toolkit_tab_helper.cc
+new file mode 100644
+index 0000000000..4e962e2c39
+--- /dev/null
++++ b/chrome/browser/meridian/toolkit/toolkit_tab_helper.cc
+@@ -0,0 +1,298 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/toolkit/toolkit_tab_helper.h"
++
++#include <utility>
++#include <vector>
++
++#include "base/base64.h"
++#include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "base/json/json_writer.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "build/build_config.h"
++#include "chrome/browser/meridian/prefs.h"
++#include "chrome/browser/meridian/space_profiles.h"
++#include "chrome/browser/meridian/test_switches.h"
++#include "chrome/browser/meridian/toolkit/toolkit_embed.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/common/chrome_isolated_world_ids.h"
++#include "components/prefs/pref_service.h"
++#include "components/prefs/scoped_user_pref_update.h"
++#include "components/viz/common/frame_sinks/copy_output_result.h"
++#include "content/public/browser/host_zoom_map.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/render_widget_host_view.h"
++#include "content/public/browser/web_contents.h"
++#include "third_party/blink/public/common/page/page_zoom.h"
++#include "ui/base/clipboard/scoped_clipboard_writer.h"
++#include "ui/gfx/codec/png_codec.h"
++#include "ui/gfx/geometry/rect_conversions.h"
++#include "ui/gfx/geometry/rect_f.h"
++#include "url/gurl.h"
++
++namespace meridian::toolkit {
++
++namespace {
++
++// Polling the page's queue: fast while a tool is up, slow otherwise; never
++// for a tab that isn't visible.
++constexpr base::TimeDelta kBusy = base::Milliseconds(60);
++constexpr base::TimeDelta kIdle = base::Milliseconds(400);
++
++constexpr char16_t kTake[] =
++    u"window.__meridianToolkit ? window.__meridianToolkit.take() : null";
++
++}  // namespace
++
++bool Enabled(Profile* profile) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "enable-meridian-toolkit") ||
++      HasTestSwitch("meridian-toolkit")) {
++    return true;
++  }
++  return profile &&
++         MainProfileFor(profile)->GetPrefs()->GetBoolean(
++             prefs::kToolkitEnabled);
++}
++
++ToolkitTabHelper::ToolkitTabHelper(content::WebContents* contents)
++    : content::WebContentsObserver(contents),
++      content::WebContentsUserData<ToolkitTabHelper>(*contents) {}
++
++ToolkitTabHelper::~ToolkitTabHelper() = default;
++
++bool ToolkitTabHelper::On() const {
++  return Enabled(
++      Profile::FromBrowserContext(web_contents()->GetBrowserContext()));
++}
++
++bool ToolkitTabHelper::Injectable() const {
++  const GURL& url = web_contents()->GetLastCommittedURL();
++  return url.SchemeIsHTTPOrHTTPS() || url.SchemeIsFile();
++}
++
++void ToolkitTabHelper::Run(const std::string& script) {
++  web_contents()->GetPrimaryMainFrame()->ExecuteJavaScriptInIsolatedWorld(
++      base::UTF8ToUTF16(script), base::NullCallback(),
++      ISOLATED_WORLD_ID_CHROME_INTERNAL);
++}
++
++void ToolkitTabHelper::Inject() {
++  if (!On() || !Injectable()) {
++    return;
++  }
++  Profile* profile =
++      Profile::FromBrowserContext(web_contents()->GetBrowserContext());
++  base::DictValue config;
++  config.Set("store",
++             MainProfileFor(profile)->GetPrefs()->GetDict(prefs::kToolkitStore)
++                 .Clone());
++#if BUILDFLAG(IS_MAC)
++  config.Set("platform", "mac");
++#else
++  config.Set("platform", "other");
++#endif
++  Run(std::string(kToolkitCoreJs) + "\nwindow.__meridianToolkitConfig = " +
++      base::WriteJson(config).value_or("{}") + ";\n" + kToolkitMeridianJs);
++  Schedule(false);
++}
++
++void ToolkitTabHelper::DOMContentLoaded(content::RenderFrameHost* frame) {
++  if (frame == web_contents()->GetPrimaryMainFrame()) {
++    Inject();
++  }
++}
++
++void ToolkitTabHelper::OnVisibilityChanged(content::Visibility visibility) {
++  if (visibility == content::Visibility::VISIBLE) {
++    Schedule(false);
++  } else {
++    timer_.Stop();
++  }
++}
++
++void ToolkitTabHelper::Schedule(bool busy) {
++  busy_ = busy;
++  if (!On() || !Injectable() ||
++      web_contents()->GetVisibility() != content::Visibility::VISIBLE) {
++    timer_.Stop();
++    return;
++  }
++  timer_.Start(FROM_HERE, busy ? kBusy : kIdle,
++               base::BindOnce(&ToolkitTabHelper::Poll,
++                              weak_factory_.GetWeakPtr()));
++}
++
++void ToolkitTabHelper::Poll() {
++  web_contents()->GetPrimaryMainFrame()->ExecuteJavaScriptInIsolatedWorld(
++      kTake,
++      base::BindOnce(&ToolkitTabHelper::OnPolled, weak_factory_.GetWeakPtr()),
++      ISOLATED_WORLD_ID_CHROME_INTERNAL);
++}
++
++void ToolkitTabHelper::OnPolled(base::Value result) {
++  if (!result.is_dict()) {
++    // A document without the toolkit yet (or the flag went off).
++    Schedule(false);
++    return;
++  }
++  const base::DictValue& dict = result.GetDict();
++  if (const base::ListValue* ops = dict.FindList("ops")) {
++    for (const base::Value& op : *ops) {
++      if (!op.is_dict()) {
++        continue;
++      }
++      const base::DictValue& o = op.GetDict();
++      const std::string* name = o.FindString("op");
++      const base::DictValue* args = o.FindDict("args");
++      const int id = o.FindInt("id").value_or(0);
++      if (!name || !args) {
++        continue;
++      }
++      if (*name == "copy") {
++        Copy(id, *args);
++      } else if (*name == "capture") {
++        Capture(id, *args);
++      } else if (*name == "store") {
++        Store(*args);
++      }
++    }
++  }
++  Schedule(dict.FindBool("busy").value_or(false));
++}
++
++void ToolkitTabHelper::Answer(int id, base::Value value) {
++  Run("window.__meridianToolkit && window.__meridianToolkit.answer(" +
++      base::NumberToString(id) + ", " +
++      base::WriteJson(value).value_or("null") + ");");
++}
++
++void ToolkitTabHelper::Copy(int id, const base::DictValue& args) {
++  const std::string* text = args.FindString("text");
++  const std::string* html = args.FindString("html");
++  const std::string* png = args.FindString("png");
++  bool wrote = false;
++  {
++    ui::ScopedClipboardWriter writer(ui::ClipboardBuffer::kCopyPaste);
++    if (text && !text->empty()) {
++      writer.WriteText(base::UTF8ToUTF16(*text));
++      wrote = true;
++    }
++    if (html && !html->empty()) {
++      writer.WriteHTML(base::UTF8ToUTF16(*html),
++                       web_contents()->GetLastCommittedURL().spec());
++      wrote = true;
++    }
++    if (png && !png->empty()) {
++      std::optional<std::vector<uint8_t>> bytes = base::Base64Decode(*png);
++      if (bytes) {
++        SkBitmap bitmap = gfx::PNGCodec::Decode(*bytes);
++        if (!bitmap.drawsNothing()) {
++          writer.WriteImage(bitmap);
++          wrote = true;
++        }
++      }
++    }
++  }
++  Answer(id, base::Value(wrote));
++}
++
++double ToolkitTabHelper::Zoom() const {
++  return blink::ZoomLevelToZoomFactor(
++      content::HostZoomMap::GetZoomLevel(web_contents()));
++}
++
++void ToolkitTabHelper::Capture(int id, const base::DictValue& args) {
++  content::RenderWidgetHostView* view =
++      web_contents()->GetRenderWidgetHostView();
++  if (!view) {
++    return Answer(id, base::Value());
++  }
++  // The page speaks CSS pixels; the view, DIP (CSS × zoom).
++  const double zoom = Zoom();
++  gfx::RectF css(args.FindDouble("x").value_or(0),
++                 args.FindDouble("y").value_or(0),
++                 args.FindDouble("width").value_or(0),
++                 args.FindDouble("height").value_or(0));
++  css.Scale(zoom);
++  gfx::Rect src = gfx::ToEnclosingRect(css);
++  src.Intersect(gfx::Rect(view->GetViewBounds().size()));
++  if (src.IsEmpty()) {
++    return Answer(id, base::Value());
++  }
++  const gfx::Size out =
++      gfx::ScaleToCeiledSize(src.size(), view->GetDeviceScaleFactor());
++  view->CopyFromSurface(
++      src, out, base::Seconds(5),
++      base::BindOnce(
++          [](base::WeakPtr<ToolkitTabHelper> self, int id,
++             const content::CopyFromSurfaceResult& result) {
++            if (!self) {
++              return;
++            }
++            if (!result.has_value() || result->bitmap.drawsNothing()) {
++              return self->Answer(id, base::Value());
++            }
++            std::optional<std::vector<uint8_t>> png =
++                gfx::PNGCodec::EncodeBGRASkBitmap(result->bitmap,
++                                                  /*discard_transparency=*/
++                                                  false);
++            self->Answer(id, png ? base::Value(base::Base64Encode(*png))
++                                 : base::Value());
++          },
++          weak_factory_.GetWeakPtr(), id));
++}
++
++void ToolkitTabHelper::Store(const base::DictValue& args) {
++  const std::string* key = args.FindString("key");
++  const base::Value* value = args.Find("value");
++  // Only the toolkit's own keys, small.
++  if (!key || !value || (*key != "brand" && *key != "prefs")) {
++    return;
++  }
++  if (base::WriteJson(*value).value_or("").size() > 64 * 1024) {
++    return;
++  }
++  Profile* profile =
++      Profile::FromBrowserContext(web_contents()->GetBrowserContext());
++  ScopedDictPrefUpdate update(MainProfileFor(profile)->GetPrefs(),
++                              prefs::kToolkitStore);
++  update->Set(*key, value->Clone());
++}
++
++void ToolkitTabHelper::ContextAction(const std::string& kind, int x, int y) {
++  if (!On() || !Injectable()) {
++    return;
++  }
++  const double zoom = Zoom();
++  Run("window.__meridianToolkit && window.__meridianToolkit.ctx(" +
++      base::WriteJson(base::Value(kind)).value_or("\"\"") + ", " +
++      base::NumberToString(x / zoom) + ", " + base::NumberToString(y / zoom) +
++      ");");
++  Schedule(true);
++}
++
++bool HasToolkit(content::WebContents* contents) {
++  ToolkitTabHelper* helper =
++      contents ? ToolkitTabHelper::FromWebContents(contents) : nullptr;
++  return helper && helper->On() && helper->Injectable();
++}
++
++bool ContextAction(content::WebContents* contents,
++                   const std::string& kind,
++                   int x,
++                   int y) {
++  if (!HasToolkit(contents)) {
++    return false;
++  }
++  ToolkitTabHelper::FromWebContents(contents)->ContextAction(kind, x, y);
++  return true;
++}
++
++WEB_CONTENTS_USER_DATA_KEY_IMPL(ToolkitTabHelper);
++
++}  // namespace meridian::toolkit
+diff --git a/chrome/browser/meridian/toolkit/toolkit_tab_helper.h b/chrome/browser/meridian/toolkit/toolkit_tab_helper.h
+new file mode 100644
+index 0000000000..f9d479df28
+--- /dev/null
++++ b/chrome/browser/meridian/toolkit/toolkit_tab_helper.h
+@@ -0,0 +1,71 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_TOOLKIT_TOOLKIT_TAB_HELPER_H_
++#define CHROME_BROWSER_MERIDIAN_TOOLKIT_TOOLKIT_TAB_HELPER_H_
++
++#include <string>
++
++#include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
++#include "base/values.h"
++#include "chrome/browser/meridian/toolkit/toolkit_menu.h"
++#include "content/public/browser/web_contents_observer.h"
++#include "content/public/browser/web_contents_user_data.h"
++
++class Profile;
++
++namespace meridian::toolkit {
++
++// The designer toolkit (behind a flag, off): the lens, the site's system,
++// capture as a bug, images under the cursor, stress text, contrast, brand
++// check. One portable page script (toolkit_core.js) plus Meridian's adapter
++// (toolkit_meridian.js), both in an isolated world of the tab's main frame.
++// The page asks the browser through a queue this helper polls: the clipboard
++// (text, HTML, PNG), real pixels of the tab, the toolkit's store.
++// Enabled(): toolkit_menu.h.
++
++class ToolkitTabHelper : public content::WebContentsObserver,
++                         public content::WebContentsUserData<ToolkitTabHelper> {
++ public:
++  ToolkitTabHelper(const ToolkitTabHelper&) = delete;
++  ToolkitTabHelper& operator=(const ToolkitTabHelper&) = delete;
++  ~ToolkitTabHelper() override;
++
++  // A toolkit item of the page's context menu, at (x, y) in the main frame's
++  // view (DIP): "lens", "shot", "png", "imgs", "color".
++  void ContextAction(const std::string& kind, int x, int y);
++
++  bool On() const;
++  bool Injectable() const;
++
++ private:
++  explicit ToolkitTabHelper(content::WebContents* contents);
++  friend class content::WebContentsUserData<ToolkitTabHelper>;
++
++  // content::WebContentsObserver:
++  void DOMContentLoaded(content::RenderFrameHost* frame) override;
++  void OnVisibilityChanged(content::Visibility visibility) override;
++
++  void Inject();
++  void Run(const std::string& script);
++  void Schedule(bool busy);
++  void Poll();
++  void OnPolled(base::Value result);
++  void Answer(int id, base::Value value);
++  void Copy(int id, const base::DictValue& args);
++  void Capture(int id, const base::DictValue& args);
++  void Store(const base::DictValue& args);
++  double Zoom() const;
++
++  bool busy_ = false;
++  base::OneShotTimer timer_;
++  base::WeakPtrFactory<ToolkitTabHelper> weak_factory_{this};
++
++  WEB_CONTENTS_USER_DATA_KEY_DECL();
++};
++
++}  // namespace meridian::toolkit
++
++#endif  // CHROME_BROWSER_MERIDIAN_TOOLKIT_TOOLKIT_TAB_HELPER_H_
+diff --git a/chrome/browser/renderer_context_menu/render_view_context_menu.cc b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+index 500506b1a9..76016d1bbb 100644
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu.cc
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu.cc
+@@ -82,6 +82,7 @@
+ #include "chrome/browser/language/language_model_manager_factory.h"
+ #include "chrome/browser/meridian/clean_url.h"
+ #include "chrome/browser/meridian/prefs.h"
++#include "chrome/browser/meridian/toolkit/toolkit_menu.h"
+ #include "chrome/browser/media/router/media_router_feature.h"
+ #include "chrome/browser/navigation_predictor/navigation_predictor_features.h"
+ #include "chrome/browser/navigation_predictor/navigation_predictor_keyed_service.h"
+@@ -1724,7 +1725,8 @@ std::u16string RenderViewContextMenu::GetImageSearchProviderName(
+ 
+ void RenderViewContextMenu::RecordUsedItem(int id) {
+   // Meridian's own item has no place in Chromium's histograms.
+-  if (id == IDC_MERIDIAN_ASK_PAGE) {
++  if (id == IDC_MERIDIAN_ASK_PAGE ||
++      (id >= IDC_MERIDIAN_TOOLKIT_LENS && id <= IDC_MERIDIAN_TOOLKIT_IMAGES)) {
+     return;
+   }
+   // Log general ID.
+@@ -1842,7 +1844,8 @@ void RenderViewContextMenu::RecordUsedItem(int id) {
+ }
+ 
+ void RenderViewContextMenu::RecordShownItem(int id, bool is_submenu) {
+-  if (id == IDC_MERIDIAN_ASK_PAGE) {
++  if (id == IDC_MERIDIAN_ASK_PAGE ||
++      (id >= IDC_MERIDIAN_TOOLKIT_LENS && id <= IDC_MERIDIAN_TOOLKIT_IMAGES)) {
+     return;
+   }
+   // The "RenderViewContextMenu.Shown" histogram is not recorded for submenus.
+@@ -2388,6 +2391,7 @@ void RenderViewContextMenu::AppendOpenInWebAppLinkItems() {
+ }
+ 
+ void RenderViewContextMenu::AppendImageItems() {
++  AppendMeridianToolkitItems();
+   if (!params_.has_image_contents) {
+     menu_model_.AddItemWithStringId(IDC_CONTENT_CONTEXT_LOAD_IMAGE,
+                                     IDS_CONTENT_CONTEXT_LOAD_IMAGE);
+@@ -2687,6 +2691,7 @@ void RenderViewContextMenu::AppendPageItems() {
+     menu_model_.AddSeparator(ui::NORMAL_SEPARATOR);
+ 
+     AppendMeridianAskItem();
++    AppendMeridianToolkitItems();
+ 
+     // Save as & Print
+     menu_model_.AddItemWithStringId(IDC_SAVE_PAGE,
+@@ -2758,6 +2763,7 @@ void RenderViewContextMenu::AppendPageItems() {
+   menu_model_.AddItemWithStringId(IDC_RELOAD, IDS_CONTENT_CONTEXT_RELOAD);
+   menu_model_.AddSeparator(ui::NORMAL_SEPARATOR);
+   AppendMeridianAskItem();
++  AppendMeridianToolkitItems();
+   if (!glic_below_search) {
+     MaybeAppendOpenGlicItem();
+   }
+@@ -3549,6 +3555,44 @@ void RenderViewContextMenu::AppendMeridianAskItem() {
+   menu_model_.AddItemWithStringId(IDC_MERIDIAN_ASK_PAGE, IDS_MERIDIAN_ASK_PAGE);
+ }
+ 
++// Meridian: the designer toolkit's items (its flag on, a web page in a tab):
++// the lens on this element, it as a bug-ready shot, the image as PNG (WebP,
++// AVIF…), every image under the cursor (CSS backgrounds, srcset's largest).
++void RenderViewContextMenu::AppendMeridianToolkitItems() {
++  if (!meridian::toolkit::Enabled(GetProfile()) ||
++      !tabs::TabInterface::MaybeGetFromContents(embedder_web_contents_) ||
++      !meridian::toolkit::HasToolkit(embedder_web_contents_) ||
++      !(params_.page_url.SchemeIsHTTPOrHTTPS() ||
++        params_.page_url.SchemeIsFile())) {
++    return;
++  }
++  const bool ru = g_browser_process->GetApplicationLocale().starts_with("ru");
++  const bool image =
++      params_.media_type == ContextMenuDataMediaType::kImage;
++  if (image) {
++    menu_model_.AddItem(IDC_MERIDIAN_TOOLKIT_PNG,
++                        ru ? u"Сохранить картинку как PNG"
++                           : u"Save Image as PNG");
++  }
++  menu_model_.AddItem(IDC_MERIDIAN_TOOLKIT_IMAGES,
++                      ru ? u"Картинки под курсором…" : u"Images Under Cursor…");
++  menu_model_.AddItem(IDC_MERIDIAN_TOOLKIT_SHOT,
++                      ru ? u"Снимок элемента → как баг"
++                         : u"Capture Element as a Bug");
++  menu_model_.AddItem(IDC_MERIDIAN_TOOLKIT_LENS,
++                      ru ? u"Линза: этот элемент" : u"Inspect with Lens");
++  menu_model_.AddSeparator(ui::NORMAL_SEPARATOR);
++}
++
++void RenderViewContextMenu::ExecMeridianToolkit(int id) {
++  const char* kind = id == IDC_MERIDIAN_TOOLKIT_PNG      ? "png"
++                     : id == IDC_MERIDIAN_TOOLKIT_IMAGES ? "imgs"
++                     : id == IDC_MERIDIAN_TOOLKIT_SHOT   ? "shot"
++                                                         : "lens";
++  meridian::toolkit::ContextAction(embedder_web_contents_, kind, params_.x,
++                                   params_.y);
++}
++
+ // Menu delegate functions -----------------------------------------------------
+ 
+ bool RenderViewContextMenu::IsCommandIdEnabled(int id) const {
+@@ -3666,6 +3710,12 @@ bool RenderViewContextMenu::IsCommandIdEnabled(int id) const {
+     case IDC_MERIDIAN_ASK_PAGE:
+       return GetBrowser() != nullptr;
+ 
++    case IDC_MERIDIAN_TOOLKIT_LENS:
++    case IDC_MERIDIAN_TOOLKIT_SHOT:
++    case IDC_MERIDIAN_TOOLKIT_PNG:
++    case IDC_MERIDIAN_TOOLKIT_IMAGES:
++      return true;
++
+     case IDC_VIEW_SOURCE:
+     case IDC_CONTENT_CONTEXT_VIEWFRAMESOURCE:
+       return IsViewSourceEnabled();
+@@ -4340,6 +4390,13 @@ void RenderViewContextMenu::ExecuteCommand(int id, int event_flags) {
+       }
+       break;
+ 
++    case IDC_MERIDIAN_TOOLKIT_LENS:
++    case IDC_MERIDIAN_TOOLKIT_SHOT:
++    case IDC_MERIDIAN_TOOLKIT_PNG:
++    case IDC_MERIDIAN_TOOLKIT_IMAGES:
++      ExecMeridianToolkit(id);
++      break;
++
+     case IDC_CONTENT_CONTEXT_RELOAD_PACKAGED_APP:
+       ExecReloadPackagedApp();
+       break;
+diff --git a/chrome/browser/renderer_context_menu/render_view_context_menu.h b/chrome/browser/renderer_context_menu/render_view_context_menu.h
+index 084723e5a7..90ff22a71b 100644
+--- a/chrome/browser/renderer_context_menu/render_view_context_menu.h
++++ b/chrome/browser/renderer_context_menu/render_view_context_menu.h
+@@ -393,6 +393,8 @@ class RenderViewContextMenu
+   void AppendLiveCaptionItem();
+   // Meridian: Ask about the page, as ⌘J.
+   void AppendMeridianAskItem();
++  void AppendMeridianToolkitItems();
++  void ExecMeridianToolkit(int id);
+   void AppendSendTabToSelfItem(bool add_separator);
+   bool AppendQRCodeGeneratorItem(bool for_image,
+                                  bool draw_icon,
+diff --git a/chrome/browser/ui/tabs/tab_features.cc b/chrome/browser/ui/tabs/tab_features.cc
+index 681f7df4bc..b21f04874f 100644
+--- a/chrome/browser/ui/tabs/tab_features.cc
++++ b/chrome/browser/ui/tabs/tab_features.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "chrome/browser/meridian/boosts/boost_tab_helper.h"
+ #include "chrome/browser/meridian/cookie_banners.h"
++#include "chrome/browser/meridian/toolkit/toolkit_tab_helper.h"
+ 
+ #include <stdint.h>
+ 
+@@ -456,6 +457,7 @@ void TabFeatures::Init(TabInterface& tab, Profile* profile) {
+ 
+   meridian::BoostTabHelper::CreateForWebContents(tab.GetContents());
+   meridian::CookieBannerTabHelper::CreateForWebContents(tab.GetContents());
++  meridian::toolkit::ToolkitTabHelper::CreateForWebContents(tab.GetContents());
+ 
+   if (!content_settings::PageSpecificContentSettings::GetDelegateForWebContents(
+           tab.GetContents())) {
+@@ -1551,6 +1553,7 @@ void TabFeatures::WillDiscardContents(tabs::TabInterface* tab,
+ 
+   meridian::BoostTabHelper::CreateForWebContents(new_contents);
+   meridian::CookieBannerTabHelper::CreateForWebContents(new_contents);
++  meridian::toolkit::ToolkitTabHelper::CreateForWebContents(new_contents);
+ 
+   if (!content_settings::PageSpecificContentSettings::GetDelegateForWebContents(
+           new_contents)) {
