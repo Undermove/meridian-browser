@@ -147,8 +147,19 @@ test('the command bar finds Settings: "ai" opens Settings at AI, an option comes
     await b.key('t', 'KeyT', 84);  // a key press, as in the test above: inserted text alone isn't "typing"
     await b.waitFor(`${BAR}.query_ === ${JSON.stringify(text)} && ${CB}.querySelectorAll('#features .tab-row').length > 0`);
   };
+  // Escape closes Settings once it has the keys (it takes them as it opens).
+  const settingsKeys = `app.$.settings.open && !!${ST}.activeElement`;
   try {
     await b.waitFor(today(1));
+    // A site's keyword chip left in the field (Chromium 159: "kiwi " typed, then Escape) doesn't
+    // come back with the next ⌘T: "ai" picks Settings' AI, not a search of that site.
+    await b.click(`${SB}.getElementById('newTabButton')`);
+    await b.waitFor(open);
+    await b.waitFor(`${BAR}.$.address.matches(':focus-within')`);
+    await b.eval(`(${BAR}.$.address.keywordModeManager.enter('kiwi', 'Search Kiwi', 1), true)`);
+    assert.equal(await b.eval(`${BAR}.$.address.keywordModeManager.isInKeywordMode`), true);
+    await b.key('Escape', 'Escape', 27);
+    await b.waitFor(`!${open}`);
     // The section named in full is first and picked, before the features that are about AI.
     await ask('ai');
     const found = await rows();
@@ -159,6 +170,7 @@ test('the command bar finds Settings: "ai" opens Settings at AI, an option comes
     // While Settings is open the command bar doesn't: it would open behind Settings and take the keys.
     await b.eval(`app.showCommandBar_(true, '')`);
     assert.equal(await b.eval(open), false, 'the command bar opened under Settings');
+    await b.waitFor(settingsKeys);
     await b.key('Escape', 'Escape', 27);
     await b.waitFor(`!app.$.settings.open`);
 
@@ -167,6 +179,7 @@ test('the command bar finds Settings: "ai" opens Settings at AI, an option comes
     assert.equal((await rows())[0], '>API Keys | Settings \u203a AI');
     await b.key('Enter', 'Enter', 13);
     await b.waitFor(`app.$.settings.open && ${ST}.querySelector('.found')?.textContent.trim() === 'API keys'`);
+    await b.waitFor(settingsKeys);
     await b.key('Escape', 'Escape', 27);
     await b.waitFor(`!app.$.settings.open`);
 

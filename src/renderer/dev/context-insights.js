@@ -32,7 +32,7 @@ const CI_PARTS = [
 const CI_SPEND = [['cacheRead', 'Cache reads', '#8a8fe0'], ['cacheWrite', 'Cache writes', '#e0a400'], ['input', 'Uncached input', '#9a9aa6'], ['output', 'Output and thinking', '#6d5fd8'], ['subagents', 'Subagents', '#2f9ea0']];
 
 // Why a turn cost what it did (the transcript has to prove it, else "unknown").
-const CI_CAUSES = [['normal', 'Normal use', '#8a8fe0'], ['cold', 'Cold cache', '#3f8fe0'], ['compaction', 'Compaction', '#e5484d'], ['file', 'Big file read', '#e0a400'], ['tool', 'Big tool output', '#c2649a'], ['mcp', 'MCP load', '#2f9ea0'], ['subagents', 'Subagents', '#30a46c'], ['unknown', 'Unknown', '#7c7c88']];
+const CI_CAUSES = [['normal', 'Normal use', '#8a8fe0'], ['cold', 'Cold cache', '#3f8fe0'], ['compaction', 'Compaction', '#e5484d'], ['file', 'Big file read', '#e0a400'], ['tool', 'Big tool output', '#c2649a'], ['mcp', 'MCP load', '#2f9ea0'], ['subagents', 'Subagents', '#30a46c'], ['model', 'Model switch', '#d46a2f'], ['unknown', 'Unknown', '#7c7c88']];
 
 const ciK = (n) => {
   n = Number(n) || 0;
@@ -144,6 +144,8 @@ function termSessionName(t) { return CI.usage[t.id]?.session_name || ''; }
 
 // ------------------------------------------------------------------ the panel
 
+function ciClearRange() { CI.range = null; CI.focusTurn = null; CI.focusCause = null; }
+
 // A redraw replaces the chart, so it waits while the mouse is dragging over it.
 function ciRedraw() {
   if (CI.dragging) { CI.redrawAfterDrag = true; return; }
@@ -155,7 +157,7 @@ function ciKeepRange(before, after) {
   if (!CI.range || !before?.length || !after?.length) return;
   const start = before[CI.range.from]?.ts;
   const end = before[CI.range.to + 1]?.ts ?? Infinity;
-  if (start == null) { CI.range = null; return; }
+  if (start == null) { ciClearRange(); return; }
   let from = 0, to = 0;
   after.forEach((b, i) => { if (b.ts <= start) from = i; if (b.ts < end) to = i; });
   CI.range = { from, to: Math.max(from, to) };
@@ -309,6 +311,7 @@ function renderInsightsPanel(el) {
   el.innerHTML = parts.join('');
   el.querySelector('#ci-refresh')?.addEventListener('click', () => ciFetch());
   ciWireMoney(el);
+  if (CI.jump) ciJump(el);
   for (const f of el.querySelectorAll('.ci-fold > button')) {
     f.addEventListener('click', () => {
       const id = f.parentElement.dataset.id;
@@ -343,7 +346,7 @@ function ciMoney(series) {
     const kinds = CI_SPEND.filter(([k]) => b[k] > 0).map(([k, label]) => `${label}: ${ciAmt(b[k])}`);
     const causes = CI_CAUSES.filter(([k]) => b.causes?.[k] > 0).map(([k, label]) => `${label}: ${ciAmt(b.causes[k])}`);
     const title = total ? `${ciTime(b.ts)} · ${ciAmt(total)}\n${causes.join('\n')}\n\n${kinds.join('\n')}` : ciTime(b.ts);
-    const parts = CI_CAUSES.map(([k, , c]) => (b.causes?.[k] > 0 ? `<i style="height:${(b.causes[k] / max) * 100}%;background:${c}"></i>` : '')).join('');
+    const parts = CI_CAUSES.map(([k, , c]) => (b.causes?.[k] > 0 ? `<i data-cause="${k}" style="height:${(b.causes[k] / max) * 100}%;background:${c}"></i>` : '')).join('');
     const on = range && i >= range.from && i <= range.to;
     return `<div class="bar${on ? ' sel' : ''}" data-i="${i}" title="${ciEsc(title)}">${parts}</div>`;
   }).join('');
@@ -359,8 +362,62 @@ function ciMoney(series) {
     <div class="ci-money" role="img" aria-label="Session ${tokens ? 'tokens' : 'cost'} over time, coloured by cause. Click a bar or drag across bars to see the turns.">${bars}</div>
     <div class="ci-row muted small"><span>${ciTime(series[0].ts)}</span><span>${ciTime(series[series.length - 1].ts)}</span></div>
     <div class="ci-legend">${legend}</div>
+    ${ciSpikesHtml(series)}
     ${range ? ciRange(series, range) : '<p class="muted small">Click a bar or drag across several to see the turns and what made them cost.</p>'}
     <p class="muted small">${note}</p>`;
+}
+
+const ciClock = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const ciBarTotal = (b) => CI_SPEND.reduce((n, [k]) => n + (b[k] || 0), 0);
+
+// The tallest bars (up to three) when they stand out: twice the average bar at least, and a
+// quarter of the tallest. Each with what made it cost: the turn whose cause the transcript proves,
+// the subagents, or what the ordinary work was.
+function ciSpikes(series) {
+  const totals = series.map(ciBarTotal);
+  const average = totals.reduce((n, v) => n + v, 0) / (totals.length || 1);
+  const tallest = Math.max(0, ...totals);
+  return totals.map((v, i) => [v, i]).filter(([v]) => v > 0 && v >= average * 2 && v >= tallest * 0.25).sort((a, b) => b[0] - a[0]).slice(0, 3)
+    .map(([total, i]) => ({ i, total, ts: series[i].ts, ...ciSpikeReason(series[i], total) }));
+}
+
+function ciSpikeReason(b, total) {
+  const turns = b.turns || [];
+  const named = turns.filter((t) => t.cause !== 'normal' && t.why).sort((x, y) => (y.causeUsd || 0) - (x.causeUsd || 0));
+  const top = named[0];
+  const sub = b.subagents || 0;
+  if (sub >= total * 0.3 && sub > (top?.causeUsd || 0)) return { cause: 'subagents', why: `Subagents: ${ciAmt(sub)} of it` };
+  if (top && (top.causeUsd || 0) >= total * 0.25) {
+    const also = [...new Set(named.slice(1).map((t) => t.cause).filter((c) => c !== top.cause))].map((c) => ciCauseName(c).replace(/^[A-Z](?![A-Z])/, (x) => x.toLowerCase()));
+    return { cause: top.cause, turn: top.index, why: top.why + (also.length ? `; also ${also.join(', ')}` : '') };
+  }
+  const n = b.turnCount || turns.length;
+  const costliest = turns[0];
+  const kinds = [['output', b.output], ['cacheRead', b.cacheRead], ['cacheWrite', b.cacheWrite], ['input', b.input]].sort((x, y) => (y[1] || 0) - (x[1] || 0));
+  const what = kinds[0][0] === 'output' ? `long answers and thinking (${ciAmt(b.output)} of output)`
+    : kinds[0][0] === 'cacheRead' ? `reading the context from the cache (${ciAmt(b.cacheRead)})`
+      : kinds[0][0] === 'cacheWrite' ? `small additions written to the cache (${ciAmt(b.cacheWrite)})`
+        : `uncached input (${ciAmt(b.input)})`;
+  return { cause: 'normal', turn: costliest?.index, why: `${n} ${n === 1 ? 'turn' : 'turns'} of ordinary work, mostly ${what}` };
+}
+
+function ciSpikesHtml(series) {
+  const spikes = ciSpikes(series);
+  if (!spikes.length) return '';
+  const rows = spikes.map((x) => {
+    const colour = CI_CAUSES.find(([k]) => k === x.cause)?.[2] || '#7c7c88';
+    return `<button class="ci-spike" data-i="${x.i}" data-cause="${x.cause}"${x.turn ? ` data-turn="${x.turn}"` : ''}><span class="ci-row"><span><i class="sw" style="background:${colour}"></i>${ciTime(x.ts)} · ${ciEsc(ciCauseName(x.cause))}</span><b>${ciAmt(x.total)}</b></span><span class="muted small ci-why">${ciEsc(x.why)}</span></button>`;
+  }).join('');
+  return `<div class="ci-spikes"><div class="muted small">${spikes.length === 1 ? 'The spike' : 'The biggest spikes'}, and why</div>${rows}</div>`;
+}
+
+// After a click on a bar or a spike: the panel scrolls to its turns and the one that matters glows.
+function ciJump(el) {
+  CI.jump = false;
+  const target = el.querySelector('.ci-turn.focus') || el.querySelector('.ci-turn.hot') || el.querySelector('.ci-range');
+  if (!target) return;
+  target.scrollIntoView({ block: 'nearest' });
+  for (const t of el.querySelectorAll('.ci-turn.focus, .ci-turn.hot')) t.classList.add('flash');
 }
 
 // The selected bars: their turns, the costliest first, and what made them cost.
@@ -376,9 +433,13 @@ function ciRange(series, { from, to }) {
     .map(([label, c, v]) => `<div class="ci-row"><span><i class="sw" style="background:${c}"></i>${label}</span><span class="muted">${ciAmt(v)}</span></div>`).join('');
   const end = series[to + 1]?.ts;
   const when = from === to && !end ? ciTime(series[from].ts) : `${ciTime(series[from].ts)}–${ciTime(end || series[to].ts)}`;
+  // The turns that cost the most stand out; the one a spike named (or the cause clicked) is marked.
+  const hot = new Set(shown.filter((t, i) => i < 3 && t.usd > 0 && (i === 0 || t.usd >= total * 0.2)).map((t) => t.index));
   const turns = shown.map((t) => {
     const colour = CI_CAUSES.find(([k]) => k === t.cause)?.[2] || '#7c7c88';
-    return `<div class="ci-turn"><div class="ci-row"><span><i class="sw" style="background:${colour}"></i>Turn ${t.index} · ${ciEsc(ciCauseName(t.cause))}</span><b>${ciAmt(t.usd)}</b></div>${t.why ? `<div class="muted small">${ciEsc(t.why)}</div>` : ''}${t.prompt ? `<div class="muted small ci-path" title="${ciEsc(t.prompt)}">${ciEsc(t.prompt)}</div>` : ''}</div>`;
+    const focus = t.index === CI.focusTurn || (CI.focusCause && t.cause === CI.focusCause);
+    const at = t.ts ? ` · ${ciClock(t.ts)}` : '';
+    return `<div class="ci-turn${hot.has(t.index) ? ' hot' : ''}${focus ? ' focus' : ''}" data-turn="${t.index}"><div class="ci-row"><span><i class="sw" style="background:${colour}"></i>Turn ${t.index}${at} · ${ciEsc(ciCauseName(t.cause))}</span><b>${ciAmt(t.usd)}</b></div>${t.why ? `<div class="muted small">${ciEsc(t.why)}</div>` : ''}${t.prompt ? `<div class="muted small ci-path" title="${ciEsc(t.prompt)}">${ciEsc(t.prompt)}</div>` : ''}</div>`;
   }).join('');
   return `<div class="ci-range"><div class="ci-range-head"><b>${when} · ${count} ${count === 1 ? 'turn' : 'turns'} · ${ciAmt(total)}</b><button class="ci-range-clear">Clear</button></div>
     <div class="ci-legend">${causes}</div>${turns || '<p class="muted small">No turns of the main session here.</p>'}
@@ -388,7 +449,17 @@ function ciRange(series, { from, to }) {
 // A click picks one bar (again: clears it); a drag picks a range.
 function ciWireMoney(el) {
   const chart = el.querySelector('.ci-money');
-  el.querySelector('.ci-range-clear')?.addEventListener('click', () => { CI.range = null; renderPanel(); });
+  el.querySelector('.ci-range-clear')?.addEventListener('click', () => { ciClearRange(); renderPanel(); });
+  for (const s of el.querySelectorAll('.ci-spike')) {
+    s.addEventListener('click', () => {
+      const i = Number(s.dataset.i);
+      CI.range = { from: i, to: i };
+      CI.focusTurn = s.dataset.turn ? Number(s.dataset.turn) : null;
+      CI.focusCause = s.dataset.turn ? null : s.dataset.cause || null;
+      CI.jump = true;
+      renderPanel();
+    });
+  }
   if (!chart) return;
   const bars = [...chart.querySelectorAll('.bar')];
   const barAt = (x) => {
@@ -401,6 +472,8 @@ function ciWireMoney(el) {
     e.preventDefault();
     const anchor = barAt(e.clientX);
     const was = CI.range;
+    // A click on one colour of a bar: that cause's turns are the ones marked.
+    const cause = e.target?.dataset?.cause || null;
     let at = anchor;
     CI.dragging = true;
     chart.setPointerCapture(e.pointerId);
@@ -412,8 +485,14 @@ function ciWireMoney(el) {
       chart.removeEventListener('pointercancel', up);
       CI.dragging = false;
       CI.redrawAfterDrag = false;
-      const same = at === anchor && was && was.from === anchor && was.to === anchor;
-      CI.range = same ? null : { from: Math.min(anchor, at), to: Math.max(anchor, at) };
+      const same = at === anchor && was && was.from === anchor && was.to === anchor && (CI.focusCause || null) === cause;
+      if (same) ciClearRange();
+      else {
+        CI.range = { from: Math.min(anchor, at), to: Math.max(anchor, at) };
+        CI.focusTurn = null;
+        CI.focusCause = at === anchor ? cause : null;
+        CI.jump = true;
+      }
       renderPanel();
     };
     chart.addEventListener('pointermove', move);
