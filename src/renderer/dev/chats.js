@@ -101,6 +101,8 @@ function chatsOpen(open) {
 // What the person sees: the session on screen ('' while this tab is hidden or the terminal folded).
 function chatsReport() {
   if (!CHATS.on) return;
+  // Studio (studio.js) reports while it is the view in sight.
+  if (document.body.classList.contains('studio-view')) return;
   const t = S.activeTerm;
   const shown = document.visibilityState === 'visible' && t && !$('#term-area').classList.contains('collapsed');
   SessionStatus.report({ on: true, onScreen: shown ? t.id : '', order: S.terms.map((x) => x.id) });
@@ -208,3 +210,6 @@ function chatsRender() {
 }
 
 document.addEventListener('DOMContentLoaded', () => { if (chatsEnabled()) chatsStart(); });
+
+// Studio went out of sight: the list says what is on screen again.
+addEventListener('studio-hidden', () => chatsReport());
