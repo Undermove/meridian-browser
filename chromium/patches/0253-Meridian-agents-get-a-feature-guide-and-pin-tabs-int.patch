@@ -1,0 +1,220 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Tue, 24 Nov 2026 22:13:24 +0400
+Subject: [PATCH 253/297] Meridian: agents get a feature guide and pin tabs
+ into a folder
+
+meridian_guide (read-only) returns a short guide to what Meridian can do,
+each line checked against the code. organize_tab's pin takes a folder name:
+the space's folder of that name, made on top the first time (a Pinterest
+moodboard, a reading list).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/meridian/agent/agent_service.cc   | 106 +++++++++++++++++-
+ chrome/browser/meridian/agent/agent_service.h |   1 +
+ .../browser/meridian/agent/agent_tools.json   |  15 ++-
+ 3 files changed, 119 insertions(+), 3 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index ef3bf76b13..b0e7f5b32e 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -791,6 +791,7 @@ void AgentService::Run(std::unique_ptr<Call> call) {
+       {"get_boost", &AgentService::GetBoost},
+       {"handle_dialog", &AgentService::HandleDialog},
+       {"set_boost", &AgentService::SetBoost},
++      {"meridian_guide", &AgentService::Guide},
+   });
+   auto it = methods->find(call->tool);
+   if (it == methods->end()) {
+@@ -1068,6 +1069,60 @@ void AgentService::ReadPageText(content::WebContents* contents,
+ 
+ // ------------------------------------------------------------------ read
+ 
++namespace {
++
++// meridian_guide: what Meridian can do, each line checked against the code
++// (shortcuts as on a Mac). Keep it true when features change.
++constexpr char kGuide[] = R"(Meridian is a browser for Mac in the spirit of Arc: tabs live in a sidebar, organized into spaces.
++
++SPACES
++- A space is a separate set of tabs (Work, Personal, a project), each with its own colour. Switch with Ctrl+1 to Ctrl+9, or Option+Cmd+Left/Right.
++- Make one with the + button at the bottom of the sidebar, then New Space.
++- Colours: right-click a space, Edit Theme.
++
++PINNED TABS, FOLDERS, FAVORITES, TODAY
++- Cmd+D pins a tab: it stays in the space and always returns to its home page.
++- Folders group pinned tabs: Option+Shift+Cmd+N, or the + button, New Folder.
++- Favorites are the icons at the top of the sidebar, shared by every space: right-click a tab, Add to Favorites.
++- Tabs you don't pin live in Today. Ones you haven't looked at go to the Archive after 12 hours (Settings > General changes this). Shift+Cmd+K clears Today; the Tidy button next to Today groups its tabs with AI.
++- The Archive keeps every closed tab: Option+Cmd+A.
++
++FIND AND DO ANYTHING: Cmd+T
++- The command bar searches the web, your open tabs in every space, Meridian's features and its settings.
++- It answers quick questions as you type: maths, unit and currency conversion, the time in a city. Return copies the answer.
++
++AI IN MERIDIAN
++- Cmd+J: Ask about the page you're on (summaries, explanations, questions). Option+Cmd+J opens a full Chat.
++- Agents such as Claude can use Meridian: open and read pages, click and type, organize tabs and restyle sites. Meridian asks before they change something, and the Stop button pauses them.
++
++SEE TWO THINGS AT ONCE
++- Split view: Ctrl+Shift+= puts two tabs side by side (Ctrl+Shift+- ends it), or right-click a tab, Open in Split View.
++- Peek: a link from a pinned tab or favorite to another site opens in a preview card on top, with Split, Open as Tab and Close.
++- Little Window: links from other apps (Mail, Slack, Notion) open in a small window without the sidebar; Open in Meridian moves the page into your sidebar. Option+Cmd+N opens one yourself.
++
++MAKE ANY SITE YOURS: BOOST
++- Site controls (the sliders at the right of the address) > Boost this site: change a site's colours, dark or light, fonts and text size, or Zap parts of the page to hide them. It applies every time you visit; turn it off or delete it there.
++- Site controls also has ad and tracker blocking for the site, Translate, and quick Copy, Pin, Split and Ask buttons.
++
++MOVING IN
++- Import from Arc (in the Meridian menu) brings spaces, pinned tabs, folders and favorites, and can keep you signed in to your sites. Arc stays untouched.
++- The Welcome Tour (Help menu) runs the first-run setup again.
++
++SMALL THINGS
++- Cmd+S hides the sidebar for a full-width page; move the pointer to the edge to bring it back.
++- Shift+Cmd+C copies the page's address.
++- Option+Cmd+Up/Down moves between tabs in the sidebar.
++- When something plays in another tab, a mini player appears in the sidebar, with Picture in Picture.
++
++FOR DEVELOPERS
++- Workbench (Shift+Cmd+E): files, an editor and terminals next to your site. Mission Control (Shift+Cmd+M) shows every agent at work.)";
++
++}  // namespace
++
++void AgentService::Guide(std::unique_ptr<Call> call) {
++  call->Ok(base::Value(base::DictValue().Set("guide", kGuide)));
++}
++
+ void AgentService::ListSpaces(std::unique_ptr<Call> call) {
+   SidebarService* service = SidebarServiceFactory::GetForProfile(profile_);
+   base::ListValue out;
+@@ -2444,12 +2499,21 @@ void AgentService::OrganizeTab(std::unique_ptr<Call> call) {
+   std::string action = call->StrOr("action", "");
+   std::string summary = action + " a tab";
+   base::ReplaceChars(summary, "_", " ", &summary);
++  std::string folder = call->StrOr("folder", "");
++  base::TrimWhitespaceASCII(folder, base::TRIM_ALL, &folder);
++  if (action != "pin") {
++    folder.clear();
++  }
++  if (!folder.empty()) {
++    summary += " in the folder \u201c" + folder + "\u201d";
++  }
+   tabs::TabHandle handle = tab->GetHandle();
+   Confirm(
+       std::move(call), summary,
+       base::BindOnce(
+           [](base::WeakPtr<AgentService> self, tabs::TabHandle handle,
+-             std::string action, std::unique_ptr<Call> call) {
++             std::string action, std::string folder,
++             std::unique_ptr<Call> call) {
+             tabs::TabInterface* tab = handle.Get();
+             SidebarHandler* handler =
+                 self ? SidebarHandler::For(self->Window()) : nullptr;
+@@ -2463,6 +2527,44 @@ void AgentService::OrganizeTab(std::unique_ptr<Call> call) {
+             std::string item = data ? data->item_id() : std::string();
+             tabs_api::NodeId node =
+                 tabs_api::NodeId::FromTabHandle(tab->GetHandle());
++            if (action == "pin" && !folder.empty()) {
++              // The space's folder of that name, else a new one on top.
++              const std::string space_id = service->active_space_id();
++              const Space* space = service->FindSpace(space_id);
++              if (!space) {
++                return call->Fail("no space to pin in");
++              }
++              std::string folder_id;
++              for (const Item& pinned : space->pinned) {
++                if (pinned.is_folder && pinned.title == folder) {
++                  folder_id = pinned.id;
++                  break;
++                }
++              }
++              if (folder_id.empty()) {
++                Item made;
++                made.is_folder = true;
++                made.title = folder;
++                folder_id = service->AddItem(space_id, std::string(), 0,
++                                             std::move(made));
++              }
++              if (folder_id.empty()) {
++                return call->Fail("couldn't make the folder");
++              }
++              auto position = mojom::ItemPosition::New();
++              position->container = space_id;
++              position->parent_id = folder_id;
++              position->index = -1;
++              if (!item.empty()) {
++                handler->MoveItem(item, std::move(position));
++              } else {
++                handler->PinTab(node, std::move(position), std::string());
++              }
++              return call->Ok(base::Value(base::DictValue()
++                                              .Set("done", action)
++                                              .Set("folder", folder)
++                                              .Set("folder_id", folder_id)));
++            }
+             if (action == "pin" || action == "favorite") {
+               auto position = mojom::ItemPosition::New();
+               position->container =
+@@ -2488,7 +2590,7 @@ void AgentService::OrganizeTab(std::unique_ptr<Call> call) {
+             }
+             call->Ok(base::Value(base::DictValue().Set("done", action)));
+           },
+-          weak_factory_.GetWeakPtr(), handle, action));
++          weak_factory_.GetWeakPtr(), handle, action, folder));
+ }
+ 
+ void AgentService::UploadFile(std::unique_ptr<Call> call) {
+diff --git a/chrome/browser/meridian/agent/agent_service.h b/chrome/browser/meridian/agent/agent_service.h
+index ba295e2bde..e36498667b 100644
+--- a/chrome/browser/meridian/agent/agent_service.h
++++ b/chrome/browser/meridian/agent/agent_service.h
+@@ -96,6 +96,7 @@ class AgentService : public KeyedService {
+ 
+   // Tools.
+   void ListSpaces(std::unique_ptr<Call> call);
++  void Guide(std::unique_ptr<Call> call);
+   void ListTabs(std::unique_ptr<Call> call);
+   void SearchTabs(std::unique_ptr<Call> call);
+   void SearchHistory(std::unique_ptr<Call> call);
+diff --git a/chrome/browser/meridian/agent/agent_tools.json b/chrome/browser/meridian/agent/agent_tools.json
+index c5599a4e09..d5e4567434 100644
+--- a/chrome/browser/meridian/agent/agent_tools.json
++++ b/chrome/browser/meridian/agent/agent_tools.json
+@@ -487,7 +487,7 @@
+  {
+   "name": "organize_tab",
+   "access": "write",
+-  "description": "Pin, unpin, favorite, rename, or move a tab to another space.",
++  "description": "Pin, unpin, favorite, rename, or move a tab to another space. To collect tabs in a folder (a moodboard, a reading list), pin each one with folder set to the folder's name: the folder is made at the top of the space's pinned tabs the first time.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+@@ -511,6 +511,10 @@
+     "space_id": {
+      "type": "string",
+      "description": "For move_to_space."
++    },
++    "folder": {
++     "type": "string",
++     "description": "For pin: the name of a folder in the space's pinned tabs to pin into (made if there is none)."
+     }
+    },
+    "required": [
+@@ -687,5 +691,14 @@
+     }
+    }
+   }
++ },
++ {
++  "name": "meridian_guide",
++  "access": "read",
++  "description": "A short guide to what the Meridian browser can do and how to reach each feature (shortcuts, menus), written for the person. Use it when they ask what Meridian can do, how to do something in Meridian, or for ideas to try. Read-only.",
++  "input_schema": {
++   "type": "object",
++   "properties": {}
++  }
+  }
+ ]

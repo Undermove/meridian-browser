@@ -59,8 +59,8 @@ Not there yet outside macOS:
 
 - code signing on Windows (SmartScreen warns on the first run of the installer). Windows has an
   installer and the in-app updater: `package_win.sh` makes `Meridian-<version>-win-<arch>-setup.exe`
-  and `SHA256SUMS-win.txt`, signed with the release key if it is on the computer
-  (`~/.config/meridian/release-ed25519.pem`, copied from the Mac); upload all three to the release.
+  and `SHA256SUMS-win.txt`; upload them to the release, then sign the checksums on the Mac, where
+  the release key stays in the Keychain (`tools/sign_win_sums.sh <tag> <installer sha256>`).
   A release only reaches installed Meridians when it is published as a full release, not a
   pre-release. Linux has neither an installer nor an updater (Settings shows the version);
 - Ask with an agent CLI (Codex, Cursor…): it only runs inside a sandbox that keeps it away from

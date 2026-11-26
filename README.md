@@ -153,7 +153,19 @@ Agents act inside your logged-in browser, so access is explicit:
 - Mission Control gets only short, redacted summaries from agents (no prompts, no tool output).
 - Keys are encrypted with the system keychain and never reach web pages.
 
-Found a vulnerability? Please open a private security advisory on GitHub.
+Found a vulnerability? Please report it privately, as [SECURITY.md](SECURITY.md) describes.
+
+### How the repository is checked
+
+- **What runs:** [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/Undermove/meridian-browser) weekly (the badge above), CodeQL code scanning, Dependabot alerts and security updates, GitHub secret scanning, and signed release checksums with build attestations (see [Verifying a download](#verifying-a-download)).
+- **Findings:** reviewed weekly; each one is fixed, or dismissed with a written reason.
+
+Scorecard checks that stay low by design:
+
+- **Maintained:** the repository is younger than 90 days.
+- **Code-Review / Branch-Protection:** one maintainer; every change still goes through a pull request with required CI.
+- **Fuzzing:** the engine is fuzzed upstream by Chromium's OSS-Fuzz and ClusterFuzz.
+- **CII-Best-Practices:** the OpenSSF Best Practices form is pending.
 
 ## Keyboard shortcuts
 
@@ -184,7 +196,7 @@ Found a vulnerability? Please open a private security advisory on GitHub.
 
 ## Build from source
 
-Meridian is a set of patches on Chromium plus its own UI. The code and build steps are in [`chromium/`](chromium/) (about 60 GB free space and a few hours for the first build). The `src/` folder and the root `package.json` are the earlier Electron version (0.4.x), kept for reference.
+Meridian is a set of patches on Chromium plus its own UI. The code and build steps are in [`chromium/`](chromium/) (about 60 GB free space and a few hours for the first build). The Chromium build still copies the Workbench page and some UI sources from `src/`; the rest of `src/` and the root `package.json` are the earlier Electron version (0.4.x). How changes and releases go: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Privacy
 

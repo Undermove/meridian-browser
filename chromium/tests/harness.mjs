@@ -131,10 +131,16 @@ process.on('exit', () => { for (const p of running) { try { p.kill('SIGKILL'); }
 export async function launch(urls = [], { profile: keep, args = [], firstRun = false, app = APP } = {}) {
   const profile = keep || fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
   const port = 9400 + Math.floor(Math.random() * 500);
-  // Never the real Arc: an empty folder unless a test gives its own.
+  // Never the real Arc, Chrome or any other browser: an empty folder unless a test gives its own.
   const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-empty-'));
-  for (const sw of ['--meridian-arc-dir']) {
+  for (const sw of ['arc', 'chrome', 'brave', 'edge', 'vivaldi', 'opera', 'firefox', 'safari'].map((k) => `--meridian-${k}-dir`)) {
     if (!args.some((a) => a.startsWith(sw + '='))) args = [...args, `${sw}=${empty}`];
+  }
+  // No cookie banner list from the internet: an empty one unless a test gives its own.
+  if (!args.some((a) => a.startsWith('--meridian-cookie-list='))) {
+    const none = path.join(os.tmpdir(), 'meridian-empty-cookie-list.txt');
+    if (!fs.existsSync(none)) fs.writeFileSync(none, '');
+    args = [...args, `--meridian-cookie-list=${none}`];
   }
   const started = Date.now();
   const proc = spawn(app, [

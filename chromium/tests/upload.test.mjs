@@ -167,3 +167,82 @@ test('upload_file: “Always on the site” stops the question there; Settings l
     for (const d of [profile, files]) fs.rmSync(d, { recursive: true, force: true });
   }
 });
+
+// A site whose upload button makes its <input type=file> on click (or calls showOpenFilePicker):
+// with no field on the page, the approved file waits for that tab's next chooser and the agent
+// clicks the site's own button. A declined upload offers nothing, and the offer runs out.
+const chooserPages = (req, res) => {
+  res.writeHead(200, { 'content-type': 'text/html' });
+  if (req.url.startsWith('/picker')) {
+    return res.end(`<title>Picker</title><button id=up onclick="showOpenFilePicker().then((h) => h[0].getFile()).then((f) => { document.title = 'Picked ' + f.name + ' ' + f.size }, (e) => { document.title = 'Aborted ' + e.name })">Upload</button>`);
+  }
+  res.end(`<title>Studio</title><button id=up onclick="const i = document.createElement('input'); i.type = 'file'; i.style.display = 'none'; document.body.append(i); i.onchange = () => { document.title = 'Got ' + i.files[0].name + ' ' + i.files[0].size }; i.oncancel = () => { document.title = 'Cancelled' }; i.click()">Upload</button>`);
+};
+
+async function chooserRun(answer, extra, body) {
+  const server = http.createServer(chooserPages);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
+  fs.mkdirSync(path.join(profile, 'Default'));
+  fs.writeFileSync(path.join(profile, 'Default', 'Preferences'), JSON.stringify({ meridian: { agent_access: 'full' } }));
+  // Windows: not in the temp folder, which is under AppData, where Chrome's File System Access
+  // blocklist keeps showOpenFilePicker out (a person's files are elsewhere too).
+  const files = fs.realpathSync(fs.mkdtempSync(path.join(process.platform === 'win32' ? os.homedir() : os.tmpdir(), 'meridian-upload-')));
+  const photo = path.join(files, 'photo.png');
+  fs.writeFileSync(photo, Buffer.alloc(1234, 7));
+  const b = await launch([`${origin}/`], { profile, args: [`--meridian-test-dialog-answer=${answer}`, '--meridian-test-cancel-file-choosers', ...extra] });
+  const mcp = bridge(profile);
+  try {
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === 'Studio')`);
+    for (let i = 0; i < 50 && !fs.existsSync(path.join(profile, 'Meridian Agent.json')); i++) await sleep(100);
+    await mcp.request('initialize', { protocolVersion: '2025-06-18', clientInfo: { name: 'test-client', version: '1' }, capabilities: {} });
+    const title = (t) => b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].some((r) => r.tab.title === ${JSON.stringify(t)})`);
+    await body({ b, mcp, origin, photo, title });
+  } finally {
+    mcp.close();
+    await b.close();
+    server.close();
+    for (const d of [profile, files]) fs.rmSync(d, { recursive: true, force: true });
+  }
+}
+
+test('upload_file: no field on the page — the approved file goes to the chooser the site’s own button opens', async () => {
+  await chooserRun('Upload this file', [], async ({ mcp, origin, photo, title }) => {
+    const offered = await mcp.call('upload_file', { path: photo });
+    assert.equal(offered.value?.offered, 'photo.png', JSON.stringify(offered));
+    assert.match(offered.value.next, /Click the site's upload button now/);
+    await mcp.call('click', { selector: '#up' });
+    await title('Got photo.png 1234');
+
+    // Used once: the next click gets no file.
+    await mcp.call('click', { selector: '#up' });
+    await title('Cancelled');
+
+    // showOpenFilePicker gets it the same way.
+    await mcp.call('navigate', { url: `${origin}/picker` });
+    await title('Picker');
+    assert.equal((await mcp.call('upload_file', { path: photo })).value?.offered, 'photo.png');
+    await mcp.call('click', { selector: '#up' });
+    await title('Picked photo.png 1234');
+  });
+});
+
+test('upload_file: a declined upload offers nothing to the site’s chooser', async () => {
+  await chooserRun('Don’t upload', [], async ({ mcp, photo, title }) => {
+    assert.match((await mcp.call('upload_file', { path: photo })).error, /declined/);
+    await mcp.call('click', { selector: '#up' });
+    await title('Cancelled');
+  });
+});
+
+test('upload_file: the offer to the site’s chooser runs out', async () => {
+  // 30 seconds for people; 2 here.
+  await chooserRun('Upload this file', ['--meridian-test-upload-offer-seconds=2'], async ({ mcp, photo, title }) => {
+    const offered = await mcp.call('upload_file', { path: photo });
+    assert.match(offered.value?.next ?? '', /within 2 seconds/);
+    await sleep(3000);
+    await mcp.call('click', { selector: '#up' });
+    await title('Cancelled');
+  });
+});

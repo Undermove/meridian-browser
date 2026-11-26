@@ -75,3 +75,62 @@ test('Ask opens with suggestions; one click makes a Boost, explains it and can u
     assert.doesNotMatch(sent, /Kiwis grow on vines/, 'not the page');
   } finally { await b.close(); site.close(); fs.rmSync(bin, { recursive: true, force: true }); }
 });
+
+// The setup a suggestion describes, applied with one button: a preview first (nothing changes
+// until the click), then Undo. Only sites that were sent and new spaces count; the person's own
+// link rules stay as they are.
+test('Ask: a suggested setup (spaces, link rules) is previewed, applied with one button and undone', async () => {
+  const site = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<title>Docs</title><h1>Docs</h1>'); });
+  await new Promise((r) => site.listen(0, '127.0.0.1', r));
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
+  const block = JSON.stringify({ spaces: [{ name: 'Reading', icon: '📚', color: '#7fbf8e' }, { name: 'personal', icon: '🏠', color: '#000000' }],
+    linkRules: [{ site: '127.0.0.1', space: 'Reading' }, { site: 'evil.example', space: 'Reading' }, { site: '127.0.0.1', space: 'Nowhere' }] });
+  const answer = `Make a **Reading** space and send your docs there.\n\n\`\`\`meridian-setup\n${block}\n\`\`\`\n`;
+  standIn(bin, 'claude', `if (process.argv[2] === 'auth') { console.log(JSON.stringify({ loggedIn: true })); process.exit(0); }
+let stdin = ''; process.stdin.on('data', (d) => { stdin += d; }); process.stdin.on('end', () => {
+  const out = ${JSON.stringify(answer)};
+  console.log(JSON.stringify({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'content_block_delta', delta: { type: 'text_delta', text: out } } }));
+  console.log(JSON.stringify({ type: 'result', is_error: false, result: out }));
+});`);
+  const b = await launch([`http://127.0.0.1:${site.address().port}/docs`], { args: [`--meridian-agents-path=${bin}`] });
+  const H = 'app.$.tabstrip.handler_';
+  const spaces = `${H}.getState().then(({state}) => state.spaces.map((s) => s.name))`;
+  const rules = `${H}.getSettings().then(({settings}) => settings.atc.rules.map((r) => r.pattern + ' -> ' + r.target))`;
+  const msg = `[...${AK}.querySelectorAll('.msg.assistant')].pop()`;
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
+    await b.eval(`${H}.getSettings().then(({settings}) => ${H}.setSettings({...settings, aiProvider: 'claude-code', aiConsent: 'always', atc: {...settings.atc, rules: [{id: 'mine', pattern: 'example.org', target: 'little'}]}}))`);
+    await b.waitFor(`${rules}.then((r) => r.length === 1)`);
+    const before = await b.eval(spaces);
+    await b.eval(`app.$.ask.toggle()`);
+    await b.waitFor(`!!${AK}.querySelector('.starter[data-kind="setup"]')`);
+    await b.click(`${AK}.querySelector('.starter[data-kind="setup"]')`);
+    await b.waitFor(`!!${msg}?.querySelector('.setup-card')`, 20000);
+    const said = await b.eval(`${msg}.textContent`);
+    assert.match(said, /send your docs there/);
+    assert.doesNotMatch(said, /meridian-setup|linkRules/, 'the machine part is not shown');
+    const card = await b.eval(`${msg}.querySelector('.setup-card').textContent.replace(/\\s+/g, ' ')`);
+    assert.match(card, /New space\s*📚\s*Reading/);
+    assert.match(card, /Links to 127\.0\.0\.1 open in Reading/);
+    assert.doesNotMatch(card, /evil\.example|Nowhere|🏠/, 'only sites that were sent, only new spaces');
+    if (process.env.SHOT) fs.writeFileSync(process.env.SHOT, Buffer.from((await b.cdp.send('Page.captureScreenshot', { format: 'png' })).data, 'base64'));
+    assert.deepEqual(await b.eval(spaces), before, 'a preview changes nothing');
+    assert.deepEqual(await b.eval(rules), ['example.org -> little']);
+
+    await b.click(`${msg}.querySelector('.apply-setup')`);
+    await b.waitFor(`${spaces}.then((n) => n.includes('Reading'))`);
+    await b.waitFor(`${rules}.then((r) => r.length === 2)`);
+    const st = await b.eval(`${H}.getState().then(({state}) => state)`);
+    const reading = st.spaces.find((s) => s.name === 'Reading');
+    assert.equal(reading.icon, '📚');
+    assert.deepEqual(await b.eval(rules), ['example.org -> little', `127.0.0.1 -> space:${reading.id}`]);
+    const route = await b.eval(`${H}.getSettings().then(({settings}) => ${H}.testLinkRoute(settings.atc, 'http://127.0.0.1:${site.address().port}/docs'))`);
+    assert.deepEqual([route.target, route.spaceId], ['space', reading.id]);
+    await b.waitFor(`/Applied/.test(${msg}.querySelector('.setup-card').textContent)`);
+
+    await b.click(`${msg}.querySelector('.undo-setup')`);
+    await b.waitFor(`${spaces}.then((n) => JSON.stringify(n) === ${JSON.stringify(JSON.stringify(before))})`);
+    assert.deepEqual(await b.eval(rules), ['example.org -> little'], 'the person\'s own rule stays');
+    await b.waitFor(`/Undone/.test(${msg}.querySelector('.setup-card').textContent)`);
+  } finally { await b.close(); site.close(); fs.rmSync(bin, { recursive: true, force: true }); }
+});

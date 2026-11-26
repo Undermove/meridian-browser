@@ -151,11 +151,18 @@
       resume: opts?.resume === true,
       resumeId: typeof opts?.resumeId === 'string' ? opts.resumeId.slice(0, 80) : undefined,
       resumeMode: typeof opts?.resumeMode === 'string' ? opts.resumeMode.slice(0, 30) : undefined,
+      resumeModel: typeof opts?.resumeModel === 'string' ? opts.resumeModel.slice(0, 80) : undefined,
+      resumeRemote: opts?.resumeRemote === true,
     }),
     ptyList: () => invoke('ptyList'),
-    // The open project's Claude Code sessions, reopened after a restart.
+    // What the page knows about a terminal (its name, its agent's session), kept with it while the
+    // Workbench tab is closed and the terminal goes on.
+    ptyMeta: (id, meta) => invoke('ptyMeta', str(id), Object.fromEntries(Object.entries(meta && typeof meta === 'object' ? meta : {}).slice(0, 12)
+      .filter(([, v]) => typeof v === 'string' || typeof v === 'boolean').map(([k, v]) => [str(k).slice(0, 30), typeof v === 'string' ? v.slice(0, 240) : v]))),
+    // The open project's agent sessions (Claude Code, Codex), reopened after a restart.
     claudeSessions: () => invoke('claudeSessions'),
-    saveClaudeSessions: (list) => invoke('saveClaudeSessions', Array.isArray(list) ? list.slice(0, 20).map((s) => ({ id: str(s?.id), name: str(s?.name), mode: str(s?.mode) })) : []),
+    saveClaudeSessions: (list) => invoke('saveClaudeSessions', Array.isArray(list) ? list.slice(0, 20).map((s) => ({ id: str(s?.id), name: str(s?.name), mode: str(s?.mode),
+      kind: s?.kind === 'codex' ? 'codex' : 'claude', model: str(s?.model).slice(0, 80), remote: s?.remote === true })) : []),
     // Before an agent that works with an online AI starts: "", "always" or "off".
     aiConsent: (agent) => invoke('aiConsent', String(agent || '')),
     setAiConsent: (agent, value) => invoke('setAiConsent', String(agent || ''), value === 'always' ? 'always' : 'once'),

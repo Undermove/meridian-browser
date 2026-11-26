@@ -1,0 +1,1029 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 03:38:36 +0400
+Subject: [PATCH] Meridian: cookie banners hidden without slowing frames down,
+ and the page scrolls again
+
+- The cookie list's rules for every site (~15,000 selectors, ~650 KB) are
+  parsed once per renderer and shared by all its documents (one user style
+  sheet, blink::WebDocument::InsertSharedStyleSheet), instead of a <style>
+  element parsed again in every frame. Sent once per list as shared memory.
+  A site's own rules (and a site with exceptions to the rules for every
+  site) go in as a small sheet of the document's.
+- Frames of other sites inside a page (ads, players, the popups' own
+  frames) get only that site's own rules.
+- Generic :has() rules are left out (on one site they stay).
+- The rules go in before the document's first element, from the browser
+  at ReadyToCommitNavigation (and again at DOMContentLoaded, kept if the
+  same), as user style sheets the page's own !important can't undo.
+- The scroll a consent popup locked comes back when its box is hidden:
+  OneTrust, Didomi, Sourcepoint, Quantcast, Cookiebot, Usercentrics,
+  TrustArc and others. Only while the popup's box is there and hidden, the
+  page is locked by the popup's class, an inline style or a generic lock
+  class, and no dialog of the site's own is open. A site's own modal still
+  locks the page.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   1 +
+ chrome/browser/meridian/cookie_banners.cc     | 107 ++++---
+ chrome/browser/meridian/cookie_banners.h      |  36 ++-
+ chrome/browser/meridian/cookie_list.cc        |  21 +-
+ chrome/browser/meridian/cookie_list.h         |  16 +-
+ .../browser/meridian/cookie_list_unittest.cc  |  33 ++
+ chrome/common/meridian/BUILD.gn               |  11 +
+ chrome/common/meridian/cookie_banners.mojom   |  25 ++
+ chrome/renderer/BUILD.gn                      |   3 +
+ .../chrome_content_renderer_client.cc         |   4 +
+ .../renderer/meridian/cookie_banner_agent.cc  | 282 ++++++++++++++++++
+ .../renderer/meridian/cookie_banner_agent.h   |  80 +++++
+ third_party/blink/public/web/web_document.h   |  12 +
+ .../renderer/core/exported/web_document.cc    |  53 ++++
+ 14 files changed, 632 insertions(+), 52 deletions(-)
+ create mode 100644 chrome/common/meridian/BUILD.gn
+ create mode 100644 chrome/common/meridian/cookie_banners.mojom
+ create mode 100644 chrome/renderer/meridian/cookie_banner_agent.cc
+ create mode 100644 chrome/renderer/meridian/cookie_banner_agent.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 29d2f8316b..174c027f3a 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -484,6 +484,7 @@ source_set("meridian") {
+   ]
+   deps = [
+     ":agent_socket_path",
++    "//chrome/common/meridian:mojo_bindings",
+     "//chrome/app:command_ids",
+     "//chrome/browser:shell_integration",
+     "//components/constrained_window",
+diff --git a/chrome/browser/meridian/cookie_banners.cc b/chrome/browser/meridian/cookie_banners.cc
+index 97a594477c..b6181c6152 100644
+--- a/chrome/browser/meridian/cookie_banners.cc
++++ b/chrome/browser/meridian/cookie_banners.cc
+@@ -7,31 +7,33 @@
+ #include <utility>
+ 
+ #include "base/command_line.h"
++#include "base/containers/span.h"
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
+ #include "base/files/important_file_writer.h"
+ #include "base/functional/bind.h"
+-#include "base/json/json_writer.h"
+ #include "base/no_destructor.h"
+ #include "base/path_service.h"
+-#include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/task/thread_pool.h"
+-#include "base/values.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/meridian/cookie_list.h"
+ #include "chrome/browser/meridian/prefs.h"
+ #include "chrome/browser/profiles/profile.h"
+-#include "chrome/common/chrome_isolated_world_ids.h"
+ #include "chrome/common/chrome_paths.h"
++#include "chrome/common/meridian/cookie_banners.mojom.h"
+ #include "components/prefs/pref_service.h"
++#include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/web_contents.h"
++#include "mojo/public/cpp/bindings/associated_remote.h"
+ #include "net/base/load_flags.h"
++#include "net/base/registry_controlled_domains/registry_controlled_domain.h"
+ #include "net/traffic_annotation/network_traffic_annotation.h"
+ #include "services/network/public/cpp/resource_request.h"
+ #include "services/network/public/cpp/shared_url_loader_factory.h"
+ #include "services/network/public/cpp/simple_url_loader.h"
++#include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"
+ #include "url/gurl.h"
+ 
+ namespace meridian {
+@@ -90,19 +92,6 @@ Read ReadList(base::FilePath path) {
+   return read;
+ }
+ 
+-// Puts `css` (a JSON string) in the frame's own style element; "" takes it
+-// away.
+-constexpr char kApply[] = R"((css) => {
+-  let s = document.getElementById('meridian-cookie-banners');
+-  if (!css) { s?.remove(); return; }
+-  if (!s) {
+-    s = document.createElement('style');
+-    s.id = 'meridian-cookie-banners';
+-  }
+-  if (s.textContent !== css) s.textContent = css;
+-  if (!s.isConnected) (document.head || document.documentElement)?.appendChild(s);
+-})";
+-
+ }  // namespace
+ 
+ // static
+@@ -137,7 +126,7 @@ void CookieBanners::OnRead(bool from_switch,
+                            std::optional<base::Time> modified,
+                            std::unique_ptr<CookieList> list) {
+   if (list) {
+-    list_ = std::move(list);
++    SetList(std::move(list));
+   }
+   if (from_switch) {
+     return;  // A test's own list: never the internet.
+@@ -197,18 +186,44 @@ void CookieBanners::OnDownloaded(std::optional<std::string> body) {
+           [](base::WeakPtr<CookieBanners> self,
+              std::unique_ptr<CookieList> list) {
+             if (self && list) {
+-              self->list_ = std::move(list);
++              self->SetList(std::move(list));
+               self->downloaded_at_ = base::Time::Now();
+             }
+           },
+           weak_factory_.GetWeakPtr()));
+ }
+ 
+-std::string CookieBanners::CssFor(const GURL& url) const {
++void CookieBanners::SetList(std::unique_ptr<CookieList> list) {
++  list_ = std::move(list);
++  generic_ = base::ReadOnlySharedMemoryRegion();
++  const std::string& css = list_->generic_css();
++  if (css.empty()) {
++    return;
++  }
++  base::MappedReadOnlyRegion shared =
++      base::ReadOnlySharedMemoryRegion::Create(css.size());
++  if (!shared.IsValid()) {
++    return;
++  }
++  shared.mapping.GetMemoryAsSpan<uint8_t>().copy_from(base::as_byte_span(css));
++  generic_ = std::move(shared.region);
++  // A new id for each list: renderers parse the text again.
++  ++generic_id_;
++}
++
++CookieBanners::FrameRules CookieBanners::RulesFor(const GURL& url,
++                                                  bool with_generic) const {
++  FrameRules out;
+   if (!list_ || !url.SchemeIsHTTPOrHTTPS()) {
+-    return std::string();
++    return out;
++  }
++  CookieList::Rules rules = list_->RulesFor(url.host());
++  out.site = std::move(rules.css);
++  if (rules.generic && with_generic && generic_.IsValid()) {
++    out.generic_id = generic_id_;
++    out.generic = generic_.Duplicate();
+   }
+-  return list_->CssFor(url.host());
++  return out;
+ }
+ 
+ CookieBannerTabHelper::CookieBannerTabHelper(content::WebContents* contents)
+@@ -224,38 +239,54 @@ CookieBannerTabHelper::CookieBannerTabHelper(content::WebContents* contents)
+ 
+ CookieBannerTabHelper::~CookieBannerTabHelper() = default;
+ 
+-void CookieBannerTabHelper::PrimaryMainDocumentElementAvailable() {
+-  Apply(web_contents()->GetPrimaryMainFrame(), false);
++void CookieBannerTabHelper::ReadyToCommitNavigation(
++    content::NavigationHandle* handle) {
++  // A page back from the cache (or a prerendered one shown) has its rules.
++  if (handle->IsSameDocument() || handle->IsPageActivation()) {
++    return;
++  }
++  Apply(handle->GetRenderFrameHost(), handle->GetURL(), true, false);
+ }
+ 
+ void CookieBannerTabHelper::DOMContentLoaded(content::RenderFrameHost* frame) {
+-  Apply(frame, false);
++  // Again, in case the frame missed them (the renderer keeps what it has).
++  Apply(frame, frame->GetLastCommittedURL(), false, false);
+ }
+ 
+ void CookieBannerTabHelper::OnPrefChanged() {
+   web_contents()->GetPrimaryMainFrame()->ForEachRenderFrameHost(
+-      [this](content::RenderFrameHost* frame) { Apply(frame, true); });
++      [this](content::RenderFrameHost* frame) {
++        Apply(frame, frame->GetLastCommittedURL(), false, true);
++      });
+ }
+ 
+ void CookieBannerTabHelper::Apply(content::RenderFrameHost* frame,
++                                  const GURL& url,
++                                  bool next_document,
+                                   bool changed) {
+-  if (!frame || !frame->IsRenderFrameLive()) {
+-    return;
+-  }
+-  const GURL& url = frame->GetLastCommittedURL();
+-  if (!url.SchemeIsHTTPOrHTTPS()) {
++  if (!frame || !frame->IsRenderFrameLive() || !url.SchemeIsHTTPOrHTTPS()) {
+     return;
+   }
+   const bool on = prefs_.prefs()->GetBoolean(prefs::kHideCookieBanners);
+-  const std::string css = on ? CookieBanners::Get().CssFor(url) : std::string();
+-  if (css.empty() && !changed) {
++  // A frame of another site inside the page gets only that site's own
++  // rules: the page's rules hide the box such frames are in, and every ad
++  // frame parsing the rules for every site was what cost the most.
++  const bool main = !frame->GetParentOrOuterDocument();
++  const bool same_site =
++      main || net::registry_controlled_domains::SameDomainOrHost(
++                  url, frame->GetOutermostMainFrame()->GetLastCommittedURL(),
++                  net::registry_controlled_domains::INCLUDE_PRIVATE_REGISTRIES);
++  CookieBanners::FrameRules rules =
++      on ? CookieBanners::Get().RulesFor(url, same_site)
++         : CookieBanners::FrameRules();
++  if (rules.empty() && !changed) {
+     return;  // Nothing to put, nothing put before.
+   }
+-  frame->ExecuteJavaScriptInIsolatedWorld(
+-      base::UTF8ToUTF16(std::string("(") + kApply + ")(" +
+-                        base::WriteJson(base::Value(css)).value_or("\"\"") +
+-                        ")"),
+-      base::NullCallback(), ISOLATED_WORLD_ID_CHROME_INTERNAL);
++  mojo::AssociatedRemote<mojom::CookieBannerAgent> agent;
++  frame->GetRemoteAssociatedInterfaces()->GetInterface(&agent);
++  const bool unlock = main && !rules.empty();
++  agent->Apply(rules.generic_id, std::move(rules.generic), rules.site, unlock,
++               next_document);
+ }
+ 
+ WEB_CONTENTS_USER_DATA_KEY_IMPL(CookieBannerTabHelper);
+diff --git a/chrome/browser/meridian/cookie_banners.h b/chrome/browser/meridian/cookie_banners.h
+index 74cb8069e1..f5e24c0146 100644
+--- a/chrome/browser/meridian/cookie_banners.h
++++ b/chrome/browser/meridian/cookie_banners.h
+@@ -9,6 +9,7 @@
+ #include <optional>
+ #include <string>
+ 
++#include "base/memory/read_only_shared_memory_region.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/no_destructor.h"
+ #include "base/time/time.h"
+@@ -41,9 +42,18 @@ class CookieBanners {
+ 
+   // Loads the list the first time (from disk, else the internet).
+   void Start();
+-  // The CSS hiding the notices on `url` ("" before the list is in, or when
+-  // nothing applies).
+-  std::string CssFor(const GURL& url) const;
++  // What a frame showing `url` is sent (mojom::CookieBannerAgent::Apply):
++  // the rules for every site as one shared text (`generic_id` 0: none), and
++  // the site's own. `with_generic` false: only the site's own (frames of
++  // other sites inside a page: ads, players, the consent popups' own frames,
++  // whose box the page's rules hide).
++  struct FrameRules {
++    uint64_t generic_id = 0;
++    base::ReadOnlySharedMemoryRegion generic;
++    std::string site;
++    bool empty() const { return !generic_id && site.empty(); }
++  };
++  FrameRules RulesFor(const GURL& url, bool with_generic) const;
+ 
+  private:
+   friend class base::NoDestructor<CookieBanners>;
+@@ -56,15 +66,22 @@ class CookieBanners {
+   void MaybeDownload();
+   void OnDownloaded(std::optional<std::string> body);
+ 
++  void SetList(std::unique_ptr<CookieList> list);
++
+   bool started_ = false;
+   std::unique_ptr<CookieList> list_;
++  // list_'s rules for every site, shared with the renderers.
++  uint64_t generic_id_ = 0;
++  base::ReadOnlySharedMemoryRegion generic_;
+   base::Time downloaded_at_;
+   std::unique_ptr<network::SimpleURLLoader> loader_;
+   base::RepeatingTimer refresh_timer_;
+   base::WeakPtrFactory<CookieBanners> weak_factory_{this};
+ };
+ 
+-// Puts the hiding CSS on a tab's pages (every frame) while the setting is on.
++// Sends a tab's frames their rules (to chrome/renderer/meridian's
++// CookieBannerAgent) while the setting is on: before each document commits,
++// and again once its DOM is in.
+ class CookieBannerTabHelper
+     : public content::WebContentsObserver,
+       public content::WebContentsUserData<CookieBannerTabHelper> {
+@@ -78,11 +95,16 @@ class CookieBannerTabHelper
+   explicit CookieBannerTabHelper(content::WebContents* contents);
+ 
+   // content::WebContentsObserver:
+-  void PrimaryMainDocumentElementAvailable() override;
++  void ReadyToCommitNavigation(content::NavigationHandle* handle) override;
+   void DOMContentLoaded(content::RenderFrameHost* frame) override;
+ 
+-  // `changed`: the setting changed (the CSS goes when it's off).
+-  void Apply(content::RenderFrameHost* frame, bool changed);
++  // Sends `frame` its rules for `url`: for the document it is about to show
++  // (`next_document`), else the one it shows. `changed`: the setting changed
++  // (the rules go when it's off).
++  void Apply(content::RenderFrameHost* frame,
++             const GURL& url,
++             bool next_document,
++             bool changed);
+   void OnPrefChanged();
+ 
+   PrefChangeRegistrar prefs_;
+diff --git a/chrome/browser/meridian/cookie_list.cc b/chrome/browser/meridian/cookie_list.cc
+index cc549df9ff..becd25dc8a 100644
+--- a/chrome/browser/meridian/cookie_list.cc
++++ b/chrome/browser/meridian/cookie_list.cc
+@@ -125,6 +125,11 @@ std::unique_ptr<CookieList> CookieList::Parse(std::string_view text) {
+       list->exceptions_[site].insert(std::string(selector));
+     }
+     if (in.empty()) {
++      // :has() on every page makes each change in it look up the tree
++      // again; on one site it's fine.
++      if (selector.find(":has(") != std::string_view::npos) {
++        continue;
++      }
+       if (seen.insert(std::string(selector)).second) {
+         generic.emplace_back(selector);
+       }
+@@ -184,9 +189,15 @@ bool CookieList::AnyIn(const std::set<std::string>& sites,
+ }
+ 
+ std::string CookieList::CssFor(std::string_view host) const {
++  Rules rules = RulesFor(host);
++  return rules.generic ? generic_css_ + rules.css : std::move(rules.css);
++}
++
++CookieList::Rules CookieList::RulesFor(std::string_view host) const {
++  Rules rules;
+   const std::vector<std::string> sites = SitesOf(host);
+   if (sites.empty() || AnyIn(no_hiding_, sites)) {
+-    return std::string();
++    return rules;
+   }
+   std::set<std::string> skip;
+   for (const std::string& site : sites) {
+@@ -195,10 +206,10 @@ std::string CookieList::CssFor(std::string_view host) const {
+       skip.insert(it->second.begin(), it->second.end());
+     }
+   }
+-  std::string css;
+-  if (!AnyIn(no_generic_, sites)) {
++  std::string& css = rules.css;
++  if (!AnyIn(no_generic_, sites) && !generic_.empty()) {
+     if (skip.empty()) {
+-      css = generic_css_;
++      rules.generic = true;
+     } else {
+       for (const std::string& selector : generic_) {
+         if (!skip.contains(selector)) {
+@@ -218,7 +229,7 @@ std::string CookieList::CssFor(std::string_view host) const {
+       }
+     }
+   }
+-  return css;
++  return rules;
+ }
+ 
+ }  // namespace meridian
+diff --git a/chrome/browser/meridian/cookie_list.h b/chrome/browser/meridian/cookie_list.h
+index 05ce9d7c7b..7c9d51bcd9 100644
+--- a/chrome/browser/meridian/cookie_list.h
++++ b/chrome/browser/meridian/cookie_list.h
+@@ -30,8 +30,20 @@ class CookieList {
+   CookieList& operator=(const CookieList&) = delete;
+   ~CookieList();
+ 
+-  // CSS hiding the notices on `host` ("" when nothing applies): one rule per
+-  // selector, so a selector this Chromium doesn't know drops only itself.
++  // What hides the notices on `host`: the rules for every site as they are
++  // (`generic`, generic_css(), the same text for most sites, so renderers
++  // parse it once for all their frames) and `css`, the site's own rules on
++  // top. A site with exceptions to the rules for every site gets them,
++  // less the exceptions, in `css` instead.
++  struct Rules {
++    bool generic = false;
++    std::string css;
++  };
++  Rules RulesFor(std::string_view host) const;
++  const std::string& generic_css() const { return generic_css_; }
++
++  // All of it as one text ("" when nothing applies): one rule per selector,
++  // so a selector this Chromium doesn't know drops only itself.
+   std::string CssFor(std::string_view host) const;
+ 
+   size_t generic_count() const { return generic_.size(); }
+diff --git a/chrome/browser/meridian/cookie_list_unittest.cc b/chrome/browser/meridian/cookie_list_unittest.cc
+index aafa89a16b..2932ad22d9 100644
+--- a/chrome/browser/meridian/cookie_list_unittest.cc
++++ b/chrome/browser/meridian/cookie_list_unittest.cc
+@@ -28,6 +28,8 @@ example.org##+js(cookie-remover)
+ @@||quiet.com^$elemhide
+ @@||own.com^$generichide
+ own.com##.own-banner
++##.wall:has(.cookie-text)
++paper.com##.paywall:has(.consent)
+ )";
+ 
+ TEST(CookieListTest, GenericRulesEverywhere) {
+@@ -80,6 +82,37 @@ TEST(CookieListTest, ElemhideAndGenerichide) {
+   EXPECT_EQ(list->CssFor("own.com"), ".own-banner{display:none!important}\n");
+ }
+ 
++// Most sites share the rules for every site as they are (renderers parse them
++// once); a site with exceptions to them gets its own copy.
++TEST(CookieListTest, SharedGenericRules) {
++  auto list = CookieList::Parse(kList);
++  ASSERT_TRUE(list);
++  CookieList::Rules any = list->RulesFor("www.any.net");
++  EXPECT_TRUE(any.generic);
++  EXPECT_EQ(any.css, "");
++  EXPECT_EQ(list->generic_css(), list->CssFor("www.any.net"));
++  CookieList::Rules sport = list->RulesFor("sport.news.com");
++  EXPECT_FALSE(sport.generic);  // news.com#@#.dup-free
++  EXPECT_NE(sport.css.find(".cookie-notice{"), std::string::npos);
++  EXPECT_EQ(sport.css.find(".dup-free"), std::string::npos);
++  CookieList::Rules shop = list->RulesFor("shop.de");
++  EXPECT_TRUE(shop.generic);
++  EXPECT_EQ(shop.css, ".shop-cookies{display:none!important}\n");
++  CookieList::Rules own = list->RulesFor("own.com");  // $generichide
++  EXPECT_FALSE(own.generic);
++  EXPECT_EQ(own.css, ".own-banner{display:none!important}\n");
++  EXPECT_FALSE(list->RulesFor("quiet.com").generic);
++}
++
++// :has() only on the sites it was written for, never on every page.
++TEST(CookieListTest, NoGenericHas) {
++  auto list = CookieList::Parse(kList);
++  ASSERT_TRUE(list);
++  EXPECT_EQ(list->generic_css().find(":has("), std::string::npos);
++  EXPECT_NE(list->CssFor("paper.com").find(".paywall:has(.consent){"),
++            std::string::npos);
++}
++
+ TEST(CookieListTest, NothingToHide) {
+   EXPECT_FALSE(CookieList::Parse(""));
+   EXPECT_FALSE(CookieList::Parse("! only\n||a.com^\n"));
+diff --git a/chrome/common/meridian/BUILD.gn b/chrome/common/meridian/BUILD.gn
+new file mode 100644
+index 0000000000..e1f263e9fc
+--- /dev/null
++++ b/chrome/common/meridian/BUILD.gn
+@@ -0,0 +1,11 @@
++# Copyright 2026 The Meridian Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//mojo/public/tools/bindings/mojom.gni")
++
++# What the browser tells a frame's renderer (chrome/renderer/meridian).
++mojom("mojo_bindings") {
++  sources = [ "cookie_banners.mojom" ]
++  public_deps = [ "//mojo/public/mojom/base" ]
++}
+diff --git a/chrome/common/meridian/cookie_banners.mojom b/chrome/common/meridian/cookie_banners.mojom
+new file mode 100644
+index 0000000000..3dc704951a
+--- /dev/null
++++ b/chrome/common/meridian/cookie_banners.mojom
+@@ -0,0 +1,25 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++module meridian.mojom;
++
++import "mojo/public/mojom/base/shared_memory.mojom";
++
++// Hide cookie banners in one frame (chrome/browser/meridian/cookie_banners.h,
++// the renderer side in chrome/renderer/meridian/cookie_banner_agent.h). The
++// rules go in as user style sheets, so a page's own !important can't undo
++// them.
++interface CookieBannerAgent {
++  // The rules for the document this frame shows now (`next_document`: the
++  // one it is about to load instead). `generic_id` names the rules for every
++  // site (0: none), the same text in every frame: the renderer parses it once
++  // and reads `generic` only when it hasn't got that id yet. `site`: the
++  // site's own rules. `unlock`: give back the scrolling a consent popup locked
++  // when the popup is hidden. Nothing at all takes the rules away.
++  Apply(uint64 generic_id,
++        mojo_base.mojom.ReadOnlySharedMemoryRegion? generic,
++        string site,
++        bool unlock,
++        bool next_document);
++};
+diff --git a/chrome/renderer/BUILD.gn b/chrome/renderer/BUILD.gn
+index 00fb18e0d1..ea39ce5346 100644
+--- a/chrome/renderer/BUILD.gn
++++ b/chrome/renderer/BUILD.gn
+@@ -74,6 +74,8 @@ static_library("renderer") {
+     "chrome_content_settings_agent_delegate.h",
+     "chrome_render_frame_observer.cc",
+     "chrome_render_frame_observer.h",
++    "meridian/cookie_banner_agent.cc",
++    "meridian/cookie_banner_agent.h",
+     "chrome_render_thread_observer.cc",
+     "chrome_render_thread_observer.h",
+     "custom_menu_commands.h",
+@@ -134,6 +136,7 @@ static_library("renderer") {
+     "//chrome:strings",
+     "//chrome/common",
+     "//chrome/common:mojo_bindings",
++    "//chrome/common/meridian:mojo_bindings",
+     "//chrome/common/net",
+     "//chrome/common/request_header_integrity:buildflags",
+     "//chrome/common/search:mojo_bindings",
+diff --git a/chrome/renderer/chrome_content_renderer_client.cc b/chrome/renderer/chrome_content_renderer_client.cc
+index 52f120d73c..01eb0b1510 100644
+--- a/chrome/renderer/chrome_content_renderer_client.cc
++++ b/chrome/renderer/chrome_content_renderer_client.cc
+@@ -56,6 +56,7 @@
+ #include "chrome/renderer/browser_exposed_renderer_interfaces.h"
+ #include "chrome/renderer/chrome_content_settings_agent_delegate.h"
+ #include "chrome/renderer/chrome_render_frame_observer.h"
++#include "chrome/renderer/meridian/cookie_banner_agent.h"
+ #include "chrome/renderer/chrome_render_thread_observer.h"
+ #include "chrome/renderer/controlled_frame/controlled_frame_extensions_renderer_api_provider.h"
+ #include "chrome/renderer/google_accounts_private_api_extension.h"
+@@ -657,6 +658,9 @@ void ChromeContentRendererClient::RenderFrameCreated(
+   service_manager::BinderRegistry* registry = render_frame_observer->registry();
+ 
+   new prerender::NoStatePrefetchRenderFrameObserver(render_frame);
++  // Meridian: Hide cookie banners (deletes itself with the frame).
++  new meridian::CookieBannerAgent(
++      render_frame, render_frame->GetAssociatedInterfaceRegistry());
+ 
+   auto content_settings_delegate =
+       std::make_unique<ChromeContentSettingsAgentDelegate>(render_frame);
+diff --git a/chrome/renderer/meridian/cookie_banner_agent.cc b/chrome/renderer/meridian/cookie_banner_agent.cc
+new file mode 100644
+index 0000000000..4f44918d07
+--- /dev/null
++++ b/chrome/renderer/meridian/cookie_banner_agent.cc
+@@ -0,0 +1,282 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/renderer/meridian/cookie_banner_agent.h"
++
++#include <string_view>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/memory/read_only_shared_memory_region.h"
++#include "base/task/single_thread_task_runner.h"
++#include "base/time/time.h"
++#include "chrome/common/chrome_isolated_world_ids.h"
++#include "content/public/renderer/render_frame.h"
++#include "third_party/blink/public/common/associated_interfaces/associated_interface_registry.h"
++#include "third_party/blink/public/platform/task_type.h"
++#include "third_party/blink/public/platform/web_string.h"
++#include "third_party/blink/public/web/web_document.h"
++#include "third_party/blink/public/web/web_element.h"
++#include "third_party/blink/public/web/web_local_frame.h"
++#include "third_party/blink/public/web/web_script_source.h"
++
++namespace meridian {
++
++namespace {
++
++constexpr char kGenericKey[] = "meridian-cookie-banners";
++constexpr char kSiteKey[] = "meridian-cookie-banners-site";
++constexpr char kUnlockKey[] = "meridian-cookie-banners-unlock";
++
++// The scrolling back: user !important beats the page's own, inline ones too.
++constexpr char kUnlockCss[] =
++    "html[meridian-cookie-unlock]{overflow:auto!important;"
++    "position:static!important}\n"
++    "html[meridian-cookie-unlock]>body{overflow:visible!important;"
++    "position:static!important}\n";
++
++// Consent popups' own boxes (the popup and its backdrop), as the cookie list
++// hides them.
++constexpr char kPopupBoxes[] =
++    "#onetrust-consent-sdk,#onetrust-banner-sdk,#onetrust-pc-sdk,"
++    ".onetrust-pc-dark-filter,#didomi-host,#didomi-popup,#didomi-notice,"
++    ".didomi-popup-backdrop,[id^=\"sp_message_container_\"],"
++    "#qc-cmp2-container,.qc-cmp2-container,#qc-cmp2-ui,.qc-cmp-ui-container,"
++    "#CybotCookiebotDialog,#CybotCookiebotDialogBodyUnderlay,"
++    "#usercentrics-root,#usercentrics-cmp-ui,#uc-banner,#truste-consent-track,"
++    "#truste-banner,.truste_overlay,.truste_box_overlay,#consent_blackbar,"
++    "#trustarc-banner-overlay,.fc-consent-root,#iubenda-cs-banner,#cmpbox,"
++    "#cmpwrapper,.cmpboxBG,#cookiescript_injected,#axeptio_overlay,"
++    ".cky-consent-container,.cky-overlay,#cmplz-cookiebanner-container,"
++    "#BorlabsCookieBox,.osano-cm-window,#sd-cmp";
++
++// Runs in an isolated world of the main frame, given kPopupBoxes. Puts
++// meridian-cookie-unlock on <html> while all of this holds:
++// - a consent popup's box is there and hidden (by the cookie rules: the
++//   popups' own boxes are in the list);
++// - the page doesn't scroll: overflow hidden on <html> or <body>, or <body>
++//   fixed in place;
++// - what locked it is the popup's: a consent manager's class on <html> or
++//   <body> (Sourcepoint, Didomi, Quantcast, OneTrust, Cookiebot,
++//   Usercentrics, TrustArc...), or an inline style on them, or a generic
++//   lock class (Bootstrap's modal-open and the like);
++// - no dialog of the site's own is open (a visible modal that isn't the
++//   popup's).
++// Looked at again when <html>'s or <body>'s class or style, or <body>'s
++// children, change, a few times while the page loads, and when the rules
++// come back on.
++constexpr char kUnlockScript[] = R"(((BOXES) => {
++  // Again (the rules back on): look again.
++  if (window.meridianCookieUnlock) { window.meridianCookieUnlock(); return; }
++  const ATTR = 'meridian-cookie-unlock';
++  const CMP_CLASS = /^(sp-message-open|didomi-popup-open|didomi-notice-popup-open|qc-cmp-showing|qc-cmp-ui-showing|qc-cmp2-showing|ot-overflow-hidden|ot-no-scroll|onetrust-.*|CybotCookiebotDialogActive|CybotCookiebot.*|uc-.*overflow.*|overflowHidden|usercentrics-.*|truste.*|trustarc.*|fc-consent-.*|iubenda-cs-.*|cmp-.*open|cky-.*|cmplz-.*|borlabs-.*|osano-.*|axeptio.*)$/;
++  const GENERIC_CLASS = /^(modal-open|no-scroll|noscroll|no-overflow|overflow-hidden|scroll-lock|scroll-locked|lock-scroll|disable-scroll|stop-scrolling|is-locked)$/;
++  const SITE_DIALOGS = 'dialog[open],[aria-modal="true"],[role="dialog"],.modal.show,.modal.in,.modal.is-open';
++  const shown = (el) => el.checkVisibility ? el.checkVisibility() : el.getClientRects().length > 0;
++  const html = document.documentElement;
++  const check = () => {
++    const body = document.body;
++    if (!body || !html) return;
++    const boxes = [...document.querySelectorAll(BOXES)];
++    const hidden = boxes.some((el) => !shown(el));
++    let unlock = false;
++    if (hidden) {
++      const h = getComputedStyle(html), b = getComputedStyle(body);
++      const stuck = (s) => s.overflowY === 'hidden' || s.overflowY === 'clip';
++      const locked = stuck(h) || stuck(b) || b.position === 'fixed' || h.position === 'fixed';
++      const classes = [...html.classList, ...body.classList];
++      const inline = [html, body].some((el) => /overflow[^;]*:\s*(hidden|clip)|position\s*:\s*fixed/i.test(el.getAttribute('style') || ''));
++      const why = classes.some((c) => CMP_CLASS.test(c) || GENERIC_CLASS.test(c)) || inline;
++      const dialog = [...document.querySelectorAll(SITE_DIALOGS)].some(
++          (el) => shown(el) && !boxes.some((box) => box.contains(el)));
++      unlock = locked && why && !dialog;
++      // Unlocked by us, the page looks unlocked: keep it while the popup's
++      // lock is there and no site dialog opens.
++      if (!unlock && html.hasAttribute(ATTR) && !dialog) unlock = why;
++    }
++    if (unlock !== html.hasAttribute(ATTR)) {
++      if (unlock) html.setAttribute(ATTR, ''); else html.removeAttribute(ATTR);
++    }
++  };
++  let timer = 0;
++  const soon = () => { if (!timer) timer = setTimeout(() => { timer = 0; check(); }, 30); };
++  window.meridianCookieUnlock = soon;
++  const watch = new MutationObserver(soon);
++  const observe = () => {
++    watch.observe(html, { attributes: true, attributeFilter: ['class', 'style'], childList: true });
++    if (document.body) watch.observe(document.body, { attributes: true, attributeFilter: ['class', 'style'], childList: true });
++  };
++  observe();
++  if (!document.body) new MutationObserver((_, me) => { if (document.body) { me.disconnect(); observe(); soon(); } }).observe(html, { childList: true });
++  document.addEventListener('DOMContentLoaded', soon);
++  addEventListener('load', soon);
++  for (const ms of [500, 1500, 3000, 6000, 10000]) setTimeout(soon, ms);
++  soon();
++}))";
++
++}  // namespace
++
++CookieBannerAgent::CookieBannerAgent(
++    content::RenderFrame* frame,
++    blink::AssociatedInterfaceRegistry* registry)
++    : content::RenderFrameObserver(frame) {
++  registry->AddInterface<mojom::CookieBannerAgent>(
++      base::BindRepeating(&CookieBannerAgent::Bind, base::Unretained(this)));
++}
++
++CookieBannerAgent::~CookieBannerAgent() = default;
++
++void CookieBannerAgent::Bind(
++    mojo::PendingAssociatedReceiver<mojom::CookieBannerAgent> receiver) {
++  receivers_.Add(this, std::move(receiver));
++}
++
++void CookieBannerAgent::Apply(uint64_t generic_id,
++                              base::ReadOnlySharedMemoryRegion generic,
++                              const std::string& site,
++                              bool unlock,
++                              bool next_document) {
++  // The rules for every site: parsed the first time this renderer sees them.
++  if (generic_id && !blink::WebDocument::HasSharedStyleSheet(generic_id)) {
++    base::ReadOnlySharedMemoryMapping mapping;
++    if (generic.IsValid()) {
++      mapping = generic.Map();
++    }
++    if (!mapping.IsValid()) {
++      generic_id = 0;
++    } else {
++      base::span<const char> text = mapping.GetMemoryAsSpan<char>();
++      blink::WebDocument::SetSharedStyleSheet(
++          generic_id, blink::WebString::FromUtf8(
++                          std::string_view(text.data(), text.size())));
++    }
++  }
++  Rules rules{generic_id, site, unlock};
++  if (next_document) {
++    next_ = std::move(rules);
++    return;
++  }
++  rules_ = std::move(rules);
++  Update();
++}
++
++void CookieBannerAgent::DidCommitProvisionalLoad(
++    ui::PageTransition transition) {
++  // A new document: nothing in it yet, and the rules sent for it.
++  rules_ = next_.value_or(Rules());
++  next_.reset();
++  inserted_ = Rules();
++  dom_loaded_ = false;
++  unlock_script_due_ = false;
++  unlock_script_ran_ = false;
++  ++document_;
++}
++
++void CookieBannerAgent::DidDispatchDOMContentLoadedEvent() {
++  dom_loaded_ = true;
++  if (unlock_script_due_) {
++    RunUnlockScript();
++  }
++}
++
++void CookieBannerAgent::RunUnlockScript() {
++  // Not from inside the frame's own notifications (a script run from there
++  // doesn't run): tasks of their own, once the DOM is in. The script (and
++  // the isolated world it needs, a few ms) only on pages with a popup's box:
++  // looked for now and a few times while consent managers load.
++  unlock_script_due_ = !dom_loaded_;
++  if (unlock_script_due_) {
++    return;
++  }
++  scoped_refptr<base::SingleThreadTaskRunner> runner =
++      render_frame()->GetTaskRunner(blink::TaskType::kInternalDefault);
++  runner->PostTask(FROM_HERE,
++                   base::BindOnce(&CookieBannerAgent::ExecuteUnlockScript,
++                                  weak_factory_.GetWeakPtr(), document_, true));
++  for (base::TimeDelta delay :
++       {base::Milliseconds(500), base::Milliseconds(1500), base::Seconds(4),
++        base::Seconds(10)}) {
++    runner->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(&CookieBannerAgent::ExecuteUnlockScript,
++                       weak_factory_.GetWeakPtr(), document_, false),
++        delay);
++  }
++}
++
++void CookieBannerAgent::ExecuteUnlockScript(int document, bool again) {
++  if (document != document_ || !rules_.unlock) {
++    return;  // Another document by now, or the rules taken away.
++  }
++  blink::WebLocalFrame* frame = render_frame()->GetWebFrame();
++  if (unlock_script_ran_) {
++    if (!again) {
++      return;  // It watches the page itself.
++    }
++  } else if (frame->GetDocument()
++                 .QuerySelector(blink::WebString::FromUtf8(kPopupBoxes))
++                 .IsNull()) {
++    return;
++  }
++  unlock_script_ran_ = true;
++  frame->ExecuteScriptInIsolatedWorld(
++      ISOLATED_WORLD_ID_CHROME_INTERNAL,
++      blink::WebScriptSource(blink::WebString::FromUtf8(
++          std::string(kUnlockScript) + "('" + kPopupBoxes + "')")),
++      blink::BackForwardCacheAware::kAllow);
++}
++
++void CookieBannerAgent::DidCreateDocumentElement() {
++  Update();
++}
++
++void CookieBannerAgent::Update() {
++  blink::WebLocalFrame* frame = render_frame()->GetWebFrame();
++  blink::WebDocument document = frame->GetDocument();
++  if (document.IsNull() || document.DocumentElement().IsNull() ||
++      rules_ == inserted_) {
++    return;
++  }
++  const blink::WebString generic_key = blink::WebString::FromUtf8(kGenericKey);
++  const blink::WebString site_key = blink::WebString::FromUtf8(kSiteKey);
++  const blink::WebString unlock_key = blink::WebString::FromUtf8(kUnlockKey);
++  if (rules_.generic_id != inserted_.generic_id) {
++    if (inserted_.generic_id) {
++      document.RemoveInsertedStyleSheet(generic_key,
++                                        blink::WebCssOrigin::kUser);
++    }
++    // Not in a document that isn't HTML (nothing to hide there).
++    if (rules_.generic_id) {
++      document.InsertSharedStyleSheet(rules_.generic_id, generic_key,
++                                      blink::WebCssOrigin::kUser);
++    }
++    inserted_.generic_id = rules_.generic_id;
++  }
++  if (rules_.site != inserted_.site) {
++    if (!inserted_.site.empty()) {
++      document.RemoveInsertedStyleSheet(site_key, blink::WebCssOrigin::kUser);
++    }
++    if (!rules_.site.empty()) {
++      document.InsertStyleSheet(blink::WebString::FromUtf8(rules_.site),
++                                &site_key, blink::WebCssOrigin::kUser);
++    }
++    inserted_.site = rules_.site;
++  }
++  if (rules_.unlock != inserted_.unlock) {
++    if (rules_.unlock) {
++      document.InsertStyleSheet(blink::WebString::FromUtf8(kUnlockCss),
++                                &unlock_key, blink::WebCssOrigin::kUser);
++      RunUnlockScript();
++    } else {
++      document.RemoveInsertedStyleSheet(unlock_key, blink::WebCssOrigin::kUser);
++    }
++    inserted_.unlock = rules_.unlock;
++  }
++}
++
++void CookieBannerAgent::OnDestruct() {
++  delete this;
++}
++
++}  // namespace meridian
+diff --git a/chrome/renderer/meridian/cookie_banner_agent.h b/chrome/renderer/meridian/cookie_banner_agent.h
+new file mode 100644
+index 0000000000..d6663d9040
+--- /dev/null
++++ b/chrome/renderer/meridian/cookie_banner_agent.h
+@@ -0,0 +1,80 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_RENDERER_MERIDIAN_COOKIE_BANNER_AGENT_H_
++#define CHROME_RENDERER_MERIDIAN_COOKIE_BANNER_AGENT_H_
++
++#include <optional>
++#include <string>
++
++#include "base/memory/weak_ptr.h"
++#include "chrome/common/meridian/cookie_banners.mojom.h"
++#include "content/public/renderer/render_frame_observer.h"
++#include "mojo/public/cpp/bindings/associated_receiver_set.h"
++
++namespace blink {
++class AssociatedInterfaceRegistry;
++}
++
++namespace meridian {
++
++// Hide cookie banners, in one frame (the browser side is
++// chrome/browser/meridian/cookie_banners.h). The rules go in as user style
++// sheets: the rules for every site parsed once in this renderer and shared by
++// all its documents (blink::WebDocument::InsertSharedStyleSheet), the site's
++// own as a small sheet of the document's. In the main frame, when a consent
++// popup locked the page's scrolling and its box is hidden, a script gives the
++// scrolling back (kUnlockScript).
++class CookieBannerAgent : public content::RenderFrameObserver,
++                          public mojom::CookieBannerAgent {
++ public:
++  CookieBannerAgent(content::RenderFrame* frame,
++                    blink::AssociatedInterfaceRegistry* registry);
++  CookieBannerAgent(const CookieBannerAgent&) = delete;
++  CookieBannerAgent& operator=(const CookieBannerAgent&) = delete;
++  ~CookieBannerAgent() override;
++
++ private:
++  struct Rules {
++    uint64_t generic_id = 0;
++    std::string site;
++    bool unlock = false;
++    bool operator==(const Rules&) const = default;
++  };
++
++  // mojom::CookieBannerAgent:
++  void Apply(uint64_t generic_id,
++             base::ReadOnlySharedMemoryRegion generic,
++             const std::string& site,
++             bool unlock,
++             bool next_document) override;
++
++  // content::RenderFrameObserver:
++  void DidCommitProvisionalLoad(ui::PageTransition transition) override;
++  void DidCreateDocumentElement() override;
++  void DidDispatchDOMContentLoadedEvent() override;
++  void OnDestruct() override;
++
++  void Bind(mojo::PendingAssociatedReceiver<mojom::CookieBannerAgent> receiver);
++  // Puts `rules_` in the document (once it has its <html>), taking away what
++  // was put before.
++  void Update();
++  void RunUnlockScript();
++  // `again`: run it again if it ran (the rules are back on).
++  void ExecuteUnlockScript(int document, bool again);
++
++  Rules rules_;                // For the document shown.
++  Rules inserted_;             // What it has.
++  std::optional<Rules> next_;  // For the document committing next.
++  bool dom_loaded_ = false;
++  bool unlock_script_due_ = false;
++  bool unlock_script_ran_ = false;
++  int document_ = 0;  // Counts the documents committed.
++  mojo::AssociatedReceiverSet<mojom::CookieBannerAgent> receivers_;
++  base::WeakPtrFactory<CookieBannerAgent> weak_factory_{this};
++};
++
++}  // namespace meridian
++
++#endif  // CHROME_RENDERER_MERIDIAN_COOKIE_BANNER_AGENT_H_
+diff --git a/third_party/blink/public/web/web_document.h b/third_party/blink/public/web/web_document.h
+index dfb05059d0..3eede4b327 100644
+--- a/third_party/blink/public/web/web_document.h
++++ b/third_party/blink/public/web/web_document.h
+@@ -155,6 +155,18 @@ class BLINK_EXPORT WebDocument : public WebNode {
+       WebCssOrigin = WebCssOrigin::kAuthor,
+       BackForwardCacheAware = BackForwardCacheAware::kAllow);
+ 
++  // Meridian: one big sheet parsed once for all the documents of this
++  // renderer (the cookie banner rules, inserted in every frame). The sheet
++  // kept is the last one set; `shared_id` names it.
++  static bool HasSharedStyleSheet(uint64_t shared_id);
++  static void SetSharedStyleSheet(uint64_t shared_id,
++                                  const WebString& source_code);
++  // Inserts the kept sheet when it is `shared_id` (and this is an HTML
++  // document); else nothing, and returns a null key.
++  WebStyleSheetKey InsertSharedStyleSheet(uint64_t shared_id,
++                                          const WebStyleSheetKey& key,
++                                          WebCssOrigin = WebCssOrigin::kAuthor);
++
+   // Removes the CSS which was previously inserted by a call to
+   // InsertStyleSheet().
+   void RemoveInsertedStyleSheet(const WebStyleSheetKey&,
+diff --git a/third_party/blink/renderer/core/exported/web_document.cc b/third_party/blink/renderer/core/exported/web_document.cc
+index 088e68a775..229a7ab404 100644
+--- a/third_party/blink/renderer/core/exported/web_document.cc
++++ b/third_party/blink/renderer/core/exported/web_document.cc
+@@ -46,6 +46,7 @@
+ #include "third_party/blink/public/web/web_form_element.h"
+ #include "third_party/blink/renderer/core/accessibility/ax_object_cache.h"
+ #include "third_party/blink/renderer/core/css/css_selector_watch.h"
++#include "third_party/blink/renderer/core/css/parser/css_parser_context.h"
+ #include "third_party/blink/renderer/core/css/style_engine.h"
+ #include "third_party/blink/renderer/core/css/style_sheet_contents.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+@@ -76,6 +77,7 @@
+ #include "third_party/blink/renderer/core/script_tools/script_tool_types.h"
+ #include "third_party/blink/renderer/core/speculation_rules/document_speculation_rules.h"
+ #include "third_party/blink/renderer/platform/heap/garbage_collected.h"
++#include "third_party/blink/renderer/platform/heap/persistent.h"
+ #include "third_party/blink/renderer/platform/loader/fetch/resource_fetcher.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ #include "third_party/blink/renderer/platform/weborigin/security_origin.h"
+@@ -301,6 +303,57 @@ WebStyleSheetKey WebDocument::InsertStyleSheet(
+   return injection_key;
+ }
+ 
++namespace {
++
++// The sheet WebDocument::SetSharedStyleSheet() parsed: its contents (and the
++// RuleSet built from them) are used by every document inserting it.
++uint64_t g_shared_style_sheet_id = 0;
++
++Persistent<StyleSheetContents>& SharedStyleSheet() {
++  DEFINE_STATIC_LOCAL(Persistent<StyleSheetContents>, contents, ());
++  return contents;
++}
++
++}  // namespace
++
++// static
++bool WebDocument::HasSharedStyleSheet(uint64_t shared_id) {
++  DCHECK(IsMainThread());
++  return shared_id && shared_id == g_shared_style_sheet_id &&
++         SharedStyleSheet();
++}
++
++// static
++void WebDocument::SetSharedStyleSheet(uint64_t shared_id,
++                                      const WebString& source_code) {
++  DCHECK(IsMainThread());
++  // No document: HTML documents' selector rules (tag names in lower case),
++  // nothing loaded from it, no use counters.
++  auto* context = MakeGarbageCollected<CSSParserContext>(
++      KURL(), /*origin_clean=*/true, TextEncoding(), kHTMLStandardMode,
++      Referrer(), /*is_html_document=*/true,
++      SecureContextMode::kInsecureContext, /*world=*/nullptr,
++      /*use_counter_document=*/nullptr, ResourceFetchRestriction::kNone);
++  auto* contents = MakeGarbageCollected<StyleSheetContents>(context);
++  contents->ParseString(source_code);
++  g_shared_style_sheet_id = shared_id;
++  SharedStyleSheet() = contents;
++}
++
++WebStyleSheetKey WebDocument::InsertSharedStyleSheet(
++    uint64_t shared_id,
++    const WebStyleSheetKey& key,
++    WebCssOrigin origin) {
++  Document* document = Unwrap<Document>();
++  DCHECK(document);
++  DCHECK(!key.IsEmpty());
++  if (!HasSharedStyleSheet(shared_id) || !document->IsHTMLDocument()) {
++    return WebStyleSheetKey();
++  }
++  document->GetStyleEngine().InjectSheet(key, SharedStyleSheet().Get(), origin);
++  return key;
++}
++
+ void WebDocument::RemoveInsertedStyleSheet(const WebStyleSheetKey& key,
+                                            WebCssOrigin origin) {
+   Unwrap<Document>()->GetStyleEngine().RemoveInjectedSheet(key, origin);

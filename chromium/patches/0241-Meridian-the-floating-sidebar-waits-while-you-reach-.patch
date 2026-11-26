@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Mon, 23 Nov 2026 23:56:58 +0400
+Subject: [PATCH 241/297] Meridian: the floating sidebar waits while you reach
+ for the window buttons
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar.mojom         |  3 +++
+ chrome/browser/meridian/sidebar_handler.cc    |  5 +++++
+ chrome/browser/meridian/sidebar_handler.h     |  2 ++
+ .../browser/meridian/sidebar_handler_mac.mm   | 20 +++++++++++++++++++
+ chrome/browser/resources/webui_browser/app.ts | 18 ++++++++++++++---
+ .../webui_browser/meridian/sidebar.ts         |  4 ++++
+ 6 files changed, 49 insertions(+), 3 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index e75d384ea1..a2f8e3ba8d 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -747,6 +747,9 @@ interface SidebarHandler {
+   // Asks Claude Desktop to quit (it asks about unsaved work itself) and opens
+   // it again; `message` says what happened.
+   RestartClaudeDesktop() => (bool ok, string message);
++  // The pointer is on the window's close, minimize or zoom button, which
++  // the page can't see (macOS).
++  IsPointerOverWindowControls() => (bool over);
+   FinishOnboarding();
+   IsDefaultBrowser() => (bool is_default);
+   // macOS asks the person to confirm.
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 90d7ea2b36..bfec765409 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -3700,6 +3700,11 @@ void SidebarHandler::ResetItemToHome(const std::string& item_id) {
+ #if !BUILDFLAG(IS_MAC)
+ void SidebarHandler::SetWindowControlsVisible(bool visible) {}
+ 
++void SidebarHandler::IsPointerOverWindowControls(
++    IsPointerOverWindowControlsCallback callback) {
++  std::move(callback).Run(false);
++}
++
+ void SidebarHandler::SwitchKeyboardLayout(const std::string& language) {}
+ 
+ void SidebarHandler::TestWindowState(TestWindowStateCallback callback) {
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 59e12ca2a9..5e5aa38ec7 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -231,6 +231,8 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void AllowAiProvider(const std::string& id) override;
+   void GrantAgentAccess() override;
+   void RestartClaudeDesktop(RestartClaudeDesktopCallback callback) override;
++  void IsPointerOverWindowControls(
++      IsPointerOverWindowControlsCallback callback) override;
+   void HasAiKey(HasAiKeyCallback callback) override;
+   void SetAiKey(const std::string& key, SetAiKeyCallback callback) override;
+   void RemoveAiKey() override;
+diff --git a/chrome/browser/meridian/sidebar_handler_mac.mm b/chrome/browser/meridian/sidebar_handler_mac.mm
+index bcdc3cd847..f49e8ce8a3 100644
+--- a/chrome/browser/meridian/sidebar_handler_mac.mm
++++ b/chrome/browser/meridian/sidebar_handler_mac.mm
+@@ -115,6 +115,26 @@ void SidebarHandler::SetWindowControlsVisible(bool visible) {
+   }
+ }
+ 
++void SidebarHandler::IsPointerOverWindowControls(
++    IsPointerOverWindowControlsCallback callback) {
++  NSWindow* window =
++      browser_->GetWindow()->GetNativeWindow().GetNativeNSWindow();
++  bool over = false;
++  const NSPoint mouse = NSEvent.mouseLocation;
++  for (NSWindowButton kind :
++       {NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton}) {
++    NSButton* button = [window standardWindowButton:kind];
++    if (!button || button.hiddenOrHasHiddenAncestor) {
++      continue;
++    }
++    const NSRect in_window = [button convertRect:button.bounds toView:nil];
++    // A little around them, and the gaps between them.
++    over |= NSPointInRect(
++        mouse, NSInsetRect([window convertRectToScreen:in_window], -6, -6));
++  }
++  std::move(callback).Run(over);
++}
++
+ void SidebarHandler::TestWindowState(TestWindowStateCallback callback) {
+   NSWindow* window =
+       browser_->GetWindow()->GetNativeWindow().GetNativeNSWindow();
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index d938cbf444..6d94bb66bd 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -671,12 +671,14 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   protected onEdgeHotzoneMouseenter_() {
+     if (this.sidebarHidden_) {
+       clearTimeout(this.peekCloseTimer_);
++      this.peekCloseTimer_ = 0;
+       this.sidebarPeek_ = true;
+     }
+   }
+ 
+   protected onSidebarMouseenter_() {
+     clearTimeout(this.peekCloseTimer_);
++    this.peekCloseTimer_ = 0;
+   }
+ 
+   protected onSidebarMouseleave_() {
+@@ -696,14 +698,24 @@ export class WebuiBrowserAppElement extends CrLitElement {
+ 
+   private closePeekSoon_() {
+     clearTimeout(this.peekCloseTimer_);
+-    this.peekCloseTimer_ = setTimeout(() => {
+-      if (this.$.tabstrip.menuOpen()) {
+-        this.closePeekSoon_();
++    const timer = setTimeout(async () => {
++      // On the window's buttons the page hears nothing, but the pointer is
++      // still on its way to use them.
++      if (this.$.tabstrip.menuOpen() ||
++          await this.$.tabstrip.pointerOverWindowControls()) {
++        // (Unless it came back to the sidebar meanwhile.)
++        if (this.peekCloseTimer_ === timer) {
++          this.closePeekSoon_();
++        }
++        return;
++      }
++      if (this.peekCloseTimer_ !== timer) {
+         return;
+       }
+       this.closeSiteControl_();
+       this.sidebarPeek_ = false;
+     }, 450);
++    this.peekCloseTimer_ = timer;
+   }
+ 
+   // Meridian split view: the content region shows the active tab's split.
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index a51154c1c6..a2859e0789 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -1180,6 +1180,10 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.tabStripService_.activateTab(tabId);
+   }
+ 
++  async pointerOverWindowControls(): Promise<boolean> {
++    return (await this.handler_.isPointerOverWindowControls()).over;
++  }
++
+   setWindowControlsVisible(visible: boolean) {
+     this.handler_.setWindowControlsVisible(visible);
+   }

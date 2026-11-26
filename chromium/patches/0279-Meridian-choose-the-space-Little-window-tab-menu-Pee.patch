@@ -1,0 +1,755 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 11:51:24 +0400
+Subject: [PATCH 279/297] Meridian: choose the space (Little window, tab menu,
+ Peek)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+As in Arc, a page can go to any space:
+- Little window: one split button, "Open in <Space>" (the space it is
+  in) and a ▾ with every space; picking one opens the page there in the
+  main window (with that space's profile). Replaces the separate space
+  button and "Open in Meridian".
+- A tab's menu (one tab or several): "Open in Space ▸" puts a copy in
+  that space and keeps this one, with a toast; "Move to Space ▸" as
+  before.
+- Peek: "Open as Tab" gets a ▾ (when there are other spaces) to open it
+  as a tab in another space, which comes up with it.
+The menus take the keyboard: ↓ on the ▾ opens them, arrows move,
+Escape goes back to the ▾. New mojom (appended): OpenUrlInSpace,
+MoveTabToSpaceAndShow.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar.mojom         |   8 ++
+ chrome/browser/meridian/sidebar_handler.cc    |  51 +++++++-
+ chrome/browser/meridian/sidebar_handler.h     |   9 ++
+ .../browser/resources/webui_browser/app.css   |  88 +++++++++-----
+ .../resources/webui_browser/app.html.ts       |  58 ++++++---
+ chrome/browser/resources/webui_browser/app.ts | 111 ++++++++++++++++--
+ .../webui_browser/content_region.css          |  29 +++++
+ .../resources/webui_browser/content_region.ts |  59 +++++++++-
+ .../webui_browser/meridian/sidebar.ts         |  22 +++-
+ 9 files changed, 372 insertions(+), 63 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index ebd3e27b07..4c621aa27c 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -953,4 +953,12 @@ interface SidebarHandler {
+   // https with a valid certificate, quickly), else the first. Nothing is
+   // sent but the request itself: no cookies.
+   FirstReachableUrl(array<url.mojom.Url> urls) => (url.mojom.Url url);
++
++  // "Open in Space ▸" (a tab's menu): a copy of `url` in `space_id` (with its
++  // profile), the tab here stays. `show`: that space comes up with it.
++  OpenUrlInSpace(string space_id, url.mojom.Url url, bool show);
++  // A Peek's "Open as Tab ▾" in another space: the page becomes a tab there
++  // (reopened if the space has another profile) and that space comes up
++  // with it.
++  MoveTabToSpaceAndShow(tabs_api.mojom.NodeId tab_id, string space_id);
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index e129d3af33..6f1ca45342 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -3275,10 +3275,53 @@ void SidebarHandler::ActivateSpaceHere(const std::string& space_id) {
+ 
+ void SidebarHandler::MoveTabToSpace(const tabs_api::NodeId& tab_id,
+                                     const std::string& space_id) {
++  MoveTabToSpaceImpl(TabFor(tab_id), space_id);
++}
++
++void SidebarHandler::MoveTabToSpaceAndShow(const tabs_api::NodeId& tab_id,
++                                           const std::string& space_id) {
+   tabs::TabInterface* tab = TabFor(tab_id);
+   if (!tab || !service_->FindSpace(space_id)) {
+     return;
+   }
++  TabData::SetPeek(tab->GetContents(), false);
++  content::WebContents* moved = MoveTabToSpaceImpl(tab, space_id);
++  ActivateSpaceHere(space_id);
++  if (tabs::TabInterface* shown =
++          moved ? tabs::TabInterface::MaybeGetFromContents(moved) : nullptr;
++      shown && model()->GetIndexOfTab(shown) != TabStripModel::kNoTab) {
++    model()->ActivateTab(shown);
++  }
++  ScheduleNotify();
++}
++
++void SidebarHandler::OpenUrlInSpace(const std::string& space_id,
++                                    const GURL& url,
++                                    bool show) {
++  const Space* space = service_->FindSpace(space_id);
++  if (!space || !url.SchemeIsHTTPOrHTTPS()) {
++    return;
++  }
++  content::WebContents* opened =
++      OpenInSpace(browser_, space_id, url, /*active=*/false);
++  if (show) {
++    ActivateSpaceHere(space_id);
++    if (tabs::TabInterface* tab =
++            tabs::TabInterface::MaybeGetFromContents(opened)) {
++      model()->ActivateTab(tab);
++    }
++  } else if (page_.is_connected()) {
++    page_->ShowToast("Opened in " + space->name);
++  }
++  ScheduleNotify();
++}
++
++content::WebContents* SidebarHandler::MoveTabToSpaceImpl(
++    tabs::TabInterface* tab,
++    const std::string& space_id) {
++  if (!tab || !service_->FindSpace(space_id)) {
++    return nullptr;
++  }
+   const TabData* data = TabData::Get(tab->GetContents());
+   std::string item_id = data ? data->item_id() : std::string();
+   // A tab leaving the space of its pinned item is no longer that item's tab.
+@@ -3292,13 +3335,15 @@ void SidebarHandler::MoveTabToSpace(const tabs_api::NodeId& tab_id,
+       HoldsSpaceTabs(browser_)) {
+     // A page can't change profiles: it reopens there (signed out, maybe).
+     content::WebContents* old = tab->GetContents();
+-    OpenInSpace(browser_, space_id, old->GetLastCommittedURL(),
+-                tab->IsActivated(), item_id);
++    content::WebContents* reopened =
++        OpenInSpace(browser_, space_id, old->GetLastCommittedURL(),
++                    tab->IsActivated(), item_id);
+     old->ClosePage();
+-    return;
++    return reopened;
+   }
+   TabData::Set(tab->GetContents(), space_id, item_id);
+   ScheduleNotify();
++  return tab->GetContents();
+ }
+ 
+ void SidebarHandler::MoveTodayTab(const tabs_api::NodeId& tab_id,
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 81851dd3b1..95ce8a45f8 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -320,6 +320,11 @@ class SidebarHandler : public mojom::SidebarHandler,
+                      AddPinnedLinkCallback callback) override;
+   void FirstReachableUrl(const std::vector<GURL>& urls,
+                          FirstReachableUrlCallback callback) override;
++  void OpenUrlInSpace(const std::string& space_id,
++                      const GURL& url,
++                      bool show) override;
++  void MoveTabToSpaceAndShow(const tabs_api::NodeId& tab_id,
++                             const std::string& space_id) override;
+   void ShareTabInstead(const tabs_api::NodeId& tab_id) override;
+   void CanShareTabInstead(const tabs_api::NodeId& tab_id,
+                           CanShareTabInsteadCallback callback) override;
+@@ -412,6 +417,10 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void OnArcExtensionsRead(bool again, std::vector<ArcExtension> found);
+   // The profile of the space shown.
+   Profile* ActiveSpaceProfile();
++  // MoveTabToSpace: the page in `space_id` afterwards (a new one when it had
++  // to reopen with that space's profile), or null.
++  content::WebContents* MoveTabToSpaceImpl(tabs::TabInterface* tab,
++                                           const std::string& space_id);
+   // Mission Control's snapshot with each session's space and the spaces, as
+   // JSON for the page.
+   std::string MissionJson(base::DictValue snapshot);
+diff --git a/chrome/browser/resources/webui_browser/app.css b/chrome/browser/resources/webui_browser/app.css
+index 9c27233c7d..28046f5585 100644
+--- a/chrome/browser/resources/webui_browser/app.css
++++ b/chrome/browser/resources/webui_browser/app.css
+@@ -594,29 +594,58 @@ cr-icon-button[hidden] {
+   color: var(--meridian-text-muted);
+ }
+ 
+-#littleSpace {
++/* "Open in <Space>" and its ▾: one button in two parts. */
++#littleOpen {
++  display: flex;
++  min-width: 0;
++  max-width: 50%;
++  gap: 1px;
++  app-region: no-drag;
++  -webkit-app-region: no-drag;
++}
++
++#littleOpen > button {
+   display: flex;
+   align-items: center;
+   gap: 6px;
+-  max-width: 40%;
+   font: inherit;
+   font-size: 12px;
+   font-weight: 550;
+   color: var(--meridian-text);
+-  padding: 4px 8px;
++  padding: 4px 10px;
+   border: 0;
+   border-radius: 7px;
+-  background: none;
+-  app-region: no-drag;
+-  -webkit-app-region: no-drag;
++  background: color-mix(in srgb, var(--meridian-row-active) 80%, transparent);
++}
++
++#littleOpen > #openInMeridian {
++  min-width: 0;
++}
++
++#littleOpen > #openInMeridian:has(+ .more) {
++  border-start-end-radius: 0;
++  border-end-end-radius: 0;
++}
++
++#littleOpen > .more {
++  flex: none;
++  padding: 4px 6px;
++  border-start-start-radius: 0;
++  border-end-start-radius: 0;
++}
++
++#littleOpen > button:hover,
++#littleOpen > .more.open {
++  background: color-mix(in srgb, var(--meridian-space) 28%, transparent);
+ }
+ 
+-#littleSpace:hover,
+-#littleSpace.open {
+-  background: color-mix(in srgb, var(--meridian-text) 9%, transparent);
++#littleOpen > button:focus-visible,
++.little-space:focus-visible {
++  outline: 2px solid var(--meridian-space);
++  outline-offset: 1px;
+ }
+ 
+-#littleSpace .name,
++#littleOpen .name,
+ .little-space .name {
+   min-width: 0;
+   overflow: hidden;
+@@ -624,7 +653,7 @@ cr-icon-button[hidden] {
+   white-space: nowrap;
+ }
+ 
+-#littleSpace .dot,
++#littleOpen .dot,
+ .little-space .dot {
+   width: 9px;
+   height: 9px;
+@@ -632,10 +661,11 @@ cr-icon-button[hidden] {
+   border-radius: 50%;
+ }
+ 
+-#littleSpaces {
++#littleSpaces,
++.space-menu {
+   position: absolute;
+   top: 34px;
+-  left: 78px;
++  right: var(--meridian-gap);
+   z-index: 40;
+   min-width: 180px;
+   padding: 5px;
+@@ -649,6 +679,21 @@ cr-icon-button[hidden] {
+   -webkit-app-region: no-drag;
+ }
+ 
++.space-menu {
++  position: fixed;
++  right: auto;
++  width: 200px;
++  z-index: 80;
++}
++
++#littleSpaces .menu-title,
++.space-menu .menu-title {
++  padding: 4px 10px 6px;
++  font-size: 11px;
++  font-weight: 600;
++  color: var(--meridian-text-muted);
++}
++
+ .little-space {
+   display: flex;
+   align-items: center;
+@@ -672,23 +717,6 @@ cr-icon-button[hidden] {
+   background: color-mix(in srgb, var(--meridian-space) 24%, transparent);
+ }
+ 
+-#openInMeridian {
+-  font: inherit;
+-  font-size: 12px;
+-  font-weight: 500;
+-  color: var(--meridian-text);
+-  padding: 4px 10px;
+-  border: 0;
+-  border-radius: 7px;
+-  background: color-mix(in srgb, var(--meridian-row-active) 80%, transparent);
+-  app-region: no-drag;
+-  -webkit-app-region: no-drag;
+-}
+-
+-#openInMeridian:hover {
+-  background: color-mix(in srgb, var(--meridian-space) 28%, transparent);
+-}
+-
+ :host([little]) #rootContainer {
+   flex-direction: column;
+ }
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 6f89343a67..d1afe426a4 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -213,25 +213,37 @@ export function getHtml(this: WebuiBrowserAppElement) {
+   <meridian-tidy id="tidy"
+       @meridian-tidy-apply="${this.onMeridianTidyApply_}"></meridian-tidy>
+   <div id="littleBar" ?hidden="${!this.little_}">
+-    ${this.littleSpace_() ? html`
+-      <button id="littleSpace" class="${this.littleMenu_ ? 'open' : ''}"
+-          title="The space this page opens in"
+-          @click="${this.onLittleSpaceClick_}">
+-        ${this.littleSpace_()!.icon ? html`
+-          <span class="emoji">${this.littleSpace_()!.icon}</span>` : html`
+-          <span class="dot" style="background:${this.littleSpace_()!.color}">
+-          </span>`}
+-        <span class="name">${this.littleSpace_()!.name}</span>
+-        ${icon('chevronDown', 12)}
+-      </button>` : ''}
+     <span class="host"><bdi dir="ltr">${this.urlHost_}</bdi></span>
+-    <button id="openInMeridian" title="Open in Meridian"
+-        @click="${this.onOpenInMeridianClick_}">Open in Meridian</button>
++    <div class="split-button" id="littleOpen">
++      <button id="openInMeridian"
++          title="${this.littleSpace_() ?
++              `Open in Meridian, in ${this.littleSpace_()!.name}` :
++              'Open in Meridian'}"
++          @click="${this.onOpenInMeridianClick_}">
++        ${this.littleSpace_() ? html`
++          ${this.littleSpace_()!.icon ? html`
++            <span class="emoji">${this.littleSpace_()!.icon}</span>` : html`
++            <span class="dot" style="background:${this.littleSpace_()!.color}">
++            </span>`}
++          <span class="name">Open in ${this.littleSpace_()!.name}</span>` :
++          html`<span class="name">Open in Meridian</span>`}
++      </button>
++      ${this.littleSpaces_.length > 1 ? html`
++        <button id="littleSpace" class="more ${this.littleMenu_ ? 'open' : ''}"
++            aria-label="Open in another space" title="Open in another space"
++            aria-haspopup="menu" aria-expanded="${this.littleMenu_}"
++            @click="${this.onLittleSpaceClick_}"
++            @keydown="${this.onLittleSpaceKeydown_}">
++          ${icon('chevronDown', 12)}
++        </button>` : ''}
++    </div>
+     ${this.littleMenu_ ? html`
+-      <div id="littleSpaces" role="menu">
++      <div id="littleSpaces" role="menu" aria-label="Open in space"
++          @keydown="${this.onSpaceMenuKeydown_}">
++        <div class="menu-title">Open in</div>
+         ${this.littleSpaces_.map(s => html`
+-          <button class="little-space" role="menuitemradio"
+-              aria-checked="${s.id === this.littleSpaceId_}" data-space="${s.id}"
++          <button class="little-space" role="menuitem" data-space="${s.id}"
++              aria-current="${s.id === this.littleSpaceId_}"
+               @click="${this.onLittleSpacePickClick_}">
+             ${s.icon ? html`<span class="emoji">${s.icon}</span>` : html`
+               <span class="dot" style="background:${s.color}"></span>`}
+@@ -240,6 +252,20 @@ export function getHtml(this: WebuiBrowserAppElement) {
+           </button>`)}
+       </div>` : ''}
+   </div>
++  ${this.peekMenu_ ? html`
++    <div id="peekSpaces" class="space-menu" role="menu"
++        aria-label="Open as tab in space"
++        style="left:${this.peekMenu_.x}px;top:${this.peekMenu_.y}px"
++        @keydown="${this.onSpaceMenuKeydown_}">
++      <div class="menu-title">Open as tab in</div>
++      ${this.peekMenu_.spaces.map(s => html`
++        <button class="little-space" role="menuitem" data-space="${s.id}"
++            @click="${this.onPeekSpacePickClick_}">
++          ${s.icon ? html`<span class="emoji">${s.icon}</span>` : html`
++            <span class="dot" style="background:${s.color}"></span>`}
++          <span class="name">${s.name}</span>
++        </button>`)}
++    </div>` : ''}
+   <div id="main">
+     <content-region id="contentRegion"
+         ?showing-side-panel="${this.showingSidePanel_}"
+diff --git a/chrome/browser/resources/webui_browser/app.ts b/chrome/browser/resources/webui_browser/app.ts
+index dc4f0b870e..77023f3d95 100644
+--- a/chrome/browser/resources/webui_browser/app.ts
++++ b/chrome/browser/resources/webui_browser/app.ts
+@@ -202,6 +202,7 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       littleSpaces_: {state: true, type: Array},
+       littleSpaceId_: {state: true, type: String},
+       littleMenu_: {state: true, type: Boolean},
++      peekMenu_: {state: true, type: Object},
+       sidebarRight_: {type: Boolean, reflect: true, attribute: 'sidebar-right'},
+       private_: {type: Boolean, reflect: true, attribute: 'private'},
+       showHome_: {state: true, type: Boolean},
+@@ -260,6 +261,9 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   protected accessor littleSpaces_: Space[] = [];
+   protected accessor littleSpaceId_: string = '';
+   protected accessor littleMenu_: boolean = false;
++  // A Peek's "Open as Tab ▾" menu: the other spaces, under the ▾.
++  protected accessor peekMenu_:
++      {tab: string, x: number, y: number, spaces: Space[]}|null = null;
+   protected accessor sidebarRight_: boolean = false;
+   protected accessor private_: boolean = false;
+   // The active tab is a new tab: the home page shows instead.
+@@ -787,7 +791,8 @@ export class WebuiBrowserAppElement extends CrLitElement {
+   }
+ 
+   protected onPeekAction_(
+-      e: CustomEvent<{action: string, tab: string, under: string}>) {
++      e: CustomEvent<{action: string, tab: string, under: string,
++                      anchor?: DOMRect}>) {
+     const {action, tab, under} = e.detail;
+     if (action === 'close') {
+       this.$.tabstrip.closeTab(tab);
+@@ -797,6 +802,22 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     } else if (action === 'split') {
+       this.$.tabstrip.expandPeek(tab);
+       this.$.tabstrip.splitActiveWith(under);
++    } else if (action === 'spaces') {
++      if (this.peekMenu_) {
++        this.peekMenu_ = null;
++        return;
++      }
++      const at = e.detail.anchor!;
++      this.peekMenu_ = {
++        tab,
++        // Under the ▾, its right edge on the button's (inside the window).
++        x: Math.max(8, at.right - 200),
++        y: at.bottom + 4,
++        spaces: this.peekSpaces_(),
++      };
++      this.closeOnClickOutside_(['peekSpaces', 'peekMore'],
++                                () => this.peekMenu_ = null);
++      this.focusSpaceMenu_('peekSpaces');
+     }
+   }
+ 
+@@ -808,7 +829,12 @@ export class WebuiBrowserAppElement extends CrLitElement {
+                  ratio: split.ratio} : null);
+     const peek = this.peeks_.find(p => p.tab === this.activeTabId_);
+     this.$.contentRegion.setPeek(
+-        peek ? {tab: peek.tab, under: peek.opener, url: this.url_} : null);
++        peek ? {tab: peek.tab, under: peek.opener, url: this.url_,
++                spaces: !this.little_ && this.peekSpaces_().length > 0} :
++               null);
++    if (!peek) {
++      this.peekMenu_ = null;
++    }
+   }
+ 
+   protected onSplitRatioChanged_(e: CustomEvent<{id: string, ratio: number}>) {
+@@ -1098,21 +1124,70 @@ export class WebuiBrowserAppElement extends CrLitElement {
+     return this.littleSpaces_.find(s => s.id === this.littleSpaceId_);
+   }
+ 
++  // A space menu (the Little window's or a Peek's): any click outside it
++  // closes it.
++  private closeOnClickOutside_(ids: string[], close: () => void) {
++    window.addEventListener('pointerdown', (ev: Event) => {
++      if (!ev.composedPath().some(
++              el => el instanceof HTMLElement && ids.includes(el.id))) {
++        close();
++      }
++    }, {once: true, capture: true});
++  }
++
++  // Focuses the menu's first (or checked) space once it's drawn.
++  private async focusSpaceMenu_(id: string) {
++    await this.updateComplete;
++    const menu = this.shadowRoot.getElementById(id);
++    (menu?.querySelector<HTMLElement>('[aria-current="true"]') ||
++     menu?.querySelector<HTMLElement>('.little-space'))?.focus();
++  }
++
+   protected onLittleSpaceClick_(e: Event) {
+     e.stopPropagation();
+     this.littleMenu_ = !this.littleMenu_;
+     if (this.littleMenu_) {
+-      // Any other click closes it.
+-      window.addEventListener('pointerdown', (ev: Event) => {
+-        if (!ev.composedPath().some(
+-                el => el instanceof HTMLElement &&
+-                    (el.id === 'littleSpaces' || el.id === 'littleSpace'))) {
+-          this.littleMenu_ = false;
+-        }
+-      }, {once: true, capture: true});
++      this.closeOnClickOutside_(['littleSpaces', 'littleSpace'],
++                                () => this.littleMenu_ = false);
++      this.focusSpaceMenu_('littleSpaces');
++    }
++  }
++
++  protected onLittleSpaceKeydown_(e: KeyboardEvent) {
++    if (e.key === 'ArrowDown' && !this.littleMenu_) {
++      e.preventDefault();
++      this.onLittleSpaceClick_(e);
+     }
+   }
+ 
++  // Arrows move between the spaces, Escape (or Tab) closes the menu.
++  protected onSpaceMenuKeydown_(e: KeyboardEvent) {
++    const menu = e.currentTarget as HTMLElement;
++    const items = [...menu.querySelectorAll<HTMLElement>('.little-space')];
++    const at = items.indexOf(this.shadowRoot.activeElement as HTMLElement);
++    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
++      e.preventDefault();
++      const step = e.key === 'ArrowDown' ? 1 : -1;
++      items[(at + step + items.length) % items.length]?.focus();
++    } else if (e.key === 'Home' || e.key === 'End') {
++      e.preventDefault();
++      items[e.key === 'Home' ? 0 : items.length - 1]?.focus();
++    } else if (e.key === 'Escape' || e.key === 'Tab') {
++      if (e.key === 'Escape') {
++        e.preventDefault();
++      }
++      const little = menu.id === 'littleSpaces';
++      this.littleMenu_ = false;
++      this.peekMenu_ = null;
++      if (little) {
++        this.shadowRoot.getElementById('littleSpace')?.focus();
++      } else {
++        this.$.contentRegion.focusPeekMore();
++      }
++    }
++  }
++
++  // Open in another space: the page goes there in the main window.
+   protected onLittleSpacePickClick_(e: Event) {
+     const id = (e.currentTarget as HTMLElement).dataset['space']!;
+     this.littleMenu_ = false;
+@@ -1120,6 +1195,22 @@ export class WebuiBrowserAppElement extends CrLitElement {
+       this.littleSpaceId_ = id;
+       this.$.tabstrip.setLittleSpace(id);
+     }
++    this.$.tabstrip.openInMeridian();
++  }
++
++  protected onPeekSpacePickClick_(e: Event) {
++    const id = (e.currentTarget as HTMLElement).dataset['space']!;
++    const menu = this.peekMenu_;
++    this.peekMenu_ = null;
++    if (menu) {
++      this.$.tabstrip.moveTabToSpaceAndShow(menu.tab, id);
++    }
++  }
++
++  // The other spaces a peeked page can open in.
++  private peekSpaces_(): Space[] {
++    const active = this.$.tabstrip.activeSpace();
++    return this.$.tabstrip.spaces().filter(sp => sp.id !== active?.id);
+   }
+ 
+   protected onOpenInMeridianClick_() {
+diff --git a/chrome/browser/resources/webui_browser/content_region.css b/chrome/browser/resources/webui_browser/content_region.css
+index dcb729d199..f57079e60e 100644
+--- a/chrome/browser/resources/webui_browser/content_region.css
++++ b/chrome/browser/resources/webui_browser/content_region.css
+@@ -183,3 +183,32 @@ cr-tab-webview.active {
+ #peekBar button:hover {
+   background: #fff;
+ }
++
++/* "Open as Tab" with a ▾ for the space: one button in two parts. */
++#peekBar .split-button {
++  display: inline-flex;
++  gap: 1px;
++}
++
++#peekBar .split-button.with-more > button[data-action='expand'] {
++  border-start-end-radius: 0;
++  border-end-end-radius: 0;
++}
++
++#peekBar .split-button > .more {
++  display: inline-grid;
++  place-items: center;
++  width: 24px;
++  padding: 0;
++  border-start-start-radius: 0;
++  border-end-start-radius: 0;
++}
++
++#peekBar .split-button > .more[hidden] {
++  display: none;
++}
++
++#peekBar button:focus-visible {
++  outline: 2px solid var(--meridian-focus, #6b5cff);
++  outline-offset: 1px;
++}
+diff --git a/chrome/browser/resources/webui_browser/content_region.ts b/chrome/browser/resources/webui_browser/content_region.ts
+index 28504e059a..f4cf56b8e2 100644
+--- a/chrome/browser/resources/webui_browser/content_region.ts
++++ b/chrome/browser/resources/webui_browser/content_region.ts
+@@ -12,6 +12,23 @@ import {getCss} from './content_region.css.js';
+ import type {DevtoolsLayout} from './browser.mojom-webui.js';
+ import type {TabWebviewElement} from './webview.js';
+ 
++// Meridian's ▾ (icons.ts chevronDown), built without a template.
++function chevron(): SVGSVGElement {
++  const ns = 'http://www.w3.org/2000/svg';
++  const svg = document.createElementNS(ns, 'svg');
++  for (const [k, v] of Object.entries({
++         width: '12', height: '12', viewBox: '0 0 24 24', fill: 'none',
++         stroke: 'currentColor', 'stroke-width': '2',
++         'stroke-linecap': 'round', 'stroke-linejoin': 'round',
++         'aria-hidden': 'true'})) {
++    svg.setAttribute(k, v);
++  }
++  const path = document.createElementNS(ns, 'path');
++  path.setAttribute('d', 'M7 9.5l5 5 5-5');
++  svg.appendChild(path);
++  return svg;
++}
++
+ export class ContentRegionElement extends CrLitElement {
+   static get is() {
+     return 'content-region';
+@@ -141,7 +158,9 @@ export class ContentRegionElement extends CrLitElement {
+   private peekHost_: HTMLElement|null = null;
+   private peek_: {tab: string, under: string}|null = null;
+ 
+-  setPeek(peek: {tab: string, under: string, url: string}|null) {
++  // `spaces`: there are other spaces, so "Open as Tab" gets a ▾ to pick one.
++  setPeek(peek: {tab: string, under: string, url: string, spaces?: boolean}|
++          null) {
+     for (const webview of this.webviews.values()) {
+       webview.classList.remove('peek-card', 'peek-under');
+     }
+@@ -170,10 +189,38 @@ export class ContentRegionElement extends CrLitElement {
+         button.dataset['action'] = action;
+         button.textContent = label!;
+         button.addEventListener('click', () => this.firePeek_(action!));
++        if (action === 'expand') {
++          // A split button: the ▾ opens the spaces to open it in.
++          const group = document.createElement('span');
++          group.className = 'split-button';
++          group.id = 'peekOpen';
++          const more = document.createElement('button');
++          more.id = 'peekMore';
++          more.className = 'more';
++          more.dataset['action'] = 'spaces';
++          more.title = 'Open as a tab in another space';
++          more.setAttribute('aria-label', 'Open as a tab in another space');
++          more.setAttribute('aria-haspopup', 'menu');
++          more.appendChild(chevron());
++          more.addEventListener('click', () => this.firePeek_('spaces', more));
++          more.addEventListener('keydown', (e: KeyboardEvent) => {
++            if (e.key === 'ArrowDown') {
++              e.preventDefault();
++              this.firePeek_('spaces', more);
++            }
++          });
++          group.append(button, more);
++          bar.appendChild(group);
++          continue;
++        }
+         bar.appendChild(button);
+       }
+       this.peekLayer_.append(backdrop, bar);
+     }
++    this.peekLayer_.querySelector<HTMLElement>('#peekMore')!.hidden =
++        !peek.spaces;
++    this.peekLayer_.querySelector('#peekOpen')!.classList.toggle(
++        'with-more', !!peek.spaces);
+     try {
+       const bdi = document.createElement('bdi');
+       bdi.dir = 'ltr';
+@@ -190,13 +237,19 @@ export class ContentRegionElement extends CrLitElement {
+     }
+   }
+ 
+-  private firePeek_(action: string) {
++  private firePeek_(action: string, anchor?: HTMLElement) {
+     if (this.peek_) {
+       this.fire('peek-action', {action, tab: this.peek_.tab,
+-                                under: this.peek_.under});
++                                under: this.peek_.under,
++                                anchor: anchor?.getBoundingClientRect()});
+     }
+   }
+ 
++  // Back to the ▾ when its menu closes from the keyboard.
++  focusPeekMore() {
++    this.shadowRoot.querySelector<HTMLElement>('#peekMore')?.focus();
++  }
++
+   // A click into the other half of a split makes its tab the active one.
+   private onWebviewFocusIn_ = (e: Event) => {
+     const webview = e.currentTarget as TabWebviewElement;
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index e74506dea8..feac27314c 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -1435,6 +1435,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+     this.handler_.openInMeridian();
+   }
+ 
++  // A Peek's "Open as Tab ▾": the page as a tab in `spaceId`, shown there.
++  moveTabToSpaceAndShow(tabId: NodeId, spaceId: string) {
++    this.handler_.moveTabToSpaceAndShow(tabId, spaceId);
++  }
++
+   setLittleSpace(spaceId: string) {
+     this.handler_.setLittleSpace(spaceId);
+   }
+@@ -2074,7 +2079,7 @@ export class MeridianSidebarElement extends CrLitElement implements
+ 
+   // --------------------------------------------------------------- menus
+ 
+-  // The other spaces, as a "Move to Space" submenu.
++  // The other spaces, as a "Move to Space" (or "Open in Space") submenu.
+   private moveToSpaceMenu_(move: (spaceId: string) => void): MenuEntry[] {
+     const active = this.activeSpace();
+     return (this.state_?.spaces || []).filter(s => s.id !== active?.id)
+@@ -2095,6 +2100,11 @@ export class MeridianSidebarElement extends CrLitElement implements
+     }
+     this.clearSelection();
+     const move = this.moveToSpaceMenu_(id => this.handler_.moveTabToSpace(tab.id, id));
++    // A copy there, this one stays (web pages only).
++    const copy = /^https?:/.test(tab.url) ?
++        this.moveToSpaceMenu_(
++            id => this.handler_.openUrlInSpace(id, tab.url, false)) :
++        [];
+     const at = this.today_.findIndex(t => t.id === tab.id);
+     const below = at < 0 ? [] : this.today_.slice(at + 1).map(t => t.id);
+     this.openMenu_(e, [
+@@ -2139,6 +2149,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+         action: () => this.renaming_ = 'tab:' + tab.id,
+       },
+       {label: 'Move to Space', icon: 'moveTo', enabled: move.length > 0, submenu: move},
++      {label: 'Open in Space', icon: 'duplicate', enabled: copy.length > 0,
++       submenu: copy},
+       {
+         label: 'Close Tab',
+         icon: 'x',
+@@ -2195,6 +2207,12 @@ export class MeridianSidebarElement extends CrLitElement implements
+       group.forEach(t => this.handler_.moveTabToSpace(t, id));
+       done();
+     });
++    const urls = group.map(t => this.tabs_.get(t)?.url || '')
++                     .filter(u => /^https?:/.test(u));
++    const copy = urls.length ? this.moveToSpaceMenu_(id => {
++      urls.forEach(u => this.handler_.openUrlInSpace(id, u, false));
++      done();
++    }) : [];
+     return [
+       {label: `${n} Tabs`, header: true},
+       {
+@@ -2217,6 +2235,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+       {label: 'Add to Folder', icon: 'folder', submenu: folders},
+       {label: 'Move to Space', icon: 'moveTo', enabled: move.length > 0,
+        submenu: move},
++      {label: 'Open in Space', icon: 'duplicate', enabled: copy.length > 0,
++       submenu: copy},
+       // Closed Today tabs go to the Archive, as in Arc.
+       {
+         label: `Archive ${n} Tabs`,

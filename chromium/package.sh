@@ -99,6 +99,8 @@ rm -rf "$OUT/stage"
 # Notarized (Developer ID only): MERIDIAN_NOTARY_PROFILE names a profile saved with
 #   xcrun notarytool store-credentials <name> --apple-id … --team-id … --password <app-specific>
 if [ -n "$TEAM" ] && [ -n "${MERIDIAN_NOTARY_PROFILE:-}" ]; then
+  # The disk image carries its own signature, so Gatekeeper checks it before mounting.
+  codesign --force --timestamp -s "$ID" "$OUT/$NAME.dmg"
   echo "Notarizing (a few minutes)…"
   xcrun notarytool submit "$OUT/$NAME.dmg" --keychain-profile "$MERIDIAN_NOTARY_PROFILE" --wait
   xcrun stapler staple "$OUT/$NAME.dmg"
@@ -133,36 +135,10 @@ fi
 
 # The checksums, signed with Meridian's release key (Ed25519; the private key never enters the repo).
 # The updater only trusts SHA256SUMS.txt under this signature, checked with the public key built
-# into it (kReleaseKey in update_check.h). The first run creates the key: back it up, since releases
+# into it (kReleaseKey in update_check.h). Keep a backup of the key, since releases
 # signed with any other key are refused by every installed Meridian.
-# MERIDIAN_RELEASE_KEY: another key file.
-KEY_FILE="${MERIDIAN_RELEASE_KEY:-$HOME/.config/meridian/release-ed25519.pem}" \
-SUMS="$OUT/SHA256SUMS.txt" HEADER="$DIR/src/chrome/browser/meridian/update_check.h" \
-node --input-type=module -e '
-import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
-const { KEY_FILE, SUMS, HEADER } = process.env;
-if (!fs.existsSync(KEY_FILE)) {
-  fs.mkdirSync(path.dirname(KEY_FILE), { recursive: true, mode: 0o700 });
-  const { privateKey } = crypto.generateKeyPairSync("ed25519");
-  fs.writeFileSync(KEY_FILE, privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600, flag: "wx" });
-  console.error(`Created the release key ${KEY_FILE}: back it up.`);
-}
-fs.chmodSync(KEY_FILE, 0o600);
-const key = crypto.createPrivateKey(fs.readFileSync(KEY_FILE));
-const pub = crypto.createPublicKey(key).export({ type: "spki", format: "der" }).subarray(-32);
-// The key built into the updater must be this one, or no installed Meridian takes the release.
-const m = /kReleaseKey = \{([^}]*)\}/.exec(fs.readFileSync(HEADER, "utf8"));
-const built = m ? Buffer.from(m[1].match(/0x[0-9a-f]{2}/gi).map((b) => parseInt(b, 16))) : Buffer.alloc(0);
-if (!built.equals(pub)) {
-  console.error(`kReleaseKey in update_check.h isn’t this key. Its public key: ${pub.toString("base64")}`);
-  console.error([...pub].map((b) => "0x" + b.toString(16).padStart(2, "0")).join(", "));
-  process.exit(1);
-}
-const sig = crypto.sign(null, fs.readFileSync(SUMS), key);
-fs.writeFileSync(`${SUMS}.sig`, sig.toString("base64") + "\n");
-'
+# The key is in the Keychain: macOS asks each time. Press Allow, not Always Allow.
+node "$HERE/tools/release_sign.mjs" "$OUT/SHA256SUMS.txt" "$DIR/src/chrome/browser/meridian/update_check.h"
 # The site's download button links to releases/latest/download/Meridian-mac-<arch>.dmg: the same
 # disk image under a name without the version (upload it too; it isn't in SHA256SUMS.txt).
 cp "$OUT/$NAME.dmg" "$OUT/Meridian-mac-$ARCH.dmg"

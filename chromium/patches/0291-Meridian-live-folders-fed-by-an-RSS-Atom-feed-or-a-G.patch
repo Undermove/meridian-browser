@@ -1,0 +1,915 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 14:12:25 +0400
+Subject: [PATCH 291/297] Meridian: live folders fed by an RSS/Atom feed or a
+ GitHub search
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+"Make Live…" in a pinned folder's menu takes an address in place of its
+name: an RSS (2.0/1.0) or Atom feed, or a GitHub search page (fetched
+through GitHub's search API). The folder then shows the first 10 items as
+pinned rows, refreshed every 30 minutes while a window is open (links kept
+by URL keep their ids, so an open tab stays theirs). A small bolt marks
+it; "Change Live Address…" and "Stop Live Updates" (the items stay). An
+address that gives no items is refused and the folder stays as it was.
+No cookies are sent; XML goes through the data decoder. Item.live_url and
+SidebarHandler.SetFolderLive appended. Test switches:
+--meridian-test-live-folder-seconds, --meridian-test-github-api.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   3 +
+ chrome/browser/meridian/live_folders.cc       | 414 ++++++++++++++++++
+ chrome/browser/meridian/live_folders.h        |  56 +++
+ chrome/browser/meridian/sidebar.mojom         |   7 +
+ chrome/browser/meridian/sidebar_handler.cc    |  38 ++
+ chrome/browser/meridian/sidebar_handler.h     |   3 +
+ chrome/browser/meridian/sidebar_service.cc    |  85 ++++
+ chrome/browser/meridian/sidebar_service.h     |  11 +
+ .../webui_browser/meridian/item.html.ts       |  10 +-
+ .../resources/webui_browser/meridian/item.ts  |   4 +
+ .../resources/webui_browser/meridian/rows.css |   9 +
+ .../webui_browser/meridian/sidebar.ts         |  30 ++
+ 12 files changed, 669 insertions(+), 1 deletion(-)
+ create mode 100644 chrome/browser/meridian/live_folders.cc
+ create mode 100644 chrome/browser/meridian/live_folders.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index d39e12ce11..da462ca2aa 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -407,6 +407,8 @@ source_set("meridian") {
+     "little_window.h",
+     "currency_rates.cc",
+     "currency_rates.h",
++    "live_folders.cc",
++    "live_folders.h",
+     "reachable.cc",
+     "reachable.h",
+     "sidebar_handler.cc",
+@@ -513,6 +515,7 @@ source_set("meridian") {
+     "//components/os_crypt/async/browser",
+     "//components/os_crypt/async/common",
+     "//components/search_engines",
++    "//services/data_decoder/public/cpp",
+     "//services/network/public/cpp",
+     "//components/viz/common",
+     "//components/viz/host",
+diff --git a/chrome/browser/meridian/live_folders.cc b/chrome/browser/meridian/live_folders.cc
+new file mode 100644
+index 0000000000..fbf8cf4ba6
+--- /dev/null
++++ b/chrome/browser/meridian/live_folders.cc
+@@ -0,0 +1,414 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/live_folders.h"
++
++#include <map>
++#include <memory>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/json/json_reader.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/no_destructor.h"
++#include "base/strings/escape.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/timer/timer.h"
++#include "chrome/browser/meridian/sidebar_service.h"
++#include "chrome/browser/meridian/test_switches.h"
++#include "chrome/browser/profiles/profile.h"
++#include "content/public/browser/storage_partition.h"
++#include "net/base/load_flags.h"
++#include "net/base/url_util.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "services/data_decoder/public/cpp/data_decoder.h"
++#include "services/data_decoder/public/cpp/safe_xml_parser.h"
++#include "services/data_decoder/public/mojom/xml_parser.mojom.h"
++#include "services/network/public/cpp/resource_request.h"
++#include "services/network/public/cpp/shared_url_loader_factory.h"
++#include "services/network/public/cpp/simple_url_loader.h"
++
++namespace meridian::live_folders {
++
++namespace {
++
++constexpr net::NetworkTrafficAnnotationTag kAnnotation =
++    net::DefineNetworkTrafficAnnotation("meridian_live_folders", R"(
++      semantics {
++        sender: "Meridian live folders"
++        description: "The feed (RSS or Atom) or GitHub search a pinned "
++          "folder was made live with, for its newest items."
++        trigger: "The person makes a folder live, then every 30 minutes "
++          "while a window is open."
++        data: "None."
++        destination: OTHER
++      }
++      policy {
++        cookies_allowed: NO
++        setting: "Stop Live Updates in the folder's menu."
++        policy_exception_justification: "Not implemented."
++      })");
++
++using Done = base::OnceCallback<void(std::string)>;
++
++// One SidebarService's live folders, while a window shows them.
++struct State {
++  ~State() {
++    for (auto& [id, list] : waiting) {
++      for (Done& done : list) {
++        std::move(done).Run("the window closed");
++      }
++    }
++  }
++  std::map<const void*, raw_ptr<Profile>> owners;
++  base::RepeatingTimer timer;
++  std::map<std::string, std::unique_ptr<network::SimpleURLLoader>> loaders;
++  std::map<std::string, std::vector<Done>> waiting;
++  base::WeakPtrFactory<State> weak{this};
++};
++
++std::map<SidebarService*, std::unique_ptr<State>>& States() {
++  static base::NoDestructor<std::map<SidebarService*, std::unique_ptr<State>>>
++      states;
++  return *states;
++}
++
++base::TimeDelta Interval() {
++  int seconds = 0;
++  if (base::StringToInt(TestSwitchValue("meridian-test-live-folder-seconds"),
++                        &seconds) &&
++      seconds > 0) {
++    return base::Seconds(seconds);
++  }
++  return base::Minutes(30);
++}
++
++std::string LocalName(const base::Value& el) {
++  std::string name;
++  if (!data_decoder::GetXmlElementTagName(el, &name)) {
++    return std::string();
++  }
++  size_t colon = name.rfind(':');
++  return colon == std::string::npos ? name : name.substr(colon + 1);
++}
++
++std::vector<const base::Value*> Children(const base::Value& el,
++                                         std::string_view name) {
++  std::vector<const base::Value*> out;
++  if (const base::ListValue* list = data_decoder::GetXmlElementChildren(el)) {
++    for (const base::Value& child : *list) {
++      if (data_decoder::IsXmlElementOfType(
++              child, data_decoder::mojom::XmlParser::kElementType) &&
++          LocalName(child) == name) {
++        out.push_back(&child);
++      }
++    }
++  }
++  return out;
++}
++
++const base::Value* Child(const base::Value& el, std::string_view name) {
++  std::vector<const base::Value*> all = Children(el, name);
++  return all.empty() ? nullptr : all.front();
++}
++
++std::string Text(const base::Value* el) {
++  std::string out;
++  if (!el) {
++    return out;
++  }
++  if (const base::ListValue* list = data_decoder::GetXmlElementChildren(*el)) {
++    // Every text and CDATA piece (GetXmlElementText gives the first only).
++    for (const base::Value& child : *list) {
++      const base::DictValue* node = child.GetIfDict();
++      const std::string* type =
++          node ? node->FindString(data_decoder::mojom::XmlParser::kTypeKey)
++               : nullptr;
++      if (type && (*type == data_decoder::mojom::XmlParser::kTextNodeType ||
++                   *type == data_decoder::mojom::XmlParser::kCDataNodeType)) {
++        if (const std::string* text =
++                node->FindString(data_decoder::mojom::XmlParser::kTextKey)) {
++          out += *text;
++        }
++      }
++    }
++  }
++  return out;
++}
++
++std::string CleanTitle(const std::string& title) {
++  std::string t = base::CollapseWhitespaceASCII(title, true);
++  return t.size() > 200 ? t.substr(0, 200) : t;
++}
++
++void Finish(SidebarService* service,
++            const std::string& id,
++            std::optional<Links> links) {
++  auto it = States().find(service);
++  if (it == States().end()) {
++    return;
++  }
++  State& state = *it->second;
++  state.loaders.erase(id);
++  std::string error;
++  if (links) {
++    if (links->size() > kMaxItems) {
++      links->resize(kMaxItems);
++    }
++    service->SetLiveItems(id, *links);
++  } else {
++    error =
++        "That address isn't an RSS or Atom feed or a GitHub search, or it "
++        "didn't load.";
++  }
++  std::vector<Done> waiting = std::move(state.waiting[id]);
++  state.waiting.erase(id);
++  for (Done& done : waiting) {
++    std::move(done).Run(error);
++  }
++}
++
++void Refresh(SidebarService* service,
++             const std::string& id,
++             const GURL& url,
++             Done done) {
++  auto it = States().find(service);
++  if (it == States().end() || it->second->owners.empty()) {
++    return std::move(done).Run("no window is open");
++  }
++  State& state = *it->second;
++  state.waiting[id].push_back(std::move(done));
++  if (state.loaders.contains(id)) {
++    return;  // Already on its way.
++  }
++  bool github = false;
++  GURL fetch = FetchUrlFor(url, &github);
++  if (!fetch.SchemeIsHTTPOrHTTPS()) {
++    return Finish(service, id, std::nullopt);
++  }
++  Profile* profile = state.owners.begin()->second;
++  auto request = std::make_unique<network::ResourceRequest>();
++  request->url = fetch;
++  request->credentials_mode = network::mojom::CredentialsMode::kOmit;
++  request->load_flags = net::LOAD_DISABLE_CACHE;
++  if (github) {
++    request->headers.SetHeader("Accept", "application/vnd.github+json");
++  }
++  auto loader =
++      network::SimpleURLLoader::Create(std::move(request), kAnnotation);
++  loader->SetTimeoutDuration(base::Seconds(20));
++  network::SimpleURLLoader* raw = loader.get();
++  state.loaders[id] = std::move(loader);
++  raw->DownloadToString(
++      profile->GetDefaultStoragePartition()
++          ->GetURLLoaderFactoryForBrowserProcess()
++          .get(),
++      base::BindOnce(
++          [](base::WeakPtr<State> state, SidebarService* service,
++             std::string id, GURL base, bool github,
++             std::optional<std::string> body) {
++            if (!state) {
++              return;
++            }
++            if (!body) {
++              return Finish(service, id, std::nullopt);
++            }
++            if (github) {
++              return Finish(service, id, ParseGithub(*body));
++            }
++            data_decoder::DataDecoder::ParseXmlIsolated(
++                *body,
++                data_decoder::mojom::XmlParser::WhitespaceBehavior::
++                    kIgnore,
++                base::BindOnce(
++                    [](base::WeakPtr<State> state, SidebarService* service,
++                       std::string id, GURL base,
++                       data_decoder::DataDecoder::ValueOrError xml) {
++                      if (!state) {
++                        return;
++                      }
++                      Finish(service, id,
++                             xml.has_value() ? ParseFeed(*xml, base)
++                                             : std::nullopt);
++                    },
++                    state, service, id, base));
++          },
++          state.weak.GetWeakPtr(), service, id, fetch, github),
++      1024 * 1024);
++}
++
++void RefreshAll(SidebarService* service) {
++  for (const auto& [id, url] : service->LiveFolderList()) {
++    Refresh(service, id, url, base::DoNothing());
++  }
++}
++
++}  // namespace
++
++void Attach(SidebarService* service, Profile* profile, const void* owner) {
++  std::unique_ptr<State>& state = States()[service];
++  if (!state) {
++    state = std::make_unique<State>();
++    state->timer.Start(FROM_HERE, Interval(),
++                       base::BindRepeating(&RefreshAll, service));
++    // Fresh items soon after the start too.
++    base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(
++            [](base::WeakPtr<State> state, SidebarService* service) {
++              if (state) {
++                RefreshAll(service);
++              }
++            },
++            state->weak.GetWeakPtr(), service),
++        base::Seconds(3));
++  }
++  state->owners[owner] = profile;
++}
++
++void Detach(SidebarService* service, const void* owner) {
++  auto it = States().find(service);
++  if (it == States().end()) {
++    return;
++  }
++  it->second->owners.erase(owner);
++  if (it->second->owners.empty()) {
++    States().erase(it);
++  }
++}
++
++void RefreshNow(SidebarService* service,
++                const std::string& item_id,
++                Done done) {
++  const Item* item = service->FindItem(item_id);
++  if (!item || !item->is_folder || !item->live_url.is_valid()) {
++    return std::move(done).Run("not a live folder");
++  }
++  Refresh(service, item_id, item->live_url, std::move(done));
++}
++
++GURL FetchUrlFor(const GURL& url, bool* github) {
++  *github = false;
++  std::string api = TestSwitchValue("meridian-test-github-api");
++  if (api.empty()) {
++    api = "https://api.github.com";
++  }
++  if (url.host() == "api.github.com" && url.path().starts_with("/search/")) {
++    *github = true;
++    return url;
++  }
++  if ((url.host() != "github.com" && url.host() != "www.github.com") ||
++      url.path() != "/search") {
++    return url;
++  }
++  std::string q, type, sort, order;
++  net::GetValueForKeyInQuery(url, "q", &q);
++  net::GetValueForKeyInQuery(url, "type", &type);
++  net::GetValueForKeyInQuery(url, "s", &sort);
++  net::GetValueForKeyInQuery(url, "o", &order);
++  if (q.empty()) {
++    return url;
++  }
++  type = base::ToLowerASCII(type);
++  std::string kind = "repositories";
++  if (type == "issues" || type == "pullrequests") {
++    kind = "issues";
++    const char* is = type == "issues" ? "is:issue" : "is:pr";
++    if (q.find(is) == std::string::npos) {
++      q += std::string(" ") + is;
++    }
++  }
++  *github = true;
++  std::string spec = api + "/search/" + kind +
++                     "?q=" + base::EscapeQueryParamValue(q, true) +
++                     "&per_page=" + base::NumberToString(kMaxItems);
++  if (!sort.empty()) {
++    spec += "&sort=" + base::EscapeQueryParamValue(sort, true);
++  }
++  if (!order.empty()) {
++    spec += "&order=" + base::EscapeQueryParamValue(order, true);
++  }
++  return GURL(spec);
++}
++
++std::optional<Links> ParseGithub(const std::string& json) {
++  std::optional<base::Value> value = base::JSONReader::Read(
++      json, base::JSON_PARSE_CHROMIUM_EXTENSIONS);
++  const base::ListValue* items =
++      value && value->is_dict() ? value->GetDict().FindList("items") : nullptr;
++  if (!items) {
++    return std::nullopt;
++  }
++  Links out;
++  for (const base::Value& v : *items) {
++    const base::DictValue* item = v.GetIfDict();
++    const std::string* href = item ? item->FindString("html_url") : nullptr;
++    if (!href) {
++      continue;
++    }
++    const std::string* title = item->FindString("title");
++    if (!title) {
++      title = item->FindString("full_name");
++    }
++    GURL url(*href);
++    if (url.SchemeIsHTTPOrHTTPS()) {
++      out.emplace_back(CleanTitle(title ? *title : *href), url);
++    }
++    if (out.size() >= kMaxItems) {
++      break;
++    }
++  }
++  return out;
++}
++
++std::optional<Links> ParseFeed(const base::Value& xml, const GURL& base) {
++  const std::string root = LocalName(xml);
++  std::vector<const base::Value*> entries;
++  const bool atom = root == "feed";
++  if (root == "rss") {
++    if (const base::Value* channel = Child(xml, "channel")) {
++      entries = Children(*channel, "item");
++    }
++  } else if (root == "RDF") {
++    entries = Children(xml, "item");
++  } else if (atom) {
++    entries = Children(xml, "entry");
++  } else {
++    return std::nullopt;
++  }
++  Links out;
++  for (const base::Value* entry : entries) {
++    std::string href;
++    if (atom) {
++      for (const base::Value* link : Children(*entry, "link")) {
++        std::string rel =
++            data_decoder::GetXmlElementAttribute(*link, "rel");
++        if (rel.empty() || rel == "alternate") {
++          href = data_decoder::GetXmlElementAttribute(*link, "href");
++          break;
++        }
++        if (href.empty()) {
++          href = data_decoder::GetXmlElementAttribute(*link, "href");
++        }
++      }
++    } else {
++      href = std::string(
++          base::TrimWhitespaceASCII(Text(Child(*entry, "link")), base::TRIM_ALL));
++    }
++    GURL url = base.Resolve(href);
++    if (href.empty() || !url.SchemeIsHTTPOrHTTPS()) {
++      continue;
++    }
++    out.emplace_back(CleanTitle(Text(Child(*entry, "title"))), url);
++    if (out.size() >= kMaxItems) {
++      break;
++    }
++  }
++  return out;
++}
++
++}  // namespace meridian::live_folders
+diff --git a/chrome/browser/meridian/live_folders.h b/chrome/browser/meridian/live_folders.h
+new file mode 100644
+index 0000000000..9301e27304
+--- /dev/null
++++ b/chrome/browser/meridian/live_folders.h
+@@ -0,0 +1,56 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_LIVE_FOLDERS_H_
++#define CHROME_BROWSER_MERIDIAN_LIVE_FOLDERS_H_
++
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/functional/callback.h"
++#include "base/values.h"
++#include "url/gurl.h"
++
++class Profile;
++
++namespace meridian {
++
++class SidebarService;
++
++// Live folders (Arc's): a pinned folder whose items come from an RSS or
++// Atom feed or a GitHub search, its first 10, refreshed every 30 minutes
++// while a window is open. Nothing is sent but the request itself: no
++// cookies.
++namespace live_folders {
++
++inline constexpr size_t kMaxItems = 10;
++
++// A window keeps them refreshing while it's open (`owner`: its handler).
++void Attach(SidebarService* service, Profile* profile, const void* owner);
++void Detach(SidebarService* service, const void* owner);
++
++// "Make Live…": the folder's items now. `done` gets "" or why not.
++void RefreshNow(SidebarService* service,
++                const std::string& item_id,
++                base::OnceCallback<void(std::string error)> done);
++
++// What is fetched for a live folder's URL: a GitHub search page
++// (github.com/search?q=…) becomes GitHub's search API (`github` true);
++// anything else is fetched as it is (a feed).
++GURL FetchUrlFor(const GURL& url, bool* github);
++
++using Links = std::vector<std::pair<std::string, GURL>>;
++// GitHub's search API answer: issues and pull requests (title) or
++// repositories (full name). nullopt: not one.
++std::optional<Links> ParseGithub(const std::string& json);
++// An RSS (2.0 or 1.0) or Atom document as the data decoder's XML parser
++// gives it; links relative to `base`. nullopt: not a feed.
++std::optional<Links> ParseFeed(const base::Value& xml, const GURL& base);
++
++}  // namespace live_folders
++}  // namespace meridian
++
++#endif  // CHROME_BROWSER_MERIDIAN_LIVE_FOLDERS_H_
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 5c53b94b7a..2bc03357c4 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -17,6 +17,8 @@ struct Item {
+   // Folders: expanded in the sidebar.
+   bool open;
+   array<Item> children;
++  // A live folder's feed (RSS/Atom or a GitHub search); empty otherwise.
++  url.mojom.Url live_url;
+ };
+ 
+ struct Space {
+@@ -973,4 +975,9 @@ interface SidebarHandler {
+   // aren't set to stay on the Space on screen.
+   TestBackgroundState() => (bool app_active, int32 shown, int32 key,
+                             int32 may_switch_space, int32 windows);
++
++  // "Make Live…" on a folder: fed by an RSS/Atom feed or a GitHub search
++  // URL from now on (its first items right away); an empty URL stops it.
++  // `error` says why not ("" when it worked).
++  SetFolderLive(string item_id, url.mojom.Url url) => (string error);
+ };
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index dc11a83556..b2318e9213 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -143,6 +143,7 @@
+ #include "components/sessions/core/serialized_navigation_entry.h"
+ #include "content/public/browser/navigation_entry.h"
+ #include "chrome/browser/dom_distiller/tab_utils.h"
++#include "chrome/browser/meridian/live_folders.h"
+ #include "components/dom_distiller/core/url_utils.h"
+ #include "chrome/browser/resource_coordinator/tab_lifecycle_unit_external.h"
+ #include "chrome/browser/resource_coordinator/lifecycle_unit_state.mojom.h"
+@@ -285,6 +286,7 @@ mojom::ItemPtr ToMojo(const Item& item) {
+   m->title = item.title;
+   m->url = item.url;
+   m->open = item.open;
++  m->live_url = item.live_url;
+   for (const Item& child : item.children) {
+     m->children.push_back(ToMojo(child));
+   }
+@@ -310,6 +312,10 @@ SidebarHandler::SidebarHandler(
+       receiver_(this, std::move(receiver)) {
+   service_observation_.Observe(service_.get());
+   archive_observation_.Observe(archive_.get());
++  // Live folders refresh while a window is open (not a private one).
++  if (!browser->GetProfile()->IsOffTheRecord()) {
++    live_folders::Attach(service_.get(), browser->GetProfile(), this);
++  }
+   if (mission::MissionControl* mission =
+           mission::MissionControlFactory::GetForProfile(browser->GetProfile())) {
+     mission_observation_.Observe(mission);
+@@ -365,6 +371,7 @@ SidebarHandler::SidebarHandler(
+ }
+ 
+ SidebarHandler::~SidebarHandler() {
++  live_folders::Detach(service_.get(), this);
+   Updater::Get().RemoveObserver(this);
+   model()->RemoveObserver(this);
+   auto it = Handlers().find(browser_);
+@@ -652,6 +659,37 @@ void SidebarHandler::ToggleReader(ToggleReaderCallback callback) {
+           contents->GetWeakPtr(), std::move(callback)));
+ }
+ 
++void SidebarHandler::SetFolderLive(const std::string& item_id,
++                                   const GURL& url,
++                                   SetFolderLiveCallback callback) {
++  if (url.is_empty()) {
++    service_->SetFolderLive(item_id, GURL());
++    return std::move(callback).Run(std::string());
++  }
++  if (!url.SchemeIsHTTPOrHTTPS()) {
++    return std::move(callback).Run(
++        "Give an http(s) address: an RSS or Atom feed, or a GitHub search.");
++  }
++  const Item* item = service_->FindItem(item_id);
++  if (!item || !item->is_folder) {
++    return std::move(callback).Run("That folder is gone.");
++  }
++  const GURL before = item->live_url;
++  service_->SetFolderLive(item_id, url);
++  // Its first items now; an address that gives none leaves it as it was.
++  live_folders::RefreshNow(
++      service_, item_id,
++      base::BindOnce(
++          [](base::WeakPtr<SidebarHandler> self, std::string item_id,
++             GURL before, SetFolderLiveCallback callback, std::string error) {
++            if (!error.empty() && self) {
++              self->service_->SetFolderLive(item_id, before);
++            }
++            std::move(callback).Run(error);
++          },
++          weak_factory_.GetWeakPtr(), item_id, before, std::move(callback)));
++}
++
+ void SidebarHandler::ShareTabInstead(const tabs_api::NodeId& tab_id) {
+   if (tabs::TabInterface* tab = TabFor(tab_id)) {
+     TabSharingUIViews::ShareInstead(tab->GetContents());
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index b98574095c..f1f172c097 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -327,6 +327,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+   void MoveTabToSpaceAndShow(const tabs_api::NodeId& tab_id,
+                              const std::string& space_id) override;
+   void TestBackgroundState(TestBackgroundStateCallback callback) override;
++  void SetFolderLive(const std::string& item_id,
++                     const GURL& url,
++                     SetFolderLiveCallback callback) override;
+   void ShareTabInstead(const tabs_api::NodeId& tab_id) override;
+   void CanShareTabInstead(const tabs_api::NodeId& tab_id,
+                           CanShareTabInsteadCallback callback) override;
+diff --git a/chrome/browser/meridian/sidebar_service.cc b/chrome/browser/meridian/sidebar_service.cc
+index d8d03fd604..fb8424bb29 100644
+--- a/chrome/browser/meridian/sidebar_service.cc
++++ b/chrome/browser/meridian/sidebar_service.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/browser/meridian/sidebar_service.h"
+ 
+ #include <algorithm>
++#include <functional>
+ #include <utility>
+ 
+ #include "base/files/file_util.h"
+@@ -41,6 +42,9 @@ base::DictValue ItemToValue(const Item& item) {
+   if (item.is_folder) {
+     d.Set("folder", true);
+     d.Set("open", item.open);
++    if (item.live_url.is_valid()) {
++      d.Set("live", item.live_url.spec());
++    }
+     base::ListValue children;
+     for (const Item& child : item.children) {
+       children.Append(ItemToValue(child));
+@@ -65,6 +69,12 @@ std::optional<Item> ItemFromValue(const base::DictValue& d) {
+   item.is_folder = d.FindBool("folder").value_or(false);
+   if (item.is_folder) {
+     item.open = d.FindBool("open").value_or(true);
++    if (const std::string* live = d.FindString("live")) {
++      GURL url(*live);
++      if (url.SchemeIsHTTPOrHTTPS()) {
++        item.live_url = url;
++      }
++    }
+     if (const base::ListValue* children = d.FindList("children")) {
+       for (const base::Value& child : *children) {
+         if (child.is_dict()) {
+@@ -645,6 +655,81 @@ bool SidebarService::SetFolderOpen(const std::string& item_id, bool open) {
+   return true;
+ }
+ 
++bool SidebarService::SetFolderLive(const std::string& item_id,
++                                   const GURL& url) {
++  Item* item = const_cast<Item*>(FindItem(item_id));
++  if (!item || !item->is_folder ||
++      (!url.is_empty() && !url.SchemeIsHTTPOrHTTPS())) {
++    return false;
++  }
++  item->live_url = url;
++  Changed();
++  return true;
++}
++
++bool SidebarService::SetLiveItems(
++    const std::string& item_id,
++    const std::vector<std::pair<std::string, GURL>>& links) {
++  Item* folder = const_cast<Item*>(FindItem(item_id));
++  if (!folder || !folder->is_folder || !folder->live_url.is_valid()) {
++    return false;
++  }
++  std::vector<Item> children;
++  for (const auto& [title, url] : links) {
++    if (!url.SchemeIsHTTPOrHTTPS()) {
++      continue;
++    }
++    Item child;
++    child.title = title.empty() ? url.spec() : title;
++    child.url = url;
++    for (const Item& old : folder->children) {
++      if (!old.is_folder && old.url == url) {
++        child.id = old.id;
++      }
++    }
++    if (child.id.empty()) {
++      child.id = NewId();
++    }
++    children.push_back(std::move(child));
++  }
++  const bool same =
++      children.size() == folder->children.size() &&
++      std::ranges::equal(children, folder->children,
++                         [](const Item& a, const Item& b) {
++                           return a.id == b.id && a.title == b.title &&
++                                  a.url == b.url && !b.is_folder;
++                         });
++  if (same) {
++    return false;
++  }
++  folder->children = std::move(children);
++  Changed();
++  return true;
++}
++
++std::vector<std::pair<std::string, GURL>> SidebarService::LiveFolderList()
++    const {
++  std::vector<std::pair<std::string, GURL>> out;
++  std::function<void(const std::vector<Item>&)> walk =
++      [&](const std::vector<Item>& items) {
++        for (const Item& item : items) {
++          if (item.is_folder && item.live_url.is_valid()) {
++            out.emplace_back(item.id, item.live_url);
++          }
++          if (item.is_folder) {
++            walk(item.children);
++          }
++        }
++      };
++  for (const Space& space : spaces_) {
++    walk(space.pinned);
++  }
++  for (const std::vector<Item>* list : FavoriteLists()) {
++    walk(*list);
++  }
++  return out;
++}
++
+ void SidebarService::Import(std::vector<Space>& spaces,
+                             std::vector<Item> favorites) {
+   for (Space& space : spaces) {
+diff --git a/chrome/browser/meridian/sidebar_service.h b/chrome/browser/meridian/sidebar_service.h
+index c75df76046..3fb343c5ec 100644
+--- a/chrome/browser/meridian/sidebar_service.h
++++ b/chrome/browser/meridian/sidebar_service.h
+@@ -49,6 +49,9 @@ struct Item {
+   GURL url;  // home URL of a link
+   bool open = true;
+   std::vector<Item> children;
++  // A live folder: its children come from this feed (RSS/Atom) or GitHub
++  // search, refreshed every 30 minutes (live_folders.h).
++  GURL live_url;
+ };
+ 
+ struct Space {
+@@ -150,6 +153,14 @@ class SidebarService : public KeyedService {
+   // A pinned tab's or favorite's home address (Arc's Edit Pinned Page).
+   bool SetItemUrl(const std::string& item_id, const GURL& url);
+   bool SetFolderOpen(const std::string& item_id, bool open);
++  // A folder fed by `url` (empty: an ordinary folder again, its items stay).
++  bool SetFolderLive(const std::string& item_id, const GURL& url);
++  // A live folder's items now: links kept by URL keep their ids (an open
++  // tab stays theirs). Nothing changes when it's the same.
++  bool SetLiveItems(const std::string& item_id,
++                    const std::vector<std::pair<std::string, GURL>>& links);
++  // Every live folder: id and feed.
++  std::vector<std::pair<std::string, GURL>> LiveFolderList() const;
+ 
+   // Import (from Arc): adds `spaces` after the existing ones, or in place of
+   // the untouched first space, and the `favorites` not there yet (by URL).
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.html.ts b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+index b6591269f1..4877d89d7b 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+@@ -23,7 +23,15 @@ ${this.item?.isFolder ? html`
+       ${this.renaming === this.item.id ? html`
+         <input class="rename" .value="${this.item.title}" spellcheck="false"
+             @keydown="${this.onRenameKeydown_}" @blur="${this.onRenameBlur_}">
+-      ` : html`<span class="title">${this.item.title}</span>`}
++      ` : html`${this.renaming === 'live:' + this.item.id ? html`
++        <input class="rename live-url" .value="${this.item.liveUrl}"
++            spellcheck="false"
++            placeholder="Feed or GitHub search address"
++            @keydown="${this.onRenameKeydown_}" @blur="${this.onLiveBlur_}">
++      ` : html`<span class="title">${this.item.title}</span>`}`}
++      ${this.item.liveUrl ? html`
++        <span class="live" title="Live: ${this.item.liveUrl}">
++          ${icon('bolt', 12)}</span>` : ''}
+     </div>
+     <div class="children">
+       ${repeat(this.item.children, c => c.id, c => html`
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.ts b/chrome/browser/resources/webui_browser/meridian/item.ts
+index 4bf5346bd9..d5cf3df838 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.ts
+@@ -167,6 +167,10 @@ export class MeridianItemElement extends CrLitElement {
+     this.host?.onRenameBlur(e, this.item!.id, false);
+   }
+ 
++  protected onLiveBlur_(e: Event) {
++    this.host?.onRenameBlur(e, 'live:' + this.item!.id, false);
++  }
++
+   protected onUrlBlur_(e: Event) {
+     this.host?.onRenameBlur(e, 'url:' + this.item!.id, false);
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/rows.css b/chrome/browser/resources/webui_browser/meridian/rows.css
+index f71a87baf9..eb6c2b97d0 100644
+--- a/chrome/browser/resources/webui_browser/meridian/rows.css
++++ b/chrome/browser/resources/webui_browser/meridian/rows.css
+@@ -323,6 +323,15 @@ input.rename {
+   box-shadow: 3px 0 0 var(--meridian-space);
+ }
+ 
++/* A live folder: a small bolt at the end of its row. */
++.row.folder .live {
++  display: inline-flex;
++  flex: none;
++  margin-inline-start: 4px;
++  color: var(--meridian-text-muted);
++  opacity: 0.8;
++}
++
+ /* Put to sleep: the favicon dims, with a small moon at its corner, until
+    the tab loads again. */
+ .row.asleep .favicon {
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index 1b65020ba0..4136004af6 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -1885,6 +1885,14 @@ export class MeridianSidebarElement extends CrLitElement implements
+     }
+     const value = (e.target as HTMLInputElement).value.trim();
+     this.renaming_ = '';
++    // Make Live…: the folder's feed or GitHub search.
++    if (id.startsWith('live:')) {
++      if (value) {
++        this.makeLive(
++            id.slice(5), /^[a-z]+:\/\//i.test(value) ? value : 'https://' + value);
++      }
++      return;
++    }
+     // Edit Pinned Page > Edit…: the item's home address.
+     if (id.startsWith('url:')) {
+       if (value) {
+@@ -2275,6 +2283,17 @@ export class MeridianSidebarElement extends CrLitElement implements
+     }];
+   }
+ 
++  // A live folder (Arc's): its items from an RSS/Atom feed or a GitHub
++  // search, the first 10, refreshed every 30 minutes. '' stops it.
++  async makeLive(itemId: string, url: string): Promise<string> {
++    const {error} = await this.handler_.setFolderLive(itemId, url);
++    const title = error ? error :
++        url ? 'Live folder: it updates every 30 minutes' :
++              'Live updates stopped: the items stay';
++    this.fire('meridian-mission-toast', {nodeId: '', title});
++    return error;
++  }
++
+   async putToSleep(id: NodeId): Promise<string> {
+     const toast = (title: string) =>
+         this.fire('meridian-mission-toast', {nodeId: '', title});
+@@ -2351,8 +2370,19 @@ export class MeridianSidebarElement extends CrLitElement implements
+         item.id, {container: spaceId, parentId: '', index: -1});
+     const move = this.moveToSpaceMenu_(moveItem);
+     if (item.isFolder) {
++      const live = !!item.liveUrl;
+       this.openMenu_(e, [
+         {label: 'Rename Folder…', icon: 'pencil', action: () => this.renaming_ = item.id},
++        {
++          label: live ? 'Change Live Address…' : 'Make Live…',
++          icon: 'bolt',
++          action: () => this.renaming_ = 'live:' + item.id,
++        },
++        ...(live ? [{
++          label: 'Stop Live Updates',
++          icon: 'stop' as const,
++          action: () => this.makeLive(item.id, ''),
++        }] : []),
+         {
+           label: item.open ? 'Collapse' : 'Expand',
+           icon: item.open ? 'folder' : 'folderOpen',

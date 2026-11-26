@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 04:36:44 +0400
+Subject: [PATCH] Meridian: Context Insights names a model switch as what made
+ a turn cost
+
+The prompt cache is per model: after a switch (Sonnet to Opus, say) the
+next request writes the whole context again. The cost chart called that
+"unknown"; now it says "Model switched from Sonnet 4.5 to Opus 5.5: the
+cache is per model, so 20.4k tokens written again", only when the
+transcript shows the model changed and the cache collapsed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../workbench/agent_insights_unittest.cc      | 34 +++++++++++
+ .../meridian/workbench/context_insights.cc    | 61 +++++++++++++++++--
+ .../meridian/workbench/context_insights.h     |  3 +
+ 3 files changed, 93 insertions(+), 5 deletions(-)
+
+diff --git a/chrome/browser/meridian/workbench/agent_insights_unittest.cc b/chrome/browser/meridian/workbench/agent_insights_unittest.cc
+index df41eb1440..4d078c036b 100644
+--- a/chrome/browser/meridian/workbench/agent_insights_unittest.cc
++++ b/chrome/browser/meridian/workbench/agent_insights_unittest.cc
+@@ -427,6 +427,40 @@ TEST_F(AgentSessionsTest, OpenCodeSessionInTheDatabase) {
+                            .NormalizePathSeparators());
+ }
+ 
++// Claude Code switched to another model mid-session: the cache is per model,
++// so the next request writes everything again. Named only when the model
++// really changed; a collapse with the same model stays unexplained.
++TEST(AgentInsightsTest, ClaudeModelSwitchWritesTheCacheAgain) {
++  ContextInsights ci;
++  int n = 0;
++  auto req = [&](int s, const char* model, int read, int write) {
++    ++n;
++    ci.Feed(base::StringPrintf(
++        R"({"type":"assistant","requestId":"r%d","timestamp":"%s",)"
++        R"("message":{"id":"m%d","model":"%s","role":"assistant",)"
++        R"("content":[],"usage":{"input_tokens":5,)"
++        R"("cache_creation_input_tokens":%d,"cache_read_input_tokens":%d,)"
++        R"("output_tokens":100}}})",
++        n, Iso(T(s)).c_str(), n, model, write, read));
++  };
++  ci.Feed(base::StringPrintf(
++      R"({"type":"user","timestamp":"%s","message":{"role":"user",)"
++      R"("content":"Fix the login page"}})",
++      Iso(T(0)).c_str()));
++  req(1, "claude-sonnet-4-5-20250929", 0, 20000);
++  req(5, "claude-sonnet-4-5-20250929", 20000, 300);
++  req(10, "claude-opus-5-5", 0, 20400);
++  req(15, "claude-opus-5-5", 20400, 200);
++  req(20, "claude-opus-5-5", 0, 20700);
++  ci.Feed(R"({"type":"cost-state","totalCostUSD":1})");
++  base::DictValue r = ci.Result(std::nullopt);
++  EXPECT_EQ(Causes(r), (std::vector<std::string>{"cold", "normal", "model",
++                                                 "normal", "unknown"}));
++  EXPECT_EQ(Why(r, 3),
++            "Model switched from Sonnet 4.5 to Opus 5.5: the cache is per "
++            "model, so 20.4k tokens written again");
++}
++
+ TEST(AgentInsightsTest, WhichAgentsHaveInsights) {
+   for (const char* kind : {"codex", "qwen", "gemini", "copilot", "opencode"}) {
+     EXPECT_TRUE(InsightsFormatOf(kind).has_value()) << kind;
+diff --git a/chrome/browser/meridian/workbench/context_insights.cc b/chrome/browser/meridian/workbench/context_insights.cc
+index d8d68807d4..01c00b0a5c 100644
+--- a/chrome/browser/meridian/workbench/context_insights.cc
++++ b/chrome/browser/meridian/workbench/context_insights.cc
+@@ -177,12 +177,13 @@ enum Cause {
+   kUnknown,
+   kNormal,
+   kSubagents,
+-  kTool
++  kTool,
++  kModel
+ };
+-constexpr int kCauseCount = 8;
++constexpr int kCauseCount = 9;
+ constexpr std::array<const char*, kCauseCount> kCauseNames = {
+-    "cold",   "compaction", "file",      "mcp",
+-    "unknown", "normal",    "subagents", "tool"};
++    "cold",   "compaction", "file",      "mcp",  "unknown",
++    "normal", "subagents",  "tool",      "model"};
+ // A file, command output or MCP load must be this large (tokens, estimated)
+ // and at least half of what the request newly sent to count as what made it
+ // expensive.
+@@ -195,6 +196,40 @@ constexpr double kJumpShare = 0.25;
+ // How many turns each bar lists; the rest are summed.
+ constexpr size_t kTurnsPerBar = 12;
+ 
++// A model's id as people say it: "claude-opus-5-5" is Opus 5.5,
++// "claude-sonnet-4-5-20250929" Sonnet 4.5. Other ids stay as they are.
++std::string ModelName(const std::string& id) {
++  if (!id.starts_with("claude-")) {
++    return id;
++  }
++  std::vector<std::string> parts;
++  size_t start = 7;
++  for (size_t dash; (dash = id.find('-', start)) != std::string::npos;
++       start = dash + 1) {
++    parts.push_back(id.substr(start, dash - start));
++  }
++  parts.push_back(id.substr(start));
++  std::string family, version;
++  for (const std::string& p : parts) {
++    const bool digits =
++        !p.empty() && std::all_of(p.begin(), p.end(), [](char c) {
++          return c >= '0' && c <= '9';
++        });
++    if (!digits) {
++      if (family.empty() && version.empty()) {
++        family = p;
++      }
++    } else if (p.size() <= 2) {
++      version += (version.empty() ? "" : ".") + p;
++    }
++  }
++  if (family.empty()) {
++    return id;
++  }
++  family[0] = static_cast<char>(family[0] - 'a' + 'A');
++  return version.empty() ? family : family + " " + version;
++}
++
+ std::string McpServerOf(const std::string& tool) {
+   const size_t sep = tool.find("__", 5);
+   return sep == std::string::npos ? tool.substr(5) : tool.substr(5, sep - 5);
+@@ -376,10 +411,14 @@ void ContextInsights::FeedAssistant(const base::DictValue& entry,
+       r.mcp_loaded_from = pending_mcp_from_;
+       pending_mcp_tokens_ = 0;
+       pending_mcp_from_.clear();
+-      requests_.push_back(r);
+       if (const std::string* model = message->FindString("model")) {
++        // "<synthetic>" marks Claude Code's own messages, not a model.
++        if (!model->starts_with("<")) {
++          r.model = Short(*model, 60);
++        }
+         model_ = Short(*model, 60);
+       }
++      requests_.push_back(r);
+     }
+   } else if (usage && !sidechain && !requests_.empty() &&
+              !key.empty()) {
+@@ -832,6 +871,17 @@ base::DictValue ContextInsights::Result(
+                    " min pause: " + K(fresh) +
+                    (format_ == AgentFormat::kClaude ? " tokens written again"
+                                                     : " tokens sent again");
++      } else if (was_cached && before > 0 && !r.model.empty() &&
++                 !requests_[i - 1].model.empty() &&
++                 r.model != requests_[i - 1].model &&
++                 r.cache_read < before * 0.1 && fresh >= before * 0.5) {
++        turn.cause = kModel;
++        turn.why = "Model switched from " +
++                   ModelName(requests_[i - 1].model) + " to " +
++                   ModelName(r.model) + ": the cache is per model, so " +
++                   K(fresh) +
++                   (format_ == AgentFormat::kClaude ? " tokens written again"
++                                                    : " tokens sent again");
+       } else if (file_big && (!mcp_big || file_in[i] >= mcp_new) &&
+                  file_in[i] >= tool_in[i]) {
+         turn.cause = kFile;
+@@ -1683,6 +1733,7 @@ void ContextInsights::RebuildGemini() {
+       q.cache_read = r.cached;
+       q.input = r.input - r.cached;
+       q.output = r.output;
++      q.model = r.model;
+       AddRequest(q, r.id);
+     }
+     for (const GeminiRecord::Call& c : r.calls) {
+diff --git a/chrome/browser/meridian/workbench/context_insights.h b/chrome/browser/meridian/workbench/context_insights.h
+index c09b71b216..e6aecc91b7 100644
+--- a/chrome/browser/meridian/workbench/context_insights.h
++++ b/chrome/browser/meridian/workbench/context_insights.h
+@@ -72,6 +72,9 @@ class ContextInsights {
+     std::string mcp_loaded_from;
+     // What the agent recorded it cost, when it records that (OpenCode).
+     double cost = -1;
++    // The model that answered, when the record names it: the prompt cache
++    // is per model, so a switch writes the whole context again.
++    std::string model;
+     double context() const { return input + cache_read + cache_write; }
+   };
+   // What a tool does, for the causes and the tips: reads a file, runs a

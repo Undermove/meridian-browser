@@ -74,7 +74,7 @@ print('ALL DONE', flush=True)
 sys.stdin.readline()
 `;
 
-test('an agent’s permission question: a card over any space’s page; Allow, Always, Deny, the terminal first, Open', async () => {
+test('an agent’s permission question: a card over any space’s page; Allow, Always, Deny, the terminal first, Open', { skip: process.platform === 'win32' && 'the stand-in Claude Code is a Python script' }, async () => {
   const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-aa-')));
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
   fs.writeFileSync(path.join(bin, 'claude'), FAKE_CLAUDE, { mode: 0o755 });
@@ -122,12 +122,17 @@ test('an agent’s permission question: a card over any space’s page; Allow, A
       const { data } = await b.cdp.send('Page.captureScreenshot', { format: 'png' });
       fs.writeFileSync(path.join(process.env.MERIDIAN_SHOTS, 'agent-ask.png'), Buffer.from(data, 'base64'));
     }
+    // A click in the first moments can't approve it.
+    await b.click(card('.allow'));
+    assert.ok(await b.eval(`!!${card('.allow')}`), 'still waiting');
+    await new Promise((r) => setTimeout(r, 700));
     await b.click(card('.allow'));
     await waitTerm('DECIDED allow meridian []');
     await b.waitFor(`![...${cards}].some((c) => c.textContent.includes('npm test'))`, 10000);
 
     // 2. Change a file: Always allow passes Claude Code's own suggestion back.
     await b.waitFor(`${cards}.length === 1 && ${card('.what')}.textContent === 'Change a file'`, 15000);
+    await new Promise((r) => setTimeout(r, 700));
     await b.click(card('.always'));
     await waitTerm('DECIDED allow meridian [{"destination": "session", "mode": "acceptEdits", "type": "setMode"}]');
     await b.waitFor(`![...${cards}].some((c) => c.textContent.includes('Change a file'))`, 10000);

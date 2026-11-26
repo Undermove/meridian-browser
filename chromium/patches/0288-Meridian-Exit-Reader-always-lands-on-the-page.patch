@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 13:52:00 +0400
+Subject: [PATCH 288/297] Meridian: Exit Reader always lands on the page
+
+Exit Reader goes back in history when the entry before is the page itself
+(its scroll position, no reload), else loads it. If the tab is still on
+that same reading view a second later with nothing on its way to the page,
+the page is loaded: once in a full run the tab stayed on chrome-distiller://.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar_handler.cc | 54 ++++++++++++++++++++--
+ 1 file changed, 50 insertions(+), 4 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 64393d8414..24b415293f 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -552,11 +552,57 @@ void SidebarHandler::ToggleReader(ToggleReaderCallback callback) {
+   if (dom_distiller::url_utils::IsDistilledPage(url)) {
+     GURL original =
+         dom_distiller::url_utils::GetOriginalUrlFromDistillerUrl(url);
+-    if (original.is_valid()) {
+-      contents->GetController().LoadURL(original, content::Referrer(),
+-                                        ui::PAGE_TRANSITION_AUTO_BOOKMARK,
+-                                        std::string());
++    content::NavigationController& controller = contents->GetController();
++    // Back to the page itself (its scroll position, no reload) when it's the
++    // entry before; else loaded again.
++    const int prev = controller.GetLastCommittedEntryIndex() - 1;
++    content::NavigationEntry* back =
++        prev >= 0 ? controller.GetEntryAtIndex(prev) : nullptr;
++    auto load = [](content::WebContents* contents, const GURL& original) {
++      if (original.is_valid()) {
++        contents->GetController().LoadURL(original, content::Referrer(),
++                                          ui::PAGE_TRANSITION_AUTO_BOOKMARK,
++                                          std::string());
++      }
++    };
++    const int entry_id = controller.GetLastCommittedEntry()
++                             ? controller.GetLastCommittedEntry()->GetUniqueID()
++                             : 0;
++    if (back && original.is_valid() && back->GetURL() == original &&
++        controller.CanGoBack()) {
++      controller.GoBack();
++    } else {
++      load(contents, original);
+     }
++    // Once in a while the tab stayed in the reading view (the navigation
++    // away dropped): still there after a second with nothing on its way to
++    // the page, the page is loaded.
++    base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++        FROM_HERE,
++        base::BindOnce(
++            [](base::WeakPtr<content::WebContents> contents, GURL original,
++               int entry_id,
++               void (*load)(content::WebContents*, const GURL&)) {
++              // Only that same reading view (not one opened again since).
++              content::NavigationEntry* now =
++                  contents ? contents->GetController().GetLastCommittedEntry()
++                           : nullptr;
++              if (!now || now->GetUniqueID() != entry_id ||
++                  !dom_distiller::url_utils::IsDistilledPage(now->GetURL())) {
++                return;
++              }
++              // A slow page still on its way there is left to arrive.
++              content::NavigationEntry* pending =
++                  contents->GetController().GetPendingEntry();
++              if (pending && pending->GetURL() == original) {
++                return;
++              }
++              load(contents.get(), original);
++            },
++            contents->GetWeakPtr(), original,
++            entry_id,
++            static_cast<void (*)(content::WebContents*, const GURL&)>(load)),
++        base::Seconds(1));
+     std::move(callback).Run("off");
+     return;
+   }

@@ -1,0 +1,663 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Wed, 25 Nov 2026 23:07:41 +0400
+Subject: [PATCH] Meridian: Boost colours paint the page from two colours, as
+ Arc's
+
+The pad's colours no longer turn the whole page with a filter. The page is
+painted as CSS from a palette of the two picked colours: neutral
+backgrounds take a tint of the main colour, big coloured blocks (headers,
+heroes, gradients) turn to it, buttons, badges and links to the second
+one. Lightness stays, so light sites stay light and dark ones dark; text
+is then made readable on what's under it (WCAG AA: 4.5:1, 3:1 for large
+text). Pictures and video are not touched. Pages that change are painted
+again, at most once a second; No colour or turning the boost off takes it
+all back at once.
+
+The small knob on the pad is the second colour now: drag it round to pick
+the hue of buttons and links (until then it follows the main one). Saved
+as tint2 (agents can set it too).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/meridian/agent/agent_service.cc   |   2 +-
+ .../browser/meridian/agent/agent_tools.json   |   4 +
+ .../browser/meridian/boosts/boost_service.cc  |  27 +-
+ .../browser/meridian/boosts/boost_service.h   |   6 +-
+ .../meridian/boosts/boost_service_unittest.cc |  18 +-
+ .../meridian/boosts/boost_tab_helper.cc       | 294 +++++++++++++++---
+ chrome/browser/meridian/sidebar.mojom         |   2 +
+ chrome/browser/meridian/sidebar_handler.cc    |   2 +
+ .../resources/webui_browser/meridian/ask.ts   |   1 +
+ .../meridian/boost_editor.html.ts             |   3 +-
+ .../webui_browser/meridian/boost_editor.ts    |  45 ++-
+ 11 files changed, 317 insertions(+), 87 deletions(-)
+
+diff --git a/chrome/browser/meridian/agent/agent_service.cc b/chrome/browser/meridian/agent/agent_service.cc
+index 4e6f95f193..eebd21e11e 100644
+--- a/chrome/browser/meridian/agent/agent_service.cc
++++ b/chrome/browser/meridian/agent/agent_service.cc
+@@ -2662,7 +2662,7 @@ void AgentService::SetBoost(std::unique_ptr<Call> call) {
+                                                                    host);
+             for (const char* key :
+                  {"css", "js", "zaps", "name", "enabled", "hue", "font", "tint",
+-                  "tint_strength", "dark", "size", "text_case"}) {
++                  "tint_strength", "dark", "size", "text_case", "tint2"}) {
+               if (const base::Value* v = call->input.Find(key)) {
+                 value.Set(key, v->Clone());
+               }
+diff --git a/chrome/browser/meridian/agent/agent_tools.json b/chrome/browser/meridian/agent/agent_tools.json
+index 361cb5b81e..34d7989e80 100644
+--- a/chrome/browser/meridian/agent/agent_tools.json
++++ b/chrome/browser/meridian/agent/agent_tools.json
+@@ -713,6 +713,10 @@
+      "type": "integer",
+      "description": "How much of the tint, 0-100."
+     },
++    "tint2": {
++     "type": "integer",
++     "description": "The second colour's hue, 0-359, for buttons, links and accents; -1: the tint's."
++    },
+     "dark": {
+      "type": "boolean",
+      "description": "Light pages dark and dark ones light (pictures stay)."
+diff --git a/chrome/browser/meridian/boosts/boost_service.cc b/chrome/browser/meridian/boosts/boost_service.cc
+index c4abb575d1..1d9a82ba4c 100644
+--- a/chrome/browser/meridian/boosts/boost_service.cc
++++ b/chrome/browser/meridian/boosts/boost_service.cc
+@@ -112,6 +112,7 @@ base::DictValue Boost::ToValue() const {
+       .Set("font", font)
+       .Set("tint", tint)
+       .Set("tint_strength", tint_strength)
++      .Set("tint2", tint2)
+       .Set("dark", dark)
+       .Set("brightness", brightness)
+       .Set("contrast", contrast)
+@@ -149,6 +150,7 @@ std::optional<Boost> Boost::FromValue(const base::DictValue& value) {
+   boost.tint = std::clamp(value.FindInt("tint").value_or(-1), -1, 359);
+   boost.tint_strength =
+       std::clamp(value.FindInt("tint_strength").value_or(60), 0, 100);
++  boost.tint2 = std::clamp(value.FindInt("tint2").value_or(-1), -1, 359);
+   boost.dark = value.FindBool("dark").value_or(false);
+   auto percent = [&](const char* key, int lo, int hi) {
+     return std::clamp(value.FindInt(key).value_or(100), lo, hi);
+@@ -181,16 +183,12 @@ std::string Boost::PageCss() const {
+     page_filter += " hue-rotate(" + turn + "deg)";
+     media_filter = " hue-rotate(-" + turn + "deg)" + media_filter;
+   }
+-  const bool tinted = tint >= 0 && tint_strength > 0;
+-  if (tinted) {
+-    // The site's own accent turns to the picked colour (the tab helper works
+-    // out the turn from the page), so white stays white and text stays text;
+-    // pictures and video are turned back.
+-    page_filter += " hue-rotate(var(--meridian-boost-turn, 0deg))";
+-    media_filter =
+-        " hue-rotate(calc(-1 * var(--meridian-boost-turn, 0deg)))" +
+-        media_filter;
++  if (tint >= 0 && tint_strength > 0) {
++    // The colours: the tab helper paints the page from these (a palette
++    // written as CSS, text kept readable); pictures stay as they are.
+     out += "\nhtml { --meridian-boost-tint: " + base::NumberToString(tint) +
++           "; --meridian-boost-tint2: " +
++           base::NumberToString(tint2 >= 0 ? tint2 : tint) +
+            "; --meridian-boost-strength: " +
+            base::NumberToString(tint_strength) + "; }";
+   }
+@@ -211,17 +209,6 @@ std::string Boost::PageCss() const {
+            "[style*=\"background-image\"] { filter:" +
+            media_filter + " !important; }";
+   }
+-  if (tinted) {
+-    // A breath of the colour on the page's background.
+-    out += "\nhtml::before { content: \"\"; position: fixed; inset: 0; "
+-           "pointer-events: none; z-index: 2147483647; background: hsl(" +
+-           base::NumberToString(tint) +
+-           " 70% 72%); filter: hue-rotate(calc(-1 * "
+-           "var(--meridian-boost-turn, 0deg))); mix-blend-mode: multiply; "
+-           "opacity: " +
+-           base::NumberToString(tint_strength / 100.0 * 0.1) +
+-           " !important; }";
+-  }
+   if (size != 100) {
+     out += "\nbody { zoom: " + base::NumberToString(size) +
+            "% !important; }";
+diff --git a/chrome/browser/meridian/boosts/boost_service.h b/chrome/browser/meridian/boosts/boost_service.h
+index a20d94e690..e228d4661e 100644
+--- a/chrome/browser/meridian/boosts/boost_service.h
++++ b/chrome/browser/meridian/boosts/boost_service.h
+@@ -47,10 +47,12 @@ struct Boost {
+   int hue = 0;
+   // A font for the page's text ("": the site's).
+   std::string font;
+-  // A colour over the page, as Arc's: its hue (-1: none) and how much of it
+-  // (0-100).
++  // The colours, as Arc's: the main one's hue (-1: none) and how much of
++  // it (0-100), and the second one's hue (buttons, links, accents; -1: the
++  // main one's).
+   int tint = -1;
+   int tint_strength = 60;
++  int tint2 = -1;
+   // Light pages dark and dark ones light (pictures stay as they are).
+   bool dark = false;
+   // Percent, 100: as the site has them.
+diff --git a/chrome/browser/meridian/boosts/boost_service_unittest.cc b/chrome/browser/meridian/boosts/boost_service_unittest.cc
+index dacc670c35..0a65febad6 100644
+--- a/chrome/browser/meridian/boosts/boost_service_unittest.cc
++++ b/chrome/browser/meridian/boosts/boost_service_unittest.cc
+@@ -77,15 +77,18 @@ TEST(BoostServiceTest, PageCssHasTintDarkSizeAndCase) {
+   b.text_case = "lower";
+   b.contrast = 120;
+   std::string css = b.PageCss();
+-  // The tint turns the site's own accent (the turn comes from the page) and
+-  // lays a breath of the colour on top.
+-  EXPECT_NE(css.find("--meridian-boost-tint: 30; --meridian-boost-strength: 50;"),
++  // The colours go to the page as the palette's inputs (the tab helper
++  // paints them as CSS); no filter and no layer over the page for them.
++  EXPECT_NE(css.find("--meridian-boost-tint: 30; --meridian-boost-tint2: 30; "
++                     "--meridian-boost-strength: 50;"),
+             std::string::npos);
+-  EXPECT_NE(css.find("hsl(30 70% 72%)"), std::string::npos);
+-  EXPECT_NE(css.find("opacity: 0.05"), std::string::npos);
+-  EXPECT_NE(css.find("invert(1) hue-rotate(180deg) hue-rotate(var("
+-                     "--meridian-boost-turn, 0deg)) contrast(120%)"),
++  EXPECT_EQ(css.find("--meridian-boost-turn"), std::string::npos);
++  EXPECT_EQ(css.find("html::before"), std::string::npos);
++  EXPECT_EQ(css.find("mix-blend-mode"), std::string::npos);
++  EXPECT_NE(css.find("invert(1) hue-rotate(180deg) contrast(120%)"),
+             std::string::npos);
++  b.tint2 = 200;
++  EXPECT_NE(b.PageCss().find("--meridian-boost-tint2: 200;"), std::string::npos);
+   // Pictures undo the dark.
+   EXPECT_NE(css.find("img, video"), std::string::npos);
+   EXPECT_NE(css.find("zoom: 110%"), std::string::npos);
+@@ -94,6 +97,7 @@ TEST(BoostServiceTest, PageCssHasTintDarkSizeAndCase) {
+   std::optional<Boost> round = Boost::FromValue(b.ToValue());
+   ASSERT_TRUE(round);
+   EXPECT_EQ(round->tint, 30);
++  EXPECT_EQ(round->tint2, 200);
+   EXPECT_TRUE(round->dark);
+   base::DictValue odd = b.ToValue();
+   odd.Set("text_case", "sideways");
+diff --git a/chrome/browser/meridian/boosts/boost_tab_helper.cc b/chrome/browser/meridian/boosts/boost_tab_helper.cc
+index ee8b14e2bb..e029dce4db 100644
+--- a/chrome/browser/meridian/boosts/boost_tab_helper.cc
++++ b/chrome/browser/meridian/boosts/boost_tab_helper.cc
+@@ -28,67 +28,260 @@ namespace meridian {
+ 
+ namespace {
+ 
++// Boost colours, as Arc's: a palette from the two picked colours, written as
++// CSS for each colour the page uses (not a filter over the page). Neutral
++// backgrounds take a tint of the main colour, big coloured blocks turn to it,
++// buttons, badges and links to the second one; lightness stays, so light
++// pages stay light and dark ones dark. Text is then made readable (WCAG AA,
++// 4.5:1, 3:1 when large) on what's under it. Pictures and video are not
++// touched. Returns {on(tint, tint2, amount), off()}, kept in the page.
++constexpr char kPaint[] = R"JS(() => {
++  // sRGB <-> OKLab/OKLCH, and WCAG contrast.
++  const lin = (v) => (v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
++  const gam = (v) => (v <= 0.0031308 ? 12.92 * v : 1.055 * v ** (1 / 2.4) - 0.055);
++  const toLch = ([r, g, b]) => {
++    const [R, G, B] = [r, g, b].map((v) => lin(v / 255));
++    const l = Math.cbrt(0.4122214708 * R + 0.5363325363 * G + 0.0514459929 * B);
++    const m = Math.cbrt(0.2119034982 * R + 0.6806995451 * G + 0.1073969566 * B);
++    const s = Math.cbrt(0.0883024619 * R + 0.2817188376 * G + 0.6299787005 * B);
++    const L = 0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s;
++    const a = 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s;
++    const bb = 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s;
++    return { L, C: Math.hypot(a, bb), h: (Math.atan2(bb, a) * 180 / Math.PI + 360) % 360 };
++  };
++  const rawRgb = ({ L, C, h }) => {
++    const a = C * Math.cos(h * Math.PI / 180), b = C * Math.sin(h * Math.PI / 180);
++    const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3;
++    const m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3;
++    const s = (L - 0.0894841775 * a - 1.291485548 * b) ** 3;
++    return [4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
++      -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
++      -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s];
++  };
++  // Into sRGB: less chroma until it fits.
++  const toRgb = (c) => {
++    let x = { ...c, L: Math.min(1, Math.max(0, c.L)) };
++    for (let i = 0; i < 24; i++) {
++      const v = rawRgb(x);
++      if (v.every((n) => n >= -0.0005 && n <= 1.0005)) break;
++      x = { ...x, C: x.C * 0.85 };
++    }
++    return rawRgb(x).map((v) => Math.round(gam(Math.min(1, Math.max(0, v))) * 255));
++  };
++  const lum = ([r, g, b]) => 0.2126 * lin(r / 255) + 0.7152 * lin(g / 255) + 0.0722 * lin(b / 255);
++  const contrast = (x, y) => { const a = lum(x), b = lum(y); return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05); };
++  // Computed colours, whatever their syntax: through a canvas once each.
++  const ctx = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
++  const parsed = new Map();
++  const parse = (c) => {
++    if (!c || c === 'transparent') return null;
++    if (parsed.has(c)) return parsed.get(c);
++    let v = null;
++    const m = c.match(/^rgba?\(([\d.]+)[, ]+([\d.]+)[, ]+([\d.]+)(?:[,/ ]+([\d.]+%?))?\)$/);
++    if (m) {
++      const a = m[4] === undefined ? 1 : m[4].endsWith('%') ? parseFloat(m[4]) / 100 : +m[4];
++      v = { rgb: [+m[1], +m[2], +m[3]], a };
++    } else if (ctx) {
++      ctx.clearRect(0, 0, 1, 1); ctx.fillStyle = '#000'; ctx.fillStyle = c; ctx.fillRect(0, 0, 1, 1);
++      const d = ctx.getImageData(0, 0, 1, 1).data;
++      v = { rgb: [d[0], d[1], d[2]], a: d[3] / 255 };
++    }
++    if (v && v.a < 0.04) v = null;
++    parsed.set(c, v);
++    return v;
++  };
++  const css = (rgb, a = 1) => (a >= 1 ? `rgb(${rgb.join(' ')})` : `rgb(${rgb.join(' ')} / ${+a.toFixed(3)})`);
++  // The picked hues (the pad's, HSL degrees) as OKLCH hues.
++  const hueOf = (deg) => {
++    const k = (n) => { const x = (n + deg / 30) % 12; return 0.5 - 0.42 * Math.max(-1, Math.min(x - 3, 9 - x, 1)); };
++    return toLch([k(0), k(8), k(4)].map((v) => v * 255)).h;
++  };
++  const turn = (from, to, k) => from + ((((to - from) % 360) + 540) % 360 - 180) * k;
++  const MEDIA = 'img,video,picture,canvas,iframe,embed,object';
++  const ATTRS = ['data-mb-bg', 'data-mb-fg', 'data-mb-bd', 'data-mb-gi'];
++  let pick = null, observer = null, timer = 0, last = 0;
++  const clear = () => {
++    document.getElementById('meridian-boost-paint')?.remove();
++    for (const el of document.querySelectorAll('[data-mb-bg],[data-mb-fg],[data-mb-bd],[data-mb-gi]')) {
++      for (const a of ATTRS) el.removeAttribute(a);
++    }
++  };
++  const paint = () => {
++    if (!pick || !document.body) return;
++    last = performance.now();
++    const { h1, h2, t } = pick;
++    const old = document.getElementById('meridian-boost-paint');
++    old?.remove();   // The site's own colours are read without ours.
++    const pageBg = parse(getComputedStyle(document.body).backgroundColor) ||
++        parse(getComputedStyle(document.documentElement).backgroundColor) || { rgb: [255, 255, 255], a: 1 };
++    const dark = toLch(pageBg.rgb).L < 0.55;
++    const screen = innerWidth * innerHeight;
++    // A background: a neutral one takes the main colour, Arc's tint; a
++    // big coloured block (a hero, a header) turns to it; a small coloured
++    // one (a button, a badge) turns to the second colour. Lightness stays.
++    const bgMemo = new Map();
++    const mapBg = (c, big) => {
++      const key = c.rgb.join() + (big ? 'B' : 's');
++      if (bgMemo.has(key)) return bgMemo.get(key);
++      const x = toLch(c.rgb);
++      let y;
++      if (x.C < 0.035) {
++        const room = 1 - Math.abs(x.L - 0.6) / 0.6;
++        y = { L: dark ? x.L + 0.03 * t : Math.min(x.L, 1 - 0.05 * t),
++              C: x.C * (1 - t) + t * (0.04 + 0.06 * room), h: h1 };
++      } else {
++        y = { L: x.L, C: x.C * (1 - 0.3 * t) + 0.3 * t * Math.max(x.C, 0.13),
++              h: turn(x.h, big ? h1 : h2, Math.min(1, t * 1.6)) };
++      }
++      const out = toRgb(y);
++      bgMemo.set(key, out);
++      return out;
++    };
++    // Text and borders: grey text gets a whisper of the main colour, coloured
++    // text (links) the second one; then it's made readable on what's under it.
++    const mapFg = (c, link) => {
++      const x = toLch(c.rgb);
++      return x.C < 0.035 && !link ?
++          { L: x.L, C: x.C * (1 - t) + t * 0.025, h: h1 } :
++          { L: x.L, C: Math.max(x.C, 0.09 * t), h: turn(x.h, h2, Math.min(1, t * 1.6)) };
++    };
++    const readable = (y, under, need) => {
++      let rgb = toRgb(y);
++      if (contrast(rgb, under) >= need) return rgb;
++      const up = lum(under) < 0.18;
++      // Darker text turns a deep shade of the colour rather than grey.
++      const deep = !up && y.C < 0.05;
++      for (let i = 0; i < 50 && contrast(rgb, under) < need; i++) {
++        y = { L: y.L + (up ? 0.02 : -0.02),
++              C: deep ? Math.max(y.C, 0.08 * pick.t) : y.C * 0.97, h: deep ? pick.h1 : y.h };
++        rgb = toRgb(y);
++      }
++      return rgb;
++    };
++    const rules = new Map();
++    const rule = (attr, prop, value) => {
++      const key = attr + prop + value;
++      let r = rules.get(key);
++      if (!r) { r = { attr, n: rules.size, text: `${prop}:${value}!important` }; rules.set(key, r); }
++      return r.n;
++    };
++    const els = [document.body, ...document.body.querySelectorAll('*')].slice(0, 6000);
++    const under = new Map();   // element -> the opaque background (new) behind it
++    const pageNew = mapBg(pageBg, true);
++    for (const el of els) {
++      for (const a of ATTRS) el.removeAttribute(a);
++      if (el.closest(MEDIA) || el.id === 'meridian-zap') continue;
++      const inSvg = el instanceof SVGElement;
++      const cs = getComputedStyle(el);
++      const parent = el.parentElement;
++      let behind = (parent && under.get(parent)) || pageNew;
++      if (!inSvg) {
++        const bg = parse(cs.backgroundColor);
++        if (bg) {
++          const r = el.getBoundingClientRect();
++          const big = el === document.body || r.width * r.height > screen * 0.12 || r.width > innerWidth * 0.8;
++          const now = mapBg(bg, big);
++          el.setAttribute('data-mb-bg', rule('bg', 'background-color', css(now, bg.a)));
++          if (bg.a > 0.85) behind = now;
++        }
++        const gi = cs.backgroundImage;
++        if (gi && gi.includes('gradient') && !gi.includes('url(')) {
++          const r = el.getBoundingClientRect();
++          const big = r.width * r.height > screen * 0.12;
++          const stops = [];
++          const text = gi.replace(/rgba?\([^)]*\)/g, (m) => {
++            const c = parse(m);
++            if (!c) return m;
++            const now = mapBg(c, big);
++            if (c.a > 0.85) stops.push(now);
++            return css(now, c.a);
++          });
++          if (text !== gi) el.setAttribute('data-mb-gi', rule('gi', 'background-image', text));
++          // Text on a gradient is read against its stops' middle.
++          if (stops.length) behind = [0, 1, 2].map((i) => Math.round(stops.reduce((n, c) => n + c[i], 0) / stops.length));
++        }
++      }
++      under.set(el, behind);
++      const fg = parse(cs.color);
++      const pfg = parent && getComputedStyle(parent).color;
++      const hasText = [...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim());
++      if (fg && (hasText || cs.color !== pfg || el === document.body) && !inSvg) {
++        const link = !!el.closest('a[href]') && toLch(fg.rgb).C >= 0.035;
++        const size = parseFloat(cs.fontSize), weight = parseInt(cs.fontWeight, 10);
++        const need = size >= 24 || (size >= 18.66 && weight >= 700) ? 3 : 4.5;
++        el.setAttribute('data-mb-fg', rule('fg', 'color', css(readable(mapFg(fg, link), behind, need), fg.a)));
++      }
++      for (const side of ['Top', 'Right', 'Bottom', 'Left']) {
++        if (parseFloat(cs[`border${side}Width`]) > 0) {
++          const bd = parse(cs[`border${side}Color`]);
++          if (bd) el.setAttribute('data-mb-bd', rule('bd', 'border-color', css(toRgb(mapFg(bd, false)), bd.a)));
++          break;
++        }
++      }
++    }
++    const accent = css(toRgb({ L: dark ? 0.72 : 0.55, C: 0.15, h: h2 }));
++    let text = `html { accent-color: ${accent} !important; }\n` +
++        `::selection { background-color: ${css(toRgb({ L: dark ? 0.45 : 0.85, C: 0.1, h: h2 }))} !important; }\n` +
++        `html { background-color: ${css(pageNew)} !important; }\n`;
++    for (const r of rules.values()) text += `[data-mb-${r.attr}="${r.n}"]{${r.text}}\n`;
++    const style = old || document.createElement('style');
++    style.id = 'meridian-boost-paint';
++    style.textContent = text;
++    document.documentElement.appendChild(style);
++  };
++  // Pages that change (apps, feeds): painted again, at most once a second.
++  const later = () => {
++    if (timer) return;
++    timer = setTimeout(() => { timer = 0; paint(); }, Math.max(150, 1000 - (performance.now() - last)));
++  };
++  const watch = () => {
++    if (observer || !document.body) return;
++    observer = new MutationObserver((list) => {
++      if (list.some((m) => m.type !== 'attributes' || !String(m.attributeName).startsWith('data-mb-'))) later();
++    });
++    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
++  };
++  return {
++    on(tint, tint2, t) {
++      const next = { h1: hueOf(tint), h2: hueOf(tint2), t: Math.max(0, Math.min(1, t)) };
++      const same = pick && pick.h1 === next.h1 && pick.h2 === next.h2 && pick.t === next.t &&
++          document.getElementById('meridian-boost-paint');
++      pick = next;
++      if (!document.body) {
++        document.addEventListener('DOMContentLoaded', () => { paint(); watch(); }, { once: true });
++        return;
++      }
++      if (!same) paint();
++      watch();
++      if (document.readyState !== 'complete') addEventListener('load', later, { once: true });
++    },
++    off() {
++      pick = null;
++      observer?.disconnect(); observer = null;
++      clearTimeout(timer); timer = 0;
++      clear();
++    },
++  };
++})JS";
++
+ // Puts `css` (a JSON string) in the page's one boost style element, at the
+ // end of the document so it comes after the site's own styles; none when
+ // it's empty.
+-constexpr char kApplyCss[] = R"((css) => {
++constexpr char kApplyCss[] = R"((css, makePaint) => {
+   const root = document.documentElement;
+   if (!root) return false;
+   let s = document.getElementById('meridian-boost-style');
+-  if (!css) { s?.remove(); document.getElementById('meridian-boost-turn')?.remove(); return true; }
++  document.getElementById('meridian-boost-turn')?.remove();
++  if (!css) { s?.remove(); window.__meridianPaint?.off(); return true; }
+   if (!s) { s = document.createElement('style'); s.id = 'meridian-boost-style'; }
+   if (s.textContent !== css) s.textContent = css;
+   if (s.parentNode !== root || s.nextSibling) root.appendChild(s);
+-  // The colour: how far to turn this site's main accent to reach it.
+   const style = getComputedStyle(root);
+   const tint = parseFloat(style.getPropertyValue('--meridian-boost-tint'));
++  const tint2 = parseFloat(style.getPropertyValue('--meridian-boost-tint2'));
+   const strength = parseFloat(style.getPropertyValue('--meridian-boost-strength'));
+-  const accent = () => {
+-    if (window.__meridianBoostAccent !== undefined) return window.__meridianBoostAccent;
+-    const hsl = (c) => {
+-      const m = c.match(/[\d.]+/g)?.map(Number);
+-      if (!m || m.length < 3 || (m.length > 3 && m[3] < 0.5)) return null;
+-      const [r, g, b] = m.map((v) => v / 255), hi = Math.max(r, g, b), lo = Math.min(r, g, b), d = hi - lo;
+-      const l = (hi + lo) / 2;
+-      if (!d) return null;
+-      const sat = d / (1 - Math.abs(2 * l - 1));
+-      const h = hi === r ? ((g - b) / d + 6) % 6 : hi === g ? (b - r) / d + 2 : (r - g) / d + 4;
+-      return { h: h * 60, s: sat, l };
+-    };
+-    const buckets = new Array(36).fill(0), hues = new Array(36).fill(0);
+-    const add = (c, weight, minS) => {
+-      const x = hsl(c);
+-      if (!x || x.s < minS || x.l < 0.14 || x.l > 0.88) return;
+-      const n = Math.floor(x.h / 10) % 36;
+-      buckets[n] += weight; hues[n] += x.h * weight;
+-    };
+-    const screen = innerWidth * innerHeight;
+-    for (const el of [...document.querySelectorAll('body, body *')].slice(0, 1500)) {
+-      if (el.closest('img,video,picture,canvas,svg,iframe')) continue;
+-      const r = el.getBoundingClientRect();
+-      if (!r.width || !r.height || r.bottom < 0 || r.top > innerHeight) continue;
+-      const cs = getComputedStyle(el);
+-      add(cs.backgroundColor, Math.min(r.width * r.height, screen / 4), 0.25);
+-      if ([...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim())) add(cs.color, 900, 0.35);
+-    }
+-    const best = buckets.indexOf(Math.max(...buckets));
+-    if (!buckets[best]) return null;
+-    return window.__meridianBoostAccent = hues[best] / buckets[best];
+-  };
+-  let turn = document.getElementById('meridian-boost-turn');
+-  if (Number.isNaN(tint)) { turn?.remove(); return true; }
+-  if (!turn) { turn = document.createElement('style'); turn.id = 'meridian-boost-turn'; }
+-  const from = accent();
+-  const deg = from === null ? 0 : ((tint - from + 540) % 360 - 180) * Math.min(1, strength / 35);
+-  turn.textContent = `html { --meridian-boost-turn: ${deg.toFixed(1)}deg; }`;
+-  if (turn.nextSibling !== s) root.insertBefore(turn, s);
+-  if (from === null && document.readyState !== 'complete' && !window.__meridianBoostLater) {
+-    window.__meridianBoostLater = true;
+-    addEventListener('load', () => {
+-      const again = accent();
+-      if (again !== null) turn.textContent = `html { --meridian-boost-turn: ${(((tint - again + 540) % 360 - 180) * Math.min(1, strength / 35)).toFixed(1)}deg; }`;
+-    }, { once: true });
+-  }
++  if (Number.isNaN(tint) || !(strength > 0)) { window.__meridianPaint?.off(); return true; }
++  (window.__meridianPaint ||= makePaint()).on(tint, Number.isNaN(tint2) ? tint : tint2, strength / 100);
+   return true;
+ })";
+ 
+@@ -456,7 +649,8 @@ void BoostTabHelper::ApplyCss() {
+   }
+   RunInFrame(frame,
+              std::string("(") + kApplyCss + ")(" +
+-                 base::WriteJson(base::Value(css)).value_or("\"\"") + ")",
++                 base::WriteJson(base::Value(css)).value_or("\"\"") + ", " +
++                 kPaint + ")",
+              base::NullCallback());
+ }
+ 
+diff --git a/chrome/browser/meridian/sidebar.mojom b/chrome/browser/meridian/sidebar.mojom
+index 82c2a4a387..a44ca04337 100644
+--- a/chrome/browser/meridian/sidebar.mojom
++++ b/chrome/browser/meridian/sidebar.mojom
+@@ -323,6 +323,8 @@ struct Boost {
+   int32 size;
+   // "", "lower" or "upper".
+   string text_case;
++  // The second colour's hue (buttons, links, accents); -1: the main one's.
++  int32 tint2;
+ };
+ 
+ // The active tab's site as the Boost panel shows it.
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index d74b7a8bc1..4201978ca4 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -4181,6 +4181,7 @@ mojom::BoostPtr ToMojom(const Boost& b) {
+   m->saturation = b.saturation;
+   m->size = b.size;
+   m->text_case = b.text_case;
++  m->tint2 = b.tint2;
+   return m;
+ }
+ 
+@@ -4248,6 +4249,7 @@ void SidebarHandler::SetBoost(mojom::BoostPtr boost,
+   value.Set("saturation", boost->saturation);
+   value.Set("size", boost->size);
+   value.Set("text_case", boost->text_case);
++  value.Set("tint2", boost->tint2);
+   std::optional<Boost> b = Boost::FromValue(value);
+   if (!service || !b) {
+     std::move(callback).Run(std::string());
+diff --git a/chrome/browser/resources/webui_browser/meridian/ask.ts b/chrome/browser/resources/webui_browser/meridian/ask.ts
+index dbd3ee6cc9..615df4a6c8 100644
+--- a/chrome/browser/resources/webui_browser/meridian/ask.ts
++++ b/chrome/browser/resources/webui_browser/meridian/ask.ts
+@@ -579,6 +579,7 @@ export class MeridianAskElement extends CrLitElement {
+         font: '',
+         tint: -1,
+         tintStrength: 60,
++        tint2: -1,
+         dark: false,
+         brightness: 100,
+         contrast: 100,
+diff --git a/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts b/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts
+index 4ccd22f2db..dc9ed817e9 100644
+--- a/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts
+@@ -25,7 +25,8 @@ ${this.boost_ ? html`
+         @click="${this.onResetClick_}">${icon('history', 15)}</button>
+   </div>
+ 
+-  <div id="pad" class="pad ${this.dragging_ ? 'drag' : ''}" title="Colour"
++  <div id="pad" class="pad ${this.dragging_ ? 'drag' : ''}"
++      title="Colour: the big dot tints the page, the small one buttons and links"
+       @pointerdown="${this.onPadPointerdown_}">
+     <div class="field" style="${this.washStyle_()}">
+       <div id="shade" class="knob shade" style="${this.shadeStyle_()}"></div>
+diff --git a/chrome/browser/resources/webui_browser/meridian/boost_editor.ts b/chrome/browser/resources/webui_browser/meridian/boost_editor.ts
+index 979bcf5aee..c050749a1a 100644
+--- a/chrome/browser/resources/webui_browser/meridian/boost_editor.ts
++++ b/chrome/browser/resources/webui_browser/meridian/boost_editor.ts
+@@ -150,6 +150,7 @@ export class MeridianBoostEditorElement extends CrLitElement {
+         font: '',
+         tint: -1,
+         tintStrength: 60,
++        tint2: -1,
+         dark: false,
+         brightness: 100,
+         contrast: 100,
+@@ -240,14 +241,26 @@ export class MeridianBoostEditorElement extends CrLitElement {
+     return `left:${x}%;top:${y}%;background:hsl(${b.tint} 85% 62%)`;
+   }
+ 
++  // The second colour (buttons, links, accents): the small knob. Until it's
++  // dragged it sits opposite the main one and follows its hue.
+   protected shadeStyle_(): string {
+     const b = this.boost_;
+     if (!b || b.tint < 0) {
+       return 'left:50%;top:50%;opacity:0';
+     }
+-    const [x, y] = this.knobAt_(b);
+-    return `left:${100 - x}%;top:${100 - y}%;` +
+-        `background:hsl(${b.tint} ${Math.round(b.tintStrength * 0.5)}% 16%)`;
++    const [x, y] = this.shadeAt_(b);
++    const hue = b.tint2 >= 0 ? b.tint2 : b.tint;
++    return `left:${x}%;top:${y}%;background:hsl(${hue} 75% ${
++        b.tint2 >= 0 ? 52 : 40}%)`;
++  }
++
++  private shadeAt_(b: Boost): [number, number] {
++    if (b.tint2 < 0) {
++      const [x, y] = this.knobAt_(b);
++      return [100 - x, 100 - y];
++    }
++    return this.knobAt_(
++        {...b, tint: b.tint2, tintStrength: Math.max(40, b.tintStrength)});
+   }
+ 
+   protected washStyle_(): string {
+@@ -338,6 +351,7 @@ export class MeridianBoostEditorElement extends CrLitElement {
+       hue: 0,
+       font: '',
+       tint: -1,
++      tint2: -1,
+       dark: false,
+       brightness: 100,
+       contrast: 100,
+@@ -351,11 +365,18 @@ export class MeridianBoostEditorElement extends CrLitElement {
+     const pad = e.currentTarget as HTMLElement;
+     const field = pad.querySelector<HTMLElement>('.field')!;
+     pad.setPointerCapture(e.pointerId);
+-    this.pickColour_(field, e);
++    // On the small knob: the second colour; anywhere else the main one.
++    const shade = pad.querySelector<HTMLElement>('#shade')!.getBoundingClientRect();
++    const second = !!this.boost_ && this.boost_.tint >= 0 &&
++        Math.hypot(e.clientX - (shade.left + shade.width / 2),
++                   e.clientY - (shade.top + shade.height / 2)) <= 14;
++    const pick = (ev: PointerEvent) => second ? this.pickSecond_(field, ev) :
++                                                this.pickColour_(field, ev);
++    pick(e);
+     // A click glides the knob over; a drag holds it under the pointer.
+     const move = (ev: PointerEvent) => {
+       this.dragging_ = true;
+-      this.pickColour_(field, ev);
++      pick(ev);
+     };
+     const up = () => {
+       this.dragging_ = false;
+@@ -381,6 +402,18 @@ export class MeridianBoostEditorElement extends CrLitElement {
+     });
+   }
+ 
++  // The second colour: only its hue (the angle), the amount is the main one's.
++  private pickSecond_(field: HTMLElement, e: PointerEvent) {
++    const r = field.getBoundingClientRect();
++    const dx = (e.clientX - r.left) / r.width - 0.5;
++    const dy = (e.clientY - r.top) / r.height - 0.5;
++    if (Math.hypot(dx, dy) < 0.02) {
++      return;
++    }
++    const hue = (Math.atan2(dx, -dy) * 180 / Math.PI + 360) % 360;
++    this.change_({tint2: Math.round(hue) % 360});
++  }
++
+   protected onDarkClick_() {
+     this.change_({dark: !this.boost_?.dark});
+   }
+@@ -390,7 +423,7 @@ export class MeridianBoostEditorElement extends CrLitElement {
+   }
+ 
+   protected onNoColourClick_() {
+-    this.change_({tint: -1, hue: 0});
++    this.change_({tint: -1, tint2: -1, hue: 0});
+   }
+ 
+   protected onAdjustInput_(e: Event) {
