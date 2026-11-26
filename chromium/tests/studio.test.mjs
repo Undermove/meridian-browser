@@ -234,3 +234,49 @@ test('Studio\'s Boost: what a site had is kept, Before/After switches it, Undo p
     cleanup(s.project, s.bin, s.profile);
   }
 });
+
+test('Point and say: Studio\'s site tab gets the overlay; a click there names the element in Studio; a hand change lands in the site\'s Boost', async () => {
+  const http = await import('node:http');
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end('<!doctype html><title>Beans</title><style>.btn{display:inline-block;margin:80px;padding:10px 18px;border-radius:20px;background:#2e7d4f;color:#fff;font:15px sans-serif}</style><a class="btn" href="#">Choose beans</a>');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}/`;
+  const s = await setup();
+  const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio', '--lang=en-US'] });
+  let wb, site;
+  try {
+    wb = await openWorkbench(b);
+    await wb.eval(`(() => { window.__pts = []; window.workbench.onHostCommand((m) => { if (m?.type === 'studio-point') window.__pts.push(m); }); return true; })()`);
+    // Studio opens the site next to itself and remembers that tab.
+    await wb.eval(`(() => { window.workbench.toHost({ type: 'studio-site', url: ${JSON.stringify(url)} }); return true; })()`);
+    site = await b.page(url);
+    await site.waitFor(`document.readyState === 'complete' && !!document.querySelector('.btn')`);
+    await wb.waitFor(`window.workbench.studioPoint('site').then((s) => s.open)`);
+    assert.equal(await wb.eval(`window.workbench.studioPoint('start', { lang: 'en', colors: [] })`), true);
+    // A real click on the page picks the element (the link doesn't navigate).
+    const r = await site.waitFor(`(() => { const r = document.querySelector('.btn').getBoundingClientRect(); return r.width ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null; })()`);
+    for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+      await site.cdp.send('Input.dispatchMouseEvent', { type, x: r.x, y: r.y, button: type === 'mouseMoved' ? 'none' : 'left', clickCount: 1 });
+    }
+    const picked = await wb.waitFor(`window.__pts.flatMap((m) => m.events).find((e) => e.type === 'select')`, 10000);
+    assert.equal(picked.items[0].name, 'Button · «Choose beans»');
+    assert.equal(await site.eval(`location.hash`), '');
+    // A hand change goes into the site's Boost (Studio's own), and shows on the page.
+    const sel = picked.items[0].sel;
+    await wb.eval(`window.workbench.studioBoost('hand', '127.0.0.1', ${JSON.stringify(`${sel} { border-radius: 3px !important; }`)})`);
+    await site.waitFor(`getComputedStyle(document.querySelector('.btn')).borderTopLeftRadius === '3px'`, 10000);
+    const boosts = await wb.eval(`window.workbench.studioBoost('get', '127.0.0.1')`);
+    assert.deepEqual(boosts.map((x) => x.name).sort(), ['127.0.0.1', 'Studio · 127.0.0.1']);
+    // Esc ends it; Studio hears so.
+    await wb.eval(`window.workbench.studioPoint('stop')`);
+    assert.equal(await wb.eval(`window.workbench.studioPoint('site').then((s) => s.on)`), false);
+  } finally {
+    site?.close();
+    wb?.close();
+    await b.close();
+    server.close();
+    cleanup(s.project, s.bin, s.profile);
+  }
+});

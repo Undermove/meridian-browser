@@ -89,6 +89,7 @@ async function studioBoot() {
 
 function studioHostCommand(msg) {
   if (!ST.on || !msg) return;
+  if (msg.type === 'studio-point') { stOnPoint(msg); return; }
   if (msg.type === 'mission' && msg.studio && typeof msg.studio === 'object') {
     const before = ST.mission;
     ST.mission = msg.studio;
@@ -234,6 +235,7 @@ function stBuild() {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); stSubmit(); }
   });
   $('#st-chips', el).addEventListener('click', (e) => {
+    if (e.target.closest('[data-point]')) { stPoint(true); return; }
     const c = e.target.closest('[data-chip]');
     if (!c) return;
     const input = $('#st-input');
@@ -368,6 +370,9 @@ function stRenderFeed(t) {
     });
     for (const a of answeredHere.filter((x) => x.after >= turn.items.length)) parts.push(answeredHtml(a));
   });
+  if (k.handNotes?.length) {
+    parts.push(`<div class="st-hand" data-key="hand">${icon('pencil', 14)}<span><b>${esc(w.handTitle)}</b> ${esc(k.handNotes.map((n) => `${n.who} — ${n.what.join(', ')}`).join('; '))}. ${esc(w.handNext)}</span></div>`);
+  }
   for (const q of k.queue) parts.push(`<div class="st-msg-user queued" data-key="q${esc(q.id)}">${esc(q.text)}<span class="st-queued">${esc(w.queued)}</span></div>`);
   if (k.trust) {
     parts.push(`<div class="st-ask" data-key="trust" data-title="${esc(w.trustTitle)}">
@@ -456,7 +461,12 @@ function stText(text) {
   if (list) out += '</ul>';
   return out;
 }
-const stInline = (s) => esc(s).replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/`([^`]+)`/g, '$1');
+const stInline = (s) => {
+  // [[pin: selector | text]] reads as a numbered pin with its text.
+  let n = 0;
+  const out = esc(s).replace(/\[\[pin:\s*[^|\]]{1,300}\|\s*([^\]]{1,400})\]\]/g, (_, text) => `<span class="st-pin">${++n}</span> ${text}`);
+  return out.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/`([^`]+)`/g, '$1');
+};
 
 function stStepHtml(s, live, progress, status = 'work') {
   const [ic, done, doing] = StudioWords.stepWords(s.tool, s.input, ST.lang);
@@ -558,9 +568,13 @@ function stRenderChips(t) {
   // Suggestions start a task; once it runs they'd only get in the way.
   const show = !t || !stTask(t).model.turns.length;
   const role = ST.persona in w.chips ? ST.persona : 'designer';
-  const html = show ? `<span class="st-role">${esc(w.roles[role])}</span>${w.chips[role].map((c) => `<button type="button" class="st-chip" data-chip="${esc(c)}">${esc(c)}</button>`).join('')}` : '';
+  // With a site to show: the way to point at it, the hero of Studio.
+  const site = t && stTask(t).site && !ST.pointing;
+  const point = site ? `<button type="button" class="st-chip hero" data-point>${stCursorIcon()}<span>${esc(w.pointChip)}</span></button>` : '';
+  const picked = ST.pointing && ST.picked?.length ? `<span class="st-picked">${stCursorIcon()}${esc(ST.picked[0].name)}${ST.picked.length > 1 ? ` ${esc(w.andMore(ST.picked.length - 1))}` : ''}</span>` : '';
+  const html = (show ? `<span class="st-role">${esc(w.roles[role])}</span>${w.chips[role].map((c) => `<button type="button" class="st-chip" data-chip="${esc(c)}">${esc(c)}</button>`).join('')}` : '') + point + picked;
   if (box.dataset.html !== html) { box.innerHTML = html; box.dataset.html = html; }
-  box.hidden = !show;
+  box.hidden = !html;
 }
 
 // ---------------------------------------------------------------- result: site, pictures, documents
@@ -605,6 +619,7 @@ function stRenderResultBar(t) {
   const changed = !!b?.changed;
   const html = `<span class="st-url">${icon('lock', 12)}<b>${esc(host)}</b></span>
     <button class="st-link" data-rb="site" title="${esc(w.showSite)}">${icon('layers', 13)}</button>
+    <button class="st-point${ST.pointing ? ' on' : ''}" data-rb="point" aria-pressed="${ST.pointing ? 'true' : 'false'}" title="${esc(w.pointTitle)}">${stCursorIcon()}<span>${esc(w.point)}</span></button>
     <div class="grow"></div>
     ${changed ? `<span class="st-boost${b.undone ? ' undone' : ''}">${icon('bolt', 13)}<span>${esc(b.undone ? w.boostUndone : w.boostUndo)}</span>${b.undone ? '' : `<button class="st-undo" data-rb="undo" title="${esc(w.undoTitle)}" aria-label="${esc(w.undo)}">${stUndoIcon()}</button>`}</span>
     <div class="st-ba" role="group"><button data-rb="before" class="${b.showing === 'before' ? 'on' : ''}">${esc(w.before)}</button><button data-rb="after" class="${b.showing !== 'before' ? 'on' : ''}"${b.undone ? ' disabled' : ''}>${esc(w.after)}</button></div>` : ''}`;
@@ -614,10 +629,13 @@ function stRenderResultBar(t) {
 
 const stUndoIcon = () => '<svg class="ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14.5L4.5 10 9 5.5"/><path d="M4.5 10h10a5 5 0 0 1 0 10h-3"/></svg>';
 
+const stCursorIcon = () => '<svg class="ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 3.5l13 7-5.6 1.6L10 18z"/></svg>';
+
 function stOpenSite(k) {
   if (!k?.site) return;
   k.siteOpened = true;
-  wb.toHost({ type: 'preview', url: k.site });
+  // Studio remembers this tab: point and say works in it.
+  wb.toHost({ type: 'studio-site', url: k.site });
 }
 
 async function stBoostSnapshot(k, host) {
@@ -633,6 +651,7 @@ async function stOnResultBarClick(e) {
   const k = stTask(t);
   const b = k.boost;
   if (a === 'site') return stOpenSite(k);
+  if (a === 'point') return stPoint(!ST.pointing);
   if (!b) return;
   try {
     if (a === 'before' && b.showing !== 'before') {
@@ -644,6 +663,8 @@ async function stOnResultBarClick(e) {
       b.showing = 'after';
     } else if (a === 'undo') {
       await wb.studioBoost('restore', b.host, b.before);
+      k.hand = new Map();
+      k.handNotes = [];
       b.showing = 'before';
       b.undone = true;
       b.after = null;
@@ -756,7 +777,9 @@ async function stSubmit() {
       stRender();
       return;
     }
-    stType(t, text);
+    // Typed while something is picked on the page: about that; hand changes go first.
+    const about = ST.pointing && ST.picked?.length ? STW().sayPrompt(StudioWords.host(k.site), ST.picked.map((x) => `${x.name} — \`${x.sel}\``).join('\n'), text) : text;
+    stSend(t, about);
     stRender();
   } finally { ST.sending = false; }
 }
@@ -800,6 +823,117 @@ function stFlush(t) {
   if (q) stType(t, q.text);
 }
 
+// ---------------------------------------------------------------- point and say (the site next to Studio)
+
+// On: the overlay in the site's tab (studio_point.js): hover, click (Shift: more), say or change by
+// hand. Opens the site next to Studio first if it isn't.
+async function stPoint(on) {
+  const t = stCurrent();
+  const k = t && stTask(t);
+  if (!on) { ST.pointing = false; wb.studioPoint?.('stop').catch(() => {}); stRender(); return; }
+  if (!k?.site) return;
+  let site = await wb.studioPoint('site').catch(() => null);
+  if (!site?.open) {
+    stOpenSite(k);
+    for (let i = 0; i < 40 && !site?.open; i++) { await new Promise((r) => setTimeout(r, 150)); site = await wb.studioPoint('site').catch(() => null); }
+  }
+  if (!site?.open) { toast(STW().pointNoSite); return; }
+  await stBoostSnapshot(k, StudioWords.host(k.site));
+  ST.pointing = !!(await wb.studioPoint('start', { lang: ST.lang, colors: [] }).catch(() => false));
+  stSendPins(t, k, true);
+  stRender();
+}
+
+// What the person did on the page.
+async function stOnPoint(msg) {
+  if (msg.gone || msg.on === false) ST.pointing = false;
+  const t = stCurrent();
+  if (!t) return stRender();
+  const k = stTask(t);
+  for (const ev of Array.isArray(msg.events) ? msg.events : []) {
+    const items = (Array.isArray(ev.items) ? ev.items : []).filter((x) => typeof x?.sel === 'string').slice(0, 60);
+    if (ev.type === 'select') ST.picked = items;
+    if (ev.type === 'edit' && items.length && ev.props && typeof ev.props === 'object') await stHand(t, k, items, ev.props);
+    if (ev.type === 'say' && typeof ev.text === 'string' && ev.text.trim()) stSayAbout(t, k, items, ev.text.trim());
+    if (ev.type === 'pin' && Number.isFinite(+ev.n)) {
+      const pin = (k.pins || []).find((p) => p.n === +ev.n);
+      if (pin && ev.answer === 'yes') stSend(t, STW().pinYes(pin.n, pin.text));
+      if (pin) { k.pinsDone = new Set([...(k.pinsDone || []), pin.n]); stSendPins(t, k, true); }
+    }
+  }
+  stRender();
+}
+
+// A change by hand: into the site's Boost (Studio's own, so Claude's restyles don't overwrite it),
+// remembered so Claude hears of it with the next message.
+async function stHand(t, k, items, props) {
+  const clean = Object.fromEntries(Object.entries(props).filter(([p, v]) => /^[a-z-]{1,40}$/.test(p) && typeof v === 'string' && /^[#\w\s.,()%-]{1,60}$/.test(v)));
+  if (!Object.keys(clean).length) return;
+  k.hand = k.hand || new Map();
+  for (const it of items) k.hand.set(it.sel, { name: it.name, props: { ...(k.hand.get(it.sel)?.props || {}), ...clean } });
+  const css = [...k.hand.entries()].map(([sel, h]) => `${sel} { ${Object.entries(h.props).map(([p, v]) => `${p}: ${v} !important;`).join(' ')} }`).join('\n');
+  const host = StudioWords.host(k.site);
+  await stBoostSnapshot(k, host);
+  try {
+    await wb.studioBoost('hand', host, css);
+    await wb.studioPoint('settled');
+  } catch (err) { toast(err.message); return; }
+  if (k.boost) { k.boost.changed = true; k.boost.undone = false; k.boost.showing = 'after'; }
+  k.handNotes = k.handNotes || [];
+  const what = StudioWords.handWords(clean, ST.lang);
+  const who = items.length > 1 ? `${items[0].name} ${STW().andMore(items.length - 1)}` : items[0].name;
+  const last = k.handNotes[k.handNotes.length - 1];
+  if (last && last.who === who) last.what = [...new Set([...last.what, ...what])];
+  else k.handNotes.push({ who, what, sels: items.map((x) => x.sel) });
+}
+
+// The hand changes in words, for Claude (sent before the next message) and for the chat.
+function stHandPrompt(k) {
+  if (!k.handNotes?.length) return '';
+  const lines = k.handNotes.map((n) => `- ${n.who} (${n.sels.slice(0, 3).join(', ')}): ${n.what.join(', ')}`);
+  return STW().handPrompt(StudioWords.host(k.site), lines.join('\n'));
+}
+
+function stSayAbout(t, k, items, text) {
+  const host = StudioWords.host(k.site);
+  const list = items.map((x) => `${x.name} — \`${x.sel}\``).join('\n');
+  stSend(t, STW().sayPrompt(host, list, text));
+}
+
+// A message from Studio itself (point and say, a pin): with the hand changes first, as typed ones.
+function stSend(t, text) {
+  const k = stTask(t);
+  const full = [stHandPrompt(k), text].filter(Boolean).join('\n\n');
+  k.handNotes = [];
+  if (stStatus(t) === 'work' || stStatus(t) === 'needs') { k.queue.push({ id: `q${++stQueueSeq}`, text: full }); return; }
+  stType(t, full);
+}
+
+// Claude's remarks about elements ([[pin: selector | text]] in its answers) as numbered pins.
+function stPinsOf(k) {
+  const out = [];
+  const seen = new Set();
+  for (const turn of k.model.turns) for (const it of turn.items) {
+    if (it.type !== 'text') continue;
+    for (const m of it.text.matchAll(/\[\[pin:\s*([^|\]]{1,300})\|\s*([^\]]{1,400})\]\]/g)) {
+      const sel = m[1].trim(), text = m[2].trim();
+      if (seen.has(sel + text)) continue;
+      seen.add(sel + text);
+      out.push({ n: out.length + 1, sel, text });
+    }
+  }
+  return out;
+}
+function stSendPins(t, k, force = false) {
+  const pins = stPinsOf(k);
+  k.pins = pins;
+  const shown = pins.filter((p) => !k.pinsDone?.has(p.n));
+  const key = JSON.stringify(shown);
+  if (!force && key === k.pinsKey) return;
+  k.pinsKey = key;
+  if (typeof wb.studioPoint === 'function') wb.studioPoint('pins', shown).catch(() => {});
+}
+
 // ---------------------------------------------------------------- the loop: transcripts in
 
 async function stRead(t, k) {
@@ -830,6 +964,7 @@ function stOnModel(t, k) {
     // The result, in sight: the site opens next to Studio once per task.
     if (!k.siteOpened && ST.view === 'studio' && ST.current === t.id && !document.hidden) stOpenSite(k);
   }
+  stSendPins(t, k);
   // A restyle that went through: Before/After and Undo for it.
   for (const turn of k.model.turns) for (const it of turn.items) {
     if (it.type === 'steps' && it.steps.some((s) => s.tool === 'mcp__meridian__set_boost' && s.state === 'ok') && k.boost) {

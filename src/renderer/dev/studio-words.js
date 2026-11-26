@@ -33,6 +33,12 @@
       openFile: 'Показать в папке', taskFallback: 'Новая задача', notStarted: 'Не удалось запустить Claude',
       details: 'Подробнее', consent: 'Задачи выполняет Claude от Anthropic: то, что вы пишете, и файлы, которые он смотрит, уходят в Anthropic.',
       consentOk: 'Понятно, начать',
+      point: 'Ткни и скажи', pointTitle: 'Покажите на странице, что поменять: скажите словами или поправьте руками', pointNoSite: 'Сначала откройте сайт рядом',
+      pointChip: 'Показать на странице',
+      pinYes: (n, t) => `Да, сделай то, что ты предложил в пине ${n}: ${t}`, andMore: (n) => `и ещё ${n}`,
+      handTitle: 'Вы поправили руками:', handNext: 'Claude узнает об этом со следующим сообщением.',
+      handPrompt: (host, lines) => `Я поправил руками на странице ${host} (это уже в Boost «Studio · ${host}», не перезаписывай и учитывай дальше):\n${lines}`,
+      sayPrompt: (host, list, text) => `На странице ${host} я показал на:\n${list}\n\n${text}\n\nМеняй только это (через Boost на этом сайте), остальное не трогай.`,
       trustTitle: 'Разрешить Claude работать в этой папке?', trustDetail: (n) => `Claude будет смотреть файлы в папке ${n} и спрашивать, прежде чем что-то поменять.`,
     },
     en: {
@@ -62,6 +68,12 @@
       openFile: 'Show in folder', taskFallback: 'New task', notStarted: 'Couldn’t start Claude',
       details: 'Details', consent: 'Tasks are done by Claude from Anthropic: what you write and the files it looks at go to Anthropic.',
       consentOk: 'Got it, start',
+      point: 'Point and say', pointTitle: 'Show on the page what to change: say it, or change it by hand', pointNoSite: 'Open the site alongside first',
+      pointChip: 'Show on the page',
+      pinYes: (n, t) => `Yes, do what you suggested in pin ${n}: ${t}`, andMore: (n) => `and ${n} more`,
+      handTitle: 'You changed by hand:', handNext: 'Claude hears about it with the next message.',
+      handPrompt: (host, lines) => `I changed these by hand on ${host} (already in the Boost "Studio · ${host}"; don't overwrite it, keep it from now on):\n${lines}`,
+      sayPrompt: (host, list, text) => `On ${host} I pointed at:\n${list}\n\n${text}\n\nChange only that (through a Boost on this site), leave the rest.`,
       trustTitle: 'Let Claude work in this folder?', trustDetail: (n) => `Claude will look at the files in ${n} and ask before it changes anything.`,
     },
   };
@@ -146,7 +158,22 @@
     return ru ? ['Разрешить следующий шаг?', ''] : ['Allow the next step?', ''];
   }
 
-  const api = { T, stepWords, askWords, host };
+  // Hand changes (CSS properties) in words.
+  function handWords(props, lang) {
+    const ru = lang === 'ru';
+    const out = [];
+    for (const [p, v] of Object.entries(props || {})) {
+      if (p === 'background-color' || p === 'color') out.push(`${ru ? 'цвет' : 'colour'} ${v}`);
+      else if (p === 'font-size') out.push(`${ru ? 'текст' : 'text'} ${v}`);
+      else if (p === 'border-radius') out.push(`${ru ? 'скругление' : 'corners'} ${v}`);
+      else if (/^padding-(left|right)$/.test(p)) { const t = `${ru ? 'отступы по бокам' : 'side spacing'} ${v}`; if (!out.includes(t)) out.push(t); }
+      else if (/^padding-(top|bottom)$/.test(p)) { const t = `${ru ? 'отступы сверху и снизу' : 'top and bottom spacing'} ${v}`; if (!out.includes(t)) out.push(t); }
+      else out.push(`${p} ${v}`);
+    }
+    return out;
+  }
+
+  const api = { T, stepWords, askWords, host, handWords };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.StudioWords = api;
 })(typeof window !== 'undefined' ? window : globalThis);
