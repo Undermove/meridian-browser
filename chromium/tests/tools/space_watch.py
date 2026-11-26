@@ -26,7 +26,10 @@ def browsers():
         return out
     for line in ps.splitlines():
         parts = line.strip().split(None, 2)
-        if len(parts) == 3 and parts[1] == '1' and BROWSER.search(parts[2]) and not any(parts[2].startswith(a) for a in ALLOWED):
+        # Only an app itself, not its helpers (…/Contents/Frameworks/…/Helpers/X Helper (Renderer).app):
+        # macOS starts a running browser's renderers from launchd too (the owner's Chrome opening a
+        # page is not a browser started).
+        if len(parts) == 3 and parts[1] == '1' and BROWSER.search(parts[2]) and '/Contents/Frameworks/' not in parts[2] and not any(parts[2].startswith(a) for a in ALLOWED):
             out[int(parts[0])] = parts[2]
     return out
 
