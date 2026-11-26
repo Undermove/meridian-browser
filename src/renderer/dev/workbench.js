@@ -905,11 +905,50 @@ function newXterm() {
     scrollback: 10000,
     macOptionIsMeta: false,
     theme: termTheme(),
+    allowProposedApi: true, // term.unicode (the width table below)
   });
   // eslint-disable-next-line no-undef
   const fit = new FitAddon.FitAddon();
   xterm.loadAddon(fit);
+  // Character widths as Claude Code and today's terminals count them (Unicode 15, whole grapheme
+  // clusters): ✅ 🔧 ⚙️ 🇬🇪 👍🏽 take two columns. xterm's own table (Unicode 6) gives many of them
+  // one, so the cursor ran a column behind the program and the next letter landed on the emoji.
+  if (typeof UnicodeGraphemesAddon !== 'undefined') {
+    // eslint-disable-next-line no-undef
+    try { xterm.loadAddon(new UnicodeGraphemesAddon.UnicodeGraphemesAddon()); xterm.unicode.activeVersion = '15-graphemes'; } catch {}
+  }
   return { xterm, fit };
+}
+
+// Measures the font again and redraws every terminal: a glyph width measured before the font
+// arrived (or at another screen's pixel ratio) makes letters overlap until something redraws, which
+// was minimizing the window and back.
+function termRemeasure(t) {
+  try { t.xterm._core._renderService?.handleDevicePixelRatioChange?.(); } catch {}
+  try { t.xterm.clearTextureAtlas(); } catch {}
+  try { t.xterm.refresh(0, t.xterm.rows - 1); } catch {}
+}
+let termRemeasureQueued = false;
+function termRemeasureAll() {
+  if (termRemeasureQueued) return;
+  termRemeasureQueued = true;
+  requestAnimationFrame(() => {
+    termRemeasureQueued = false;
+    fitActive();
+    for (const t of S.terms) termRemeasure(t);
+  });
+}
+function initTermRemeasure() {
+  document.fonts?.ready?.then(termRemeasureAll);
+  document.fonts?.addEventListener?.('loadingdone', termRemeasureAll);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') termRemeasureAll(); });
+  window.addEventListener('focus', termRemeasureAll);
+  // A move to a screen with another pixel ratio: the query is for the ratio it was made at.
+  const watchRatio = () => {
+    const mq = matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+    mq.addEventListener('change', () => { termRemeasureAll(); watchRatio(); }, { once: true });
+  };
+  watchRatio();
 }
 
 // Scrolling as in a Mac app: the lines follow the fingers at a steady rate. xterm hands a program
@@ -1252,7 +1291,10 @@ function activateTerm(t) {
 function fitActive() {
   const t = S.activeTerm;
   if (!t || $('#term-area').classList.contains('collapsed')) return;
+  const { cols, rows } = t.xterm;
   try { t.fit.fit(); } catch {}
+  // A new size redraws by itself; the same size after the area was hidden may not.
+  if (t.xterm.cols === cols && t.xterm.rows === rows) try { t.xterm.refresh(0, rows - 1); } catch {}
 }
 
 // Names given by hand (double click on a tab), by terminal, for as long as the terminals live.
@@ -1951,6 +1993,7 @@ function initTerminals() {
     if ($('#topbar')) ro.observe($('#topbar'));
   }
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { for (const t of S.terms) t.xterm.options.theme = termTheme(); });
+  initTermRemeasure();
 }
 
 // ---------------------------------------------------------------- layout: resizable panes
