@@ -39,7 +39,7 @@ export function decide(ours, releases, now = new Date()) {
       body: `Meridian is built on Chromium ${ours} (branch ${branch}). Chrome ${stable.version} has been ` +
         `stable for ${behind} day(s), so branch ${branch} no longer gets security fixes.\n\n` +
         `Run \`chromium/update_chromium.sh --branch ${parse(stable.version)[2]}\` (rebases the patches, ` +
-        `builds, tests, packages and drafts a release).`,
+        `builds, tests, packages and opens a pull request to main).`,
     };
   }
   // A newer build of our branch (stable or beta).
@@ -57,7 +57,7 @@ export function decide(ours, releases, now = new Date()) {
         `(${mine.map((r) => `${r.version} ${r.channel.toLowerCase()}`).join(', ')}); the first came out ` +
         `${behind} day(s) ago. They usually carry security fixes.\n\n` +
         `Run \`chromium/update_chromium.sh\` (moves to the branch's head, builds, tests, packages and ` +
-        `drafts a release).`,
+        `opens a pull request to main).`,
     };
   }
   return { action: 'none', version: ours, branch, urgent: false, title: '', body: '' };

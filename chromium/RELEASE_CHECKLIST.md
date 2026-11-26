@@ -54,6 +54,14 @@ packaged app). Run it when no build or other test run is going on (`pgrep -f aut
    renderer or the browser crashed behind it. Each crash is either fixed or filed with the test
    that ran then. On Windows: `%LOCALAPPDATA%\CrashDumps`.
 
+## A new Chromium
+
+`chromium/update_chromium.sh` (by hand, or the "Chromium update" workflow) moves to the new
+Chromium, builds, runs the tests and packages, then commits on a new branch
+`chromium-<Chromium version>`, pushes it and opens a pull request to `main`. It never pushes to
+`main` and never drafts a release. The gate above runs on that branch's build; the release is made
+from `main` after the PR is reviewed and merged.
+
 ## Then, as before (chromium/README.md, CLAUDE.md §6)
 
 - `chromium/package.sh` (`package_win.sh`), and the touched tests plus `journey.test.mjs` against
