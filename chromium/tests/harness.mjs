@@ -437,3 +437,7 @@ export const NEEDS_SCREEN = !FOREGROUND && 'needs a window on screen: run with M
 export const tabEl = (i) => `${SB}.querySelectorAll('meridian-tab-row')[${i}]`;
 export const itemEl = (title) => `(() => { const all = []; const walk = (root) => { for (const el of root.querySelectorAll('meridian-item')) { all.push(el); walk(el.shadowRoot); } }; walk(${SB}); return all.find((el) => el.item.title === ${JSON.stringify(title)}); })()`;
 export const favEl = (i) => `${SB}.querySelectorAll('meridian-fav')[${i}]`;
+// How a sidebar row (a meridian-tab-row or meridian-item, as an expression) looks: its classes,
+// host attributes, favicon (children, opacity, filter) and any sleep mark — a JSON string to
+// compare. A sleeping tab looks like any other (as in Arc): no moon, no dimming.
+export const rowLook = (el) => `(() => { const h = ${el}; const r = h.shadowRoot.querySelector('.row'); const f = r.querySelector('.favicon'); const cs = getComputedStyle(f.querySelector('img')); return JSON.stringify({ cls: [...r.classList].sort(), attrs: h.getAttributeNames().sort(), fav: f.children.length, opacity: cs.opacity, filter: cs.filter, mark: !!h.shadowRoot.querySelector('.moon, .asleep, [title^="Asleep"]') }); })()`;
