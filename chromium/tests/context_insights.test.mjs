@@ -277,6 +277,43 @@ test('cost chart: each spike takes its cause only when the transcript proves it;
     const panel = await wb.eval(`document.querySelector('#side-body').innerText`);
     for (const s of ['Cold cache', 'Compaction', 'Big file read', 'MCP load', 'Unknown', 'Normal use', 'Subagents', 'API price']) assert.ok(panel.includes(s), `says “${s}”`);
 
+    // The two tallest bars are explained under the chart, from the transcript alone: the start
+    // (where the unexplained collapse costs most, with the file and the MCP load next to it) and
+    // the cache gone cold after the 10-minute pause.
+    const spikes = await wb.eval(`[...document.querySelectorAll('.ci-spike')].map((e) => ({ i: +e.dataset.i, cause: e.dataset.cause, turn: +e.dataset.turn, text: e.innerText }))`);
+    assert.equal(spikes.length, 2, JSON.stringify(spikes));
+    assert.equal(spikes[0].cause, 'unknown');
+    assert.match(spikes[0].text, /doesn’t say why; also MCP load, big file read, cold cache/);
+    assert.equal(spikes[1].cause, 'cold');
+    assert.match(spikes[1].text, /Cold cache[\s\S]*10 min pause[\s\S]*also compaction/);
+    const coldTurn = await wb.eval(`${allTurns}.find((t) => t.cause === 'cold' && /pause/.test(t.why)).index`);
+    assert.equal(spikes[1].turn, coldTurn);
+
+    // A click on the spike: its bar is picked, the panel scrolls to its turns, the turn it named
+    // is marked and the costliest turns stand out.
+    await wb.eval(`(document.querySelector('#side-body').scrollTop = 0, true)`);
+    await click(wb, `document.querySelectorAll('.ci-spike')[1]`);
+    await wb.waitFor(`!!document.querySelector('.ci-range .ci-turn.focus')`);
+    assert.deepEqual(await wb.eval(`[...document.querySelectorAll('.ci-turn.focus')].map((e) => +e.dataset.turn)`), [coldTurn]);
+    assert.equal(await wb.eval(`document.querySelector('.ci-money .bar.sel')?.dataset.i`), String(spikes[1].i));
+    assert.ok(await wb.eval(`document.querySelector('.ci-turn.hot')?.dataset.turn === '${coldTurn}'`), 'the costliest turn of the bar stands out');
+    const inView = (sel) => `(() => { const e = document.querySelector('${sel}'); const b = document.querySelector('#side-body').getBoundingClientRect(); const r = e.getBoundingClientRect(); return r.top >= b.top - 1 && r.bottom <= b.bottom + 1; })()`;
+    assert.ok(await wb.eval(inView('.ci-turn.focus')), 'scrolled to the turn');
+
+    // A click on one colour of a bar: that cause's turns are the marked ones.
+    const fileBar = await wb.eval(`CI.data.moneySeries.findIndex((b) => b.turns.some((t) => t.cause === 'file'))`);
+    await wb.eval(`(document.querySelector('#side-body').scrollTop = 0, true)`);
+    const seg = await wb.eval(`(() => { const e = document.querySelectorAll('.ci-money .bar')[${fileBar}].querySelector('i[data-cause="file"]'); e.scrollIntoView({ block: 'center' }); const r = e.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: seg.x, y: seg.y });
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: seg.x, y: seg.y, button: 'left', clickCount: 1 });
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: seg.x, y: seg.y, button: 'left', clickCount: 1 });
+    await wb.waitFor(`document.querySelector('.ci-turn.focus')?.innerText.includes('Big file read')`);
+    assert.match(await wb.eval(`[...document.querySelectorAll('.ci-turn.focus')].map((e) => e.innerText).join('\\n')`), /^Turn \d+ · [^·]+ · Big file read[\s\S]*huge\.js/);
+    assert.equal(await wb.eval(`document.querySelectorAll('.ci-turn.focus').length`), 1);
+    assert.ok(await wb.eval(inView('.ci-turn.focus')), 'scrolled to the file read');
+    await click(wb, `document.querySelector('.ci-range-clear')`);
+    await wb.waitFor(`!document.querySelector('.ci-range')`);
+
     // A click on the bar with the unexplained spike.
     const bar = await wb.eval(`CI.data.moneySeries.findIndex((b) => b.turns.some((t) => t.cause === 'unknown'))`);
     const p = await barPoint(wb, bar);
