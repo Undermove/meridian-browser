@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { launch, APP, SB } from './harness.mjs';
+import { launch, APP, SB, NEEDS_FRAMES } from './harness.mjs';
 import { standIn } from './stand_in.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -428,7 +428,7 @@ process.stdin.on('end', () => {
   return () => fs.readdirSync(log).sort((a, c) => parseInt(a) - parseInt(c)).map((f) => JSON.parse(fs.readFileSync(path.join(log, f), 'utf8')));
 }
 
-test('Improve redesigns in rounds: each CSS checked (nothing hidden, nothing from the internet), a screenshot to review it, progress in the editor; kept after a reload; Undo', async () => {
+test('Improve redesigns in rounds: each CSS checked (nothing hidden, nothing from the internet), a screenshot to review it, progress in the editor; kept after a reload; Undo', { skip: NEEDS_FRAMES }, async () => {
   const s = await site();
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-accounts-')));
@@ -563,7 +563,7 @@ test('Improve with reduced motion: the glow stands still, the round in words; it
   }
 });
 
-test('Improve with Claude Code when nothing is picked in Settings › AI: in the default space and in a space with its own profile (as its AI account)', async () => {
+test('Improve with Claude Code when nothing is picked in Settings › AI: in the default space and in a space with its own profile (as its AI account)', { skip: NEEDS_FRAMES }, async () => {
   const s = await site();
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
   const runs = fakeClaudeCode(bin, { name: 'Calm News', css: '#story { color: rgb(1, 2, 3); }', hide: ['#promo'], summary: 'Hid the banner.' });
