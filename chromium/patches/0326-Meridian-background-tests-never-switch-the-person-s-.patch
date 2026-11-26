@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 15:09:29 +0400
+Subject: [PATCH 326/330] Meridian: background tests never switch the person's
+ Space
+
+The owner's screen still jumped to an empty Desktop while background
+tests ran (little, link_preview): a window shown active makes Chromium
+call -[NSApp activateIgnoringOtherApps:], and macOS switches to a Space
+where the app has a window, even for an app whose activation policy is
+prohibited. "Move to the active Space" didn't stop it.
+
+With --meridian-test-background:
+- every window is on every Space (CanJoinAllSpaces, never full screen):
+  there is always one where the person is, so nothing to switch to;
+- the app never activates or unhides (NSApp activate*, unhide*,
+  NSRunningApplication activateWithOptions: for this process);
+- no window enters native full screen (a new Space with an invisible
+  window: an empty Desktop). Full screen tests run in the foreground.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/app_controller_mac.mm | 94 +++++++++++++++++++++++-----
+ 1 file changed, 78 insertions(+), 16 deletions(-)
+
+diff --git a/chrome/browser/app_controller_mac.mm b/chrome/browser/app_controller_mac.mm
+index 5c16a70d60..4a8387886c 100644
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -9,6 +9,7 @@
+ #include <AppKit/AppKit.h>
+ #include <dispatch/dispatch.h>
+ #include <stddef.h>
++#include <unistd.h>
+ 
+ #include <algorithm>
+ #include <memory>
+@@ -948,9 +949,30 @@ class AppControllerProfileObserver : public ProfileAttributesStorage::Observer,
+     // (Clicks and scrolling pass through always: a see-through window on
+     // top of the person's own apps must not take them.)
+     // Every window of the process (any profile's, a Little window, a
+-    // popup, an app window, one opened later): see-through, clicks pass,
+-    // and never a reason for macOS to switch to another desktop Space (it
+-    // moves to the one on screen instead).
++    // popup, a link preview, an app window, a dialog, a bubble, one opened
++    // later): see-through, clicks pass, and never a reason for macOS to
++    // switch to another desktop Space. "Move to the active Space" wasn't
++    // enough: the person's screen still jumped to an empty Desktop while
++    // little/link_preview ran (a window shown active asks the app to
++    // activate, and macOS switches to a Space where the app has a window).
++    // So every window is on every Space (there is always one where the
++    // person is, so there is nothing to switch to), never a full screen
++    // Space of its own, and the app never activates (below).
++    // "Every Space" includes another app's full screen Space
++    // (FullScreenAuxiliary): without it a window isn't on the active Space
++    // while the person works in a full screen app, and views holds back its
++    // child windows until it is (NativeWidgetNSWindowBridge::OrderChildren):
++    // the find bar, bubbles and popups never showed. Auxiliary windows never
++    // take a full screen Space of their own (and toggleFullScreen: is off).
++    static NSWindowCollectionBehavior (^everywhere)(NSWindowCollectionBehavior) =
++        ^(NSWindowCollectionBehavior behavior) {
++          behavior &= ~(NSWindowCollectionBehaviorMoveToActiveSpace |
++                        NSWindowCollectionBehaviorFullScreenPrimary |
++                        NSWindowCollectionBehaviorFullScreenNone |
++                        NSWindowCollectionBehaviorFullScreenAllowsTiling);
++          return behavior | NSWindowCollectionBehaviorCanJoinAllSpaces |
++                 NSWindowCollectionBehaviorFullScreenAuxiliary;
++        };
+     static void (^keep_back)(NSWindow*) = ^(NSWindow* window) {
+       if (window.alphaValue > 0) {
+         window.alphaValue = 0;
+@@ -958,13 +980,58 @@ class AppControllerProfileObserver : public ProfileAttributesStorage::Observer,
+       if (!window.ignoresMouseEvents) {
+         window.ignoresMouseEvents = YES;
+       }
+-      NSWindowCollectionBehavior behavior = window.collectionBehavior;
+-      if (!(behavior & (NSWindowCollectionBehaviorCanJoinAllSpaces |
+-                        NSWindowCollectionBehaviorMoveToActiveSpace))) {
+-        window.collectionBehavior =
+-            behavior | NSWindowCollectionBehaviorMoveToActiveSpace;
++      const NSWindowCollectionBehavior behavior = window.collectionBehavior;
++      if (behavior != everywhere(behavior)) {
++        window.collectionBehavior = everywhere(behavior);
+       }
+     };
++    // The app never activates, whoever asks (a widget shown active, a
++    // click's mouse capture, Mission Control's Reveal, the Dock menu):
++    // activating is what makes macOS switch Spaces, even for an app whose
++    // activation policy is "prohibited".
++    if (Method method = class_getInstanceMethod(
++            NSApplication.class, @selector(activateIgnoringOtherApps:))) {
++      method_setImplementation(method,
++                               imp_implementationWithBlock(^(id, BOOL) {}));
++    }
++    if (Method method = class_getInstanceMethod(NSApplication.class,
++                                                @selector(unhide:))) {
++      method_setImplementation(method,
++                               imp_implementationWithBlock(^(id, id) {}));
++    }
++    for (SEL selector :
++         {@selector(activate), @selector(unhideWithoutActivation)}) {
++      if (Method method =
++              class_getInstanceMethod(NSApplication.class, selector)) {
++        method_setImplementation(method, imp_implementationWithBlock(^(id) {}));
++      }
++    }
++    {
++      Method method = class_getInstanceMethod(
++          NSRunningApplication.class, @selector(activateWithOptions:));
++      using Activate = BOOL (*)(id, SEL, NSApplicationActivationOptions);
++      static Activate original_activate =
++          reinterpret_cast<Activate>(method_getImplementation(method));
++      method_setImplementation(
++          method, imp_implementationWithBlock(^BOOL(
++                      NSRunningApplication* app,
++                      NSApplicationActivationOptions options) {
++            if (app.processIdentifier == getpid()) {
++              return NO;
++            }
++            return original_activate(app, @selector(activateWithOptions:),
++                                     options);
++          }));
++    }
++    // Nor a window into native full screen: that is a new Space, shown with
++    // an invisible window in it (an empty Desktop). Tests of full screen
++    // run in the foreground (MERIDIAN_FOREGROUND=1).
++    {
++      Method method = class_getInstanceMethod(NSWindow.class,
++                                              @selector(toggleFullScreen:));
++      method_setImplementation(method,
++                               imp_implementationWithBlock(^(id, id) {}));
++    }
+     auto hide = ^{
+       for (NSWindow* window in NSApp.windows) {
+         keep_back(window);
+@@ -1033,8 +1100,8 @@ class AppControllerProfileObserver : public ProfileAttributesStorage::Observer,
+             return NSWindowAnimationBehaviorNone;
+           }));
+     }
+-    // Whatever collection behaviour Chrome gives a window, it keeps "move
+-    // to the active Space" (exclusive with "all Spaces", which stays).
++    // Whatever collection behaviour Chrome gives a window, it stays on
++    // every Space and out of full screen (`everywhere`, above).
+     {
+       Method method = class_getInstanceMethod(
+           NSWindow.class, @selector(setCollectionBehavior:));
+@@ -1044,13 +1111,8 @@ class AppControllerProfileObserver : public ProfileAttributesStorage::Observer,
+       method_setImplementation(
+           method, imp_implementationWithBlock(^(
+                       id window, NSWindowCollectionBehavior behavior) {
+-            if (behavior & NSWindowCollectionBehaviorCanJoinAllSpaces) {
+-              behavior &= ~NSWindowCollectionBehaviorMoveToActiveSpace;
+-            } else {
+-              behavior |= NSWindowCollectionBehaviorMoveToActiveSpace;
+-            }
+             original_set_behavior(window, @selector(setCollectionBehavior:),
+-                                  behavior);
++                                  everywhere(behavior));
+           }));
+     }
+     for (NSNotificationName name :

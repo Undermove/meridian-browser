@@ -1,0 +1,281 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 16:25:37 +0400
+Subject: [PATCH 329/330] Meridian: a side panel's tab switched away and back
+ no longer crashes the window
+
+Reading mode open in a tab, then a switch to another tab and back (the
+tabs API, the sidebar) crashed in WebUIBrowserUI::ShowSidePanel. The
+WebUI side panel closed on a tab switch with kSidePanelClosed (Views uses
+kBackgrounded); reading mode then took its WebContents back out of the
+view just cached for the tab, and coming back showed that empty view.
+Tab switches now close it as backgrounded, a cached view without its
+WebContents is replaced by a fresh one, and a window whose WebUI or page
+isn't there yet (being made, closing) shows nothing instead of crashing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../webui_browser_side_panel_ui.cc            | 49 +++++++++++++++---
+ .../ui/webui_browser/webui_browser_ui.cc      | 16 ++++--
+ .../ui/webui_browser/webui_browser_window.cc  | 50 ++++++++++++++-----
+ .../ui/webui_browser/webui_browser_window.h   |  3 ++
+ 4 files changed, 96 insertions(+), 22 deletions(-)
+
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.cc b/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.cc
+index 51a9db5ad9..21b15a71c8 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_side_panel_ui.cc
+@@ -22,9 +22,15 @@
+ namespace {
+ 
+ content::WebContents* GetContainingWebContents(views::View* view) {
+-  auto* web_view = view->GetViewByID(SidePanelWebUIView::kSidePanelWebViewId);
+-  CHECK(web_view);
+-  return views::AsViewClass<views::WebView>(web_view)->web_contents();
++  // Meridian: null rather than a crash for a view without a WebView, or with
++  // one whose WebContents has gone (reading mode takes its contents back when
++  // it's hidden, leaving its cached view empty).
++  if (!view) {
++    return nullptr;
++  }
++  auto* web_view = views::AsViewClass<views::WebView>(
++      view->GetViewByID(SidePanelWebUIView::kSidePanelWebViewId));
++  return web_view ? web_view->web_contents() : nullptr;
+ }
+ 
+ }  // namespace
+@@ -47,7 +53,11 @@ void WebUIBrowserSidePanelUI::Close(SidePanelEntryHideReason reason,
+   // Asynchronously close the side panel in webshell.
+   // WebUI then notifies the browser when the side panel is actually closed
+   // via OnSidePanelClosed().
+-  GetWebUIBrowserWindow()->CloseSidePanel();
++  if (WebUIBrowserWindow* window = GetWebUIBrowserWindow()) {
++    window->CloseSidePanel();
++  } else {
++    OnSidePanelClosed();
++  }
+ }
+ 
+ void WebUIBrowserSidePanelUI::Toggle(SidePanelEntryKey key,
+@@ -121,6 +131,16 @@ void WebUIBrowserSidePanelUI::PopulateSidePanel(
+     std::optional<SidePanelOpenTrigger> open_trigger,
+     SidePanelEntry* entry,
+     std::optional<std::unique_ptr<views::View>> content_view) {
++  // Meridian: the window's views or its page aren't there (being made, or
++  // closing; the waiter can call back late): keep the view for later, show
++  // nothing.
++  WebUIBrowserWindow* window = GetWebUIBrowserWindow();
++  if (!window || !window->widget() || !window->GetPage()) {
++    if (content_view && *content_view) {
++      entry->CacheView(std::move(*content_view));
++    }
++    return;
++  }
+   if (IsSidePanelShowing()) {
+     SidePanelEntry* previous_entry = GetEntryForUniqueKey(*current_key());
+     if (previous_entry) {
+@@ -136,14 +156,26 @@ void WebUIBrowserSidePanelUI::PopulateSidePanel(
+ 
+   current_side_panel_view_ =
+       content_view ? std::move(content_view.value()) : entry->GetContent();
++  // Meridian: a cached view can have lost its WebContents since it was cached
++  // (reading mode returns them to its controller when the panel closes or is
++  // replaced). Showing it crashed in WebUIBrowserUI::ShowSidePanel; the entry
++  // makes a new view instead.
++  if (!GetContainingWebContents(current_side_panel_view_.get())) {
++    current_side_panel_view_ = entry->GetContent();
++  }
++  if (!GetContainingWebContents(current_side_panel_view_.get())) {
++    current_side_panel_view_.reset();
++    SetCurrentKey(std::nullopt);
++    return;
++  }
+   // This view is never attached to a widget, so override the focus manager
+   // to use the top level widget's focus manager. This makes sure that
+   // View::GetFocusManager() does not crash (called during key event dispatch).
+   current_side_panel_view_->SetProperty(
+       views::kDetachedViewFocusManagerKey,
+-      GetWebUIBrowserWindow()->widget()->GetFocusManager());
++      window->widget()->GetFocusManager());
+   SetCurrentKey(unique_key);
+-  GetWebUIBrowserWindow()->ShowSidePanel(entry->key());
++  window->ShowSidePanel(entry->key());
+ 
+   if (auto* contextual_registry = GetActiveContextualRegistry()) {
+     contextual_registry->ResetActiveEntry();
+@@ -189,7 +221,10 @@ void WebUIBrowserSidePanelUI::MaybeShowEntryOnTabStripModelChanged(
+     current_side_panel_view_.reset();
+   }
+ 
+-  Close(SidePanelEntryHideReason::kSidePanelClosed,
++  // Meridian: kBackgrounded, as SidePanelCoordinator does on a tab switch.
++  // kSidePanelClosed made reading mode take its WebContents out of the view
++  // just cached above, and coming back to the tab showed that empty view.
++  Close(SidePanelEntryHideReason::kBackgrounded,
+         /*suppress_animations=*/true);
+ }
+ 
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_ui.cc b/chrome/browser/ui/webui_browser/webui_browser_ui.cc
+index 38f1da56c0..54f2bfb60e 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_ui.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_ui.cc
+@@ -346,9 +346,17 @@ void WebUIBrowserUI::ShowSidePanel(SidePanelEntryKey side_panel_entry_key) {
+   WebUIBrowserSidePanelUI* side_panel_ui =
+       browser_window()->GetWebUIBrowserSidePanelUI();
+   content::WebContents* web_contents =
+-      side_panel_ui->GetWebContentsForId(side_panel_entry_key.id());
++      side_panel_ui
++          ? side_panel_ui->GetWebContentsForId(side_panel_entry_key.id())
++          : nullptr;
++  // Meridian: the page isn't bound yet (a window being made) or the panel's
++  // view has no WebContents. This used to dereference it before the CHECK
++  // below and crash on a tab switch; WebUIBrowserSidePanelUI::PopulateSidePanel
++  // makes a fresh view instead, so here it only means "nothing to show".
++  if (!web_contents || !page_.is_bound()) {
++    return;
++  }
+   web_contents->SetColorProviderSource(browser_window());
+-  CHECK(web_contents);
+   auto* embedded_handle =
+       surface_embed::SurfaceEmbedHandle::CreateForWebContents(web_contents);
+ 
+@@ -358,7 +366,9 @@ void WebUIBrowserUI::ShowSidePanel(SidePanelEntryKey side_panel_entry_key) {
+ }
+ 
+ void WebUIBrowserUI::CloseSidePanel() {
+-  page_->CloseSidePanel();
++  if (page_.is_bound()) {
++    page_->CloseSidePanel();
++  }
+ }
+ 
+ contextual_search::ContextualSearchSessionHandle*
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.cc b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+index 305d40d497..e52f1d3151 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.cc
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.cc
+@@ -78,6 +78,8 @@
+ #include "content/public/browser/keyboard_event_processing_result.h"
+ #include "content/public/browser/web_contents.h"
+ #include "content/public/browser/web_contents_observer.h"
++#include "content/public/browser/web_ui.h"
++#include "content/public/browser/web_ui_controller.h"
+ #include "content/public/common/content_features.h"
+ #include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"
+ #include "third_party/blink/public/mojom/page/draggable_region.mojom.h"
+@@ -359,7 +361,7 @@ void WebUIBrowserWindow::PaintAsActiveChanged() {
+   } else {
+     BrowserActiveStateManager::From(browser_)->DidBecomeInactive();
+   }
+-  if (webui_browser::mojom::Page* page = GetWebUIBrowserUI()->page()) {
++  if (webui_browser::mojom::Page* page = GetPage()) {
+     page->OnPaintAsActiveChanged(widget_->ShouldPaintAsActive());
+   }
+ }
+@@ -711,7 +713,7 @@ void WebUIBrowserWindow::SyncFullscreenMode() {
+   }
+   sent_fullscreen_context_ = context;
+ 
+-  if (webui_browser::mojom::Page* page = GetWebUIBrowserUI()->page()) {
++  if (webui_browser::mojom::Page* page = GetPage()) {
+     page->OnFullscreenModeChanged(fullscreen, context);
+   }
+   if (window_changed) {
+@@ -723,7 +725,7 @@ void WebUIBrowserWindow::UpdateDevtoolsForContents(
+     content::WebContents* inspected) {
+   tabs::TabInterface* tab =
+       inspected ? tabs::TabInterface::MaybeGetFromContents(inspected) : nullptr;
+-  webui_browser::mojom::Page* page = GetWebUIBrowserUI()->page();
++  webui_browser::mojom::Page* page = GetPage();
+   if (!tab || !page) {
+     return;
+   }
+@@ -879,7 +881,9 @@ void WebUIBrowserWindow::UpdateTitleBar() {
+ 
+ void WebUIBrowserWindow::OnBookmarkBarStateChanged(
+     BookmarkBar::AnimateChangeType change_type) {
+-  GetWebUIBrowserUI()->BookmarkBarStateChanged(change_type);
++  if (WebUIBrowserUI* ui = GetWebUIBrowserUI()) {
++    ui->BookmarkBarStateChanged(change_type);
++  }
+ }
+ 
+ void WebUIBrowserWindow::UpdateLoadingAnimations(bool is_visible) {
+@@ -990,13 +994,13 @@ PinnedToolbarActions* WebUIBrowserWindow::GetPinnedToolbarActions() {
+ }
+ 
+ void WebUIBrowserWindow::SetFocusToLocationBar(bool is_user_initiated) {
+-  if (webui_browser::mojom::Page* page = GetWebUIBrowserUI()->page()) {
++  if (webui_browser::mojom::Page* page = GetPage()) {
+     page->SetFocusToLocationBar(is_user_initiated);
+   }
+ }
+ 
+ void WebUIBrowserWindow::UpdateReloadStopState(bool is_loading, bool force) {
+-  if (webui_browser::mojom::Page* page = GetWebUIBrowserUI()->page()) {
++  if (webui_browser::mojom::Page* page = GetPage()) {
+     page->SetReloadStopState(is_loading);
+   }
+ }
+@@ -1548,18 +1552,40 @@ bool WebUIBrowserWindow::WidgetDelegate::ShouldDescendIntoChildForEventHandling(
+ }
+ 
+ WebUIBrowserUI* WebUIBrowserWindow::GetWebUIBrowserUI() const {
+-  return web_contents_delegate_->web_contents()
+-      ->GetWebUI()
+-      ->GetController()
+-      ->GetAs<WebUIBrowserUI>();
++  // Meridian: null while the window's own WebUI isn't there: before its first
++  // commit (a window being made) and while the window closes. Callers that
++  // reached for it then (a side panel shown on a tab switch, say) crashed.
++  content::WebContents* contents =
++      web_contents_delegate_ ? web_contents_delegate_->web_contents() : nullptr;
++  content::WebUI* web_ui = contents ? contents->GetWebUI() : nullptr;
++  if (!web_ui || !web_ui->GetController()) {
++    return nullptr;
++  }
++  return web_ui->GetController()->GetAs<WebUIBrowserUI>();
++}
++
++webui_browser::mojom::Page* WebUIBrowserWindow::GetPage() const {
++  WebUIBrowserUI* ui = GetWebUIBrowserUI();
++  return ui ? ui->page() : nullptr;
+ }
+ 
+ void WebUIBrowserWindow::ShowSidePanel(SidePanelEntryKey side_panel_entry_key) {
+-  GetWebUIBrowserUI()->ShowSidePanel(side_panel_entry_key);
++  if (WebUIBrowserUI* ui = GetWebUIBrowserUI()) {
++    ui->ShowSidePanel(side_panel_entry_key);
++  }
+ }
+ 
+ void WebUIBrowserWindow::CloseSidePanel() {
+-  GetWebUIBrowserUI()->CloseSidePanel();
++  WebUIBrowserUI* ui = GetWebUIBrowserUI();
++  if (ui && ui->page()) {
++    ui->CloseSidePanel();
++    return;
++  }
++  // Meridian: no page to animate it away and call back (the window is being
++  // made or closing): closed now, so the side panel isn't left "showing".
++  if (WebUIBrowserSidePanelUI* side_panel_ui = GetWebUIBrowserSidePanelUI()) {
++    side_panel_ui->OnSidePanelClosed();
++  }
+ }
+ 
+ WebUIBrowserSidePanelUI* WebUIBrowserWindow::GetWebUIBrowserSidePanelUI() {
+diff --git a/chrome/browser/ui/webui_browser/webui_browser_window.h b/chrome/browser/ui/webui_browser/webui_browser_window.h
+index cf758873ee..7934b1175d 100644
+--- a/chrome/browser/ui/webui_browser/webui_browser_window.h
++++ b/chrome/browser/ui/webui_browser/webui_browser_window.h
+@@ -239,6 +239,9 @@ class WebUIBrowserWindow : public BrowserWindow,
+   void CloseSidePanel();
+ 
+   WebUIBrowserUI* GetWebUIBrowserUI() const;
++  // The window's page, or null while it isn't bound (window being made or
++  // closing).
++  webui_browser::mojom::Page* GetPage() const;
+   WebUIBrowserSidePanelUI* GetWebUIBrowserSidePanelUI();
+ 
+   BrowserWindowInterface* browser() { return browser_.get(); }

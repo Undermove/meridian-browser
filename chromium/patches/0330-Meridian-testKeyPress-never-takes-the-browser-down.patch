@@ -1,0 +1,238 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 16:59:14 +0400
+Subject: [PATCH 330/330] Meridian: testKeyPress never takes the browser down
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A main-menu item's action was sent straight to the test window; items
+the window doesn't take (⌘J Jump to Selection, ⌘E, ⌘C…) threw an
+Objective-C exception that ended the browser. The action now goes where
+AppKit would send it for a key window (the window, its responder chain,
+its delegate, NSApp), or the key goes on to the page when nobody takes
+it. Keys and modifiers no keyboard has, and a window that's gone, are
+refused; any exception is logged instead of crashing. The whole-AppKit
+path (1 << 30) is used only for a window on screen.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/meridian/sidebar_handler_mac.mm   | 176 +++++++++++++-----
+ 1 file changed, 129 insertions(+), 47 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar_handler_mac.mm b/chrome/browser/meridian/sidebar_handler_mac.mm
+index b87de0bdb6..05da6182b9 100644
+--- a/chrome/browser/meridian/sidebar_handler_mac.mm
++++ b/chrome/browser/meridian/sidebar_handler_mac.mm
+@@ -8,6 +8,7 @@
+ #include "chrome/browser/meridian/sidebar_handler.h"
+ 
+ #include "base/command_line.h"
++#include "base/logging.h"
+ #include "base/strings/escape.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "chrome/app/chrome_command_ids.h"
+@@ -436,24 +437,108 @@ NSMenuItem* MenuItemFor(NSMenu* menu, NSString* chars, uint32_t modifiers) {
+ 
+ }  // namespace
+ 
++namespace {
++
++// Who AppKit would send a menu item's `action` to if `window` were the key
++// window: the window itself first (Chromium's commandDispatch: lives there),
++// then its first responder's chain, the window's delegate, NSApp and its
++// delegate. Null when nobody takes it or the item is disabled for it, as the
++// menu would leave it: then the key goes on to the page.
++id MenuTargetIn(NSWindow* window, NSMenuItem* item) {
++  SEL action = item.action;
++  id target = nil;
++  // The class, not -respondsToSelector:: a views window without a command
++  // handler of its own says it doesn't take commandDispatch:, yet dispatches
++  // it (to its parent's), which ⌘F and the other browser commands rely on.
++  if ([window.class instancesRespondToSelector:action]) {
++    target = window;
++  }
++  for (NSResponder* r = window.firstResponder; !target && r;
++       r = r.nextResponder) {
++    if ([r respondsToSelector:action]) {
++      target = r;
++    }
++  }
++  if (!target && [window.delegate respondsToSelector:action]) {
++    target = window.delegate;
++  }
++  if (!target && [NSApp respondsToSelector:action]) {
++    target = NSApp;
++  }
++  if (!target && [NSApp.delegate respondsToSelector:action]) {
++    target = NSApp.delegate;
++  }
++  if (!target || target == window) {
++    return target;
++  }
++  if ([target respondsToSelector:@selector(validateMenuItem:)] &&
++      ![target validateMenuItem:item]) {
++    return nil;
++  }
++  if ([target respondsToSelector:@selector(validateUserInterfaceItem:)] &&
++      ![target validateUserInterfaceItem:item]) {
++    return nil;
++  }
++  return target;
++}
++
++}  // namespace
++
+ void SidebarHandler::TestKeyPress(uint16_t key_code,
+                                   const std::string& characters,
+                                   uint32_t modifiers) {
+   if (!HasTestSwitch("meridian-test-keys")) {
+     return;
+   }
+-  NSWindow* window =
+-      browser_->GetWindow()->GetNativeWindow().GetNativeNSWindow();
+-  NSString* chars = base::SysUTF8ToNSString(characters);
+   // 1 << 30: the whole of AppKit's way, as for a key typed in the key
+   // window: the window made key (without bringing the app forward) and the
+   // event given to NSApp.
+   constexpr uint32_t kThroughApp = 1u << 30;
+-  if (modifiers & kThroughApp) {
+-    modifiers &= ~kThroughApp;
+-    [window makeKeyWindow];
++  const bool through_app = modifiers & kThroughApp;
++  modifiers &= ~kThroughApp;
++  // A key a keyboard can type: a virtual key code and device-independent
++  // modifiers only.
++  if (key_code > 0x7f ||
++      (modifiers & ~NSEventModifierFlagDeviceIndependentFlagsMask)) {
++    LOG(ERROR) << "Meridian testKeyPress: no such key " << key_code << " / "
++               << modifiers;
++    return;
++  }
++  // The window may be closing or gone (the key before closed it).
++  ui::BaseWindow* base_window = browser_ ? browser_->GetWindow() : nullptr;
++  NSWindow* window =
++      base_window ? base_window->GetNativeWindow().GetNativeNSWindow() : nil;
++  if (!window || window.windowNumber <= 0) {
++    LOG(ERROR) << "Meridian testKeyPress: no window";
++    return;
++  }
++  NSString* chars = base::SysUTF8ToNSString(characters);
++  // A test helper must never take the browser down with it: an exception from
++  // a menu action or a responder is logged and the key dropped. (⌘J, Jump to
++  // Selection, was sent to the window, which has no
++  // centerSelectionInVisibleArea:, and crashed the browser.)
++  @try {
++    // The whole of AppKit's way needs a window AppKit can make key: one on
++    // screen. A test window kept off screen takes the way below.
++    if (through_app && window.visible && window.canBecomeKeyWindow) {
++      [window makeKeyWindow];
++      for (NSEventType type : {NSEventTypeKeyDown, NSEventTypeKeyUp}) {
++        [NSApp sendEvent:[NSEvent keyEventWithType:type
++                                          location:NSZeroPoint
++                                     modifierFlags:modifiers
++                                         timestamp:NSProcessInfo.processInfo
++                                                       .systemUptime
++                                      windowNumber:window.windowNumber
++                                           context:nil
++                                        characters:chars
++                       charactersIgnoringModifiers:chars
++                                         isARepeat:NO
++                                           keyCode:key_code]];
++      }
++      return;
++    }
+     for (NSEventType type : {NSEventTypeKeyDown, NSEventTypeKeyUp}) {
+-      [NSApp sendEvent:[NSEvent keyEventWithType:type
++      NSEvent* event = [NSEvent keyEventWithType:type
+                                         location:NSZeroPoint
+                                    modifierFlags:modifiers
+                                        timestamp:NSProcessInfo.processInfo
+@@ -463,49 +548,46 @@ void SidebarHandler::TestKeyPress(uint16_t key_code,
+                                       characters:chars
+                      charactersIgnoringModifiers:chars
+                                        isARepeat:NO
+-                                         keyCode:key_code]];
+-    }
+-    return;
+-  }
+-  for (NSEventType type : {NSEventTypeKeyDown, NSEventTypeKeyUp}) {
+-    NSEvent* event = [NSEvent keyEventWithType:type
+-                                      location:NSZeroPoint
+-                                 modifierFlags:modifiers
+-                                     timestamp:NSProcessInfo.processInfo
+-                                                   .systemUptime
+-                                  windowNumber:window.windowNumber
+-                                       context:nil
+-                                    characters:chars
+-                   charactersIgnoringModifiers:chars
+-                                     isARepeat:NO
+-                                       keyCode:key_code];
+-    // What -[NSApplication sendEvent:] does for the key window, which a test
+-    // window in the background isn't: key equivalents first (the window's,
+-    // then the main menu's), then the window's first responder.
+-    if (type == NSEventTypeKeyUp || [window performKeyEquivalent:event]) {
+-      if (type == NSEventTypeKeyUp) {
+-        [window sendEvent:event];
+-      }
+-      continue;
+-    }
+-    // The main menu sends its items to the key window; aim them at this one.
+-    if (NSMenuItem* item = (modifiers & NSEventModifierFlagCommand)
+-                               ? MenuItemFor(NSApp.mainMenu, chars, modifiers)
+-                               : nil) {
+-      // ⌘W and ⇧⌘W swap between Close Tab and Close Window by the key window
+-      // (AppController's updateMenuItemKeyEquivalents); for a window with
+-      // tabs, ⌘W closes the tab.
+-      if (item.tag == IDC_CLOSE_WINDOW || item.tag == IDC_CLOSE_TAB) {
+-        chrome::ExecuteCommand(browser_,
+-                               (modifiers & NSEventModifierFlagShift)
+-                                   ? IDC_CLOSE_WINDOW
+-                                   : IDC_CLOSE_TAB);
++                                         keyCode:key_code];
++      // What -[NSApplication sendEvent:] does for the key window, which a
++      // test window in the background isn't: key equivalents first (the
++      // window's, then the main menu's), then the window's first responder.
++      if (type == NSEventTypeKeyUp || [window performKeyEquivalent:event]) {
++        if (type == NSEventTypeKeyUp) {
++          [window sendEvent:event];
++        }
+         continue;
+       }
+-      [NSApp sendAction:item.action to:window from:item];
+-      continue;
++      // The main menu sends its items to the key window; aim them at this
++      // one.
++      if (NSMenuItem* item =
++              (modifiers & NSEventModifierFlagCommand)
++                  ? MenuItemFor(NSApp.mainMenu, chars, modifiers)
++                  : nil) {
++        // ⌘W and ⇧⌘W swap between Close Tab and Close Window by the key
++        // window (AppController's updateMenuItemKeyEquivalents); for a window
++        // with tabs, ⌘W closes the tab.
++        if (item.tag == IDC_CLOSE_WINDOW || item.tag == IDC_CLOSE_TAB) {
++          chrome::ExecuteCommand(browser_,
++                                 (modifiers & NSEventModifierFlagShift)
++                                     ? IDC_CLOSE_WINDOW
++                                     : IDC_CLOSE_TAB);
++          continue;
++        }
++        // Sent where the menu would send it; an item nobody here takes
++        // (Jump to Selection with no text view) leaves the key to the page.
++        if (id target = MenuTargetIn(window, item)) {
++          [NSApp sendAction:item.action to:target from:item];
++          continue;
++        }
++      }
++      [window sendEvent:event];
+     }
+-    [window sendEvent:event];
++  } @catch (NSException* exception) {
++    LOG(ERROR) << "Meridian testKeyPress " << key_code << " '" << characters
++               << "' " << modifiers << ": "
++               << base::SysNSStringToUTF8(exception.name) << ": "
++               << base::SysNSStringToUTF8(exception.reason);
+   }
+ }
+ 
