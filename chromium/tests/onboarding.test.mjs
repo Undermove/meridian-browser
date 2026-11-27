@@ -290,7 +290,9 @@ test('first run: "Not now" connects nothing; with nothing found there is no ques
     await b.waitFor(`${step} === 'default'`);
     await b.click(`${OB}.getElementById('next')`);
     await b.waitFor(`${step} === 'done'`);
-    assert.equal(await b.eval(`!!${OB}.getElementById('getClaude')`), true);
+    // No agent at all: «Get Claude» once the check has answered, as a tile of the same grid.
+    await b.waitFor(`!!${OB}.getElementById('getClaude')`);
+    assert.equal(await b.eval(`${OB}.getElementById('getClaude').parentElement.matches('.tries.four')`), true);
   } finally { await b.close(); fs.rmSync(profile2, { recursive: true, force: true }); none.clean(); }
 });
 

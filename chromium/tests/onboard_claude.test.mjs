@@ -149,6 +149,8 @@ test('first run, Claude Desktop open with other servers: Yes keeps them, the end
     const code = await checkOf(b, 'claude-code');
     assert.equal(code.state, 'ok');
     assert.match(code.text, /signed in and connected/);
+    // An agent is here: no «Get Claude» tile.
+    assert.equal(await b.eval(`!!${OB}.getElementById('getClaude')`), false);
 
     // Claude restarts and starts Meridian's server: now it's connected for real.
     await desktopSaysHello(profile);
