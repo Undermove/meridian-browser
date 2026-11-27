@@ -94,8 +94,16 @@ test('toolkit on: dock, lens click copies the colour, menu items, stress text re
     await key(page, 'Escape', 'Escape', 0, 27);
     await page.waitFor(`document.getElementById('btn').textContent === 'Выбрать зёрна'`);
     // The page menu has the toolkit's items; "Images under cursor" runs in the page.
+    await page.eval('getSelection().removeAllRanges(), true');
     const ids = await menuIds(page, pick, btn.x, btn.y);
     for (const id of [IDS.lens, IDS.shot, IDS.images]) assert.ok(ids.includes(id), `toolkit item ${id}: ${ids.join(', ')}`);
+    // With text selected the menu is the selection's (Copy, Search for…: no page group): the items too, once.
+    await page.eval(`getSelection().selectAllChildren(document.getElementById('lead')), true`);
+    const lead = await rect(page, '#lead');
+    const selected = await menuIds(page, pick, lead.x, lead.y);
+    assert.ok(selected.includes(50150), `the selection's menu (IDC_CONTENT_CONTEXT_COPY): ${selected.join(', ')}`);
+    for (const id of [IDS.lens, IDS.shot, IDS.images]) assert.equal(selected.filter((x) => x === id).length, 1, `toolkit item ${id} once with a selection: ${selected.join(', ')}`);
+    await page.eval('getSelection().removeAllRanges(), true');
     fs.writeFileSync(pick, String(IDS.lens));
     await rightClick(page, btn.x, btn.y);
     await page.waitFor(`!!document.querySelector('meridian-toolkit')`);
