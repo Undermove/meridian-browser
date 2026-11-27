@@ -1,7 +1,7 @@
 // The Boost editor and its badge in the site controls, pixel for pixel against reference PNGs
 // (fixtures/boost_visual/, 2x): the editor with no colour (as the owner's screenshot of Arc), with a
 // colour, 125 % and Courier New (as Arc's recording), Code's own page, and the badge's twinkling
-// stars at three moments of their round. The references were rendered from the same WebUI code in
+// glints (Meridian's own motion, S/arc-px/MOTION.md) at their peaks. The references were rendered from the same WebUI code in
 // headless Chrome and compared with Arc's frames (S/arc-px/REPORT.md); here the real Meridian must
 // draw the same. Set MERIDIAN_SHOT_DIR to keep what it drew and the diffs.
 import { test } from 'node:test';
@@ -68,6 +68,11 @@ const site = () => new Promise((r) => {
   server.listen(0, '127.0.0.1', () => r({ server, url: `http://127.0.0.1:${server.address().port}/` }));
 });
 
+// Every finite animation and transition in the editor run to its end: a window in the background
+// (the E2E default) may not advance them, and a pad caught half way from grey to its colours is not
+// what the person sees.
+const SETTLE = `${BE}.getAnimations({ subtree: true }).filter((a) => a.effect?.getTiming().iterations !== Infinity).forEach((a) => a.finish())`;
+
 // The element at 2 device pixels per CSS pixel, whatever the screen.
 async function shoot(b, expr, name) {
   const r = await b.eval(`(() => { const r = (${expr}).getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height, dpr: devicePixelRatio }; })()`);
@@ -79,9 +84,13 @@ async function shoot(b, expr, name) {
 
 const BOOST = { id: '', host: '127.0.0.1', name: 'My Boost', enabled: true, css: '', js: '', zaps: [], hue: 0, font: '', tint: -1, tintStrength: 60, tint2: -1, dark: false, brightness: 100, contrast: 100, saturation: 100, size: 100, textCase: '' };
 
-test('the Boost editor and its badge look as the references (Arc’s, measured)', { skip: NEEDS_FRAMES }, async () => {
+test('the Boost editor and its badge look as the references (Arc’s layout measured; our own glints)', { skip: NEEDS_FRAMES }, async () => {
   const s = await site();
-  const b = await launch([s.url]);
+  // sRGB, as the references: a Mac screenshot is in the display's own colour space (P3 on a Retina
+  // Mac), which shifts every saturated colour (the rim, the knobs) and leaves the greys as they are.
+  const b = await launch([s.url], { args: ['--force-color-profile=srgb'] });
+  const off = [];
+  const check = (ok, what) => { if (!ok) off.push(what); };
   try {
     await b.cdp.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: 'light' }, { name: 'prefers-reduced-motion', value: 'no-preference' }] });
     const page = await b.page(s.url);
@@ -92,40 +101,46 @@ test('the Boost editor and its badge look as the references (Arc’s, measured)'
       await b.eval(`${H}.setBoost(${JSON.stringify({ ...BOOST, id, ...change })})`);
       await b.eval(`app.$.boostEditor.show(${JSON.stringify(id)})`);
       await b.waitFor(`app.$.boostEditor.open && !!${BE}.getElementById('pad')`);
-      await sleep(900);  // the card's slide in, the knobs' glide
+      await sleep(300);
+      await b.eval(SETTLE);  // the card's slide in, the knobs' glide, the rim's fade
+      await sleep(100);
     };
 
     // No colour: Arc's greys (the owner's screenshot).
     await show({});
     let d = differ(await shoot(b, `${BE}.getElementById('card')`, 'main'), 'main.png', inCard);
-    assert.ok(d.share < 0.015, `no colour: ${(d.share * 100).toFixed(2)} % of the pixels differ (${d.size} vs ${d.ref})`);
+    check(d.share < 0.015, `no colour: ${(d.share * 100).toFixed(2)} % of the pixels differ (${d.size} vs ${d.ref})`);
 
     // A colour, 125 % and Courier New (as on Arc's recording).
     await show({ tint: 99, tintStrength: 62, tint2: 258, size: 125, font: 'Courier New' });
     d = differ(await shoot(b, `${BE}.getElementById('card')`, 'colour'), 'colour.png', inCard);
-    assert.ok(d.share < 0.015, `colour: ${(d.share * 100).toFixed(2)} %`);
+    check(d.share < 0.015, `colour: ${(d.share * 100).toFixed(2)} %`);
 
     // Code: its own page, 480 px.
     await b.eval(`${BE}.getElementById('code').click()`);
+    await sleep(100);
+    await b.eval(SETTLE);
     await b.waitFor(`${BE}.getElementById('card').getBoundingClientRect().width === 480`, 3000);
-    await sleep(500);
+    await sleep(100);
     d = differ(await shoot(b, `${BE}.getElementById('card')`, 'code'), 'code.png', inCard);
-    assert.ok(d.share < 0.015, `code: ${(d.share * 100).toFixed(2)} %`);
+    check(d.share < 0.015, `code: ${(d.share * 100).toFixed(2)} %`);
     await b.eval(`app.$.boostEditor.close()`);
 
-    // The badge in the site controls, its stars stopped at three moments of the 1.65 s round.
+    // The badge in the site controls: Meridian's own glints (S/arc-px/MOTION.md), a 2 s round,
+    // three glints each on its ring; stopped at each one's peak.
     await b.eval(`${H}.setBoost(${JSON.stringify({ ...BOOST, id, tint: 340, tint2: 24 })})`);
     await b.click(`app.$.locationIconButton`);
     await b.waitFor(`app.$.siteControl.open && !!${SC}.querySelector('.boost-row.on .boost-ic')`);
-    const names = await b.eval(`${SC}.querySelector('.boost-ic').getAnimations({ subtree: true }).map((a) => a.animationName).sort().join()`);
-    assert.equal(names, 'star-a,star-b,star-c', 'three stars twinkle');
-    for (const t of ['0.433', '0.633', '0.850']) {
+    const anims = await b.eval(`${SC}.querySelector('.boost-ic').getAnimations({ subtree: true }).map((a) => a.animationName + '/' + a.effect.getTiming().duration + '/' + a.effect.getTiming().iterations).sort().join()`);
+    assert.equal(anims, ['glint-1', 'glint-1-ring', 'glint-2', 'glint-2-ring', 'glint-3', 'glint-3-ring'].map((n) => `${n}/2000/Infinity`).sort().join(), 'three glints on their rings, a 2 s round');
+    for (const t of ['0.450', '0.733', '1.017']) {
       await b.eval(`${SC}.querySelector('.boost-ic').getAnimations({ subtree: true }).forEach((a) => { a.pause(); a.currentTime = ${Number(t) * 1000}; })`);
       await sleep(100);
       // Inside the circle only (the popover's own background shows round it).
-      d = differ(await shoot(b, `${SC}.querySelector('.boost-ic')`, `badge-${t}`), `badge-${t}.png`, (x, y) => (x - 30) ** 2 + (y - 30) ** 2 < 26 ** 2);
-      assert.ok(d.share < 0.02, `badge at ${t} s: ${(d.share * 100).toFixed(2)} %`);
+      d = differ(await shoot(b, `${SC}.querySelector('.boost-ic')`, `glint-${t}`), `glint-${t}.png`, (x, y) => (x - 30) ** 2 + (y - 30) ** 2 < 26 ** 2);
+      check(d.share < 0.02, `glints at ${t} s: ${(d.share * 100).toFixed(2)} %`);
     }
     page.close();
   } finally { await b.close(); s.server.close(); }
+  assert.deepEqual(off, [], 'all as the references');
 });

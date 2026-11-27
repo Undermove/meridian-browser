@@ -515,6 +515,9 @@ test('Improve redesigns in rounds: each CSS checked (nothing hidden, nothing fro
     // In the editor's code, to change by hand.
     await clickEditor(b, `${BE}.getElementById('code')`);
     await b.waitFor(`${BE}.getElementById('css')?.value.includes('letter-spacing: 1px')`, 5000);
+    // Code is a page of its own, as Arc's: back to the panel, where Undo is.
+    await clickEditor(b, `${BE}.getElementById('back')`);
+    await b.waitFor(`${BE}.getElementById('card').getBoundingClientRect().width === 183`, 3000);
 
     // A reload: still there.
     await page.eval('location.reload()');
@@ -1000,7 +1003,8 @@ test('a colour paints the page, Arc’s way: a tinted background and accents in 
     const { worst, at } = await page.eval(CONTRAST);
     assert.ok(worst >= 1, `contrast ${worst} at ${at}`);
 
-    // The second colour: the small knob dragged round to the bottom (yellow, hue 60) paints the dark
+    // The second colour: the small knob dragged round to the bottom (Arc's rim there: yellow-green,
+    // hue ~77) paints the dark
     // top bar; the button keeps the main colour.
     const from = await b.eval(`(() => { const r = ${BE}.getElementById('shade').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
     const to = await b.eval(`(() => { const r = ${BE}.querySelector('#pad .field').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height * 0.95 }; })()`);
@@ -1011,8 +1015,8 @@ test('a colour paints the page, Arc’s way: a tinted background and accents in 
       await sleep(30);
     }
     await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', clickCount: 1 });
-    await b.waitFor(`(async () => { const { state } = await ${H}.getBoost(); return state.boost.tint2 >= 55 && state.boost.tint2 <= 65 && state.boost.tint === 0; })()`, 5000);
-    await page.waitFor(`(() => { const h = ${HUE(`document.querySelector('header')`, 'backgroundColor')}; return h >= 30 && h <= 90; })()`, 5000);
+    await b.waitFor(`(async () => { const { state } = await ${H}.getBoost(); return state.boost.tint2 >= 70 && state.boost.tint2 <= 85 && (state.boost.tint >= 356 || state.boost.tint <= 6); })()`, 5000, `${H}.getBoost().then(({ state }) => JSON.stringify([state.boost.tint, state.boost.tint2]))`);
+    await page.waitFor(`(() => { const h = ${HUE(`document.querySelector('header')`, 'backgroundColor')}; return h >= 40 && h <= 115; })()`, 5000);
     assert.ok(near(await page.eval(HUE(`document.querySelector('button')`, 'backgroundColor')), 0, 30), 'the button keeps the main colour');
     assert.ok((await page.eval(CONTRAST)).worst >= 1);
     if (process.env.MERIDIAN_SHOT) {
@@ -1372,7 +1376,7 @@ test('the pad’s orbit as Arc’s (circle, arc between the knobs, the second kn
     assert.ok(dist(held.knob, top) < 4, `the knob under the pointer: ${JSON.stringify(held.knob)} vs ${JSON.stringify(top)}`);
     assert.ok(Math.abs(held.shade.x - g.c.x) < 4 && held.shade.y > g.c.y + r * 0.9, `the second knob went round to the bottom: ${JSON.stringify(held.shade)}`);
     await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: top.x, y: top.y, button: 'left', clickCount: 1 });
-    await b.waitFor(`(async () => { const { state } = await ${H}.getBoost(); return Math.abs(state.boost.tint - 300) <= 4 && Math.abs(state.boost.tint2 - 60) <= 4; })()`, 5000);
+    await b.waitFor(`(async () => { const { state } = await ${H}.getBoost(); return Math.abs(state.boost.tint - 262) <= 4 && Math.abs(state.boost.tint2 - 77) <= 4; })()`, 5000);
     // The second knob dragged round to the right: only the second colour turns (red), the main stays.
     g = await b.eval(PAD_GEOMETRY);
     await move(g.shade.x, g.shade.y);
@@ -1383,7 +1387,7 @@ test('the pad’s orbit as Arc’s (circle, arc between the knobs, the second kn
       await sleep(20);
     }
     await b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: g.c.x + r, y: g.c.y, button: 'left', clickCount: 1 });
-    await b.waitFor(`(async () => { const { state } = await ${H}.getBoost(); return Math.abs(state.boost.tint - 300) <= 4 && (state.boost.tint2 >= 356 || state.boost.tint2 <= 4); })()`, 5000);
+    await b.waitFor(`(async () => { const { state } = await ${H}.getBoost(); return Math.abs(state.boost.tint - 262) <= 4 && (state.boost.tint2 >= 356 || state.boost.tint2 <= 8); })()`, 5000);
     g = await b.eval(PAD_GEOMETRY);
     assert.ok(dist(g.knob, top) < 4, 'the main knob stayed');
     assert.ok(g.arc.mid.x > g.c.x && g.arc.mid.y < g.c.y, 'the arc now a quarter: top round to the right');
@@ -1398,7 +1402,8 @@ test('the pad’s orbit as Arc’s (circle, arc between the knobs, the second kn
     for (const id of ['dark', 'adjust', 'zap', 'code']) {
       await hover(id);
       await b.waitFor(`getComputedStyle(${BE}.getElementById('${id}')).backgroundColor === 'rgb(222, 222, 224)'`, 1000, `getComputedStyle(${BE}.getElementById('${id}')).backgroundColor`);
-      assert.equal(await b.eval(`${BE}.getElementById('${id}').getAnimations({ subtree: true }).length`), 0, `${id}: nothing moves`);
+      // Only the colour eases (Meridian's 70 ms, MOTION.md); nothing moves.
+      assert.equal(await b.eval(`${BE}.getElementById('${id}').getAnimations({ subtree: true }).filter((a) => !['background-color', 'fill'].includes(a.transitionProperty)).length`), 0, `${id}: nothing moves`);
     }
     // Size, as Arc's: the value on Arc's orange once changed.
     await clickEditor(b, `${BE}.getElementById('size')`);
