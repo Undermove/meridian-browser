@@ -251,7 +251,6 @@ function stBuild() {
           <button role="tab" data-pane="brand">${icon('palette', 14)}<span>${esc(w.brand)}</span></button>
         </div></div>
         <div class="st-brand" id="st-brand" hidden></div>
-        <div class="st-resultbar" id="st-resultbar" hidden></div>
         <div class="st-feed" id="st-feed" aria-live="polite"></div>
         <div class="st-composer">
           <div class="st-chips" id="st-chips"></div>
@@ -264,7 +263,7 @@ function stBuild() {
         </div>
       </div>
       <div class="st-split" id="st-split" role="separator" aria-orientation="vertical" tabindex="0" aria-label="${esc(w.splitter)}" title="${esc(w.splitterHint)}"><i></i></div>
-      <div class="st-result" id="st-result"></div>
+      <div class="st-stage"><div class="st-result" id="st-result"></div><div class="st-resultbar st-dock" id="st-resultbar" hidden></div></div>
       <div class="st-tsplit" id="st-tsplit" role="separator" aria-orientation="vertical" tabindex="0" aria-label="${esc(w.tasksSplitter)}" title="${esc(w.splitterHint)}"><i></i></div>
     </div>
     <div class="st-pick" id="st-pick" hidden></div>`;
@@ -315,6 +314,24 @@ function stBuild() {
     const k = ST.tasks.get(ST.current);
     if (k) k.seen = true;
     stRender();
+  });
+  // The waiting card answers keys (not while typing): ↵ allows, Esc says no; a question's options are
+  // 1, 2, 3…, ↵ sends what's picked.
+  document.addEventListener('keydown', (e) => {
+    if (!ST.on || ST.view !== 'studio' || ST.el?.hidden || e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (ST.menuFor || ST.starter) return;  // (Esc closes those first.)
+    if (e.target.closest?.('input, textarea, select, [contenteditable=""], [contenteditable="true"]')) return;
+    const card = [...document.querySelectorAll('#st-feed .st-ask')].find((c) => !c.classList.contains('answering') && !c.classList.contains('st-allowed') && !c.classList.contains('st-denied'));
+    if (!card) return;
+    let btn = null;
+    if (card.classList.contains('st-question')) {
+      if (/^[1-9]$/.test(e.key)) btn = card.querySelectorAll('.st-q-opts')[0]?.querySelectorAll('.st-opt')[Number(e.key) - 1] || null;
+      else if (e.key === 'Enter') btn = card.querySelector('[data-qsend]:not(:disabled)');
+    } else if (e.key === 'Enter') btn = card.querySelector('[data-answer="allow"], [data-trust="yes"]');
+    else if (e.key === 'Escape') btn = card.querySelector('[data-answer="deny"], [data-trust="no"]');
+    if (!btn) return;
+    e.preventDefault();
+    btn.click();
   });
   // A menu closes on a click anywhere else, and on Escape.
   document.addEventListener('pointerdown', (e) => { if (ST.menuFor && !e.target.closest('.st-tmenu, [data-tmenu]')) { ST.menuFor = ''; stRender(); } });
@@ -506,7 +523,7 @@ function stRenderTasks(terms) {
     // Its picture: only a real result of this task (its last screenshot or picture), else none.
     const pic = stCardPicture(k);
     const thumb = pic ? `<span class="st-tthumb st-th img" aria-hidden="true">${stImg(pic.after)}</span>` : '';
-    return `<div class="st-task ${s}${t.id === ST.current ? ' active' : ''}${menu ? ' menu-open' : ''}${thumb ? ' has-thumb' : ''}" role="listitem" data-term="${esc(t.id)}" tabindex="0">${thumb}${stDot(s)}<span class="st-task-name">${esc(stTitle(t))}</span><button class="st-tmore" data-tmenu="${esc(t.id)}" title="${esc(w.more)}" aria-label="${esc(w.more)}" aria-haspopup="menu" aria-expanded="${menu ? 'true' : 'false'}">${icon('more', 14)}</button>${menu}</div>`;
+    return `<div class="st-task ${s}${t.id === ST.current ? ' active' : ''}${menu ? ' menu-open' : ''}${thumb ? ' has-thumb' : ''}" role="listitem" data-term="${esc(t.id)}" tabindex="0" title="${esc(stTitle(t))}">${thumb}${stDot(s)}<span class="st-task-name">${esc(stTitle(t))}</span><button class="st-tmore" data-tmenu="${esc(t.id)}" title="${esc(w.more)}" aria-label="${esc(w.more)}" aria-haspopup="menu" aria-expanded="${menu ? 'true' : 'false'}">${icon('more', 14)}</button>${menu}</div>`;
   }).join('');
   if (list.dataset.html !== html) { list.innerHTML = html; list.dataset.html = html; stFillImages(list); }
   // The open menu floats above everything (the list clips sideways), under its «…», on screen.
@@ -549,7 +566,10 @@ function stRenderFeed(t) {
   const w = STW();
   const feed = $('#st-feed');
   if (!t) {
-    const html = `<div class="st-empty"><div class="st-empty-ic">${icon('sparkles', 22)}</div><h2>${esc(w.emptyTitle)}</h2><p>${esc(w.emptyHint)}</p></div>`;
+    // A new task: a welcome, and the starters as the first things to try (each a whole task).
+    const role = ST.persona in w.starters ? ST.persona : 'designer';
+    const ideas = w.starters[role].map((x) => `<button type="button" class="st-idea" data-starter="${esc(x.id)}"><span><b>${esc(x.label)}</b>${x.hint ? `<small>${esc(x.hint)}</small>` : ''}</span>${icon('arrowRight', 14)}</button>`).join('');
+    const html = `<div class="st-hello"><h2>${w.helloTitle}</h2><p>${esc(w.emptyHint)}</p><div class="st-ideas">${ideas}</div></div>`;
     if (feed.dataset.html !== html) { feed.innerHTML = html; feed.dataset.html = html; }
     return;
   }
@@ -582,7 +602,10 @@ function stRenderFeed(t) {
         const steps = it.steps.filter((s) => s.tool !== 'TodoWrite');
         // One check, on the last step done: less noise than a column of them.
         const lastOk = steps.map((s) => s.state).lastIndexOf('ok');
-        if (steps.length) parts.push(`<div class="st-steps" data-key="s${ti}.${ii}">${steps.map((s, si) => stStepHtml(s, last && (status === 'work' || status === 'needs'), progress, status, si === lastOk)).join('')}</div>`);
+        // Steps as a thread: filled up to the last one done.
+        const doneN = steps.filter((x) => x.state === 'ok').length;
+        const fill = steps.length > 1 ? Math.round((Math.max(0, doneN - 0.5) / (steps.length - 1)) * 100) : 0;
+        if (steps.length) parts.push(`<div class="st-steps st-thread" style="--fill:${Math.min(100, fill)}%" data-key="s${ti}.${ii}">${steps.map((s, si) => stStepHtml(s, last && (status === 'work' || status === 'needs'), progress, status, si === lastOk)).join('')}</div>`);
       }
     });
     for (const a of answeredHere.filter((x) => x.after >= turn.items.length)) parts.push(answeredHtml(a));
@@ -651,6 +674,8 @@ function stKeepVisible(feed, el) {
 // Same element, new content: steps keep their rows so a spinner turns into a check in place.
 function stMorph(o, n) {
   if (o.classList.contains('st-steps')) {
+    // (The thread's fill moves with the steps done.)
+    o.setAttribute('style', n.getAttribute('style') || '');
     const rows = new Map([...o.children].map((c) => [c.dataset.step, c]));
     o.replaceChildren(...[...n.children].map((c) => {
       const r = rows.get(c.dataset.step);
@@ -712,12 +737,12 @@ function stStepHtml(s, live, progress, status = 'work', checked = true) {
     text += ` — ${STW().step(progress.index, progress.total)}`;
   }
   const state = s.state === 'running' && !live ? 'stopped' : s.state;
-  const mark = state === 'ok' ? (checked ? `<span class="st-ok">${icon('check', 12)}</span>` : '')
-    : state === 'running' ? stDot(status === 'needs' ? 'needs' : 'work')
-      : state === 'denied' ? `<span class="st-no">${icon('x', 13)}</span>`
-        : state === 'error' ? `<span class="st-no">${icon('x', 13)}</span>` : '';
+  // One mark per step, on the thread: a filled check when done, a ring while it runs (warm when it
+  // waits for the person), a cross when it was refused or failed.
+  const knot = state === 'ok' ? icon('check', 12) : state === 'denied' || state === 'error' ? icon('x', 12) : icon(ic, 12);
+  const mark = state === 'running' && status === 'needs' ? '<span class="st-wait" aria-hidden="true"></span>' : '';
   const more = ST.openSteps?.has(s.id) ? `<div class="st-step-more">${esc(StudioWords.stepDetail(s.tool, s.input))}</div>` : '';
-  return `<div class="st-step ${state}${more ? ' open' : ''}" data-step="${esc(s.id)}" title="${esc(STW().details)}"><span class="st-si">${icon(ic, 13)}</span><span class="st-st">${esc(text)}</span>${mark}${more}</div>`;
+  return `<div class="st-step ${state}${more ? ' open' : ''}" data-step="${esc(s.id)}" title="${esc(STW().details)}"><span class="st-si">${knot}</span><span class="st-st">${esc(text)}</span>${mark}${more}</div>`;
 }
 
 // Claude's own reason for the step it asks about: the first sentence of what it said last in this turn.
@@ -736,9 +761,9 @@ function stAskHtml(ask, k) {
   const showDetail = ask.summary && (ask.tool === 'Bash' || ask.tool === 'PowerShell' || /^mcp__/.test(ask.tool || ''));
   const buttons = ask.answerable === false
     ? `<span class="st-ask-note">${esc(w.answerInWorkbench)}</span><button class="st-btn" data-go="workbench">${esc(w.openWorkbench)}</button>`
-    : `<button class="st-btn pri" data-answer="allow" data-ask="${esc(ask.id)}">${esc(w.allowOnce)}</button>`
+    : `<button class="st-btn pri" data-answer="allow" data-ask="${esc(ask.id)}" aria-keyshortcuts="Enter">${esc(w.allowOnce)}</button>`
       + (ask.canAlways ? `<button class="st-btn" data-answer="session" data-ask="${esc(ask.id)}">${esc(w.allowTask)}</button>` : '')
-      + `<button class="st-btn ghost" data-answer="deny" data-ask="${esc(ask.id)}">${esc(w.no)}</button>`;
+      + `<button class="st-btn ghost" data-answer="deny" data-ask="${esc(ask.id)}" aria-keyshortcuts="Escape">${esc(w.no)}</button>`;
   return `<div class="st-ask st-perm" data-key="ask${esc(ask.id)}" data-kind="${esc(p.kind)}" data-title="${esc(title)}" role="group" aria-label="${esc(p.title)}">
     <div class="st-perm-ill" aria-hidden="true">${icon(p.icon, 18)}</div>
     <div class="st-perm-body">
@@ -1027,7 +1052,8 @@ function stRenderChips(t) {
   const w = STW();
   const box = $('#st-chips');
   // Suggestions start a task; once it runs they'd only get in the way.
-  const show = !t || !stTask(t).model.turns.length;
+  // (A new task's welcome already lists them: not twice.)
+  const show = !!t && !stTask(t).model.turns.length;
   const role = ST.persona in w.chips ? ST.persona : 'designer';
   // A web page in the result (the task's site, or what it made, opened alongside).
   const site = !!t && !!(stTask(t).site || stTask(t).resultOpened);
@@ -1070,44 +1096,46 @@ function stRenderResult(t) {
   const w = STW();
   const pane = $('#st-result');
   const k = t ? stTask(t) : null;
-  let html;
   const sel = ST.preview;
   const shots = k?.model.shots || [];
   const fileSel = sel?.kind === 'file' && k?.model.files.get(sel.key);
   const links = k ? StudioTranscript.linksOf(k.model) : [];
   const linksHtml = links.length > 1 ? `<div class="st-r-links">${links.slice(0, 6).map((u) => `<button class="st-r-link${u === k.result ? ' on' : ''}" data-r="link" data-url="${esc(u)}">${icon('globe', 12)}<span>${esc(stShortUrl(u))}</span></button>`).join('')}</div>` : '';
+  // The result is an artboard on the table: a label above it (what it is), a window's chrome with its
+  // address, the content; its tools float in the dock below (#st-resultbar).
+  const fileBody = (f, th) => (f.image ? `<div class="st-r-img">${th?.src ? stImg(th.src) : ''}</div>`
+    : f.page ? `<div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(basename(f.abs))}</div><p class="st-r-note">${esc(w.pageAlongside)}</p></div>`
+      : f.outside ? `<div class="st-r-empty"><p>${esc(w.outsideFolder)}</p></div>`
+        : `<div class="st-r-doc"><div class="st-paper">${stText(th?.text || '')}</div></div>`);
+  let a = null;
   if (fileSel) {
-    const th = k.thumbs.get(fileSel.key);
-    html = `<div class="st-r-head"><span class="st-r-name">${esc(basename(fileSel.abs))}</span><span class="st-r-sub">${esc(fileSel.outside ? dirname(fileSel.abs) : dirname(fileSel.rel))}</span><div class="grow"></div>
-      ${fileSel.page ? `<button class="st-btn pri" data-r="file" data-abs="${esc(fileSel.abs)}">${icon('layers', 14)}<span>${esc(w.showPage)}</span></button>` : ''}
-      ${fileSel.outside ? '' : `<button class="st-btn" data-r="reveal" data-rel="${esc(fileSel.rel)}">${esc(w.openFile)}</button>`}</div>`
-      + (fileSel.image ? `<div class="st-r-img">${th?.src ? stImg(th.src) : ''}</div>`
-        : fileSel.page ? `<div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(basename(fileSel.abs))}</div><p class="st-r-note">${esc(w.pageAlongside)}</p></div>`
-          : fileSel.outside ? `<div class="st-r-empty"><p>${esc(w.outsideFolder)}</p></div>`
-            : `<div class="st-r-doc"><div class="st-paper">${stText(th?.text || '')}</div></div>`);
+    a = { name: basename(fileSel.abs), sub: fileSel.outside ? dirname(fileSel.abs) : dirname(fileSel.rel), addr: basename(fileSel.abs),
+      act: (fileSel.page ? `<button class="st-btn pri" data-r="file" data-abs="${esc(fileSel.abs)}">${icon('layers', 14)}<span>${esc(w.showPage)}</span></button>` : '')
+        + (fileSel.outside ? '' : `<button class="st-btn ghost" data-r="reveal" data-rel="${esc(fileSel.rel)}">${esc(w.openFile)}</button>`),
+      body: fileBody(fileSel, k.thumbs.get(fileSel.key)) };
   } else if (!k?.site && stLastPreviewable(k)) {
     const f = stLastPreviewable(k);
-    const th = k.thumbs.get(f.key);
-    html = `<div class="st-r-head"><span class="st-r-name">${esc(basename(f.abs))}</span><span class="st-r-sub">${esc(stAgo(f.at))}</span><div class="grow"></div>
-      ${f.page ? `<button class="st-btn pri" data-r="file" data-abs="${esc(f.abs)}">${icon('layers', 14)}<span>${esc(w.showPage)}</span></button>` : ''}</div>`
-      + (f.image ? `<div class="st-r-img">${th?.src ? stImg(th.src) : ''}</div>`
-        : f.page ? `<div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(basename(f.abs))}</div><p class="st-r-note">${esc(w.pageAlongside)}</p></div>`
-          : `<div class="st-r-doc"><div class="st-paper">${stText(th?.text || '')}</div></div>`);
+    a = { name: basename(f.abs), sub: stAgo(f.at), addr: basename(f.abs),
+      act: f.page ? `<button class="st-btn pri" data-r="file" data-abs="${esc(f.abs)}">${icon('layers', 14)}<span>${esc(w.showPage)}</span></button>` : '',
+      body: fileBody(f, k.thumbs.get(f.key)) };
   } else if (!k?.site && k?.result) {
-    html = `<div class="st-r-head"><span class="st-url">${icon('globe', 12)}<b>${esc(stShortUrl(k.result))}</b></span><div class="grow"></div>
-      <button class="st-btn pri" data-r="link" data-url="${esc(k.result)}">${icon('layers', 14)}<span>${esc(w.showSite)}</span></button></div>${linksHtml}
-      <div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(stShortUrl(k.result))}</div><p class="st-r-note">${esc(w.pageAlongside)}</p></div>`;
+    a = { name: stShortUrl(k.result), sub: '', addr: stShortUrl(k.result), lock: true,
+      act: `<button class="st-btn pri" data-r="link" data-url="${esc(k.result)}">${icon('layers', 14)}<span>${esc(w.showSite)}</span></button>`,
+      body: `<div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(stShortUrl(k.result))}</div><p class="st-r-note">${esc(w.pageAlongside)}</p></div>`,
+      after: linksHtml };
   } else if (sel?.kind === 'shot' && shots[sel.key]) {
-    html = `<div class="st-r-head"><span class="st-r-name">${esc(sel.key === 0 && shots.length > 1 ? w.shotBefore : sel.key === shots.length - 1 && shots.length > 1 ? w.shotAfter : `${w.shot} ${sel.key + 1}`)}</span></div><div class="st-r-img">${stImg(stShotKey(shots[sel.key]))}</div>`;
+    const name = sel.key === 0 && shots.length > 1 ? w.shotBefore : sel.key === shots.length - 1 && shots.length > 1 ? w.shotAfter : `${w.shot} ${sel.key + 1}`;
+    a = { name, sub: '', addr: k.site ? StudioWords.host(k.site) : name, act: '', body: `<div class="st-r-img">${stImg(stShotKey(shots[sel.key]))}</div>` };
   } else if (k?.site) {
     const shot = shots[shots.length - 1];
-    html = `<div class="st-r-head"><span class="st-url">${icon('lock', 12)}<b>${esc(StudioWords.host(k.site))}</b></span>${shot ? `<span class="st-r-sub">${esc(shots.length > 1 ? w.wipeHint : w.lastShot)}</span>` : ''}<div class="grow"></div>
-      <button class="st-btn pri" data-r="site">${icon('layers', 14)}<span>${esc(w.showSite)}</span></button></div>`
-      + (shot ? (shots.length > 1 ? stWipeHtml(shots[0], shot) : `<div class="st-r-img">${stImg(stShotKey(shot))}</div>`) : `<div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(StudioWords.host(k.site))}</div></div>`);
-  } else {
-    // Nothing yet: nothing drawn (no placeholder; the result appears here by itself).
-    html = '';
+    a = { name: StudioWords.host(k.site), sub: shot ? (shots.length > 1 ? w.wipeHint : w.lastShot) : '', addr: StudioWords.host(k.site), lock: true,
+      // (Showing the live site is the dock's first tool.)
+      act: '',
+      body: shot ? (shots.length > 1 ? stWipeHtml(shots[0], shot) : `<div class="st-r-img">${stImg(stShotKey(shot))}</div>`) : `<div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(StudioWords.host(k.site))}</div></div>` };
   }
+  // Nothing yet: nothing drawn (no placeholder; the result appears here by itself).
+  const html = a ? `<div class="st-ab"><div class="st-ab-label"><b>${esc(a.name)}</b>${a.sub ? `<span>${esc(a.sub)}</span>` : ''}<div class="grow"></div>${a.act}</div>
+    <div class="st-artboard"><div class="st-chrome" aria-hidden="true"><i></i><i></i><i></i><span class="st-addr">${a.lock ? icon('lock', 10) : ''}${esc(a.addr)}</span></div>${a.body}</div>${a.after || ''}</div>` : '';
   if (pane.dataset.html !== html) { pane.innerHTML = html; pane.dataset.html = html; pane.classList.remove('st-fade'); void pane.offsetWidth; pane.classList.add('st-fade'); }
   stFillImages(pane);
 }
@@ -1144,14 +1172,12 @@ function stRenderResultBar(t) {
   const bar = $('#st-resultbar');
   const k = t ? stTask(t) : null;
   if (!k?.site) { bar.hidden = true; bar.innerHTML = ''; bar.dataset.html = ''; return; }
-  const host = StudioWords.host(k.site);
   const b = k.boost;
   const changed = !!b?.changed;
-  const html = `<span class="st-url">${icon('lock', 12)}<b>${esc(host)}</b></span>
-    <button class="st-link" data-rb="site" title="${esc(w.showSite)}">${icon('layers', 13)}</button>
+  // (The address is on the artboard's chrome; the dock holds only tools.)
+  const html = `<button class="st-link" data-rb="site" title="${esc(w.showSite)}">${icon('layers', 13)}<span>${esc(w.inTab)}</span></button>
     <button class="st-point${ST.pointing ? ' on' : ''}" data-rb="point" aria-pressed="${ST.pointing ? 'true' : 'false'}" title="${esc(w.pointTitle)}">${stCursorIcon()}<span>${esc(w.point)}</span></button>
-    <div class="grow"></div>
-    ${changed ? `<span class="st-boost${b.undone ? ' undone' : ''}">${icon('bolt', 13)}<span>${esc(b.undone ? w.boostUndone : w.boostUndo)}</span>${b.undone ? '' : `<button class="st-undo" data-rb="undo" title="${esc(w.undoTitle)}" aria-label="${esc(w.undo)}">${stUndoIcon()}</button>`}</span>
+    ${changed ? `<span class="st-dock-vr" aria-hidden="true"></span><span class="st-boost${b.undone ? ' undone' : ''}">${icon('bolt', 13)}<span>${esc(b.undone ? w.boostUndone : w.boostUndo)}</span>${b.undone ? '' : `<button class="st-undo" data-rb="undo" title="${esc(w.undoTitle)}" aria-label="${esc(w.undo)}">${stUndoIcon()}</button>`}</span>
     <div class="st-ba" role="group"><button data-rb="before" class="${b.showing === 'before' ? 'on' : ''}">${esc(w.before)}</button><button data-rb="after" class="${b.showing !== 'before' ? 'on' : ''}"${b.undone ? ' disabled' : ''}>${esc(w.after)}</button></div>` : ''}`;
   if (bar.dataset.html !== html) { bar.innerHTML = html; bar.dataset.html = html; }
   bar.hidden = false;
@@ -1279,6 +1305,8 @@ async function stOnFeedClick(e) {
     stRender();
     return;
   }
+  const idea = e.target.closest('.st-idea[data-starter]');
+  if (idea) return stStarterOpen(idea.dataset.starter);
   const opt = e.target.closest('[data-qopt]');
   if (opt) return stQuestionPick(opt);
   const qsend = e.target.closest('[data-qsend]');
@@ -1701,7 +1729,8 @@ function stSplitInit(el) {
 }
 // The task list's width: the same gestures as the chat's (drag, keys, double-click back to 210 px),
 // kept per profile.
-const ST_TASKS_DEF = 210, ST_TASKS_MIN = 150, ST_TASKS_MAX = 420;
+// Narrower than ST_TASKS_RAIL the list is a strip: mini-artboards and dots, names on hover.
+const ST_TASKS_DEF = 210, ST_TASKS_MIN = 64, ST_TASKS_MAX = 420, ST_TASKS_RAIL = 120;
 function stTasksSplitInit(el) {
   const split = $('#st-tsplit', el);
   if (!split) return;
@@ -1741,6 +1770,7 @@ function stSetTasksWidth(px, save) {
   const el = ST.el;
   if (!el) return;
   el.style.setProperty('--st-tasks-w', `${px}px`);
+  el.classList.toggle('st-rail', px < ST_TASKS_RAIL);
   const split = $('#st-tsplit', el);
   if (split) {
     split.setAttribute('aria-valuenow', String(px));

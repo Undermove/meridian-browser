@@ -27,6 +27,9 @@ for f in workbench.html workbench.js workbench-pro.js workbench.css secret-detec
   cp "$repo/src/renderer/dev/$f" "$dest.tmp/$f"
 done
 cp "$repo/src/renderer/icons.js" "$dest.tmp/icons.js"
+# Studio's display font (Geologica, SIL OFL 1.1: fonts/OFL.txt).
+mkdir -p "$dest.tmp/fonts"
+cp "$repo/src/renderer/dev/fonts/"geologica-*.woff2 "$repo/src/renderer/dev/fonts/OFL.txt" "$dest.tmp/fonts/"
 cp "$here/workbench/bridge.js" "$dest.tmp/bridge.js"
 # Docker sandboxes: the image recipe, and the Mission Control hook node runs inside it.
 mkdir -p "$dest.tmp/sandbox" "$dest.tmp/hooks"

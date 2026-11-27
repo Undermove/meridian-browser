@@ -160,10 +160,15 @@ test('new task: no folder question, the own-files link, the task menu on screen'
       ST.menuFor = 't1';
       stRender();
       const menu = document.querySelector('.st-tmenu').getBoundingClientRect();
-      return { own: own.hidden ? '' : own.innerText.trim(), chips: document.querySelectorAll('#st-chips .st-chip').length, folderTalk: /Выберите папку|Pick a folder/.test(text),
+      return { own: own.hidden ? '' : own.innerText.trim(), chips: document.querySelectorAll('#st-feed .st-idea').length, folderTalk: /Выберите папку|Pick a folder/.test(text),
         menu: document.querySelector('.st-tmenu').innerText.trim(), inView: menu.left >= 0 && menu.right <= innerWidth && menu.bottom <= innerHeight && menu.height > 20,
         sub: document.querySelector('#st-sub').textContent };
     })()`);
+    if (process.env.MERIDIAN_LAYOUT_SHOTS) {
+      await page.evaluate(`(() => { ST.menuFor = ''; stRender(); return true; })()`);
+      const shot = await page.send('Page.captureScreenshot', { format: 'png' });
+      fs.writeFileSync(path.join(process.env.MERIDIAN_LAYOUT_SHOTS, 'new-task.png'), Buffer.from(shot.result.data, 'base64'));
+    }
     assert.equal(m.own, 'Работать с моими файлами…');
     assert.ok(m.chips > 0);
     assert.equal(m.folderTalk, false);
@@ -215,5 +220,33 @@ test('task list resizes by its splitter; segmented controls slide a pill instead
     // (No Cards | Task switch any more: one view.)
     assert.equal(await page.evaluate(`!!document.querySelector('.st-viewseg')`), false);
     for (const sel of ['.st-head .st-switch']) assert.equal(await page.evaluate(`!!document.querySelector('${sel} .st-pill')`), true, sel);
+  } finally { await page.close(); }
+});
+
+// Keys on the waiting card: ↵ allows (not while typing in the box), Esc says no; a question's options by number.
+test('waiting cards answer keys: ↵ allows, Esc says no, 1–3 pick an option; never while typing', { skip: !chrome && 'no Chromium headless shell' }, async () => {
+  const page = await open();
+  try {
+    await page.send('Emulation.setDeviceMetricsOverride', { width: 1100, height: 760, deviceScaleFactor: 1, mobile: false });
+    await page.send('Page.navigate', { url: pathToFileURL(path.join(here, 'studio-ask.html')).href });
+    for (let i = 0; i < 50 && (await page.evaluate('typeof stBuild === "function" && document.readyState')) !== 'complete'; i++) await sleep(100);
+    await page.evaluate(SETUP('permission'));
+    const key = (k) => page.evaluate(`(() => { document.activeElement?.blur?.(); document.body.dispatchEvent(new KeyboardEvent('keydown', { key: ${JSON.stringify(k)}, bubbles: true })); return true; })()`);
+    await page.evaluate(`(() => { window.__answers = []; wb.studioAnswer = async (id, c) => { window.__answers.push(c); return true; }; return true; })()`);
+    // Typing in the box: Enter is the box's, not the card's.
+    await page.evaluate(`(() => { const i = document.querySelector('#st-input'); i.focus(); i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); return true; })()`);
+    assert.deepEqual(await page.evaluate('window.__answers'), []);
+    await key('Escape');
+    await sleep(100);
+    assert.deepEqual(await page.evaluate('window.__answers'), ['deny']);
+    // A question: «2» picks the second option (one question, one answer: that sends it).
+    await page.evaluate(SETUP('question'));
+    await page.evaluate(`(() => { window.__answers = []; wb.studioAnswer = async (id, c) => { window.__answers.push(c); return true; }; return true; })()`);
+    await key('2');
+    await sleep(100);
+    const got = await page.evaluate('window.__answers');
+    assert.equal(got.length, 1);
+    assert.match(got[0], /^answers:/);
+    assert.match(got[0], /Две версии баннера/);
   } finally { await page.close(); }
 });

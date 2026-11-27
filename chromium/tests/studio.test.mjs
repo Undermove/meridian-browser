@@ -181,7 +181,7 @@ test('Studio on: a task in plain words, a permission card answered with a button
     delete info.home;
     delete info.beta;  // (a Beta build says so)
     assert.deepEqual(info, { enabled: true, figma: false, chosen: false, ask: false, persona: 'designer' });
-    assert.equal(await wb.eval(`document.querySelectorAll('#st-chips .st-chip').length`), 3);
+    assert.equal(await wb.eval(`document.querySelectorAll('#st-feed .st-idea').length`), 3);
     assert.equal(await wb.eval(`document.querySelector('#studio .st-switch button.on').dataset.view`), 'studio');
     // Nothing about terminals, tokens or MCP in sight.
     assert.doesNotMatch(await wb.eval(`document.querySelector('#studio').innerText`), /terminal|token|MCP|CLI/i);
@@ -575,7 +575,7 @@ test('No folder question: Studio opens its own folder, a new task gets a folder 
     assert.ok(fs.statSync(home).isDirectory());
     assert.equal(await wb.eval(`!!document.querySelector('#st-pick') && document.querySelector('#st-pick').hidden`), true);
     assert.doesNotMatch(await wb.eval(`document.querySelector('#studio').innerText`), /Pick a folder|Choose a folder/);
-    assert.ok(await wb.eval(`document.querySelectorAll('#st-chips .st-chip').length`) > 0);
+    assert.ok(await wb.eval(`document.querySelectorAll('#st-feed .st-idea').length`) > 0);
     // The other way is one small link under the composer.
     assert.equal(await wb.eval(`document.querySelector('#st-own [data-own]')?.textContent`), 'Work with my files…');
 
@@ -817,9 +817,9 @@ test('Starters: each asks what it needs right there, runs, and its result shows 
   const pages = [];
   try {
     wb = await openWorkbench(b, s.project);
-    await wb.waitFor(`document.querySelectorAll('#st-chips [data-starter]').length === 3`);
+    await wb.waitFor(`document.querySelectorAll('#st-feed .st-idea[data-starter]').length === 3`);
     // Restyle: «Which site?» with the open tab as a choice; picking it runs the task.
-    await click(wb, '#st-chips [data-starter="restyle"]');
+    await click(wb, '#st-feed .st-idea[data-starter=\"restyle\"]');
     await wb.waitFor(`!!document.querySelector('.st-starter [data-sv]')`, 10000);
     assert.match(await wb.eval(`document.querySelector('.st-starter-q').innerText`), /Which site\?/);
     assert.equal(await wb.eval(`document.querySelector('.st-starter [data-sv]').dataset.sv`), site);
@@ -834,7 +834,7 @@ test('Starters: each asks what it needs right there, runs, and its result shows 
     // The board: «What is the board about?» — a few words, then the page it makes opens beside Studio.
     await newTask(wb);
     fs.rmSync(path.join(s.project, '.prompt'));
-    await click(wb, '#st-chips [data-starter="board"]');
+    await click(wb, '#st-feed .st-idea[data-starter=\"board\"]');
     await wb.waitFor(`!!document.querySelector('.st-starter-in')`);
     await wb.eval(`(() => { document.querySelector('.st-starter-in').value = 'Nordic coffee shops'; return true; })()`);
     await click(wb, '.st-starter [data-sgo]');
@@ -847,7 +847,7 @@ test('Starters: each asks what it needs right there, runs, and its result shows 
     // Inconsistencies: the page, then pins on it.
     await newTask(wb);
     fs.rmSync(path.join(s.project, '.prompt'));
-    await click(wb, '#st-chips [data-starter="audit"]');
+    await click(wb, '#st-feed .st-idea[data-starter=\"audit\"]');
     await wb.waitFor(`!!document.querySelector('.st-starter [data-sv]')`, 10000);
     await click(wb, '.st-starter [data-sv]');
     await wb.waitFor(`(stTask(stCurrent())?.pins || []).length === 2`, 20000);

@@ -25,7 +25,7 @@
       ownFiles: 'Работать с моими файлами…', ownChange: 'Другая папка…', backHome: 'Вернуться в Meridian Studio',
       ownTitle: 'Работать с вашими файлами', ownHint: 'Выберите папку с файлами. Claude будет работать с копиями файлов из этой папки, оригиналы не тронет.', ownPick: 'Выбрать папку',
       inFolder: (n) => `Папка «${n}»`, reveal: 'Показать в Finder', more: 'Ещё',
-      emptyTitle: 'Что сделаем?', emptyHint: 'Напишите задачу своими словами или выберите подсказку. Claude покажет каждый шаг, спросит разрешения и ничего не отправит наружу без вас.',
+      emptyTitle: 'Что сделаем?', helloTitle: 'С чего <em>начнём?</em>', emptyHint: 'Напишите задачу своими словами или начните с одной из этих. Claude спросит, прежде чем что-то менять.',
       roles: { designer: 'Дизайнер:', manager: 'Менеджер:', developer: 'Разработчику:', everyday: 'Можно так:' },
       // Starters: each one complete, with what it needs asked inline and a result you see.
       // need: 'site' (an open tab or an address) | 'text' (a few words) | '' (runs at once).
@@ -68,7 +68,7 @@
       },
       allow: 'Разрешить', once: 'Только в этот раз', no: 'Нет', allowed: 'Разрешено', denied: 'Не разрешено',
       answerInWorkbench: 'Ответить можно в Workbench', openWorkbench: 'Открыть Workbench',
-      trustFailed: 'Не получилось ответить на вопрос о папке — ответьте в Workbench',
+      inTab: 'Во вкладке', trustFailed: 'Не получилось ответить на вопрос о папке — ответьте в Workbench',
       allowOnce: 'Разрешить', allowTask: 'Разрешить всегда для этой задачи', whyAsk: 'Почему спрашиваем?',
       qAsks: 'Claude спрашивает', qOwn: 'Своими словами — в Workbench', qSend: 'Ответить', qAnswered: 'Ответ',
       filesTitle: 'Файлы по ходу работы', created: 'новый', changed: 'изменён', shot: 'скриншот', shots: 'Снимки', shotBefore: 'Было', shotAfter: 'Стало', wipeHint: 'было ← шторка → стало',
@@ -135,7 +135,7 @@
       ownFiles: 'Work with my files…', ownChange: 'Another folder…', backHome: 'Back to Meridian Studio',
       ownTitle: 'Work with your files', ownHint: 'Pick a folder with your files. Claude works on copies of the files in it and leaves the originals as they are.', ownPick: 'Choose a folder',
       inFolder: (n) => `Folder “${n}”`, reveal: 'Show in Finder', more: 'More',
-      emptyTitle: 'What shall we make?', emptyHint: 'Describe the task in your own words or pick a suggestion. Claude shows every step, asks before it changes things and never sends anything out without you.',
+      emptyTitle: 'What shall we make?', helloTitle: 'Where shall we <em>start?</em>', emptyHint: 'Say the task in your own words, or start with one of these. Claude asks before it changes anything.',
       roles: { designer: 'Designer:', manager: 'Manager:', developer: 'Developer:', everyday: 'Try:' },
       starters: {
         designer: [
@@ -176,7 +176,7 @@
       },
       allow: 'Allow', once: 'Just this once', no: 'No', allowed: 'Allowed', denied: 'Not allowed',
       answerInWorkbench: 'This one is answered in the Workbench', openWorkbench: 'Open Workbench',
-      trustFailed: 'Couldn’t answer the folder question here — answer it in the Workbench',
+      inTab: 'In a tab', trustFailed: 'Couldn’t answer the folder question here — answer it in the Workbench',
       allowOnce: 'Allow', allowTask: 'Always allow for this task', whyAsk: 'Why are we asking?',
       qAsks: 'Claude asks', qOwn: 'In my own words — Workbench', qSend: 'Answer', qAnswered: 'Answer',
       filesTitle: 'Files from this task', created: 'new', changed: 'changed', shot: 'screenshot', shots: 'Snapshots', shotBefore: 'Before', shotAfter: 'After', wipeHint: 'before ← drag → after',
