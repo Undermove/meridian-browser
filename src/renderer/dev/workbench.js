@@ -1316,6 +1316,7 @@ function saveTermName(t, name) {
   try { sessionStorage.setItem('termNames', JSON.stringify(all)); } catch {}
   syncTermMeta(t);
   if (t.kind === 'claude' || t.kind === 'codex') saveClaudeSessions();
+  if (typeof chatsRenamed === 'function') chatsRenamed(t, name); // Claude Code's own name too (Chats preview)
 }
 
 // A name given by hand, else the session's name (Claude Code's status line), else the terminal's title.

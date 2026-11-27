@@ -54,6 +54,7 @@ status()
 print('READY ' + name, flush=True)
 for line in sys.stdin:
     cmd = line.strip()
+    open(os.path.join(here, 'input-' + name + '.log'), 'a').write(cmd + '\\n')
     if cmd == 'prompt':
         hook('UserPromptSubmit')
         hook('PreToolUse', tool_name='Bash', tool_use_id='t1', tool_input={'command': 'npm run e2e'})
@@ -287,6 +288,57 @@ test('Chats list on: sessions with their status from hooks, done-unseen clears w
     assert.equal(await wb.eval(`document.querySelectorAll('.ss-mark').length`), 0);
     assert.equal(await wb.eval(`document.querySelector('#view-files').classList.contains('on')`), true);
     await b.waitFor(`${badgeText} === 'none'`);
+  } finally {
+    wb?.close();
+    await b.close();
+    for (const d of [project, bin]) fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('Chats list: a session renamed in the list is renamed everywhere; Claude Code gets /rename only once its turn is over', { skip: process.platform === 'win32' && 'the stand-in Claude Code is a Python script' }, async () => {
+  const { project, bin } = setup();
+  const b = await launch(['about:blank'], { args: [`--meridian-test-project=${project}`, `--meridian-agents-path=${bin}`, '--meridian-no-notify'] });
+  const typed = (who) => { try { return fs.readFileSync(path.join(bin, `input-${who}.log`), 'utf8').split('\n').filter(Boolean); } catch { return []; } };
+  let wb;
+  try {
+    wb = await openWorkbench(b);
+    await wb.eval(`(() => { localStorage.setItem('wb.chatsList', '1'); chatsStart(); return true; })()`);
+    const a = await startSession(wb, 'Alpha');
+    await startSession(wb, 'Beta');
+    await type(wb, a, 'prompt');
+    await wb.waitFor(`${row(a)}?.dataset.state === 'working'`, 10000);
+    // A double click on its name in the list, a new name, Enter.
+    const p = await wb.eval(`(() => { const r = ${row(a)}.querySelector('.chat-name').getBoundingClientRect(); return { x: r.x + 10, y: r.y + r.height / 2 }; })()`);
+    for (const clickCount of [1, 2]) {
+      await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: p.x, y: p.y, button: 'left', clickCount });
+      await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: p.x, y: p.y, button: 'left', clickCount });
+    }
+    await wb.waitFor(`document.activeElement?.classList.contains('chat-rename')`);
+    await wb.eval(`(() => { document.activeElement.select(); return true; })()`);
+    await wb.cdp.send('Input.insertText', { text: 'Boost fixes' });
+    await wb.cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await wb.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await wb.waitFor(`${row(a)}?.querySelector('.chat-name')?.textContent === 'Boost fixes'`);
+    // Everywhere: its tab, Mission Control, what Resume and a restart bring back.
+    assert.equal(await wb.eval(`termName(S.terms.find((t) => t.id === ${JSON.stringify(a)}))`), 'Boost fixes');
+    await wb.eval(`(() => { activateTerm(S.terms.find((t) => t.id === ${JSON.stringify(a)})); return true; })()`);
+    await wb.waitFor(`document.querySelector('#term-tab-list .ttab.active .name')?.textContent === 'Boost fixes'`);
+    const state = () => b.eval('app.$.tabstrip.handler_.getMissionState().then(({snapshotJson}) => JSON.parse(snapshotJson))');
+    for (let i = 0; i < 50 && !(await state()).nodes.some((n) => n.label === 'Boost fixes'); i++) await sleep(200);
+    assert.ok((await state()).nodes.some((n) => n.label === 'Boost fixes'), 'Mission Control shows the new name');
+    await wb.waitFor(`(S.savedSessions || '').includes('"name":"Boost fixes"')`);
+    // Working: nothing typed into the session.
+    await sleep(1500);
+    assert.ok(!typed('Alpha').some((l) => l.startsWith('/rename')), 'not during a turn');
+    // The turn ends: /rename goes in, once.
+    await type(wb, a, 'stop');
+    for (let i = 0; i < 50 && !typed('Alpha').includes('/rename Boost fixes'); i++) await sleep(200);
+    assert.deepEqual(typed('Alpha').filter((l) => l.startsWith('/rename')), ['/rename Boost fixes']);
+    // A double click on the tab's name does the same.
+    await wb.eval(`(() => { renameTerm(S.activeTerm); const i = document.querySelector('#term-tab-list .rename'); i.value = 'Boost'; i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' })); return true; })()`);
+    await wb.waitFor(`${row(a)}?.querySelector('.chat-name')?.textContent === 'Boost'`);
+    for (let i = 0; i < 50 && !typed('Alpha').includes('/rename Boost'); i++) await sleep(200);
+    assert.ok(typed('Alpha').includes('/rename Boost'));
   } finally {
     wb?.close();
     await b.close();

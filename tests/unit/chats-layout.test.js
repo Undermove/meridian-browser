@@ -23,7 +23,8 @@ function page() {
 
 // What chats.js uses from workbench.js, context-insights.js and terminal code.
 const STANDINS = `
-const wb = { platform: 'darwin', onHostCommand(fn) { window.__host = fn; }, toHost() {}, termLastAnswer: async () => '' };
+const wb = { platform: 'darwin', onHostCommand(fn) { window.__host = fn; }, toHost() {}, termLastAnswer: async () => '', ptyWrite(id, data) { window.__writes.push([id, data]); }, menu: async () => window.__menuChoice };
+window.__writes = []; window.__menuChoice = null;
 const $ = (s, root = document) => root.querySelector(s);
 const MEM = new Map();
 const load = (k) => (MEM.has(k) ? MEM.get(k) : null);
@@ -31,7 +32,8 @@ const store = (k, v) => MEM.set(k, v);
 const AGENT_UI = { claude: { label: 'Claude Code', mark: 'Cl', color: '#d97757' }, codex: { label: 'Codex', mark: 'Cx', color: '#3c3c46' }, shell: { label: 'Shell', mark: '$', color: '#7a808c' } };
 function agentMark(kind) { const m = document.createElement('span'); m.className = 'mark'; m.style.setProperty('--mark', AGENT_UI[kind].color); m.textContent = AGENT_UI[kind].mark; return m; }
 const termIsClaude = (t) => t.kind === 'claude';
-const termName = (t) => t.name;
+const termName = (t) => t.custom || t.name;
+function saveTermName(t, name) { t.custom = name; if (typeof chatsRenamed === 'function') chatsRenamed(t, name); }
 function termRcBadge(t) { const el = document.createElement('span'); el.className = 'tab-rc on'; el.textContent = 'RC'; return el; }
 function termUsageBadge(t) {
   if (t.pct == null) return null;
@@ -94,6 +96,32 @@ const MEASURE = `(sel) => {
   return out;
 }`;
 
+// A fresh page with the panel at `width`, its sessions and their states.
+async function openPanel(browser, { width, scheme = 'light', states }) {
+  const p = await browser.newPage({ viewport: { width: 1280, height: 800 }, colorScheme: scheme });
+  p.errors = [];
+  p.on('pageerror', (e) => p.errors.push(e.message));
+  await p.setContent(page());
+  await p.addScriptTag({ content: read('../icons.js') });
+  await p.addScriptTag({ content: STANDINS });
+  await p.addScriptTag({ content: read('session-status.js') });
+  await p.addScriptTag({ content: read('chats.js') });
+  await p.evaluate(({ terms, width }) => {
+    document.querySelector('#main').hidden = false;
+    document.querySelector('#welcome').hidden = true;
+    for (const s of document.querySelectorAll('.ic-slot[data-icon]')) s.innerHTML = icon(s.dataset.icon, 14);
+    const n = document.querySelector('#scm-count'); n.hidden = false; n.textContent = '11';
+    store('treeW', String(width));
+    document.documentElement.style.setProperty('--tree-w', width + 'px');
+    S.terms = terms.map((x) => ({ ...x }));
+    S.activeTerm = S.terms[1];
+    chatsStart();
+    SessionStatus.report({ on: true, onScreen: '2', order: S.terms.map((x) => x.id) });
+  }, { terms: TERMS, width });
+  if (states) await p.evaluate((sessions) => window.__host({ type: 'mission', sessions }), states);
+  return p;
+}
+
 let chromium;
 try { ({ chromium } = require('playwright')); } catch {}
 
@@ -105,33 +133,12 @@ test('Chats panel: no overlaps and nothing outside the pane at 160, 290 and 480 
     for (const scheme of ['light', 'dark']) {
       for (const width of [160, 290, 480]) {
         // A page of its own each time: the scripts declare globals.
-        const p = await browser.newPage({ viewport: { width: 1280, height: 800 }, colorScheme: scheme });
-        const errors = [];
-        p.on('pageerror', (e) => errors.push(e.message));
-        await p.setContent(page());
-        await p.addScriptTag({ content: read('../icons.js') });
-        await p.addScriptTag({ content: STANDINS });
-        await p.addScriptTag({ content: read('session-status.js') });
-        await p.addScriptTag({ content: read('chats.js') });
-        await p.evaluate(({ terms, width }) => {
-          document.querySelector('#main').hidden = false;
-          document.querySelector('#welcome').hidden = true;
-          // The tree's own icons (workbench.js iconize()).
-          for (const s of document.querySelectorAll('.ic-slot[data-icon]')) s.innerHTML = icon(s.dataset.icon, 14);
-          const n = document.querySelector('#scm-count'); n.hidden = false; n.textContent = '11';
-          store('treeW', String(width));
-          document.documentElement.style.setProperty('--tree-w', width + 'px');
-          S.terms = terms.map((x) => ({ ...x }));
-          S.activeTerm = S.terms[1];
-          chatsStart();
-          // Statuses as Mission Control sends them.
-          SessionStatus.report({ on: true, onScreen: '2', order: S.terms.map((x) => x.id) });
-        }, { terms: TERMS, width });
-        await p.evaluate(() => window.__host({ type: 'mission', sessions: {
+        const p = await openPanel(browser, { width, scheme, states: {
           1: { chat: 'needs', ask: { tool: 'Bash', summary: '$ dotnet test --filter Integration' } },
           2: { chat: 'working', tool: { name: 'Bash', summary: '$ npm run e2e -- --grep boost' } },
           3: { chat: 'done' },
-        } }));
+        } });
+        const errors = p.errors;
         assert.deepEqual(errors, [], 'the page threw');
         for (const view of ['chats', 'files']) {
           await p.evaluate((view) => { document.querySelector(view === 'chats' ? '#view-chats' : '#view-files').click(); const e = document.querySelector('details.chats-ended'); if (e) e.open = true; }, view);
@@ -158,6 +165,68 @@ test('Chats panel: no overlaps and nothing outside the pane at 160, 290 and 480 
         await p.close();
       }
     }
+  } finally {
+    await browser.close();
+  }
+});
+
+test('Chats panel: a session is renamed in place (double click, its menu, F2); Claude Code gets /rename only when idle with an empty prompt', async (t) => {
+  let browser;
+  try { browser = chromium && await chromium.launch({ headless: true }); } catch {}
+  if (!browser) { t.skip('Playwright Chromium is not installed'); return; }
+  const name = (p, id) => p.evaluate((id) => document.querySelector(`.chat-row[data-term="${id}"] .chat-name`)?.textContent, id);
+  const writes = (p) => p.evaluate(() => window.__writes.map(([id, d]) => `${id}:${d}`));
+  const state = (p, sessions) => p.evaluate((sessions) => window.__host({ type: 'mission', sessions }), sessions);
+  try {
+    const p = await openPanel(browser, { width: 290, states: { 2: { chat: 'working', tool: { name: 'Bash', summary: '$ npm test' } }, 3: { chat: 'idle' } } });
+
+    // A double click on a working session's name: a field; Enter keeps the name.
+    await p.dblclick('.chat-row[data-term="2"] .chat-name');
+    await p.waitForSelector('.chat-row[data-term="2"] input.chat-rename');
+    // A status update meanwhile doesn't take the field away.
+    await state(p, { 2: { chat: 'working', tool: { name: 'Read', summary: 'a.js' } }, 3: { chat: 'idle' } });
+    assert.equal(await p.evaluate(() => document.activeElement?.className), 'chat-rename');
+    await p.keyboard.press('Meta+A');
+    await p.keyboard.type('Boost fixes');
+    await p.keyboard.press('Enter');
+    assert.equal(await name(p, '2'), 'Boost fixes');
+    assert.equal(await p.evaluate(() => S.terms[1].custom), 'Boost fixes', 'the name given by hand (tab, Mission Control, Resume)');
+    // Working: nothing typed into it yet.
+    assert.deepEqual(await writes(p), []);
+    // Idle, but with half-typed text in its prompt: still waits.
+    await p.evaluate(() => { S.terms[1].typed = 'and then'; });
+    await state(p, { 2: { chat: 'idle' }, 3: { chat: 'idle' } });
+    assert.deepEqual(await writes(p), []);
+    // The prompt cleared: /rename goes in, once.
+    await p.evaluate(() => { S.terms[1].typed = ''; });
+    await p.waitForFunction(() => window.__writes.length === 1, null, { timeout: 3000 });
+    assert.deepEqual(await writes(p), ['2:/rename Boost fixes\r']);
+
+    // Esc gives the old name back and sends nothing.
+    await p.dblclick('.chat-row[data-term="3"] .chat-name');
+    await p.keyboard.type('Nope');
+    await p.keyboard.press('Escape');
+    assert.equal(await name(p, '3'), 'TraleBot: push schedule');
+    // F2 on the row; an idle session is renamed at once.
+    await p.focus('.chat-row[data-term="3"]');
+    await p.keyboard.press('F2');
+    await p.waitForSelector('.chat-row[data-term="3"] input.chat-rename');
+    await p.keyboard.press('Meta+A');
+    await p.keyboard.type('Push');
+    await p.keyboard.press('Enter');
+    assert.equal(await name(p, '3'), 'Push');
+    assert.deepEqual((await writes(p)).slice(1), ['3:/rename Push\r']);
+    // The row's menu: Rename…; a Codex session is renamed here only (no /rename for it).
+    await p.evaluate(() => { window.__menuChoice = 'rename'; });
+    await p.click('.chat-row[data-term="4"] .chat-name', { button: 'right' });
+    await p.waitForSelector('.chat-row[data-term="4"] input.chat-rename');
+    await p.keyboard.press('Meta+A');
+    await p.keyboard.type('Review');
+    await p.keyboard.press('Enter');
+    assert.equal(await name(p, '4'), 'Review');
+    assert.equal((await writes(p)).length, 2);
+    assert.deepEqual(p.errors, []);
+    await p.close();
   } finally {
     await browser.close();
   }
