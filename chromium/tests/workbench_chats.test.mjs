@@ -66,6 +66,26 @@ for line in sys.stdin:
         hook('PostToolUse', tool_name='Bash', tool_use_id='t1', tool_input={})
         answer('Push schedule updated, e2e green.')
         hook('Stop')
+    elif cmd == 'pr':
+        hook('UserPromptSubmit')
+        hook('PreToolUse', tool_name='Bash', tool_use_id='t3', tool_input={'command': 'gh pr create'})
+        hook('PostToolUse', tool_name='Bash', tool_use_id='t3', tool_input={'command': 'gh pr create'})
+        answer('Opened https://github.com/acme/app/pull/77 for review.')
+        hook('Stop')
+    elif cmd == 'fail':
+        hook('UserPromptSubmit')
+        hook('PreToolUse', tool_name='Bash', tool_use_id='t4', tool_input={'command': 'npm test'})
+        hook('PostToolUseFailure', tool_name='Bash', tool_use_id='t4', tool_input={'command': 'npm test'})
+        answer('The tests fail.')
+        hook('Stop')
+    elif cmd == 'write':
+        hook('UserPromptSubmit')
+        f = {'file_path': os.path.join(cwd, 'notes.md'), 'content': 'x'}
+        hook('PreToolUse', tool_name='Write', tool_use_id='t5', tool_input=f)
+        open(f['file_path'], 'w').write('notes')
+        hook('PostToolUse', tool_name='Write', tool_use_id='t5', tool_input=f)
+        answer('Wrote the notes.')
+        hook('Stop')
     elif cmd == '':
         hook('PostToolUse', tool_name='Bash', tool_use_id='t2', tool_input={})
         answer('Tests pass.')
@@ -150,7 +170,7 @@ test('Chats list off (the default): the Workbench looks and works as before, and
     assert.deepEqual(await wb.eval(`[...document.querySelectorAll('#left-views .left-view')].map((b) => b.id)`), ['view-files', 'view-scm']);
     assert.equal(await wb.eval(`document.querySelector('#view-files').classList.contains('on')`), true);
     assert.equal(await wb.eval(visibleTabs), 2);
-    assert.equal(await wb.eval(`document.querySelectorAll('.ss-mark').length`), 0);
+    assert.equal(await wb.eval(`document.querySelectorAll('.ss-mark, .ss-kind').length`), 0);
     // Meridian lists no Workbench as showing chats, and the sidebar's Workbench row has no mark.
     assert.deepEqual(s.chats, []);
     assert.equal(await b.eval(badgeText), 'none');
@@ -199,13 +219,13 @@ test('Chats list on: sessions with their status from hooks, done-unseen clears w
     assert.equal(await wb.eval(`${row(a)}.querySelector('.chat-name').textContent`), 'Alpha');
     assert.equal(await wb.eval(`${row(a)}.querySelector('.chat-words').textContent`), 'Idle');
     assert.match(await wb.eval(`${row(a)}.querySelector('.ctx-badge')?.textContent || ''`), /^12%$/);
-    assert.equal(await wb.eval(`${row(a)}.querySelector('.ss-mark')`), null);
+    assert.equal(await wb.eval(`${row(a)}.querySelector('.ss-kind')`), null);
     assert.equal(await b.eval(badgeText), 'none');
 
     // Working: a turn runs in Alpha (not on screen) — a spinner on its row, the sidebar spins.
     await type(wb, a, 'prompt');
     await wb.waitFor(`${row(a)}?.dataset.state === 'working'`, 10000);
-    assert.ok(await wb.eval(`!!${row(a)}.querySelector('.ss-mark.working')`));
+    assert.ok(await wb.eval(`!!${row(a)}.querySelector('.ss-kind.working')`));
     // "Working" comes with UserPromptSubmit, the tool with the next hook (PreToolUse): two hook processes.
     // Mission Control sends its changes at most every 80 ms, so when the second hook starts later than
     // that (a busy machine) the page first gets "Working" alone; the tool follows in the same state.
@@ -215,21 +235,21 @@ test('Chats list on: sessions with their status from hooks, done-unseen clears w
     // Done, not seen: Alpha's turn ends while Gamma is on screen — blue, the sidebar says 1.
     await type(wb, a, 'stop');
     await wb.waitFor(`${row(a)}?.dataset.state === 'done'`, 10000);
-    assert.ok(await wb.eval(`!!${row(a)}.querySelector('.ss-mark.done')`));
+    assert.ok(await wb.eval(`!!${row(a)}.querySelector('.ss-kind.done')`));
     await wb.waitFor(`${row(a)}.querySelector('.chat-words').textContent.startsWith('Done')`);
     await b.waitFor(`${badgeText} === 'done:1'`);
 
     // Needs you: Beta asks to run dotnet test — orange, bolder, in words; it outranks done.
     await type(wb, bb, 'perm');
     await wb.waitFor(`${row(bb)}?.dataset.state === 'needs'`, 10000);
-    assert.ok(await wb.eval(`!!${row(bb)}.querySelector('.ss-mark.needs')`));
-    assert.equal(await wb.eval(`${row(bb)}.querySelector('.chat-words').textContent`), 'Needs you · Allow Bash(dotnet test)?');
+    assert.ok(await wb.eval(`!!${row(bb)}.querySelector('.ss-kind.permission')`));
+    assert.equal(await wb.eval(`${row(bb)}.querySelector('.chat-words').textContent`), 'Needs permission: Bash(dotnet test)');
     assert.equal(await wb.eval(`getComputedStyle(${row(bb)}.querySelector('.chat-name')).fontWeight`), '650');
-    await b.waitFor(`${badgeText} === 'needs:1'`);
+    await b.waitFor(`${badgeText} === 'permission:1'`);
     // The order never follows the status.
     assert.deepEqual(await rows(), order);
     // The strip's tab (Gamma, idle) has no mark; marks show on the tab of a session on screen.
-    assert.equal(await wb.eval(`document.querySelector('#term-tab-list .ttab.active .ss-mark')`), null);
+    assert.equal(await wb.eval(`document.querySelector('#term-tab-list .ttab.active .ss-kind')`), null);
 
     await shot(wb, 'chats-on-light.png');
     await sidebarShot(b, 'sidebar-badge-needs-light.png');
@@ -245,13 +265,13 @@ test('Chats list on: sessions with their status from hooks, done-unseen clears w
     await b.click(`${wbRow}.shadowRoot.querySelector('.title')`);
     await b.waitFor(`${wbRow}.tab.isActive`);
     await wb.waitFor(`S.activeTerm?.id === ${JSON.stringify(bb)}`, 10000);
-    assert.equal(await wb.eval(`document.querySelector('#term-tab-list .ttab.active .ss-mark.needs') !== null`), true, 'the strip shows its mark');
+    assert.equal(await wb.eval(`document.querySelector('#term-tab-list .ttab.active .ss-kind.permission') !== null`), true, 'the strip shows its mark');
 
     // Showing Alpha (a click on its row) clears its "done".
     await click(wb, row(a));
     await wb.waitFor(`S.activeTerm?.id === ${JSON.stringify(a)}`);
     await wb.waitFor(`${row(a)}?.dataset.state === 'idle'`, 10000);
-    await b.waitFor(`${badgeText} === 'needs:1'`);
+    await b.waitFor(`${badgeText} === 'permission:1'`);
 
     // Beta answered (it's not on screen, so its turn's end is "done"); then shown: all quiet.
     await type(wb, bb, '');
@@ -266,7 +286,7 @@ test('Chats list on: sessions with their status from hooks, done-unseen clears w
     // A session on screen that finishes stays plain idle (it was seen).
     await type(wb, bb, 'prompt');
     await wb.waitFor(`${row(bb)}?.dataset.state === 'working'`, 10000);
-    assert.ok(await wb.eval(`!!document.querySelector('#term-tab-list .ttab.active .ss-mark.working')`));
+    assert.ok(await wb.eval(`!!document.querySelector('#term-tab-list .ttab.active .ss-kind.working')`));
     await type(wb, bb, 'stop');
     await wb.waitFor(`${row(bb)}?.dataset.state === 'idle'`, 10000);
     await sleep(500);
@@ -281,14 +301,14 @@ test('Chats list on: sessions with their status from hooks, done-unseen clears w
 
     // Off again: the old Workbench, and Meridian stops counting.
     await type(wb, c, 'perm');
-    await b.waitFor(`${badgeText} === 'needs:1'`);
+    await b.waitFor(`${badgeText} === 'permission:1'`);
     await wb.eval(`openPanel('customize')`);
     await wb.waitFor(`!!document.querySelector('.chats-list input')`);
     await wb.eval(`(() => { document.querySelector('details.advanced').open = true; return true; })()`);
     await click(wb, `document.querySelector('.chats-list input')`);
     await wb.waitFor(`!document.body.dataset.chats && !document.querySelector('#view-chats')`);
     assert.equal(await wb.eval(visibleTabs), 3);
-    assert.equal(await wb.eval(`document.querySelectorAll('.ss-mark').length`), 0);
+    assert.equal(await wb.eval(`document.querySelectorAll('.ss-mark, .ss-kind').length`), 0);
     assert.equal(await wb.eval(`document.querySelector('#view-files').classList.contains('on')`), true);
     await b.waitFor(`${badgeText} === 'none'`);
   } finally {
@@ -342,6 +362,49 @@ test('Chats list: a session renamed in the list is renamed everywhere; Claude Co
     await wb.waitFor(`${row(a)}?.querySelector('.chat-name')?.textContent === 'Boost'`);
     for (let i = 0; i < 50 && !typed('Alpha').includes('/rename Boost'); i++) await sleep(200);
     assert.ok(typed('Alpha').includes('/rename Boost'));
+  } finally {
+    wb?.close();
+    await b.close();
+    for (const d of [project, bin]) fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('Chats list: what each finished session wants — a PR, an error, a result — as icons; the sidebar shows the top one', { skip: process.platform === 'win32' && 'the stand-in Claude Code is a Python script' }, async () => {
+  const { project, bin } = setup();
+  const b = await launch(['about:blank'], { args: [`--meridian-test-project=${project}`, `--meridian-agents-path=${bin}`, '--meridian-no-notify'] });
+  let wb;
+  try {
+    wb = await openWorkbench(b);
+    await wb.eval(`(() => { localStorage.setItem('wb.chatsList', '1'); chatsStart(); return true; })()`);
+    const a = await startSession(wb, 'Alpha');
+    const bb = await startSession(wb, 'Beta');
+    const c = await startSession(wb, 'Gamma');
+    const d = await startSession(wb, 'Delta');
+    const kind = (id) => `${row(id)}?.dataset.kind`;
+    // Delta on screen; the others finish turns of each kind.
+    await type(wb, a, 'write');
+    await wb.waitFor(`${kind(a)} === 'result'`, 15000);
+    assert.equal(await wb.eval(`${row(a)}.querySelector('.chat-words').textContent`), 'Result: notes.md');
+    await b.waitFor(`${badgeText} === 'result:1'`);
+    await type(wb, bb, 'pr');
+    await wb.waitFor(`${kind(bb)} === 'pr'`, 15000);
+    assert.equal(await wb.eval(`${row(bb)}.querySelector('.chat-words').textContent`), 'PR #77 ready for review');
+    assert.equal(await wb.eval(`SessionStatus.info(${JSON.stringify(bb)}).link.href`), 'https://github.com/acme/app/pull/77');
+    await b.waitFor(`${badgeText} === 'pr:1'`);
+    await type(wb, c, 'fail');
+    await wb.waitFor(`${kind(c)} === 'error'`, 15000);
+    await b.waitFor(`${badgeText} === 'error:1'`);
+    // Asking outranks them all.
+    await type(wb, d, 'perm');
+    await wb.waitFor(`${kind(d)} === 'permission'`, 15000);
+    await b.waitFor(`${badgeText} === 'permission:1'`);
+    assert.ok(await wb.eval(`!!document.querySelector('#term-tab-list .ttab.active .ss-kind.permission svg')`), 'the tab shows the icon');
+    // A click on the result's words opens the file; the session is seen.
+    await click(wb, `${row(a)}.querySelector('.chat-words')`);
+    await wb.waitFor(`S.activeTab?.path === 'notes.md'`, 10000);
+    await wb.waitFor(`${kind(a)} === 'none'`);
+    await shot(wb, 'chats-kinds-light.png');
+    await sidebarShot(b, 'sidebar-badge-kinds-light.png');
   } finally {
     wb?.close();
     await b.close();

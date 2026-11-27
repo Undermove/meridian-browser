@@ -136,8 +136,12 @@ test('Chats panel: no overlaps and nothing outside the pane at 160, 290 and 480 
         const p = await openPanel(browser, { width, scheme, states: {
           1: { chat: 'needs', ask: { tool: 'Bash', summary: '$ dotnet test --filter Integration' } },
           2: { chat: 'working', tool: { name: 'Bash', summary: '$ npm run e2e -- --grep boost' } },
-          3: { chat: 'done' },
+          3: { chat: 'done', turn: { files: ['src/push/schedule.ts', 'src/push/schedule.test.ts'] } },
         } });
+        // What each wants, as an icon: permission, working, a result.
+        assert.deepEqual(await p.evaluate(() => [...document.querySelectorAll('#chats-view .chat-row')].map((r) => r.dataset.kind)),
+          ['permission', 'working', 'result', 'none', 'none', 'none']);
+        assert.equal(await p.evaluate(() => document.querySelectorAll('#chats-view .ss-kind svg').length), 2);
         const errors = p.errors;
         assert.deepEqual(errors, [], 'the page threw');
         for (const view of ['chats', 'files']) {
