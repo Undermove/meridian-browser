@@ -1,0 +1,602 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 27 Nov 2026 18:20:02 +0400
+Subject: [PATCH] =?UTF-8?q?Meridian:=20=C2=ABYou're=20all=20set=C2=BB=20fi?=
+ =?UTF-8?q?ts=20the=20window,=20one=20grid=20of=20tiles?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The welcome tour's last page could run under «Start browsing»: the page
+centres what it holds, so whatever was taller than the window spilled
+below it, over the tour's button (the owner's window: the move-in note,
+three tiles, «Get Claude for Mac» as a wide card, the Claude Code check).
+
+- «Get Claude» shows only when no agent is there at all (none found, none
+  in the check, Claude Desktop not just set up), once the check answered,
+  and as the fourth tile of the same grid, not a wide card under it.
+- The check's lines are as wide as the tiles.
+- On a laptop-height window the mark, the headline and the gaps get
+  smaller; a page still taller than the window scrolls under its own edge,
+  never under the button.
+
+Test: node --test chrome/browser/resources/webui_browser/meridian/layout_tests/onboarding_done.test.mjs
+(real onboarding.css in headless Google Chrome, 800×600 to 2560×1440: no
+overlaps, nothing under the button, one grid, no scrolling from 1024×640).
+The layout tests share a small DevTools launcher, layout_tests/cdp.mjs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/layout_tests/cdp.mjs             |  57 +++++
+ .../layout_tests/onboarding_done.test.mjs     | 213 ++++++++++++++++++
+ .../meridian/layout_tests/url_pill.test.mjs   |  48 +---
+ .../webui_browser/meridian/onboarding.css     |  99 ++++++++
+ .../webui_browser/meridian/onboarding.html.ts |  21 +-
+ .../webui_browser/meridian/onboarding.ts      |  12 +
+ 6 files changed, 392 insertions(+), 58 deletions(-)
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/layout_tests/cdp.mjs
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/layout_tests/onboarding_done.test.mjs
+
+diff --git a/chrome/browser/resources/webui_browser/meridian/layout_tests/cdp.mjs b/chrome/browser/resources/webui_browser/meridian/layout_tests/cdp.mjs
+new file mode 100644
+index 0000000000..7401393a7b
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/layout_tests/cdp.mjs
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Headless Google Chrome over the DevTools protocol, for the layout tests in
++// this folder (no build, no dependencies: Node's own WebSocket).
++
++import {spawn} from 'node:child_process';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++
++export const CHROME = process.env.CHROME ||
++    ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
++     '/usr/bin/google-chrome', '/usr/bin/chromium']
++        .find((p) => fs.existsSync(p));
++
++// A fresh headless Chrome with one page: {s(method, params), close()}.
++export async function launch() {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-layout-'));
++  const proc = spawn(CHROME, ['--headless=new', '--remote-debugging-port=0',
++    `--user-data-dir=${dir}`, '--no-first-run', '--no-default-browser-check',
++    '--hide-scrollbars', '--force-color-profile=srgb', 'about:blank'],
++    {stdio: 'ignore'});
++  const portFile = path.join(dir, 'DevToolsActivePort');
++  for (let i = 0; i < 200 && !fs.existsSync(portFile); i++) {
++    await new Promise((r) => setTimeout(r, 50));
++  }
++  const [port, wsPath] = fs.readFileSync(portFile, 'utf8').trim().split('\n');
++  const ws = new WebSocket(`ws://127.0.0.1:${port}${wsPath}`);
++  await new Promise((r, j) => { ws.onopen = r; ws.onerror = j; });
++  let id = 0;
++  const waiting = new Map();
++  ws.onmessage = (e) => {
++    const msg = JSON.parse(e.data);
++    const w = waiting.get(msg.id);
++    if (!w) return;
++    waiting.delete(msg.id);
++    msg.error ? w.j(new Error(JSON.stringify(msg.error))) : w.r(msg.result);
++  };
++  const send = (method, params = {}, sessionId) => new Promise((r, j) => {
++    waiting.set(++id, {r, j});
++    ws.send(JSON.stringify({id, method, params, sessionId}));
++  });
++  const {targetId} = await send('Target.createTarget', {url: 'about:blank'});
++  const {sessionId} = await send('Target.attachToTarget', {targetId, flatten: true});
++  const s = (method, params) => send(method, params, sessionId);
++  return {
++    s,
++    async close() {
++      ws.close();
++      proc.kill();
++      await new Promise((r) => setTimeout(r, 200));
++      fs.rmSync(dir, {recursive: true, force: true});
++    },
++  };
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/layout_tests/onboarding_done.test.mjs b/chrome/browser/resources/webui_browser/meridian/layout_tests/onboarding_done.test.mjs
+new file mode 100644
+index 0000000000..7a4647e102
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/layout_tests/onboarding_done.test.mjs
+@@ -0,0 +1,213 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The welcome tour's last page, «You're all set», lays out without overlaps
++// from a small laptop window to a big screen: the real onboarding.css and
++// icons in headless Google Chrome, with the page's markup as
++// onboarding.html.ts draws it for the 'done' step (keep the two in step).
++// Cases: an agent connected (three tiles, its check line), no agent (four
++// tiles with «Get Claude»), moved in with an agent (the owner's), and
++// everything at once (the move-in note, the passwords button, two check
++// lines, one with a button, the restart line, «Undo this setup»). At each
++// size: nothing overlaps, nothing is under the tour's button or outside the
++// window, the tiles are one grid (same width, same height in a row), the check
++// lines are as wide as the grid, and from 1024×640 up the page has room
++// without scrolling (everything at once: from 1075×810; smaller, it scrolls
++// under its own edge, still clear of the button).
++// No build needed. Run: node --test chrome/browser/resources/webui_browser/meridian/layout_tests/onboarding_done.test.mjs
++// Skipped without Google Chrome (CHROME=/path/to/chrome to pick one).
++// MERIDIAN_SHOTS=<dir> also writes a shot of each case there.
++
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import path from 'node:path';
++import {fileURLToPath} from 'node:url';
++
++import {CHROME, launch} from './cdp.mjs';
++
++const HERE = path.dirname(fileURLToPath(import.meta.url));
++const MERIDIAN = process.env.MERIDIAN_ROOT || path.resolve(HERE, '..');
++const SHOTS = process.env.MERIDIAN_SHOTS;
++const read = (f) => fs.readFileSync(path.join(MERIDIAN, f), 'utf8');
++
++function icon(name, size) {
++  const m = read('icons.ts').match(
++      new RegExp(`case '${name}':\\s*return html\`([^\`]*)\``));
++  return m[1].replaceAll('${size}', String(size));
++}
++
++const tile = (ic, b, em, id = '') =>
++    `<button class="try"${id ? ` id="${id}"` : ''}><span class="try-ic">${
++        icon(ic, 17)}</span><b>${b}</b><em>${em}</em></button>`;
++
++const check = (state, name, message, fix = '') => `
++  <div class="check ${state}"><span class="check-ic">${
++    icon(state === 'ok' ? 'check' : 'info', 14)}</span>
++    <span class="check-text"><b>${name}</b><span class="check-msg">${
++    message}</span></span>${
++    fix ? `<button class="btn ghost check-fix">${fix}</button>` : ''}</div>`;
++
++const CASES = {
++  connected: {
++    getClaude: false,
++    checks: [check('ok', 'Claude Code', 'Claude Code is signed in and connected.')],
++  },
++  'no-agent': {getClaude: true, checks: []},
++  // The owner's window on 27.11: moved in from Chrome, Claude Code connected.
++  'moved-in': {
++    getClaude: false,
++    note: 'You’re still signed in to your sites (5,915 sign-ins, 682 ' +
++        'passwords, 1 card brought over). Your history and the rest came too.',
++    checks: [check('ok', 'Claude Code', 'Claude Code is signed in and connected.')],
++  },
++  everything: {
++    getClaude: false,
++    note: 'You’re still signed in to your sites (5,915 sign-ins, 682 ' +
++        'passwords, 1 card brought over). Your history and the rest came too.',
++    passwords: true,
++    restart: 'Close Claude and open it again, then ask it to do something ' +
++        'in Meridian.',
++    undo: true,
++    checks: [
++      check('ok', 'Claude Code', 'Claude Code is signed in and connected.'),
++      check('restart', 'Claude for Mac',
++            'Claude for Mac needs a restart to load Meridian.', 'Restart'),
++    ],
++    checkNote: 'Sign in to Claude Code in the Terminal, then come back.',
++  },
++};
++
++// onboarding.html.ts, step 'done'.
++function page(c) {
++  return `<!doctype html><html><head><meta charset="utf-8">
++<style>html, body { margin: 0; height: 100%; }</style></head>
++<body><div id="host" open></div><script>
++document.getElementById('host').attachShadow({mode: 'open'}).innerHTML =
++  ${JSON.stringify(`<style>${read('onboarding.css')}</style>
++<div id="root" data-step="done">
++  <div class="bg"><i class="b1"></i><i class="b2"></i><i class="b3"></i></div>
++  <div class="top"><div class="grow"></div>
++    <button id="skip" class="skip" hidden>Skip</button></div>
++  <div class="stage">
++    <div class="page step-done">
++      <div class="hero">
++        <div class="mark done">${icon('check', 54)}</div>
++        <h1>You’re all set</h1>
++        <p class="whisper">Press <kbd>⌘</kbd><kbd>T</kbd> to open a new tab
++          or find anything you had open.</p>
++        ${c.note ? `<p class="whisper">${c.note}</p>` : ''}
++        ${c.passwords ? `<button id="passwordsFile" class="pill">${
++          icon('lock', 15)} Import passwords from a file</button>` : ''}
++        <div class="tries ${c.getClaude ? 'four' : ''}">
++          ${tile('sparkles', 'Ask about a page', 'Get an answer from what’s open')}
++          ${tile('sliders', 'Clean up a site', 'Remove what distracts you')}
++          ${tile('split', 'Two tabs side by side', 'Read and work at once')}
++          ${c.getClaude ? tile('external', 'Get Claude for Mac',
++              'Free; Meridian sets it up for you', 'getClaude') : ''}
++        </div>
++        ${c.restart ? `<div class="ai-done"><span>${c.restart}</span></div>` : ''}
++        ${c.undo ? '<button id="undoSetup" class="link">Undo this setup</button>' : ''}
++        ${c.checks.length ? `<div class="checks" id="checks">${c.checks.join('')}${
++          c.checkNote ? `<p id="checkNote" class="whisper">${c.checkNote}</p>` : ''}
++        </div>` : ''}
++      </div>
++    </div>
++  </div>
++  <div class="foot">
++    <button id="back" class="btn ghost" hidden>${icon('arrowLeft', 16)}</button>
++    <div class="dots">${[0, 1, 2, 3, 4].map((i) =>
++      `<button class="dot ${i < 4 ? 'past' : 'on'}"></button>`).join('')}</div>
++    <button id="next" class="btn primary">Start browsing</button>
++  </div>
++</div>`)};
++</script></body></html>`;
++}
++
++const MEASURE = `(() => {
++  const root = document.getElementById('host').shadowRoot;
++  const box = (el) => { const r = el.getBoundingClientRect();
++    return {l: r.left, t: r.top, r: r.right, b: r.bottom, w: r.width, h: r.height}; };
++  const pg = root.querySelector('.page');
++  const named = [];
++  const add = (sel, name) => root.querySelectorAll(sel).forEach((el, i) =>
++      named.push({name: name + (i ? ' ' + (i + 1) : ''), ...box(el)}));
++  add('.mark', 'mark'); add('h1', 'headline'); add('.hero > .whisper', 'line');
++  add('#passwordsFile', 'passwords'); add('.try', 'tile'); add('.ai-done', 'restart line');
++  add('#undoSetup', 'undo'); add('.check', 'check'); add('#checkNote', 'check note');
++  const foot = [];
++  root.querySelectorAll('#next, .dot').forEach((el) => foot.push(box(el)));
++  return {named, foot, page: box(pg), scroll: pg.scrollHeight - pg.clientHeight,
++          clips: getComputedStyle(pg).overflowY !== 'visible',
++          tries: box(root.querySelector('.tries')),
++          checks: root.querySelector('.checks') && box(root.querySelector('.checks')),
++          vw: innerWidth, vh: innerHeight};
++})()`;
++
++const SIZES = [[800, 600], [1024, 640], [1075, 810], [1280, 800], [1440, 900],
++               [1728, 1117], [2560, 1440]];
++const overlap = (a, b) => a.l < b.r - 0.5 && b.l < a.r - 0.5 &&
++                          a.t < b.b - 0.5 && b.t < a.b - 0.5;
++
++test('«You’re all set»: nothing overlaps, one tile grid, room for it all',
++    {skip: !CHROME && 'no Google Chrome'}, async () => {
++  const b = await launch();
++  const misses = [];
++  try {
++    const {s} = b;
++    await s('Page.enable');
++    const frameId = (await s('Page.getFrameTree')).frameTree.frame.id;
++    await s('Emulation.setEmulatedMedia',
++        {features: [{name: 'prefers-reduced-motion', value: 'reduce'}]});
++    for (const [name, c] of Object.entries(CASES)) {
++      for (const [w, h] of SIZES) {
++        await s('Emulation.setDeviceMetricsOverride',
++            {width: w, height: h, deviceScaleFactor: 1, mobile: false});
++        await s('Page.setDocumentContent', {frameId, html: page(c)});
++        // The page slides in (0.56 s); measure where it lands.
++        await new Promise((r) => setTimeout(r, 700));
++        const m = (await s('Runtime.evaluate',
++            {expression: MEASURE, returnByValue: true})).result.value;
++        const tag = `${name} ${w}×${h}`;
++        const miss = (what) => misses.push(`${tag}: ${what}`);
++        for (let i = 0; i < m.named.length; i++) {
++          const a = m.named[i];
++          if (a.l < 0 || a.r > m.vw) miss(`${a.name} outside the window`);
++          for (const f of m.foot) {
++            // Under the page's own edge (scrolled away) is fine; on top of
++            // the button is not.
++            const shown = m.clips ? {...a, t: Math.max(a.t, m.page.t), b: Math.min(a.b, m.page.b)} : a;
++            if (shown.b > shown.t && overlap(shown, f)) miss(`${a.name} over the tour's button`);
++          }
++          for (let j = i + 1; j < m.named.length; j++) {
++            if (overlap(a, m.named[j])) miss(`${a.name} overlaps ${m.named[j].name}`);
++          }
++        }
++        if (m.clips && m.page.b > Math.min(...m.foot.map((f) => f.t)) + 0.5) {
++          miss('the page runs under the tour\'s button');
++        }
++        const roomy = name === 'everything' ? w >= 1075 && h >= 800 : w >= 1024 && h >= 640;
++        if (roomy && m.scroll > 0) miss(`scrolls by ${m.scroll}px`);
++        const tiles = m.named.filter((n) => n.name.startsWith('tile'));
++        for (const t of tiles) {
++          if (Math.abs(t.w - tiles[0].w) > 0.5) miss(`${t.name} width ${t.w} vs ${tiles[0].w}`);
++          const row = tiles.filter((u) => Math.abs(u.t - t.t) < 0.5);
++          if (row.some((u) => Math.abs(u.h - t.h) > 0.5)) miss(`${t.name} height differs in its row`);
++        }
++        if (m.checks && Math.abs(m.checks.w - m.tries.w) > 0.5) {
++          miss(`check lines ${m.checks.w}px wide, tiles ${m.tries.w}px`);
++        }
++        if (SHOTS) {
++          fs.mkdirSync(SHOTS, {recursive: true});
++          const {data} = await s('Page.captureScreenshot', {format: 'png'});
++          fs.writeFileSync(path.join(SHOTS, `${name}-${w}x${h}.png`),
++                           Buffer.from(data, 'base64'));
++        }
++      }
++    }
++  } finally {
++    await b.close();
++  }
++  assert.deepEqual(misses, []);
++});
+diff --git a/chrome/browser/resources/webui_browser/meridian/layout_tests/url_pill.test.mjs b/chrome/browser/resources/webui_browser/meridian/layout_tests/url_pill.test.mjs
+index 49d14d902b..3e02e669ab 100644
+--- a/chrome/browser/resources/webui_browser/meridian/layout_tests/url_pill.test.mjs
++++ b/chrome/browser/resources/webui_browser/meridian/layout_tests/url_pill.test.mjs
+@@ -15,19 +15,15 @@
+ 
+ import {test} from 'node:test';
+ import assert from 'node:assert/strict';
+-import {spawn} from 'node:child_process';
+ import fs from 'node:fs';
+-import os from 'node:os';
+ import path from 'node:path';
+ import {fileURLToPath} from 'node:url';
+ 
++import {CHROME, launch} from './cdp.mjs';
++
+ const HERE = path.dirname(fileURLToPath(import.meta.url));
+ const WEBUI = process.env.WEBUI_ROOT || path.resolve(HERE, '../..');
+ const CR = path.resolve(WEBUI, '../../../../ui/webui/resources/cr_elements');
+-const CHROME = process.env.CHROME ||
+-    ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+-     '/usr/bin/google-chrome', '/usr/bin/chromium']
+-        .find((p) => fs.existsSync(p));
+ const SHOTS = process.env.MERIDIAN_SHOTS;
+ 
+ const read = (f) => fs.readFileSync(f, 'utf8');
+@@ -105,46 +101,6 @@ const MEASURE = `(which) => {
+           siteLayer: getComputedStyle(hoverLayer).display === 'none' ? 'none' : bg(hoverLayer)};
+ }`;
+ 
+-async function launch() {
+-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'url-pill-'));
+-  const proc = spawn(CHROME, ['--headless=new', '--remote-debugging-port=0',
+-    `--user-data-dir=${dir}`, '--no-first-run', '--no-default-browser-check',
+-    '--hide-scrollbars', '--force-color-profile=srgb', 'about:blank'],
+-    {stdio: 'ignore'});
+-  const portFile = path.join(dir, 'DevToolsActivePort');
+-  for (let i = 0; i < 200 && !fs.existsSync(portFile); i++) {
+-    await new Promise((r) => setTimeout(r, 50));
+-  }
+-  const [port, wsPath] = read(portFile).trim().split('\n');
+-  const ws = new WebSocket(`ws://127.0.0.1:${port}${wsPath}`);
+-  await new Promise((r, j) => { ws.onopen = r; ws.onerror = j; });
+-  let id = 0;
+-  const waiting = new Map();
+-  ws.onmessage = (e) => {
+-    const msg = JSON.parse(e.data);
+-    const w = waiting.get(msg.id);
+-    if (!w) return;
+-    waiting.delete(msg.id);
+-    msg.error ? w.j(new Error(JSON.stringify(msg.error))) : w.r(msg.result);
+-  };
+-  const send = (method, params = {}, sessionId) => new Promise((r, j) => {
+-    waiting.set(++id, {r, j});
+-    ws.send(JSON.stringify({id, method, params, sessionId}));
+-  });
+-  const {targetId} = await send('Target.createTarget', {url: 'about:blank'});
+-  const {sessionId} = await send('Target.attachToTarget', {targetId, flatten: true});
+-  const s = (method, params) => send(method, params, sessionId);
+-  return {
+-    s,
+-    async close() {
+-      ws.close();
+-      proc.kill();
+-      await new Promise((r) => setTimeout(r, 200));
+-      fs.rmSync(dir, {recursive: true, force: true});
+-    },
+-  };
+-}
+-
+ // Every case is checked and shot; the misses are listed together at the end.
+ const misses = [];
+ const near = (a, b, tol, what) => {
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.css b/chrome/browser/resources/webui_browser/meridian/onboarding.css
+index 3fc27bda70..c6a1dae766 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.css
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.css
+@@ -1193,6 +1193,105 @@ kbd {
+   justify-content: center;
+ }
+ 
++/* «You're all set»: one grid of tiles (four with «Get Claude»), the check's
++ * lines as wide as the grid, under it. Taller than the window: the page
++ * scrolls under its own edge, never under the tour's button. */
++.page.step-done {
++  justify-content: safe center;
++  overflow-x: hidden;
++  overflow-y: auto;
++  padding: 8px 40px 12px;
++}
++
++.step-done .tries.four {
++  grid-template-columns: repeat(4, minmax(0, 1fr));
++  width: min(780px, 88vw);
++}
++
++.step-done .checks {
++  width: min(620px, 86vw);
++  margin-top: 14px;
++}
++
++@media (max-width: 760px) {
++  .step-done .tries.four {
++    grid-template-columns: repeat(2, minmax(0, 1fr));
++    width: min(620px, 86vw);
++  }
++}
++
++/* A laptop window: the mark, the headline and the gaps give up room first. */
++@media (max-height: 900px) {
++  .step-done .mark {
++    width: 80px;
++    height: 80px;
++    margin-bottom: 0;
++  }
++
++  .step-done .mark svg {
++    width: 36px;
++    height: 36px;
++  }
++
++  .step-done h1 {
++    font-size: clamp(36px, 5vw, 56px);
++    margin: 12px 0 4px;
++  }
++
++  .step-done .whisper {
++    margin-top: 10px;
++  }
++
++  .step-done #passwordsFile {
++    height: 34px;
++    margin-top: 10px;
++  }
++
++  .step-done .tries {
++    margin-top: 14px;
++  }
++
++  .step-done .ai-done,
++  .step-done .link {
++    margin-top: 10px;
++  }
++
++  .step-done .checks {
++    gap: 6px;
++    margin-top: 12px;
++  }
++
++  .step-done .check {
++    padding: 8px 12px;
++  }
++}
++
++@media (max-height: 700px) {
++  .step-done .mark {
++    width: 72px;
++    height: 72px;
++    border-radius: 50%;
++  }
++
++  .step-done .mark svg {
++    width: 32px;
++    height: 32px;
++  }
++
++  .step-done h1 {
++    font-size: clamp(32px, 5vw, 48px);
++    margin: 10px 0 4px;
++  }
++
++  .step-done .whisper {
++    margin-top: 8px;
++  }
++
++  .step-done .tries {
++    margin-top: 12px;
++  }
++}
++
+ /* ------------------------------------------------------------ sources */
+ 
+ /* Both Arc and Chrome are here: where to move in from. */
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+index 348ca7e69a..a7520032e8 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.html.ts
+@@ -267,7 +267,7 @@ export function getHtml(this: MeridianOnboardingElement) {
+               <button id="passwordsFile" class="pill"
+                   @click="${this.onPasswordsFileClick_}">
+                 ${icon('lock', 15)} Import passwords from a file</button>` : ''}
+-            <div class="tries">
++            <div class="tries ${this.showGetClaude_() ? 'four' : ''}">
+               <button class="try" data-try="ask" @click="${this.onTryClick_}">
+                 <span class="try-ic">${icon('sparkles', 17)}</span>
+                 <b>Ask about a page</b><em>Get an answer from what’s open</em>
+@@ -280,6 +280,14 @@ export function getHtml(this: MeridianOnboardingElement) {
+                 <span class="try-ic">${icon('split', 17)}</span>
+                 <b>Two tabs side by side</b><em>Read and work at once</em>
+               </button>
++              <!-- No agent at all: Claude, as a tile of the same grid. -->
++              ${this.showGetClaude_() ? html`
++                <button id="getClaude" class="try"
++                    @click="${this.onGetClaudeClick_}">
++                  <span class="try-ic">${icon('external', 17)}</span>
++                  <b>Get ${claudeApp}</b>
++                  <em>Free; Meridian sets it up for you</em>
++                </button>` : ''}
+             </div>
+             ${this.desktopConnected_ && !this.canRestartClaude_ ? html`
+               <div class="ai-done">
+@@ -301,17 +309,6 @@ export function getHtml(this: MeridianOnboardingElement) {
+               <button id="undoSetup" class="link"
+                   @click="${this.onUndoSetupClick_}">Undo this setup</button>` :
+                 ''}
+-            ${!this.aiFound_.length ? html`
+-              <div class="tries one">
+-                <button id="getClaude" class="try"
+-                    @click="${this.onGetClaudeClick_}">
+-                  <span class="try-ic">${icon('external', 17)}</span>
+-                  <b>Get ${claudeApp}</b>
+-                  <em>Free to download. Then Meridian sets it up for you,
+-                    and Claude can restyle sites, build moodboards and tidy
+-                    your tabs.</em>
+-                </button>
+-              </div>` : ''}
+             <!-- Last, so nothing above moves when it comes in. -->
+             ${this.checks_.length ? html`
+               <div class="checks" id="checks">
+diff --git a/chrome/browser/resources/webui_browser/meridian/onboarding.ts b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+index d0face13ea..81d1f095d6 100644
+--- a/chrome/browser/resources/webui_browser/meridian/onboarding.ts
++++ b/chrome/browser/resources/webui_browser/meridian/onboarding.ts
+@@ -178,6 +178,7 @@ export class MeridianOnboardingElement extends CrLitElement {
+       codeSignedOut_: {state: true, type: Boolean},
+       signInNote_: {state: true, type: String},
+       checks_: {state: true, type: Array},
++      checked_: {state: true, type: Boolean},
+       checkNote_: {state: true, type: String},
+       canUndo_: {state: true, type: Boolean},
+       sources_: {state: true, type: Array},
+@@ -246,6 +247,8 @@ export class MeridianOnboardingElement extends CrLitElement {
+   protected accessor signInNote_: string = '';
+   // The honest check at the end: what really works, each with its fix.
+   protected accessor checks_: AiConnectionCheck[] = [];
++  // The check at the end has answered (checks_ may be empty: no agent).
++  protected accessor checked_: boolean = false;
+   protected accessor checkNote_: string = '';
+   private signInPoll_: number|null = null;
+   // Windows: Meridian can't reopen Claude, so it says what to do instead.
+@@ -315,6 +318,7 @@ export class MeridianOnboardingElement extends CrLitElement {
+     this.codeSignedOut_ = false;
+     this.signInNote_ = '';
+     this.checks_ = [];
++    this.checked_ = false;
+     this.checkNote_ = '';
+     this.canUndo_ = false;
+     if (start === 'tour') {
+@@ -792,6 +796,7 @@ export class MeridianOnboardingElement extends CrLitElement {
+     const {checks} = await this.handler_.checkAiConnections();
+     if (this.open) {
+       this.checks_ = checks;
++      this.checked_ = true;
+     }
+   }
+ 
+@@ -907,6 +912,13 @@ export class MeridianOnboardingElement extends CrLitElement {
+     this.finish_();
+   }
+ 
++  // «Get Claude» only when no agent is there at all: none found, none in
++  // the check (connected or not), Claude Desktop not just set up.
++  protected showGetClaude_(): boolean {
++    return this.checked_ && !this.aiFound_.length && !this.checks_.length &&
++        !this.desktopConnected_;
++  }
++
+   protected onGetClaudeClick_() {
+     this.fire('meridian-open-url', 'https://claude.ai/download');
+     this.finish_();
