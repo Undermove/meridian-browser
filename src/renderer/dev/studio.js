@@ -229,6 +229,7 @@ function stBuild() {
             <div class="st-input-row"><button type="button" class="st-pick-btn" id="st-pick-btn" hidden title="${esc(w.pickTitle)}" aria-label="${esc(w.pickTitle)}" aria-pressed="false">${stCursorIcon()}</button><div class="grow"></div>
               <button type="submit" class="st-send" id="st-send" title="${esc(w.send)}" aria-label="${esc(w.send)}">${icon('arrowUp', 16)}</button></div>
           </form>
+          <div class="st-own" id="st-own" hidden></div>
         </div>
       </div>
       <div class="st-split" id="st-split" role="separator" aria-orientation="vertical" tabindex="0" aria-label="${esc(w.splitter)}" title="${esc(w.splitterHint)}"><i></i></div>
@@ -254,6 +255,11 @@ function stBuild() {
   $('#st-brand', el).addEventListener('click', stOnBrandClick);
   $('#st-new', el).addEventListener('click', () => { ST.current = ''; ST.preview = null; stRender(); $('#st-input').focus({ preventScroll: true }); });
   $('#st-task-list', el).addEventListener('click', (e) => {
+    const more = e.target.closest('[data-tmenu]');
+    if (more) { ST.menuFor = ST.menuFor === more.dataset.tmenu ? '' : more.dataset.tmenu; stRender(); return; }
+    const rv = e.target.closest('[data-reveal]');
+    if (rv) { ST.menuFor = ''; stReveal(stTerms().find((x) => x.id === rv.dataset.reveal)); stRender(); return; }
+    if (ST.menuFor) { ST.menuFor = ''; }
     const row = e.target.closest('[data-term]');
     if (!row) return;
     ST.current = row.dataset.term;
@@ -261,6 +267,13 @@ function stBuild() {
     const k = ST.tasks.get(ST.current);
     if (k) k.seen = true;
     stRender();
+  });
+  // A menu closes on a click anywhere else, and on Escape.
+  document.addEventListener('pointerdown', (e) => { if (ST.menuFor && !e.target.closest('.st-tmenu, [data-tmenu]')) { ST.menuFor = ''; stRender(); } });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && ST.menuFor) { ST.menuFor = ''; stRender(); } });
+  $('#st-own', el).addEventListener('click', (e) => {
+    if (e.target.closest('[data-own]')) stOwnFolder();
+    if (e.target.closest('[data-home]')) stBackHome();
   });
   $('#st-form', el).addEventListener('submit', (e) => { e.preventDefault(); stSubmit(); });
   $('#st-pick-btn', el).addEventListener('click', () => stPoint(!ST.pointing));
@@ -315,7 +328,7 @@ function stTitle(t) {
 function stRender() {
   if (!ST.on || !ST.el || ST.view !== 'studio') return;
   const w = STW();
-  if (!S.project) return stRenderPick();
+  if (!S.project) return stOpenHome();
   $('#st-pick').hidden = true;
   const terms = stTerms();
   // The board: every task as a card. It is where Studio starts when there are tasks and none is open.
@@ -324,7 +337,7 @@ function stRender() {
   for (const b of ST.el.querySelectorAll('.st-viewseg button')) b.classList.toggle('on', (b.dataset.mode === 'board') === ST.board);
   if (ST.board) {
     $('#st-title').textContent = w.studio;
-    $('#st-sub').textContent = `${S.project.name} · ${w.taskCount(terms.length)}`;
+    $('#st-sub').textContent = stAtHome() ? w.taskCount(terms.length) : `${S.project.name} · ${w.taskCount(terms.length)}`;
     document.title = w.studio;
     stRenderBoard(terms);
     stReport();
@@ -333,7 +346,7 @@ function stRender() {
   if (ST.current && !terms.some((t) => t.id === ST.current)) ST.current = '';
   const t = stCurrent();
   $('#st-title').textContent = t ? stTitle(t) : w.newTask;
-  $('#st-sub').textContent = `${S.project.name} · ${w.claude}`;
+  $('#st-sub').textContent = stAtHome() ? w.claude : `${S.project.name} · ${w.claude}`;
   document.title = t ? stTitle(t) : w.studio;
   stRenderTasks(terms);
   stRenderPane();
@@ -357,30 +370,88 @@ function stRenderSend(t) {
   b.setAttribute('aria-label', b.title);
 }
 
-function stRenderPick() {
-  const w = STW();
+// Studio never asks for a folder: with none open it opens its own one in Documents
+// (~/Documents/Meridian Studio), and each new task gets a folder in it. Only when that fails does
+// it say so, with a retry and the person's own folder as the other way.
+const stNorm = (p) => String(p || '').replace(/\/+$/, '');
+// (The folder as opened may read differently from the one asked for: a link resolved.)
+function stHomeRoot() {
+  if (ST.homeRoot === undefined) { try { ST.homeRoot = localStorage.getItem('wb.studioHomeRoot') || ''; } catch { ST.homeRoot = ''; } }
+  return ST.homeRoot;
+}
+function stNoteHome(p) {
+  ST.homeRoot = p?.root || '';
+  try { localStorage.setItem('wb.studioHomeRoot', ST.homeRoot); } catch {}
+}
+const stAtHome = () => !!S.project && [ST.info?.home, stHomeRoot()].some((h) => h && stNorm(S.project.root) === stNorm(h));
+
+async function stOpenHome() {
   $('.st-body', ST.el).hidden = true;
+  $('#st-board').hidden = true;
+  const pick = $('#st-pick');
+  if (ST.homeError) return stRenderHomeError();
+  pick.hidden = true;
+  if (ST.homeBusy || typeof wb.studioHome !== 'function') return;
+  ST.homeBusy = true;
+  try {
+    const p = await wb.studioHome();
+    stNoteHome(p);
+    if (!S.project && p) await setProject(p);
+  } catch (err) {
+    ST.homeError = err?.message || 'failed';
+  } finally { ST.homeBusy = false; }
+  stRender();
+}
+
+function stRenderHomeError() {
+  const w = STW();
   const pick = $('#st-pick');
   pick.hidden = false;
-  const recents = (S.info?.recents || []).slice(0, 5);
   pick.innerHTML = `<div class="st-pick-card">
-    <div class="st-pick-ic">${icon('folder', 26)}</div>
-    <h2>${esc(w.pickFolder)}</h2><p>${esc(w.pickFolderHint)}</p>
-    <button class="st-btn pri" data-a="choose">${esc(w.chooseFolder)}</button>
-    ${recents.length ? `<div class="st-recents"><div class="st-label">${esc(w.recent)}</div>${recents.map((r) => `<button class="st-recent" data-path="${esc(r.root || r.path || '')}">${icon('folder', 14)}<span>${esc(r.name || basename(r.root || r.path || ''))}</span></button>`).join('')}</div>` : ''}
+    <div class="st-pick-ic">${icon('info', 24)}</div>
+    <h2>${esc(w.homeFailed)}</h2><p>${esc(ST.homeError)}</p>
+    <button class="st-btn pri" data-a="retry">${esc(w.retry)}</button>
+    <button class="st-link-btn" data-a="own">${esc(w.ownFiles)}</button>
   </div>`;
   pick.onclick = (e) => {
-    if (e.target.closest('[data-a="choose"]')) pickProject();
-    const r = e.target.closest('[data-path]');
-    if (r?.dataset.path) openRecent(r.dataset.path);
+    if (e.target.closest('[data-a="retry"]')) { ST.homeError = ''; stRender(); }
+    if (e.target.closest('[data-a="own"]')) stOwnFolder();
   };
+}
+
+// The advanced way: the person's own folder (Claude works on copies there). Said first, in plain words.
+async function stOwnFolder() {
+  const w = STW();
+  if (!(await confirmBox(w.ownTitle, w.ownHint, w.ownPick))) return;
+  await pickProject();
+  ST.homeError = '';
+  stRender();
+}
+
+// Back to Studio's own folder from the person's.
+async function stBackHome() {
+  if (stAtHome() || typeof wb.studioHome !== 'function') return;
+  try {
+    const p = await wb.studioHome();
+    stNoteHome(p);
+    await setProject(p);
+    ST.current = '';
+  } catch (err) { toast(err.message); }
+  stRender();
+}
+
+// The task's folder in Finder: its own one in Studio's home, else the folder it works in.
+function stReveal(t) {
+  wb.reveal(t?.taskDir || '').catch((err) => toast(err.message));
 }
 
 function stRenderTasks(terms) {
   const list = $('#st-task-list');
   const html = terms.map((t) => {
     const s = stStatus(t);
-    return `<div class="st-task ${s}${t.id === ST.current ? ' active' : ''}" role="listitem" data-term="${esc(t.id)}" tabindex="0">${stDot(s)}<span class="st-task-name">${esc(stTitle(t))}</span></div>`;
+    const menu = ST.menuFor === t.id
+      ? `<div class="st-tmenu" role="menu"><button role="menuitem" data-reveal="${esc(t.id)}">${icon('folder', 13)}<span>${esc(STW().reveal)}</span></button></div>` : '';
+    return `<div class="st-task ${s}${t.id === ST.current ? ' active' : ''}${menu ? ' menu-open' : ''}" role="listitem" data-term="${esc(t.id)}" tabindex="0">${stDot(s)}<span class="st-task-name">${esc(stTitle(t))}</span><button class="st-tmore" data-tmenu="${esc(t.id)}" title="${esc(STW().more)}" aria-label="${esc(STW().more)}" aria-haspopup="menu" aria-expanded="${menu ? 'true' : 'false'}">${icon('more', 14)}</button>${menu}</div>`;
   }).join('');
   if (list.dataset.html !== html) { list.innerHTML = html; list.dataset.html = html; }
   $('#st-new').classList.toggle('active', !ST.current);
@@ -823,6 +894,15 @@ function stRenderChips(t) {
   const html = (show ? `${w.chips[role].map((c) => `<button type="button" class="st-chip" data-chip="${esc(c)}">${esc(c)}</button>`).join('')}` : '') + point + picked;
   if (box.dataset.html !== html) { box.innerHTML = html; box.dataset.html = html; }
   box.hidden = !html;
+  // A new task: Studio's own folder, unless the person wants their files (or is in them).
+  const own = $('#st-own');
+  if (own) {
+    const ohtml = t ? '' : stAtHome() || !S.project
+      ? `<button type="button" class="st-link-btn" data-own>${esc(w.ownFiles)}</button>`
+      : `<span>${icon('folder', 12)}${esc(w.inFolder(S.project.name))}</span><button type="button" class="st-link-btn" data-own>${esc(w.ownChange)}</button><button type="button" class="st-link-btn" data-home>${esc(w.backHome)}</button>`;
+    if (own.dataset.html !== ohtml) { own.innerHTML = ohtml; own.dataset.html = ohtml; }
+    own.hidden = !ohtml;
+  }
 }
 
 // ---------------------------------------------------------------- result: site, pictures, documents
@@ -1079,7 +1159,10 @@ async function stSubmit() {
   ST.sending = true;
   try {
     if (!t || t.exited) {
-      t = await launch('claude', { studio: true });
+      // Its own folder in Studio's home ("" in the person's folder: it works there).
+      let taskDir = '';
+      try { taskDir = (await wb.studioTaskFolder(text)) || ''; } catch {}
+      t = await launch('claude', { studio: true, taskDir });
       if (!t) { toast(STW().notStarted); return; }
       ST.current = t.id;
       stTask(t);
@@ -1087,6 +1170,12 @@ async function stSubmit() {
       stShow('studio');
       input.value = '';
       await stWhenReady(t);
+      if (taskDir && stTrustAsked(t)) {
+        // A folder Meridian just made, empty: nothing to ask about.
+        wb.ptyWrite(t.id, '\r');
+        for (let i = 0; i < 40 && stTrustAsked(t); i++) await new Promise((r) => setTimeout(r, 150));
+        await stWhenReady(t);
+      }
       if (stTrustAsked(t)) {
         // Asked in plain words first; the message goes once the folder is trusted.
         stTask(t).trust = text;

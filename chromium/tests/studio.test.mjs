@@ -150,7 +150,10 @@ test('Studio on: a task in plain words, a permission card answered with a button
     wb = await openWorkbench(b);
     // A designer sees Studio first, with the designer's suggestions and the switch.
     await wb.waitFor(`document.querySelector('#studio') && !document.querySelector('#studio').hidden`);
-    assert.deepEqual(await wb.eval('window.workbench.studioInfo()'), { enabled: true, figma: false, chosen: false, ask: false, persona: 'designer' });
+    const info = await wb.eval('window.workbench.studioInfo()');
+    assert.match(info.home, /Meridian Studio$/);
+    delete info.home;
+    assert.deepEqual(info, { enabled: true, figma: false, chosen: false, ask: false, persona: 'designer' });
     assert.equal(await wb.eval(`document.querySelectorAll('#st-chips .st-chip').length`), 3);
     assert.equal(await wb.eval(`document.querySelector('#studio .st-switch button.on').dataset.view`), 'studio');
     // Nothing about terminals, tokens or MCP in sight.
@@ -507,6 +510,120 @@ test('«Кто вы?» is part of the first-run tour (Studio on), the pick is ke
     // Settings › Profiles: who you are, and Change… opens the heroes alone.
     await b.eval(`app.$.settings.show ? (app.$.settings.show('profiles'), true) : true`).catch(() => true);
   } finally {
+    await b.close();
+    cleanup(s.project, s.bin, s.profile);
+  }
+});
+
+test('No folder question: Studio opens its own folder, a new task gets a folder of its own there, «Show in Finder» names it', { skip: process.platform === 'win32' && 'the stand-in is a Python script' }, async () => {
+  const s = await setup();
+  const home = path.join(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-home-'))), 'Meridian Studio');
+  const args = s.args.filter((a) => !a.startsWith('--meridian-test-project'));
+  const b = await launch(['about:blank'], { profile: s.profile, args: [...args, '--meridian-studio', '--lang=en-US', `--meridian-test-studio-home=${home}`] });
+  let wb;
+  try {
+    wb = await openWorkbench(b);
+    await wb.waitFor(`document.querySelector('#studio') && !document.querySelector('#studio').hidden && !document.querySelector('.st-body').hidden`);
+    // Nobody was asked for a folder: Studio's own one is open, the composer and suggestions are there.
+    assert.equal(await wb.eval('S.project.root'), home);
+    assert.ok(fs.statSync(home).isDirectory());
+    assert.equal(await wb.eval(`!!document.querySelector('#st-pick') && document.querySelector('#st-pick').hidden`), true);
+    assert.doesNotMatch(await wb.eval(`document.querySelector('#studio').innerText`), /Pick a folder|Choose a folder/);
+    assert.ok(await wb.eval(`document.querySelectorAll('#st-chips .st-chip').length`) > 0);
+    // The other way is one small link under the composer.
+    assert.equal(await wb.eval(`document.querySelector('#st-own [data-own]')?.textContent`), 'Work with my files…');
+
+    await startTask(wb, 'Two pictures side by side');
+    const day = new Date();
+    const name = `Two pictures side by side, ${String(day.getDate()).padStart(2, '0')}.${String(day.getMonth() + 1).padStart(2, '0')}.${day.getFullYear()}`;
+    const dir = path.join(home, name);
+    for (let i = 0; i < 150 && !fs.existsSync(path.join(dir, '.prompt')); i++) await sleep(100);
+    // Claude Code ran in the task's folder; what it made is there.
+    assert.equal(fs.readFileSync(path.join(dir, '.prompt'), 'utf8'), 'Two pictures side by side');
+    await wb.waitFor(`document.querySelector('#st-feed').innerText.includes('Created palette.png')`, 15000);
+    assert.ok(fs.existsSync(path.join(dir, 'Drafts', 'palette.png')));
+    assert.equal(await wb.eval('stCurrent().taskDir'), name);
+    // The task's menu: «Show in Finder» reveals its folder (recorded here instead of opening Finder).
+    await wb.eval(`(() => { window.workbench.reveal = async (rel) => { window.__revealed = rel; return true; }; return true; })()`);
+    await click(wb, '.st-task.active .st-tmore');
+    await wb.waitFor(`!!document.querySelector('.st-tmenu [data-reveal]')`);
+    assert.equal(await wb.eval(`document.querySelector('.st-tmenu').innerText.trim()`), 'Show in Finder');
+    await click(wb, '.st-tmenu [data-reveal]');
+    await wb.waitFor(`window.__revealed === ${JSON.stringify(name)}`);
+    assert.equal(await wb.eval(`!!document.querySelector('.st-tmenu')`), false);
+    // A second task with the same words: a folder of its own too.
+    assert.equal(await wb.eval(`window.workbench.studioTaskFolder('Two pictures side by side')`), `${name} (2)`);
+  } finally {
+    wb?.close();
+    await b.close();
+    cleanup(s.project, s.bin, s.profile, path.dirname(home));
+  }
+});
+
+// Claude asks with its question tool: Studio shows the question and its options; the one picked
+// goes back to Claude Code as the tool's answers.
+const FAKE_QUESTION = `#!/usr/bin/python3
+import json, os, subprocess, sys, time
+args = sys.argv
+cwd = os.getcwd()
+settings = json.load(open(args[args.index('--settings') + 1]))
+tdir = os.path.join(cwd, '.transcripts'); os.makedirs(tdir, exist_ok=True)
+tpath = os.path.join(tdir, 's1.jsonl')
+def ev(event, **f):
+    return json.dumps(dict(hook_event_name=event, session_id='s1', transcript_path=tpath, cwd=cwd, **f))
+def hook(event, **f):
+    for e in settings['hooks'].get(event, []):
+        for h in e['hooks']:
+            if 'secret-guard --permission' in h['command']: continue
+            subprocess.run(h['command'], shell=True, input=ev(event, **f), text=True, capture_output=True)
+def line(kind, content):
+    with open(tpath, 'a') as f:
+        f.write(json.dumps({'type': kind, 'uuid': str(time.time()), 'sessionId': 's1', 'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'message': {'role': kind, 'content': content}}) + '\\n')
+open(tpath, 'w').close()
+hook('SessionStart', model='claude-opus-5-5', source='startup')
+print('READY', flush=True)
+buf = ''
+while '\\n' not in buf.replace('\\r', '\\n'):
+    buf += os.read(0, 4096).decode('utf8', 'replace')
+prompt = buf.replace('\\x1b[200~', '').replace('\\x1b[201~', '').strip()
+hook('UserPromptSubmit', prompt=prompt)
+line('user', prompt)
+inp = {'questions': [{'question': 'Which two pictures?', 'header': 'Pictures', 'multiSelect': False, 'options': [{'label': 'Old and new logo', 'description': 'Same size, side by side'}, {'label': 'Two banners', 'description': ''}]}]}
+line('assistant', [{'type': 'tool_use', 'id': 'q1', 'name': 'AskUserQuestion', 'input': inp}])
+hook('PreToolUse', tool_name='AskUserQuestion', tool_input=inp, tool_use_id='q1')
+cmd = settings['hooks']['PermissionRequest'][0]['hooks'][0]['command']
+out = subprocess.run(cmd, shell=True, input=ev('PermissionRequest', tool_name='AskUserQuestion', tool_input=inp), text=True, capture_output=True).stdout.strip()
+open(os.path.join(cwd, '.answer'), 'w').write(out)
+line('user', [{'type': 'tool_result', 'tool_use_id': 'q1', 'content': 'ok'}])
+hook('Stop')
+while True:
+    time.sleep(1)
+`;
+
+test('A question Claude asks: its text and options on a card; the pick reaches Claude Code as the answer', { skip: process.platform === 'win32' && 'the stand-in is a Python script' }, async () => {
+  const s = await setup(FAKE_QUESTION);
+  const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio', '--lang=en-US'] });
+  let wb;
+  try {
+    wb = await openWorkbench(b);
+    await startTask(wb, 'Make two pictures to compare side by side');
+    await wb.waitFor(`document.querySelector('.st-question')?.innerText.includes('Which two pictures?')`, 20000);
+    assert.doesNotMatch(await wb.eval(`document.querySelector('#st-feed').innerText`), /Allow the next step|Asked a question/);
+    assert.match(await wb.eval(`document.querySelector('#st-feed').innerText`), /Asking: Which two pictures\?|Asked: Which two pictures\?/);
+    assert.deepEqual(await wb.eval(`[...document.querySelectorAll('.st-question .st-opt b')].map((e) => e.textContent)`), ['Old and new logo', 'Two banners']);
+    // Whole, above the composer.
+    const fits = await wb.eval(`(() => { const c = document.querySelector('.st-question').getBoundingClientRect(); const m = document.querySelector('.st-composer').getBoundingClientRect(); const card = document.querySelector('.st-question'); return c.bottom <= m.top + 1 && card.scrollHeight <= card.clientHeight + 1 && c.height > 80; })()`);
+    assert.equal(fits, true);
+    await click(wb, '.st-question .st-opt[data-qopt="0"]');
+    for (let i = 0; i < 100 && !fs.existsSync(path.join(s.project, '.answer')); i++) await sleep(100);
+    const out = JSON.parse(fs.readFileSync(path.join(s.project, '.answer'), 'utf8'));
+    const d = out.hookSpecificOutput.decision;
+    assert.equal(d.behavior, 'allow');
+    assert.deepEqual(d.updatedInput.answers, { 'Which two pictures?': 'Old and new logo' });
+    assert.equal(d.updatedInput.questions[0].question, 'Which two pictures?');
+    await wb.waitFor(`document.querySelector('#st-feed').innerText.includes('Answer: Old and new logo')`);
+  } finally {
+    wb?.close();
     await b.close();
     cleanup(s.project, s.bin, s.profile);
   }

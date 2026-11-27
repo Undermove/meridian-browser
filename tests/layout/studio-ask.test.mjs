@@ -141,3 +141,34 @@ for (const kind of ['permission', 'question']) {
     });
   }
 }
+
+// A new task in Studio's own folder: no folder talk, the composer with suggestions, one small link to
+// the person's own files; a task's menu («Показать в Finder») opens whole on screen.
+test('new task: no folder question, the own-files link, the task menu on screen', { skip: !chrome && 'no Chromium headless shell' }, async () => {
+  const page = await open();
+  try {
+    await page.send('Emulation.setDeviceMetricsOverride', { width: 1100, height: 700, deviceScaleFactor: 1, mobile: false });
+    await page.send('Page.navigate', { url: pathToFileURL(path.join(here, 'studio-ask.html')).href });
+    for (let i = 0; i < 50 && (await page.evaluate('typeof stBuild === "function" && document.readyState')) !== 'complete'; i++) await sleep(100);
+    const m = await page.evaluate(`(async () => {
+      ST.on = true; ST.lang = 'ru'; ST.view = 'studio'; ST.current = ''; ST.info = { home: S.project.path };
+      S.project.root = S.project.path;
+      stBuild(); ST.el.hidden = false;
+      stRender();
+      const own = document.querySelector('#st-own');
+      const text = document.querySelector('#studio').innerText;
+      ST.menuFor = 't1';
+      stRender();
+      const menu = document.querySelector('.st-tmenu').getBoundingClientRect();
+      return { own: own.hidden ? '' : own.innerText.trim(), chips: document.querySelectorAll('#st-chips .st-chip').length, folderTalk: /Выберите папку|Pick a folder/.test(text),
+        menu: document.querySelector('.st-tmenu').innerText.trim(), inView: menu.left >= 0 && menu.right <= innerWidth && menu.bottom <= innerHeight && menu.height > 20,
+        sub: document.querySelector('#st-sub').textContent };
+    })()`);
+    assert.equal(m.own, 'Работать с моими файлами…');
+    assert.ok(m.chips > 0);
+    assert.equal(m.folderTalk, false);
+    assert.equal(m.menu, 'Показать в Finder');
+    assert.equal(m.inView, true);
+    assert.equal(m.sub, 'Claude');
+  } finally { await page.close(); }
+});

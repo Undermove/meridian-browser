@@ -1,0 +1,380 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 27 Nov 2026 11:07:21 +0400
+Subject: [PATCH] Meridian: Studio never asks for a folder; each task gets its
+ own
+
+Studio opens ~/Documents/Meridian Studio by itself (studioHome); a new task
+gets "<its words>, <date>" there (studioTaskFolder) and Claude Code starts
+in it (ptyCreate taskDir, kept with the session for a restart). The
+person's own folder stays possible; there tasks work in it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/workbench/studio.cc   | 59 +++++++++++++
+ chrome/browser/meridian/workbench/studio.h    | 21 +++++
+ .../browser/meridian/workbench/studio_core.cc | 87 +++++++++++++++++++
+ .../meridian/workbench/studio_unittest.cc     | 36 ++++++++
+ .../meridian/workbench/workbench_handler.cc   | 28 +++++-
+ 5 files changed, 227 insertions(+), 4 deletions(-)
+
+diff --git a/chrome/browser/meridian/workbench/studio.cc b/chrome/browser/meridian/workbench/studio.cc
+index f612f0befd..6f69f38f03 100644
+--- a/chrome/browser/meridian/workbench/studio.cc
++++ b/chrome/browser/meridian/workbench/studio.cc
+@@ -9,9 +9,11 @@
+ #include <vector>
+ 
+ #include "base/command_line.h"
++#include "base/files/file_util.h"
+ #include "base/functional/bind.h"
+ #include "base/strings/string_util.h"
+ #include "base/task/thread_pool.h"
++#include "base/time/time.h"
+ #include "chrome/browser/meridian/boosts/boost_service.h"
+ #include "chrome/browser/meridian/boosts/boost_service_factory.h"
+ #include "chrome/browser/meridian/mission/mission_control.h"
+@@ -71,6 +73,8 @@ void WorkbenchHandler::DispatchStudio(const std::string& method,
+     }
+     info.Set("figma", MainProfileFor(profile_)->GetPrefs()->GetBoolean(
+                           prefs::kStudioFigma));
++    // Studio's own folder: tasks there get folders of their own.
++    info.Set("home", StudioHomeDir().AsUTF8Unsafe());
+     // Picked in "Кто вы?", else a guess (the tour's): the picker starts on it.
+     const std::string chosen =
+         MainProfileFor(profile_)->GetPrefs()->GetString(prefs::kStudioPersona);
+@@ -118,6 +122,61 @@ void WorkbenchHandler::DispatchStudio(const std::string& method,
+             std::move(reply), figma_on));
+     return;
+   }
++  if (method == "studioHome") {
++    // Studio never asks for a folder: its own one in Documents, made when
++    // missing, opened as the project (with none open, or back from the
++    // person's own folder, as opening a recent one).
++    const base::FilePath home = StudioHomeDir();
++    files_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(
++            [](base::FilePath dir) { return base::CreateDirectory(dir); },
++            home),
++        base::BindOnce(
++            [](base::WeakPtr<WorkbenchHandler> self, base::FilePath dir,
++               Reply reply, bool made) {
++              if (!self) {
++                return;
++              }
++              if (!made) {
++                return std::move(reply).Run(base::unexpected(
++                    "Couldn’t make the Meridian Studio folder in Documents."));
++              }
++              self->OpenProject(dir, std::move(reply));
++            },
++            weak_factory_.GetWeakPtr(), home, std::move(reply)));
++    return;
++  }
++  if (method == "studioTaskFolder") {
++    // A new task's own folder in Studio's home ("" in the person's own
++    // folder: there the task works in it).
++    if (!project_) {
++      return std::move(reply).Run(base::unexpected("No folder is open."));
++    }
++    base::Time::Exploded day;
++    base::Time::Now().LocalExplode(&day);
++    std::string title = str(0);
++    if (title.size() > 400) {
++      title.resize(400);
++    }
++    files_->PostTaskAndReplyWithResult(
++        FROM_HERE,
++        base::BindOnce(
++            [](base::FilePath root, std::string name) {
++              if (base::MakeAbsoluteFilePath(root) !=
++                  base::MakeAbsoluteFilePath(StudioHomeDir())) {
++                return std::string();
++              }
++              return MakeStudioTaskFolder(root, name);
++            },
++            project_->root(), StudioTaskFolderName(title, day)),
++        base::BindOnce(
++            [](Reply reply, std::string made) {
++              std::move(reply).Run(base::Value(std::move(made)));
++            },
++            std::move(reply)));
++    return;
++  }
+   if (method == "studioFigmaOpen") {
+     // The Figma app, to switch its server on.
+     platform_util::OpenExternal(GURL("figma://"));
+diff --git a/chrome/browser/meridian/workbench/studio.h b/chrome/browser/meridian/workbench/studio.h
+index 6798309e22..c0cde2d14b 100644
+--- a/chrome/browser/meridian/workbench/studio.h
++++ b/chrome/browser/meridian/workbench/studio.h
+@@ -11,6 +11,7 @@
+ #include <string_view>
+ 
+ #include "base/files/file_path.h"
++#include "base/time/time.h"
+ #include "base/values.h"
+ 
+ class Profile;
+@@ -67,6 +68,26 @@ base::DictValue ReadTranscriptBefore(const base::FilePath& path,
+                                      int64_t end,
+                                      int64_t max);
+ 
++// Where Studio's tasks live when the person picked no folder of their own:
++// ~/Documents/Meridian Studio (a test may point it elsewhere). Studio never
++// asks for a folder: it opens this one.
++base::FilePath StudioHomeDir();
++
++// A new task's folder name in Studio's home: its first words and the date,
++// "Две картинки, 27.11.2026"; nothing a file system minds, at most 60
++// characters before the date.
++std::string StudioTaskFolderName(std::string_view title,
++                                 const base::Time::Exploded& day);
++
++// Makes `parent`/`name` (or "name (2)", "name (3)"… when taken) and returns
++// the name made, or "" when it couldn't. Blocking.
++std::string MakeStudioTaskFolder(const base::FilePath& parent,
++                                 const std::string& name);
++
++// A task folder a terminal may start in: one plain name, nothing hidden or
++// climbing out.
++bool IsStudioTaskFolder(std::string_view name);
++
+ }  // namespace meridian::workbench
+ 
+ #endif  // CHROME_BROWSER_MERIDIAN_WORKBENCH_STUDIO_H_
+diff --git a/chrome/browser/meridian/workbench/studio_core.cc b/chrome/browser/meridian/workbench/studio_core.cc
+index 9c2e0a8247..e0e8a0023d 100644
+--- a/chrome/browser/meridian/workbench/studio_core.cc
++++ b/chrome/browser/meridian/workbench/studio_core.cc
+@@ -12,6 +12,12 @@
+ 
+ #include "base/containers/span.h"
+ #include "base/files/file.h"
++#include "base/files/file_util.h"
++#include "base/path_service.h"
++#include "base/strings/stringprintf.h"
++#include "base/third_party/icu/icu_utf.h"
++#include "chrome/browser/meridian/test_switches.h"
++#include "chrome/common/chrome_paths.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "chrome/browser/meridian/workbench/studio.h"
+@@ -294,4 +300,85 @@ base::DictValue ReadTranscriptChunk(const base::FilePath& path,
+       .Set("reset", reset);
+ }
+ 
++base::FilePath StudioHomeDir() {
++  if (HasTestSwitch("meridian-test-studio-home")) {
++    return TestSwitchPath("meridian-test-studio-home");
++  }
++  base::FilePath docs;
++  if (!base::PathService::Get(chrome::DIR_USER_DOCUMENTS, &docs)) {
++    docs = base::GetHomeDir().Append("Documents");
++  }
++  return docs.Append("Meridian Studio");
++}
++
++std::string StudioTaskFolderName(std::string_view title,
++                                 const base::Time::Exploded& day) {
++  std::u16string in = base::UTF8ToUTF16(title);
++  std::u16string out;
++  bool space = false;
++  for (char16_t c : in) {
++    // Nothing Finder or a shell minds: separators, controls, quotes.
++    const bool bad = c < 0x20 || c == 0x7f || c == '/' || c == '\\' ||
++                     c == ':' || c == '*' || c == '?' || c == '"' ||
++                     c == '<' || c == '>' || c == '|' || c == '`' ||
++                     (c >= 0x2028 && c <= 0x2029);
++    if (bad || c == ' ' || c == '\t' || c == 0xa0) {
++      space = !out.empty();
++      continue;
++    }
++    if (space) {
++      out.push_back(' ');
++      space = false;
++    }
++    out.push_back(c);
++  }
++  // Not hidden, not ".." and not ending in dots.
++  while (!out.empty() && (out.front() == '.' || out.front() == '-')) {
++    out.erase(out.begin());
++  }
++  if (out.size() > 60) {
++    out.resize(60);
++    // At a word's end when there is one near.
++    const size_t cut = out.rfind(' ');
++    if (cut != std::u16string::npos && cut > 30) {
++      out.resize(cut);
++    }
++    if (!out.empty() && CBU16_IS_LEAD(out.back())) {
++      out.pop_back();
++    }
++  }
++  while (!out.empty() && (out.back() == '.' || out.back() == ' ' ||
++                          out.back() == ',')) {
++    out.pop_back();
++  }
++  std::string name = out.empty() ? std::string("Задача") : base::UTF16ToUTF8(out);
++  return base::StringPrintf("%s, %02d.%02d.%04d", name.c_str(),
++                            day.day_of_month, day.month, day.year);
++}
++
++std::string MakeStudioTaskFolder(const base::FilePath& parent,
++                                 const std::string& name) {
++  if (!IsStudioTaskFolder(name) || !base::CreateDirectory(parent)) {
++    return std::string();
++  }
++  for (int i = 1; i <= 50; ++i) {
++    const std::string pick =
++        i == 1 ? name : base::StringPrintf("%s (%d)", name.c_str(), i);
++    const base::FilePath dir = parent.Append(base::FilePath::FromUTF8Unsafe(pick));
++    if (base::PathExists(dir)) {
++      continue;
++    }
++    return base::CreateDirectory(dir) ? pick : std::string();
++  }
++  return std::string();
++}
++
++bool IsStudioTaskFolder(std::string_view name) {
++  return !name.empty() && name.size() <= 255 && name.front() != '.' &&
++         name.find('/') == std::string_view::npos &&
++         name.find('\\') == std::string_view::npos &&
++         name.find('\0') == std::string_view::npos && name != "." &&
++         name != ".." && base::IsStringUTF8(name);
++}
++
+ }  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/studio_unittest.cc b/chrome/browser/meridian/workbench/studio_unittest.cc
+index fdf335c8fe..b8f1b6dcaf 100644
+--- a/chrome/browser/meridian/workbench/studio_unittest.cc
++++ b/chrome/browser/meridian/workbench/studio_unittest.cc
+@@ -8,6 +8,9 @@
+ #include "base/files/scoped_temp_dir.h"
+ #include "base/json/json_reader.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/time/time.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+ namespace meridian::workbench {
+@@ -111,5 +114,38 @@ TEST(StudioTest, RulesKeepOriginalsAndAvoidJargon) {
+   EXPECT_NE(rules.find("without asking first"), std::string::npos);
+ }
+ 
++// A new task's folder: its words and the date, nothing a file system minds,
++// a second one with the same name gets "(2)".
++TEST(StudioTest, TaskFolders) {
++  base::Time::Exploded day = {};
++  day.year = 2026;
++  day.month = 11;
++  day.day_of_month = 27;
++  EXPECT_EQ(StudioTaskFolderName("Две картинки", day), "Две картинки, 27.11.2026");
++  EXPECT_EQ(StudioTaskFolderName("  ../a/b:c?  ", day), "a b c, 27.11.2026");
++  EXPECT_EQ(StudioTaskFolderName("", day), "Задача, 27.11.2026");
++  const std::string long_name = StudioTaskFolderName(
++      "Мне нужно сделать две картинки чтобы я сравнил их сайд бай сайд и ещё "
++      "что-нибудь",
++      day);
++  EXPECT_LE(base::UTF8ToUTF16(long_name).size(), 72u);
++  EXPECT_TRUE(base::IsStringUTF8(long_name));
++  EXPECT_TRUE(IsStudioTaskFolder("Две картинки, 27.11.2026"));
++  for (const char* bad : {"", ".", "..", ".hidden", "a/b", "a\\b"}) {
++    EXPECT_FALSE(IsStudioTaskFolder(bad)) << bad;
++  }
++
++  base::ScopedTempDir temp;
++  ASSERT_TRUE(temp.CreateUniqueTempDir());
++  const base::FilePath home = temp.GetPath().Append("Meridian Studio");
++  EXPECT_EQ(MakeStudioTaskFolder(home, "Логотип, 27.11.2026"),
++            "Логотип, 27.11.2026");
++  EXPECT_EQ(MakeStudioTaskFolder(home, "Логотип, 27.11.2026"),
++            "Логотип, 27.11.2026 (2)");
++  EXPECT_TRUE(base::DirectoryExists(
++      home.Append(base::FilePath::FromUTF8Unsafe("Логотип, 27.11.2026 (2)"))));
++  EXPECT_EQ(MakeStudioTaskFolder(home, "../x"), "");
++}
++
+ }  // namespace
+ }  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index d6c1b223d2..58a7dd9798 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -1002,6 +1002,14 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+         if (v.GetDict().FindBool("remote").value_or(false)) {
+           entry.Set("remote", true);
+         }
++        // A Studio task: Studio's again, in its own folder.
++        if (v.GetDict().FindBool("studio").value_or(false)) {
++          entry.Set("studio", true);
++          if (const std::string* dir = v.GetDict().FindString("taskDir");
++              dir && IsStudioTaskFolder(*dir)) {
++            entry.Set("taskDir", *dir);
++          }
++        }
+         // Resumed under another account than the space's: that one again.
+         if (const std::string* account = v.GetDict().FindString("account");
+             account && account->size() == 8 &&
+@@ -2666,6 +2674,12 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+   const bool studio = kind == "claude" &&
+                       opts.FindBool("studio").value_or(false) &&
+                       StudioEnabled(profile_);
++  // A Studio task runs in its own folder in Studio's home (studioTaskFolder).
++  std::string task_dir;
++  if (const std::string* dir = opts.FindString("taskDir");
++      studio && dir && IsStudioTaskFolder(*dir)) {
++    task_dir = *dir;
++  }
+   // Host terminals and agents get the project's vault secrets in their
+   // environment (names are shown, values never).
+   std::map<std::string, std::string> secrets =
+@@ -2836,7 +2850,7 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+              std::vector<std::string> secret_names, std::string guard_token,
+              std::string mission_kind, bool in_shell,
+              std::map<std::string, std::string> account_env,
+-             std::string account, Reply reply,
++             std::string account, std::string task_dir, Reply reply,
+              std::pair<base::expected<LaunchSpec, std::string>,
+                        std::map<std::string, std::string>> made) {
+             mission::MissionControl* mission =
+@@ -2884,7 +2898,11 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+             Terminal::Spec run;
+             run.argv = spec->argv;
+             run.env = env;
+-            run.cwd = self->project_->root().AsUTF8Unsafe();
++            run.cwd = task_dir.empty()
++                          ? self->project_->root().AsUTF8Unsafe()
++                          : self->project_->root()
++                                .Append(base::FilePath::FromUTF8Unsafe(task_dir))
++                                .AsUTF8Unsafe();
+             run.cols = cols;
+             run.rows = rows;
+             // Through a sink: the terminal may outlive this page.
+@@ -2903,7 +2921,9 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+             Term term;
+             term.terminal = std::move(terminal);
+             term.sink = sink;
+-            term.root = run.cwd;
++            // The project's (a Studio task's folder is inside it): its
++            // sessions are the project's.
++            term.root = self->project_->root().AsUTF8Unsafe();
+             term.kind = kind;
+             term.started = base::Time::Now();
+             term.title = spec->title;
+@@ -2935,7 +2955,7 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+           std::move(registration), std::move(secrets), std::move(secret_names),
+           guard_token, shell_claude ? std::string("claude") : kind,
+           shell_claude, std::move(account_env), std::move(account),
+-          std::move(reply)));
++          std::move(task_dir), std::move(reply)));
+ }
+ 
+ void WorkbenchHandler::AgentInsights(const std::string& term_id,
+-- 
+2.36.1
+
