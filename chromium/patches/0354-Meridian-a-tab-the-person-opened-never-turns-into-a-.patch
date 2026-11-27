@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 27 Nov 2026 15:12:10 +0400
+Subject: [PATCH] Meridian: a tab the person opened never turns into a Peek
+ later
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A site opened with ⌘T while a pinned tab (the Workbench) was shown became
+a Peek over that tab after its first link inside the site. The browser
+makes the shown tab the opener of what ⌘T opens; MaybePeek ignored that
+for the typed page itself, but on any later change of the tab it made the
+tab a candidate again (its opener still the pinned tab) and judged the
+site's own link navigation as "a link out of the pinned tab". It only ran
+while some candidate was pending, and candidates of tabs closed before
+their first page were never dropped, so after that it ran for good.
+
+Now a tab is a Peek candidate only when it is inserted, the first page it
+gets decides (a non-web page: never a Peek), and a removed tab drops its
+candidate. Links out of a pinned tab still open in a Peek.
+
+Test: chromium/tests/peek.test.mjs "a site opened with ⌘T over a pinned
+tab stays a tab…" (fails before: the site leaves Today and shows as a Peek).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/sidebar_handler.cc | 58 ++++++++++++++--------
+ chrome/browser/meridian/sidebar_handler.h  |  6 ++-
+ 2 files changed, 41 insertions(+), 23 deletions(-)
+
+diff --git a/chrome/browser/meridian/sidebar_handler.cc b/chrome/browser/meridian/sidebar_handler.cc
+index 715482dddf..1d1c3636b1 100644
+--- a/chrome/browser/meridian/sidebar_handler.cc
++++ b/chrome/browser/meridian/sidebar_handler.cc
+@@ -442,31 +442,40 @@ tabs::TabInterface* SidebarHandler::LiveTabOf(const std::string& item_id) {
+ }
+ 
+ // A tab opened from a pinned tab or favorite into another site becomes a
+-// Peek over it (Arc). Its URL often isn't known when it is inserted (a
+-// target=_blank link starts loading after), so this runs again on changes.
++// Peek over it (Arc). Only when it is inserted: a tab already in the strip
++// never becomes one later (on 27.11 a site opened with ⌘T while the Workbench
++// was shown turned into a Peek over it on its own next link inside the site:
++// candidates used to be made again on any change, and closed tabs left
++// theirs behind, which kept that going).
++void SidebarHandler::AddPeekCandidate(tabs::TabInterface* tab) {
++  int index = model()->GetIndexOfTab(tab);
++  tabs::TabInterface* opener = index == TabStripModel::kNoTab
++                                   ? nullptr
++                                   : model()->GetOpenerOfTabAt(index);
++  const TabData* opener_data =
++      opener ? TabData::Get(opener->GetContents()) : nullptr;
++  if (!opener_data || opener_data->item_id().empty()) {
++    return;
++  }
++  peek_candidates_.insert_or_assign(
++      tab->GetHandle(), opener->GetContents()->GetLastCommittedURL());
++  MaybePeek(tab);
++}
++
++// Its URL often isn't known when it is inserted (a target=_blank link starts
++// loading after), so this runs again on changes, until the first URL decides.
+ void SidebarHandler::MaybePeek(tabs::TabInterface* tab) {
+   auto candidate = peek_candidates_.find(tab->GetHandle());
+   if (candidate == peek_candidates_.end()) {
+-    int index = model()->GetIndexOfTab(tab);
+-    tabs::TabInterface* opener = index == TabStripModel::kNoTab
+-                                     ? nullptr
+-                                     : model()->GetOpenerOfTabAt(index);
+-    const TabData* opener_data =
+-        opener ? TabData::Get(opener->GetContents()) : nullptr;
+-    if (!opener_data || opener_data->item_id().empty()) {
+-      return;
+-    }
+-    candidate = peek_candidates_
+-                    .emplace(tab->GetHandle(),
+-                             opener->GetContents()->GetLastCommittedURL())
+-                    .first;
++    return;
+   }
+   GURL to = tab->GetContents()->GetVisibleURL();
+-  if (!to.SchemeIsHTTPOrHTTPS()) {
++  if (to.is_empty() || to.IsAboutBlank()) {
+     return;  // not known yet
+   }
+   // Only what the page opened (a link, window.open): Navigate() also makes
+-  // the active tab the opener of what the sidebar or the command bar opens.
++  // the active tab the opener of what the sidebar or the command bar opens
++  // (⌘T, a typed address, a suggestion: never a Peek).
+   content::NavigationEntry* entry =
+       tab->GetContents()->GetController().GetVisibleEntry();
+   const TabData* own = TabData::Get(tab->GetContents());
+@@ -474,9 +483,10 @@ void SidebarHandler::MaybePeek(tabs::TabInterface* tab) {
+                    ui::PageTransitionCoreTypeIs(entry->GetTransitionType(),
+                                                 ui::PAGE_TRANSITION_LINK) &&
+                    !(own && !own->item_id().empty());
+-  bool peek = from_page && !net::registry_controlled_domains::SameDomainOrHost(
+-      candidate->second, to,
+-      net::registry_controlled_domains::INCLUDE_PRIVATE_REGISTRIES);
++  bool peek = from_page && to.SchemeIsHTTPOrHTTPS() &&
++              !net::registry_controlled_domains::SameDomainOrHost(
++                  candidate->second, to,
++                  net::registry_controlled_domains::INCLUDE_PRIVATE_REGISTRIES);
+   peek_candidates_.erase(candidate);
+   if (peek) {
+     TabData::SetPeek(tab->GetContents(), true);
+@@ -3747,7 +3757,7 @@ void SidebarHandler::OnTabStripModelChanged(
+       Adopt(inserted.tab);
+       // With this window's session (it may come from another window).
+       TabData::Save(inserted.tab->GetContents());
+-      MaybePeek(inserted.tab);
++      AddPeekCandidate(inserted.tab);
+       // A Peek reopened by ⇧⌘T: a Peek again, over its pinned tab if that is
+       // open (Arc); otherwise an ordinary Today tab.
+       std::string peek_over =
+@@ -3760,6 +3770,12 @@ void SidebarHandler::OnTabStripModelChanged(
+       }
+     }
+   }
++  // A tab that leaves undecided leaves no candidate behind.
++  if (change.type() == TabStripModelChange::kRemoved) {
++    for (const auto& removed : change.GetRemove()->contents) {
++      peek_candidates_.erase(removed.tab->GetHandle());
++    }
++  }
+   // A closed Today tab goes to the archive (not when the window closes).
+   if (change.type() == TabStripModelChange::kRemoved &&
+       !tab_strip_model->closing_all()) {
+diff --git a/chrome/browser/meridian/sidebar_handler.h b/chrome/browser/meridian/sidebar_handler.h
+index 210306bdc7..1cbb411aec 100644
+--- a/chrome/browser/meridian/sidebar_handler.h
++++ b/chrome/browser/meridian/sidebar_handler.h
+@@ -501,6 +501,7 @@ class SidebarHandler : public mojom::SidebarHandler,
+   std::string Favorites() const;
+   // The space in this window, without switching windows.
+   void ActivateSpaceHere(const std::string& space_id);
++  void AddPeekCandidate(tabs::TabInterface* tab);
+   void MaybePeek(tabs::TabInterface* tab);
+   void OnActiveTabChanged(tabs::TabInterface* tab);
+   // Whether `tab` is shown in the active space: its own tab, or a favorite.
+@@ -538,8 +539,9 @@ class SidebarHandler : public mojom::SidebarHandler,
+   raw_ptr<ArchiveService> archive_;
+   base::RepeatingTimer archive_timer_;
+   base::RepeatingTimer sleep_timer_;
+-  // New tabs opened from a pinned tab or favorite, until their URL is known:
+-  // opener's URL, to decide whether they are a Peek (MaybePeek).
++  // Tabs inserted with a pinned tab or favorite as opener, until their first
++  // URL is known: the opener's URL, to decide whether they are a Peek
++  // (MaybePeek). Made only on insertion; gone when decided or removed.
+   std::map<tabs::TabHandle, GURL> peek_candidates_;
+   // Last active tab per space id.
+   std::map<std::string, tabs::TabHandle> last_active_;
