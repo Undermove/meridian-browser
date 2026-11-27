@@ -192,7 +192,7 @@ test('Studio on: a task in plain words, a permission card answered with a button
     assert.doesNotMatch(feed, /\bWrite\(|\bRead\(|tool_use/);
 
     // The permission question as a card; «Allow» answers it for the session.
-    await wb.waitFor(`document.querySelector('.st-ask .st-ask-q')?.innerText.includes('Allow changing files in Brand?')`, 15000);
+    await wb.waitFor(`document.querySelector('.st-ask .st-ask-q')?.innerText.includes('Allow: change colors.css?')`, 15000);
     assert.equal(await wb.eval(`document.querySelector('.st-task.needs') !== null`), true);
     await click(wb, '.st-ask [data-answer="session"]');
     for (let i = 0; i < 100 && !fs.existsSync(path.join(s.project, '.answer')); i++) await sleep(100);
