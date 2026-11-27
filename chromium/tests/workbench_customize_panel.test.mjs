@@ -1,7 +1,8 @@
-// The Customize panel says, in plain words, what can be changed: examples by kind (each one a click
-// that asks the AI for it), what isn't possible yet, one-click looks that Reset takes off again, and
-// empty states that explain. File names stay under "Advanced". settings.json moves the tab bars to
-// the left as real vertical lists.
+// The Customize panel, simple first: three looks in a row (Familiar, Calm, Minimal; «As it was» takes
+// them off), one field to say what to change with three ideas, and the rest folded under «More ideas
+// and add-ons»: examples by kind (each one a click that asks the AI for it), what isn't possible yet,
+// empty states that explain; file names under "Advanced". settings.json moves the tab bars to the
+// left as real vertical lists.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -43,14 +44,21 @@ test('the Customize panel explains what can be customized, asks the AI from an e
     await click(wb, `document.querySelector('#open-folder')`);
     await wb.waitFor('!!S.project');
     await click(wb, `document.querySelector('#btn-customize')`);
-    await wb.waitFor(`!!${panel}?.querySelector('.custom-ideas')`);
+    await wb.waitFor(`!!${panel}?.querySelector('.custom-looks')`);
 
-    // The first screen: no file names (they are under Advanced, closed).
+    // The first screen: three looks, one field, three ideas; the rest folded.
+    assert.deepEqual(await wb.eval(`[...${panel}.querySelectorAll('.custom-looks .look')].map((l) => l.dataset.preset)`), ['familiar', 'calm', 'minimal']);
+    assert.equal(await wb.eval(`!!${panel}.querySelector('.custom-ask input')`), true);
+    assert.equal(await wb.eval(`${panel}.querySelectorAll('.custom-chips .idea').length`), 3);
+    assert.equal(await wb.eval(`${panel}.querySelector('details.custom-more').open`), false);
+    // No file names (they are under Advanced, closed).
     const first = await wb.eval(`(() => { const c = ${panel}.cloneNode(true); c.querySelector('details.advanced')?.remove(); return c.textContent; })()`);
     for (const word of ['plugins/', 'user.css', 'settings.json', 'hello-button']) assert.ok(!first.includes(word), `"${word}" is not on the first screen`);
     assert.equal(await wb.eval(`${panel}.querySelector('details.advanced').open`), false);
     assert.match(await wb.eval(`${panel}.querySelector('details.advanced').textContent`), /user\.css/);
-    // What you can ask for, by kind.
+    // More ideas, by kind.
+    await click(wb, `${panel}.querySelector('details.custom-more > summary')`);
+    await wb.waitFor(`${panel}.querySelector('details.custom-more').open`);
     assert.deepEqual(await wb.eval(`[...${panel}.querySelectorAll('.idea-cat')].map((e) => e.textContent)`), ['Look', 'Layout', 'Buttons & commands', 'Panels', 'Launchers']);
     // What isn't possible (yet).
     const limits = await wb.eval(`${panel}.querySelector('.custom-limits').textContent`);
@@ -60,31 +68,42 @@ test('the Customize panel explains what can be customized, asks the AI from an e
     assert.match(first, /Nothing changed yet/);
     assert.ok(await wb.eval(`[...${panel}.querySelectorAll('.empty-state .btn')].some((b) => b.textContent.includes('Ask for an add-on'))`));
 
-    // Designer mode: one click on, Reset takes it off; the person's files are untouched.
+    // Calm: one click on (marked, the left pane stays); «As it was» takes it off; the person's files
+    // are untouched.
     const settingsFile = path.join(await wb.eval('PRO.custom.root'), 'settings.json');
     const settingsBefore = fs.readFileSync(settingsFile, 'utf8');
-    await click(wb, `${panel}.querySelector('.preset[data-preset="designer"]')`);
-    await wb.waitFor(`document.body.dataset.look === 'soft' && document.querySelector('#tree-pane').hidden && getComputedStyle(document.querySelector('#statusbar')).display === 'none'`);
+    await click(wb, `${panel}.querySelector('.look[data-preset="calm"]')`);
+    await wb.waitFor(`document.body.dataset.look === 'soft' && !document.querySelector('#tree-pane').hidden && ${panel}.querySelector('.look.on')?.dataset.preset === 'calm'`);
     assert.equal(await wb.eval('PRO.settings.editor.theme'), 'light');
     assert.equal(await wb.eval('PRO.settings.editor.minimap'), false);
     assert.doesNotMatch(await wb.eval('PRO.settings.editor.fontFamily'), /mono/i, 'a regular (not code) font');
+    assert.match(await wb.eval(`document.querySelector('#toasts .toast-action')?.textContent || ''`), /Calm applied/);
     assert.equal(fs.readFileSync(settingsFile, 'utf8'), settingsBefore, 'settings.json is not changed');
-    await click(wb, `${panel}.querySelector('.preset-reset')`);
+    await click(wb, `${panel}.querySelector('.look-back')`);
     await wb.waitFor(`document.body.dataset.look === 'default' && !document.querySelector('#tree-pane').hidden && getComputedStyle(document.querySelector('#statusbar')).display !== 'none'`);
-    // Minimal, then Reset.
-    await click(wb, `${panel}.querySelector('.preset[data-preset="minimal"]')`);
-    await wb.waitFor(`document.querySelector('#tree-pane').hidden && document.body.classList.contains('wb-no-statusbar') && document.body.dataset.look === 'default'`);
-    await click(wb, `${panel}.querySelector('.preset-reset')`);
-    await wb.waitFor(`!document.querySelector('#tree-pane').hidden && !document.body.classList.contains('wb-no-statusbar')`);
+    // Minimal: no status bar, the left pane stays; Undo in its toast takes it back.
+    await click(wb, `${panel}.querySelector('.look[data-preset="minimal"]')`);
+    await wb.waitFor(`!document.querySelector('#tree-pane').hidden && document.body.classList.contains('wb-no-statusbar') && document.body.dataset.look === 'minimal'`);
+    await click(wb, `document.querySelector('#toasts .toast-action button')`);
+    await wb.waitFor(`!document.body.classList.contains('wb-no-statusbar') && document.body.dataset.look === 'default'`);
+    // Familiar: a desktop editor's layout (files left, tabs on top, status bar, minimap).
+    await click(wb, `${panel}.querySelector('.look[data-preset="familiar"]')`);
+    await wb.waitFor(`PRO.settings.editor.minimap === true && PRO.settings.layout.editorTabs === 'top' && !document.querySelector('#tree-pane').hidden`);
+    await click(wb, `${panel}.querySelector('.look-back')`);
+    await wb.waitFor(`activePreset() === ''`);
 
     // An example, clicked: Claude Code opens in the customization folder and gets the request.
     await click(wb, `[...${panel}.querySelectorAll('.idea')].find((b) => b.textContent === 'Hide the file tree')`);
     await wb.waitFor(`S.project?.root === PRO.custom.root && S.activeTerm?.kind === 'claude'`, 15000);
     await wb.waitFor(`${termText}.includes('GOT Hide the file tree.')`, 20000);
     // A second one goes to the same session.
-    await wb.waitFor(`!!${panel}?.querySelector('.custom-ideas')`);
+    await wb.waitFor(`${panel}?.querySelector('details.custom-more')?.open`);
     await click(wb, `[...${panel}.querySelectorAll('.idea')].find((b) => b.textContent === 'Minimap off')`);
     await wb.waitFor(`${termText}.includes('GOT Turn the editor minimap off.')`, 20000);
+    assert.equal(await wb.eval(`S.terms.filter((t) => t.kind === 'claude').length`), 1);
+    // The field: said in one's own words, Return; the same session gets it.
+    await wb.eval(`(() => { const f = ${panel}.querySelector('.custom-ask'); f.querySelector('input').value = 'Make the status bar blue'; f.requestSubmit(); })()`);
+    await wb.waitFor(`${termText}.includes('GOT Make the status bar blue')`, 20000);
     assert.equal(await wb.eval(`S.terms.filter((t) => t.kind === 'claude').length`), 1);
 
     // settings.json: the tab bars on the left, as vertical lists.

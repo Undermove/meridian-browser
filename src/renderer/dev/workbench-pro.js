@@ -34,35 +34,77 @@ const DEFAULTS = {
   agents: { autoContinue: false },
 };
 
-// One-click looks from the Customize panel. Kept apart from the person's own settings (in this page's
-// storage, not in their files), laid over them, and taken off again with Reset.
+// The Workbench's looks, from the top of Customize. Kept apart from the person's own settings (in this
+// page's storage, not in their files), laid over them, and taken off with «As it was».
+// A look never hides the left pane: it holds Files, Changes (and Chats), not only the file tree.
 const UI_SANS = '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, "Segoe UI", Roboto, sans-serif';
 const PRESETS = {
-  designer: {
-    label: 'Designer mode',
-    about: 'A calm, light look: a regular (not code) font, soft colours and rounded corners, no file tree, no status bar, no minimap.',
-    settings: { editor: { fontFamily: UI_SANS, theme: 'light', minimap: false }, layout: { showTree: false, showStatusBar: false }, ui: { look: 'soft' } },
+  familiar: {
+    label: 'Familiar',
+    about: 'Like a desktop code editor: files on the left, tabs on top, the terminal below, a status bar.',
+    settings: { editor: { fontFamily: '', minimap: true }, layout: { showTree: true, showStatusBar: true, editorTabs: 'top', terminalTabs: 'top', terminalHeight: '30%' }, ui: { look: 'default' } },
+  },
+  calm: {
+    label: 'Calm',
+    about: 'Light and soft: a regular font in the editor, warm colours, rounded corners.',
+    settings: { editor: { fontFamily: UI_SANS, theme: 'light', minimap: false }, ui: { look: 'soft' } },
   },
   minimal: {
     label: 'Minimal',
-    about: 'Only the editor and the agents: no file tree, no status bar, no minimap.',
-    settings: { editor: { minimap: false }, layout: { showTree: false, showStatusBar: false } },
+    about: 'The editor and the agents: no status bar, hairline borders, the file tools on hover.',
+    settings: { editor: { minimap: false }, layout: { showStatusBar: false }, ui: { look: 'minimal' } },
   },
 };
-function activePreset() { const id = load('preset'); return PRESETS[id] ? id : ''; }
+const lookName = (id) => PRESETS[id]?.label || 'Your own look';
+// 'designer' was Calm's name before 1.5.4.
+function activePreset() { const id = load('preset') === 'designer' ? 'calm' : load('preset'); return PRESETS[id] ? id : ''; }
 function mergeSettings(base, over) {
   const out = { ...(base && typeof base === 'object' ? base : {}) };
   for (const [k, v] of Object.entries(over || {})) out[k] = v && typeof v === 'object' && !Array.isArray(v) ? mergeSettings(out[k], v) : v;
   return out;
 }
 function effectiveSettings(raw) { const p = activePreset(); return sanitizeSettings(p ? mergeSettings(raw, PRESETS[p].settings) : raw); }
-async function setPreset(id) {
+async function setPreset(id, { quiet = false } = {}) {
+  const before = activePreset();
   store('preset', PRESETS[id] ? id : '');
   const prev = PRO.settings;
   PRO.settings = effectiveSettings(PRO.custom?.safeMode ? null : PRO.custom?.settings);
   applySettings(prev);
-  toast(PRESETS[id] ? `${PRESETS[id].label} on — Reset takes it off` : 'Back to your own look');
+  // Familiar shows the files in the left pane (it may have been on Changes or Chats).
+  if (activePreset() === 'familiar' && before !== 'familiar') $('#view-files')?.click();
+  if (!quiet && before !== activePreset()) {
+    toastAction(activePreset() ? `${lookName(activePreset())} applied` : 'Back to your own look', 'Undo', () => setPreset(before, { quiet: true }));
+  }
   if (PRO.activePanel === 'customize') renderPanel();
+}
+
+// A toast with one button (Undo), a little longer than a plain one.
+function toastAction(text, label, onClick, timeout = 5000) {
+  const el = document.createElement('div');
+  el.className = 'toast toast-action';
+  el.append(h('span', '', text));
+  const b = h('button', '', label);
+  b.addEventListener('click', () => { onClick(); close(); });
+  el.append(b);
+  $('#toasts').appendChild(el);
+  requestAnimationFrame(() => el.classList.add('show'));
+  const close = () => { el.classList.remove('show'); setTimeout(() => el.remove(), 250); };
+  setTimeout(close, timeout);
+}
+
+// A small picture of the Workbench in a look: the left pane, editor lines, a terminal and (unless the
+// look takes it off) the status bar. Drawn with the page's own colours, so it follows the space colour.
+function lookThumb(id) {
+  const t = h('div', `look-thumb look-thumb-${id || 'default'}`);
+  t.setAttribute('aria-hidden', 'true');
+  const left = h('div', 'lt-left');
+  for (let i = 0; i < 4; i++) left.appendChild(h('i'));
+  const main = h('div', 'lt-main');
+  const lines = h('div', 'lt-lines');
+  for (let i = 0; i < 4; i++) lines.appendChild(h('i'));
+  main.append(h('div', 'lt-tabs'), lines, h('div', 'lt-term'));
+  t.append(left, main, h('div', 'lt-status'));
+  return t;
 }
 
 function sanitizeSettings(raw) {
@@ -87,7 +129,7 @@ function sanitizeSettings(raw) {
       terminalTabs: pick(l.terminalTabs, ['top', 'left'], 'top'),
       editorTabs: pick(l.editorTabs, ['top', 'left'], 'top'),
     },
-    ui: { accent: typeof u.accent === 'string' && /^#[0-9a-f]{3}([0-9a-f]{3})?$/i.test(u.accent) ? u.accent : '', look: pick(u.look, ['default', 'soft'], 'default') },
+    ui: { accent: typeof u.accent === 'string' && /^#[0-9a-f]{3}([0-9a-f]{3})?$/i.test(u.accent) ? u.accent : '', look: pick(u.look, ['default', 'soft', 'minimal'], 'default') },
     agents: { autoContinue: a.autoContinue === true },
   };
 }
@@ -1125,6 +1167,12 @@ function renderCustomStatus() {
 
 // What a person can ask for, in their words. A click hands the request to Claude Code in the
 // customization folder (the same session if one runs there).
+// The three under the field: the ones people ask for most.
+const QUICK_IDEAS = [
+  ['Bigger text', 'Make the editor and terminal font 15px.'],
+  ['Taller terminal', 'Make the terminal area take half of the window height.'],
+  ['A “Run tests” button', 'Add a button to the top bar that asks the agent in the current terminal to run the tests.'],
+];
 const CUSTOM_IDEAS = [
   { cat: 'Look', items: [
     ['Bigger text', 'Make the editor and terminal font 15px.'],
@@ -1193,15 +1241,56 @@ function renderCustomizePanel(el) {
   head.append(h('h2', '', 'Customize'));
   el.appendChild(head);
   if (st.unavailable) { el.appendChild(h('p', 'warn-box', 'Customizing is unavailable right now.')); return; }
-  el.appendChild(h('p', 'muted small', 'Change how the Workbench looks and works by asking in plain words. The AI makes the change, it shows up right away, and every change can be undone below.'));
-  const actions = h('div', 'row-actions');
-  actions.append(btn('Customize with AI', 'accent', () => customizeWithClaude()));
-  el.appendChild(actions);
 
-  // What you can ask for: examples by kind, each one click away.
+  // 1. The look: three pictures in a row, one click each; the one in use is marked.
+  const looks = h('div', 'custom-looks');
+  const current = activePreset();
+  for (const [id, p] of Object.entries(PRESETS)) {
+    const on = current === id;
+    const card = h('button', `look${on ? ' on' : ''}`);
+    card.dataset.preset = id;
+    card.title = p.about;
+    card.setAttribute('aria-pressed', String(on));
+    card.append(lookThumb(id), h('span', 'look-name', on ? `${p.label} ✓` : p.label));
+    card.addEventListener('click', () => { if (!on) setPreset(id); });
+    looks.appendChild(card);
+  }
+  el.appendChild(looks);
+  if (current) {
+    const back = h('button', 'link look-back small', 'As it was');
+    back.addEventListener('click', () => setPreset(''));
+    el.appendChild(back);
+  }
+
+  // 2. One field: say what to change; three ideas under it.
+  const ask = h('form', 'custom-ask');
+  const field = h('input');
+  field.type = 'text';
+  field.placeholder = 'Say what to change…';
+  field.setAttribute('aria-label', 'What to change in the Workbench');
+  ask.appendChild(field);
+  ask.addEventListener('submit', (e) => { e.preventDefault(); const text = field.value.trim(); if (text) askToCustomize(text); else customizeWithClaude(); });
+  el.appendChild(ask);
+  const chips = h('div', 'idea-list custom-chips');
+  for (const [label, request] of QUICK_IDEAS) {
+    const b = h('button', 'idea', label);
+    b.title = request;
+    b.dataset.request = request;
+    b.addEventListener('click', () => askToCustomize(request));
+    chips.appendChild(b);
+  }
+  el.appendChild(chips);
+  if (st.settingsError) el.appendChild(h('p', 'warn-box', `The settings file has a mistake (${st.settingsError}), so the defaults are used. Ask the AI to fix it.`));
+
+  // 3. Everything else, folded: more ideas, add-ons, history, what isn't possible, the folder.
+  const more = h('details', 'custom-more');
+  more.appendChild(h('summary', '', 'More ideas and add-ons'));
+  if (st.safeMode || PRO.moreOpen) more.open = true;
+  more.addEventListener('toggle', () => { PRO.moreOpen = more.open; });
+  el.appendChild(more);
+  el = more;
+
   const ideas = h('div', 'section custom-ideas');
-  ideas.appendChild(h('h3', '', 'What you can ask for'));
-  ideas.appendChild(h('p', 'muted small', 'Click one to ask the AI for it, or say it your own way.'));
   for (const group of CUSTOM_IDEAS) {
     const g = h('div', 'idea-group');
     g.appendChild(h('div', 'idea-cat', group.cat));
@@ -1217,23 +1306,6 @@ function renderCustomizePanel(el) {
     ideas.appendChild(g);
   }
   el.appendChild(ideas);
-
-  // Ready-made looks: one click on, one click off.
-  const pre = h('div', 'section custom-presets');
-  const ph = h('div', 'panel-head');
-  ph.appendChild(h('h3', '', 'One-click looks'));
-  const current = activePreset();
-  if (current) ph.appendChild(btn('Reset', 'preset-reset', () => setPreset('')));
-  pre.appendChild(ph);
-  for (const [id, p] of Object.entries(PRESETS)) {
-    const card = h('button', `preset${current === id ? ' on' : ''}`);
-    card.dataset.preset = id;
-    card.append(h('b', '', p.label), h('span', 'muted small', p.about));
-    if (current === id) card.appendChild(h('span', 'preset-on small', 'On'));
-    card.addEventListener('click', () => setPreset(current === id ? '' : id));
-    pre.appendChild(card);
-  }
-  el.appendChild(pre);
 
   // What it can't do (yet), said plainly so nobody waits for it.
   const lim = h('div', 'section custom-limits');
@@ -1276,8 +1348,6 @@ function renderCustomizePanel(el) {
     pl.appendChild(row);
   }
   el.appendChild(pl);
-
-  if (st.settingsError) el.appendChild(h('p', 'warn-box', `The settings file has a mistake (${st.settingsError}), so the defaults are used. Ask the AI to fix it.`));
 
   // History
   const hist = h('div', 'section');
