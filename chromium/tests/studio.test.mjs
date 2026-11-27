@@ -161,6 +161,7 @@ test('Studio on: a task in plain words, a permission card answered with a button
     const info = await wb.eval('window.workbench.studioInfo()');
     assert.match(info.home, /Meridian Studio$/);
     delete info.home;
+    delete info.beta;  // (a Beta build says so)
     assert.deepEqual(info, { enabled: true, figma: false, chosen: false, ask: false, persona: 'designer' });
     assert.equal(await wb.eval(`document.querySelectorAll('#st-chips .st-chip').length`), 3);
     assert.equal(await wb.eval(`document.querySelector('#studio .st-switch button.on').dataset.view`), 'studio');
@@ -202,8 +203,8 @@ test('Studio on: a task in plain words, a permission card answered with a button
     // Done: Claude's answer, and cards only for what it created or changed.
     await wb.waitFor(`document.querySelector('#st-feed').innerText.includes('Done: the palette is in Drafts.')`, 10000);
     await wb.waitFor(`[...document.querySelectorAll('.st-fc .st-fn')].map((e) => e.textContent).sort().join() === 'colors.css,palette.png'`, 10000);
-    // The picture's card has its picture.
-    await wb.waitFor(`document.querySelector('.st-fc[data-file="Drafts/palette.png"] img')?.src.startsWith('data:image/png')`, 10000);
+    // The picture's card has its picture (a small copy made from it).
+    await wb.waitFor(`document.querySelector('.st-fc[data-file="Drafts/palette.png"] img')?.src.startsWith('data:image/')`, 20000);
     // The original was never touched by Studio itself.
     assert.equal(fs.readFileSync(path.join(s.project, 'Brand', 'colors.css'), 'utf8'), ':root { --main: green; }\n');
 
@@ -316,7 +317,7 @@ def hook(event, **f):
 n = [0]
 def line(kind, content, f):
     n[0] += 1
-    f.write(json.dumps({'type': kind, 'uuid': 'l%d' % n[0], 'sessionId': 's1', 'timestamp': '2026-11-27T09:00:00Z', 'message': {'role': kind, 'content': content}}) + '\\\\n')
+    f.write(json.dumps({'type': kind, 'uuid': 'l%d' % n[0], 'sessionId': 's1', 'timestamp': '2026-11-27T09:00:00Z', 'message': {'role': kind, 'content': content}}) + '\\n')
 with open(tpath, 'w') as f:
     # A long session already: 5000 turns, about 50 MB (a picture read from disk in each, never a snapshot).
     if os.path.exists(os.path.join(cwd, '.big')):
@@ -327,9 +328,9 @@ with open(tpath, 'w') as f:
             line('user', [{'type': 'tool_result', 'tool_use_id': 'r%d' % i, 'content': [{'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': pad}}]}], f)
 hook('SessionStart', model='claude-opus-5-5', source='startup')
 buf = ''
-while '\\\\n' not in buf.replace('\\\\r', '\\\\n'):
+while '\\n' not in buf.replace('\\r', '\\n'):
     buf += os.read(0, 4096).decode('utf8', 'replace')
-prompt = buf.replace('\\\\x1b[200~', '').replace('\\\\x1b[201~', '').strip()
+prompt = buf.replace('\\x1b[200~', '').replace('\\x1b[201~', '').strip()
 hook('UserPromptSubmit', prompt=prompt)
 with open(tpath, 'a') as f:
     line('user', prompt, f)
@@ -377,7 +378,7 @@ test('The result: a link in the last answer opens next to Studio (http and https
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const url = `http://127.0.0.1:${server.address().port}/artifact/abc`;
   const s = await setup(FAKE_SITE);
-  // No page file this time: only the link counts.
+  // The answer ends with a link (the task wrote a page file too, which opens first).
   fs.writeFileSync(path.join(s.project, '.site-url'), url);
   const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio', '--lang=en-US'] });
   let wb, site;
@@ -497,7 +498,8 @@ test('«Кто вы?» is part of the first-run tour (Studio on), the pick is ke
   const args = s.args.filter((a) => !a.startsWith('--meridian-test-persona'));
   const b = await launch(['about:blank'], { profile: s.profile, args: [...args, '--meridian-studio', '--lang=en-US'] });
   try {
-    // The tour: hello, then the heroes.
+    // The tour: hello, then the heroes (once the window's UI is up).
+    await b.waitFor(`!!app?.$?.onboarding?.show`, 15000);
     await b.eval(`app.$.onboarding.show('tour').then(() => true)`);
     await b.waitFor(`app.$.onboarding.shadowRoot.querySelector('#root')?.dataset.step === 'hello'`);
     await b.eval(`app.$.onboarding.shadowRoot.querySelector('#next').click(), true`);
@@ -510,6 +512,8 @@ test('«Кто вы?» is part of the first-run tour (Studio on), the pick is ke
     // Kept at once; Studio pinned and opened when the tour ends.
     await b.eval(`app.$.onboarding.shadowRoot.querySelector('#skip').click(), true`);
     const studio = await b.page('chrome://workbench/?view=studio', 15000);
+    // (The tab is found as it starts loading: its bridge comes with the page.)
+    await studio.waitFor(`typeof window.workbench?.studioInfo === 'function'`, 15000);
     assert.equal((await studio.eval('window.workbench.studioInfo()')).persona, 'manager');
     await studio.waitFor(`document.querySelector('#studio') && !document.querySelector('#studio').hidden`);
     // The Workbench page itself never asks, and has no role chip.
@@ -617,7 +621,8 @@ test('A question Claude asks: its text and options on a card; the pick reaches C
     await startTask(wb, 'Make two pictures to compare side by side');
     await wb.waitFor(`document.querySelector('.st-question')?.innerText.includes('Which two pictures?')`, 20000);
     assert.doesNotMatch(await wb.eval(`document.querySelector('#st-feed').innerText`), /Allow the next step|Asked a question/);
-    assert.match(await wb.eval(`document.querySelector('#st-feed').innerText`), /Asking: Which two pictures\?|Asked: Which two pictures\?/);
+    // The step says what was asked (it comes with the transcript, a moment after the card).
+    await wb.waitFor(`/Asking: Which two pictures\\?|Asked: Which two pictures\\?/.test(document.querySelector('#st-feed').innerText)`, 10000);
     assert.deepEqual(await wb.eval(`[...document.querySelectorAll('.st-question .st-opt b')].map((e) => e.textContent)`), ['Old and new logo', 'Two banners']);
     // Whole, above the composer.
     const fits = await wb.eval(`(() => { const c = document.querySelector('.st-question').getBoundingClientRect(); const m = document.querySelector('.st-composer').getBoundingClientRect(); const card = document.querySelector('.st-question'); return c.bottom <= m.top + 1 && card.scrollHeight <= card.clientHeight + 1 && c.height > 80; })()`);
@@ -633,6 +638,56 @@ test('A question Claude asks: its text and options on a card; the pick reaches C
   } finally {
     wb?.close();
     await b.close();
+    cleanup(s.project, s.bin, s.profile);
+  }
+});
+
+// The result opens beside the Workbench as a split. A tab is in one split at most (Chromium CHECKs
+// it and the whole browser went down): a second result, a result after the last one was closed,
+// after the Workbench tab was pinned, after the person took the pair apart, and the Workbench's own
+// preview — each time the browser stays up and the Workbench is beside the newest.
+test('The result beside the Workbench, again and again: never a crash, always beside the newest', async () => {
+  const http = await import('node:http');
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(`<!doctype html><title>${req.url.slice(1)}</title><p>${req.url}</p>`); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = (p) => `http://127.0.0.1:${server.address().port}/${p}`;
+  const s = await setup();
+  const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio', '--lang=en-US'] });
+  let wb;
+  const pages = [];
+  try {
+    wb = await openWorkbench(b, s.project);
+    const splits = () => b.eval(`(() => { const ts = app.$.tabstrip; const all = [...ts.tabs_.values()]; const u = (id) => all.find((t) => t.id === id)?.url || ''; return ts.state_.splits.map((x) => [u(x.start), u(x.end)].sort()); })()`);
+    const open = async (type, p) => {
+      await wb.eval(`(() => { window.workbench.toHost({ type: ${JSON.stringify(type)}, url: ${JSON.stringify(url(p))} }); return true; })()`);
+      const page = await b.page(url(p), 15000);
+      pages.push(page);
+      // Still up, and the Workbench is beside this one.
+      await b.waitFor(`(() => { const ts = app.$.tabstrip; const all = [...ts.tabs_.values()]; const u = (id) => all.find((t) => t.id === id)?.url || ''; return ts.state_.splits.some((x) => [u(x.start), u(x.end)].includes(${JSON.stringify(url(p))}) && [u(x.start), u(x.end)].some((v) => v.startsWith('chrome://workbench'))); })()`, 10000);
+      return page;
+    };
+    await open('studio-site', 'one');
+    await open('studio-site', 'two');                 // the Workbench was in a split already
+    assert.equal((await splits()).length, 1, 'one split, the earlier result on its own');
+    assert.ok((await b.tabs()).some((t) => t.url === url('one')), 'the earlier result stays open');
+    (await open('studio-site', 'three')).close();      // closed by the person…
+    await sleep(500);
+    await open('studio-site', 'four');                // …and the next one still goes beside
+    await open('preview', 'five');                    // the Workbench's own preview, the same way
+    await open('preview', 'six');
+    // The Workbench tab pinned as a hub, then a result.
+    await wb.eval(`(() => { window.workbench.toHost({ type: 'pin-hub', where: 'pinned' }); return true; })()`);
+    await sleep(800);
+    await open('studio-site', 'seven');
+    // The person took the pair apart (⌃⇧-), then a result.
+    await b.eval(`app.$.tabstrip.runCommand(8, 0), true`).catch(() => {});
+    await open('studio-site', 'eight');
+    assert.equal(await b.eval('1 + 1'), 2, 'the browser is up');
+  } finally {
+    for (const p of pages) p?.close?.();
+    wb?.close();
+    await b.close();
+    server.close();
     cleanup(s.project, s.bin, s.profile);
   }
 });

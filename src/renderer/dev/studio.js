@@ -50,6 +50,9 @@ const stReduced = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 // Control's state for the terminal: a question → needs you; running → working; finished and not
 // looked at → done; otherwise nothing.
 function stStatus(t) {
+  // A question on screen is the task waiting for the person, whatever else says otherwise: the row's
+  // dot and the card always agree.
+  if (!t.exited && ST.mission[t.id]?.asks?.length) return 'needs';
   // The chats list's module (session-status.js), when this build has it.
   if (typeof SessionStatus !== 'undefined' && SessionStatus?.get) {
     try {
@@ -1755,6 +1758,9 @@ function stSendPins(t, k, force = false) {
 function stAutoResult(t, k) {
   const visible = ST.view === 'studio' && ST.current === t.id && !document.hidden;
   const page = [...k.model.files.values()].filter((f) => f.page).sort((a, b) => b.at - a.at)[0];
+  // The links of the last answer are the result's too (one click away when a page file opened first).
+  const links = StudioTranscript.linksOf(k.model);
+  if (links.length && (!k.result || !links.includes(k.result))) k.result = links[0];
   if (page) {
     const sig = `${page.key}|${page.times}`;
     if (k.pageSig === sig) return;
@@ -1765,9 +1771,7 @@ function stAutoResult(t, k) {
     else wb.studioPoint?.('reload').catch(() => {});
     return;
   }
-  const links = StudioTranscript.linksOf(k.model);
   if (!links.length) return;
-  if (!k.result || !links.includes(k.result)) k.result = links[0];
   if (visible && k.linksSeen !== links.join(' ')) {
     k.linksSeen = links.join(' ');
     if (k.resultOpened !== links[0]) stOpenResult(k, links[0]);
