@@ -92,16 +92,24 @@ async function setup(standIn = FAKE_CLAUDE) {
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
   fs.writeFileSync(path.join(bin, 'claude'), standIn, { mode: 0o755 });
   const profile = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-')));
-  return { project, bin, profile, args: [`--meridian-test-project=${project}`, `--meridian-agents-path=${bin}`, '--meridian-no-notify', '--meridian-test-persona=designer'] };
+  // Never the real ~/Documents/Meridian Studio.
+  const studioHome = path.join(profile, 'Meridian Studio');
+  return { project, bin, profile, args: [`--meridian-test-studio-home=${studioHome}`, `--meridian-test-project=${project}`, `--meridian-agents-path=${bin}`, '--meridian-no-notify', '--meridian-test-persona=designer'] };
 }
 
-async function openWorkbench(b) {
+async function openWorkbench(b, project) {
   await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length >= 1`);
   await b.eval('app.$.tabstrip.runCommand(16, 0)');
   const wb = await b.page('chrome://workbench');
   await wb.waitFor(`!!S.project || (document.querySelector('#welcome') && !document.querySelector('#welcome').hidden)`, 15000);
   if (!(await wb.eval('!!S.project'))) await wb.eval(`document.querySelector('#open-folder').click(), true`);
   await wb.waitFor('!!S.project', 15000);
+  // Studio opens its own folder (a temp one here) by itself; these tests work in the person's
+  // folder (the test project), as «Работать с моими файлами…» would.
+  if (project && (await wb.eval('S.project.root')) !== project) {
+    await wb.eval('pickProject().then(() => true)');
+    await wb.waitFor(`S.project?.root === ${JSON.stringify(project)}`, 15000);
+  }
   return wb;
 }
 
@@ -120,7 +128,7 @@ test('Studio off (the default): the Workbench is as before, Studio\'s calls are 
   const b = await launch(['about:blank'], { profile: s.profile, args: s.args });
   let wb;
   try {
-    wb = await openWorkbench(b);
+    wb = await openWorkbench(b, s.project);
     await sleep(500);
     assert.equal(await wb.eval(`!!document.querySelector('#studio, .st-switch')`), false);
     assert.equal(await wb.eval('document.body.classList.contains("studio-on")'), false);
@@ -147,7 +155,7 @@ test('Studio on: a task in plain words, a permission card answered with a button
   const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio'] });
   let wb;
   try {
-    wb = await openWorkbench(b);
+    wb = await openWorkbench(b, s.project);
     // A designer sees Studio first, with the designer's suggestions and the switch.
     await wb.waitFor(`document.querySelector('#studio') && !document.querySelector('#studio').hidden`);
     const info = await wb.eval('window.workbench.studioInfo()');
@@ -221,7 +229,7 @@ test('Studio\'s Boost: what a site had is kept, Before/After switches it, Undo p
   const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio'] });
   let wb;
   try {
-    wb = await openWorkbench(b);
+    wb = await openWorkbench(b, s.project);
     const call = (code) => wb.eval(`${code}.then((r) => r, (e) => 'ERR ' + e.message)`);
     assert.deepEqual(await call(`window.workbench.studioBoost('get', 'studio.test')`), []);
     const after = await call(`window.workbench.studioBoost('restore', 'studio.test', [{ id: 'b1', host: 'studio.test', name: 'Brand', css: 'body { color: rebeccapurple; }', enabled: true }])`);
@@ -252,7 +260,7 @@ test('Point and say: Studio\'s site tab gets the overlay; a click there names th
   const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio', '--lang=en-US'] });
   let wb, site;
   try {
-    wb = await openWorkbench(b);
+    wb = await openWorkbench(b, s.project);
     await wb.eval(`(() => { window.__pts = []; window.workbench.onHostCommand((m) => { if (m?.type === 'studio-point') window.__pts.push(m); }); return true; })()`);
     // Studio opens the site next to itself and remembers that tab.
     await wb.eval(`(() => { window.workbench.toHost({ type: 'studio-site', url: ${JSON.stringify(url)} }); return true; })()`);
@@ -348,7 +356,7 @@ test('The result: a page file the task wrote opens next to Studio by itself; the
   const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio', '--lang=en-US'] });
   let wb, site;
   try {
-    wb = await openWorkbench(b);
+    wb = await openWorkbench(b, s.project);
     await startTask(wb, 'Make a test site');
     await wb.waitFor(`[...document.querySelectorAll('.st-fc .st-fn')].some((e) => e.textContent === 'test-site.html')`, 20000);
     assert.match(await wb.eval(`document.querySelector('#st-feed').innerText`), /Created test-site\.html/);
@@ -374,7 +382,7 @@ test('The result: a link in the last answer opens next to Studio (http and https
   const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio', '--lang=en-US'] });
   let wb, site;
   try {
-    wb = await openWorkbench(b);
+    wb = await openWorkbench(b, s.project);
     // The page file opens first (it's the last thing made); then the link is one click.
     await startTask(wb, 'Publish it');
     await wb.waitFor(`document.querySelector('#st-feed').innerText.includes(${JSON.stringify(url)})`, 20000);
@@ -403,7 +411,7 @@ test('A 50 MB session opens at its end in under 300 ms, renders 30 turns, pages 
   const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio', '--lang=en-US'] });
   let wb;
   try {
-    wb = await openWorkbench(b);
+    wb = await openWorkbench(b, s.project);
     await startTask(wb, 'One more');
     await wb.waitFor(`document.querySelector('#st-feed').innerText.includes('Hello') || document.querySelector('#st-feed').innerText.includes('Готово')`, 60000);
     // Reopen the task as the person would: the time from the click to its feed drawn.
@@ -440,7 +448,7 @@ test('Layout: nothing clipped or overlapping at three widths; the splitter drags
   const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio', '--lang=en-US'] });
   let wb;
   try {
-    wb = await openWorkbench(b);
+    wb = await openWorkbench(b, s.project);
     await startTask(wb, 'Make a test site');
     await wb.waitFor(`document.querySelectorAll('.st-fc').length > 0`, 20000);
     const check = `(() => {
@@ -605,7 +613,7 @@ test('A question Claude asks: its text and options on a card; the pick reaches C
   const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio', '--lang=en-US'] });
   let wb;
   try {
-    wb = await openWorkbench(b);
+    wb = await openWorkbench(b, s.project);
     await startTask(wb, 'Make two pictures to compare side by side');
     await wb.waitFor(`document.querySelector('.st-question')?.innerText.includes('Which two pictures?')`, 20000);
     assert.doesNotMatch(await wb.eval(`document.querySelector('#st-feed').innerText`), /Allow the next step|Asked a question/);
