@@ -151,6 +151,7 @@ test('new task: no folder question, the own-files link, the task menu on screen'
     for (let i = 0; i < 50 && (await page.evaluate('typeof stBuild === "function" && document.readyState')) !== 'complete'; i++) await sleep(100);
     const m = await page.evaluate(`(async () => {
       ST.on = true; ST.lang = 'ru'; ST.view = 'studio'; ST.current = ''; ST.info = { home: S.project.path };
+      S.terms[0].custom = 'Две картинки';
       S.project.root = S.project.path;
       stBuild(); ST.el.hidden = false;
       stRender();
@@ -168,7 +169,7 @@ test('new task: no folder question, the own-files link, the task menu on screen'
     assert.equal(m.folderTalk, false);
     assert.equal(m.menu, 'Показать в Finder');
     assert.equal(m.inView, true);
-    assert.equal(m.sub, 'Claude');
+    assert.equal(m.sub, '', 'no filler caption');
   } finally { await page.close(); }
 });
 
@@ -211,6 +212,8 @@ test('task list resizes by its splitter; segmented controls slide a pill instead
     const moved = await page.evaluate(`(() => { const box = document.querySelector('.st-ctabs .st-seg'); return { x: box.style.getPropertyValue('--pill-x'), on: box.querySelector('button.on').offsetLeft }; })()`);
     assert.equal(moved.x, `${moved.on}px`, 'the pill follows the picked button');
     assert.notEqual(moved.x, pill.x);
-    for (const sel of ['.st-head .st-switch', '.st-viewseg']) assert.equal(await page.evaluate(`!!document.querySelector('${sel} .st-pill')`), true, sel);
+    // (No Cards | Task switch any more: one view.)
+    assert.equal(await page.evaluate(`!!document.querySelector('.st-viewseg')`), false);
+    for (const sel of ['.st-head .st-switch']) assert.equal(await page.evaluate(`!!document.querySelector('${sel} .st-pill')`), true, sel);
   } finally { await page.close(); }
 });

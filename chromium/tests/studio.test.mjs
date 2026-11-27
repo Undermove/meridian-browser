@@ -182,10 +182,9 @@ test('Studio on: a task in plain words, a permission card answered with a button
     // Nothing about terminals, tokens or MCP in sight.
     assert.doesNotMatch(await wb.eval(`document.querySelector('#studio').innerText`), /terminal|token|MCP|CLI/i);
 
-    // A suggestion fills the box; the person sends it.
-    await click(wb, '#st-chips .st-chip');
-    const prompt = await wb.eval(`document.querySelector('#st-input').value`);
-    assert.ok(prompt.length > 5);
+    // The person writes the task in their own words and sends it (starters have their own test).
+    const prompt = 'Make a palette for our brand';
+    await wb.eval(`(() => { document.querySelector('#st-input').value = ${JSON.stringify(prompt)}; return true; })()`);
     await click(wb, '#st-send');
     // Claude Code first asks about the folder: a card in plain words, not lost typing.
     await wb.waitFor(`document.querySelector('.st-ask[data-key="trust"]')?.innerText.includes('Let Claude work in this folder?')`, 15000);

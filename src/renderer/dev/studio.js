@@ -40,7 +40,8 @@ function stTask(t) {
   return k;
 }
 
-const stTerms = () => (typeof S !== 'undefined' ? S.terms.filter((t) => t.kind === 'claude' && !t.closed) : []);
+// Studio's tasks: only what was started in Studio (a developer's sessions stay in the Workbench).
+const stTerms = () => (typeof S !== 'undefined' ? S.terms.filter((t) => t.kind === 'claude' && t.studio && !t.closed) : []);
 const stCurrent = () => stTerms().find((t) => t.id === ST.current) || null;
 const stReduced = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -84,7 +85,8 @@ async function studioBoot() {
   ST.on = true;
   ST.info = info;
   if (['designer', 'manager', 'developer', 'everyday'].includes(info.persona)) ST.persona = info.persona;
-  try { ST.board = localStorage.getItem('wb.studioBoard') === '1'; } catch {}
+  // One view (the separate «Cards» board is gone).
+  ST.board = false;
   document.body.classList.add('studio-on');
   stBuild();
   stSwitchInTopbar();
@@ -234,9 +236,6 @@ function stBuild() {
     <header class="st-head">
       <div class="st-titles"><span class="st-ttl" id="st-title"></span><span class="st-sub" id="st-sub"></span></div>
       <div class="grow"></div>
-      <div class="st-viewseg" role="tablist" aria-label="${esc(w.tasks)}">
-        <button role="tab" data-mode="board">${icon('grid', 13)}<span>${esc(w.cards)}</span></button>
-        <button role="tab" data-mode="list">${icon('file', 13)}<span>${esc(w.taskView)}</span></button></div>
       ${stSwitchHtml()}
     </header>
     <div class="st-board" id="st-board" hidden></div>
@@ -271,10 +270,6 @@ function stBuild() {
   document.body.appendChild(el);
   ST.el = el;
   $('.st-switch', el).addEventListener('click', stOnSwitch);
-  $('.st-viewseg', el).addEventListener('click', (e) => {
-    const m = e.target.closest('[data-mode]')?.dataset.mode;
-    if (m) stSetBoard(m === 'board');
-  });
   $('#st-board', el).addEventListener('click', stOnBoardClick);
   stSplitInit(el);
   stTasksSplitInit(el);
@@ -295,11 +290,19 @@ function stBuild() {
     if (more) { ST.menuFor = ST.menuFor === more.dataset.tmenu ? '' : more.dataset.tmenu; stRender(); return true; }
     const rv = e.target.closest('[data-reveal]');
     if (rv) { ST.menuFor = ''; stReveal(stTerms().find((x) => x.id === rv.dataset.reveal)); stRender(); return true; }
+    const ho = e.target.closest('[data-handoff-task]');
+    if (ho) {
+      ST.menuFor = '';
+      const t = stTerms().find((x) => x.id === ho.dataset.handoffTask);
+      if (t) { ST.current = t.id; stSend(t, STW().handoffPrompt); }
+      stRender();
+      return true;
+    }
     return false;
   };
   $('#st-task-list', el).addEventListener('pointerup', (e) => { if (e.button === 0) stTaskMenu(e); });
   $('#st-task-list', el).addEventListener('click', (e) => {
-    if (e.target.closest('[data-tmenu], [data-reveal]')) { if (e.detail === 0) stTaskMenu(e); return; }
+    if (e.target.closest('[data-tmenu], [data-reveal], [data-handoff-task]')) { if (e.detail === 0) stTaskMenu(e); return; }
     if (ST.menuFor) { ST.menuFor = ''; }
     const row = e.target.closest('[data-term]');
     if (!row) return;
@@ -372,9 +375,8 @@ function stRender() {
   $('#st-pick').hidden = true;
   const terms = stTerms();
   // The board: every task as a card. It is where Studio starts when there are tasks and none is open.
-  $('.st-body', ST.el).hidden = ST.board;
-  $('#st-board').hidden = !ST.board;
-  for (const b of ST.el.querySelectorAll('.st-viewseg button')) b.classList.toggle('on', (b.dataset.mode === 'board') === ST.board);
+  $('.st-body', ST.el).hidden = false;
+  $('#st-board').hidden = true;
   if (ST.board) {
     $('#st-title').textContent = w.studio;
     $('#st-sub').textContent = stAtHome() ? w.taskCount(terms.length) : `${S.project.name} · ${w.taskCount(terms.length)}`;
@@ -386,7 +388,8 @@ function stRender() {
   if (ST.current && !terms.some((t) => t.id === ST.current)) ST.current = '';
   const t = stCurrent();
   $('#st-title').textContent = t ? stTitle(t) : w.newTask;
-  $('#st-sub').textContent = stAtHome() ? w.claude : `${S.project.name} · ${w.claude}`;
+  // Only what says something: the person's own folder, when it's that.
+  $('#st-sub').textContent = stAtHome() ? '' : S.project.name;
   document.title = t ? stTitle(t) : w.studio;
   stRenderTasks(terms);
   stRenderPane();
@@ -487,13 +490,32 @@ function stReveal(t) {
 
 function stRenderTasks(terms) {
   const list = $('#st-task-list');
-  const html = terms.map((t) => {
+  const w = STW();
+  // A task without a name of its own and nothing done yet isn't listed (it never shows as «Untitled»).
+  const named = terms.filter((t) => t.id === ST.current || t.custom || ST.tasks.get(t.id)?.model.turns.some((x) => x.prompt));
+  const html = named.map((t) => {
     const s = stStatus(t);
+    const k = stTask(t);
+    const done = k.model.turns.length > 0;
     const menu = ST.menuFor === t.id
-      ? `<div class="st-tmenu" role="menu"><button role="menuitem" data-reveal="${esc(t.id)}">${icon('folder', 13)}<span>${esc(STW().reveal)}</span></button></div>` : '';
-    return `<div class="st-task ${s}${t.id === ST.current ? ' active' : ''}${menu ? ' menu-open' : ''}" role="listitem" data-term="${esc(t.id)}" tabindex="0">${stDot(s)}<span class="st-task-name">${esc(stTitle(t))}</span><button class="st-tmore" data-tmenu="${esc(t.id)}" title="${esc(STW().more)}" aria-label="${esc(STW().more)}" aria-haspopup="menu" aria-expanded="${menu ? 'true' : 'false'}">${icon('more', 14)}</button>${menu}</div>`;
+      ? `<div class="st-tmenu" role="menu"><button role="menuitem" data-reveal="${esc(t.id)}">${icon('folder', 13)}<span>${esc(w.reveal)}</span></button>${done ? `<button role="menuitem" data-handoff-task="${esc(t.id)}">${icon('arrowRight', 13)}<span><b>${esc(w.handoff)}</b><small>${esc(w.handoffHint)}</small></span></button>` : ''}</div>` : '';
+    // Its picture: only a real result of this task (its last screenshot or picture), else none.
+    const pic = stCardPicture(k);
+    const thumb = pic ? `<span class="st-tthumb st-th img" aria-hidden="true">${stImg(pic.after)}</span>` : '';
+    return `<div class="st-task ${s}${t.id === ST.current ? ' active' : ''}${menu ? ' menu-open' : ''}${thumb ? ' has-thumb' : ''}" role="listitem" data-term="${esc(t.id)}" tabindex="0">${thumb}${stDot(s)}<span class="st-task-name">${esc(stTitle(t))}</span><button class="st-tmore" data-tmenu="${esc(t.id)}" title="${esc(w.more)}" aria-label="${esc(w.more)}" aria-haspopup="menu" aria-expanded="${menu ? 'true' : 'false'}">${icon('more', 14)}</button>${menu}</div>`;
   }).join('');
-  if (list.dataset.html !== html) { list.innerHTML = html; list.dataset.html = html; }
+  if (list.dataset.html !== html) { list.innerHTML = html; list.dataset.html = html; stFillImages(list); }
+  // The open menu floats above everything (the list clips sideways), under its «…», on screen.
+  const menu = list.querySelector('.st-tmenu');
+  const more = menu && menu.parentElement.querySelector('.st-tmore');
+  if (menu && more) {
+    const b = more.getBoundingClientRect();
+    const mw = menu.offsetWidth, mh = menu.offsetHeight;
+    const left = Math.max(8, Math.min(innerWidth - mw - 8, b.left));
+    const top = b.bottom + 4 + mh > innerHeight - 8 ? Math.max(8, b.top - 4 - mh) : b.bottom + 4;
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+  }
   $('#st-new').classList.toggle('active', !ST.current);
 }
 
@@ -1079,7 +1101,8 @@ function stRenderResult(t) {
       <button class="st-btn pri" data-r="site">${icon('layers', 14)}<span>${esc(w.showSite)}</span></button></div>`
       + (shot ? (shots.length > 1 ? stWipeHtml(shots[0], shot) : `<div class="st-r-img">${stImg(stShotKey(shot))}</div>`) : `<div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(StudioWords.host(k.site))}</div></div>`);
   } else {
-    html = `<div class="st-r-empty">${icon('eye', 22)}<p>${esc(w.resultEmpty)}</p></div>`;
+    // Nothing yet: nothing drawn (no placeholder; the result appears here by itself).
+    html = '';
   }
   if (pane.dataset.html !== html) { pane.innerHTML = html; pane.dataset.html = html; pane.classList.remove('st-fade'); void pane.offsetWidth; pane.classList.add('st-fade'); }
   stFillImages(pane);
@@ -1759,7 +1782,7 @@ function stCardPicture(k) {
   const shots = k.model.shots;
   if (shots.length) return { after: stShotKey(shots[shots.length - 1]), before: shots.length > 1 ? stShotKey(shots[0]) : '' };
   const img = [...k.model.files.values()].filter((f) => f.image).sort((a, b) => b.at - a.at)[0];
-  const th = img && k.thumbs.get(img.rel);
+  const th = img && (k.thumbs.get(img.key) || k.thumbs.get(img.rel));
   if (th?.src) return { after: th.src, before: '' };
   return null;
 }
