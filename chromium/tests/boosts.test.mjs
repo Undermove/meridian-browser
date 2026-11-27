@@ -4,7 +4,7 @@
 // over with the rest of its data.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -299,7 +299,7 @@ function fakeClaude(answer) {
   return new Promise((r) => server.listen(0, '127.0.0.1', () => r({ server, requests, base: `http://127.0.0.1:${server.address().port}` })));
 }
 
-test('Improve with Claude, a direction: the page outline goes to Claude once, its CSS becomes the boost, what it hides a zap; Undo', async () => {
+test('Improve with Claude, one click: no AI yet says why and where; then the page outline goes to Claude once, its CSS becomes the boost, what it hides a zap; Undo', async () => {
   const s = await site();
   const api = await fakeClaude({ name: 'Calm News', css: '#story h1 { color: rgb(1, 2, 3); }', hide: ['#promo'], summary: 'Hid the subscription banner.' });
   const b = await launch([s.url], { args: [`--meridian-ai-base-url=${api.base}`] });
@@ -307,16 +307,10 @@ test('Improve with Claude, a direction: the page outline goes to Claude once, it
     const page = await b.page(s.url);
     await page.waitFor(`document.readyState === 'complete'`);
     await openEditor(b);
-    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
-    // No AI yet: the button says where to set one up.
-    await b.waitFor(`${BE}.getElementById('improve').disabled && /Settings/.test(${BE}.getElementById('improve').textContent)`);
+    // No AI yet: the button, never greyed out, is the way to set one up, and says why.
+    await b.waitFor(`!${BE}.getElementById('improve').disabled && /Open Settings › AI/.test(${BE}.getElementById('improve').textContent) && /No AI for Improve/.test(${BE}.getElementById('improveHint')?.textContent)`);
     assert.equal((await b.eval(`${H}.setAiKey(${JSON.stringify(KEY)})`)).ok, true);
-    // Folded and opened again: the AI set up meanwhile.
-    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
-    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
-    await b.waitFor(`/Improve with Claude/.test(${BE}.getElementById('improve').textContent)`);
-
-    await b.eval(`${BE}.getElementById('wish').value = 'hide the banner'`);
+    // The AI set up meanwhile: the click finds it and goes.
     await clickEditor(b, `${BE}.getElementById('improve')`);
     await b.waitFor(`${BE}.getElementById('note')?.textContent.includes('Hid the subscription banner.')`, 15000, `${BE}.getElementById('note')?.textContent`);
     await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
@@ -332,11 +326,11 @@ test('Improve with Claude, a direction: the page outline goes to Claude once, it
     assert.equal(asked.length, 1, 'one quick round');
     const req = asked[0];
     assert.match(req.system, /Do exactly what they ask/);
+    assert.match(JSON.stringify(req.messages), /What the person wants: make the site less distracting/);
     assert.equal(req.tools, undefined, 'no browser tools for a boost');
     const text = JSON.stringify(req.messages);
     assert.match(text, /div#promo\.promo-banner/);
     assert.match(text, /Subscribe now!/);
-    assert.match(text, /hide the banner/);
     assert.match(text, /main#story/);
     assert.doesNotMatch(text, /"type":"image"/, 'no screenshot');
 
@@ -375,168 +369,6 @@ process.stdin.on('end', () => {
 `);
   return () => fs.readdirSync(log).sort((a, c) => parseInt(a) - parseInt(c)).map((f) => fs.readFileSync(path.join(log, f), 'utf8'));
 }
-
-// The pixels at the left and right edges, a fifth from the bottom, of a JPEG (base64), read through
-// macOS's sips as a BMP.
-function pageEdges(jpeg) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-shot-'));
-  try {
-    fs.writeFileSync(path.join(dir, 'a.jpg'), Buffer.from(jpeg, 'base64'));
-    execFileSync('sips', ['-s', 'format', 'bmp', path.join(dir, 'a.jpg'), '--out', path.join(dir, 'a.bmp')], { stdio: 'ignore' });
-    const bmp = fs.readFileSync(path.join(dir, 'a.bmp'));
-    const at = bmp.readUInt32LE(10), w = bmp.readInt32LE(18), h = bmp.readInt32LE(22), bpp = bmp.readUInt16LE(28) / 8;
-    const row = Math.ceil((w * bpp) / 4) * 4;
-    const y = Math.round(Math.abs(h) * 0.8);
-    const line = h > 0 ? Math.abs(h) - 1 - y : y;  // Bottom-up unless the height is negative.
-    const px = (x) => { const o = at + line * row + x * bpp; return [bmp[o + 2], bmp[o + 1], bmp[o]]; };
-    return [px(1), px(4), px(w - 2), px(w - 5)];
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-}
-
-// A stand-in Claude Code that designs in rounds: run n answers `rounds[n]` (the last one again
-// after that), a second and a half later, as a real one takes its time; each run's message is
-// written down: what it was asked and whether a screenshot came with it.
-function fakeDesigner(dir, rounds) {
-  const log = path.join(dir, 'log');
-  fs.mkdirSync(log);
-  standIn(dir, 'claude', `const fs = require('fs'), path = require('path');
-const log = ${JSON.stringify(log)};
-const rounds = ${JSON.stringify(rounds)};
-const args = process.argv.slice(2);
-if (args[0] === 'auth' && args[1] === 'status') { console.log(JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' })); process.exit(0); }
-const n = fs.readdirSync(log).length;
-let stdin = '';
-process.stdin.on('data', (d) => { stdin += d; });
-process.stdin.on('end', () => {
-  // A screenshot comes as a stream-json user message: its picture and its text.
-  let text = stdin, images = [];
-  if (args.includes('--input-format')) {
-    const content = JSON.parse(stdin.trim()).message.content;
-    images = content.filter((c) => c.type === 'image').map((c) => c.source.media_type + ':' + c.source.data);
-    text = content.filter((c) => c.type === 'text').map((c) => c.text).join('');
-  }
-  fs.writeFileSync(path.join(log, n + '.json'), JSON.stringify({ text, images }));
-  const out = (o) => console.log(JSON.stringify(o));
-  const answer = JSON.stringify(rounds[Math.min(n, rounds.length - 1)]);
-  setTimeout(() => {
-    out({ type: 'system', subtype: 'init', session_id: 's-' + n, model: 'claude-opus-5-5' });
-    out({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'content_block_delta', delta: { type: 'text_delta', text: answer } } });
-    out({ type: 'result', subtype: 'success', is_error: false, result: answer });
-  }, 1500);
-});
-`);
-  return () => fs.readdirSync(log).sort((a, c) => parseInt(a) - parseInt(c)).map((f) => JSON.parse(fs.readFileSync(path.join(log, f), 'utf8')));
-}
-
-test('Improve redesigns in rounds: each CSS checked (nothing hidden, nothing from the internet), a screenshot to review it, progress in the editor; kept after a reload; Undo', { skip: NEEDS_FRAMES }, async () => {
-  const s = await site();
-  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
-  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-accounts-')));
-  fs.mkdirSync(path.join(home, '.claude'));
-  fs.writeFileSync(path.join(home, '.claude', 'settings.json'), '');
-  const runs = fakeDesigner(bin, [
-    // Round 1: a redesign, with a rule that hides the content and a picture from the internet.
-    { name: 'Night Desk', summary: 'A dark, calm reading desk.', hide: [],
-      css: 'main#story { background: rgb(10, 20, 30); color: rgb(240, 240, 240) }\n' +
-        'main { display: none !important }\n' +
-        'body { background-image: url(https://tracker.example/pixel.png); font-size: 17px }\n' +
-        'a:focus-visible { outline: 2px solid rgb(120, 160, 255) }' },
-    // Round 2, the review: fixes, the whole CSS again.
-    { summary: 'Fixed the heading.', hide: [],
-      css: 'main#story { background: rgb(10, 20, 30); color: rgb(240, 240, 240) }\n' +
-        'body { font-size: 17px }\n#story h1 { letter-spacing: 1px }' },
-    // Round 3: good as it is.
-    { done: true, css: '', summary: '' },
-  ]);
-  const b = await launch([s.url], { args: [`--meridian-agents-path=${bin}`, `--meridian-accounts-home=${home}`] });
-  try {
-    const page = await b.page(s.url);
-    await page.waitFor(`document.readyState === 'complete'`);
-    const before = await page.eval(`getComputedStyle(document.getElementById('story')).backgroundColor`);
-    await openEditor(b);
-    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
-    await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
-    await b.eval(`${BE}.getElementById('wish').value = 'redesign: dark and strict'`);
-    await clickEditor(b, `${BE}.getElementById('improve')`);
-    // The rounds, as the button and the page's status pill show them; the glow over the page all the
-    // while, never in the way.
-    const labels = new Set(), pills = new Set();
-    let overlay = null, magic = null;
-    for (let i = 0; i < 300; i++) {
-      const now = await b.eval(`({ label: ${BE}.getElementById('improve').textContent.trim(), magic: ${BE}.getElementById('improve').classList.contains('magic'), note: ${BE}.getElementById('note')?.textContent || '', state: app.$.boostMagic.state, pill: app.$.boostMagic.shadowRoot.getElementById('pill')?.textContent.replace(/\\s+/g, ' ').trim() || '' })`);
-      labels.add(now.label);
-      if (now.state === 'running') {
-        pills.add(now.pill);
-        magic ||= now.magic;
-        overlay ||= await b.eval(`(() => { const m = app.$.boostMagic, r = m.getBoundingClientRect(), c = app.$.contentRegion.getBoundingClientRect(); const st = getComputedStyle(m); return { over: Math.abs(r.left - c.left) < 2 && Math.abs(r.top - c.top) < 2 && Math.abs(r.width - c.width) < 2 && Math.abs(r.height - c.height) < 2, pointer: st.pointerEvents, opacity: st.opacity, turning: getComputedStyle(m.shadowRoot.querySelector('.ring.edge i')).animationName }; })()`);
-      }
-      if (now.note) break;
-      await sleep(100);
-    }
-    assert.match(await b.eval(`${BE}.getElementById('note').textContent`), /A dark, calm reading desk\./);
-    assert.ok([...labels].some((l) => /Designing… 1\/3/.test(l)), [...labels].join(' | '));
-    assert.ok([...labels].some((l) => /2\/3/.test(l)), [...labels].join(' | '));
-    assert.ok([...labels].some((l) => /3\/3/.test(l)), [...labels].join(' | '));
-    assert.ok(magic, 'the button glows while it works');
-    assert.deepEqual({ ...overlay, opacity: undefined }, { over: true, pointer: 'none', opacity: undefined, turning: 'magic-turn' });
-    assert.ok([...pills].some((p) => /Designing… 1\/3.*going for “redesign: dark and strict”/.test(p)), [...pills].join(' | '));
-    // Each round says what the last one changed.
-    assert.ok([...pills].some((p) => /Reviewing… 2\/3.*fixing what the checks took out · round 1: A dark, calm reading desk\./.test(p)), [...pills].join(' | '));
-    assert.ok([...pills].some((p) => /Polishing… 3\/3/.test(p)), [...pills].join(' | '));
-    // Done: a moment with what changed and Undo in the pill, then it goes by itself.
-    await b.waitFor(`app.$.boostMagic.state === 'done' && /A dark, calm reading desk/.test(app.$.boostMagic.shadowRoot.getElementById('pill').textContent) && !!app.$.boostMagic.shadowRoot.getElementById('magicUndo')`, 3000);
-    await b.waitFor(`app.$.boostMagic.state === 'off' && getComputedStyle(app.$.boostMagic).visibility === 'hidden'`, 8000);
-
-    // Three runs, each with a screenshot; the review hears what the checks took out.
-    const asked = runs();
-    assert.equal(asked.length, 3);
-    for (const r of asked) assert.deepEqual(r.images.map((i) => i.split(':')[0]), ['image/jpeg'], 'a screenshot each round');
-    // The glow is the browser's, over the tab: the AI's screenshot (taken while it shone) is the
-    // page alone, its edges the page's own white.
-    if (process.platform === 'darwin') {
-      const edges = pageEdges(asked[1].images[0].split(':')[1]);
-      assert.ok(edges.every((px) => px.every((v) => v > 235)), `screenshot edges ${JSON.stringify(edges)}`);
-    }
-    assert.match(asked[0].text, /The person's direction: redesign: dark and strict/);
-    assert.match(asked[0].text, /Landmarks/);
-    assert.match(asked[1].text, /Review round 2 of 3/);
-    assert.match(asked[1].text, /main: display: none hides content/);
-    assert.match(asked[1].text, /loads from the internet/);
-    assert.match(asked[1].text, /<css_on_the_page>[\s\S]*main#story/);
-
-    // On the page: round 2's CSS; the content shown; nothing loaded from the internet.
-    const look = () => page.eval(`(() => { const st = getComputedStyle(document.getElementById('story')); return { bg: st.backgroundColor, display: st.display, spacing: getComputedStyle(document.querySelector('#story h1')).letterSpacing, image: getComputedStyle(document.body).backgroundImage }; })()`);
-    await page.waitFor(`getComputedStyle(document.querySelector('#story h1')).letterSpacing === '1px'`, 5000);
-    assert.deepEqual(await look(), { bg: 'rgb(10, 20, 30)', display: 'block', spacing: '1px', image: 'none' });
-    const saved = (await b.eval(`${H}.getBoost()`)).state.boost;
-    assert.equal(saved.name, 'Night Desk');
-    assert.match(saved.css, /#story h1 \{\n {2}letter-spacing: 1px !important;\n\}/);
-    assert.doesNotMatch(saved.css, /display: none|tracker\.example/);
-    // In the editor's code, to change by hand.
-    await clickEditor(b, `${BE}.getElementById('code')`);
-    await b.waitFor(`${BE}.getElementById('css')?.value.includes('letter-spacing: 1px')`, 5000);
-    // Code is a page of its own, as Arc's: back to the panel, where Undo is.
-    await clickEditor(b, `${BE}.getElementById('back')`);
-    await b.waitFor(`${BE}.getElementById('card').getBoundingClientRect().width === 183`, 3000);
-
-    // A reload: still there.
-    await page.eval('location.reload()');
-    await page.waitFor(`document.readyState === 'complete' && getComputedStyle(document.getElementById('story')).backgroundColor === 'rgb(10, 20, 30)'`, 8000);
-
-    // Undo: the page as before Improve, also after a reload.
-    await clickEditor(b, `${BE}.getElementById('undo')`);
-    await page.waitFor(`getComputedStyle(document.getElementById('story')).backgroundColor === ${JSON.stringify(before)}`, 5000);
-    assert.equal((await b.eval(`${H}.getBoost()`)).state.boost.css, '');
-    await page.eval('location.reload()');
-    await page.waitFor(`document.readyState === 'complete'`);
-    await sleep(500);
-    assert.equal(await page.eval(`getComputedStyle(document.getElementById('story')).backgroundColor`), before);
-    page.close();
-  } finally {
-    await b.close(); s.server.close();
-    fs.rmSync(bin, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true });
-  }
-});
 
 // A YouTube-like home page: the masthead with the bell and its count, a grid of videos and two
 // Shorts shelves between them, as YouTube marks them.
@@ -591,7 +423,16 @@ process.stdin.on('end', () => {
   const system = at >= 0 ? args[at + 1] : at2 >= 0 ? args[at2 + 1] : '';
   fs.writeFileSync(path.join(log, n + '.json'), JSON.stringify({ text, images, system, args }));
   const sees = /ytd-rich-shelf-renderer/.test(text) && /yt-spec-icon-badge-shape__badge/.test(text);
-  const answer = JSON.stringify(sees ? {
+  // The one click's brief asks for labels in English (the browser's language here).
+  const en = /Labels and summary in English/.test(text);
+  const answer = JSON.stringify(sees && en ? {
+    name: 'Calm YouTube',
+    css: 'ytd-rich-shelf-renderer[is-shorts] { display: none !important; }',
+    hide: [{ selector: 'ytd-rich-shelf-renderer[is-shorts]', label: 'the Shorts shelf' },
+      { selector: '.yt-spec-icon-badge-shape__badge', label: 'the notification count' }],
+    changes: [],
+    summary: 'Hid the Shorts shelf and the notification count.',
+  } : sees ? {
     name: 'YouTube без шортсов',
     css: 'ytd-rich-shelf-renderer[is-shorts] { display: none !important; }\\n' +
       '#masthead { border-bottom: 1px solid rgb(9, 9, 9) }\\n' +
@@ -615,7 +456,10 @@ process.stdin.on('end', () => {
 
 // The owner's report on 1.5.3: «убери шортсы и цифры у колокольчика» on YouTube was slow, said
 // nothing clear and hid neither. As in 1.5.2 it's one quick round, and the editor says what it did.
-test('Improve, a direction («убери шортсы и цифры у колокольчика»): both hidden in one quick round, said as it goes, each change shown and undone by itself', async () => {
+// The owner's decision: Boost's Improve is 1.5.2's, simpler: one button, nothing to type, the site
+// less distracting in one quick round; what it hides becomes the site's Zaps, each with its name,
+// shown on the page from the Zap list and brought back one by one there.
+test('Improve, one button: the site less distracting (the Shorts and the bell’s count hidden) in one quick round, said at once; named Zaps, each shown and undone by itself', async () => {
   const s = await tube();
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-accounts-')));
@@ -625,74 +469,50 @@ test('Improve, a direction («убери шортсы и цифры у коло�
   const b = await launch([s.url], { args: [`--meridian-agents-path=${bin}`, `--meridian-accounts-home=${home}`] });
   try {
     const page = await b.page(s.url);
-    await page.waitFor(`document.readyState === 'complete'`);
-    const display = (sel) => page.eval(`[...document.querySelectorAll(${JSON.stringify(sel)})].map((el) => getComputedStyle(el).display)`);
     await page.waitFor(`document.querySelectorAll('ytd-rich-shelf-renderer').length === 2`);
-    assert.deepEqual(await display('ytd-rich-shelf-renderer[is-shorts]'), ['block', 'block']);
     await openEditor(b);
-    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
-    await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
-    await b.eval(`${BE}.getElementById('wish').value = 'убери шортсы и цифры у колокольчика'`);
+    await b.waitFor(`${BE}.getElementById('improve').title === 'Improve with Claude Code'`, 15000, `${BE}.getElementById('improve').title`);
+    // Nothing to type: one button, saying what it does, full strength.
+    assert.equal(await b.eval(`!!${BE}.querySelector('textarea#wish, #improveToggle')`), false);
+    assert.equal(await b.eval(`${BE}.getElementById('improve').textContent.trim()`), 'Declutter');
+    assert.match(await b.eval(`${BE}.getElementById('improveHint').textContent`), /Claude Code hides what distracts/);
+    assert.deepEqual(await b.eval(`(() => { const st = getComputedStyle(${BE}.getElementById('improve')); return { opacity: st.opacity, bg: st.backgroundColor, disabled: ${BE}.getElementById('improve').disabled }; })()`), { opacity: '1', bg: 'rgb(2, 119, 248)', disabled: false });
     const started = Date.now();
     await clickEditor(b, `${BE}.getElementById('improve')`);
-    // What it says while it works: in the editor and on the page's pill, concrete, in Russian.
-    const said = new Set();
-    let note = '';
-    for (let i = 0; i < 300 && !note; i++) {
-      const now = await b.eval(`({ label: ${BE}.getElementById('improve').textContent.trim(), status: ${BE}.getElementById('improveStatus')?.textContent.trim() || '', pill: app.$.boostMagic.state === 'running' ? app.$.boostMagic.shadowRoot.getElementById('pill')?.textContent.replace(/\\s+/g, ' ').trim() : '', note: ${BE}.getElementById('note')?.textContent.trim() || '' })`);
-      for (const t of [now.label, now.status, now.pill]) if (t) said.add(t);
-      note = now.note;
-      if (!note) await sleep(50);
-    }
+    // At once: pressed, still full strength, and the first step in words.
+    const atOnce = await b.eval(`(() => { const x = ${BE}.getElementById('improve'); return { busy: x.getAttribute('aria-busy'), disabled: x.disabled, opacity: getComputedStyle(x).opacity, label: x.textContent.trim(), step: ${BE}.querySelector('#improveStatus li')?.textContent.trim() }; })()`);
+    const firstLook = Date.now() - started;
+    assert.deepEqual(atOnce, { busy: 'true', disabled: false, opacity: '1', label: 'Looking at the page…', step: 'Looking at the page…' });
+    assert.ok(firstLook < 400, `the first words after ${firstLook} ms`);
+    await b.waitFor(`!!${BE}.getElementById('note')`, 10000);
     const took = Date.now() - started;
-    const lines = [...said].join(' | ');
-    assert.ok([...said].some((t) => /Спрашиваю Claude Code…/.test(t)), lines);
-    assert.ok([...said].some((t) => /прочитал \d+ элемент\S* страницы · «убери шортсы и цифры у колокольчика»/.test(t)), lines);
-    assert.ok(![...said].some((t) => /Designing|1\/3|Reviewing/.test(t)), `no rounds for a direction: ${lines}`);
-    // Done in the time of one answer (1.5 s here) and a little, as 1.5.2 was.
     assert.ok(took < 4500, `took ${took} ms`);
-    assert.match(await b.eval(`${BE}.getElementById('note').textContent.replace(/\\s+/g, ' ')`), /Скрыл: полку Shorts, счётчик уведомлений · Изменил: линию под шапкой/);
-    await b.waitFor(`app.$.boostMagic.state === 'done' && /Скрыл: полку Shorts, счётчик уведомлений/.test(app.$.boostMagic.shadowRoot.getElementById('pill').textContent)`, 3000);
-
-    // On the page: both Shorts shelves and the count gone; the videos, the bell and the search stay.
-    await page.waitFor(`[...document.querySelectorAll('ytd-rich-shelf-renderer[is-shorts]')].every((el) => getComputedStyle(el).display === 'none')`, 3000);
-    await page.waitFor(`getComputedStyle(document.querySelector('.yt-spec-icon-badge-shape__badge')).display === 'none'`, 3000);
-    assert.deepEqual(await display('ytd-rich-item-renderer'), Array(6).fill('block'));
-    assert.notEqual(await page.eval(`getComputedStyle(document.querySelector('[aria-label=Notifications]')).display`), 'none');
-    assert.notEqual(await page.eval(`getComputedStyle(document.getElementById('search')).display`), 'none');
-    // Its CSS checked as ever: the hairline kept, nothing from the internet, no animation.
-    assert.equal(await page.eval(`getComputedStyle(document.getElementById('masthead')).borderBottomColor`), 'rgb(9, 9, 9)');
-    assert.equal(await page.eval(`getComputedStyle(document.body).backgroundImage`), 'none');
-    assert.equal(await page.eval(`getComputedStyle(document.getElementById('logo')).animationName`), 'none');
-    const saved = (await b.eval(`${H}.getBoost()`)).state.boost;
-    assert.deepEqual(saved.zaps, ['ytd-rich-shelf-renderer[is-shorts]', '.yt-spec-icon-badge-shape__badge']);
-    assert.doesNotMatch(saved.css, /display: none|tracker\.example|animation/);
-
-    // One run, as 1.5.2's: the outline and the direction, the quick brief, no screenshot.
+    assert.match(await b.eval(`${BE}.getElementById('note').textContent.replace(/\\s+/g, ' ')`), /Hid: the Shorts shelf, the notification count/);
+    const steps = await b.eval(`[...${BE}.querySelectorAll('#improveStatus li')].map((l) => l.className + ' ' + l.textContent.trim())`);
+    assert.ok(steps.every((l) => l.startsWith('done ')), steps.join(' | '));
+    assert.ok(steps.some((l) => /Asking Claude Code… read \d+ elements of the page · “less distraction”/.test(l)), steps.join(' | '));
+    await page.waitFor(`[...document.querySelectorAll('ytd-rich-shelf-renderer[is-shorts]')].every((el) => getComputedStyle(el).display === 'none') && getComputedStyle(document.querySelector('.yt-spec-icon-badge-shape__badge')).display === 'none'`, 3000);
+    // One request, 1.5.2's shape: the outline and the default direction, no screenshot.
     const asked = runs();
-    assert.equal(asked.length, 1, 'one round');
-    assert.deepEqual(asked[0].images, [], 'no screenshot');
-    assert.match(asked[0].text, /What the person wants: убери шортсы и цифры у колокольчика/);
-    assert.match(asked[0].text, /<page_outline>/);
-    // The outline marks the Shorts shelves as YouTube does, and shows the count.
-    assert.match(asked[0].text, /ytd-rich-shelf-renderer\[is-shorts\] \d+x\d+/);
-    assert.match(asked[0].text, /div\.yt-spec-icon-badge-shape__badge \d+x\d+ "9\+"/);
-    assert.doesNotMatch(asked[0].text, /Review round/);
-    assert.match(JSON.stringify(asked[0].args), /Do exactly what they ask/);
+    assert.equal(asked.length, 1);
+    assert.deepEqual(asked[0].images, []);
+    assert.match(asked[0].text, /What the person wants: make the site less distracting/);
+    assert.doesNotMatch(asked[0].text, /Review round|Landmarks/);
 
-    // The list of what changed: each one shown on the page for a moment, and undone by itself.
-    const items = await b.eval(`[...${BE}.querySelectorAll('#changes .change')].map((c) => c.querySelector('.change-peek').textContent.trim())`);
-    assert.deepEqual(items, ['полку Shorts', 'счётчик уведомлений', 'линию под шапкой']);
-    await clickEditor(b, `${BE}.querySelectorAll('#changes .change-peek')[0]`);
-    await page.waitFor(`!!document.getElementById('meridian-boost-peek') && getComputedStyle(document.querySelector('ytd-rich-shelf-renderer[is-shorts]')).display !== 'none' && getComputedStyle(document.querySelector('ytd-rich-shelf-renderer[is-shorts]')).outlineStyle === 'solid'`, 3000);
+    // The Zap list: each one by its name; a click shows it on the page for a moment; ✕ brings it back.
+    const zaps = (await b.eval(`${H}.getBoost()`)).state.boost.zaps;
+    assert.deepEqual(zaps, ['ytd-rich-shelf-renderer[is-shorts] /* the Shorts shelf */', '.yt-spec-icon-badge-shape__badge /* the notification count */']);
+    assert.deepEqual(await b.eval(`[...${BE}.querySelectorAll('.zap-name')].map((z) => z.textContent.trim())`), ['the Shorts shelf', 'the notification count']);
+    await clickEditor(b, `${BE}.querySelectorAll('.zap-name')[0]`);
+    await page.waitFor(`!!document.getElementById('meridian-boost-peek') && getComputedStyle(document.querySelector('ytd-rich-shelf-renderer[is-shorts]')).display !== 'none'`, 3000);
     await page.waitFor(`!document.getElementById('meridian-boost-peek') && getComputedStyle(document.querySelector('ytd-rich-shelf-renderer[is-shorts]')).display === 'none'`, 5000);
-    // The count back, the Shorts still gone.
-    await clickEditor(b, `${BE}.querySelectorAll('#changes .change-undo')[1]`);
+    await clickEditor(b, `${BE}.querySelectorAll('.zap-x')[1]`);
     await page.waitFor(`getComputedStyle(document.querySelector('.yt-spec-icon-badge-shape__badge')).display === 'block'`, 5000);
-    assert.deepEqual(await display('ytd-rich-shelf-renderer[is-shorts]'), ['none', 'none']);
-    await sleep(300);
-    assert.deepEqual((await b.eval(`${H}.getBoost()`)).state.boost.zaps, ['ytd-rich-shelf-renderer[is-shorts]']);
-    assert.ok(await b.eval(`${BE}.querySelectorAll('#changes .change')[1].classList.contains('undone')`));
+    assert.equal(await page.eval(`getComputedStyle(document.querySelector('ytd-rich-shelf-renderer[is-shorts]')).display`), 'none');
+    await b.waitFor(`(${BE}.querySelectorAll('.zap-name').length === 1)`, 3000);
+    // Undo all: the boost as before.
+    await clickEditor(b, `${BE}.getElementById('undo')`);
+    await page.waitFor(`getComputedStyle(document.querySelector('ytd-rich-shelf-renderer[is-shorts]')).display === 'block'`, 5000);
     page.close();
   } finally {
     await b.close(); s.server.close();
@@ -700,74 +520,52 @@ test('Improve, a direction («убери шортсы и цифры у коло�
   }
 });
 
-test('Improve, no direction: a redesign in rounds; round 1 lands quickly, each round says what it changed, «Enough, keep this» stops with what is on the page', { skip: NEEDS_FRAMES }, async () => {
-  const s = await site();
-  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
-  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-accounts-')));
-  fs.mkdirSync(path.join(home, '.claude'));
-  fs.writeFileSync(path.join(home, '.claude', 'settings.json'), '');
-  const runs = fakeDesigner(bin, [
-    { name: 'Night Desk', summary: 'A dark, calm reading desk.', hide: [], css: 'main#story { background: rgb(10, 20, 30); color: rgb(240, 240, 240) }' },
-    { summary: 'Warmer.', hide: [], css: 'main#story { background: rgb(60, 30, 10) }' },
-    { done: true, css: '', summary: '' },
-  ]);
-  const b = await launch([s.url], { args: [`--meridian-agents-path=${bin}`, `--meridian-accounts-home=${home}`] });
-  try {
-    const page = await b.page(s.url);
-    await page.waitFor(`document.readyState === 'complete'`);
-    await openEditor(b);
-    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
-    await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
-    const started = Date.now();
-    await clickEditor(b, `${BE}.getElementById('improve')`);
-    await b.waitFor(`/Designing… 1\\/3/.test(${BE}.getElementById('improve').textContent)`, 5000);
-    // Round 1 on the page in the time of one answer.
-    await page.waitFor(`getComputedStyle(document.getElementById('story')).backgroundColor === 'rgb(10, 20, 30)'`, 6000);
-    const landed = Date.now() - started;
-    assert.ok(landed < 5000, `round 1 landed after ${landed} ms`);
-    // Round 2 says what round 1 did; it can be stopped from the editor and from the page's pill.
-    await b.waitFor(`/Reviewing… 2\\/3/.test(app.$.boostMagic.shadowRoot.getElementById('pill')?.textContent) && /round 1: A dark, calm reading desk/.test(app.$.boostMagic.shadowRoot.getElementById('pill').textContent) && !!app.$.boostMagic.shadowRoot.getElementById('magicKeep') && !!${BE}.getElementById('keepImprove')`, 5000, `app.$.boostMagic.shadowRoot.getElementById('pill')?.textContent`);
-    assert.equal(await b.eval(`app.$.boostMagic.shadowRoot.getElementById('magicKeep').textContent.trim()`), 'Enough, keep this');
-    await clickEditor(b, `${BE}.getElementById('keepImprove')`);
-    await b.waitFor(`/A dark, calm reading desk\\./.test(${BE}.getElementById('note')?.textContent || '')`, 3000);
-    assert.equal(await b.eval(`${BE}.getElementById('note').classList.contains('err')`), false);
-    // Round 1's look stays; round 2 never lands.
-    await sleep(2500);
-    assert.equal(await page.eval(`getComputedStyle(document.getElementById('story')).backgroundColor`), 'rgb(10, 20, 30)');
-    assert.ok(runs().length <= 2, `${runs().length} runs`);
-    assert.match((await b.eval(`${H}.getBoost()`)).state.boost.css, /rgb\(10, 20, 30\)/);
-    page.close();
-  } finally {
-    await b.close(); s.server.close();
-    fs.rmSync(bin, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true });
-  }
-});
+// A Dodo-Pizza-like menu: the app banner stuck to the bottom, a cookie popup, a promo slider over the
+// menu. One click: those three are named Zaps, the menu and the cart stay; the button in the narrow
+// panel shows its whole label, nothing clipped.
+const DODO = `<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Додо Пицца</title><style>
+body { margin: 0; font-family: Arial; }
+header { height: 64px; display: flex; align-items: center; gap: 16px; padding: 0 24px; }
+.promo-slider { height: 220px; margin: 0 24px; background: #ff6900; color: #fff; }
+main { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; padding: 24px; }
+.product { height: 200px; background: #f4f4f4; }
+.app-banner { position: fixed; left: 0; right: 0; bottom: 0; height: 80px; background: #222; color: #fff; }
+#cookie-popup { position: fixed; right: 16px; bottom: 96px; width: 320px; height: 120px; background: #fff; box-shadow: 0 2px 12px #0004; }
+</style></head><body>
+<header><span class="logo">Додо Пицца</span><button class="cart">Корзина</button></header>
+<div class="promo-slider">2 пиццы за 999 ₽</div>
+<main>${['Пепперони', 'Маргарита', 'Четыре сыра', 'Ветчина и грибы', 'Додо', 'Гавайская'].map((n) => `<div class="product"><h3>${n}</h3><button>Выбрать</button></div>`).join('')}</main>
+<div class="app-banner">Скачайте приложение Додо Пицца</div>
+<div id="cookie-popup">Мы используем cookies <button>Хорошо</button></div>
+</body></html>`;
 
-test('Improve with reduced motion: the glow stands still, the round in words; it goes on an error', async () => {
-  const s = await site();
+test('Improve on a Dodo-like menu, one click in the narrow panel: the app banner, the cookie popup and the promo slider become named Zaps; the menu stays; the button is whole', async () => {
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(DODO); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}/`;
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-accounts-')));
   fs.mkdirSync(path.join(home, '.claude'));
   fs.writeFileSync(path.join(home, '.claude', 'settings.json'), '');
-  // Not a boost: an error, and the magic goes at once.
-  fakeDesigner(bin, [{ nothing: 'here' }]);
-  const b = await launch([s.url], { args: [`--meridian-agents-path=${bin}`, `--meridian-accounts-home=${home}`] });
+  fakeClaudeCode(bin, { name: 'Calm Dodo', css: '', summary: 'Hid the banners.',
+    hide: [{ selector: '.app-banner', label: 'the app banner' }, { selector: '#cookie-popup', label: 'the cookie popup' },
+      { selector: '.promo-slider', label: 'the promo slider' }] });
+  const b = await launch([url], { args: [`--meridian-agents-path=${bin}`, `--meridian-accounts-home=${home}`] });
   try {
-    const page = await b.page(s.url);
-    await page.waitFor(`document.readyState === 'complete'`);
-    await b.cdp.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
+    const page = await b.page(url);
+    await page.waitFor(`document.querySelectorAll('.product').length === 6`);
     await openEditor(b);
-    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
-    await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
+    await b.waitFor(`${BE}.getElementById('improve').title === 'Improve with Claude Code'`, 15000, `${BE}.getElementById('improve').title`);
+    const whole = await b.eval(`(() => { const x = ${BE}.getElementById('improve'), c = ${BE}.getElementById('card').getBoundingClientRect(), r = x.getBoundingClientRect(); return { fits: x.scrollHeight <= x.clientHeight + 1 && x.scrollWidth <= x.clientWidth + 1, inside: r.left >= c.left - 0.5 && r.right <= c.right + 0.5, opacity: getComputedStyle(x).opacity }; })()`);
+    assert.deepEqual(whole, { fits: true, inside: true, opacity: '1' });
     await clickEditor(b, `${BE}.getElementById('improve')`);
-    await b.waitFor(`app.$.boostMagic.state === 'running' && /Designing… 1\\/3/.test(app.$.boostMagic.shadowRoot.getElementById('pill').textContent)`, 8000);
-    const still = await b.eval(`(() => { const r = app.$.boostMagic.shadowRoot; const a = (sel) => getComputedStyle(r.querySelector(sel)).animationName; return { ring: a('.ring.edge i'), glow: a('.ring.glow'), shimmer: getComputedStyle(r.querySelector('.shimmer')).display, button: getComputedStyle(${BE}.getElementById('improve'), '::before').animationName, shown: getComputedStyle(app.$.boostMagic).opacity }; })()`);
-    assert.deepEqual(still, { ring: 'none', glow: 'none', shimmer: 'none', button: 'none', shown: '1' });
-    await b.waitFor(`${BE}.getElementById('note')?.classList.contains('err')`, 15000);
-    await b.waitFor(`app.$.boostMagic.state === 'off'`, 2000);
+    await b.waitFor(`/Hid: the app banner, the cookie popup, the promo slider/.test(${BE}.getElementById('note')?.textContent || '')`, 10000, `${BE}.getElementById('note')?.textContent`);
+    await page.waitFor(`['.app-banner', '#cookie-popup', '.promo-slider'].every((s) => getComputedStyle(document.querySelector(s)).display === 'none')`, 3000);
+    assert.deepEqual(await page.eval(`[...document.querySelectorAll('.product, .cart')].map((e) => getComputedStyle(e).display !== 'none')`), Array(7).fill(true));
+    assert.deepEqual(await b.eval(`[...${BE}.querySelectorAll('.zap-name')].map((z) => z.textContent.trim())`), ['the app banner', 'the cookie popup', 'the promo slider']);
     page.close();
   } finally {
-    await b.close(); s.server.close();
+    await b.close(); server.close();
     fs.rmSync(bin, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true });
   }
 });
@@ -789,12 +587,11 @@ test('Improve with Claude Code when nothing is picked in Settings › AI: in the
 
     // (a) The default space: Claude Code, found on this computer, improves the boost.
     await openEditor(b);
-    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
-    await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
+    await b.waitFor(`${BE}.getElementById('improve').title === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
     await clickEditor(b, `${BE}.getElementById('improve')`);
     await b.waitFor(`${BE}.getElementById('note')?.textContent.includes('Hid the banner.')`, 20000, `${BE}.getElementById('note')?.textContent`);
     await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
-    assert.deepEqual(runs(), ['<unset>', '<unset>'], 'a redesign and a review, as Claude Code’s own account');
+    assert.deepEqual(runs(), ['<unset>'], 'one quick round, as Claude Code’s own account');
     await b.eval('app.$.boostEditor.open = false');
     page.close();
 
@@ -819,12 +616,11 @@ test('Improve with Claude Code when nothing is picked in Settings › AI: in the
       if (process.platform !== 'win32' || await b.eval('app.$.siteControl.open')) throw e;
       await openEditor(b, '.boost-edit');
     });
-    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
-    await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
+    await b.waitFor(`${BE}.getElementById('improve').title === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
     await clickEditor(b, `${BE}.getElementById('improve')`);
     await b.waitFor(`${BE}.getElementById('note')?.textContent.includes('Hid the banner.')`, 20000, `${BE}.getElementById('note')?.textContent`);
     await page2.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
-    assert.deepEqual(runs(), ['<unset>', '<unset>', path.join(home, '.claude-work'), path.join(home, '.claude-work')], 'the space’s Work account');
+    assert.deepEqual(runs(), ['<unset>', path.join(home, '.claude-work')], 'the space’s Work account');
     page2.close();
   } finally {
     await b.close(); s.server.close();
@@ -848,11 +644,10 @@ test('Improve with AI in a space that never chose runs as the main subscription 
     const work = accounts.vendors.find((v) => v.id === 'claude').accounts.find((a) => a.label === 'Claude Work').id;
     await b.eval(`${H}.setMainAiAccount('claude', ${JSON.stringify(work)})`);
     await openEditor(b);
-    await clickEditor(b, `${BE}.getElementById('improveToggle')`);
-    await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
+    await b.waitFor(`${BE}.getElementById('improve').title === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve').textContent`);
     await clickEditor(b, `${BE}.getElementById('improve')`);
     await b.waitFor(`${BE}.getElementById('note')?.textContent.includes('Hid the banner.')`, 20000, `${BE}.getElementById('note')?.textContent`);
-    assert.deepEqual(runs(), [path.join(home, '.claude-work'), path.join(home, '.claude-work')], 'as the main subscription');
+    assert.deepEqual(runs(), [path.join(home, '.claude-work')], 'as the main subscription');
     page.close();
   } finally {
     await b.close(); s.server.close();
