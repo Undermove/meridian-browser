@@ -33,6 +33,7 @@
       },
       allow: 'Разрешить', once: 'Только в этот раз', no: 'Нет', allowed: 'Разрешено', denied: 'Не разрешено',
       answerInWorkbench: 'Ответить можно в Workbench', openWorkbench: 'Открыть Workbench',
+      qAsks: 'Claude спрашивает', qOwn: 'Своими словами — в Workbench', qSend: 'Ответить', qAnswered: 'Ответ',
       filesTitle: 'Файлы по ходу работы', created: 'новый', changed: 'изменён', shot: 'скриншот', shots: 'Снимки', shotBefore: 'Было', shotAfter: 'Стало', wipeHint: 'было ← шторка → стало',
       siteBar: 'Результат', showSite: 'Показать живой сайт рядом', lastShot: 'последний снимок', boostUndo: 'Boost · можно отменить', boostUndone: 'Вернули как было',
       before: 'До', after: 'После', undo: 'Отменить', undoTitle: 'Вернуть сайт как был до задачи',
@@ -105,6 +106,7 @@
       },
       allow: 'Allow', once: 'Just this once', no: 'No', allowed: 'Allowed', denied: 'Not allowed',
       answerInWorkbench: 'This one is answered in the Workbench', openWorkbench: 'Open Workbench',
+      qAsks: 'Claude asks', qOwn: 'In my own words — Workbench', qSend: 'Answer', qAnswered: 'Answer',
       filesTitle: 'Files from this task', created: 'new', changed: 'changed', shot: 'screenshot', shots: 'Snapshots', shotBefore: 'Before', shotAfter: 'After', wipeHint: 'before ← drag → after',
       siteBar: 'Result', showSite: 'Show the live site alongside', lastShot: 'latest snapshot', boostUndo: 'Boost · can be undone', boostUndone: 'Back as it was',
       before: 'Before', after: 'After', undo: 'Undo', undoTitle: 'Put the site back as it was before the task',
@@ -212,7 +214,10 @@
         return d ? say('wand', d, d) : say('wand', 'Выполнил команду', 'Ran a command', 'Выполняю команду', 'Running a command');
       }
       case 'ExitPlanMode': return say('layers', 'Предложил план', 'Proposed a plan');
-      case 'AskUserQuestion': return say('chat', 'Задал вопрос', 'Asked a question');
+      case 'AskUserQuestion': {
+        const q = clip(questionsOf(i)[0]?.question, 70);
+        return q ? say('chat', `Спросил: ${q}`, `Asked: ${q}`, `Спрашивает: ${q}`, `Asking: ${q}`) : say('chat', 'Задал вопрос', 'Asked a question', 'Задаёт вопрос', 'Asking a question');
+      }
       default: return say('sparkles', 'Работал над задачей', 'Worked on the task', 'Работаю над задачей', 'Working on the task');
     }
   }
@@ -239,33 +244,63 @@
     return `${tool}${what ? ` · ${clip(what, 160)}` : ''}`;
   }
 
-  // A permission question in plain words: [title, detail].
+  // The questions of an AskUserQuestion, from its input (an object or its JSON,
+  // which may come cut): [{question, header, multiSelect, options: [{label, description}]}].
+  function questionsOf(input) {
+    let i = input;
+    if (typeof i === 'string') { try { i = JSON.parse(i); } catch { i = null; } }
+    const qs = Array.isArray(i?.questions) ? i.questions : [];
+    return qs.filter((q) => q && typeof q.question === 'string').map((q) => ({
+      question: q.question, header: typeof q.header === 'string' ? q.header : '', multiSelect: !!q.multiSelect,
+      options: (Array.isArray(q.options) ? q.options : []).filter((o) => o && typeof o.label === 'string')
+        .map((o) => ({ label: o.label, description: typeof o.description === 'string' ? o.description : '' })),
+    }));
+  }
+
+  // A permission question in plain words, saying what exactly: [title, detail].
+  // «Разрешить: создать файл compare.html?»
   function askWords(tool, summary, lang) {
     const ru = lang === 'ru';
     const s = String(summary || '');
     const parts = s.split('/').filter(Boolean);
     const folder = parts.length > 1 ? parts[parts.length - 2] : '';
-    const file = parts[parts.length - 1] || '';
+    const file = clip(parts[parts.length - 1] || '', 60);
     const mcp = /^mcp__([^_]+(?:_[^_]+)*)__(.+)$/.exec(tool || '');
-    if (/^(Edit|MultiEdit|Write|NotebookEdit)$/.test(tool)) {
-      return ru
-        ? [folder ? `Разрешить менять файлы в папке ${folder}?` : `Разрешить поменять ${file}?`, `${tool === 'Write' ? 'Создам' : 'Поменяю'} ${file}. Оригиналы не трогаю — всё можно вернуть.`]
-        : [folder ? `Allow changing files in ${folder}?` : `Allow changing ${file}?`, `${tool === 'Write' ? 'I’ll create' : 'I’ll change'} ${file}. Originals stay as they are — everything can be undone.`];
+    const ask = (r, e) => (ru ? `Разрешить: ${r}?` : `Allow: ${e}?`);
+    const where = folder ? (ru ? ` Папка ${folder}.` : ` Folder ${folder}.`) : '';
+    if (tool === 'Write') {
+      return [file ? ask(`создать файл ${file}`, `create the file ${file}`) : ask('создать файл', 'create a file'),
+        (ru ? 'Новый файл, остальное не трогаю.' : 'A new file; nothing else is touched.') + where];
     }
+    if (/^(Edit|MultiEdit|NotebookEdit)$/.test(tool)) {
+      return [file ? ask(`изменить ${file}`, `change ${file}`) : ask('изменить файл', 'change a file'),
+        (ru ? 'Всё можно вернуть.' : 'Everything can be undone.') + where];
+    }
+    if (tool === 'Read') return [file ? ask(`посмотреть ${file}`, `look at ${file}`) : ask('посмотреть файл', 'look at a file'), where.trim()];
     if (mcp && mcp[1].toLowerCase().includes('meridian')) {
       const n = mcp[2];
-      if (n === 'set_boost') return ru ? ['Разрешить перекрасить сайт?', 'Это Boost: меняется только вид у вас в браузере, его можно отменить одной кнопкой.'] : ['Allow restyling the site?', 'It’s a Boost: only how it looks in your browser changes, and one button undoes it.'];
-      if (n === 'navigate' || n === 'open_tab') return ru ? ['Разрешить открыть сайт?', s] : ['Allow opening a site?', s];
-      if (n === 'click' || n === 'type_text') return ru ? ['Разрешить действовать на странице?', 'Claude нажмёт или введёт текст на открытой странице.'] : ['Allow acting on the page?', 'Claude will click or type on the open page.'];
-      return ru ? ['Разрешить действие в браузере?', ''] : ['Allow a step in the browser?', ''];
+      if (n === 'set_boost') return [ask('перекрасить сайт', 'restyle the site'), ru ? 'Это Boost: меняется только вид у вас в браузере, его можно отменить одной кнопкой.' : 'It’s a Boost: only how it looks in your browser changes, and one button undoes it.'];
+      if (n === 'navigate' || n === 'open_tab') return [ask(`открыть ${host(s) || 'сайт'}`, `open ${host(s) || 'a site'}`), s];
+      if (n === 'click') return [ask('нажать на странице', 'click on the page'), ''];
+      if (n === 'type_text') return [ask('ввести текст на странице', 'type on the page'), ''];
+      return [ask('действие в браузере', 'a step in the browser'), ''];
     }
-    if (mcp && mcp[1].toLowerCase().includes('figma')) return ru ? ['Разрешить посмотреть макет в Figma?', 'Только чтение: в Figma ничего не меняется.'] : ['Allow reading the Figma file?', 'Read only: nothing changes in Figma.'];
-    if (tool === 'Bash' || tool === 'PowerShell') return ru ? ['Разрешить действие на компьютере?', 'Claude хочет выполнить команду — подробности в «Подробнее».'] : ['Allow a step on the computer?', 'Claude wants to run a command — see Details.'];
-    if (tool === 'WebFetch') return ru ? ['Разрешить открыть страницу?', s] : ['Allow opening a page?', s];
-    if (tool === 'Read') return ru ? [`Разрешить посмотреть ${file}?`, ''] : [`Allow looking at ${file}?`, ''];
-    return ru ? ['Разрешить следующий шаг?', ''] : ['Allow the next step?', ''];
+    if (mcp && mcp[1].toLowerCase().includes('figma')) return [ask('посмотреть макет в Figma', 'read the Figma file'), ru ? 'Только чтение: в Figma ничего не меняется.' : 'Read only: nothing changes in Figma.'];
+    if (tool === 'Bash' || tool === 'PowerShell') {
+      const c = clip(s.split('\n')[0], 48);
+      return [c ? ask(`выполнить команду «${c}»`, `run the command “${c}”`) : ask('выполнить команду', 'run a command'), ru ? 'Команда целиком — в «Подробнее».' : 'The whole command is under Details.'];
+    }
+    if (tool === 'WebFetch') return [ask(`открыть ${host(s) || 'страницу'}`, `open ${host(s) || 'a page'}`), s];
+    if (tool === 'WebSearch') return [ask(`поискать «${clip(s, 40)}»`, `search for “${clip(s, 40)}”`), ''];
+    if (tool === 'ExitPlanMode') return [ru ? 'Claude предлагает план. Начинать?' : 'Claude has a plan. Start?', ''];
+    if (mcp) {
+      const svc = mcp[1].replace(/^claude_ai_/, '').replace(/[_-]+/g, ' ').trim();
+      const nice = svc ? svc.charAt(0).toUpperCase() + svc.slice(1) : '';
+      return [nice ? ask(`обратиться к ${nice}`, `use ${nice}`) : ask('обратиться к подключённому сервису', 'use a connected service'), s ? clip(s, 160) : ''];
+    }
+    if (tool === 'Task' || tool === 'Agent') return [ask('позвать помощника', 'ask a helper'), s ? clip(s, 160) : ''];
+    return [ask('следующий шаг', 'the next step'), s ? clip(s, 160) : ''];
   }
-
   // Hand changes (CSS properties) in words.
   function handWords(props, lang) {
     const ru = lang === 'ru';
@@ -281,7 +316,7 @@
     return out;
   }
 
-  const api = { T, stepWords, askWords, host, handWords, stepDetail };
+  const api = { T, stepWords, askWords, questionsOf, host, handWords, stepDetail };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.StudioWords = api;
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -102,7 +102,10 @@ test('steps and questions in plain words, without tool names or jargon', () => {
       assert.doesNotMatch(title, jargon);
     }
   }
-  assert.equal(W.askWords('Edit', '/Users/d/Brand/colors.css', 'ru')[0], 'Разрешить менять файлы в папке Brand?');
+  assert.equal(W.askWords('Edit', '/Users/d/Brand/colors.css', 'ru')[0], 'Разрешить: изменить colors.css?');
+  assert.equal(W.askWords('Write', '/Users/d/Brand/compare.html', 'ru')[0], 'Разрешить: создать файл compare.html?');
+  assert.equal(W.askWords('Write', '/Users/d/Brand/compare.html', 'en')[0], 'Allow: create the file compare.html?');
+  assert.match(W.askWords('Bash', 'npm test', 'ru')[0], /^Разрешить: выполнить команду «npm test»\?$/);
   assert.equal(W.stepWords('Bash', { description: 'Run the checks' }, 'en')[1], 'Run the checks');
   assert.equal(W.stepWords('mcp__meridian__navigate', { url: 'https://www.zerno.coffee/x' }, 'ru')[1], 'Открыл сайт zerno.coffee');
 });
@@ -192,4 +195,22 @@ test('times read as people say them', () => {
   assert.equal(W.T.ru.ago(60 * 24 * 7), '7 дней назад');
   assert.equal(W.T.ru.ago(60 * 24 * 22), '22 дня назад');
   assert.equal(W.T.en.ago(60 * 24 * 7), '7 days ago');
+});
+
+test('a question Claude asks: its text in the step, its options for the card, even from cut JSON', () => {
+  const input = { questions: [{ question: 'Какие две картинки сравнить?', header: 'Картинки', multiSelect: false,
+    options: [{ label: 'Старый и новый логотип', description: 'Рядом, в одном размере' }, { label: 'Две версии баннера' }] }] };
+  assert.equal(W.stepWords('AskUserQuestion', input, 'ru')[1], 'Спросил: Какие две картинки сравнить?');
+  assert.equal(W.stepWords('AskUserQuestion', input, 'en')[1], 'Asked: Какие две картинки сравнить?');
+  assert.equal(W.stepWords('AskUserQuestion', {}, 'en')[1], 'Asked a question');
+  const qs = W.questionsOf(JSON.stringify(input));
+  assert.equal(qs.length, 1);
+  assert.deepEqual(qs[0].options.map((o) => o.label), ['Старый и новый логотип', 'Две версии баннера']);
+  assert.equal(qs[0].options[1].description, '');
+  assert.deepEqual(W.questionsOf(JSON.stringify(input).slice(0, 40)), []);
+  assert.deepEqual(W.questionsOf({ questions: [{ nope: 1 }] }), []);
+  for (const lang of ['ru', 'en']) {
+    const t = W.T[lang];
+    for (const k of ['qAsks', 'qOwn', 'qSend', 'qAnswered']) assert.ok(t[k], `${lang}.${k}`);
+  }
 });
