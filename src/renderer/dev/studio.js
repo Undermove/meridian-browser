@@ -435,7 +435,7 @@ function stRenderFeed(t) {
     }
     const last = ti === m.turns.length - 1;
     const answeredHere = k.answered.filter((x) => x.turn === ti);
-    const answeredHtml = (a) => `<div class="st-answered ${a.choice === 'deny' ? 'no' : 'yes'}" data-key="a${esc(a.id)}">${icon(a.choice === 'deny' ? 'x' : 'check', 13)}<span>${esc(a.choice === 'deny' ? w.denied : w.allowed)}: ${esc(a.title)}</span></div>`;
+    const answeredHtml = (a) => `<div class="st-answered ${a.choice === 'deny' ? 'no' : 'yes'}" data-key="a${esc(a.id)}">${icon(a.choice === 'deny' ? 'x' : 'check', 13)}<span>${esc(a.choice === 'deny' ? w.denied : a.choice === 'answer' ? w.qAnswered : w.allowed)}: ${esc(a.title)}</span></div>`;
     turn.items.forEach((it, ii) => {
       // An answer goes right after what was there when it was given.
       for (const a of answeredHere.filter((x) => x.after === ii)) parts.push(answeredHtml(a));
@@ -460,7 +460,7 @@ function stRenderFeed(t) {
       <div class="st-ask-d">${esc(w.trustDetail(S.project?.name || ''))}</div>
       <div class="st-ask-btns"><button class="st-btn pri" data-trust="yes">${esc(w.allow)}</button><button class="st-btn" data-trust="no">${esc(w.no)}</button></div></div>`);
   }
-  for (const ask of mission.asks || []) parts.push(stAskHtml(ask));
+  for (const ask of mission.asks || []) parts.push(ask.tool === 'AskUserQuestion' ? stQuestionHtml(ask, k) : stAskHtml(ask));
   if (status === 'work' && !(mission.asks || []).length && !stHasRunningStep(m)) {
     parts.push(`<div class="st-thinking" data-key="thinking"><span class="st-shimmer">${esc(progress?.now || w.working)}</span></div>`);
   }
@@ -494,6 +494,21 @@ function stRenderFeed(t) {
     const lastUser = [...feed.querySelectorAll('.st-msg-user')].pop();
     feed.scrollTop = lastUser ? Math.max(0, lastUser.offsetTop - feed.offsetTop - 12) : feed.scrollHeight;
   } else if (atBottom) feed.scrollTop = feed.scrollHeight;
+  // A question waiting for the person: whole, above the composer, never under it.
+  const ask = [...feed.querySelectorAll('.st-ask')].find((a) => !a.classList.contains('st-allowed') && !a.classList.contains('st-denied'));
+  if (ask && (firstPaint || !old.has(ask.dataset.key) || ask.dataset.seen !== '1')) {
+    ask.dataset.seen = '1';
+    stKeepVisible(feed, ask);
+  }
+}
+
+// Scrolls the feed so `el` shows whole (its top first, when it is taller than the feed).
+function stKeepVisible(feed, el) {
+  const f = feed.getBoundingClientRect();
+  const r = el.getBoundingClientRect();
+  const pad = 12;
+  if (r.height + pad * 2 > f.height || r.top < f.top + pad) feed.scrollTop += r.top - f.top - pad;
+  else if (r.bottom > f.bottom - pad) feed.scrollTop += r.bottom - f.bottom + pad;
 }
 
 // Same element, new content: steps keep their rows so a spinner turns into a check in place.
@@ -582,6 +597,92 @@ function stAskHtml(ask) {
     ${detail ? `<div class="st-ask-d">${esc(detail)}</div>` : ''}
     ${showDetail ? `<details class="st-ask-more"><summary>${esc(w.details)}</summary><pre>${esc(String(ask.summary).slice(0, 1200))}</pre></details>` : ''}
     <div class="st-ask-btns">${buttons}</div></div>`;
+}
+
+// The questions Claude asks (AskUserQuestion): from the question itself, or,
+// when that came cut, from the step in the transcript.
+function stQuestions(ask, k) {
+  const own = StudioWords.questionsOf(ask.summary);
+  if (own.length) return own;
+  const steps = (k?.model.turns || []).flatMap((t) => t.items).filter((x) => x.type === 'steps').flatMap((x) => x.steps);
+  const step = steps.filter((x) => x.tool === 'AskUserQuestion').pop();
+  return step ? StudioWords.questionsOf(step.input) : [];
+}
+
+function stAskTitle(ask, k) {
+  if (ask.tool === 'AskUserQuestion') return stQuestions(ask, k)[0]?.question || STW().qAsks;
+  return StudioWords.askWords(ask.tool, ask.summary, ST.lang)[0];
+}
+
+// A question card: the question in Claude's words, its options as buttons.
+// One question with one answer goes on the first click; otherwise «Ответить».
+function stQuestionHtml(ask, k) {
+  const w = STW();
+  const qs = stQuestions(ask, k);
+  const picked = ST.qpick?.get(ask.id) || {};
+  const own = `<button class="st-btn ghost" data-go="workbench">${esc(w.qOwn)}</button>`;
+  if (!qs.length) {
+    return `<div class="st-ask st-question" data-key="ask${esc(ask.id)}" data-title="${esc(w.qAsks)}">
+      <div class="st-ask-q">${stDot('needs')}<span>${esc(w.qAsks)}</span></div>
+      <div class="st-ask-btns"><span class="st-ask-note">${esc(w.answerInWorkbench)}</span><button class="st-btn" data-go="workbench">${esc(w.openWorkbench)}</button></div></div>`;
+  }
+  const one = qs.length === 1 && !qs[0].multiSelect;
+  const ready = qs.every((q, qi) => (picked[qi] || []).length);
+  const body = qs.map((q, qi) => `<div class="st-qblock">
+      ${q.header ? `<div class="st-q-h">${esc(q.header)}</div>` : ''}
+      <div class="st-ask-q">${qi === 0 ? stDot('needs') : '<span class="st-dot"></span>'}<span>${esc(q.question)}</span></div>
+      <div class="st-q-opts" role="${q.multiSelect ? 'group' : 'radiogroup'}">${q.options.map((o, oi) => {
+        const on = (picked[qi] || []).includes(oi);
+        return `<button class="st-opt${on ? ' on' : ''}" data-qopt="${oi}" data-q="${qi}" data-ask="${esc(ask.id)}" ${q.multiSelect ? `aria-pressed="${on}"` : `role="radio" aria-checked="${on}"`}><b>${esc(o.label)}</b>${o.description ? `<span>${esc(o.description)}</span>` : ''}</button>`;
+      }).join('')}</div></div>`).join('');
+  const foot = one ? own : `<button class="st-btn pri" data-qsend="${esc(ask.id)}"${ready ? '' : ' disabled'}>${esc(w.qSend)}</button>${own}`;
+  return `<div class="st-ask st-question" data-key="ask${esc(ask.id)}" data-title="${esc(qs[0].question)}">${body}
+    <div class="st-ask-btns">${foot}</div></div>`;
+}
+
+// Picks an option; sends when the question needs nothing more.
+async function stQuestionPick(btn) {
+  const t = stCurrent();
+  const k = t && stTask(t);
+  const ask = t && ST.mission[t.id]?.asks?.find((x) => x.id === btn.dataset.ask);
+  if (!ask) return;
+  const qs = stQuestions(ask, k);
+  const qi = Number(btn.dataset.q), oi = Number(btn.dataset.qopt);
+  const q = qs[qi];
+  if (!q) return;
+  ST.qpick = ST.qpick || new Map();
+  const picked = { ...(ST.qpick.get(ask.id) || {}) };
+  const cur = picked[qi] || [];
+  picked[qi] = q.multiSelect ? (cur.includes(oi) ? cur.filter((x) => x !== oi) : [...cur, oi]) : [oi];
+  ST.qpick.set(ask.id, picked);
+  if (qs.length === 1 && !q.multiSelect) return stQuestionSend(t, ask, qs, btn.closest('.st-ask'));
+  stRender();
+}
+
+async function stQuestionSend(t, ask, qs, card) {
+  const w = STW();
+  const picked = ST.qpick?.get(ask.id) || {};
+  const answers = {};
+  qs.forEach((q, qi) => { answers[q.question] = (picked[qi] || []).map((oi) => q.options[oi]?.label).filter(Boolean).join(', '); });
+  if (!Object.values(answers).every(Boolean) || !card || card.classList.contains('answering')) return;
+  card.classList.add('answering');
+  for (const b of card.querySelectorAll('button')) b.disabled = true;
+  try {
+    if (!(await wb.studioAnswer(ask.id, `answers:${JSON.stringify(answers)}`))) throw new Error('gone');
+    const k = stTask(t);
+    const ti = Math.max(0, k.model.turns.length - 1);
+    k.answered.push({ id: ask.id, choice: 'answer', title: Object.values(answers).join('; '), turn: ti, after: k.model.turns[ti]?.items.length || 0 });
+    ST.qpick.delete(ask.id);
+    card.classList.add('st-allowed');
+    const m = ST.mission[t.id];
+    if (m?.asks) m.asks = m.asks.filter((x) => x.id !== ask.id);
+    setTimeout(() => stRender(), stReduced() ? 0 : 240);
+  } catch {
+    card.classList.remove('answering');
+    for (const b of card.querySelectorAll('button')) b.disabled = false;
+    toast(w.answerInWorkbench);
+    stRender();
+  }
 }
 
 // Only files the task created or changed, and its pictures; newest first.
@@ -932,6 +1033,15 @@ async function stOnFeedClick(e) {
     stRender();
     return;
   }
+  const opt = e.target.closest('[data-qopt]');
+  if (opt) return stQuestionPick(opt);
+  const qsend = e.target.closest('[data-qsend]');
+  if (qsend) {
+    const t = stCurrent();
+    const ask = t && ST.mission[t.id]?.asks?.find((x) => x.id === qsend.dataset.qsend);
+    if (ask) await stQuestionSend(t, ask, stQuestions(ask, stTask(t)), qsend.closest('.st-ask'));
+    return;
+  }
   const btn = e.target.closest('[data-answer]');
   if (!btn) return;
   const card = btn.closest('.st-ask');
@@ -944,7 +1054,7 @@ async function stOnFeedClick(e) {
     const ok = await wb.studioAnswer(btn.dataset.ask, choice);
     if (!ok) throw new Error('gone');
     const k = stTask(t);
-    const what = (card.dataset.title || '').replace(/^(Разрешить|Allow)\s+/, '').replace(/\?$/, '');
+    const what = (card.dataset.title || '').replace(/^(Разрешить|Allow):?\s+/, '').replace(/\?$/, '');
     const ti = Math.max(0, k.model.turns.length - 1);
     k.answered.push({ id: btn.dataset.ask, choice, title: what, turn: ti, after: k.model.turns[ti]?.items.length || 0 });
     // Collapses into one calm line (the check draws itself); the snapshot then drops the question.
@@ -1327,7 +1437,7 @@ function stCardPicture(k) {
 function stCardLine(t, k, status) {
   const w = STW();
   const ask = ST.mission[t.id]?.asks?.[0];
-  if (status === 'needs' && ask) return `<b>${esc(w.waiting)}:</b> ${esc(StudioWords.askWords(ask.tool, ask.summary, ST.lang)[0])}`;
+  if (status === 'needs' && ask) return `<b>${esc(w.waiting)}:</b> ${esc(stAskTitle(ask, k))}`;
   if (status === 'work') {
     const p = StudioTranscript.planProgress(k.model.plan);
     const turn = k.model.turns[k.model.turns.length - 1];
@@ -1421,7 +1531,7 @@ async function stOnBoardClick(e) {
         const k = stTask(t);
         const ti = Math.max(0, k.model.turns.length - 1);
         const ask = ST.mission[t.id]?.asks?.find((x) => x.id === ans.dataset.ask);
-        const what = ask ? StudioWords.askWords(ask.tool, ask.summary, ST.lang)[0].replace(/^(Разрешить|Allow)\s+/, '').replace(/\?$/, '') : '';
+        const what = ask ? StudioWords.askWords(ask.tool, ask.summary, ST.lang)[0].replace(/^(Разрешить|Allow):?\s+/, '').replace(/\?$/, '') : '';
         k.answered.push({ id: ans.dataset.ask, choice: ans.dataset.answer, title: what, turn: ti, after: k.model.turns[ti]?.items.length || 0 });
         if (ST.mission[t.id]?.asks) ST.mission[t.id].asks = ST.mission[t.id].asks.filter((x) => x.id !== ans.dataset.ask);
         card.classList.add('st-answered-card');
