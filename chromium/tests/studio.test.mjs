@@ -862,3 +862,32 @@ test('Starters: each asks what it needs right there, runs, and its result shows 
     cleanup(s.project, s.bin, s.profile);
   }
 });
+
+// The first-run tour's magic: Studio opens the site beside itself, then asks for Remix with the
+// person's mood; Remix opens on that site (its tab in front) with the wish filled in. (No AI here:
+// only that it opens with the wish; Remix's own tests cover the rest.)
+test('Tour → Remix: «studio-remix» opens Remix on the site Studio opened, the wish filled in', async () => {
+  const http = await import('node:http');
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<!doctype html><title>Coffee</title><h1>Coffee</h1>'); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const site = `http://127.0.0.1:${server.address().port}/`;
+  const s = await setup();
+  const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio', '--lang=ru-RU'] });
+  let wb, page;
+  try {
+    wb = await openWorkbench(b, s.project);
+    await wb.eval(`(() => { window.workbench.toHost({ type: 'studio-site', url: ${JSON.stringify(site)} }); return true; })()`);
+    page = await b.page(site, 15000);
+    await page.waitFor(`document.readyState === 'complete'`);
+    await wb.eval(`(() => { window.workbench.toHost({ type: 'studio-remix', wish: 'Сделай сайт спокойнее' }); return true; })()`);
+    await b.waitFor(`app.$.remixPanel.open === true`, 10000);
+    assert.equal(await b.eval(`app.$.remixPanel.shadowRoot.querySelector('#wish')?.value`), 'Сделай сайт спокойнее');
+    assert.equal(await b.eval(`[...app.$.tabstrip.tabs_.values()].find((t) => t.isActive)?.url`), site, 'the site in front');
+  } finally {
+    page?.close();
+    wb?.close();
+    await b.close();
+    server.close();
+    cleanup(s.project, s.bin, s.profile);
+  }
+});
