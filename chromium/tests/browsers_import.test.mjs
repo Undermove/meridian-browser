@@ -369,3 +369,24 @@ test('the first run lists every browser found; Import from Another Browser too; 
       ['Import from Arc…', 'Import from Chrome…', 'Import from Brave…', 'Import from Firefox…']);
   } finally { await b.close(); s.server.close(); for (const d of [chrome, brave, fx, empty]) fs.rmSync(d, { recursive: true, force: true }); }
 });
+
+// Meridian › Import from Another Browser… is a browser command (39729). In 1.5.2 and 1.5.3 it was
+// outside Meridian's command range, so the menu item was greyed out and did nothing; the command bar
+// above reached the same screen another way. Through the command itself (chrome::ExecuteCommand, as
+// the menu does), next to Import from Arc (39721) for comparison.
+test('Import from Another Browser… through its browser command opens the moving-in step', async () => {
+  const chrome = fakeChromium('chrome', [{ name: 'Personal', bar: [] }]);
+  const empty = tmp('noarc');
+  const b = await launch(['about:blank'], { args: ['--meridian-test-keys', `--meridian-arc-dir=${empty}`, `--meridian-chrome-dir=${chrome}`, '--lang=en-US'] });
+  try {
+    await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length >= 1`, 15000);
+    for (const [id, steps] of [[39721, 'arc,done'], [39729, 'arc,done']]) {
+      await b.eval(`app.$.onboarding.open = false`);
+      await b.eval(`app.$.tabstrip.handler_.testCommand(${id})`);
+      await b.waitFor(`app.$.onboarding.open && app.$.onboarding.steps_.join(',') === '${steps}'`, 5000);
+    }
+    // The browser found (Chrome here), ready to bring over.
+    await b.waitFor(`${OB}.querySelector('h2')?.textContent.includes('Chrome')`, 5000, `${OB}.querySelector('h2')?.textContent`);
+    await b.eval(`app.$.onboarding.open = false`);
+  } finally { await b.close(); for (const d of [chrome, empty]) fs.rmSync(d, { recursive: true, force: true }); }
+});
