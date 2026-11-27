@@ -337,9 +337,12 @@ test('OpenCode Ask runs with the person’s own model: the one last picked in Op
   const m = picked.runs[0].indexOf('-m');
   assert.ok(m > 0, `-m given: ${picked.runs[0]}`);
   assert.equal(picked.runs[0][m + 1], 'alfagen/EVC-Com-model');
-  // The config's model wins over the last picked; the .json file over the .jsonc one.
+  // The config's model wins over the last picked; the .jsonc file over the .json one, as OpenCode
+  // loads them (opencode.json, then opencode.jsonc).
   const configured = await askOpenCode(2, { jsonc: CORPORATE.replace('{\n', '{\n  "model": "alfagen/EVC-Com-model",\n'), json: '{"model": "openai/gpt-5"}', state: { recent: [{ providerID: 'opencode', modelID: 'big-pickle' }] } });
-  assert.equal(configured.runs[0][configured.runs[0].indexOf('-m') + 1], 'openai/gpt-5');
+  assert.equal(configured.runs[0][configured.runs[0].indexOf('-m') + 1], 'alfagen/EVC-Com-model');
+  const onlyJson = await askOpenCode(2, { jsonc: CORPORATE, json: '{"model": "openai/gpt-5"}', state: { recent: [{ providerID: 'opencode', modelID: 'big-pickle' }] } });
+  assert.equal(onlyJson.runs[0][onlyJson.runs[0].indexOf('-m') + 1], 'openai/gpt-5');
 });
 
 test('OpenCode Ask with no model anywhere: no -m made up, and a plain word when its free one runs out', { skip: process.platform !== 'darwin' && 'needs the macOS sandbox' }, async () => {
