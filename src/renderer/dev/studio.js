@@ -138,6 +138,7 @@ function stShow(view) {
   if (studio) {
     document.title = (stCurrent() && stTitle(stCurrent())) || STW().studio;
     stRender();
+    if (stTourWanted()) stTourStart();
     setTimeout(() => $('#st-input')?.focus({ preventScroll: true }), 0);
   } else {
     document.title = S.project?.name || 'Workbench';
@@ -319,7 +320,9 @@ function stBuild() {
   // 1, 2, 3…, ↵ sends what's picked.
   document.addEventListener('keydown', (e) => {
     if (!ST.on || ST.view !== 'studio' || ST.el?.hidden || e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
-    if (ST.menuFor || ST.starter) return;  // (Esc closes those first.)
+    // The tour ends on Esc wherever the focus is.
+    if (ST.tour && e.key === 'Escape') { e.preventDefault(); stTourEnd(); return; }
+    if (ST.menuFor || ST.starter || ST.tour) return;  // (Esc closes those first.)
     if (e.target.closest?.('input, textarea, select, [contenteditable=""], [contenteditable="true"]')) return;
     const card = [...document.querySelectorAll('#st-feed .st-ask')].find((c) => !c.classList.contains('answering') && !c.classList.contains('st-allowed') && !c.classList.contains('st-denied'));
     if (!card) return;
@@ -2172,3 +2175,141 @@ function stTick() {
 }
 
 // For tests (node): nothing to export here; the parts are in studio-words.js and studio-transcript.js.
+
+// ---------------------------------------------------------------- the first-run tour
+// Studio's first open (a designer or a manager, nothing done yet): 30 seconds on the person's own
+// site, with Remix as the first magic. 1 a site (an open tab or an address) → 2 a mood → 3 Remix
+// restyles it beside Studio (the site itself never changes; Remix's panel shows before/after and
+// takes more wishes) → 4 «Studio is yours» with the starters, «Put the site back», «Open Studio».
+// Never blocks: Esc or «Skip» ends it; any step can be skipped. Shown once (wb.studioTourDone).
+
+const ST_TOUR_STEPS = ['site', 'mood', 'remix', 'done'];
+
+function stTourWanted() {
+  try { if (localStorage.getItem('wb.studioTourDone') === '1') return false; } catch {}
+  // After «Кто вы?» was answered (designer or manager), before any task.
+  return ST.info?.chosen === true && ['designer', 'manager'].includes(ST.persona) && !stTerms().length && typeof wb.studioTabs === 'function';
+}
+
+async function stTourStart() {
+  if (ST.tour) return;
+  ST.tour = { step: 'site', url: '', tabs: [], wish: '', host: '', before: null, polls: 0 };
+  try { ST.tour.tabs = (await wb.studioTabs()) || []; } catch {}
+  const active = ST.tour.tabs.find((x) => x.active) || ST.tour.tabs[0];
+  ST.tour.url = active?.url || '';
+  stTourRender();
+  setTimeout(() => $('#st-tour .st-tour-in')?.focus({ preventScroll: true }), 0);
+}
+
+function stTourEnd() {
+  try { localStorage.setItem('wb.studioTourDone', '1'); } catch {}
+  clearTimeout(ST.tour?.timer);
+  ST.tour = null;
+  $('#st-tour')?.remove();
+  $('#st-input')?.focus({ preventScroll: true });
+}
+
+function stTourHtml() {
+  const w = STW();
+  const t = w.tour;
+  const tr = ST.tour;
+  const at = ST_TOUR_STEPS.indexOf(tr.step);
+  const head = `<div class="st-tour-head"><span class="st-tour-name">${esc(t.name)}</span><span class="st-tour-bars" aria-hidden="true">${ST_TOUR_STEPS.map((_, i) => `<i class="${i <= at ? 'on' : ''}"></i>`).join('')}</span>
+    <button type="button" class="st-tour-skip" data-tour="skip">${esc(t.skip)} · esc</button></div>`;
+  if (tr.step === 'site') {
+    const chips = tr.tabs.slice(0, 5).map((x) => `<button type="button" class="st-chip st-choice" data-tour-url="${esc(x.url)}">${icon('globe', 12)}<span>${esc(StudioWords.host(x.url))}</span></button>`).join('');
+    return `${head}<div class="st-tour-hero">
+      <div class="st-tour-k">${icon('sparkles', 12)}<span>${esc(t.kicker)}</span></div>
+      <h2>${t.title}</h2><p>${esc(t.lead)}</p>
+      <form class="st-tour-url" data-tour-form>${icon('globe', 14)}<input class="st-tour-in" type="url" inputmode="url" value="${esc(tr.url)}" placeholder="${esc(t.addr)}" aria-label="${esc(t.addr)}"><button type="submit" class="st-btn pri">${esc(t.go)}</button></form>
+      ${chips ? `<div class="st-tour-or">${esc(t.orTab)}</div><div class="st-tour-tabs">${chips}</div>` : ''}
+      <div class="st-tour-fine">${esc(t.consent)}</div></div>`;
+  }
+  if (tr.step === 'mood') {
+    return `${head}<div class="st-tour-card"><div class="st-ask-q">${esc(t.moodQ)}</div>
+      <div class="st-q-opts">${t.moods.map((m) => `<button type="button" class="st-opt" data-tour-mood="${esc(m.id)}"><b>${esc(m.label)}</b><span>${esc(m.hint)}</span></button>`).join('')}</div>
+      <form class="st-tour-own" data-tour-own><input class="st-tour-in" type="text" placeholder="${esc(t.own)}" aria-label="${esc(t.own)}"><button type="submit" class="st-btn">${esc(t.go)}</button></form></div>`;
+  }
+  if (tr.step === 'remix') {
+    return `${head}<div class="st-tour-card"><div class="st-tour-wait"><span class="st-shimmer">${esc(tr.slow ? t.slow : t.remixing)}</span></div>
+      ${tr.slow ? `<div class="st-ask-btns"><button type="button" class="st-btn" data-tour="next">${esc(t.next)}</button></div>` : ''}</div>`;
+  }
+  // (The starters are on the welcome right behind: not twice.)
+  return `${head}<div class="st-tour-card st-tour-done"><h3>${t.doneTitle}</h3><p>${esc(t.doneLead)}</p>
+    <div class="st-ask-btns"><button type="button" class="st-btn pri" data-tour="open">${esc(t.open)}</button>${tr.before ? `<button type="button" class="st-btn ghost" data-tour="back">${esc(t.back)}</button>` : ''}</div></div>`;
+}
+
+function stTourRender() {
+  if (!ST.tour || !ST.el) return;
+  let box = $('#st-tour');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'st-tour';
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-label', STW().tour.name);
+    ST.el.append(box);
+    box.addEventListener('click', stTourClick);
+    box.addEventListener('submit', stTourSubmit);
+  }
+  // The first step has the stage; after it the tour is a card that leaves Studio and the site in sight.
+  box.className = `st-tour ${ST.tour.step === 'site' ? 'full' : 'coach'}`;
+  box.innerHTML = stTourHtml();
+}
+
+function stTourClick(e) {
+  const b = e.target.closest('button');
+  if (!b) return;
+  const tr = ST.tour;
+  if (b.dataset.tour === 'skip') return stTourEnd();
+  if (b.dataset.tourUrl) { tr.url = b.dataset.tourUrl; return stTourGoSite(); }
+  if (b.dataset.tourMood) { const m = STW().tour.moods.find((x) => x.id === b.dataset.tourMood); return stTourRun(m?.wish || ''); }
+  if (b.dataset.tour === 'next') { tr.step = 'done'; return stTourRender(); }
+  if (b.dataset.tour === 'open') return stTourEnd();
+  if (b.dataset.tour === 'back') {
+    if (tr.before && tr.host) wb.studioBoost('restore', tr.host, tr.before).catch(() => {});
+    tr.before = null;
+    return stTourRender();
+  }
+}
+
+function stTourSubmit(e) {
+  e.preventDefault();
+  const tr = ST.tour;
+  const input = e.target.querySelector('.st-tour-in');
+  if (e.target.matches('[data-tour-form]')) { tr.url = input?.value || ''; return stTourGoSite(); }
+  if (e.target.matches('[data-tour-own]') && input?.value.trim()) return stTourRun(input.value.trim());
+}
+
+function stTourGoSite() {
+  const tr = ST.tour;
+  let u;
+  try { u = new URL(/^https?:\/\//i.test(tr.url) ? tr.url : `https://${tr.url}`); } catch { u = null; }
+  if (!u || !/^https?:$/.test(u.protocol) || !u.hostname.includes('.')) { toast(STW().tour.badSite); return; }
+  tr.url = u.href;
+  tr.host = StudioWords.host(u.href);
+  tr.step = 'mood';
+  // The site beside Studio now: it loads while the person picks a mood.
+  wb.toHost({ type: 'studio-site', url: tr.url });
+  stTourRender();
+}
+
+async function stTourRun(wish) {
+  const tr = ST.tour;
+  tr.wish = wish;
+  tr.step = 'remix';
+  try { tr.before = await wb.studioBoost('get', tr.host); } catch { tr.before = null; }
+  const had = new Set((tr.before || []).map((b) => b.id));
+  stTourRender();
+  wb.toHost({ type: 'studio-remix', wish });
+  // Remix's result is a Boost of the site named «Remix…»: when it's there, the magic happened.
+  const started = Date.now();
+  const poll = async () => {
+    if (!ST.tour || ST.tour !== tr || tr.step !== 'remix') return;
+    let list = [];
+    try { list = (await wb.studioBoost('get', tr.host)) || []; } catch {}
+    if (list.some((b) => /^Remix/i.test(b.name || '') && !had.has(b.id))) { tr.step = 'done'; return stTourRender(); }
+    if (!tr.slow && Date.now() - started > 90000) { tr.slow = true; stTourRender(); }
+    tr.timer = setTimeout(poll, 1500);
+  };
+  tr.timer = setTimeout(poll, 1500);
+}

@@ -27,6 +27,22 @@
       inFolder: (n) => `Папка «${n}»`, reveal: 'Показать в Finder', more: 'Ещё',
       emptyTitle: 'Что сделаем?', helloTitle: 'С чего <em>начнём?</em>', emptyHint: 'Напишите задачу своими словами или начните с одной из этих. Claude спросит, прежде чем что-то менять.',
       roles: { designer: 'Дизайнер:', manager: 'Менеджер:', developer: 'Разработчику:', everyday: 'Можно так:' },
+      // The first-run tour (Remix on the person's own site).
+      tour: {
+        name: 'Знакомство', kicker: 'Студия · первые 30 секунд', title: 'Давайте сразу <em>на вашем сайте</em>',
+        lead: 'Ремикс перекрасит его на ваших глазах: сравните «было / стало». Сам сайт не меняется — видите только вы.',
+        addr: 'Адрес сайта', go: 'Поехали', skip: 'Пропустить', orTab: 'или возьмите открытую вкладку',
+        moodQ: 'Какое настроение?', own: 'Своими словами…',
+        moods: [
+          { id: 'calm', label: 'Спокойнее', hint: 'мягкий фон, тихий шрифт', wish: 'Сделай сайт спокойнее: мягкий светлый фон, приглушённые цвета, более тихий и читаемый шрифт, больше воздуха. Контент и кнопки остаются рабочими.' },
+          { id: 'bold', label: 'Смелее', hint: 'глубокий цвет, крупные заголовки', wish: 'Сделай сайт смелее: один глубокий фирменный цвет, крупные выразительные заголовки, контрастные кнопки, современная сетка. Контент и кнопки остаются рабочими.' },
+          { id: 'night', label: 'Ночная', hint: 'тёмный фон, светлый текст', wish: 'Сделай ночную версию сайта: тёмный фон, светлый текст, мягкие акценты, ничего не слепит. Контент и кнопки остаются рабочими.' },
+        ],
+        remixing: 'Ремикс перекрашивает сайт — смотрите справа', slow: 'Ремикс ещё работает — можно подождать или идти дальше',
+        next: 'Дальше', doneTitle: 'Студия <em>ваша</em>', doneLead: 'Поправить словами — в панели Ремикса. А в Студии любая задача: начните с подсказки или своими словами.',
+        back: 'Вернуть сайт', open: 'Открыть Студию', badSite: 'Нужен адрес сайта, например zerno.coffee',
+        consent: 'Ремикс работает через ИИ: картинка страницы и ваши слова уходят ему.',
+      },
       // Starters: each one complete, with what it needs asked inline and a result you see.
       // need: 'site' (an open tab or an address) | 'text' (a few words) | '' (runs at once).
       starters: {
@@ -137,6 +153,21 @@
       inFolder: (n) => `Folder “${n}”`, reveal: 'Show in Finder', more: 'More',
       emptyTitle: 'What shall we make?', helloTitle: 'Where shall we <em>start?</em>', emptyHint: 'Say the task in your own words, or start with one of these. Claude asks before it changes anything.',
       roles: { designer: 'Designer:', manager: 'Manager:', developer: 'Developer:', everyday: 'Try:' },
+      tour: {
+        name: 'Getting started', kicker: 'Studio · the first 30 seconds', title: 'Let’s go <em>on your own site</em>',
+        lead: 'Remix restyles it before your eyes: compare before and after. The site itself doesn’t change — only you see it.',
+        addr: 'Site address', go: 'Go', skip: 'Skip', orTab: 'or take an open tab',
+        moodQ: 'What mood?', own: 'In your own words…',
+        moods: [
+          { id: 'calm', label: 'Calmer', hint: 'soft background, quiet type', wish: 'Make the site calmer: a soft light background, muted colours, quieter and more readable type, more air. Content and buttons keep working.' },
+          { id: 'bold', label: 'Bolder', hint: 'deep colour, big headings', wish: 'Make the site bolder: one deep brand colour, big expressive headings, high-contrast buttons, a modern grid. Content and buttons keep working.' },
+          { id: 'night', label: 'Night', hint: 'dark background, light text', wish: 'Make a night version of the site: a dark background, light text, soft accents, nothing glaring. Content and buttons keep working.' },
+        ],
+        remixing: 'Remix is restyling the site — look on the right', slow: 'Remix is still working — wait or go on',
+        next: 'Next', doneTitle: 'Studio is <em>yours</em>', doneLead: 'Ask Remix for changes in its panel. In Studio, any task: start from a suggestion or in your own words.',
+        back: 'Put the site back', open: 'Open Studio', badSite: 'It needs a site address, like zerno.coffee',
+        consent: 'Remix works through an AI: a picture of the page and your words go to it.',
+      },
       starters: {
         designer: [
           { id: 'restyle', label: 'Restyle our site in our brand', need: 'site', ask: 'Which site?',

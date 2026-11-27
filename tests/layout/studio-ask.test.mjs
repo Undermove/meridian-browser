@@ -250,3 +250,59 @@ test('waiting cards answer keys: ↵ allows, Esc says no, 1–3 pick an option; 
     assert.match(got[0], /Две версии баннера/);
   } finally { await page.close(); }
 });
+
+// The first-run tour: the site (an open tab), a mood, Remix asked with that mood as its wish, done
+// when a «Remix…» Boost appears; «Put the site back» restores the Boosts as they were; Esc ends it.
+test('first-run tour: site → mood → Remix with the wish → done; back restores; esc ends', { skip: !chrome && 'no Chromium headless shell' }, async () => {
+  const page = await open();
+  try {
+    await page.send('Emulation.setDeviceMetricsOverride', { width: 1100, height: 760, deviceScaleFactor: 1, mobile: false });
+    await page.send('Page.navigate', { url: pathToFileURL(path.join(here, 'studio-ask.html')).href });
+    for (let i = 0; i < 50 && (await page.evaluate('typeof stBuild === "function" && document.readyState')) !== 'complete'; i++) await sleep(100);
+    await page.evaluate(`(() => {
+      S.terms = []; ST.on = true; ST.lang = 'ru'; ST.view = 'studio'; ST.persona = 'designer'; ST.info = { chosen: true, home: '/x' };
+      window.__host = []; window.__restored = null; let remixed = false;
+      wb.studioTabs = async () => [{ url: 'https://www.zerno.coffee/', title: 'Зерно', active: true }, { url: 'https://example.org/', title: 'Example', active: false }];
+      wb.toHost = (m) => { window.__host.push(m); if (m.type === 'studio-remix') setTimeout(() => { remixed = true; }, 300); };
+      wb.studioBoost = async (op, host, list) => { if (op === 'restore') { window.__restored = list; return []; } return remixed ? [{ id: 'r1', name: 'Remix: Спокойнее' }] : []; };
+      try { localStorage.removeItem('wb.studioTourDone'); } catch {}
+      stBuild(); ST.el.hidden = false; stRender(); return stTourWanted(); })()`).then((wanted) => assert.equal(wanted, true));
+    await page.evaluate('stTourStart().then(() => true)');
+    const step = () => page.evaluate(`({ cls: document.querySelector('#st-tour')?.className || '', text: document.querySelector('#st-tour')?.innerText || '', url: document.querySelector('#st-tour .st-tour-in')?.value })`);
+    let s = await step();
+    assert.match(s.cls, /full/);
+    assert.match(s.text, /Давайте сразу на вашем сайте/);
+    assert.equal(s.url, 'https://www.zerno.coffee/', 'the active tab, filled in');
+    await sleep(350);  // (after the fade-in)
+    if (process.env.MERIDIAN_LAYOUT_SHOTS) fs.writeFileSync(path.join(process.env.MERIDIAN_LAYOUT_SHOTS, 'tour-1-site.png'), Buffer.from((await page.send('Page.captureScreenshot', { format: 'png' })).result.data, 'base64'));
+    // The site: Go → it opens beside Studio; a mood next.
+    await page.evaluate(`document.querySelector('#st-tour form[data-tour-form] button').click(), true`);
+    s = await step();
+    assert.match(s.cls, /coach/);
+    assert.match(s.text, /Какое настроение\?/);
+    assert.deepEqual(await page.evaluate('window.__host'), [{ type: 'studio-site', url: 'https://www.zerno.coffee/' }]);
+    await page.evaluate(`document.querySelector('[data-tour-mood="calm"]').click(), true`);
+    s = await step();
+    assert.match(s.text, /Ремикс перекрашивает сайт/);
+    const remix = (await page.evaluate('window.__host')).find((m) => m.type === 'studio-remix');
+    assert.match(remix.wish, /спокойнее/i);
+    for (let i = 0; i < 40 && !/Студия ваша/.test((await step()).text); i++) await sleep(100);
+    s = await step();
+    assert.match(s.text, /Студия ваша/);
+    // (The starters are on the welcome behind it, not repeated in the card.)
+    assert.equal(await page.evaluate(`document.querySelectorAll('#st-tour .st-idea').length`), 0);
+    assert.equal(await page.evaluate(`document.querySelectorAll('#st-feed .st-idea').length`), 3);
+    if (process.env.MERIDIAN_LAYOUT_SHOTS) fs.writeFileSync(path.join(process.env.MERIDIAN_LAYOUT_SHOTS, 'tour-4-done.png'), Buffer.from((await page.send('Page.captureScreenshot', { format: 'png' })).result.data, 'base64'));
+    // Put the site back: the Boosts as they were (none).
+    await page.evaluate(`document.querySelector('[data-tour="back"]').click(), true`);
+    assert.deepEqual(await page.evaluate('window.__restored'), []);
+    // The card never covers the composer's send or the task list (it sits bottom-left over the canvas).
+    const ok = await page.evaluate(`(() => { const t = document.querySelector('#st-tour').getBoundingClientRect(); return t.left >= 0 && t.bottom <= innerHeight && t.width <= 380; })()`);
+    assert.equal(ok, true);
+    // Esc ends it, once and for all.
+    await page.evaluate(`document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })), true`);
+    assert.equal(await page.evaluate(`!!document.querySelector('#st-tour')`), false);
+    assert.equal(await page.evaluate(`localStorage.getItem('wb.studioTourDone')`), '1');
+    assert.equal(await page.evaluate('stTourWanted()'), false);
+  } finally { await page.close(); }
+});
