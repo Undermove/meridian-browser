@@ -48,6 +48,9 @@ open(tpath, 'w').close()
 # exit» first and focused, ↓ moves to «Yes, I trust this folder», Enter picks; «No» ends it.
 ask_trust = os.environ.get('STAND_IN_TRUST') or os.path.exists(os.path.join(cwd, '.ask-trust')) or os.path.exists(os.path.join(os.path.dirname(cwd), '.ask-trust'))
 if ask_trust:
+    # Keys one by one, not echoed (Claude Code's own terminal mode), so ↓ arrives without Enter.
+    import tty
+    tty.setcbreak(0)
     focus = 0
     def draw():
         print('Quick safety check: Is this a project you created or one you trust?', flush=True)
@@ -129,7 +132,8 @@ async function openWorkbench(b, project) {
 
 // A real mouse click inside the Workbench page.
 async function click(wb, sel) {
-  const r = await wb.waitFor(`(() => { const el = document.querySelector(${JSON.stringify(sel)}); if (!el) return null; const r = el.getBoundingClientRect(); return r.width ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null; })()`);
+  // (Scrolled into sight first, as a person would: a chip may sit past the edge of its row.)
+  const r = await wb.waitFor(`(() => { const el = document.querySelector(${JSON.stringify(sel)}); if (!el) return null; el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); const r = el.getBoundingClientRect(); return r.width ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null; })()`);
   for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
     await wb.cdp.send('Input.dispatchMouseEvent', { type, x: r.x, y: r.y, button: type === 'mouseMoved' ? 'none' : 'left', clickCount: 1 });
   }
@@ -366,6 +370,12 @@ while True:
     time.sleep(1)
 `;
 
+// «New task»: the list's button, or the header's when Studio is narrow (beside a site).
+async function newTask(wb) {
+  const sel = await wb.eval(`document.querySelector('#st-new').getBoundingClientRect().width ? '#st-new' : '#st-new-h'`);
+  await click(wb, sel);
+}
+
 async function startTask(wb, text) {
   await wb.waitFor(`document.querySelector('#studio') && !document.querySelector('#studio').hidden`);
   await wb.eval(`(() => { document.querySelector('#st-input').value = ${JSON.stringify(text)}; return true; })()`);
@@ -499,7 +509,8 @@ test('Layout: nothing clipped or overlapping at three widths; the splitter drags
     await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: r.x + 120, y: r.y, button: 'left', clickCount: 1 });
     const w1 = await width();
     assert.ok(Math.abs(w1 - w0 - 120) <= 4, `${w0} → ${w1}`);
-    assert.equal(await wb.eval(`localStorage.getItem('wb.studioChatWidth')`), String(w1));
+    // (Kept: the column's width; the chat card sits inside it with its margins.)
+    assert.equal(await wb.eval(`localStorage.getItem('wb.studioChatWidth')`), String(await wb.eval('ST.chatWidth')));
     await wb.eval(`(() => { const s = document.querySelector('#st-split'); s.focus(); s.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true })); return true; })()`);
     assert.equal(await width(), w1 - 16);
     await wb.eval(`(() => { document.querySelector('#st-split').dispatchEvent(new MouseEvent('dblclick', { bubbles: true })); return true; })()`);
@@ -586,7 +597,7 @@ test('No folder question: Studio opens its own folder, a new task gets a folder 
     await wb.eval(`(() => { window.workbench.reveal = async (rel) => { window.__revealed = rel; return true; }; return true; })()`);
     await click(wb, '.st-task.active .st-tmore');
     await wb.waitFor(`!!document.querySelector('.st-tmenu [data-reveal]')`);
-    assert.equal(await wb.eval(`document.querySelector('.st-tmenu').innerText.trim()`), 'Show in Finder');
+    assert.deepEqual(await wb.eval(`[...document.querySelectorAll('.st-tmenu [role=menuitem]')].map((b) => b.querySelector('b')?.innerText || b.innerText.trim())`), ['Show in Finder', 'Hand over to a developer']);
     await click(wb, '.st-tmenu [data-reveal]');
     await wb.waitFor(`window.__revealed === ${JSON.stringify(name)}`);
     assert.equal(await wb.eval(`!!document.querySelector('.st-tmenu')`), false);
@@ -821,7 +832,7 @@ test('Starters: each asks what it needs right there, runs, and its result shows 
     assert.equal(await wb.eval(`stTask(stCurrent()).site`), site, 'the site is the task’s (Before/After on the right)');
 
     // The board: «What is the board about?» — a few words, then the page it makes opens beside Studio.
-    await click(wb, '#st-new');
+    await newTask(wb);
     fs.rmSync(path.join(s.project, '.prompt'));
     await click(wb, '#st-chips [data-starter="board"]');
     await wb.waitFor(`!!document.querySelector('.st-starter-in')`);
@@ -834,7 +845,7 @@ test('Starters: each asks what it needs right there, runs, and its result shows 
     await board.waitFor(`document.querySelector('#board')?.textContent === 'Reference board'`);
 
     // Inconsistencies: the page, then pins on it.
-    await click(wb, '#st-new');
+    await newTask(wb);
     fs.rmSync(path.join(s.project, '.prompt'));
     await click(wb, '#st-chips [data-starter="audit"]');
     await wb.waitFor(`!!document.querySelector('.st-starter [data-sv]')`, 10000);

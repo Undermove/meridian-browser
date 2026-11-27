@@ -234,6 +234,7 @@ function stBuild() {
   el.lang = ST.lang;
   el.innerHTML = `
     <header class="st-head">
+      <button class="st-new-h" id="st-new-h" title="${esc(w.newTask)}" aria-label="${esc(w.newTask)}">${icon('plus', 15)}</button>
       <div class="st-titles"><span class="st-ttl" id="st-title"></span><span class="st-sub" id="st-sub"></span></div>
       <div class="grow"></div>
       ${stSwitchHtml()}
@@ -282,7 +283,9 @@ function stBuild() {
     stRender();
   });
   $('#st-brand', el).addEventListener('click', stOnBrandClick);
-  $('#st-new', el).addEventListener('click', () => { ST.current = ''; ST.preview = null; stRender(); $('#st-input').focus({ preventScroll: true }); });
+  $('#st-new', el).addEventListener('click', () => { ST.current = ''; ST.chosen = true; ST.preview = null; stRender(); $('#st-input').focus({ preventScroll: true }); });
+  // (The same, from the header, when the window is too narrow for the task list: Studio beside a site.)
+  $('#st-new-h', el).addEventListener('click', () => { ST.current = ''; ST.chosen = true; ST.preview = null; stRender(); $('#st-input').focus({ preventScroll: true }); });
   // The task menu acts on pointer-up (and on a key's click): the list redraws while a task works, and
   // a click whose button was redrawn between press and release never arrives.
   const stTaskMenu = (e) => {
@@ -307,6 +310,7 @@ function stBuild() {
     const row = e.target.closest('[data-term]');
     if (!row) return;
     ST.current = row.dataset.term;
+    ST.chosen = true;
     ST.preview = null;
     const k = ST.tasks.get(ST.current);
     if (k) k.seen = true;
@@ -2131,6 +2135,7 @@ function stTick() {
     if (t.id === ST.current && ST.view === 'studio' ? true : stTickN % 6 === 0 || !k.loaded) stRead(t, k);
   }
   if (ST.view === 'studio') {
+    // On opening only: the latest task. Once the person picked (a task, or «New task»), never again.
     if (!ST.current && stTerms().length && !ST.chosen) { ST.current = stTerms()[stTerms().length - 1].id; ST.chosen = true; }
     stRender();
   }
