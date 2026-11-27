@@ -8,7 +8,7 @@
  * the terminal then shows just that one's tab. The states come from SessionStatus (session-status.js):
  * hooks only, nothing guessed.
  */
-const CHATS = { on: false, open: true, timer: 0, dom: null };
+const CHATS = { on: false, open: true, timer: 0, dom: null, renaming: null, renameTimer: 0 };
 
 function chatsEnabled() { return load('chatsList') === '1'; }
 
@@ -63,7 +63,10 @@ function chatsStart() {
   btn.addEventListener('click', () => chatsOpen(true));
   $('#view-files').addEventListener('click', onFiles);
   $('#view-scm').addEventListener('click', onFiles);
-  const unsub = SessionStatus.onChange(() => chatsRefresh());
+  const unsub = SessionStatus.onChange(() => { chatsRefresh(); chatsFlushRenames(); });
+  // Rename: a double click on a name, the row's menu, or F2 on the row.
+  list.addEventListener('keydown', chatsKeys);
+  endedList.addEventListener('keydown', chatsKeys);
   const onVis = () => chatsReport();
   document.addEventListener('visibilitychange', onVis);
   window.addEventListener('focus', onVis);
@@ -85,6 +88,8 @@ function chatsStop() {
   const d = CHATS.dom;
   CHATS.dom = null;
   clearInterval(CHATS.timer);
+  clearTimeout(CHATS.renameTimer);
+  CHATS_RENAMES.clear();
   d.unsub();
   d.folds.disconnect();
   document.removeEventListener('visibilitychange', d.onVis);
@@ -160,7 +165,7 @@ function chatsQuietWords(t) {
 }
 
 function chatsRender() {
-  if (!CHATS.on) return;
+  if (!CHATS.on || CHATS.renaming) return;
   const count = $('#chats-count');
   const live = S.terms.filter((t) => !t.exited).length;
   count.textContent = live ? String(live) : '';
@@ -189,6 +194,7 @@ function chatsRow(t) {
   row.dataset.term = t.id;
   row.dataset.state = st.state || 'none';
   row.setAttribute('role', 'option');
+  row.tabIndex = t === S.activeTerm ? 0 : -1;
   row.setAttribute('aria-selected', String(t === S.activeTerm));
   const status = document.createElement('span');
   status.className = 'chat-status';
@@ -222,11 +228,92 @@ function chatsRow(t) {
   row.appendChild(main);
   row.title = termName(t);
   row.addEventListener('click', (e) => {
-    if (e.target.closest('.tab-usage')) return;
+    if (e.target.closest('.tab-usage, .chat-rename')) return;
+    // A double click on the name renames (told by the click count: the first click redraws the list).
+    if (e.detail === 2 && e.target.closest('.chat-name')) { chatsRename(t); return; }
+    if (e.detail > 1) return;
     $('#term-area').classList.remove('collapsed');
     activateTerm(t);
   });
+  row.addEventListener('contextmenu', async (e) => {
+    e.preventDefault();
+    if (typeof wb.menu !== 'function') return;
+    const choice = await wb.menu([{ id: 'rename', label: 'Rename…' }]);
+    if (choice === 'rename') chatsRename(t);
+  });
   return row;
+}
+
+// ---------------------------------------------------------------- renaming a session
+
+function chatsKeys(e) {
+  if (e.key !== 'F2' || e.target.closest('.chat-rename')) return;
+  const row = e.target.closest('.chat-row');
+  const t = row ? S.terms.find((x) => x.id === row.dataset.term) : S.activeTerm;
+  if (!t) return;
+  e.preventDefault();
+  chatsRename(t);
+}
+
+// The name in place: Enter keeps it, Esc goes back, leaving the field keeps it (as on the tab).
+function chatsRename(t) {
+  if (!CHATS.on || CHATS.renaming) return;
+  const nameEl = CHATS.dom.view.querySelector(`.chat-row[data-term="${CSS.escape(t.id)}"] .chat-name`);
+  if (!nameEl) return;
+  CHATS.renaming = t;
+  S.renamingTerm = t;
+  const input = document.createElement('input');
+  input.className = 'chat-rename';
+  input.value = termName(t);
+  input.spellcheck = false;
+  input.setAttribute('aria-label', 'Session name');
+  nameEl.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = (keep) => {
+    if (done) return;
+    done = true;
+    CHATS.renaming = null;
+    S.renamingTerm = null;
+    // Empty: back to the name the program gives (saveTermName's rule).
+    if (keep && input.value.trim() !== termName(t)) saveTermName(t, input.value.trim().slice(0, 80));
+    renderTermTabs();
+  };
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener('blur', () => finish(true));
+  input.addEventListener('click', (e) => e.stopPropagation());
+  input.addEventListener('dblclick', (e) => e.stopPropagation());
+}
+
+// A name given by hand becomes Claude Code's own name too (/rename: what `claude --resume` and
+// claude.ai show), typed into the session only while it is idle with an empty prompt, so a running
+// turn or half-typed text is never touched. Until then it waits; a newer name replaces it.
+const CHATS_RENAMES = new Map(); // termId -> name
+function chatsRenamed(t, name) {
+  if (!CHATS.on || !termIsClaude(t) || t.exited) return;
+  const clean = String(name || '').replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 80);
+  if (!clean) { CHATS_RENAMES.delete(t.id); return; }
+  CHATS_RENAMES.set(t.id, clean);
+  chatsFlushRenames();
+}
+
+function chatsFlushRenames() {
+  clearTimeout(CHATS.renameTimer);
+  for (const [id, name] of CHATS_RENAMES) {
+    const t = S.terms.find((x) => x.id === id);
+    if (!t || t.exited || !termIsClaude(t)) { CHATS_RENAMES.delete(id); continue; }
+    const state = SessionStatus.get(id).state;
+    if ((state !== 'idle' && state !== 'done') || (t.typed || '').length) continue;
+    CHATS_RENAMES.delete(id);
+    wb.ptyWrite(id, `/rename ${name}\r`);
+  }
+  // Waiting on an empty prompt: the status says when it's idle; typing is looked at again shortly.
+  if (CHATS_RENAMES.size) CHATS.renameTimer = setTimeout(chatsFlushRenames, 1000);
 }
 
 document.addEventListener('DOMContentLoaded', () => { if (chatsEnabled()) chatsStart(); });
