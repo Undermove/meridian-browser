@@ -1,0 +1,1062 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 27 Nov 2026 18:32:49 +0400
+Subject: [PATCH] Meridian: Boost's Improve is one button again: the site less
+ distracting in one quick round, what it hides named Zaps
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The owner: 1.5.2's Improve "отлично срабатывала"; 1.5.3's was slow and
+unclear. 1.5.3 made Improve with nothing typed a redesign: up to three
+rounds, each with a screenshot (one JPEG, ~38 KB of base64) and a
+measured page and designer brief (14 KB of text against 1.5.2's 10 KB),
+the whole CSS written each round. In the beta's narrow panel the field
+was cut off and the button, in a pale space's colour, looked disabled.
+
+Now, as in 1.5.2 and simpler:
+- One button, nothing to type: "Declutter" («Убрать лишнее» in Russian).
+  One quick round with 1.5.2's prompt shape (the outline, the boost's CSS)
+  and a fixed direction: the site less distracting (Shorts and reels
+  shelves, badges and counters, promo, sign-up and cookie banners,
+  autoplay rails, sticky popups), labels in the browser's language. No
+  screenshot, no review, no redesign.
+- What it hides becomes the site's Zaps, each with its name
+  ("ytd-rich-shelf-renderer[is-shorts] /* the Shorts shelf */"): the Zap
+  list shows the name, a click shows it on the page for a moment, its ✕
+  brings it back by itself. "Undo all" puts the boost back as it was.
+- It says what it does from the click (the first line in under a
+  millisecond in the page), line by line: "Looking at the page…",
+  "Asking Claude Code… read 812 elements of the page", "Found: …",
+  then "Hid: the Shorts shelf, the notification count". The button is a
+  strong blue whatever the space's colour, pressed while it works, never
+  greyed out: with no AI it says why and opens Settings › AI.
+- The AIs on this computer are waited for (WhenDetected) instead of
+  failing a first Improve; where the time goes is logged (MERIDIAN_LOG:
+  "Meridian Improve: quick, 1 round(s), 10755 prompt bytes,
+  0 screenshot(s); … AI answering 1553 ms, first CSS at 1556 ms").
+- The redesign in rounds stays as an engine for Remix
+  (BoostImprover::Start(…, Mode::kRedesign), Keep(), progress(),
+  changes_json(); boost_magic.ts its glow); Boost no longer uses it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../browser/meridian/boosts/boost_improve.cc  |  14 +-
+ .../browser/meridian/boosts/boost_improve.h   |  13 +-
+ .../meridian/boosts/boost_improve_unittest.cc |  11 +-
+ .../browser/meridian/boosts/boost_improver.cc | 122 ++++++++++--
+ .../browser/meridian/boosts/boost_improver.h  |  39 +++-
+ .../browser/resources/webui_browser/BUILD.gn  |   1 +
+ .../resources/webui_browser/app.html.ts       |   3 +-
+ .../webui_browser/meridian/boost_editor.css   | 104 +++++++++-
+ .../meridian/boost_editor.html.ts             |  74 +++----
+ .../webui_browser/meridian/boost_editor.ts    | 180 +++++++-----------
+ .../webui_browser/meridian/improve_words.ts   |  53 ++++++
+ 11 files changed, 428 insertions(+), 186 deletions(-)
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/improve_words.ts
+
+diff --git a/chrome/browser/meridian/boosts/boost_improve.cc b/chrome/browser/meridian/boosts/boost_improve.cc
+index e146948c19..99594e82e1 100644
+--- a/chrome/browser/meridian/boosts/boost_improve.cc
++++ b/chrome/browser/meridian/boosts/boost_improve.cc
+@@ -1018,7 +1018,8 @@ Kind Classify(const std::string& wish) {
+   const std::u16string w = Lower(std::string(
+       base::TrimWhitespaceASCII(wish, base::TRIM_ALL)));
+   if (w.empty()) {
+-    return Kind::kRedesign;
++    // One click with nothing typed: a calmer page, at once.
++    return Kind::kQuick;
+   }
+   static constexpr const char16_t* kRedesign[] = {
+       u"redesign", u"re-design", u"overhaul", u"makeover", u"make over",
+@@ -1056,6 +1057,17 @@ Kind Classify(const std::string& wish) {
+   return Kind::kQuick;
+ }
+ 
++std::string DeclutterWish(bool russian) {
++  return std::string(
++             "make the site less distracting: hide what pulls attention away "
++             "from what I came for: Shorts and reels shelves, badges and "
++             "counters on icons, promo, sign-up and cookie banners, autoplay "
++             "and recommendation rails, sticky popups and floating widgets. "
++             "Keep the content, the navigation and the controls; calmer "
++             "reading; keep the site’s look otherwise. Labels and summary in ") +
++         (russian ? "Russian." : "English.");
++}
++
+ bool Russian(const std::string& text) {
+   for (char16_t c : base::UTF8ToUTF16(text)) {
+     if (c >= u'Ѐ' && c <= u'ӿ') {
+diff --git a/chrome/browser/meridian/boosts/boost_improve.h b/chrome/browser/meridian/boosts/boost_improve.h
+index c73b2ea1e7..8f77aeb74b 100644
+--- a/chrome/browser/meridian/boosts/boost_improve.h
++++ b/chrome/browser/meridian/boosts/boost_improve.h
+@@ -56,13 +56,18 @@ CssCheck CheckCss(const std::string& css,
+ std::vector<std::string> CheckHide(const base::ListValue* selectors,
+                                    std::vector<std::string>* labels = nullptr);
+ 
+-// What an Improve is asked for. A direction ("убери шортсы", "bigger
+-// text", "dark") is done as asked, in one quick round (kQuick); an empty
+-// one, or one asking for a redesign ("redesign", "редизайн", "переделай
+-// целиком", "сделай красиво"), is a redesign in rounds (kRedesign).
++// What a direction asks for, for a caller that offers both (Remix; Boost's
++// Improve is always quick): nothing typed or a direction ("убери шортсы",
++// "bigger text", "dark") is kQuick; one asking for a redesign ("redesign",
++// "редизайн", "переделай целиком", "сделай красиво") is kRedesign.
+ enum class Kind { kQuick, kRedesign };
+ Kind Classify(const std::string& wish);
+ 
++// The one-click Improve's direction: the site less distracting (Shorts
++// shelves, badges and counters, promo banners, autoplay rails, sticky
++// popups hidden), its labels in Russian or English.
++std::string DeclutterWish(bool russian);
++
+ // The person wrote in Russian (any Cyrillic letter): the browser's status
+ // lines for this Improve are in Russian too.
+ bool Russian(const std::string& text);
+diff --git a/chrome/browser/meridian/boosts/boost_improve_unittest.cc b/chrome/browser/meridian/boosts/boost_improve_unittest.cc
+index f966540eb6..32361d2d36 100644
+--- a/chrome/browser/meridian/boosts/boost_improve_unittest.cc
++++ b/chrome/browser/meridian/boosts/boost_improve_unittest.cc
+@@ -238,9 +238,16 @@ TEST(BoostImproveTest, ClassifiesDirections) {
+         "like Linear", "warm editorial", "переделай кнопку синей"}) {
+     EXPECT_EQ(Classify(wish), Kind::kQuick) << wish;
+   }
+-  // Nothing, or a redesign asked for: rounds.
++  // Nothing typed: the one-click calmer page, quick too.
++  EXPECT_EQ(Classify(""), Kind::kQuick);
++  EXPECT_EQ(Classify("   "), Kind::kQuick);
++  EXPECT_TRUE(Has(DeclutterWish(true), "Shorts"));
++  EXPECT_TRUE(Has(DeclutterWish(true), "in Russian"));
++  EXPECT_TRUE(Has(DeclutterWish(false), "in English"));
++  EXPECT_EQ(Classify(DeclutterWish(false)), Kind::kQuick);
++  // A redesign asked for: rounds.
+   for (const char* wish :
+-       {"", "   ", "редизайн", "Сделай редизайн в стиле Linear",
++       {"редизайн", "Сделай редизайн в стиле Linear",
+         "переделай целиком", "Переделай всё", "переделай полностью",
+         "сделай красиво", "Сделай красивее", "сделай покрасивее",
+         "новый дизайн", "redesign", "Redesign it, dark and strict",
+diff --git a/chrome/browser/meridian/boosts/boost_improver.cc b/chrome/browser/meridian/boosts/boost_improver.cc
+index f3f42eb6b0..9e8a1e0f30 100644
+--- a/chrome/browser/meridian/boosts/boost_improver.cc
++++ b/chrome/browser/meridian/boosts/boost_improver.cc
+@@ -14,6 +14,9 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/uuid.h"
++#include "base/logging.h"
++#include "base/strings/string_util.h"
++#include "chrome/browser/browser_process.h"
+ #include "chrome/browser/meridian/agent/tab_frame_capture.h"
+ #include "chrome/browser/meridian/ai/ai_service.h"
+ #include "chrome/browser/meridian/ai/ai_service_factory.h"
+@@ -353,6 +356,24 @@ std::string Join(const std::vector<std::string>& parts,
+   return out;
+ }
+ 
++// A Zap with its name as a comment, the name made safe for one.
++std::string NamedZap(const std::string& sel, std::string name) {
++  base::ReplaceSubstringsAfterOffset(&name, 0, "*/", "");
++  base::ReplaceSubstringsAfterOffset(&name, 0, "/*", "");
++  std::erase_if(name, [](char c) {
++    return c == '{' || c == '}' || c == '<' || c == '\\' || c == '\n';
++  });
++  name = std::string(base::TrimWhitespaceASCII(name, base::TRIM_ALL));
++  return name.empty() ? sel : sel + " /* " + name + " */";
++}
++
++// A Zap's selector, without its name.
++std::string ZapSelector(const std::string& zap) {
++  const size_t at = zap.find(" /* ");
++  return at == std::string::npos || !zap.ends_with(" */") ? zap
++                                                          : zap.substr(0, at);
++}
++
+ // A selector as a label when the AI gave none.
+ std::string SelectorLabel(const std::string& sel) {
+   return sel.size() > 40 ? sel.substr(0, 38) + "…" : sel;
+@@ -410,7 +431,8 @@ void BoostImprover::SetProgress(std::string text, std::string detail) {
+ void BoostImprover::Start(const std::string& boost_id,
+                           const std::string& wish,
+                           const std::string& provider,
+-                          Done done) {
++                          Done done,
++                          Mode mode) {
+   if (running()) {
+     std::move(done).Run("It’s already being improved.", std::string());
+     return;
+@@ -427,19 +449,19 @@ void BoostImprover::Start(const std::string& boost_id,
+     std::move(done).Run("The AI isn’t available here.", std::string());
+     return;
+   }
+-  if (provider.empty() && ai->CurrentProvider().empty()) {
+-    std::move(done).Run(ai->NotReadyMessage(), std::string());
+-    return;
+-  }
+   boost_id_ = boost_id;
+-  wish_ = wish;
+   provider_ = provider;
+   url_ = url.spec();
+   title_ = base::UTF16ToUTF8(contents_->GetTitle());
+-  quick_ = boost_ai::Classify(wish) == boost_ai::Kind::kQuick;
+-  ru_ = boost_ai::Russian(wish);
+-  // A quick one sees the outline only, as in 1.5.2: no screenshot.
+-  sees_images_ = !quick_ && ai->SeesImages(provider);
++  quick_ = mode == Mode::kQuick;
++  // No direction: the one-click default, a calmer page in the browser's
++  // language.
++  ru_ = wish.empty()
++            ? base::StartsWith(g_browser_process->GetApplicationLocale(), "ru")
++            : boost_ai::Russian(wish);
++  wish_ = wish.empty() ? boost_ai::DeclutterWish(ru_) : wish;
++  shown_wish_ = wish.empty() ? L("less distraction", "меньше отвлекающего")
++                             : Short(wish);
+   outline_.clear();
+   last_round_summary_.clear();
+   changes_ = base::ListValue();
+@@ -453,9 +475,34 @@ void BoostImprover::Start(const std::string& boost_id,
+   done_ = std::move(done);
+   started_ = base::TimeTicks::Now();
+   applied_count_ = 0;
++  timings_ = Timings();
++  // Said at once, before anything slow (the AIs on this computer may still
++  // be being looked for).
++  SetProgress(L("Looking at the page…", "Смотрю страницу…"),
++              L("“" + shown_wish_ + "”", "«" + shown_wish_ + "»"));
++  ai->WhenDetected(base::BindOnce(&BoostImprover::OnDetected,
++                                  run_weak_factory_.GetWeakPtr()));
++}
++
++void BoostImprover::OnDetected() {
++  timings_.detected = base::TimeTicks::Now() - started_;
++  AiService* ai = this->ai();
++  content::RenderFrameHost* frame = contents_->GetPrimaryMainFrame();
++  if (!ai) {
++    Finish(L("The AI isn’t available here.", "ИИ здесь недоступен."));
++    return;
++  }
++  if (provider_.empty() && ai->CurrentProvider().empty()) {
++    Finish(ai->NotReadyMessage());
++    return;
++  }
++  // A quick one sees the outline only, as in 1.5.2: no screenshot.
++  sees_images_ = !quick_ && ai->SeesImages(provider_);
++  if (!frame->IsRenderFrameLive()) {
++    Finish(L("The page went away.", "Страница закрылась."));
++    return;
++  }
+   if (quick_) {
+-    SetProgress(L("Looking at the page…", "Смотрю страницу…"),
+-                L("“" + Short(wish) + "”", "«" + Short(wish) + "»"));
+     RunInFrame(frame, kOutline,
+                base::BindOnce(&BoostImprover::OnOutline,
+                               run_weak_factory_.GetWeakPtr()));
+@@ -473,6 +520,7 @@ std::string BoostImprover::L(std::string en, std::string ru) const {
+ }
+ 
+ void BoostImprover::OnOutline(base::Value outline) {
++  timings_.page = base::TimeTicks::Now() - started_;
+   outline_ = outline.is_string() ? outline.GetString() : std::string();
+   round_ = 1;
+   const size_t n =
+@@ -486,9 +534,9 @@ void BoostImprover::OnOutline(base::Value outline) {
+   SetProgress(who.empty() ? L("Asking the AI…", "Спрашиваю ИИ…")
+                           : L("Asking " + who + "…", "Спрашиваю " + who + "…"),
+               L("read " + Elements(n, false) + " of the page · “" +
+-                    Short(wish_) + "”",
++                    shown_wish_ + "”",
+                 "прочитал " + Elements(n, true) + " страницы · «" +
+-                    Short(wish_) + "»"));
++                    shown_wish_ + "»"));
+   Ask(std::string());
+ }
+ 
+@@ -574,9 +622,13 @@ void BoostImprover::Ask(std::string image) {
+   }
+   request.provider = provider_;
+   request.mode = "chat";
++  ++timings_.rounds;
++  timings_.prompt_bytes += request.text.size() + request.system.size();
+   if (!image.empty()) {
++    ++timings_.images;
+     request.images.push_back(std::move(image));
+   }
++  ask_started_ = base::TimeTicks::Now();
+   // The tab's space: its AI account, as Ask uses it (ai/account_prefs.h).
+   if (const TabData* data = TabData::Get(contents_)) {
+     request.space_id = data->space_id();
+@@ -618,6 +670,7 @@ void BoostImprover::OnAiEvent(int round,
+     return;
+   }
+   deadline_.Stop();
++  timings_.ai += base::TimeTicks::Now() - ask_started_;
+   // The session's callback is running: drop it afterwards.
+   base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+       FROM_HERE, base::BindOnce(
+@@ -716,6 +769,9 @@ void BoostImprover::OnHideChecked(boost_ai::Answer answer,
+     boost.name = !answer.name.empty() ? answer.name : host_;
+   }
+   boost_id_ = s->Set(std::move(boost));
++  if (timings_.first_applied.is_zero()) {
++    timings_.first_applied = base::TimeTicks::Now() - started_;
++  }
+   css_ = check.css;
+   problems_ = check.problems;
+   applied_ = true;
+@@ -871,17 +927,25 @@ void BoostImprover::OnQuickHideChecked(boost_ai::Answer answer,
+     boost.css = check.css;
+   }
+   std::vector<std::string> hid, left;
++  // Something hidden that the AI didn't name: its own sentence says it
++  // better than a selector.
++  bool unnamed = false;
+   for (size_t i = 0; i < hide.size(); ++i) {
+     const std::string label =
+         labels[i].empty() ? SelectorLabel(hide[i]) : labels[i];
++    unnamed = unnamed || labels[i].empty();
+     const bool ok = safe.is_list() &&
+                     std::ranges::contains(safe.GetList(), base::Value(hide[i]));
+     if (!ok) {
+       left.push_back(label);
+       continue;
+     }
+-    if (!std::ranges::contains(boost.zaps, hide[i])) {
+-      boost.zaps.push_back(hide[i]);
++    // A named Zap ("sel /* the Shorts shelf */"): the Zap list shows the
++    // name, each undone by itself there.
++    if (!std::ranges::any_of(boost.zaps, [&](const std::string& z) {
++          return ZapSelector(z) == hide[i];
++        })) {
++      boost.zaps.push_back(NamedZap(hide[i], labels[i]));
+     }
+     hid.push_back(label);
+     changes_.Append(base::DictValue()
+@@ -919,16 +983,22 @@ void BoostImprover::OnQuickHideChecked(boost_ai::Answer answer,
+     boost.name = !answer.name.empty() ? answer.name : host_;
+   }
+   boost_id_ = s->Set(std::move(boost));
++  timings_.first_applied = base::TimeTicks::Now() - started_;
+   applied_ = true;
+   ++applied_count_;
+   std::vector<std::string> parts;
+-  if (!hid.empty()) {
++  if (!hid.empty() && unnamed && !answer.summary.empty()) {
++    parts.push_back(answer.summary);
++  } else if (!hid.empty()) {
+     parts.push_back(L("Hid: ", "Скрыл: ") + Join(hid, ", "));
+   }
+   if (restyled) {
+     const std::string what = Join(answer.changes, ", ");
+-    parts.push_back(what.empty() ? answer.summary
+-                                 : L("Changed: ", "Изменил: ") + what);
++    if (!what.empty()) {
++      parts.push_back(L("Changed: ", "Изменил: ") + what);
++    } else if (!std::ranges::contains(parts, answer.summary)) {
++      parts.push_back(answer.summary);
++    }
+   }
+   parts.push_back(not_hidden);
+   summary_ = Join(parts, " · ");
+@@ -946,6 +1016,20 @@ void BoostImprover::OnDeadline() {
+ }
+ 
+ void BoostImprover::Finish(std::string error) {
++  if (done_) {
++    // Where the time went (MERIDIAN_LOG), to compare with 1.5.2's one
++    // request.
++    LOG(INFO) << "Meridian Improve: " << (quick_ ? "quick" : "redesign")
++              << ", " << timings_.rounds << " round(s), "
++              << timings_.prompt_bytes << " prompt bytes, "
++              << timings_.images << " screenshot(s); AIs found after "
++              << timings_.detected.InMilliseconds() << " ms, page read at "
++              << timings_.page.InMilliseconds() << " ms, AI answering "
++              << timings_.ai.InMilliseconds() << " ms, first CSS at "
++              << timings_.first_applied.InMilliseconds() << " ms, done at "
++              << (base::TimeTicks::Now() - started_).InMilliseconds()
++              << " ms" << (error.empty() ? "" : " (" + error + ")");
++  }
+   run_weak_factory_.InvalidateWeakPtrs();
+   deadline_.Stop();
+   settle_.Stop();
+diff --git a/chrome/browser/meridian/boosts/boost_improver.h b/chrome/browser/meridian/boosts/boost_improver.h
+index a71f161881..e3d077461c 100644
+--- a/chrome/browser/meridian/boosts/boost_improver.h
++++ b/chrome/browser/meridian/boosts/boost_improver.h
+@@ -26,11 +26,11 @@ class AiService;
+ class BoostService;
+ struct Boost;
+ 
+-// Improve with AI for one tab. A direction ("убери шортсы", "bigger text") is
+-// done as asked in one quick round, as in 1.5.2: the page's outline and the
+-// direction go to the AI, its CSS and the things it hides (zaps, each with a
+-// label) reach the page at once (boost_ai::Classify). An empty direction, or
+-// one asking for a redesign, is a redesign in up to three rounds. The page is
++// Improve with AI for one tab. Boost's Improve is always one quick round, as
++// in 1.5.2: the page's outline and the direction (none: the site less
++// distracting, boost_ai::DeclutterWish) go to the AI, its CSS and the things
++// it hides (zaps, each with a label) reach the page at once. The redesign
++// in up to three rounds (Mode::kRedesign) is kept for Remix. The page is
+ // measured (boost_ai::ContextText) and, for the AIs that see pictures,
+ // photographed; the AI answers with CSS, which is checked
+ // (boost_ai::CheckCss) and saved into the boost, so the page shows it; then
+@@ -47,10 +47,19 @@ class BoostImprover {
+ 
+   // `boost_id`: the boost it goes into ("" or gone: the site's first, or a
+   // new one). `wish`: the person's direction. `provider` "": Settings > AI.
++  // kQuick: Boost's Improve, always: one round, the outline, no
++  // screenshot ("" wish: the site less distracting). kRedesign: the
++  // redesign in rounds with screenshots and a critique (the engine kept for
++  // Remix: Start with it, progress()/detail()/applied() for the status,
++  // Keep() to stop, changes_json() for the list; boost_ai::SystemPrompt,
++  // RoundPrompt, ContextText and CheckCss are its parts; boost_magic.ts
++  // its glow over the page).
++  enum class Mode { kQuick, kRedesign };
+   void Start(const std::string& boost_id,
+              const std::string& wish,
+              const std::string& provider,
+-             Done done);
++             Done done,
++             Mode mode = Mode::kQuick);
+   bool running() const { return !done_.is_null(); }
+   // "Designing… 1/3" and so on while it runs, else "".
+   const std::string& progress() const { return progress_; }
+@@ -73,6 +82,9 @@ class BoostImprover {
+   AiService* ai();
+   // The boost it changes, if there is one yet.
+   const Boost* Target();
++  // The AIs on this computer are known (the first Improve may wait for
++  // them to be looked for): the page is read.
++  void OnDetected();
+   void OnContext(base::Value context);
+   // A quick Improve: the page's outline, the AI's answer, its hides checked
+   // on the page.
+@@ -109,6 +121,21 @@ class BoostImprover {
+   std::string context_;
+   bool sees_images_ = false;
+   bool quick_ = false;
++  // The direction as the status lines quote it (the default: "less
++  // distraction").
++  std::string shown_wish_;
++  // Where an Improve's time goes, logged when it ends.
++  struct Timings {
++    base::TimeDelta detected;
++    base::TimeDelta page;
++    base::TimeDelta ai;
++    base::TimeDelta first_applied;
++    int rounds = 0;
++    int images = 0;
++    size_t prompt_bytes = 0;
++  };
++  Timings timings_;
++  base::TimeTicks ask_started_;
+   bool ru_ = false;
+   std::string outline_;
+   base::ListValue changes_;
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index 06cc6959cb..33def101d1 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -45,6 +45,7 @@ build_webui("build") {
+     "meridian/boost_editor.ts",
+     "meridian/boost_magic.html.ts",
+     "meridian/boost_magic.ts",
++    "meridian/improve_words.ts",
+     "meridian/chat.html.ts",
+     "meridian/chat.ts",
+     "meridian/mission.html.ts",
+diff --git a/chrome/browser/resources/webui_browser/app.html.ts b/chrome/browser/resources/webui_browser/app.html.ts
+index 44fc9afb8b..b0038b372c 100644
+--- a/chrome/browser/resources/webui_browser/app.html.ts
++++ b/chrome/browser/resources/webui_browser/app.html.ts
+@@ -111,7 +111,8 @@ export function getHtml(this: WebuiBrowserAppElement) {
+       </webui-browser-extensions-bar>
+     </meridian-site-control>
+     <meridian-boost-editor id="boostEditor" .url="${this.url_}"
+-        @boost-magic="${this.onBoostMagic_}">
++        @boost-magic="${this.onBoostMagic_}"
++        @meridian-show-settings="${this.onMeridianShowSettings_}">
+     </meridian-boost-editor>
+     <meridian-boost-magic id="boostMagic"></meridian-boost-magic>
+     <meridian-sidebar id="tabstrip" ?private="${this.private_}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/boost_editor.css b/chrome/browser/resources/webui_browser/meridian/boost_editor.css
+index 445c8681e7..57eb01243a 100644
+--- a/chrome/browser/resources/webui_browser/meridian/boost_editor.css
++++ b/chrome/browser/resources/webui_browser/meridian/boost_editor.css
+@@ -592,6 +592,21 @@ svg {
+   color: var(--meridian-text-muted);
+ }
+ 
++.zap-name {
++  flex: 1;
++  min-width: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++  text-align: start;
++  font: inherit;
++  color: inherit;
++}
++
++.zap-name:hover {
++  color: var(--meridian-text);
++}
++
+ .zap span {
+   flex: 1;
+   min-width: 0;
+@@ -653,13 +668,98 @@ textarea:focus {
+   font: 11.5px ui-monospace, Menlo, monospace;
+ }
+ 
++/* Improve's button: a strong blue whatever the space's colour (a pale space
++ * made it look disabled), pressed when clicked; while it works it stays
++ * full strength and says what's going on. */
+ .primary {
+-  height: 32px;
++  min-height: 32px;
++  padding: 6px 10px;
+   border-radius: 9px;
+   text-align: center;
+-  background: var(--meridian-space);
++  background: #0277f8;
+   color: white;
+   font-weight: 600;
++  line-height: 1.25;
++  transition: transform 80ms ease, filter 80ms ease;
++}
++
++.primary:hover {
++  filter: brightness(1.06);
++}
++
++.primary:active,
++.primary.busy {
++  transform: scale(0.97);
++  filter: brightness(0.92);
++}
++
++.primary.busy {
++  cursor: progress;
++}
++
++.line.primary,
++.line.primary:hover {
++  background: #0277f8;
++  color: white;
++}
++
++.line.primary .spark {
++  color: white;
++}
++
++/* What Improve did so far: a line per step, the current one pulsing. */
++.steps {
++  margin: 0;
++  padding: 0;
++  list-style: none;
++  display: flex;
++  flex-direction: column;
++  gap: 3px;
++  font-size: 12px;
++  color: var(--meridian-text-muted);
++}
++
++.steps li {
++  position: relative;
++  padding-left: 16px;
++}
++
++.steps li::before {
++  position: absolute;
++  left: 2px;
++  content: '✓';
++  color: #2f9e5b;
++}
++
++.steps li.now {
++  color: var(--meridian-text);
++}
++
++.steps li.now::before {
++  content: '•';
++  color: #0277f8;
++  animation: step-pulse 1s ease-in-out infinite;
++}
++
++@keyframes step-pulse {
++  50% {
++    opacity: 0.3;
++  }
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .steps li.now::before {
++    animation: none;
++  }
++
++  .primary {
++    transition: none;
++  }
++}
++
++.say {
++  align-self: flex-start;
++  font-size: 12px;
+ }
+ 
+ .note {
+diff --git a/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts b/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts
+index eb36b53491..e439e6e7d3 100644
+--- a/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/boost_editor.html.ts
+@@ -6,6 +6,7 @@ import {html} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+ import type {MeridianBoostEditorElement} from './boost_editor.js';
+ import {icon} from './icons.js';
++import {zapName, zapSelector} from './improve_words.js';
+ 
+ export function getHtml(this: MeridianBoostEditorElement) {
+   return html`<!--_html_template_start_-->
+@@ -121,7 +122,8 @@ ${this.boost_ ? html`
+   </button>
+   ${this.boost_.zaps.map((z, i) => html`
+     <div class="zap">
+-      <span title="${z}">${z}</span>
++      <button class="zap-name" data-index="${i}" title="${zapSelector(z)}"
++          @click="${this.onZapPeekClick_}">${zapName(z)}</button>
+       <button class="zap-x" data-index="${i}" title="Show it again"
+           @click="${this.onZapRemoveClick_}">${icon('x', 12)}</button>
+     </div>`)}
+@@ -143,50 +145,32 @@ ${this.boost_ ? html`
+         Save</button>
+     </div>` : ''}
+ 
+-  <button id="improveToggle" class="line ${this.improveOpen_ ? 'on' : ''}"
+-      @click="${this.onImproveToggleClick_}">
+-    <span class="grow">Improve with AI</span>
+-    <span class="anim spark">${icon('sparkles', 16)}</span>
+-  </button>
+-  ${this.improveOpen_ ? html`
+-    <div class="improve">
+-      <textarea id="wish" rows="2"
+-          placeholder="What to change: “hide Shorts”, “bigger text”, “dark”. Empty or “redesign”: a whole new look"></textarea>
+-      <button id="improve" class="primary ${this.improving_ ? 'magic' : ''}"
+-          ?disabled="${this.improveDisabled_()}"
+-          @click="${this.onImproveClick_}">${this.improveLabel_()}</button>
+-      ${this.improving_ && this.detail_ ? html`
+-        <div id="improveStatus" class="note" role="status">
+-          <span>${this.detail_}</span>
+-        </div>` : ''}
+-      ${this.canKeep_ ? html`
+-        <button id="keepImprove" class="line"
+-            @click="${this.onKeepClick_}">
+-          <span class="grow">${this.keepLabel_()}</span></button>` : ''}
+-      ${this.note_ ? html`
+-        <div id="note" class="note ${this.noteError_ ? 'err' : ''}">
+-          <span>${this.note_}</span>
+-          ${this.canUndo_ ? html`
+-            <button id="undo" class="link" @click="${this.onUndoClick_}">
+-              ${this.ru_ ? 'Отменить' : 'Undo'}</button>` : ''}
+-        </div>` : ''}
+-      ${this.changes_.length ? html`
+-        <div id="changes" class="changes">
+-          ${this.changes_.map((c, i) => html`
+-            <div class="change ${c.kind} ${c.undone ? 'undone' : ''}">
+-              <button class="change-peek" data-index="${i}"
+-                  title="${c.selector || c.label}"
+-                  ?disabled="${!c.selector}"
+-                  @click="${this.onChangePeekClick_}">
+-                ${icon(c.kind === 'hide' ? 'eyeOff' : 'wand', 12)}
+-                <span>${c.label}</span></button>
+-              ${!c.undone ? html`
+-                <button class="change-undo link" data-index="${i}"
+-                    @click="${this.onChangeUndoClick_}">
+-                  ${this.undoChangeLabel_()}</button>` : ''}
+-            </div>`)}
+-        </div>` : ''}
+-    </div>` : ''}
++  <div class="improve">
++    <button id="improve" aria-busy="${this.improving_}"
++        title="${this.improveTitle_()}"
++        class="line primary ${this.improving_ ? 'magic busy' : ''}"
++        ?disabled="${this.improveDisabled_()}"
++        @click="${this.onImproveClick_}">
++      <span class="grow">${this.improveLabel_()}</span>
++      <span class="anim spark">${icon('sparkles', 16)}</span>
++    </button>
++    ${this.improveHint_() ? html`
++      <div id="improveHint" class="note">
++        <span>${this.improveHint_()}</span></div>` : ''}
++    ${this.steps_.length ? html`
++      <ol id="improveStatus" class="steps" role="status" aria-live="polite">
++        ${this.steps_.map((line, i) => html`
++          <li class="${this.improving_ && i === this.steps_.length - 1 ?
++              'now' : 'done'}">${line}</li>`)}
++      </ol>` : ''}
++    ${this.note_ ? html`
++      <div id="note" class="note ${this.noteError_ ? 'err' : ''}">
++        <span>${this.note_}</span>
++        ${this.canUndo_ ? html`
++          <button id="undo" class="link" @click="${this.onUndoClick_}">
++            ${this.words_().undo}</button>` : ''}
++      </div>` : ''}
++  </div>
+ 
+   <button id="delete" class="line danger ${this.confirmDelete_ ? 'confirm' : ''}"
+       @click="${this.onDeleteClick_}">
+diff --git a/chrome/browser/resources/webui_browser/meridian/boost_editor.ts b/chrome/browser/resources/webui_browser/meridian/boost_editor.ts
+index dcdd5336ff..346caa8e1b 100644
+--- a/chrome/browser/resources/webui_browser/meridian/boost_editor.ts
++++ b/chrome/browser/resources/webui_browser/meridian/boost_editor.ts
+@@ -17,6 +17,7 @@ import type {Boost, SidebarHandlerInterface} from '../sidebar.mojom-webui.js';
+ 
+ import {getCss} from './boost_editor.css.js';
+ import {getHtml} from './boost_editor.html.js';
++import {improveInRussian, improveWords, zapSelector} from './improve_words.js';
+ 
+ // A font as the grid shows it.
+ export interface BoostFont {
+@@ -125,13 +126,12 @@ export class MeridianBoostEditorElement extends CrLitElement {
+       signingIn_: {state: true, type: Boolean},
+       adjustOpen_: {state: true, type: Boolean},
+       codeOpen_: {state: true, type: Boolean},
+-      improveOpen_: {state: true, type: Boolean},
+       improving_: {state: true, type: Boolean},
+       progress_: {state: true, type: String},
+       detail_: {state: true, type: String},
+-      canKeep_: {state: true, type: Boolean},
+-      changes_: {state: true, type: Array},
+       ru_: {state: true, type: Boolean},
++      steps_: {state: true, type: Array},
++      ran_: {state: true, type: Boolean},
+       zapping_: {state: true, type: Boolean},
+       note_: {state: true, type: String},
+       noteError_: {state: true, type: Boolean},
+@@ -156,18 +156,17 @@ export class MeridianBoostEditorElement extends CrLitElement {
+   private signInPoll_: number|null = null;
+   protected accessor adjustOpen_: boolean = false;
+   protected accessor codeOpen_: boolean = false;
+-  protected accessor improveOpen_: boolean = false;
+   protected accessor improving_: boolean = false;
+   // Where a running Improve is ("Designing… 1/3").
+   protected accessor progress_: string = '';
+   // What it's doing ("read 812 elements of the page · “hide Shorts”").
+   protected accessor detail_: string = '';
+-  // A redesign with a round on the page: "Enough, keep this" stops it.
+-  protected accessor canKeep_: boolean = false;
+-  // What the last Improve changed, each to look at and to undo by itself.
+-  protected accessor changes_: ImproveChange[] = [];
+   // The person wrote in Russian: the editor's words for Improve follow.
+-  protected accessor ru_: boolean = false;
++  protected accessor ru_: boolean = improveInRussian();
++  // What Improve did so far, line by line (the last one is going on).
++  protected accessor steps_: string[] = [];
++  // Improve ran in this editor: its result card is in sight.
++  protected accessor ran_: boolean = false;
+   private progressTimer_: number = 0;
+   protected accessor zapping_: boolean = false;
+   // What Improve did, or why it couldn't.
+@@ -245,9 +244,11 @@ export class MeridianBoostEditorElement extends CrLitElement {
+     this.boost_ = boost;
+     this.adjustOpen_ = false;
+     this.codeOpen_ = !!(boost.css || boost.js);
+-    this.improveOpen_ = false;
+     this.note_ = '';
+     this.canUndo_ = false;
++    this.ran_ = false;
++    this.steps_ = [];
++    this.ru_ = improveInRussian();
+     this.confirmDelete_ = false;
+     this.open = true;
+   }
+@@ -468,13 +469,16 @@ export class MeridianBoostEditorElement extends CrLitElement {
+     return this.zapping_ ? 'Zapping… Esc to stop' : 'Zap';
+   }
+ 
++  protected words_() {
++    return improveWords(this.ru_);
++  }
++
+   protected improveLabel_(): string {
+     if (this.improving_) {
+-      return this.progress_ ||
+-          (this.ru_ ? 'Смотрю страницу…' : 'Looking at the page…');
++      return this.progress_ || this.words_().looking;
+     }
+     if (this.aiLabel_) {
+-      return `Improve with ${this.aiLabel_}`;
++      return this.words_().button;
+     }
+     if (this.signingIn_) {
+       return 'Waiting for you to sign in…';
+@@ -482,12 +486,29 @@ export class MeridianBoostEditorElement extends CrLitElement {
+     // "Sign in to Claude to use AI" for Claude Code.
+     return this.aiSignIn_ ?
+         `Sign in to ${this.aiSignInLabel_.replace(/ Code$/, '')} to use AI` :
+-        'Set up an AI in Settings';
++        this.words_().setUp;
++  }
++
++  // Who answers: "Improve with Claude Code".
++  protected improveTitle_(): string {
++    return this.aiLabel_ ? `Improve with ${this.aiLabel_}` : '';
+   }
+ 
++  // Under the button before the first run: what one click does, and who.
++  protected improveHint_(): string {
++    if (this.ran_ || this.improving_) {
++      return '';
++    }
++    if (!this.aiLabel_ && !this.aiSignIn_) {
++      return this.words_().noAi;
++    }
++    return this.aiLabel_ ? this.words_().hint(this.aiLabel_) : '';
++  }
++
++  // Never greyed out while it works or before it can: it says what's going
++  // on instead (only a sign-in in progress waits).
+   protected improveDisabled_(): boolean {
+-    return this.improving_ || this.signingIn_ ||
+-        (!this.aiLabel_ && !this.aiSignIn_);
++    return this.signingIn_;
+   }
+ 
+   // Signed out: its own sign-in in Terminal, then the button works by itself.
+@@ -710,6 +731,15 @@ export class MeridianBoostEditorElement extends CrLitElement {
+     this.zapping_ = false;
+   }
+ 
++  // A Zap's name: the page shows what it hides, for a moment.
++  protected onZapPeekClick_(e: Event) {
++    const z = this.boost_?.zaps[Number(
++        (e.currentTarget as HTMLElement).dataset['index'])];
++    if (z) {
++      this.handler_.peekBoostChange(zapSelector(z), true);
++    }
++  }
++
+   protected onZapRemoveClick_(e: Event) {
+     const index = Number((e.currentTarget as HTMLElement).dataset['index']);
+     const zaps = [...(this.boost_?.zaps || [])];
+@@ -727,123 +757,62 @@ export class MeridianBoostEditorElement extends CrLitElement {
+     this.change_({css: css?.value || '', js: js?.value || ''});
+   }
+ 
+-  protected async onImproveToggleClick_() {
+-    this.improveOpen_ = !this.improveOpen_;
+-    // An AI set up since the editor opened.
+-    await this.reload_();
+-  }
+ 
+   protected async onImproveClick_() {
+-    if (!this.boost_) {
++    if (!this.boost_ || this.improving_) {
+       return;
+     }
++    if (!this.aiLabel_) {
++      // An AI set up since the editor opened?
++      await this.reload_();
++    }
+     if (!this.aiLabel_ && this.aiSignIn_) {
+       return this.signIn_();
+     }
+-    const wish = this.shadowRoot.querySelector<HTMLTextAreaElement>('#wish');
+-    const text = wish?.value.trim() || '';
+-    this.ru_ = /[\u0400-\u04ff]/.test(text);
++    if (!this.aiLabel_) {
++      // No AI at all: where to connect one, one click away.
++      this.fire('meridian-show-settings', 'ai');
++      return;
++    }
++    this.ru_ = improveInRussian();
+     this.before_ = {...this.boost_};
++    // At once, before anything comes back: it's working, and on what.
+     this.improving_ = true;
++    this.ran_ = true;
++    this.steps_ = [this.words_().looking];
+     this.note_ = '';
+     this.canUndo_ = false;
+-    this.canKeep_ = false;
+-    this.changes_ = [];
+     this.progress_ = '';
+     this.detail_ = '';
+-    // As it goes: "Asking Claude…", "Found: …"; a redesign's rounds.
++    // As it goes, line by line: "Asking Claude Code…", "Found: …".
+     clearInterval(this.progressTimer_);
+-    // The page shows it too (boost_magic.ts): the glow, what it's doing, a
+-    // soft reveal of each round's CSS.
+-    const keep = () => this.onKeepClick_();
+-    this.fire('boost-magic', {
+-      state: 'running',
+-      label: this.ru_ ? 'Смотрю страницу…' : 'Looking at the page…',
+-    });
+     this.progressTimer_ = setInterval(async () => {
+-      const {progress, detail, applied, redesign} =
+-          await this.handler_.getImproveProgress();
++      const {progress, detail} = await this.handler_.getImproveProgress();
+       if (this.improving_ && progress) {
+         this.progress_ = progress;
+         this.detail_ = detail;
+-        this.canKeep_ = redesign && applied > 0;
+-        this.fire('boost-magic', {
+-          state: 'running',
+-          label: progress,
+-          detail,
+-          applied,
+-          stop: this.canKeep_ ? keep : undefined,
+-          stopLabel: this.keepLabel_(),
+-        });
++        const line = detail ? `${progress} ${detail}` : progress;
++        if (this.steps_.at(-1) !== line) {
++          // The same step with more detail replaces its line.
++          this.steps_ = this.steps_.at(-1) &&
++                  line.startsWith(this.steps_.at(-1)!) ?
++              [...this.steps_.slice(0, -1), line] :
++              [...this.steps_, line];
++        }
+       }
+-    }, 300);
+-    const {error, summary, changes} =
+-        await this.handler_.improveBoost(this.boost_.id, text, '');
++    }, 150);
++    const {error, summary} =
++        await this.handler_.improveBoost(this.boost_.id, '', '');
+     clearInterval(this.progressTimer_);
+     this.progress_ = '';
+     this.detail_ = '';
+-    this.canKeep_ = false;
+-    this.fire('boost-magic', error ? {state: 'off'} : {
+-      state: 'done',
+-      doneText: summary,
+-      undo: () => this.onUndoClick_(),
+-    });
+     this.improving_ = false;
+     this.noteError_ = !!error;
+     this.note_ = error || summary;
+     this.canUndo_ = !error;
+-    try {
+-      this.changes_ = error ? [] : (JSON.parse(changes || '[]') as ImproveChange[]);
+-    } catch {
+-      this.changes_ = [];
+-    }
+     await this.reload_();
+   }
+ 
+-  protected keepLabel_(): string {
+-    return this.ru_ ? 'Хватит, оставить так' : 'Enough, keep this';
+-  }
+-
+-  // "Enough, keep this": the redesign stops with what's on the page.
+-  protected onKeepClick_() {
+-    this.canKeep_ = false;
+-    this.handler_.stopImprove();
+-  }
+-
+-  // A change in the list: the page shows it for a moment.
+-  protected onChangePeekClick_(e: Event) {
+-    const c = this.changes_[Number(
+-        (e.currentTarget as HTMLElement).dataset['index'])];
+-    if (c?.selector) {
+-      this.handler_.peekBoostChange(c.selector, c.kind === 'hide' && !c.undone);
+-    }
+-  }
+-
+-  // A change in the list undone by itself: a hidden thing back, or the
+-  // CSS as it was before Improve.
+-  protected onChangeUndoClick_(e: Event) {
+-    const index = Number((e.currentTarget as HTMLElement).dataset['index']);
+-    const c = this.changes_[index];
+-    if (!c || c.undone || !this.boost_) {
+-      return;
+-    }
+-    if (c.kind === 'hide') {
+-      this.change_({zaps: this.boost_.zaps.filter((z) => z !== c.selector)});
+-    } else {
+-      this.change_({css: this.before_?.css || ''});
+-    }
+-    this.changes_ = this.changes_.map(
+-        (x, i) => i === index ? {...x, undone: true} : x);
+-    if (this.changes_.every((x) => x.undone)) {
+-      this.fire('boost-magic', {state: 'off'});
+-      this.canUndo_ = false;
+-    }
+-  }
+-
+-  protected undoChangeLabel_(): string {
+-    return this.ru_ ? 'Вернуть' : 'Undo';
+-  }
+-
+   protected async onUndoClick_() {
+     this.fire('boost-magic', {state: 'off'});
+     if (this.before_) {
+@@ -851,8 +820,7 @@ export class MeridianBoostEditorElement extends CrLitElement {
+       await this.handler_.setBoost(this.before_);
+     }
+     this.canUndo_ = false;
+-    this.changes_ = [];
+-    this.note_ = this.ru_ ? 'Отменено.' : 'Undone.';
++    this.note_ = this.words_().undone;
+     this.noteError_ = false;
+   }
+ 
+diff --git a/chrome/browser/resources/webui_browser/meridian/improve_words.ts b/chrome/browser/resources/webui_browser/meridian/improve_words.ts
+new file mode 100644
+index 0000000000..9dbae4e390
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/improve_words.ts
+@@ -0,0 +1,53 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Boost's Improve with AI, as in 1.5.2 and simpler: one button makes the
++// site less distracting in one quick round, and what it hides becomes the
++// site's Zaps, each with its name. Its words in Russian or English (the
++// browser's language).
++
++export function improveInRussian(): boolean {
++  return (document.documentElement.lang || navigator.language || '')
++      .toLowerCase()
++      .startsWith('ru');
++}
++
++// A Zap the AI picked carries its name as a comment ("ytd-rich-shelf-renderer
++// [is-shorts] /* the Shorts shelf */", boost_improver.cc): the name for the
++// list, the selector for the page.
++const NAMED = /^(.*?)\s*\/\*\s*(.*?)\s*\*\/\s*$/s;
++
++export function zapName(zap: string): string {
++  const m = zap.match(NAMED);
++  return m && m[2] ? m[2] : zap;
++}
++
++export function zapSelector(zap: string): string {
++  const m = zap.match(NAMED);
++  return m ? m[1]! : zap;
++}
++
++export function improveWords(ru: boolean) {
++  return ru ? {
++    button: 'Убрать лишнее',
++    looking: 'Смотрю страницу…',
++    hint: (ai: string) => `${ai} спрячет то, что отвлекает: полки Shorts, ` +
++        'счётчики, промо-баннеры, всплывашки. Каждое станет Zap — вернуть ' +
++        'можно по одному.',
++    undo: 'Отменить всё',
++    undone: 'Отменено.',
++    setUp: 'Открыть Настройки › ИИ',
++    noAi: 'Нет ИИ для Improve: подключите Claude Code, Codex или ключ API.',
++  } : {
++    button: 'Declutter',
++    looking: 'Looking at the page…',
++    hint: (ai: string) => `${ai} hides what distracts: Shorts shelves, ` +
++        'counters, promo banners, popups. Each becomes a Zap you can bring ' +
++        'back one by one.',
++    undo: 'Undo all',
++    undone: 'Undone.',
++    setUp: 'Open Settings › AI',
++    noAi: 'No AI for Improve yet: connect Claude Code, Codex or an API key.',
++  };
++}
