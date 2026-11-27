@@ -139,3 +139,61 @@ test('Peek: Open as Tab ▾ opens it as a tab in another space', async () => {
     ws.close();
   } finally { await b.close(); site.close(); }
 });
+
+// 27.11: a site opened with ⌘T while a pinned tab (the Workbench) was shown became a Peek over it
+// once the person clicked a link inside the site and switched away. The browser makes the shown tab
+// the opener of what ⌘T opens; the sidebar used to weigh that opener again on any change of the tab
+// (and a tab closed before its first page kept that going). A tab the person opened is a tab.
+test('a site opened with ⌘T over a pinned tab stays a tab: links inside it and switching away make no Peek', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(req.url.startsWith('/app')
+      ? `<title>App</title><a id=blank target=_blank href="about:blank">blank</a>`
+      : req.url.startsWith('/site2') ? `<title>Site inside</title><h1>inside</h1>`
+      : `<title>Site</title><a id=next href="/site2">next</a>`);
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+  const app = `http://127.0.0.1:${port}/app`;
+  const other = `http://localhost:${port}/site`;
+  const b = await launch([app]);
+  try {
+    await b.waitFor(today(1));
+    await b.menu(`${SB}.querySelector('meridian-tab-row')`, 'Pin Tab');
+    await b.waitFor(`!!${itemEl('App')}`);
+    // Something opened from the pinned page and closed before it had a page (as Workbench's tabs can).
+    const page = await b.page(app);
+    const click = (pg, id) => pg.cdp.send('Runtime.evaluate', { expression: `document.getElementById('${id}').click()`, userGesture: true });
+    await click(page, 'blank');
+    page.close();
+    await b.waitFor(today(1));
+    await b.eval(`app.$.tabstrip.closeTab((${SB}.querySelector('meridian-tab-row')).tab.id)`);
+    await b.waitFor(today(0));
+    await b.click(`${itemEl('App')}.shadowRoot.querySelector('.row')`);
+    await b.waitFor(`${itemEl('App')}.shadowRoot.querySelector('.row.active')`);
+
+    // ⌘T (New Tab takes the same route into the bar), the other site typed, Return.
+    await b.click(`${SB}.getElementById('newTabButton')`);
+    await b.waitFor(`app.$.commandBar.open && app.$.commandBar.$.address.shadowRoot.querySelector('cr-searchbox-input')`);
+    await b.type(other);
+    await new Promise((r) => setTimeout(r, 400));
+    await b.key('Enter', 'Enter', 13);
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive)?.tab.title === 'Site'`);
+    // A link inside the site, then away to the pinned tab and back.
+    const site = await b.page(other);
+    await click(site, 'next');
+    site.close();
+    await b.waitFor(`[...${SB}.querySelectorAll('meridian-tab-row')].find((r) => r.tab.isActive)?.tab.title === 'Site inside'`,
+        10000, `({ peek: ${CR}.hasAttribute('peek'), today: [...${SB}.querySelectorAll('meridian-tab-row')].map((r) => r.tab.title) })`);
+    await b.click(`${itemEl('App')}.shadowRoot.querySelector('.row')`);
+    await b.waitFor(`${itemEl('App')}.shadowRoot.querySelector('.row.active')`);
+    await new Promise((r) => setTimeout(r, 1000));
+    assert.equal(await b.eval(`${CR}.hasAttribute('peek')`), false, 'no Peek over the pinned tab');
+    await b.waitFor(today(1));
+    await b.click(`${SB}.querySelector('meridian-tab-row')`);
+    await b.waitFor(`${SB}.querySelector('meridian-tab-row').tab.isActive`);
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(await b.eval(`${CR}.hasAttribute('peek')`), false, 'the site is shown as a tab');
+    assert.equal((await b.tabs()).find((t) => t.active)?.title, 'Site inside');
+  } finally { await b.close(); server.close(); }
+});
