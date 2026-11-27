@@ -222,9 +222,8 @@ test('first run, no Claude Desktop, Claude Code signed out: the tour signs it in
     await b.click('app.$.locationIconButton');
     await b.waitFor(`app.$.siteControl.open && !!${SC}.querySelector('#boostRow, .boost-row')`);
     await b.click(`${SC}.querySelector('#boostRow')`);
-    await b.waitFor(`app.$.boostEditor.open && !!${BE}.getElementById('improveToggle')`);
-    await b.eval(`${BE}.getElementById('improveToggle').click()`);
-    await b.waitFor(`${BE}.getElementById('improve')?.textContent.trim() === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve')?.textContent`);
+    await b.waitFor(`app.$.boostEditor.open && !!${BE}.getElementById('improve')`);
+    await b.waitFor(`${BE}.getElementById('improve')?.title === 'Improve with Claude Code' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve')?.textContent`);
     await b.eval(`${BE}.getElementById('improve').click()`);
     await b.waitFor(`${BE}.getElementById('note')?.textContent.includes('Hid the banner.')`, 20000, `${BE}.getElementById('note')?.textContent`);
   } finally { await b.close(); server.close(); fs.rmSync(profile, { recursive: true, force: true }); f.clean(); }
@@ -242,8 +241,7 @@ test('Improve with AI, Claude Code signed out: "Sign in to Claude to use AI" sta
     await b.click('app.$.locationIconButton');
     await b.waitFor(`app.$.siteControl.open && !!${SC}.querySelector('#boostRow, .boost-row')`);
     await b.click(`${SC}.querySelector('#boostRow')`);
-    await b.waitFor(`app.$.boostEditor.open && !!${BE}.getElementById('improveToggle')`);
-    await b.eval(`${BE}.getElementById('improveToggle').click()`);
+    await b.waitFor(`app.$.boostEditor.open && !!${BE}.getElementById('improve')`);
     await b.waitFor(`${BE}.getElementById('improve')?.textContent.trim() === 'Sign in to Claude to use AI' && !${BE}.getElementById('improve').disabled`, 15000, `${BE}.getElementById('improve')?.textContent`);
     await b.eval(`${BE}.getElementById('improve').click()`);
     for (let i = 0; i < 50 && !fs.existsSync(f.signins); i++) await sleep(100);
@@ -251,7 +249,7 @@ test('Improve with AI, Claude Code signed out: "Sign in to Claude to use AI" sta
     // (The stand-in writes its log before the editor hears the sign-in started: wait for the note.)
     await b.waitFor(`/Finish signing in/.test(${BE}.getElementById('note')?.textContent || '')`, 10000, `${BE}.getElementById('note')?.textContent`);
     fs.writeFileSync(path.join(f.home, '.claude', 'signed-in'), '');
-    await b.waitFor(`${BE}.getElementById('improve').textContent.trim() === 'Improve with Claude Code'`, 20000, `${BE}.getElementById('improve').textContent`);
+    await b.waitFor(`${BE}.getElementById('improve').title === 'Improve with Claude Code'`, 20000, `${BE}.getElementById('improve').textContent`);
     await b.eval(`${BE}.getElementById('improve').click()`);
     await b.waitFor(`${BE}.getElementById('note')?.textContent.includes('Hid the banner.')`, 20000, `${BE}.getElementById('note')?.textContent + ' / ' + ${BE}.getElementById('improve')?.textContent + ' / ' + app.$.boostEditor.open`);
     // Ask says the same, never a dead "Set up an AI".

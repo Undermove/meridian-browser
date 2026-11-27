@@ -217,10 +217,9 @@ for (const [name, skip] of machinesHere()) {
       await b.click('app.$.locationIconButton');
       await b.waitFor(`app.$.siteControl.open && !!${SC}.querySelector('#boostRow')`);
       await b.click(`${SC}.querySelector('#boostRow')`);
-      await b.waitFor(`app.$.boostEditor.open && !!${BE}.getElementById('improveToggle')`);
-      await b.eval(`${BE}.getElementById('improveToggle').click()`);
+      await b.waitFor(`app.$.boostEditor.open && !!${BE}.getElementById('improve')`);
       await sleep(1500);
-      const label = await b.waitFor(`${BE}.getElementById('improve')?.textContent.trim()`, 15000);
+      const label = await b.waitFor(`${BE}.getElementById('improve')?.title || ${BE}.getElementById('improve')?.textContent.trim()`, 15000);
       note('improveLabel', label);
       if (!code) {
         assert.doesNotMatch(label, /Improve with Claude Code/, 'Improve offers a Claude Code that isn’t installed');
