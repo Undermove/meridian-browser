@@ -206,7 +206,10 @@ test('Chats list on: sessions with their status from hooks, done-unseen clears w
     await type(wb, a, 'prompt');
     await wb.waitFor(`${row(a)}?.dataset.state === 'working'`, 10000);
     assert.ok(await wb.eval(`!!${row(a)}.querySelector('.ss-mark.working')`));
-    assert.match(await wb.eval(`${row(a)}.querySelector('.chat-words').textContent`), /^Working · Bash\(npm run e2e\)$/);
+    // "Working" comes with UserPromptSubmit, the tool with the next hook (PreToolUse): two hook processes.
+    // Mission Control sends its changes at most every 80 ms, so when the second hook starts later than
+    // that (a busy machine) the page first gets "Working" alone; the tool follows in the same state.
+    await wb.waitFor(`${row(a)}.querySelector('.chat-words').textContent === 'Working · Bash(npm run e2e)'`);
     await b.waitFor(`${badgeText} === 'working:'`);
 
     // Done, not seen: Alpha's turn ends while Gamma is on screen — blue, the sidebar says 1.
