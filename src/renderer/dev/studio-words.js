@@ -27,14 +27,49 @@
       inFolder: (n) => `Папка «${n}»`, reveal: 'Показать в Finder', more: 'Ещё',
       emptyTitle: 'Что сделаем?', emptyHint: 'Напишите задачу своими словами или выберите подсказку. Claude покажет каждый шаг, спросит разрешения и ничего не отправит наружу без вас.',
       roles: { designer: 'Дизайнер:', manager: 'Менеджер:', developer: 'Разработчику:', everyday: 'Можно так:' },
+      // Starters: each one complete, with what it needs asked inline and a result you see.
+      // need: 'site' (an open tab or an address) | 'text' (a few words) | '' (runs at once).
+      starters: {
+        designer: [
+          { id: 'restyle', label: 'Перекрась сайт под наш бренд', need: 'site', ask: 'Какой сайт перекрасить?',
+            prompt: (v) => `Перекрась сайт ${v} под наш бренд. Открой его в браузере (он уже открыт рядом со Studio), сделай скриншот «до». Возьми цвета и шрифты из brand.json в этой папке; если его нет — возьми основной цвет из логотипа сайта и собери из него спокойную палитру. Перекрась через Boost этого сайта (set_boost, только CSS), сделай скриншот «после». В конце в 2–3 строках скажи, что поменял.` },
+          { id: 'board', label: 'Собери референсы в доску', need: 'text', ask: 'О чём доска?', placeholder: 'например: кофейни в скандинавском стиле',
+            prompt: (v) => `Собери доску референсов на тему «${v}». Найди в интернете 9–12 хороших примеров (сайты, интерьеры, упаковка — что подходит теме). Сделай в папке «Черновики» файл board.html: сетка карточек — картинка (по прямой ссылке на изображение), короткая подпись, чем пример хорош, и ссылка на источник; светлый фон, аккуратная типографика. Ничего не публикуй. В конце одной строкой скажи, что получилось.` },
+          { id: 'audit', label: 'Найди несостыковки на странице', need: 'site', ask: 'Какую страницу проверить?',
+            prompt: (v) => `Проверь страницу ${v} (она открыта рядом со Studio) на несостыковки дизайна: разные оттенки одного цвета, разные шрифты и размеры у одинаковых элементов, разные отступы и скругления у похожих блоков, кнопки разного вида. Каждую найденную отметь на странице пином: [[pin: <CSS-селектор> | <что не так, коротко>]] — не больше 12. Ничего не меняй. В конце дай список по важности.` },
+        ],
+        manager: [
+          { id: 'report', label: 'Сделай отчёт по задачам за неделю', need: 'text', ask: 'Откуда взять задачи?', placeholder: 'ссылка на доску или пара слов',
+            prompt: (v) => `Сделай отчёт за неделю по задачам: ${v}. Сделай в папке «Черновики» файл report.html: что сделано, что в работе, что мешает, на одну страницу, без жаргона. Ничего никуда не отправляй.` },
+          { id: 'compare', label: 'Сравни два документа', need: 'text', ask: 'Какие два документа?', placeholder: 'ссылки или названия файлов',
+            prompt: (v) => `Сравни два документа: ${v}. Сделай в папке «Черновики» файл compare.html: они рядом, различия подсвечены, сверху — короткий итог, что поменялось.` },
+          { id: 'agenda', label: 'Подготовь повестку встречи', need: 'text', ask: 'О чём встреча?', placeholder: 'тема и кто будет',
+            prompt: (v) => `Подготовь повестку встречи: ${v}. Сделай в папке «Черновики» файл agenda.html: цель, пункты со временем, кто что готовит, решения, которые нужно принять.` },
+        ],
+        developer: [
+          { id: 'bug', label: 'Найди и почини баг на странице', need: 'site', ask: 'На какой странице?',
+            prompt: (v) => `На странице ${v} (она открыта рядом со Studio) найди, что сломано: ошибки в консоли, то, что не работает или съехало. Покажи пином [[pin: <селектор> | <что не так>]] и предложи исправление; если это наш проект в этой папке — поправь копию в «Черновиках».` },
+          { id: 'explain', label: 'Объясни, как устроен этот проект', need: '',
+            prompt: () => 'Объясни простыми словами, как устроен проект в этой папке. Сделай в папке «Черновики» файл overview.html: из чего он состоит, как части связаны (схема), откуда начать читать.' },
+        ],
+        everyday: [
+          { id: 'read', label: 'Сделай сайт удобнее для чтения', need: 'site', ask: 'Какой сайт?',
+            prompt: (v) => `Сделай сайт ${v} удобнее для чтения через Boost (только CSS): крупнее текст, спокойнее фон, шире межстрочный, убери отвлекающее. Скриншоты до и после.` },
+          { id: 'notes', label: 'Собери заметки из этих страниц', need: 'site', ask: 'Из какой страницы?',
+            prompt: (v) => `Собери главное со страницы ${v} в заметку: сделай в папке «Черновики» файл notes.html — суть в 5–7 пунктах, цитаты со ссылками.` },
+        ],
+      },
+      starterGo: 'Начать', starterOther: 'Другой адрес…', starterNoTabs: 'Откройте сайт во вкладке или вставьте адрес', starterCancel: 'Отмена',
       chips: {
-        designer: ['Перекрась сайт под наш бренд', 'Собери референсы в доску', 'Найди несостыковки в макете'],
+        designer: ['Перекрась сайт под наш бренд', 'Собери референсы в доску', 'Найди несостыковки на странице'],
         manager: ['Сделай отчёт по задачам за неделю', 'Сравни два документа', 'Подготовь повестку встречи'],
         developer: ['Найди и почини баг на странице', 'Объясни, как устроен этот проект'],
         everyday: ['Сделай сайт удобнее для чтения', 'Собери заметки из этих страниц'],
       },
       allow: 'Разрешить', once: 'Только в этот раз', no: 'Нет', allowed: 'Разрешено', denied: 'Не разрешено',
       answerInWorkbench: 'Ответить можно в Workbench', openWorkbench: 'Открыть Workbench',
+      trustFailed: 'Не получилось ответить на вопрос о папке — ответьте в Workbench',
+      allowOnce: 'Разрешить', allowTask: 'Разрешить всегда для этой задачи', whyAsk: 'Почему спрашиваем?',
       qAsks: 'Claude спрашивает', qOwn: 'Своими словами — в Workbench', qSend: 'Ответить', qAnswered: 'Ответ',
       filesTitle: 'Файлы по ходу работы', created: 'новый', changed: 'изменён', shot: 'скриншот', shots: 'Снимки', shotBefore: 'Было', shotAfter: 'Стало', wipeHint: 'было ← шторка → стало',
       siteBar: 'Результат', showSite: 'Показать живой сайт рядом', lastShot: 'последний снимок', boostUndo: 'Boost · можно отменить', boostUndone: 'Вернули как было',
@@ -43,7 +78,7 @@
       busy: 'Claude ещё работает — отправлю, когда закончит.', queued: 'В очереди',
       startedInWorkbench: 'Начато в Workbench: здесь Claude правит файлы сразу, без черновиков.',
       showPage: 'Открыть рядом', pageAlongside: 'Открыта рядом со Студией — меняется вместе с задачей.', outsideFolder: 'Этот файл лежит вне папки задачи: показать его здесь не получится.',
-      splitter: 'Ширина чата', splitterHint: 'Потяните, чтобы изменить ширину; двойной щелчок — как было', taskView: 'Задача',
+      splitter: 'Ширина чата', tasksSplitter: 'Ширина списка задач', splitterHint: 'Потяните, чтобы изменить ширину; двойной щелчок — как было', taskView: 'Задача',
       step: (i, n) => `шаг ${i} из ${n}`, noFiles: 'Здесь появятся файлы, которые Claude создаст или поменяет.',
       resultEmpty: 'Здесь будет результат: сайт, картинки и документы, которые получатся.',
       openFile: 'Показать в папке', taskFallback: 'Без названия', notStarted: 'Не удалось запустить Claude',
@@ -102,14 +137,47 @@
       inFolder: (n) => `Folder “${n}”`, reveal: 'Show in Finder', more: 'More',
       emptyTitle: 'What shall we make?', emptyHint: 'Describe the task in your own words or pick a suggestion. Claude shows every step, asks before it changes things and never sends anything out without you.',
       roles: { designer: 'Designer:', manager: 'Manager:', developer: 'Developer:', everyday: 'Try:' },
+      starters: {
+        designer: [
+          { id: 'restyle', label: 'Restyle our site in our brand', need: 'site', ask: 'Which site?',
+            prompt: (v) => `Restyle the site ${v} in our brand. Open it in the browser (it's already open next to Studio) and take a "before" screenshot. Take the colours and fonts from brand.json in this folder; if there is none, take the main colour from the site's logo and build a calm palette from it. Restyle it with this site's Boost (set_boost, CSS only) and take an "after" screenshot. Finish with 2–3 lines on what you changed.` },
+          { id: 'board', label: 'Collect references into a board', need: 'text', ask: 'What is the board about?', placeholder: 'e.g. Scandinavian-style coffee shops',
+            prompt: (v) => `Make a reference board about "${v}". Find 9–12 good examples on the web (sites, interiors, packaging — whatever fits). In the Drafts folder write board.html: a grid of cards — a picture (a direct image link), a short line on why it's good, and a link to the source; light background, tidy type. Publish nothing. Finish with one line on what you made.` },
+          { id: 'audit', label: 'Find inconsistencies on a page', need: 'site', ask: 'Which page should I check?',
+            prompt: (v) => `Check the page ${v} (open next to Studio) for design inconsistencies: different shades of one colour, different fonts and sizes on the same kind of element, different spacing and corner radii on similar blocks, buttons that don't match. Mark each one on the page with a pin: [[pin: <CSS selector> | <what's wrong, briefly>]] — at most 12. Change nothing. Finish with a list by importance.` },
+        ],
+        manager: [
+          { id: 'report', label: 'Write a weekly report from our tasks', need: 'text', ask: 'Where are the tasks?', placeholder: 'a board link or a few words',
+            prompt: (v) => `Write this week's report on the tasks: ${v}. In the Drafts folder make report.html: done, in progress, what's in the way — one page, no jargon. Send nothing anywhere.` },
+          { id: 'compare', label: 'Compare two documents', need: 'text', ask: 'Which two documents?', placeholder: 'links or file names',
+            prompt: (v) => `Compare two documents: ${v}. In the Drafts folder make compare.html: side by side, differences highlighted, a short summary of what changed on top.` },
+          { id: 'agenda', label: 'Prepare a meeting agenda', need: 'text', ask: 'What is the meeting about?', placeholder: 'topic and who comes',
+            prompt: (v) => `Prepare a meeting agenda: ${v}. In the Drafts folder make agenda.html: the goal, items with times, who prepares what, decisions to take.` },
+        ],
+        developer: [
+          { id: 'bug', label: 'Find and fix a bug on the page', need: 'site', ask: 'On which page?',
+            prompt: (v) => `On the page ${v} (open next to Studio) find what's broken: console errors, things that don't work or are misplaced. Pin each one [[pin: <selector> | <what's wrong>]] and suggest a fix; if it's our project in this folder, fix a copy in Drafts.` },
+          { id: 'explain', label: 'Explain how this project works', need: '',
+            prompt: () => 'Explain in plain words how the project in this folder works. In the Drafts folder make overview.html: what it is made of, how the parts connect (a diagram), where to start reading.' },
+        ],
+        everyday: [
+          { id: 'read', label: 'Make the site easier to read', need: 'site', ask: 'Which site?',
+            prompt: (v) => `Make the site ${v} easier to read with a Boost (CSS only): bigger text, calmer background, more line spacing, less distraction. Screenshots before and after.` },
+          { id: 'notes', label: 'Collect notes from a page', need: 'site', ask: 'Which page?',
+            prompt: (v) => `Collect the main points of the page ${v} into a note: in the Drafts folder make notes.html — the gist in 5–7 points, quotes with links.` },
+        ],
+      },
+      starterGo: 'Start', starterOther: 'Another address…', starterNoTabs: 'Open the site in a tab or paste its address', starterCancel: 'Cancel',
       chips: {
-        designer: ['Restyle our site in our brand', 'Collect references into a board', 'Find inconsistencies in the mockup'],
+        designer: ['Restyle our site in our brand', 'Collect references into a board', 'Find inconsistencies on a page'],
         manager: ['Write a weekly report from our tasks', 'Compare two documents', 'Prepare a meeting agenda'],
         developer: ['Find and fix a bug on the page', 'Explain how this project works'],
-        everyday: ['Make the site easier to read', 'Collect notes from these pages'],
+        everyday: ['Make the site easier to read', 'Collect notes from a page'],
       },
       allow: 'Allow', once: 'Just this once', no: 'No', allowed: 'Allowed', denied: 'Not allowed',
       answerInWorkbench: 'This one is answered in the Workbench', openWorkbench: 'Open Workbench',
+      trustFailed: 'Couldn’t answer the folder question here — answer it in the Workbench',
+      allowOnce: 'Allow', allowTask: 'Always allow for this task', whyAsk: 'Why are we asking?',
       qAsks: 'Claude asks', qOwn: 'In my own words — Workbench', qSend: 'Answer', qAnswered: 'Answer',
       filesTitle: 'Files from this task', created: 'new', changed: 'changed', shot: 'screenshot', shots: 'Snapshots', shotBefore: 'Before', shotAfter: 'After', wipeHint: 'before ← drag → after',
       siteBar: 'Result', showSite: 'Show the live site alongside', lastShot: 'latest snapshot', boostUndo: 'Boost · can be undone', boostUndone: 'Back as it was',
@@ -118,7 +186,7 @@
       busy: 'Claude is still working — I’ll send it when it’s done.', queued: 'Queued',
       startedInWorkbench: 'Started in the Workbench: here Claude edits files directly, without drafts.',
       showPage: 'Open alongside', pageAlongside: 'Open next to Studio — it changes along with the task.', outsideFolder: 'This file is outside the task’s folder: it can’t be shown here.',
-      splitter: 'Chat width', splitterHint: 'Drag to change the width; double-click to reset', taskView: 'Task',
+      splitter: 'Chat width', tasksSplitter: 'Task list width', splitterHint: 'Drag to change the width; double-click to reset', taskView: 'Task',
       step: (i, n) => `step ${i} of ${n}`, noFiles: 'Files Claude creates or changes show up here.',
       resultEmpty: 'The result shows here: the site, pictures and documents it makes.',
       openFile: 'Show in folder', taskFallback: 'Untitled', notStarted: 'Couldn’t start Claude',
@@ -320,7 +388,73 @@
     return out;
   }
 
-  const api = { T, stepWords, askWords, questionsOf, host, handWords, stepDetail };
+  // A permission card in friendly words: what Claude wants to do and why, what it can't touch, and why
+  // Studio asks at all. `why`: Claude's own reason when there is one (the command's description, or
+  // what it last said), else none. {kind, icon, title, why, safe, whyAsk}.
+  function permWords(tool, summary, lang, why) {
+    const ru = lang === 'ru';
+    const s = String(summary || '');
+    const file = clip(s.split('/').filter(Boolean).pop() || '', 60);
+    const mcp = /^mcp__([^_]+(?:_[^_]+)*)__(.+)$/.exec(tool || '');
+    const reason = clip(String(why || '').replace(/[.!…]+$/, ''), 140);
+    const end = /[.!?…]$/.test(reason) ? '' : '.';
+    const so = reason ? (ru ? `Зачем: ${lowerFirst(reason)}${end}` : `Why: ${lowerFirst(reason)}${end}`) : '';
+    const inFolder = ru ? 'Меняется только папка этой задачи — ничего за её пределами.' : 'Only this task’s folder changes — nothing outside it.';
+    const W = (kind, icon, title, safe, whyAsk) => ({ kind, icon, title, why: so, safe, whyAsk });
+    if (tool === 'Write') {
+      return W('create', 'file', ru ? `Claude хочет создать файл ${file || ''}`.trim() : `Claude wants to create ${file || 'a file'}`, inFolder,
+        ru ? 'Studio спрашивает перед каждым новым файлом, чтобы на компьютере не появлялось ничего без вашего ведома.' : 'Studio asks before each new file so nothing appears on your computer without you knowing.');
+    }
+    if (/^(Edit|MultiEdit|NotebookEdit)$/.test(tool)) {
+      return W('edit', 'pencil', ru ? `Claude хочет изменить ${file || 'файл'}` : `Claude wants to change ${file || 'a file'}`,
+        ru ? 'Меняется копия в папке задачи, ваш оригинал остаётся как был. Всё можно вернуть.' : 'A copy in the task’s folder changes; your original stays as it was. Everything can be undone.',
+        ru ? 'Изменения в файлах — то, что вы точно захотите увидеть заранее.' : 'Changes to files are something you’ll want to see coming.');
+    }
+    if (tool === 'Bash' || tool === 'PowerShell') {
+      return W('run', 'terminal', ru ? 'Claude хочет выполнить команду на компьютере' : 'Claude wants to run a command on your computer',
+        ru ? 'Сама команда — в «Подробнее». Если она вам незнакома, нажмите «Нет»: Claude найдёт другой путь.' : 'The command itself is under Details. If it looks unfamiliar, say No: Claude will find another way.',
+        ru ? 'Команды могут менять что угодно на компьютере, поэтому каждую новую Studio показывает вам.' : 'Commands can change anything on the computer, so Studio shows you each new one.');
+    }
+    if (tool === 'WebFetch' || (mcp && mcp[1].toLowerCase().includes('meridian') && /^(navigate|open_tab)$/.test(mcp[2]))) {
+      const h = host(s) || (ru ? 'сайт' : 'a site');
+      return W('web', 'globe', ru ? `Claude хочет открыть ${h}` : `Claude wants to open ${h}`,
+        ru ? 'Только посмотреть страницу: ничего не отправляется и не покупается.' : 'Only to look at the page: nothing is sent or bought.',
+        ru ? 'Сайты видят, что их открыли, поэтому Studio спрашивает о новых адресах.' : 'Sites see they were opened, so Studio asks about new addresses.');
+    }
+    if (mcp && mcp[1].toLowerCase().includes('meridian') && mcp[2] === 'set_boost') {
+      return W('style', 'palette', ru ? 'Claude хочет перекрасить сайт' : 'Claude wants to restyle the site',
+        ru ? 'Меняется только вид у вас в браузере; одна кнопка возвращает как было.' : 'Only how it looks in your browser changes; one button puts it back.',
+        ru ? 'Вы должны знать, когда сайт выглядит не так, как у всех.' : 'You should know when a site looks different from what everyone else sees.');
+    }
+    if (mcp && mcp[1].toLowerCase().includes('meridian')) {
+      return W('browser', 'globe', ru ? 'Claude хочет действовать на открытой странице' : 'Claude wants to act on the open page',
+        ru ? 'Нажать или ввести текст — только на этой странице.' : 'To click or type — on this page only.',
+        ru ? 'Нажатия на сайте могут что-то отправить, поэтому Studio спрашивает.' : 'Clicks on a site can send something, so Studio asks.');
+    }
+    if (mcp && mcp[1].toLowerCase().includes('figma')) {
+      return W('figma', 'palette', ru ? 'Claude хочет посмотреть макет в Figma' : 'Claude wants to look at the Figma file',
+        ru ? 'Только чтение: в Figma ничего не меняется.' : 'Read only: nothing changes in Figma.',
+        ru ? 'Макеты — ваша работа; Studio спрашивает, прежде чем их читать.' : 'Designs are your work; Studio asks before reading them.');
+    }
+    if (tool === 'Read') {
+      return W('read', 'eye', ru ? `Claude хочет посмотреть ${file || 'файл'}` : `Claude wants to look at ${file || 'a file'}`,
+        ru ? 'Только прочитать: файл не меняется.' : 'Only to read it: the file doesn’t change.',
+        ru ? 'Этот файл вне папки задачи — поэтому спрашиваем.' : 'This file is outside the task’s folder — that’s why we ask.');
+    }
+    const [t] = askWords(tool, summary, lang);
+    return W('other', 'sparkles', t.replace(/^(Разрешить|Allow):\s*/, ru ? 'Claude хочет: ' : 'Claude wants to: ').replace(/\?$/, ''), '',
+      ru ? 'Studio спрашивает перед шагами, которые что-то меняют.' : 'Studio asks before steps that change things.');
+  }
+  function lowerFirst(t) { return t ? t.charAt(0).toLowerCase() + t.slice(1) : t; }
+
+  // A task's name from the first message: its first sentence, a few words.
+  function taskName(text) {
+    const one = String(text || '').replace(/\s+/g, ' ').trim().split(/(?<=[.!?…])\s/)[0];
+    if (one.length <= 48) return one;
+    return `${one.slice(0, 47).replace(/[\s,.:;—-]+\S*$/, '')}…`;
+  }
+
+  const api = { T, taskName, permWords, stepWords, askWords, questionsOf, host, handWords, stepDetail };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.StudioWords = api;
 })(typeof window !== 'undefined' ? window : globalThis);

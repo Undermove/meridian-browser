@@ -185,6 +185,34 @@ function stSwitchInTopbar() {
   sw.classList.add('in-topbar');
   bar.insertBefore(sw, bar.querySelector('.grow'));
   sw.addEventListener('click', stOnSwitch);
+  stPills(bar);
+}
+
+// A sliding pill under the picked button of a segmented control. It follows the `on` class (whoever
+// sets it) and the control's size.
+const stPillCtl = new WeakSet();
+function stPills(root) {
+  for (const box of (root || document).querySelectorAll('.st-switch, .st-viewseg, .st-seg')) {
+    if (stPillCtl.has(box)) continue;
+    stPillCtl.add(box);
+    const pill = document.createElement('i');
+    pill.className = 'st-pill';
+    pill.setAttribute('aria-hidden', 'true');
+    box.prepend(pill);
+    box.classList.add('has-pill');
+    const place = () => {
+      const on = box.querySelector(':scope > button.on');
+      if (!on || !on.offsetWidth) { pill.style.opacity = '0'; return; }
+      pill.style.opacity = '';
+      box.style.setProperty('--pill-x', `${on.offsetLeft}px`);
+      box.style.setProperty('--pill-w', `${on.offsetWidth}px`);
+    };
+    place();
+    // Placed first, animated from then on.
+    requestAnimationFrame(() => requestAnimationFrame(() => box.classList.add('pill-ready')));
+    new MutationObserver(place).observe(box, { subtree: true, attributes: true, attributeFilter: ['class'] });
+    new ResizeObserver(place).observe(box);
+  }
 }
 
 function stOnSwitch(e) {
@@ -237,6 +265,7 @@ function stBuild() {
       </div>
       <div class="st-split" id="st-split" role="separator" aria-orientation="vertical" tabindex="0" aria-label="${esc(w.splitter)}" title="${esc(w.splitterHint)}"><i></i></div>
       <div class="st-result" id="st-result"></div>
+      <div class="st-tsplit" id="st-tsplit" role="separator" aria-orientation="vertical" tabindex="0" aria-label="${esc(w.tasksSplitter)}" title="${esc(w.splitterHint)}"><i></i></div>
     </div>
     <div class="st-pick" id="st-pick" hidden></div>`;
   document.body.appendChild(el);
@@ -248,6 +277,8 @@ function stBuild() {
   });
   $('#st-board', el).addEventListener('click', stOnBoardClick);
   stSplitInit(el);
+  stTasksSplitInit(el);
+  stPills(el);
   $('.st-ctabs', el).addEventListener('click', (e) => {
     const p = e.target.closest('[data-pane]')?.dataset.pane;
     if (!p) return;
@@ -293,12 +324,11 @@ function stBuild() {
   });
   $('#st-chips', el).addEventListener('click', (e) => {
     if (e.target.closest('[data-unpick]')) { ST.picked = []; stRender(); return; }
-    const c = e.target.closest('[data-chip]');
-    if (!c) return;
-    const input = $('#st-input');
-    input.value = c.dataset.chip;
-    input.focus({ preventScroll: true });
-    input.setSelectionRange(input.value.length, input.value.length);
+    stOnStarterClick(e);
+  });
+  $('#st-chips', el).addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target.matches('.st-starter-in')) { e.preventDefault(); stStarterGo(); }
+    if (e.key === 'Escape' && ST.starter) { ST.starter = null; stRender(); $('#st-input').focus({ preventScroll: true }); }
   });
   $('#st-feed', el).addEventListener('click', stOnFeedClick);
   // Scrolled up to the top: the earlier part of the session.
@@ -541,7 +571,7 @@ function stRenderFeed(t) {
       <div class="st-ask-d">${esc(w.trustDetail(S.project?.name || ''))}</div>
       <div class="st-ask-btns"><button class="st-btn pri" data-trust="yes">${esc(w.allow)}</button><button class="st-btn" data-trust="no">${esc(w.no)}</button></div></div>`);
   }
-  for (const ask of mission.asks || []) parts.push(ask.tool === 'AskUserQuestion' ? stQuestionHtml(ask, k) : stAskHtml(ask));
+  for (const ask of mission.asks || []) parts.push(ask.tool === 'AskUserQuestion' ? stQuestionHtml(ask, k) : stAskHtml(ask, k));
   if (status === 'work' && !(mission.asks || []).length && !stHasRunningStep(m)) {
     parts.push(`<div class="st-thinking" data-key="thinking"><span class="st-shimmer">${esc(progress?.now || w.working)}</span></div>`);
   }
@@ -664,20 +694,35 @@ function stStepHtml(s, live, progress, status = 'work', checked = true) {
   return `<div class="st-step ${state}${more ? ' open' : ''}" data-step="${esc(s.id)}" title="${esc(STW().details)}"><span class="st-si">${icon(ic, 13)}</span><span class="st-st">${esc(text)}</span>${mark}${more}</div>`;
 }
 
-function stAskHtml(ask) {
+// Claude's own reason for the step it asks about: the first sentence of what it said last in this turn.
+function stAskReason(k) {
+  const turn = k?.model.turns.at(-1);
+  const text = turn?.items.filter((x) => x.type === 'text').at(-1)?.text || '';
+  return String(text).replace(/\s+/g, ' ').trim().split(/(?<=[.!?…])\s/)[0].slice(0, 160);
+}
+
+// A permission card: what Claude wants and why, in plain words; a picture for the kind of step; what
+// stays safe; «Почему спрашиваем?» folded. The look is the stylesheet's (data-kind, .st-perm-*).
+function stAskHtml(ask, k) {
   const w = STW();
-  const [title, detail] = StudioWords.askWords(ask.tool, ask.summary, ST.lang);
+  const p = StudioWords.permWords(ask.tool, ask.summary, ST.lang, stAskReason(k));
+  const [title] = StudioWords.askWords(ask.tool, ask.summary, ST.lang);
   const showDetail = ask.summary && (ask.tool === 'Bash' || ask.tool === 'PowerShell' || /^mcp__/.test(ask.tool || ''));
   const buttons = ask.answerable === false
     ? `<span class="st-ask-note">${esc(w.answerInWorkbench)}</span><button class="st-btn" data-go="workbench">${esc(w.openWorkbench)}</button>`
-    : `<button class="st-btn pri" data-answer="${ask.canAlways ? 'session' : 'allow'}" data-ask="${esc(ask.id)}">${esc(w.allow)}</button>`
-      + (ask.canAlways ? `<button class="st-btn" data-answer="allow" data-ask="${esc(ask.id)}">${esc(w.once)}</button>` : '')
-      + `<button class="st-btn" data-answer="deny" data-ask="${esc(ask.id)}">${esc(w.no)}</button>`;
-  return `<div class="st-ask" data-key="ask${esc(ask.id)}" data-title="${esc(title)}">
-    <div class="st-ask-q">${stDot('needs')}<span>${esc(title)}</span></div>
-    ${detail ? `<div class="st-ask-d">${esc(detail)}</div>` : ''}
-    ${showDetail ? `<details class="st-ask-more"><summary>${esc(w.details)}</summary><pre>${esc(String(ask.summary).slice(0, 1200))}</pre></details>` : ''}
-    <div class="st-ask-btns">${buttons}</div></div>`;
+    : `<button class="st-btn pri" data-answer="allow" data-ask="${esc(ask.id)}">${esc(w.allowOnce)}</button>`
+      + (ask.canAlways ? `<button class="st-btn" data-answer="session" data-ask="${esc(ask.id)}">${esc(w.allowTask)}</button>` : '')
+      + `<button class="st-btn ghost" data-answer="deny" data-ask="${esc(ask.id)}">${esc(w.no)}</button>`;
+  return `<div class="st-ask st-perm" data-key="ask${esc(ask.id)}" data-kind="${esc(p.kind)}" data-title="${esc(title)}" role="group" aria-label="${esc(p.title)}">
+    <div class="st-perm-ill" aria-hidden="true">${icon(p.icon, 18)}</div>
+    <div class="st-perm-body">
+      <div class="st-ask-q st-perm-title">${esc(p.title)}</div>
+      ${p.why ? `<div class="st-perm-why">${esc(p.why)}</div>` : ''}
+      ${p.safe ? `<div class="st-perm-safe">${icon('shield', 12)}<span>${esc(p.safe)}</span></div>` : ''}
+      ${showDetail ? `<details class="st-ask-more"><summary>${esc(w.details)}</summary><pre>${esc(String(ask.summary).slice(0, 1200))}</pre></details>` : ''}
+      <details class="st-perm-whyask"><summary>${esc(w.whyAsk)}</summary><p>${esc(p.whyAsk)}</p></details>
+      <div class="st-ask-btns">${buttons}</div>
+    </div></div>`;
 }
 
 // The questions Claude asks (AskUserQuestion): from the question itself, or,
@@ -884,6 +929,74 @@ async function stLoadThumbs(k) {
   }
 }
 
+// ---------------------------------------------------------------- starters
+// A suggestion is a whole task: what it needs is asked right there («Какой сайт?» with the open tabs as
+// choices, or a few words), then it runs, and its result shows on the right (the site with Before/After,
+// a page it made, pins on the page).
+
+const stStarterDef = (id) => {
+  const w = STW();
+  const role = ST.persona in w.starters ? ST.persona : 'designer';
+  return [...w.starters[role], ...Object.values(w.starters).flat()].find((x) => x.id === id) || null;
+};
+
+function stStarterFormHtml(st) {
+  const w = STW();
+  const tabs = st.need === 'site' ? (ST.starterTabs || []) : [];
+  const choices = tabs.map((x) => `<button type="button" class="st-chip st-choice" data-sv="${esc(x.url)}" title="${esc(x.url)}">${icon('globe', 12)}<span>${esc(StudioWords.host(x.url))}</span>${x.title ? `<i>${esc(x.title.slice(0, 40))}</i>` : ''}</button>`).join('');
+  const field = st.need === 'site'
+    ? `<input class="st-starter-in" type="url" inputmode="url" placeholder="${esc(tabs.length ? w.starterOther : w.starterNoTabs)}" aria-label="${esc(st.ask)}">`
+    : `<input class="st-starter-in" type="text" placeholder="${esc(st.placeholder || '')}" aria-label="${esc(st.ask)}">`;
+  return `<div class="st-starter" data-starter-open="${esc(st.id)}" role="group" aria-label="${esc(st.label)}">
+    <div class="st-starter-q"><b>${esc(st.label)}</b><span>${esc(st.ask)}</span></div>
+    ${choices ? `<div class="st-starter-choices">${choices}</div>` : ''}
+    <div class="st-starter-row">${field}<button type="button" class="st-btn pri" data-sgo>${esc(w.starterGo)}</button><button type="button" class="st-btn ghost" data-scancel>${esc(w.starterCancel)}</button></div>
+  </div>`;
+}
+
+async function stOnStarterClick(e) {
+  const pick = e.target.closest('[data-starter]');
+  if (pick) return stStarterOpen(pick.dataset.starter);
+  if (e.target.closest('[data-scancel]')) { ST.starter = null; stRender(); return; }
+  const choice = e.target.closest('[data-sv]');
+  if (choice) return stStarterGo(choice.dataset.sv);
+  if (e.target.closest('[data-sgo]')) return stStarterGo();
+}
+
+async function stStarterOpen(id) {
+  const st = stStarterDef(id);
+  if (!st) return;
+  if (!st.need) return stStarterRun(st, '');
+  ST.starter = id;
+  ST.starterTabs = [];
+  stRender();
+  if (st.need === 'site' && typeof wb.studioTabs === 'function') {
+    try { ST.starterTabs = (await wb.studioTabs()) || []; } catch { ST.starterTabs = []; }
+    stRender();
+  }
+  $('#st-chips .st-starter-in')?.focus({ preventScroll: true });
+}
+
+function stStarterGo(value) {
+  const st = ST.starter && stStarterDef(ST.starter);
+  if (!st) return;
+  let v = String(value ?? $('#st-chips .st-starter-in')?.value ?? '').trim();
+  if (st.need === 'site') {
+    try { const u = new URL(/^https?:\/\//i.test(v) ? v : `https://${v}`); v = /^https?:$/.test(u.protocol) && u.hostname.includes('.') ? u.href : ''; } catch { v = ''; }
+    if (!v) { toast(STW().siteBad); $('#st-chips .st-starter-in')?.focus({ preventScroll: true }); return; }
+  } else if (!v) { $('#st-chips .st-starter-in')?.focus({ preventScroll: true }); return; }
+  stStarterRun(st, v);
+}
+
+// Runs a starter: its name on the task, its site opened beside Studio first, its full prompt sent.
+function stStarterRun(st, v) {
+  ST.starter = null;
+  ST.nextName = st.need === 'site' ? `${st.label} · ${StudioWords.host(v)}` : v ? `${st.label}: ${v}` : st.label;
+  ST.pendingSite = st.need === 'site' ? v : '';
+  $('#st-input').value = st.prompt(v);
+  stSubmit();
+}
+
 function stRenderChips(t) {
   const w = STW();
   const box = $('#st-chips');
@@ -901,8 +1014,18 @@ function stRenderChips(t) {
     pb.classList.toggle('on', !!ST.pointing);
     pb.setAttribute('aria-pressed', ST.pointing ? 'true' : 'false');
   }
-  const html = (show ? `${w.chips[role].map((c) => `<button type="button" class="st-chip" data-chip="${esc(c)}">${esc(c)}</button>`).join('')}` : '') + point + picked;
-  if (box.dataset.html !== html) { box.innerHTML = html; box.dataset.html = html; }
+  const starter = ST.starter && stStarterDef(ST.starter);
+  const html = starter ? stStarterFormHtml(starter)
+    : (show ? `${w.starters[role].map((c) => `<button type="button" class="st-chip" data-starter="${esc(c.id)}">${esc(c.label)}</button>`).join('')}` : '') + point + picked;
+  if (box.dataset.html !== html) {
+    // (A value typed into the form survives a redraw.)
+    const typed = box.querySelector('.st-starter-in')?.value;
+    box.innerHTML = html;
+    box.dataset.html = html;
+    const input = box.querySelector('.st-starter-in');
+    if (input && typed) input.value = typed;
+  }
+  box.classList.toggle('starter-open', !!starter);
   box.hidden = !html;
   // A new task: Studio's own folder, unless the person wants their files (or is in them).
   const own = $('#st-own');
@@ -1110,14 +1233,20 @@ async function stOnFeedClick(e) {
     const text = k.trust;
     k.trust = '';
     if (trust.dataset.trust === 'yes') {
-      // Claude Code's own choice: the first one is "Yes, proceed".
-      wb.ptyWrite(t.id, '\r');
       stRender();
-      for (let i = 0; i < 40 && stTrustAsked(t); i++) await new Promise((r) => setTimeout(r, 150));
+      if (!(await stTrustYes(t))) {
+        // Couldn't answer it here: the message waits in the box, the question in the Workbench.
+        k.trust = text;
+        toast(STW().trustFailed);
+        stRender();
+        return;
+      }
       await stWhenReady(t);
       stType(t, text);
     } else {
-      wb.ptyWrite(t.id, '\x1b');
+      // «No»: that Claude Code never started work; it goes, the message stays in the box.
+      if (typeof killTerm === 'function') await killTerm(t, { quiet: true }); else wb.ptyWrite(t.id, '\x1b');
+      ST.current = '';
       $('#st-input').value = text;
     }
     stRender();
@@ -1169,22 +1298,44 @@ async function stSubmit() {
   ST.sending = true;
   try {
     if (!t || t.exited) {
+      // A task that never got going (its Claude Code ended before the first answer) starts again in
+      // its own folder, under its own name: no second «Untitled».
+      const again = t && t.exited && !stTask(t).model.turns.length ? t : null;
       // Its own folder in Studio's home ("" in the person's folder: it works there).
-      let taskDir = '';
-      try { taskDir = (await wb.studioTaskFolder(text)) || ''; } catch {}
+      let taskDir = again?.taskDir || '';
+      if (!again) { try { taskDir = (await wb.studioTaskFolder(text)) || ''; } catch {} }
+      if (again && typeof killTerm === 'function') await killTerm(again, { quiet: true });
       t = await launch('claude', { studio: true, taskDir });
       if (!t) { toast(STW().notStarted); return; }
+      // Named after what the person asked, from the start (never «Untitled»).
+      t.custom = StudioWords.taskName(ST.nextName || text);
+      ST.nextName = '';
+      if (typeof syncTermMeta === 'function') syncTermMeta(t);
       ST.current = t.id;
       stTask(t);
       // Back to Studio: launch shows the terminal underneath.
       stShow('studio');
+      // A starter's site: beside Studio now, its look kept for Before/After.
+      if (ST.pendingSite) {
+        const k = stTask(t);
+        k.site = ST.pendingSite;
+        ST.pendingSite = '';
+        stBoostSnapshot(k, StudioWords.host(k.site));
+        stOpenSite(k);
+      }
       input.value = '';
       await stWhenReady(t);
       if (taskDir && stTrustAsked(t)) {
-        // A folder Meridian just made, empty: nothing to ask about.
-        wb.ptyWrite(t.id, '\r');
-        for (let i = 0; i < 40 && stTrustAsked(t); i++) await new Promise((r) => setTimeout(r, 150));
+        // A folder Studio itself just made, empty: nothing to ask the person about.
+        await stTrustYes(t);
         await stWhenReady(t);
+      }
+      if (t.exited) {
+        // It ended before the message (a «No» to the folder, a crash): the message stays in the box.
+        input.value = text;
+        toast(STW().notStarted);
+        stRender();
+        return;
       }
       if (stTrustAsked(t)) {
         // Asked in plain words first; the message goes once the folder is trusted.
@@ -1199,6 +1350,13 @@ async function stSubmit() {
     }
     input.value = '';
     const k = stTask(t);
+    if (ST.pendingSite) {
+      k.site = ST.pendingSite;
+      ST.pendingSite = '';
+      ST.nextName = '';
+      stBoostSnapshot(k, StudioWords.host(k.site));
+      stOpenSite(k);
+    }
     if (stStatus(t) === 'work' || stStatus(t) === 'needs') {
       k.queue.push({ id: `q${++stQueueSeq}`, text });
       stRender();
@@ -1221,7 +1379,29 @@ function stScreen(t, rows = 40) {
   } catch { return ''; }
 }
 // Claude Code's first question in a new folder: whether to trust it.
-const stTrustAsked = (t) => /Do you trust the files in this folder|trust this folder|Is this a project you/i.test(stScreen(t));
+const stTrustAsked = (t) => /Do you trust the files in this folder|trust this folder|Is this a project you/i.test(stScreen(t, 30));
+
+// Claude Code's trust question, answered «yes» the way a person would: its options are a list, and
+// 2.1.332 puts «No, exit» first and focused (Enter alone exits). Read which line has the pointer,
+// move down to «Yes, I trust this folder», then Enter. Never Enter blind.
+function stTrustFocus(t) {
+  const rows = stScreen(t, 30).split('\n').filter((l) => /^\s*[❯›>▶]\s*\S/.test(l));
+  const at = rows.pop() || '';
+  return /\bYes\b/i.test(at) ? 'yes' : /\bNo\b/i.test(at) ? 'no' : '';
+}
+async function stTrustYes(t) {
+  for (let i = 0; i < 6 && !t.exited; i++) {
+    const at = stTrustFocus(t);
+    if (at === 'yes') {
+      wb.ptyWrite(t.id, '\r');
+      for (let j = 0; j < 60 && stTrustAsked(t) && !t.exited; j++) await new Promise((r) => setTimeout(r, 100));
+      return !t.exited && !stTrustAsked(t);
+    }
+    wb.ptyWrite(t.id, at === 'no' ? '\x1b[B' : '\x1b[B');
+    await new Promise((r) => setTimeout(r, 180));
+  }
+  return false;
+}
 
 // Claude Code is ready for a message once its session has started (Mission Control saw it), or
 // when it asks about the folder first.
@@ -1492,6 +1672,57 @@ function stSplitInit(el) {
     stSetChatWidth(Math.min(max, Math.max(ST_CHAT_MIN, next)), true);
   });
 }
+// The task list's width: the same gestures as the chat's (drag, keys, double-click back to 210 px),
+// kept per profile.
+const ST_TASKS_DEF = 210, ST_TASKS_MIN = 150, ST_TASKS_MAX = 420;
+function stTasksSplitInit(el) {
+  const split = $('#st-tsplit', el);
+  if (!split) return;
+  let saved = 0;
+  try { saved = Number(localStorage.getItem('wb.studioTasksWidth')) || 0; } catch {}
+  stSetTasksWidth(saved || ST_TASKS_DEF, false);
+  const clamp = (v) => Math.min(ST_TASKS_MAX, Math.max(ST_TASKS_MIN, Math.round(v)));
+  split.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    split.setPointerCapture(e.pointerId);
+    document.body.classList.add('st-resizing');
+    const left = $('.st-body', el).getBoundingClientRect().left;
+    const move = (m) => stSetTasksWidth(clamp(m.clientX - left), false);
+    const up = () => {
+      split.removeEventListener('pointermove', move);
+      split.removeEventListener('pointerup', up);
+      split.removeEventListener('pointercancel', up);
+      document.body.classList.remove('st-resizing');
+      stSetTasksWidth(ST.tasksWidth, true);
+    };
+    split.addEventListener('pointermove', move);
+    split.addEventListener('pointerup', up);
+    split.addEventListener('pointercancel', up);
+  });
+  split.addEventListener('dblclick', () => stSetTasksWidth(ST_TASKS_DEF, true));
+  split.addEventListener('keydown', (e) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+    e.preventDefault();
+    const step = e.shiftKey ? 64 : ST_SPLIT_STEP;
+    const next = e.key === 'Home' ? ST_TASKS_MIN : e.key === 'End' ? ST_TASKS_MAX : ST.tasksWidth + (e.key === 'ArrowRight' ? step : -step);
+    stSetTasksWidth(clamp(next), true);
+  });
+}
+function stSetTasksWidth(px, save) {
+  ST.tasksWidth = px;
+  const el = ST.el;
+  if (!el) return;
+  el.style.setProperty('--st-tasks-w', `${px}px`);
+  const split = $('#st-tsplit', el);
+  if (split) {
+    split.setAttribute('aria-valuenow', String(px));
+    split.setAttribute('aria-valuemin', String(ST_TASKS_MIN));
+    split.setAttribute('aria-valuemax', String(ST_TASKS_MAX));
+  }
+  if (save) { try { if (px !== ST_TASKS_DEF) localStorage.setItem('wb.studioTasksWidth', String(px)); else localStorage.removeItem('wb.studioTasksWidth'); } catch {} }
+}
+
 // 0: the default (the columns share the room).
 function stSetChatWidth(px, save) {
   ST.chatWidth = Math.round(px) || 0;
@@ -1566,9 +1797,9 @@ function stRenderBoard(terms) {
   items.sort((a, b) => order[a.status] - order[b.status] || (b.k.model.turns.at(-1)?.at || 0) - (a.k.model.turns.at(-1)?.at || 0));
   const filter = ST.boardFilter || 'all';
   const shown = items.filter((x) => filter === 'all' || x.status === filter || (filter === 'done' && x.status === 'idle'));
-  const chips = w.chips[ST.persona in w.chips ? ST.persona : 'designer'];
+  const chips = w.starters[ST.persona in w.starters ? ST.persona : 'designer'];
   const newCard = `<div class="st-card st-newcard" data-key="new"><div class="st-nc-ttl"><span class="st-nc-pl">${icon('plus', 15)}</span>${esc(w.newTask)}</div>
-    ${chips.map((c) => `<button class="st-chip" data-newchip="${esc(c)}">${esc(c)}</button>`).join('')}
+    ${chips.map((c) => `<button class="st-chip" data-newchip="${esc(c.id)}">${esc(c.label)}</button>`).join('')}
     <button class="st-nc-blank" data-new>${esc(w.ownWords)}</button></div>`;
   const cards = shown.map(({ t, k, status }) => {
     const pic = stCardPicture(k);
@@ -1578,7 +1809,7 @@ function stRenderBoard(terms) {
       ? `<div class="st-cpv">${stImg(pic.after)}${pic.before ? `<span class="st-cpv-before">${stImg(pic.before)}</span><span class="st-cba"><button data-ba="before">${esc(w.before)}</button><button data-ba="after" class="on">${esc(w.after)}</button></span>` : ''}</div>`
       : `<div class="st-cpv empty">${k.site ? icon('globe', 22) : icon('file', 22)}${k.site ? `<span>${esc(StudioWords.host(k.site))}</span>` : ''}</div>`;
     const acts = status === 'needs' && ask && ask.answerable !== false
-      ? `<div class="st-cacts"><button class="st-btn pri" data-answer="${ask.canAlways ? 'session' : 'allow'}" data-ask="${esc(ask.id)}">${esc(w.allow)}</button>${ask.canAlways ? `<button class="st-btn" data-answer="allow" data-ask="${esc(ask.id)}">${esc(w.once)}</button>` : ''}<button class="st-btn" data-answer="deny" data-ask="${esc(ask.id)}">${esc(w.no)}</button></div>`
+      ? `<div class="st-cacts"><button class="st-btn pri" data-answer="allow" data-ask="${esc(ask.id)}">${esc(w.allowOnce)}</button>${ask.canAlways ? `<button class="st-btn" data-answer="session" data-ask="${esc(ask.id)}">${esc(w.allowTask)}</button>` : ''}<button class="st-btn" data-answer="deny" data-ask="${esc(ask.id)}">${esc(w.no)}</button></div>`
       : (status === 'done' || status === 'idle') && (k.model.files.size || k.boost?.changed)
         ? `<div class="st-cacts"><button class="st-btn" data-open>${icon('eye', 13)}<span>${esc(w.look)}</span></button><button class="st-btn" data-handoff>${icon('arrowRight', 13)}<span>${esc(w.handoff)}</span></button></div>`
         : '';
@@ -1607,7 +1838,8 @@ async function stOnBoardClick(e) {
     ST.current = '';
     ST.preview = null;
     stSetBoard(false);
-    $('#st-input').value = chip ? chip.dataset.newchip : '';
+    $('#st-input').value = '';
+    if (chip) return stStarterOpen(chip.dataset.newchip);
     $('#st-input').focus({ preventScroll: true });
     return;
   }
@@ -1859,6 +2091,12 @@ let stTickN = 0;
 function stTick() {
   if (!ST.on || !S.project) return;
   stTickN++;
+  // A task whose Claude Code ended before anything happened is no task: gone from the list
+  // (the one on screen stays, with its message back in the box, until another is picked).
+  for (const t of stTerms()) {
+    const k = ST.tasks.get(t.id);
+    if (t.studio && t.exited && t.id !== ST.current && k?.loaded && !k.model.turns.length && typeof killTerm === 'function') killTerm(t, { quiet: true });
+  }
   for (const t of stTerms()) {
     const k = stTask(t);
     // A restyle is about to happen: what the site looked like before it (for Undo).

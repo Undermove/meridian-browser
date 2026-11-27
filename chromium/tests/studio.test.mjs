@@ -44,14 +44,28 @@ def tool(tid, name, inp, result='ok'):
     line('user', [{'type': 'tool_result', 'tool_use_id': tid, 'content': result}])
     hook('PostToolUse', tool_name=name, tool_input=inp, tool_use_id=tid, tool_response={})
 open(tpath, 'w').close()
-# A new folder: Claude Code asks whether to trust it before anything else (Enter = "Yes, proceed").
-if os.environ.get('STAND_IN_TRUST') or os.path.exists(os.path.join(cwd, '.ask-trust')):
-    print('Do you trust the files in this folder?', flush=True)
-    print(' > 1. Yes, proceed   2. No, exit', flush=True)
-    got = ''
-    while '\\r' not in got and '\\n' not in got:
-        got += os.read(0, 4096).decode('utf8', 'replace')
-    open(os.path.join(cwd, '.trusted'), 'w').write(got)
+# A new folder: Claude Code asks whether to trust it before anything else, as 2.1.332 does: «No,
+# exit» first and focused, ↓ moves to «Yes, I trust this folder», Enter picks; «No» ends it.
+ask_trust = os.environ.get('STAND_IN_TRUST') or os.path.exists(os.path.join(cwd, '.ask-trust')) or os.path.exists(os.path.join(os.path.dirname(cwd), '.ask-trust'))
+if ask_trust:
+    focus = 0
+    def draw():
+        print('Quick safety check: Is this a project you created or one you trust?', flush=True)
+        print((' ❯ ' if focus == 0 else '   ') + 'No, exit', flush=True)
+        print((' ❯ ' if focus == 1 else '   ') + 'Yes, I trust this folder', flush=True)
+    draw()
+    keys = []
+    while True:
+        got = os.read(0, 4096).decode('utf8', 'replace')
+        keys.append(got)
+        if '\\x1b[B' in got: focus = 1; draw()
+        if '\\x1b[A' in got: focus = 0; draw()
+        if '\\r' in got or '\\n' in got: break
+    open(os.path.join(cwd, '.trusted'), 'w').write('yes' if focus == 1 else 'no')
+    if focus == 0:
+        print('Claude Code did not start because this folder is not trusted.', flush=True)
+        sys.exit(1)
+    print('\\x1b[2J\\x1b[H', end='', flush=True)
 hook('SessionStart', model='claude-opus-5-5', source='startup')
 print('READY', flush=True)
 buf = ''
@@ -178,7 +192,8 @@ test('Studio on: a task in plain words, a permission card answered with a button
     assert.equal(fs.existsSync(path.join(s.project, '.trusted')), false);
     await click(wb, '.st-ask [data-trust="yes"]');
     for (let i = 0; i < 100 && !fs.existsSync(path.join(s.project, '.trusted')); i++) await sleep(100);
-    assert.match(fs.readFileSync(path.join(s.project, '.trusted'), 'utf8'), /^[\r\n]+$/);
+    // «Yes, I trust this folder», picked the way a person would (not Enter on «No, exit»).
+    assert.equal(fs.readFileSync(path.join(s.project, '.trusted'), 'utf8'), 'yes');
     for (let i = 0; i < 150 && !fs.existsSync(path.join(s.project, '.prompt')); i++) await sleep(100);
     assert.equal(fs.readFileSync(path.join(s.project, '.prompt'), 'utf8'), prompt);
     const argv = JSON.parse(fs.readFileSync(path.join(s.project, '.argv'), 'utf8'));
@@ -193,7 +208,13 @@ test('Studio on: a task in plain words, a permission card answered with a button
     assert.doesNotMatch(feed, /\bWrite\(|\bRead\(|tool_use/);
 
     // The permission question as a card; «Allow» answers it for the session.
-    await wb.waitFor(`document.querySelector('.st-ask .st-ask-q')?.innerText.includes('Allow: change colors.css?')`, 15000);
+    await wb.waitFor(`document.querySelector('.st-ask .st-ask-q')?.innerText.includes('Claude wants to change colors.css')`, 15000);
+    // What, why it's safe, why Studio asks; «Allow» / «Always allow for this task» / «No».
+    const card = await wb.eval(`(() => { const c = document.querySelector('.st-perm'); return { kind: c.dataset.kind, safe: c.querySelector('.st-perm-safe')?.innerText, whyAsk: c.querySelector('.st-perm-whyask summary')?.innerText, btns: [...c.querySelectorAll('.st-ask-btns button')].map((b) => b.innerText.trim()) }; })()`);
+    assert.equal(card.kind, 'edit');
+    assert.match(card.safe, /original stays/);
+    assert.equal(card.whyAsk, 'Why are we asking?');
+    assert.deepEqual(card.btns, ['Allow', 'Always allow for this task', 'No']);
     assert.equal(await wb.eval(`document.querySelector('.st-task.needs') !== null`), true);
     await click(wb, '.st-ask [data-answer="session"]');
     for (let i = 0; i < 100 && !fs.existsSync(path.join(s.project, '.answer')); i++) await sleep(100);
@@ -530,6 +551,9 @@ test('«Кто вы?» is part of the first-run tour (Studio on), the pick is ke
 test('No folder question: Studio opens its own folder, a new task gets a folder of its own there, «Show in Finder» names it', { skip: process.platform === 'win32' && 'the stand-in is a Python script' }, async () => {
   const s = await setup();
   const home = path.join(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-home-'))), 'Meridian Studio');
+  // Claude Code asks about every new folder (as 2.1.332 does); Studio made these, so Studio answers.
+  fs.mkdirSync(home);
+  fs.writeFileSync(path.join(home, '.ask-trust'), '');
   const args = s.args.filter((a) => !a.startsWith('--meridian-test-project'));
   const b = await launch(['about:blank'], { profile: s.profile, args: [...args, '--meridian-studio', '--lang=en-US', `--meridian-test-studio-home=${home}`] });
   let wb;
@@ -552,6 +576,10 @@ test('No folder question: Studio opens its own folder, a new task gets a folder 
     for (let i = 0; i < 150 && !fs.existsSync(path.join(dir, '.prompt')); i++) await sleep(100);
     // Claude Code ran in the task's folder; what it made is there.
     assert.equal(fs.readFileSync(path.join(dir, '.prompt'), 'utf8'), 'Two pictures side by side');
+    // Its folder question was answered «Yes» by Studio, never shown; the task is named from the message.
+    assert.equal(fs.readFileSync(path.join(dir, '.trusted'), 'utf8'), 'yes');
+    assert.equal(await wb.eval(`!!document.querySelector('.st-ask[data-key="trust"]')`), false);
+    assert.equal(await wb.eval(`document.querySelector('.st-task.active .st-task-name').textContent`), 'Two pictures side by side');
     await wb.waitFor(`document.querySelector('#st-feed').innerText.includes('Created palette.png')`, 15000);
     assert.ok(fs.existsSync(path.join(dir, 'Drafts', 'palette.png')));
     assert.equal(await wb.eval('stCurrent().taskDir'), name);
@@ -683,6 +711,139 @@ test('The result beside the Workbench, again and again: never a crash, always be
     await b.eval(`app.$.tabstrip.runCommand(8, 0), true`).catch(() => {});
     await open('studio-site', 'eight');
     assert.equal(await b.eval('1 + 1'), 2, 'the browser is up');
+  } finally {
+    for (const p of pages) p?.close?.();
+    wb?.close();
+    await b.close();
+    server.close();
+    cleanup(s.project, s.bin, s.profile);
+  }
+});
+
+// «No» to the folder question, then the same message again: still one task (the one that never got
+// going starts again, under the same name), and «Allow» this time really lets Claude Code go on.
+test('Folder question: «No» then again is still one task; «Allow» lets Claude Code go on', { skip: process.platform === 'win32' && 'the stand-in is a Python script' }, async () => {
+  const s = await setup();
+  fs.writeFileSync(path.join(s.project, '.ask-trust'), '');
+  const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio', '--lang=en-US'] });
+  let wb;
+  try {
+    wb = await openWorkbench(b, s.project);
+    await startTask(wb, 'Make a palette');
+    await wb.waitFor(`!!document.querySelector('.st-ask[data-key="trust"]')`, 15000);
+    await click(wb, '.st-ask [data-trust="no"]');
+    await wb.waitFor(`stCurrent()?.exited === true || !stCurrent()`, 15000);
+    assert.equal(await wb.eval(`document.querySelector('#st-input').value`), 'Make a palette');
+    // Again.
+    await click(wb, '#st-send');
+    await wb.waitFor(`!!document.querySelector('.st-ask[data-key="trust"]')`, 15000);
+    assert.equal(await wb.eval(`document.querySelectorAll('.st-task').length`), 1, 'one task, not one per try');
+    assert.equal(await wb.eval(`document.querySelector('.st-task .st-task-name').textContent`), 'Make a palette');
+    await click(wb, '.st-ask [data-trust="yes"]');
+    for (let i = 0; i < 150 && !fs.existsSync(path.join(s.project, '.prompt')); i++) await sleep(100);
+    assert.equal(fs.readFileSync(path.join(s.project, '.trusted'), 'utf8'), 'yes');
+    assert.equal(fs.readFileSync(path.join(s.project, '.prompt'), 'utf8'), 'Make a palette');
+    await wb.waitFor(`document.querySelector('#st-feed').innerText.includes('Created palette.png')`, 15000);
+  } finally {
+    wb?.close();
+    await b.close();
+    cleanup(s.project, s.bin, s.profile);
+  }
+});
+
+// A stand-in that does what each starter asks, the visible part of it: the board page, pins on the
+// page, a reply after a restyle.
+const FAKE_STARTER = `#!/usr/bin/python3
+import json, os, subprocess, sys, time
+args = sys.argv
+cwd = os.getcwd()
+settings = json.load(open(args[args.index('--settings') + 1]))
+tdir = os.path.join(cwd, '.transcripts'); os.makedirs(tdir, exist_ok=True)
+tpath = os.path.join(tdir, 's1.jsonl')
+def ev(event, **f):
+    return json.dumps(dict(hook_event_name=event, session_id='s1', transcript_path=tpath, cwd=cwd, **f))
+def hook(event, **f):
+    for e in settings['hooks'].get(event, []):
+        for h in e['hooks']:
+            if 'secret-guard --permission' in h['command']: continue
+            subprocess.run(h['command'], shell=True, input=ev(event, **f), text=True, capture_output=True)
+def line(kind, content):
+    with open(tpath, 'a') as f:
+        f.write(json.dumps({'type': kind, 'uuid': str(time.time()), 'sessionId': 's1', 'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'message': {'role': kind, 'content': content}}) + '\\n')
+open(tpath, 'w').close()
+hook('SessionStart', model='claude-opus-5-5', source='startup')
+print('READY', flush=True)
+buf = ''
+while '\\n' not in buf.replace('\\r', '\\n'):
+    buf += os.read(0, 4096).decode('utf8', 'replace')
+prompt = buf.replace('\\x1b[200~', '').replace('\\x1b[201~', '').strip()
+open(os.path.join(cwd, '.prompt'), 'w').write(prompt)
+hook('UserPromptSubmit', prompt=prompt)
+line('user', prompt)
+if 'board.html' in prompt:
+    os.makedirs(os.path.join(cwd, 'Drafts'), exist_ok=True)
+    page = os.path.join(cwd, 'Drafts', 'board.html')
+    open(page, 'w').write('<!doctype html><title>Board</title><h1 id="board">Reference board</h1>')
+    line('assistant', [{'type': 'tool_use', 'id': 'w1', 'name': 'Write', 'input': {'file_path': page, 'content': '...'}}])
+    line('user', [{'type': 'tool_result', 'tool_use_id': 'w1', 'content': 'ok'}])
+    line('assistant', [{'type': 'text', 'text': 'The board is ready: 9 references.'}])
+elif '[[pin:' in prompt:
+    line('assistant', [{'type': 'text', 'text': 'Found two: [[pin: h1 | The heading uses another font]] [[pin: p | Grey text, a different shade]]'}])
+else:
+    line('assistant', [{'type': 'text', 'text': 'Restyled in your brand.'}])
+hook('Stop')
+while True:
+    time.sleep(1)
+`;
+
+test('Starters: each asks what it needs right there, runs, and its result shows (site beside Studio, the board page, pins)', { skip: process.platform === 'win32' && 'the stand-in is a Python script' }, async () => {
+  const http = await import('node:http');
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<!doctype html><title>Coffee</title><h1>Coffee</h1><p>Beans</p>'); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const site = `http://127.0.0.1:${server.address().port}/`;
+  const s = await setup(FAKE_STARTER);
+  const b = await launch(['about:blank', site], { profile: s.profile, args: [...s.args, '--meridian-studio', '--lang=en-US'] });
+  let wb;
+  const pages = [];
+  try {
+    wb = await openWorkbench(b, s.project);
+    await wb.waitFor(`document.querySelectorAll('#st-chips [data-starter]').length === 3`);
+    // Restyle: «Which site?» with the open tab as a choice; picking it runs the task.
+    await click(wb, '#st-chips [data-starter="restyle"]');
+    await wb.waitFor(`!!document.querySelector('.st-starter [data-sv]')`, 10000);
+    assert.match(await wb.eval(`document.querySelector('.st-starter-q').innerText`), /Which site\?/);
+    assert.equal(await wb.eval(`document.querySelector('.st-starter [data-sv]').dataset.sv`), site);
+    await click(wb, '.st-starter [data-sv]');
+    for (let i = 0; i < 150 && !fs.existsSync(path.join(s.project, '.prompt')); i++) await sleep(100);
+    const prompt = fs.readFileSync(path.join(s.project, '.prompt'), 'utf8');
+    assert.ok(prompt.includes(site) && /set_boost/.test(prompt), 'the whole task, with the site');
+    assert.equal(await wb.eval(`document.querySelector('.st-task.active .st-task-name').textContent`), `Restyle our site in our brand · 127.0.0.1`);
+    await wb.waitFor(`document.querySelector('#st-feed').innerText.includes('Restyled in your brand.')`, 15000);
+    assert.equal(await wb.eval(`stTask(stCurrent()).site`), site, 'the site is the task’s (Before/After on the right)');
+
+    // The board: «What is the board about?» — a few words, then the page it makes opens beside Studio.
+    await click(wb, '#st-new');
+    fs.rmSync(path.join(s.project, '.prompt'));
+    await click(wb, '#st-chips [data-starter="board"]');
+    await wb.waitFor(`!!document.querySelector('.st-starter-in')`);
+    await wb.eval(`(() => { document.querySelector('.st-starter-in').value = 'Nordic coffee shops'; return true; })()`);
+    await click(wb, '.st-starter [data-sgo]');
+    for (let i = 0; i < 150 && !fs.existsSync(path.join(s.project, '.prompt')); i++) await sleep(100);
+    assert.match(fs.readFileSync(path.join(s.project, '.prompt'), 'utf8'), /Nordic coffee shops[\s\S]*board\.html/);
+    const board = await b.page(`file://${path.join(s.project, 'Drafts', 'board.html')}`, 20000);
+    pages.push(board);
+    await board.waitFor(`document.querySelector('#board')?.textContent === 'Reference board'`);
+
+    // Inconsistencies: the page, then pins on it.
+    await click(wb, '#st-new');
+    fs.rmSync(path.join(s.project, '.prompt'));
+    await click(wb, '#st-chips [data-starter="audit"]');
+    await wb.waitFor(`!!document.querySelector('.st-starter [data-sv]')`, 10000);
+    await click(wb, '.st-starter [data-sv]');
+    await wb.waitFor(`(stTask(stCurrent())?.pins || []).length === 2`, 20000);
+    assert.deepEqual(await wb.eval(`stTask(stCurrent()).pins.map((p) => p.sel)`), ['h1', 'p']);
+    // Three tasks, each named after its starter; none «Untitled».
+    assert.doesNotMatch(await wb.eval(`[...document.querySelectorAll('.st-task-name')].map((e) => e.textContent).join('|')`), /Untitled/);
   } finally {
     for (const p of pages) p?.close?.();
     wb?.close();

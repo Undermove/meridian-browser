@@ -214,3 +214,48 @@ test('a question Claude asks: its text in the step, its options for the card, ev
     for (const k of ['qAsks', 'qOwn', 'qSend', 'qAnswered']) assert.ok(t[k], `${lang}.${k}`);
   }
 });
+
+test('permission cards say what, why, what stays safe and why Studio asks — for every kind, in both languages', () => {
+  const p = W.permWords('Write', '/Users/d/Studio/Two pictures/compare.html', 'ru', 'Сделаю страницу, чтобы сравнить картинки рядом.');
+  assert.equal(p.title, 'Claude хочет создать файл compare.html');
+  assert.equal(p.why, 'Зачем: сделаю страницу, чтобы сравнить картинки рядом.');
+  assert.match(p.safe, /ничего за её пределами/);
+  assert.equal(p.kind, 'create');
+  const jargon = /\b(MCP|CLI|tool|Bash|stdin|token)\b/i;
+  for (const lang of ['ru', 'en']) {
+    for (const [tool, sum] of [['Write', '/a/b.html'], ['Edit', '/a/c.css'], ['Bash', 'npm test'], ['WebFetch', 'https://www.zerno.coffee/x'], ['mcp__meridian__set_boost', ''], ['mcp__meridian__click', ''], ['mcp__figma__get_code', ''], ['Read', '/x/y.md'], ['SomethingNew', 'x']]) {
+      const q = W.permWords(tool, sum, lang, '');
+      assert.ok(q.title && q.whyAsk && q.icon && q.kind, `${lang} ${tool}`);
+      assert.doesNotMatch(`${q.title} ${q.safe} ${q.whyAsk}`, jargon, `${lang} ${tool}`);
+      assert.equal(q.why, '');
+    }
+    const t = W.T[lang];
+    for (const k of ['allowOnce', 'allowTask', 'whyAsk', 'trustFailed', 'tasksSplitter']) assert.ok(t[k], `${lang}.${k}`);
+  }
+  assert.equal(W.taskName('Сделай две картинки. И ещё что-нибудь'), 'Сделай две картинки.');
+  assert.ok(W.taskName('x '.repeat(80)).length <= 48);
+});
+
+test('every starter is a whole task: a label, what it needs (and how it asks), and a prompt with the answer in it', () => {
+  for (const lang of ['ru', 'en']) {
+    const t = W.T[lang];
+    for (const [role, list] of Object.entries(t.starters)) {
+      assert.ok(list.length >= 2, `${lang}.${role}`);
+      for (const st of list) {
+        assert.ok(st.id && st.label, `${lang}.${role}`);
+        assert.ok(['site', 'text', ''].includes(st.need), `${lang}.${st.id}.need`);
+        if (st.need) assert.match(st.ask, /\?$/, `${lang}.${st.id}.ask`);
+        const p = st.prompt(st.need === 'site' ? 'https://zerno.coffee/' : 'кофейни');
+        assert.ok(p.length > 60, `${lang}.${st.id}.prompt`);
+        if (st.need === 'site') assert.ok(p.includes('https://zerno.coffee/'), `${lang}.${st.id}: the site is in it`);
+        if (st.need === 'text') assert.ok(p.includes('кофейни'), `${lang}.${st.id}: the answer is in it`);
+      }
+    }
+    // The three designer starters say what you'll see: a Boost with before/after, a board page, pins.
+    const d = Object.fromEntries(t.starters.designer.map((x) => [x.id, x.prompt('https://a.b/')]));
+    assert.match(d.restyle, /set_boost/);
+    assert.match(d.board, /board\.html/);
+    assert.match(d.audit, /\[\[pin:/);
+    for (const k of ['starterGo', 'starterOther', 'starterNoTabs', 'starterCancel']) assert.ok(t[k], `${lang}.${k}`);
+  }
+});

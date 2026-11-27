@@ -125,8 +125,7 @@ for (const kind of ['permission', 'question']) {
         assert.ok(m.height > 70, `card is a strip: ${m.height}px`);
         assert.ok(m.scrollH <= m.clientH + 1, `card clips its content: ${m.scrollH} > ${m.clientH}`);
         assert.deepEqual(m.outside, [], 'parts of the card stick out of it');
-        assert.equal(m.before, 'none', 'the stripe is a pseudo-element again');
-        assert.match(m.shadow, /inset/, 'the stripe is an inset shadow');
+        assert.equal(m.before, 'none', 'a pseudo-element stripe again');
         assert.ok(m.top >= m.feedTop - 1, `card starts above the feed: ${m.top} < ${m.feedTop}`);
         assert.ok(m.bottom <= m.compTop + 1, `card goes under the composer: ${m.bottom} > ${m.compTop}`);
         assert.ok(m.bottom <= m.feedBottom + 1, 'card is cut by the feed');
@@ -134,8 +133,8 @@ for (const kind of ['permission', 'question']) {
           assert.equal(m.opts, 3, 'the options are buttons');
           assert.match(m.title, /^Мне нужно сделать две картинки/);
         } else {
-          assert.match(m.title, /^Разрешить: создать файл compare-old/);
-          assert.deepEqual(m.btns, ['Разрешить', 'Только в этот раз', 'Нет']);
+          assert.match(m.title, /^Claude хочет создать файл compare-old/);
+          assert.deepEqual(m.btns, ['Разрешить', 'Разрешить всегда для этой задачи', 'Нет']);
         }
       } finally { await page.close(); }
     });
@@ -170,5 +169,48 @@ test('new task: no folder question, the own-files link, the task menu on screen'
     assert.equal(m.menu, 'Показать в Finder');
     assert.equal(m.inView, true);
     assert.equal(m.sub, 'Claude');
+  } finally { await page.close(); }
+});
+
+// The task list's splitter (drag, kept, double-click back), and the segmented controls' sliding pill.
+test('task list resizes by its splitter; segmented controls slide a pill instead of jumping', { skip: !chrome && 'no Chromium headless shell' }, async () => {
+  const page = await open();
+  try {
+    await page.send('Emulation.setDeviceMetricsOverride', { width: 1300, height: 760, deviceScaleFactor: 1, mobile: false });
+    await page.send('Page.navigate', { url: pathToFileURL(path.join(here, 'studio-ask.html')).href });
+    for (let i = 0; i < 50 && (await page.evaluate('typeof stBuild === "function" && document.readyState')) !== 'complete'; i++) await sleep(100);
+    await page.evaluate(`(() => { ST.on = true; ST.lang = 'ru'; ST.view = 'studio'; ST.current = 't1'; stBuild(); ST.el.hidden = false; stRender(); return true; })()`);
+    const at = await page.evaluate(`(() => { const r = document.querySelector('#st-tsplit').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2, w: document.querySelector('.st-tasks').getBoundingClientRect().width }; })()`);
+    assert.ok(Math.abs(at.w - 210) < 2, `starts at 210 (${at.w})`);
+    const mouse = (type, x) => page.send('Input.dispatchMouseEvent', { type, x, y: at.y, button: 'left', buttons: type === 'mouseReleased' ? 0 : 1, clickCount: 1 });
+    await page.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: at.x, y: at.y });
+    await mouse('mousePressed', at.x);
+    await mouse('mouseMoved', at.x + 90);
+    await mouse('mouseReleased', at.x + 90);
+    const after = await page.evaluate(`({ w: document.querySelector('.st-tasks').getBoundingClientRect().width, kept: localStorage.getItem('wb.studioTasksWidth') })`);
+    assert.ok(Math.abs(after.w - 300) < 3, `dragged to ~300 (${after.w})`);
+    assert.equal(after.kept, String(Math.round(after.w)));
+    // Not past its bounds.
+    await page.evaluate(`stSetTasksWidth(Math.min(ST_TASKS_MAX, 9999), true), true`);
+    assert.equal(await page.evaluate(`document.querySelector('.st-tasks').getBoundingClientRect().width`), 420);
+    // Double-click: back to 210, nothing kept.
+    const at2 = await page.evaluate(`(() => { const r = document.querySelector('#st-tsplit').getBoundingClientRect(); return { x: r.x + r.width / 2 }; })()`);
+    for (const clickCount of [1, 2]) for (const type of ['mousePressed', 'mouseReleased']) await page.send('Input.dispatchMouseEvent', { type, x: at2.x, y: at.y, button: 'left', clickCount });
+    assert.equal(await page.evaluate(`Math.round(document.querySelector('.st-tasks').getBoundingClientRect().width)`), 210);
+    assert.equal(await page.evaluate(`localStorage.getItem('wb.studioTasksWidth')`), null);
+
+    // The pill: one element that moves (transform over 220 ms), under the picked button.
+    await sleep(100);
+    const pill = await page.evaluate(`(() => { const box = document.querySelector('.st-ctabs .st-seg'); const p = box.querySelector('.st-pill'); const cs = getComputedStyle(p); return { has: !!p, dur: cs.transitionDuration, prop: cs.transitionProperty, x: box.style.getPropertyValue('--pill-x'), on: box.querySelector('button.on').offsetLeft }; })()`);
+    assert.equal(pill.has, true);
+    assert.match(pill.prop, /transform/);
+    assert.match(pill.dur, /0\.22s/);
+    assert.equal(pill.x, `${pill.on}px`);
+    await page.evaluate(`(() => { const b = [...document.querySelectorAll('.st-ctabs .st-seg button')]; b[0].classList.remove('on'); b[1].classList.add('on'); return true; })()`);
+    await sleep(50);
+    const moved = await page.evaluate(`(() => { const box = document.querySelector('.st-ctabs .st-seg'); return { x: box.style.getPropertyValue('--pill-x'), on: box.querySelector('button.on').offsetLeft }; })()`);
+    assert.equal(moved.x, `${moved.on}px`, 'the pill follows the picked button');
+    assert.notEqual(moved.x, pill.x);
+    for (const sel of ['.st-head .st-switch', '.st-viewseg']) assert.equal(await page.evaluate(`!!document.querySelector('${sel} .st-pill')`), true, sel);
   } finally { await page.close(); }
 });

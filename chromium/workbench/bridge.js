@@ -230,6 +230,8 @@
     // Studio's own folder in Documents, opened as the project; a new task's folder in it.
     studioHome: () => invoke('studioHome'),
     studioTaskFolder: (title) => invoke('studioTaskFolder', str(title).slice(0, 400)),
+    // The web pages open in this window (a starter's «Какой сайт?»).
+    studioTabs: () => invoke('studioTabs'),
     studioSetPersona: (p) => invoke('studioSetPersona', str(p)),
     studioFigma: (on) => invoke('studioFigma', on === true),
     // Connected in Studio, and whether the Figma app's server answers now; open the Figma app.
