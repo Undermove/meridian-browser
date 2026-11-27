@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 27 Nov 2026 05:53:22 +0400
+Subject: [PATCH 2/3] Meridian: Studio's feed gets its steps before the first
+ permission question (the transcript from the session's first hook)
+
+Mission Control learned a session's transcript only from its status line.
+Claude Code may not draw one before its first permission question (and the
+E2E stand-in draws none), so Studio's studioTranscript had no file and the
+feed stayed empty until then: the question, the answer and the file cards
+came from Mission Control, the steps never. Every hook event names the
+transcript (transcript_path); the hook now passes it on and Mission Control
+keeps it from SessionStart on (a subagent's events are skipped; /clear's new
+file replaces it).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/mission/mission_control.cc |  8 ++++++++
+ chrome/browser/meridian/mission/mission_hook.cc    |  4 ++++
+ .../meridian/mission/mission_hook_unittest.cc      | 14 ++++++++++++++
+ 3 files changed, 26 insertions(+)
+
+diff --git a/chrome/browser/meridian/mission/mission_control.cc b/chrome/browser/meridian/mission/mission_control.cc
+index 9dab4755f5..50fcbc77e7 100644
+--- a/chrome/browser/meridian/mission/mission_control.cc
++++ b/chrome/browser/meridian/mission/mission_control.cc
+@@ -737,6 +737,14 @@ void MissionControl::OnHookEvent(const std::string& node_id,
+   if (root->project.empty()) {
+     root->project = cwd_name;
+   }
++  // The session's transcript from its first hook (SessionStart), not only
++  // from the status line: Claude Code may not draw one before its first
++  // permission question, and Studio's feed reads the steps from it. A
++  // subagent's events name its parent's file; /clear starts a new one.
++  if (const std::string* path = raw.FindString("transcript_path");
++      path && !path->empty() && agent_id.empty()) {
++    root->transcript = path->substr(0, 1024);
++  }
+   Node* target = root;
+   if (!agent_id.empty()) {
+     if (Node* sub = FindChild(root->id, [&](const Node& n) {
+diff --git a/chrome/browser/meridian/mission/mission_hook.cc b/chrome/browser/meridian/mission/mission_hook.cc
+index 7fc21feb56..2210dafee9 100644
+--- a/chrome/browser/meridian/mission/mission_hook.cc
++++ b/chrome/browser/meridian/mission/mission_hook.cc
+@@ -433,6 +433,10 @@ base::DictValue FromClaudeEvent(const base::DictValue& ev) {
+   // The session's permission mode (default, acceptEdits, plan, auto,
+   // bypassPermissions…), so a resumed session gets it back.
+   SetIf(out, "permission_mode", Str(ev.Find("permission_mode"), 30));
++  // Its own transcript, as every hook event names it (the status line too,
++  // but only once Claude Code draws one): read on this computer by Studio and
++  // Context Insights; never shown.
++  SetIf(out, "transcript_path", Str(ev.Find("transcript_path"), 1024));
+   SetIf(out, "tool", tool);
+   SetIf(out, "tool_use_id", Str(ev.Find("tool_use_id"), 80));
+   if (tool) {
+diff --git a/chrome/browser/meridian/mission/mission_hook_unittest.cc b/chrome/browser/meridian/mission/mission_hook_unittest.cc
+index f0fe94de3a..ba158115e3 100644
+--- a/chrome/browser/meridian/mission/mission_hook_unittest.cc
++++ b/chrome/browser/meridian/mission/mission_hook_unittest.cc
+@@ -50,6 +50,20 @@ TEST(MissionHookTest, SummarizesWithoutInputs) {
+   EXPECT_EQ(*line.FindString("summary"), "meridian › navigate · example.com");
+ }
+ 
++// Every hook event names the session's transcript; Mission Control keeps it
++// from the first one (Studio's feed reads the steps from it before any status
++// line).
++TEST(MissionHookTest, HookEventsCarryTheTranscript) {
++  base::DictValue line = FromClaudeEvent(Parse(R"({
++    "hook_event_name": "SessionStart", "session_id": "s1", "source": "startup",
++    "transcript_path": "/Users/me/.claude/projects/p/s1.jsonl"})"));
++  EXPECT_EQ(*line.FindString("transcript_path"),
++            "/Users/me/.claude/projects/p/s1.jsonl");
++  line = FromClaudeEvent(Parse(R"({"hook_event_name": "PreToolUse",
++    "tool_name": "Read", "tool_input": {}})"));
++  EXPECT_FALSE(line.Find("transcript_path"));
++}
++
+ TEST(MissionHookTest, StatusLineKeepsTheModelsId) {
+   base::DictValue status;
+   status.Set("session_id", "s1");

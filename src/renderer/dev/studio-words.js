@@ -10,6 +10,17 @@
       studio: 'Студия', workbench: 'Workbench', tasks: 'Задачи', newTask: 'Новая задача',
       placeholder: 'Напишите, что сделать…', send: 'Отправить', stop: 'Остановить',
       claude: 'Claude', you: 'Вы', minutes: (n) => (n < 1 ? 'только что' : n < 60 ? `${n} мин` : `${Math.floor(n / 60)} ч`),
+      ago: (n) => {
+        if (n < 1) return 'только что';
+        if (n < 60) return `${n} мин назад`;
+        const h = Math.floor(n / 60);
+        if (h < 24) return `${h} ч назад`;
+        const d = Math.floor(h / 24);
+        if (d === 1) return 'вчера';
+        const w = d % 10 === 1 && d % 100 !== 11 ? 'день' : [2, 3, 4].includes(d % 10) && ![12, 13, 14].includes(d % 100) ? 'дня' : 'дней';
+        return `${d} ${w} назад`;
+      },
+      earlier: 'Показать раньше', allFiles: (n) => `Показать все (${n})`,
       pickFolder: 'Выберите папку для работы', pickFolderHint: 'Claude будет работать с копиями ваших файлов в этой папке — оригиналы не тронет.',
       chooseFolder: 'Выбрать папку', recent: 'Недавние',
       emptyTitle: 'Что сделаем?', emptyHint: 'Напишите задачу своими словами или выберите подсказку. Claude покажет каждый шаг, спросит разрешения и ничего не отправит наружу без вас.',
@@ -27,14 +38,16 @@
       before: 'До', after: 'После', undo: 'Отменить', undoTitle: 'Вернуть сайт как был до задачи',
       working: 'Работаю…', waiting: 'Ждёт вас', done: 'Готово', idle: 'Готово',
       busy: 'Claude ещё работает — отправлю, когда закончит.', queued: 'В очереди',
-      startedInWorkbench: 'Задача начата в Workbench: правила черновиков в ней не включены.',
+      startedInWorkbench: 'Начато в Workbench: здесь Claude правит файлы сразу, без черновиков.',
+      showPage: 'Открыть рядом', pageAlongside: 'Открыта рядом со Студией — меняется вместе с задачей.', outsideFolder: 'Этот файл лежит вне папки задачи: показать его здесь не получится.',
+      splitter: 'Ширина чата', splitterHint: 'Потяните, чтобы изменить ширину; двойной щелчок — как было', taskView: 'Задача',
       step: (i, n) => `шаг ${i} из ${n}`, noFiles: 'Здесь появятся файлы, которые Claude создаст или поменяет.',
       resultEmpty: 'Здесь будет результат: сайт, картинки и документы, которые получатся.',
-      openFile: 'Показать в папке', taskFallback: 'Новая задача', notStarted: 'Не удалось запустить Claude',
+      openFile: 'Показать в папке', taskFallback: 'Без названия', notStarted: 'Не удалось запустить Claude',
       details: 'Подробнее', consent: 'Задачи выполняет Claude от Anthropic: то, что вы пишете, и файлы, которые он смотрит, уходят в Anthropic.',
       consentOk: 'Понятно, начать',
       point: 'Ткни и скажи', pointTitle: 'Покажите на странице, что поменять: скажите словами или поправьте руками', pointNoSite: 'Сначала откройте сайт рядом',
-      pointChip: 'Показать на странице',
+      pointChip: 'Показать на странице', pickTitle: 'Выбрать элемент на странице — сообщение будет про него', unpick: 'Убрать выбор',
       pinYes: (n, t) => `Да, сделай то, что ты предложил в пине ${n}: ${t}`, andMore: (n) => `и ещё ${n}`,
       handTitle: 'Вы поправили руками:', handNext: 'Claude узнает об этом со следующим сообщением.',
       handPrompt: (host, lines) => `Я поправил руками на странице ${host} (это уже в Boost «Studio · ${host}», не перезаписывай и учитывай дальше):\n${lines}`,
@@ -45,7 +58,9 @@
       brandCheck: 'Проверить сайт по бренду', brandAllGood: 'Всё на странице — в цветах бренда.',
       driftTitle: (n) => `${n} ${n % 10 === 1 && n % 100 !== 11 ? 'цвет' : [2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100) ? 'цвета' : 'цветов'} на сайте не из бренда — заменить?`,
       driftFix: 'Заменить все', driftWhere: 'Показать где', driftKeep: 'Оставить',
-      figmaOff: 'не подключена', figmaOn: 'подключена', figmaConnect: 'Подключить Figma', figmaLink: 'Ссылка на файл бренда в Figma', figmaTake: 'Взять бренд',
+      figmaOff: 'не подключена', figmaOn: 'подключена', figmaNotRunning: 'не подключена — Figma не отвечает', figmaOpen: 'Открыть Figma',
+      figmaLinkHint: 'Вставьте ссылку на файл с цветами и шрифтами (Styles / Variables)',
+      siteAddress: 'Адрес сайта', takeFromSite: 'Забрать с сайта', siteBad: 'Нужен адрес сайта, например zerno.coffee', figmaConnect: 'Подключить Figma', figmaLink: 'Ссылка на файл бренда в Figma', figmaTake: 'Взять бренд',
       figmaHow: 'Откройте Figma на этом компьютере и один раз включите: меню Figma → Настройки → Dev Mode MCP Server. Студия только читает макеты.',
       figmaBadLink: 'Нужна ссылка вида https://www.figma.com/…',
       figmaPrompt: (l) => `Возьми бренд из Figma (только читай, ничего в Figma не меняй): ${l}\nНайди цвета и шрифты бренда (переменные и стили) и запиши их в brand.json в этой папке так: {"source":"figma","name":"<название>","colors":[{"name":"<имя>","value":"#RRGGBB"}],"fonts":[{"family":"<шрифт>","use":"head" или "text"}]}. Коротко скажи, что нашёл.`,
@@ -69,6 +84,15 @@
       studio: 'Studio', workbench: 'Workbench', tasks: 'Tasks', newTask: 'New task',
       placeholder: 'Say what to do…', send: 'Send', stop: 'Stop',
       claude: 'Claude', you: 'You', minutes: (n) => (n < 1 ? 'just now' : n < 60 ? `${n} min` : `${Math.floor(n / 60)} h`),
+      ago: (n) => {
+        if (n < 1) return 'just now';
+        if (n < 60) return `${n} min ago`;
+        const h = Math.floor(n / 60);
+        if (h < 24) return `${h} h ago`;
+        const d = Math.floor(h / 24);
+        return d === 1 ? 'yesterday' : `${d} days ago`;
+      },
+      earlier: 'Show earlier', allFiles: (n) => `Show all (${n})`,
       pickFolder: 'Pick a folder to work in', pickFolderHint: 'Claude works on copies of your files in this folder and leaves the originals as they are.',
       chooseFolder: 'Choose a folder', recent: 'Recent',
       emptyTitle: 'What shall we make?', emptyHint: 'Describe the task in your own words or pick a suggestion. Claude shows every step, asks before it changes things and never sends anything out without you.',
@@ -86,14 +110,16 @@
       before: 'Before', after: 'After', undo: 'Undo', undoTitle: 'Put the site back as it was before the task',
       working: 'Working…', waiting: 'Needs you', done: 'Done', idle: 'Done',
       busy: 'Claude is still working — I’ll send it when it’s done.', queued: 'Queued',
-      startedInWorkbench: 'This task started in the Workbench: the drafts rules aren’t on in it.',
+      startedInWorkbench: 'Started in the Workbench: here Claude edits files directly, without drafts.',
+      showPage: 'Open alongside', pageAlongside: 'Open next to Studio — it changes along with the task.', outsideFolder: 'This file is outside the task’s folder: it can’t be shown here.',
+      splitter: 'Chat width', splitterHint: 'Drag to change the width; double-click to reset', taskView: 'Task',
       step: (i, n) => `step ${i} of ${n}`, noFiles: 'Files Claude creates or changes show up here.',
       resultEmpty: 'The result shows here: the site, pictures and documents it makes.',
-      openFile: 'Show in folder', taskFallback: 'New task', notStarted: 'Couldn’t start Claude',
+      openFile: 'Show in folder', taskFallback: 'Untitled', notStarted: 'Couldn’t start Claude',
       details: 'Details', consent: 'Tasks are done by Claude from Anthropic: what you write and the files it looks at go to Anthropic.',
       consentOk: 'Got it, start',
       point: 'Point and say', pointTitle: 'Show on the page what to change: say it, or change it by hand', pointNoSite: 'Open the site alongside first',
-      pointChip: 'Show on the page',
+      pointChip: 'Show on the page', pickTitle: 'Pick an element on the page — your message will be about it', unpick: 'Clear the pick',
       pinYes: (n, t) => `Yes, do what you suggested in pin ${n}: ${t}`, andMore: (n) => `and ${n} more`,
       handTitle: 'You changed by hand:', handNext: 'Claude hears about it with the next message.',
       handPrompt: (host, lines) => `I changed these by hand on ${host} (already in the Boost "Studio · ${host}"; don't overwrite it, keep it from now on):\n${lines}`,
@@ -104,7 +130,9 @@
       brandCheck: 'Check the site against the brand', brandAllGood: 'Everything on the page is in brand colours.',
       driftTitle: (n) => `${n} colour${n === 1 ? '' : 's'} on the site ${n === 1 ? 'isn’t' : 'aren’t'} from the brand — replace?`,
       driftFix: 'Replace all', driftWhere: 'Show where', driftKeep: 'Keep',
-      figmaOff: 'not connected', figmaOn: 'connected', figmaConnect: 'Connect Figma', figmaLink: 'Link to the brand file in Figma', figmaTake: 'Take the brand',
+      figmaOff: 'not connected', figmaOn: 'connected', figmaNotRunning: 'not connected — Figma isn’t answering', figmaOpen: 'Open Figma',
+      figmaLinkHint: 'Paste a link to the file with the colours and fonts (Styles / Variables)',
+      siteAddress: 'Site address', takeFromSite: 'Take from the site', siteBad: 'It needs a site address, like zerno.coffee', figmaConnect: 'Connect Figma', figmaLink: 'Link to the brand file in Figma', figmaTake: 'Take the brand',
       figmaHow: 'Open Figma on this computer and switch on, once: Figma menu → Preferences → Dev Mode MCP Server. Studio only reads designs.',
       figmaBadLink: 'It needs a link like https://www.figma.com/…',
       figmaPrompt: (l) => `Take the brand from Figma (read only, change nothing in Figma): ${l}\nFind the brand colours and fonts (variables and styles) and write them to brand.json in this folder as: {"source":"figma","name":"<name>","colors":[{"name":"<name>","value":"#RRGGBB"}],"fonts":[{"family":"<font>","use":"head" or "text"}]}. Say briefly what you found.`,
@@ -158,25 +186,57 @@
         }
       }
       if (server.includes('figma')) return say('palette', 'Посмотрел макет в Figma', 'Looked at the Figma file', 'Смотрю макет в Figma', 'Looking at the Figma file');
-      return say('puzzle', 'Воспользовался подключённым сервисом', 'Used a connected service');
+      const svc = server.replace(/^claude_ai_/, '').replace(/[_-]+/g, ' ').trim();
+      const nice = svc ? svc.charAt(0).toUpperCase() + svc.slice(1) : '';
+      return say('puzzle', nice ? `Обратился к ${nice}` : 'Воспользовался подключённым сервисом', nice ? `Used ${nice}` : 'Used a connected service', nice ? `Обращаюсь к ${nice}` : 'Обращаюсь к сервису', nice ? `Using ${nice}` : 'Using a service');
     }
     switch (tool) {
       case 'Read': case 'NotebookRead': return say('file', `Посмотрел ${f || 'файл'}`, `Looked at ${f || 'a file'}`, `Смотрю ${f || 'файл'}`, `Looking at ${f || 'a file'}`);
-      case 'Write': return say('pencil', `Создал ${f}`, `Created ${f}`, `Создаю ${f}`, `Creating ${f}`);
-      case 'Edit': case 'MultiEdit': case 'NotebookEdit': return say('pencil', `Поменял ${f}`, `Changed ${f}`, `Меняю ${f}`, `Changing ${f}`);
+      case 'Write': return say('pencil', `Создал файл ${f}`, `Created ${f}`, `Создаю файл ${f}`, `Creating ${f}`);
+      case 'Edit': case 'MultiEdit': case 'NotebookEdit': return say('pencil', `Изменил ${f}`, `Changed ${f}`, `Меняю ${f}`, `Changing ${f}`);
+      case 'Artifact': return say('globe', 'Опубликовал страницу', 'Published a page', 'Публикую страницу', 'Publishing a page');
+      case 'ArtifactComments': return say('chat', 'Посмотрел комментарии к странице', 'Read the page’s comments');
+      case 'ArtifactData': return say('layers', 'Обновил данные страницы', 'Updated the page’s data');
+      case 'Skill': return say('sparkles', `Взял навык${i.skill ? `: ${clip(i.skill, 30)}` : ''}`, `Used a skill${i.skill ? `: ${clip(i.skill, 30)}` : ''}`);
+      case 'ToolSearch': return say('search', 'Подготовил инструменты', 'Got its tools ready');
+      case 'BashOutput': case 'KillShell': case 'KillBash': case 'TaskOutput': case 'TaskStop': return say('history', 'Проверил, как идёт работа', 'Checked on the work');
+      case 'TaskCreate': case 'TaskUpdate': case 'TaskList': case 'TaskGet': return say('layers', 'Обновил план', 'Updated the plan');
+      case 'SlashCommand': return say('wand', 'Выполнил команду', 'Ran a command');
       case 'Glob': case 'Grep': case 'LS': return say('search', 'Поискал по файлам', 'Searched the files', 'Ищу по файлам', 'Searching the files');
       case 'WebFetch': return say('globe', `Открыл страницу ${site}`.trim(), `Opened ${site || 'a page'}`, `Открываю ${site}`.trim(), `Opening ${site || 'a page'}`);
       case 'WebSearch': return say('search', `Поискал в интернете: ${clip(i.query, 40)}`, `Searched the web: ${clip(i.query, 40)}`);
       case 'TodoWrite': return say('layers', 'Составил план', 'Made a plan');
       case 'Task': case 'Agent': return say('sparkles', `Позвал помощника: ${clip(i.description, 40)}`, `Asked a helper: ${clip(i.description, 40)}`);
       case 'Bash': case 'PowerShell': {
-        const d = clip(i.description, 56);
-        return d ? say('wand', d, d) : say('wand', 'Выполнил действие на компьютере', 'Ran a step on the computer', 'Выполняю действие', 'Running a step');
+        const d = clip(i.description, 56) || cmdWords(i.command, ru);
+        return d ? say('wand', d, d) : say('wand', 'Выполнил команду', 'Ran a command', 'Выполняю команду', 'Running a command');
       }
       case 'ExitPlanMode': return say('layers', 'Предложил план', 'Proposed a plan');
       case 'AskUserQuestion': return say('chat', 'Задал вопрос', 'Asked a question');
-      default: return say('sparkles', ru ? 'Сделал шаг' : 'Did a step', 'Did a step');
+      default: return say('sparkles', 'Работал над задачей', 'Worked on the task', 'Работаю над задачей', 'Working on the task');
     }
+  }
+
+  // A command in a few words, when Claude gave it no description.
+  function cmdWords(cmd, ru) {
+    const c = String(cmd || '').trim();
+    if (!c) return '';
+    const first = c.split(/\s+/)[0].replace(/^.*\//, '');
+    const known = {
+      npm: ['Запустил npm', 'Ran npm'], npx: ['Запустил инструмент', 'Ran a tool'], node: ['Запустил скрипт', 'Ran a script'], python3: ['Запустил скрипт', 'Ran a script'], python: ['Запустил скрипт', 'Ran a script'],
+      git: ['Посмотрел историю изменений', 'Checked the history'], ls: ['Посмотрел, что в папке', 'Looked at the folder'], cat: ['Посмотрел файл', 'Looked at a file'],
+      mkdir: ['Создал папку', 'Made a folder'], cp: ['Скопировал файлы', 'Copied files'], mv: ['Переместил файлы', 'Moved files'], open: ['Открыл файл', 'Opened a file'],
+      curl: ['Скачал страницу', 'Fetched a page'], grep: ['Поискал по файлам', 'Searched the files'], rg: ['Поискал по файлам', 'Searched the files'], find: ['Поискал файлы', 'Looked for files'],
+    };
+    const k = known[first];
+    return k ? (ru ? k[0] : k[1]) : '';
+  }
+
+  // The technical line under «Подробнее»: the tool and what it was given.
+  function stepDetail(tool, input) {
+    const i = input || {};
+    const what = i.command || i.file_path || i.notebook_path || i.url || i.query || i.pattern || i.path || i.description || i.skill || '';
+    return `${tool}${what ? ` · ${clip(what, 160)}` : ''}`;
   }
 
   // A permission question in plain words: [title, detail].
@@ -221,7 +281,7 @@
     return out;
   }
 
-  const api = { T, stepWords, askWords, host, handWords };
+  const api = { T, stepWords, askWords, host, handWords, stepDetail };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.StudioWords = api;
 })(typeof window !== 'undefined' ? window : globalThis);

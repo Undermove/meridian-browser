@@ -228,9 +228,13 @@
     studioInfo: () => invoke('studioInfo'),
     studioSetPersona: (p) => invoke('studioSetPersona', str(p)),
     studioFigma: (on) => invoke('studioFigma', on === true),
+    // Connected in Studio, and whether the Figma app's server answers now; open the Figma app.
+    studioFigmaState: () => invoke('studioFigmaState'),
+    studioFigmaOpen: () => invoke('studioFigmaOpen'),
     // Point and say on Studio's site tab: 'start' (config), 'stop', 'pins' (list), 'settled', 'site'.
     studioPoint: (op, arg) => invoke('studioPoint', str(op), ...(arg === undefined ? [] : [JSON.parse(JSON.stringify(arg))])),
-    studioTranscript: (id, offset) => invoke('studioTranscript', str(id), Math.max(0, Number(offset) || 0)),
+    // `mode` "tail" (a long session opens at its end) or "before" (the page before `offset`).
+    studioTranscript: (id, offset, mode) => invoke('studioTranscript', str(id), Math.max(0, Number(offset) || 0), mode === 'tail' || mode === 'before' ? mode : ''),
     studioAnswer: (askId, choice) => invoke('studioAnswer', str(askId), ['allow', 'deny', 'session'].includes(choice) ? choice : 'deny'),
     studioBoost: (op, host, ...rest) => invoke('studioBoost', str(op), str(host), ...JSON.parse(JSON.stringify(rest.slice(0, 2)))),
 
