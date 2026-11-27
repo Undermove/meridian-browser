@@ -115,8 +115,8 @@ test('Boost editor, as Arc’s: a colour on the pad, a font, size, case, dark, c
     assert.ok(state.boost.tintStrength >= 55 && state.boost.tintStrength <= 65, `strength ${state.boost.tintStrength}`);
     await b.waitFor(`(() => { const f = ${BE}.querySelector('#pad .field').getBoundingClientRect(); const at = (id) => { const r = ${BE}.getElementById(id).getBoundingClientRect(); return [(r.x + r.width / 2 - f.x) / f.width, (r.y + r.height / 2 - f.y) / f.height]; }; const [kx, ky] = at('knob'), [sx, sy] = at('shade'); return Math.abs(kx - 0.8) < 0.03 && Math.abs(ky - 0.5) < 0.03 && Math.abs(sx - 0.2) < 0.03 && Math.abs(sy - 0.5) < 0.03; })()`, 3000);
     // A font from the grid, the size up, upper case (Arc's order: AA, then aa), dark.
-    await clickEditor(b, `${BE}.querySelector('.font[data-font="Georgia"]')`);
-    await page.waitFor(`getComputedStyle(document.querySelector('p')).fontFamily.startsWith('Georgia')`, 5000);
+    await clickEditor(b, `${BE}.querySelector('.font[data-font="Baskerville"]')`);
+    await page.waitFor(`getComputedStyle(document.querySelector('p')).fontFamily.startsWith('Baskerville')`, 5000);
     await clickEditor(b, `${BE}.getElementById('size')`);
     await page.waitFor(`getComputedStyle(document.body).zoom === '1.1'`, 5000);
     await clickEditor(b, `${BE}.getElementById('case')`);
@@ -126,11 +126,15 @@ test('Boost editor, as Arc’s: a colour on the pad, a font, size, case, dark, c
     // Quick changes, one boost.
     assert.equal((await b.eval(`${H}.getBoosts()`)).boosts.length, 1);
 
-    // Code: CSS hides the promo at once; JavaScript runs from the next load.
+    // Code, as Arc's: a page of its own (the card widens to 480 px, Back returns); CSS hides the
+    // promo at once with the hammer; JavaScript runs from the next load.
     await clickEditor(b, `${BE}.getElementById('code')`);
+    await b.waitFor(`${BE}.getElementById('card').getBoundingClientRect().width === 480 && getComputedStyle(${BE}.querySelector('.codev')).visibility === 'visible'`, 3000);
     await b.eval(`(() => { ${BE}.getElementById('css').value = '#promo { display: none !important; }'; ${BE}.getElementById('js').value = "document.body.dataset.boosted = 'yes';"; })()`);
     await clickEditor(b, `${BE}.getElementById('codeSave')`);
     await page.waitFor(`getComputedStyle(document.getElementById('promo')).display === 'none'`, 5000);
+    await clickEditor(b, `${BE}.getElementById('back')`);
+    await b.waitFor(`${BE}.getElementById('card').getBoundingClientRect().width === 183`, 3000);
     assert.equal(await page.eval(`document.body.dataset.boosted || ''`), '');
 
     // Another page of the site, opened fresh: all of it, the JavaScript too, the style after the site's.
@@ -156,6 +160,7 @@ test('Boost editor, as Arc’s: a colour on the pad, a font, size, case, dark, c
     await b.click(`${SC}.getElementById('newBoost')`);
     await b.waitFor(`app.$.boostEditor.open && ${BE}.getElementById('name').value === 'Boost 2'`);
     assert.equal((await b.eval(`${H}.getBoost()`)).state.boosts.length, 2);
+    await clickEditor(b, `${BE}.getElementById('more')`);
     await clickEditor(b, `${BE}.getElementById('delete')`);
     await clickEditor(b, `${BE}.getElementById('delete')`);
     await b.waitFor(`!app.$.boostEditor.open`);
@@ -163,6 +168,7 @@ test('Boost editor, as Arc’s: a colour on the pad, a font, size, case, dark, c
     // The first one, from its chevron, deleted (two clicks): the site's own look again.
     await openEditor(b, '.boost-edit');
     assert.equal(await b.eval(`${BE}.getElementById('name').value`), 'My Boost');
+    await clickEditor(b, `${BE}.getElementById('more')`);
     await clickEditor(b, `${BE}.getElementById('delete')`);
     await clickEditor(b, `${BE}.getElementById('delete')`);
     await page.waitFor(`!document.getElementById('meridian-boost-style')`, 5000);
@@ -1127,7 +1133,7 @@ test('a heavy live app (custom-property theme, dark sidebar, 18k elements, shado
 // second round with it (as far apart as they were); dragging the second turns only its colour. The
 // buttons' icons move: the sliders' knobs slide, the no-entry sign turns, the bulb swings, the bolt
 // jolts; size and case take Arc's orange once changed.
-test('the pad’s orbit as Arc’s (circle, arc between the knobs, the second knob going round with the first) and the buttons’ icons animate', async () => {
+test('the pad’s orbit as Arc’s (circle, arc between the knobs, the second knob going round with the first); the tiles darken under the pointer, as Arc’s', async () => {
   const s = await site();
   const b = await launch([s.url]);
   const move = (x, y, buttons = 0) => b.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: buttons ? 'left' : 'none', buttons });
@@ -1186,22 +1192,17 @@ test('the pad’s orbit as Arc’s (circle, arc between the knobs, the second kn
     await move(card.x, card.y);
     await b.waitFor(`getComputedStyle(${BE}.getElementById('orbit')).opacity === '0'`, 3000);
 
-    // The icons move under the pointer.
+    // As Arc's (its recording, frame by frame): under the pointer a tile darkens at once
+    // (235 → 222) and its icon stands still.
     const hover = async (id) => { const p = await b.point(`${BE}.getElementById('${id}')`); await move(p.x, p.y); };
-    const running = (sel) => `${BE}.querySelector(${JSON.stringify(sel)}).getAnimations().map((a) => a.animationName || a.transitionProperty).join()`;
-    await hover('adjust');
-    await b.waitFor(`/transform/.test(${running('#adjust .k1')}) || getComputedStyle(${BE}.querySelector('#adjust .k1')).transform !== 'none'`, 2000);
-    await b.waitFor(`getComputedStyle(${BE}.querySelector('#adjust .k1')).transform.startsWith('matrix(1, 0, 0, 1, -6')`, 2000, `getComputedStyle(${BE}.querySelector('#adjust .k1')).transform`);
-    await hover('noColour');
-    await b.waitFor(`getComputedStyle(${BE}.querySelector('#noColour .ban')).transform !== 'none'`, 2000);
-    assert.equal(await b.eval(`getComputedStyle(${BE}.querySelector('#adjust .k1')).transitionDuration`), '0.32s');
-    await hover('dark');
-    await b.waitFor(`/swing/.test(${running('#dark .swing')})`, 2000);
-    await hover('zap');
-    await b.waitFor(`/jolt/.test(${running('#zap .bolt')})`, 2000);
-    // Size, as Arc's: the value on orange once changed.
+    for (const id of ['dark', 'adjust', 'zap', 'code']) {
+      await hover(id);
+      await b.waitFor(`getComputedStyle(${BE}.getElementById('${id}')).backgroundColor === 'rgb(222, 222, 224)'`, 1000, `getComputedStyle(${BE}.getElementById('${id}')).backgroundColor`);
+      assert.equal(await b.eval(`${BE}.getElementById('${id}').getAnimations({ subtree: true }).length`), 0, `${id}: nothing moves`);
+    }
+    // Size, as Arc's: the value on Arc's orange once changed.
     await clickEditor(b, `${BE}.getElementById('size')`);
-    await b.waitFor(`${BE}.getElementById('size').textContent.trim() === '110 %' && getComputedStyle(${BE}.getElementById('size')).backgroundColor === 'rgb(240, 122, 26)'`, 3000);
+    await b.waitFor(`${BE}.getElementById('size').textContent.trim() === '110 %' && getComputedStyle(${BE}.getElementById('size')).backgroundImage.includes('rgb(255, 90, 42)')`, 3000);
     if (process.env.MERIDIAN_SHOT_DIR) {
       await move(g.c.x, g.c.y);
       await sleep(400);
