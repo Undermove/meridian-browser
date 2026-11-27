@@ -136,7 +136,7 @@ function chatsAfterTabs() {
   S.terms.forEach((t, i) => {
     const el = tabs[i];
     if (!el) return;
-    const m = SessionStatus.mark(SessionStatus.get(t.id).state);
+    const m = SessionStatus.icon(SessionStatus.kind(t.id));
     if (m) el.querySelector('.mark')?.after(m);
   });
   chatsRender();
@@ -196,12 +196,14 @@ function chatsRow(t) {
   row.className = `chat-row${t === S.activeTerm ? ' active' : ''}${st.state ? ' ' + st.state : ''}${t.exited ? ' exited' : ''}`;
   row.dataset.term = t.id;
   row.dataset.state = st.state || 'none';
+  const kind = SessionStatus.kind(t.id);
+  row.dataset.kind = kind || 'none';
   row.setAttribute('role', 'option');
   row.tabIndex = t === S.activeTerm ? 0 : -1;
   row.setAttribute('aria-selected', String(t === S.activeTerm));
   const status = document.createElement('span');
   status.className = 'chat-status';
-  const m = SessionStatus.mark(st.state);
+  const m = SessionStatus.icon(kind);
   if (m) status.appendChild(m);
   row.appendChild(status);
   row.appendChild(agentMark(t.kind === 'shell' && t.sessionId ? 'claude' : AGENT_UI[t.kind] ? t.kind : 'shell'));
@@ -224,6 +226,9 @@ function chatsRow(t) {
   words.className = 'chat-words';
   words.textContent = st.state ? SessionStatus.words(t.id) : chatsQuietWords(t);
   words.title = words.textContent;
+  // A PR or a result: its words open it.
+  const link = kind === 'pr' || kind === 'result' ? SessionStatus.info(t.id).link : null;
+  if (link) { words.classList.add('chat-link'); words.title = `Open ${link.href || link.path}`; }
   sub.appendChild(words);
   const gauge = typeof termUsageBadge === 'function' ? termUsageBadge(t) : null;
   if (gauge) sub.appendChild(gauge);
@@ -235,6 +240,7 @@ function chatsRow(t) {
     // A double click on the name renames (told by the click count: the first click redraws the list).
     if (e.detail === 2 && e.target.closest('.chat-name')) { chatsRename(t); return; }
     if (e.detail > 1) return;
+    if (e.target.closest('.chat-link')) SessionStatus.open(t.id);
     $('#term-area').classList.remove('collapsed');
     activateTerm(t);
   });

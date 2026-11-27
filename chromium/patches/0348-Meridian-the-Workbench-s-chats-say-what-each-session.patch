@@ -1,0 +1,386 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 27 Nov 2026 13:35:01 +0400
+Subject: [PATCH] =?UTF-8?q?Meridian:=20the=20Workbench's=20chats=20say=20w?=
+ =?UTF-8?q?hat=20each=20session=20wants=20=E2=80=94=20permission,=20questi?=
+ =?UTF-8?q?on,=20error,=20PR,=20result=20=E2=80=94=20and=20its=20sidebar?=
+ =?UTF-8?q?=20mark=20shows=20the=20top=20one?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Mission Control keeps what a Claude Code session's turn did (from its hooks):
+the files it wrote or edited (Write/Edit/MultiEdit/NotebookEdit, at most 5)
+and whether its last tool call failed; a turn that fails (StopFailure) while
+another session is on screen is unseen too. The Workbench gets them per
+terminal (sessions[id].turn: files, failed, error). The page sorts its
+sessions out (it also reads their last answers for a PR link) and sends its
+top kind with the chats report; the sidebar's Workbench row shows that kind's
+icon and count (amber permission/question, red error, blue PR/result/done),
+or Mission Control's own counts for an older page.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/mission/mission_control.cc       | 47 ++++++++++-
+ .../meridian/mission/mission_control.h        | 11 +++
+ .../meridian/workbench/workbench_handler.cc   | 16 ++++
+ .../resources/webui_browser/meridian/item.ts  |  2 +-
+ .../resources/webui_browser/meridian/rows.css | 30 +++++++
+ .../webui_browser/meridian/tab_row.ts         |  2 +-
+ .../webui_browser/meridian/workbench_badge.ts | 82 +++++++++++++++----
+ 7 files changed, 169 insertions(+), 21 deletions(-)
+
+diff --git a/chrome/browser/meridian/mission/mission_control.cc b/chrome/browser/meridian/mission/mission_control.cc
+index 9dab4755f5..abd81ad538 100644
+--- a/chrome/browser/meridian/mission/mission_control.cc
++++ b/chrome/browser/meridian/mission/mission_control.cc
+@@ -756,6 +756,8 @@ void MissionControl::OnHookEvent(const std::string& node_id,
+       SetStatus(*root, "idle", "Ready");
+     }
+   } else if (event == "UserPromptSubmit") {
++    root->turn_files.clear();
++    root->turn_failed = false;
+     SetStatus(*root, "thinking");
+   } else if (event == "PreToolUse") {
+     target->tool_calls++;
+@@ -796,6 +798,16 @@ void MissionControl::OnHookEvent(const std::string& node_id,
+     if (error) {
+       target->errors++;
+     }
++    // What the turn did, for the chats list: files written, the last call.
++    if (target == root) {
++      root->turn_failed = error;
++      if (!error && !summary.empty() && root->turn_files.size() < 5 &&
++          (tool == "Write" || tool == "Edit" || tool == "MultiEdit" ||
++           tool == "NotebookEdit") &&
++          !std::ranges::contains(root->turn_files, summary)) {
++        root->turn_files.push_back(summary);
++      }
++    }
+     target->tool.reset();
+     if (target->status == "tool" || target->status == "waiting") {
+       SetStatus(*target, "thinking");
+@@ -869,6 +881,10 @@ void MissionControl::OnHookEvent(const std::string& node_id,
+     root->tool.reset();
+     root->errors++;
+     SetStatus(*root, "error", "The turn failed");
++    if (auto view = chats_.find(root->owner_tab);
++        view != chats_.end() && view->second.on_screen != root->term_id) {
++      root->unseen = true;
++    }
+   } else if (event == "SubagentStart") {
+     // Known by its id already (its launch returned first), or the oldest
+     // spawn of its type waiting for one.
+@@ -1643,11 +1659,31 @@ base::ListValue MissionControl::ChatsSummary() const {
+                    .Set("needs", needs)
+                    .Set("done", done)
+                    .Set("working", working)
+-                   .Set("first", first));
++                   .Set("first", first)
++                   .Set("kind", view.badge_kind)
++                   .Set("count", view.badge_count));
+   }
+   return out;
+ }
+ 
++void MissionControl::SetChatsBadge(int owner_tab,
++                                   const std::string& kind,
++                                   int count) {
++  static constexpr std::string_view kKinds[] = {
++      "", "permission", "question", "error", "pr", "result", "done", "working"};
++  auto view = chats_.find(owner_tab);
++  if (view == chats_.end() || !std::ranges::contains(kKinds, kind)) {
++    return;
++  }
++  count = std::clamp(count, 0, 999);
++  if (view->second.badge_kind == kind && view->second.badge_count == count) {
++    return;
++  }
++  view->second.badge_kind = kind;
++  view->second.badge_count = count;
++  Changed();
++}
++
+ void MissionControl::SetChatsView(int owner_tab,
+                                   bool on,
+                                   const std::string& on_screen,
+@@ -1728,6 +1764,15 @@ base::DictValue MissionControl::Snapshot() const {
+                               : base::Value(n.usage.dict.Clone()))
+             .Set("permissionMode", OptString(n.permission_mode))
+             .Set("unseen", n.unseen)
++            .Set("turnFiles",
++                 [&] {
++                   base::ListValue files;
++                   for (const std::string& f : n.turn_files) {
++                     files.Append(f);
++                   }
++                   return files;
++                 }())
++            .Set("turnFailed", n.turn_failed)
+             .Set("chat", ChatState(n))
+             .Set("log", std::move(log)));
+   }
+diff --git a/chrome/browser/meridian/mission/mission_control.h b/chrome/browser/meridian/mission/mission_control.h
+index 9b261d76f5..01fe14ce13 100644
+--- a/chrome/browser/meridian/mission/mission_control.h
++++ b/chrome/browser/meridian/mission/mission_control.h
+@@ -206,6 +206,11 @@ class MissionControl : public KeyedService,
+                     bool on,
+                     const std::string& on_screen,
+                     std::vector<std::string> order);
++  // The Workbench's one mark for its sessions, as its page sorts them out
++  // (it reads the answers: a PR link, a result): `kind` one of permission,
++  // question, error, pr, result, done, working ("" for none), `count` how
++  // many sessions are of that kind's rank.
++  void SetChatsBadge(int owner_tab, const std::string& kind, int count);
+ 
+   // ---- The view ----
+   base::DictValue Snapshot() const;
+@@ -299,6 +304,10 @@ class MissionControl : public KeyedService,
+     // Its last turn ended while the Workbench listing it showed another
+     // session (or was hidden), and it hasn't been shown since.
+     bool unseen = false;
++    // The current (or last) turn: files the session itself wrote or edited
++    // (their short names, at most 5), whether its last tool call failed.
++    std::vector<std::string> turn_files;
++    bool turn_failed = false;
+   };
+   // Under a session's own name: the agent and its model.
+   static std::string AgentLine(const Node& n);
+@@ -396,6 +405,8 @@ class MissionControl : public KeyedService,
+     ~ChatsView();
+     std::string on_screen;
+     std::vector<std::string> order;
++    std::string badge_kind;
++    int badge_count = 0;
+   };
+   std::map<int, ChatsView> chats_;
+   base::RepeatingTimer sweep_;
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 38b299dc4d..1b78a0d551 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -3805,6 +3805,16 @@ void WorkbenchHandler::OnMissionChanged(const base::DictValue& snapshot) {
+         if (const base::DictValue* tool = n.FindDict("tool")) {
+           entry.Set("tool", tool->Clone());
+         }
++        // What its turn did: the files it wrote, whether its last tool call
++        // failed, whether the turn itself failed (StopFailure).
++        base::DictValue turn;
++        if (const base::ListValue* files = n.FindList("turnFiles")) {
++          turn.Set("files", files->Clone());
++        }
++        turn.Set("failed", n.FindBool("turnFailed").value_or(false));
++        const std::string* status = n.FindString("status");
++        turn.Set("error", status && *status == "error");
++        entry.Set("turn", std::move(turn));
+         // What it asks (the oldest question still open).
+         for (size_t i = 0; asks && i < asks->size(); ++i) {
+           const base::DictValue& a = (*asks)[i].GetDict();
+@@ -3862,6 +3872,12 @@ void WorkbenchHandler::ToHost(const base::DictValue& message) {
+     mission->SetChatsView(
+         owner, on, shown && terms_.contains(*shown) ? *shown : std::string(),
+         std::move(order));
++    // The page's one mark for its sessions (it reads their answers).
++    if (const base::DictValue* badge = message.FindDict("badge"); on && badge) {
++      const std::string* kind = badge->FindString("kind");
++      mission->SetChatsBadge(owner, kind ? *kind : std::string(),
++                             badge->FindInt("count").value_or(0));
++    }
+     return;
+   }
+   if (type && *type == "ready") {
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.ts b/chrome/browser/resources/webui_browser/meridian/item.ts
+index edec23765f..024cdda3de 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.ts
+@@ -129,7 +129,7 @@ export class MeridianItemElement extends CrLitElement {
+ 
+   // A Workbench whose sessions need you opens on the first of them.
+   protected onRowClick_(e: MouseEvent) {
+-    const first = this.wbBadge_?.kind === 'needs' ? this.wbBadge_.first : '';
++    const first = this.wbBadge_?.first || '';
+     if (first && e.button === 0 && !e.metaKey && !e.shiftKey && !e.ctrlKey &&
+         !e.altKey && !(e.target as Element).closest?.('.row-btn')) {
+       this.host?.revealMissionNode(first);
+diff --git a/chrome/browser/resources/webui_browser/meridian/rows.css b/chrome/browser/resources/webui_browser/meridian/rows.css
+index 2471e75da9..74be14fdb8 100644
+--- a/chrome/browser/resources/webui_browser/meridian/rows.css
++++ b/chrome/browser/resources/webui_browser/meridian/rows.css
+@@ -408,6 +408,36 @@ input.rename {
+   color: color-mix(in srgb, var(--wb-badge) 80%, var(--meridian-text));
+ }
+ 
++/* What the sessions want (the page's kinds): amber asks, red failed, blue to
++ * look at; colour and shape (the icon) together. */
++.wb-badge.permission,
++.wb-badge.question {
++  --wb-badge: #c97a06;
++  gap: 4px;
++  background: color-mix(in srgb, var(--wb-badge) 16%, transparent);
++  color: color-mix(in srgb, var(--wb-badge) 85%, var(--meridian-text));
++}
++
++.wb-badge.error {
++  --wb-badge: #e0383e;
++  gap: 4px;
++  background: color-mix(in srgb, var(--wb-badge) 14%, transparent);
++  color: color-mix(in srgb, var(--wb-badge) 85%, var(--meridian-text));
++}
++
++.wb-badge.pr,
++.wb-badge.result,
++.wb-badge.done {
++  --wb-badge: #2f7bf6;
++  gap: 4px;
++  background: color-mix(in srgb, var(--wb-badge) 13%, transparent);
++  color: color-mix(in srgb, var(--wb-badge) 85%, var(--meridian-text));
++}
++
++.wb-badge svg {
++  flex: none;
++}
++
+ .wb-badge.working {
+   padding: 0 4px;
+ }
+diff --git a/chrome/browser/resources/webui_browser/meridian/tab_row.ts b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+index 9f51383653..17beb1f894 100644
+--- a/chrome/browser/resources/webui_browser/meridian/tab_row.ts
++++ b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+@@ -133,7 +133,7 @@ export class MeridianTabRowElement extends CrLitElement {
+ 
+   // A Workbench whose sessions need you opens on the first of them.
+   protected onRowClick_(e: MouseEvent) {
+-    const first = this.wbBadge_?.kind === 'needs' ? this.wbBadge_.first : '';
++    const first = this.wbBadge_?.first || '';
+     if (first && e.button === 0 && !e.metaKey && !e.shiftKey && !e.ctrlKey &&
+         !e.altKey && !(e.target as Element).closest?.('.row-btn')) {
+       this.host?.revealMissionNode(first);
+diff --git a/chrome/browser/resources/webui_browser/meridian/workbench_badge.ts b/chrome/browser/resources/webui_browser/meridian/workbench_badge.ts
+index 9d45d5a625..46331fc1c7 100644
+--- a/chrome/browser/resources/webui_browser/meridian/workbench_badge.ts
++++ b/chrome/browser/resources/webui_browser/meridian/workbench_badge.ts
+@@ -3,15 +3,21 @@
+ // found in the LICENSE file.
+ 
+ // One mark on a Workbench tab's row whose page lists its sessions as chats (a
+-// preview the Workbench turns on): orange with a count when sessions need
+-// you, else blue with a count when turns ended that you haven't seen, else a
+-// calm spinner while any works, else nothing. From Mission Control's snapshot
+-// ("chats": per Workbench tab, from the sessions' own hooks).
++// preview the Workbench turns on). The page sorts its sessions out (it reads
++// their answers) and sends the top kind: permission or question (amber), an
++// error (red), a PR to look at or a result (blue), done (a blue check), with a
++// count; else a calm spinner while any works; else nothing. Older pages send
++// no kind: then orange when sessions need you, else blue when turns ended
++// unseen, else the spinner (Mission Control's own counts).
+ 
+ import {html} from '//resources/lit/v3_0/lit.rollup.js';
++import type {TemplateResult} from '//resources/lit/v3_0/lit.rollup.js';
++
++export type WorkbenchKind =
++    'permission'|'question'|'error'|'pr'|'result'|'done'|'needs'|'working';
+ 
+ export interface WorkbenchBadge {
+-  kind: 'needs'|'done'|'working';
++  kind: WorkbenchKind;
+   count: number;
+   // The Mission Control node of the first session that needs you (in the
+   // Workbench's list order): a click on the row opens it.
+@@ -24,21 +30,35 @@ interface ChatsEntry {
+   done: number;
+   working: number;
+   first: string;
++  kind?: string;
++  count?: number;
+ }
+ 
++const KINDS: WorkbenchKind[] =
++    ['permission', 'question', 'error', 'pr', 'result', 'done', 'working'];
++
+ // Tab handle -> mark.
+ let badges = new Map<string, WorkbenchBadge>();
+ let key = '';
+ const listeners = new Set<() => void>();
+ 
++function badgeOf(c: ChatsEntry): WorkbenchBadge|null {
++  const first = c.needs > 0 ? c.first || '' : '';
++  if (typeof c.kind === 'string' && c.kind) {
++    const kind = KINDS.find(k => k === c.kind);
++    return kind ? {kind, count: Math.max(0, Number(c.count) || 0), first} :
++                  null;
++  }
++  return c.needs > 0 ? {kind: 'needs', count: c.needs, first} :
++      c.done > 0     ? {kind: 'done', count: c.done, first: ''} :
++      c.working > 0  ? {kind: 'working', count: c.working, first: ''} :
++                       null;
++}
++
+ export function setWorkbenchChats(chats: ChatsEntry[]|undefined) {
+   const next = new Map<string, WorkbenchBadge>();
+   for (const c of Array.isArray(chats) ? chats : []) {
+-    const badge: WorkbenchBadge|null = c.needs > 0 ?
+-        {kind: 'needs', count: c.needs, first: c.first || ''} :
+-        c.done > 0    ? {kind: 'done', count: c.done, first: ''} :
+-        c.working > 0 ? {kind: 'working', count: c.working, first: ''} :
+-                        null;
++    const badge = badgeOf(c);
+     if (badge) {
+       next.set(String(c.tab), badge);
+     }
+@@ -64,19 +84,45 @@ export function onWorkbenchBadges(fn: () => void): () => void {
+   return () => listeners.delete(fn);
+ }
+ 
++// The kinds' icons (the Workbench's session-status.js draws the same).
++function kindIcon(kind: WorkbenchKind): TemplateResult|string {
++  switch (kind) {
++    case 'permission':
++      return html`<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.2l7 2.9v5.1c0 4.4-2.9 8.1-7 9.6-4.1-1.5-7-5.2-7-9.6V6.1z"/><circle cx="12" cy="10.6" r="1.7"/><path d="M12 12.3v3.4"/></svg>`;
++    case 'question':
++      return html`<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.2 11.6a8.2 8.2 0 0 1-11.9 7.3L3.8 20l1.2-4.2a8.2 8.2 0 1 1 15.2-4.2z"/><path d="M9.9 9.4a2.2 2.2 0 0 1 4.3.6c0 1.5-2.2 1.9-2.2 3.3"/><path d="M12 16.1v.1"/></svg>`;
++    case 'error':
++      return html`<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.6"/><path d="M12 7.6v5.3"/><path d="M12 16.3v.1"/></svg>`;
++    case 'pr':
++      return html`<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6.5" cy="6" r="2.2"/><circle cx="6.5" cy="18" r="2.2"/><circle cx="17.5" cy="18" r="2.2"/><path d="M6.5 8.2v7.6"/><path d="M17.5 15.8V9.5a3 3 0 0 0-3-3H11"/><path d="M13.2 4.2L10.9 6.5l2.3 2.3"/></svg>`;
++    case 'result':
++      return html`<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 3.5l1.7 4.8 4.8 1.7-4.8 1.7L11 16.5l-1.7-4.8-4.8-1.7 4.8-1.7z"/><path d="M18 14.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z"/></svg>`;
++    case 'done':
++      return html`<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5.5 12.6l4.2 4.2 8.8-9.3"/></svg>`;
++    default:
++      return html`<span class="wb-dot"></span>`;
++  }
++}
++
++const TITLES: Record<WorkbenchKind, (n: number) => string> = {
++  permission: n => `${n} waiting for permission`,
++  question: n => `${n} asking you something`,
++  needs: n => `${n} ${n === 1 ? 'session needs' : 'sessions need'} you`,
++  error: n => `${n} ended with an error`,
++  pr: n => `${n} with a pull request to review`,
++  result: n => `${n} with a result ready`,
++  done: n => `${n} finished, not seen yet`,
++  working: n => `${n} working`,
++};
++
+ export function workbenchBadgeHtml(badge: WorkbenchBadge|null) {
+   if (!badge) {
+     return '';
+   }
+-  const title = badge.kind === 'needs' ?
+-      `${badge.count} ${
+-          badge.count === 1 ? 'session needs' : 'sessions need'} you` :
+-      badge.kind === 'done' ?
+-      `${badge.count} finished, not seen yet` :
+-      `${badge.count} working`;
+-  return html`<span class="wb-badge ${badge.kind}" title="${title}"
++  return html`<span class="wb-badge ${badge.kind}"
++      title="${TITLES[badge.kind](badge.count)}"
+       data-kind="${badge.kind}">${badge.kind === 'working' ?
+       html`<span class="wb-spin"></span>` :
+-      html`<span class="wb-dot"></span><span class="wb-count">${
++      html`${kindIcon(badge.kind)}<span class="wb-count">${
+           badge.count}</span>`}</span>`;
+ }
