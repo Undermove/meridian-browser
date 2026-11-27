@@ -43,6 +43,20 @@ const key = async (page, key, code, modifiers = 0, keyCode = 0) => {
   await page.cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key, code, modifiers, windowsVirtualKeyCode: keyCode });
   await page.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, modifiers, windowsVirtualKeyCode: keyCode });
 };
+// The toolkit editor's <canvas> (a remote object id) once it is up, else null. Its UI is in a closed
+// shadow root, which DevTools' DOM (pierce) can still walk.
+async function editorCanvas(page) {
+  await page.cdp.send('DOM.enable');
+  const { root } = await page.cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+  const find = (n) => n.nodeName === 'MERIDIAN-TOOLKIT' ? n : (n.children || []).map(find).find(Boolean) || null;
+  const host = find(root);
+  const shadow = host?.shadowRoots?.[0];
+  if (!shadow) return null;
+  const { nodeId } = await page.cdp.send('DOM.querySelector', { nodeId: shadow.nodeId, selector: '.editor canvas' });
+  if (!nodeId) return null;
+  const { object } = await page.cdp.send('DOM.resolveNode', { nodeId });
+  return object?.objectId || null;
+}
 const rect = (page, sel) => page.eval(`(() => { const r = document.querySelector(${JSON.stringify(sel)}).getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`);
 
 test('toolkit off: no host element, no menu items', async () => {
@@ -127,14 +141,33 @@ test('toolkit on: ⌘⇧2 takes the whole page; P opens the page again as a phon
   try {
     const page = await b.page(url);
     await page.waitFor(`document.readyState === 'complete'`);
-    await page.eval(`document.body.insertAdjacentHTML('beforeend', '<div id="tall" style="height:3000px;background:linear-gradient(#f6eee3,#5b3fa8)"></div>'), true`);
+    // A sticky header (magenta) and a bar fixed at the bottom (cyan) on a page of several slices (the
+    // browser takes ≤ 8000 device px a slice: 2 slices at 1×, 3 at 2×). Their styles are in a sheet, so
+    // anything inline afterwards is the toolkit's.
+    await page.eval(`(() => {
+      document.head.insertAdjacentHTML('beforeend', '<style>#hdr{position:sticky;top:0;height:120px;background:#ff00ff;z-index:2}#bar{position:fixed;left:0;right:0;bottom:0;height:60px;background:#00ffff}#tall{height:11000px;background:linear-gradient(#f6eee3,#5b3fa8)}</style>');
+      document.body.insertAdjacentHTML('afterbegin', '<header id="hdr"></header>');
+      document.body.insertAdjacentHTML('beforeend', '<div id="tall"></div><div id="bar"></div>');
+      return true; })()`);
     await sleep(500);
     // ⌘⇧2: lazy pass down the page and back, the capture, the editor; the page scroll comes back.
     await page.eval('scrollTo(0, 120), true');
     await key(page, '2', 'Digit2', MAC ? 4 | 8 : 2 | 8, 50);
-    await sleep(6000);
+    // The editor's picture (in the toolkit's closed shadow root: found through DevTools' DOM).
+    let canvas = null;
+    for (let i = 0; i < 80 && !canvas; i++) { await sleep(250); canvas = await editorCanvas(page); }
+    assert.ok(canvas, 'the editor shows the whole page');
     assert.equal(await page.eval('Math.round(scrollY)'), 120, 'the scroll position is restored');
-    assert.equal(await page.eval(`[...document.querySelectorAll('*')].filter(e => e.style.getPropertyValue('position') || e.style.getPropertyValue('visibility')).length`), 0, 'fixed/sticky changes are undone');
+    assert.equal(await page.eval(`[...document.querySelectorAll('*')].filter(e => e.tagName !== 'MERIDIAN-TOOLKIT' && ['position', 'visibility', 'opacity'].some(k => e.style.getPropertyValue(k))).length`), 0, 'fixed/sticky changes are undone');
+    // Down the picture: the header once (the first slice), the bottom bar never.
+    const bands = await page.cdp.send('Runtime.callFunctionOn', { objectId: canvas, returnByValue: true, functionDeclaration: `function () {
+      const d = this.getContext('2d').getImageData(Math.round(this.width * 0.3), 0, 1, this.height).data;
+      const runs = (on) => { let n = 0, was = false; for (let i = 0; i < d.length; i += 4) { const is = on(d[i], d[i + 1], d[i + 2]); if (is && !was) n++; was = is; } return n; };
+      return { h: this.height, header: runs((r, g, b) => r > 200 && g < 70 && b > 200), bar: runs((r, g, b) => r < 70 && g > 200 && b > 200) };
+    }` });
+    const got = bands.result.value;
+    assert.equal(got.header, 1, `the sticky header shows once: ${JSON.stringify(got)}`);
+    assert.equal(got.bar, 0, `the bottom bar doesn't show: ${JSON.stringify(got)}`);
     await key(page, 'Escape', 'Escape', 0, 27);
     // P (dock up): a second tab with the same URL, emulated as an iPhone (UA, touch, viewport).
     await key(page, 'X', 'KeyX', MAC ? 4 | 8 : 2 | 8, 88);
