@@ -257,11 +257,18 @@ function stBuild() {
   });
   $('#st-brand', el).addEventListener('click', stOnBrandClick);
   $('#st-new', el).addEventListener('click', () => { ST.current = ''; ST.preview = null; stRender(); $('#st-input').focus({ preventScroll: true }); });
-  $('#st-task-list', el).addEventListener('click', (e) => {
+  // The task menu acts on pointer-up (and on a key's click): the list redraws while a task works, and
+  // a click whose button was redrawn between press and release never arrives.
+  const stTaskMenu = (e) => {
     const more = e.target.closest('[data-tmenu]');
-    if (more) { ST.menuFor = ST.menuFor === more.dataset.tmenu ? '' : more.dataset.tmenu; stRender(); return; }
+    if (more) { ST.menuFor = ST.menuFor === more.dataset.tmenu ? '' : more.dataset.tmenu; stRender(); return true; }
     const rv = e.target.closest('[data-reveal]');
-    if (rv) { ST.menuFor = ''; stReveal(stTerms().find((x) => x.id === rv.dataset.reveal)); stRender(); return; }
+    if (rv) { ST.menuFor = ''; stReveal(stTerms().find((x) => x.id === rv.dataset.reveal)); stRender(); return true; }
+    return false;
+  };
+  $('#st-task-list', el).addEventListener('pointerup', (e) => { if (e.button === 0) stTaskMenu(e); });
+  $('#st-task-list', el).addEventListener('click', (e) => {
+    if (e.target.closest('[data-tmenu], [data-reveal]')) { if (e.detail === 0) stTaskMenu(e); return; }
     if (ST.menuFor) { ST.menuFor = ''; }
     const row = e.target.closest('[data-term]');
     if (!row) return;
