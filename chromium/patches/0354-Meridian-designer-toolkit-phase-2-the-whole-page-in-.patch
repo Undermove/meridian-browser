@@ -1,0 +1,937 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <d.afonchenko@dodopizza.com>
+Date: Fri, 27 Nov 2026 00:25:00 +0400
+Subject: [PATCH] =?UTF-8?q?Meridian:=20designer=20toolkit,=20phase=202=20?=
+ =?UTF-8?q?=E2=80=94=20the=20whole=20page=20in=20one=20gesture,=20the=20ph?=
+ =?UTF-8?q?one=20beside,=20QR=20for=20public=20pages=20(behind=20the=20sam?=
+ =?UTF-8?q?e=20flag)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- ⌘⇧2 / «Вся страница»: the page script does a lazy-load pass, keeps fixed
+  headers once and hides bottom bars, then the browser captures tiles
+  beyond the viewport (Page.captureScreenshot, ≤ 8000 px each, screen
+  scale) through a DevTools session of its own (CdpSession, no infobar);
+  the page stitches them and opens a markup editor (arrow, box, note pin,
+  blur, crop; export at full size; copy, as a bug, PNG, drag out).
+- «Телефон» (P): the page again in a new tab of the same Space, split with
+  this one, emulated as iPhone 16 Pro / Pixel 9 / iPad mini (metrics, touch,
+  UA, fit to the pane), dark scheme, reduced motion, slow 3G, landscape; the
+  frame is drawn by the page script; Boost changes apply to both tabs.
+- QR of the page's address (components/qr_code_generator) for http(s)
+  pages only. localhost and files are refused here: they'd need a server on
+  the network, left for later.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   3 +
+ .../browser/meridian/toolkit/toolkit_cdp.cc   |  91 ++++++
+ chrome/browser/meridian/toolkit/toolkit_cdp.h |  57 ++++
+ .../browser/meridian/toolkit/toolkit_core.js  | 168 ++++++++++-
+ .../meridian/toolkit/toolkit_meridian.js      |  57 +++-
+ .../meridian/toolkit/toolkit_tab_helper.cc    | 282 +++++++++++++++++-
+ .../meridian/toolkit/toolkit_tab_helper.h     |  24 ++
+ 7 files changed, 671 insertions(+), 11 deletions(-)
+ create mode 100644 chrome/browser/meridian/toolkit/toolkit_cdp.cc
+ create mode 100644 chrome/browser/meridian/toolkit/toolkit_cdp.h
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index f671613e66..cf20ae9434 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -459,6 +459,8 @@ source_set("meridian") {
+     "status_bubble.h",
+     "tab_data.cc",
+     "tab_data.h",
++    "toolkit/toolkit_cdp.cc",
++    "toolkit/toolkit_cdp.h",
+     "toolkit/toolkit_tab_helper.cc",
+     "toolkit/toolkit_tab_helper.h",
+     "updater.h",
+@@ -521,6 +523,7 @@ source_set("meridian") {
+     "//ui/views",
+     ":agent_embed",
+     ":toolkit_embed",
++    "//components/qr_code_generator",
+     ":agent_input",
+     ":arc_staged",
+     "//chrome/browser/autofill",
+diff --git a/chrome/browser/meridian/toolkit/toolkit_cdp.cc b/chrome/browser/meridian/toolkit/toolkit_cdp.cc
+new file mode 100644
+index 0000000000..963b6b375f
+--- /dev/null
++++ b/chrome/browser/meridian/toolkit/toolkit_cdp.cc
+@@ -0,0 +1,91 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/toolkit/toolkit_cdp.h"
++
++#include <string_view>
++#include <utility>
++
++#include "base/containers/span.h"
++#include "base/functional/bind.h"
++#include "base/json/json_reader.h"
++#include "base/json/json_writer.h"
++#include "base/task/sequenced_task_runner.h"
++#include "content/public/browser/devtools_agent_host.h"
++#include "content/public/browser/web_contents.h"
++
++namespace meridian::toolkit {
++
++CdpSession::CdpSession(content::WebContents* contents) {
++  host_ = content::DevToolsAgentHost::GetOrCreateFor(contents);
++  if (!host_->AttachClient(this)) {
++    host_ = nullptr;
++  }
++}
++
++CdpSession::~CdpSession() {
++  if (host_) {
++    host_->DetachClient(this);
++  }
++}
++
++void CdpSession::Send(const std::string& method,
++                      base::DictValue params,
++                      Done done) {
++  if (!host_) {
++    if (done) {
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE, base::BindOnce(std::move(done), base::Value()));
++    }
++    return;
++  }
++  const int id = ++id_;
++  if (done) {
++    pending_[id] = std::move(done);
++  }
++  std::string json = base::WriteJson(base::DictValue()
++                                         .Set("id", id)
++                                         .Set("method", method)
++                                         .Set("params", std::move(params)))
++                         .value_or("{}");
++  host_->DispatchProtocolMessage(this, base::as_byte_span(json));
++}
++
++void CdpSession::DispatchProtocolMessage(content::DevToolsAgentHost*,
++                                         base::span<const uint8_t> message) {
++  std::optional<base::Value> v = base::JSONReader::Read(
++      std::string_view(reinterpret_cast<const char*>(message.data()),
++                       message.size()),
++      0);
++  if (!v || !v->is_dict()) {
++    return;
++  }
++  const std::optional<int> id = v->GetDict().FindInt("id");
++  if (!id) {
++    return;  // an event
++  }
++  auto it = pending_.find(*id);
++  if (it == pending_.end()) {
++    return;
++  }
++  Done done = std::move(it->second);
++  pending_.erase(it);
++  base::Value result;
++  if (base::DictValue* r = v->GetDict().FindDict("result")) {
++    result = base::Value(std::move(*r));
++  }
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(std::move(done), std::move(result)));
++}
++
++void CdpSession::AgentHostClosed(content::DevToolsAgentHost*) {
++  host_ = nullptr;
++  for (auto& [id, done] : pending_) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(std::move(done), base::Value()));
++  }
++  pending_.clear();
++}
++
++}  // namespace meridian::toolkit
+diff --git a/chrome/browser/meridian/toolkit/toolkit_cdp.h b/chrome/browser/meridian/toolkit/toolkit_cdp.h
+new file mode 100644
+index 0000000000..f823c66c67
+--- /dev/null
++++ b/chrome/browser/meridian/toolkit/toolkit_cdp.h
+@@ -0,0 +1,57 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_TOOLKIT_TOOLKIT_CDP_H_
++#define CHROME_BROWSER_MERIDIAN_TOOLKIT_TOOLKIT_CDP_H_
++
++#include <map>
++#include <string>
++
++#include "base/functional/callback.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/values.h"
++#include "content/public/browser/devtools_agent_host_client.h"
++
++namespace content {
++class DevToolsAgentHost;
++class WebContents;
++}  // namespace content
++
++namespace meridian::toolkit {
++
++// A DevTools session of one tab, from the browser (no infobar): the toolkit's
++// full-page capture and the phone's emulation. Emulation lasts as long as
++// the session: the phone tab keeps its session while it is a phone.
++class CdpSession : public content::DevToolsAgentHostClient {
++ public:
++  using Done = base::OnceCallback<void(base::Value result)>;
++
++  explicit CdpSession(content::WebContents* contents);
++  CdpSession(const CdpSession&) = delete;
++  CdpSession& operator=(const CdpSession&) = delete;
++  ~CdpSession() override;
++
++  bool attached() const { return !!host_; }
++  // `done` gets the result dict, or a none value on an error; it never runs
++  // inside DevTools' dispatch.
++  void Send(const std::string& method,
++            base::DictValue params,
++            Done done = Done());
++
++  // content::DevToolsAgentHostClient:
++  void DispatchProtocolMessage(content::DevToolsAgentHost* host,
++                               base::span<const uint8_t> message) override;
++  void AgentHostClosed(content::DevToolsAgentHost* host) override;
++
++ private:
++  scoped_refptr<content::DevToolsAgentHost> host_;
++  int id_ = 0;
++  std::map<int, Done> pending_;
++  base::WeakPtrFactory<CdpSession> weak_factory_{this};
++};
++
++}  // namespace meridian::toolkit
++
++#endif  // CHROME_BROWSER_MERIDIAN_TOOLKIT_TOOLKIT_CDP_H_
+diff --git a/chrome/browser/meridian/toolkit/toolkit_core.js b/chrome/browser/meridian/toolkit/toolkit_core.js
+index e689647671..af2b80b92f 100644
+--- a/chrome/browser/meridian/toolkit/toolkit_core.js
++++ b/chrome/browser/meridian/toolkit/toolkit_core.js
+@@ -379,6 +379,16 @@ pre.code { margin: 0 16px; max-height: 330px; overflow: auto; background: var(--
+ .tape { position: absolute; background: repeating-linear-gradient(45deg, color-mix(in srgb, var(--m-danger) 18%, transparent) 0 6px, transparent 6px 12px); }
+ .edge { position: absolute; background: var(--m-danger); }
+ .sring { position: absolute; border-radius: var(--r-xs); box-shadow: 0 0 0 1px var(--m-danger); }
++.editor { position: absolute; display: flex; gap: 0; padding: 0; overflow: hidden; max-width: calc(100vw - 24px); }
++.editor .ecol { padding: 12px; background: var(--m-surface-2); display: flex; flex-direction: column; gap: 10px; }
++.editor .etools { display: flex; align-items: center; gap: 8px; }
++.editor .inks { display: inline-flex; gap: 6px; } .editor .inks button { width: 16px; height: 16px; border-radius: 50%; border: 0; padding: 0; background: var(--c); cursor: pointer; }
++.editor .inks button.on { box-shadow: 0 0 0 2px var(--m-surface-2), 0 0 0 3px var(--m-text); }
++.editor .ib.light { color: var(--m-text-2); } .editor .ib.light:hover { background: rgba(0,0,0,.06); }
++.editor .ecan { border-radius: var(--r-md); overflow: hidden; box-shadow: var(--m-hair); background: repeating-conic-gradient(#ececf0 0 25%, #fff 0 50%) 0 0 / 14px 14px; cursor: grab; }
++.editor canvas { display: block; cursor: crosshair; }
++.editor .eside { width: 230px; padding: 14px; display: flex; flex-direction: column; gap: 8px; }
++.editor .enote { position: absolute; height: 28px; width: 200px; border: 0; border-radius: var(--r-sm); box-shadow: 0 0 0 1px var(--m-space), 0 0 0 3px var(--m-space-wash), var(--e2); padding: 0 9px; font: 500 12.5px -apple-system, system-ui, sans-serif; outline: none; }
+ .why { position: absolute; max-width: 260px; padding: 8px 10px; border-radius: var(--r-md); background: var(--m-surface); box-shadow: var(--e3); font-size: 12px; pointer-events: none; }
+ @media (prefers-reduced-motion: reduce) { .root * { animation-duration: 120ms !important; animation-name: tick !important; transition: opacity 120ms !important; } .ants rect.a { animation: none !important; } }
+ `;
+@@ -420,7 +430,7 @@ function create(adapter = {}) {
+     if (!host.isConnected) document.documentElement.appendChild(host);
+     try { if (host.matches(':popover-open')) host.hidePopover(); host.showPopover(); } catch {}
+   }
+-  function unmountIfIdle() { if (!S.active && !S.mode && !S.peek && !root.querySelector('.card,.panel,.toast,.dock')) { try { host.hidePopover(); } catch {} host.remove(); } }
++  function unmountIfIdle() { if (!S.active && !S.mode && !S.peek && !root.querySelector('.card,.panel,.toast,.dock,.editor')) { try { host.hidePopover(); } catch {} host.remove(); } }
+   const H = (html, cls) => { const d = document.createElement('div'); if (cls) d.className = cls; d.innerHTML = html; return d; };
+   const add = (html, cls, parent = root) => { const n = H(html, cls); parent.appendChild(n); return n; };
+   const layer = name => { let l = root.querySelector(`[data-l="${name}"]`); if (!l) { l = document.createElement('div'); l.dataset.l = name; root.insertBefore(l, root.firstChild); } return l; };
+@@ -856,6 +866,140 @@ function create(adapter = {}) {
+     return sys;
+   }
+ 
++  // ---------- full page: one gesture (⌘⇧2 or «Вся страница»); stitched by the adapter
++  const sleepMs = ms => new Promise(r => setTimeout(r, ms));
++  async function fullPage() {
++    exitModes(); mount(); showDock(); setDockOn('capture');
++    const p = dockPanel(`<span class="ttl">Вся страница</span><span class="m" data-pr>догружаю картинки…</span>`);
++    const de = document.scrollingElement || document.documentElement;
++    const W = Math.max(de.scrollWidth, innerWidth), PH = Math.min(Math.max(de.scrollHeight, innerHeight), 30000);
++    const x0 = scrollX, y0 = scrollY;
++    // lazy images: one quick pass down the page (≤ 25 screens)
++    for (let y = 0, n = 0; y < PH && n < 25; y += innerHeight, n++) { scrollTo(x0, y); await sleepMs(70); }
++    scrollTo(x0, 0); await sleepMs(120);
++    // fixed/sticky once: a header stays at the top, bars at the bottom of the screen go
++    const changed = [];
++    for (const el of SCOPE().querySelectorAll('*')) {
++      if (el.closest('meridian-toolkit')) continue;
++      const pos = getComputedStyle(el).position; if (pos !== 'fixed' && pos !== 'sticky') continue;
++      const r = el.getBoundingClientRect();
++      changed.push([el, el.style.getPropertyValue('position'), el.style.getPropertyPriority('position'), el.style.getPropertyValue('visibility'), el.style.getPropertyPriority('visibility')]);
++      if (pos === 'fixed' && r.top > innerHeight * 0.5) el.style.setProperty('visibility', 'hidden', 'important');
++      else el.style.setProperty('position', pos === 'fixed' ? 'absolute' : 'relative', 'important');
++    }
++    p.querySelector('[data-pr]').textContent = 'снимаю…';
++    root.style.opacity = '0';
++    let blob = null;
++    try { blob = A.capturePage ? await A.capturePage({ width: W, height: PH, dpr: Math.min(devicePixelRatio, 2) }) : null; } catch {}
++    root.style.opacity = '';
++    for (const [el, pv, pp, vv, vp] of changed) { pv ? el.style.setProperty('position', pv, pp) : el.style.removeProperty('position'); vv ? el.style.setProperty('visibility', vv, vp) : el.style.removeProperty('visibility'); }
++    scrollTo(x0, y0); dockPanel(''); setDockOn(null);
++    if (!blob) { toast('Снимок всей страницы — в Meridian', false); return; }
++    if (!reduced()) { const f = H('', 'shutter'); box(f, { left: 0, top: 0, width: innerWidth, height: innerHeight }); root.appendChild(f); f.animate([{ opacity: 0 }, { opacity: .5 }, { opacity: 0 }], { duration: 180 }).onfinish = () => f.remove(); }
++    showEditor(blob, { title: 'Вся страница', w: W, h: PH, from: { left: 0, top: 0, width: innerWidth, height: innerHeight } });
++  }
++
++  // ---------- markup editor: arrow, box, note (drop pin), blur, crop; exports at full resolution
++  async function showEditor(blob, meta = {}) {
++    root.querySelector('.editor')?.remove(); root.querySelector('.card')?.remove(); showDock();
++    let bmp; try { bmp = await createImageBitmap(blob); } catch { toast('Не удалось открыть снимок', false); return; }
++    const ed = H('', 'panel editor in int'); root.appendChild(ed);
++    const maxW = Math.min(innerWidth - 400, 900), maxH = innerHeight - 140;
++    const k = Math.min(maxW / bmp.width, maxH / bmp.height, 1);
++    const dw = Math.round(bmp.width * k), dh = Math.round(bmp.height * k);
++    const tools = [['arrow', 'Стрелка'], ['box', 'Рамка'], ['note', 'Заметка'], ['blur', 'Размыть'], ['crop', 'Обрезать']];
++    const inks = ['#1d1d22', 'var(--m-space)', '#f24822'];
++    ed.innerHTML = `<div class="ecol"><div class="etools"><span class="seg">${tools.map(([t, n], i) => `<button data-tool="${t}" class="${i ? '' : 'on'}">${n}</button>`).join('')}</span>
++        <span class="inks">${inks.map((c, i) => `<button data-ink="${i}" class="${i ? '' : 'on'}" style="--c:${c}"></button>`).join('')}</span><button class="ib light" data-undo title="Отменить (${K.mod}Z)">${ic('undo', 15)}</button></div>
++        <div class="ecan" style="width:${dw}px;height:${dh}px"><canvas width="${dw * devicePixelRatio}" height="${dh * devicePixelRatio}" style="width:${dw}px;height:${dh}px"></canvas></div></div>
++      <div class="eside"><div class="ph" style="padding:0 0 4px"><b>${esc(meta.title || 'Снимок')}</b><button class="x" data-close>×</button></div>
++        <div class="m num" style="color:var(--m-text-2);font-size:12px;margin-bottom:10px">${bmp.width} × ${bmp.height} px · PNG</div>
++        <button class="btn pri" data-e="copy" style="justify-content:center">Скопировать</button>
++        <button class="btn" data-e="bug" style="justify-content:center">Как баг → <span data-tn>${BUG_TARGETS[S.lastBugTarget]}</span></button>
++        <span class="seg" style="flex-wrap:wrap">${Object.entries(BUG_TARGETS).filter(([x]) => x !== 'md').map(([x, n]) => `<button data-bug="${x}" class="${x === S.lastBugTarget ? 'on' : ''}">${n}</button>`).join('')}</span>
++        <button class="btn ghost" data-e="png" style="justify-content:center">Сохранить PNG</button>${A.sendToAgent ? '<button class="btn ghost" data-e="agent" style="justify-content:center">В агента</button>' : ''}
++        <div style="font-size:11.5px;color:var(--m-text-2);margin-top:auto;line-height:1.45">Тащите картинку прямо в Figma, Slack или Finder.<br>${K.mod}Z — отменить пометку.</div></div>`;
++    Object.assign(ed.style, { left: '50%', top: '50%', transform: 'translate(-50%,-50%)' });
++    if (meta.from && !reduced()) { const r = ed.getBoundingClientRect(); ed.animate([{ opacity: .3, transform: `translate(-50%,-50%) scale(${Math.min(meta.from.width / r.width, 1.4)})` }, { opacity: 1, transform: 'translate(-50%,-50%)' }], { duration: 380, easing: 'cubic-bezier(.6,0,.2,1)' }); }
++    const cv = ed.querySelector('canvas'), g = cv.getContext('2d'); g.scale(devicePixelRatio, devicePixelRatio);
++    const marks = [], hist = []; let crop = null, tool = 'arrow', ink = 0, draft = null;
++    const inkOf = i => i === 1 ? getComputedStyle(root).getPropertyValue('--m-space').trim() || '#6d6fd6' : inks[i];
++    // shapes are kept in image pixels; drawn at any scale
++    function drawMarks(ctx, s, ox = 0, oy = 0) {
++      for (const m of marks.concat(draft ? [draft] : [])) {
++        const X = v => (v - ox) * s, Y = v => (v - oy) * s, c = m.ink;
++        ctx.save(); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
++        if (m.t === 'blur') { const x = Math.min(m.x1, m.x2), y = Math.min(m.y1, m.y2), w = Math.abs(m.x2 - m.x1), h = Math.abs(m.y2 - m.y1); if (w > 2 && h > 2) { const tmp = document.createElement('canvas'), q = Math.max(1, Math.round(10 * (bmp.width / 1000))); tmp.width = Math.max(1, Math.round(w / q)); tmp.height = Math.max(1, Math.round(h / q)); tmp.getContext('2d').drawImage(bmp, x, y, w, h, 0, 0, tmp.width, tmp.height); ctx.imageSmoothingEnabled = false; ctx.drawImage(tmp, X(x), Y(y), w * s, h * s); } }
++        if (m.t === 'box' || m.t === 'arrow') { ctx.strokeStyle = '#fff'; ctx.lineWidth = 6 * s * m.w; const path = () => { ctx.beginPath(); if (m.t === 'box') { ctx.roundRect(X(Math.min(m.x1, m.x2)), Y(Math.min(m.y1, m.y2)), Math.abs(m.x2 - m.x1) * s, Math.abs(m.y2 - m.y1) * s, 6 * s * m.w); } else { const a = Math.atan2(m.y2 - m.y1, m.x2 - m.x1), L = 16 * m.w; ctx.moveTo(X(m.x1), Y(m.y1)); ctx.lineTo(X(m.x2), Y(m.y2)); ctx.moveTo(X(m.x2 - L * Math.cos(a - .45)), Y(m.y2 - L * Math.sin(a - .45))); ctx.lineTo(X(m.x2), Y(m.y2)); ctx.lineTo(X(m.x2 - L * Math.cos(a + .45)), Y(m.y2 - L * Math.sin(a + .45))); } };
++          path(); ctx.stroke(); ctx.strokeStyle = c; ctx.lineWidth = 3 * s * m.w; path(); ctx.stroke(); }
++        if (m.t === 'note') { const r = 11 * s * m.w, x = X(m.x1), y = Y(m.y1); ctx.fillStyle = c; ctx.beginPath(); ctx.arc(x, y - r, r, Math.PI * .75, Math.PI * 2.25); ctx.lineTo(x, y); ctx.closePath(); ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5 * s * m.w; ctx.stroke();
++          ctx.fillStyle = '#fff'; ctx.font = `700 ${11 * s * m.w}px -apple-system, system-ui, sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(String(m.n), x, y - r);
++          if (m.text) { ctx.font = `500 ${12.5 * s * m.w}px -apple-system, system-ui, sans-serif`; ctx.textAlign = 'left'; const tw = ctx.measureText(m.text).width, px2 = x + r + 6 * s * m.w, ph = 24 * s * m.w;
++            ctx.shadowColor = 'rgba(0,0,0,.18)'; ctx.shadowBlur = 8 * s * m.w; ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.roundRect(px2, y - r - ph / 2, tw + 16 * s * m.w, ph, 6 * s * m.w); ctx.fill(); ctx.shadowBlur = 0; ctx.fillStyle = '#1d1d22'; ctx.fillText(m.text, px2 + 8 * s * m.w, y - r); } }
++        ctx.restore();
++      }
++    }
++    function render() {
++      g.clearRect(0, 0, dw, dh); g.drawImage(bmp, 0, 0, dw, dh); drawMarks(g, k);
++      const c = crop || (draft?.t === 'crop' ? { x: Math.min(draft.x1, draft.x2), y: Math.min(draft.y1, draft.y2), w: Math.abs(draft.x2 - draft.x1), h: Math.abs(draft.y2 - draft.y1) } : null);
++      if (c && c.w > 2) { g.save(); g.fillStyle = 'rgba(20,15,40,.45)'; g.beginPath(); g.rect(0, 0, dw, dh); g.rect(c.x * k, c.y * k, c.w * k, c.h * k); g.fill('evenodd'); g.strokeStyle = '#fff'; g.setLineDash([4, 4]); g.strokeRect(c.x * k + .5, c.y * k + .5, c.w * k, c.h * k); g.restore(); }
++    }
++    render();
++    const toImg = e => { const r = cv.getBoundingClientRect(); return { x: clamp((e.clientX - r.left) / k, 0, bmp.width), y: clamp((e.clientY - r.top) / k, 0, bmp.height) }; };
++    const lw = Math.max(1, bmp.width / 1200);
++    cv.addEventListener('pointerdown', e => { e.preventDefault(); cv.setPointerCapture(e.pointerId); const p = toImg(e);
++      if (tool === 'note') { const n = marks.filter(m => m.t === 'note').length + 1; const m = { t: 'note', x1: p.x, y1: p.y, ink: inkOf(ink), w: lw, n, text: '' }; marks.push(m); hist.push(['m']); render(); noteInput(m, e); return; }
++      draft = { t: tool, x1: p.x, y1: p.y, x2: p.x, y2: p.y, ink: inkOf(ink), w: lw }; });
++    cv.addEventListener('pointermove', e => { if (!draft) return; const p = toImg(e); draft.x2 = p.x; draft.y2 = p.y; render(); });
++    cv.addEventListener('pointerup', () => { if (!draft) return; const d = draft; draft = null;
++      if (Math.hypot(d.x2 - d.x1, d.y2 - d.y1) > 4 / k) { if (d.t === 'crop') { hist.push(['c', crop]); crop = { x: Math.min(d.x1, d.x2), y: Math.min(d.y1, d.y2), w: Math.abs(d.x2 - d.x1), h: Math.abs(d.y2 - d.y1) }; } else { marks.push(d); hist.push(['m']); } } render(); });
++    function noteInput(m, e) {
++      const inp = document.createElement('input'); inp.className = 'enote'; inp.placeholder = 'Что тут?'; ed.appendChild(inp);
++      const er = ed.getBoundingClientRect(); Object.assign(inp.style, { left: e.clientX - er.left + 18 + 'px', top: e.clientY - er.top - 36 + 'px' });
++      inp.focus(); const done = () => { m.text = inp.value.trim(); inp.remove(); render(); };
++      inp.addEventListener('keydown', ev => { ev.stopPropagation(); if (ev.key === 'Enter') done(); if (ev.key === 'Escape') { inp.value = ''; done(); } }); inp.addEventListener('blur', done);
++    }
++    function undoEd() { const h = hist.pop(); if (!h) return; if (h[0] === 'c') crop = h[1]; else marks.pop(); render(); }
++    async function exportBlob() {
++      const c = crop || { x: 0, y: 0, w: bmp.width, h: bmp.height }, out = document.createElement('canvas');
++      out.width = Math.round(c.w); out.height = Math.round(c.h); const o = out.getContext('2d');
++      o.drawImage(bmp, c.x, c.y, c.w, c.h, 0, 0, c.w, c.h); drawMarks(o, 1, c.x, c.y);
++      return new Promise(r => out.toBlob(r, 'image/png'));
++    }
++    // drag the picture out (Figma, Slack, Finder)
++    cv.draggable = false; const ecan = ed.querySelector('.ecan'); ecan.draggable = true;
++    ecan.addEventListener('dragstart', async e => { try { const b = await exportBlob(); const u = URL.createObjectURL(b); e.dataTransfer.setData('DownloadURL', `image/png:${location.hostname || 'page'}-snimok.png:${u}`); } catch {} });
++    ed.addEventListener('click', async e => {
++      const b = e.target.closest('button'); if (!b) return;
++      if (b.dataset.close !== undefined) { ed.remove(); unmountIfIdle(); return; }
++      if (b.dataset.tool) { tool = b.dataset.tool; ed.querySelectorAll('[data-tool]').forEach(x => x.classList.toggle('on', x === b)); ecan.draggable = false; cv.style.cursor = 'crosshair'; return; }
++      if (b.dataset.ink) { ink = +b.dataset.ink; ed.querySelectorAll('[data-ink]').forEach(x => x.classList.toggle('on', x === b)); return; }
++      if (b.dataset.undo !== undefined) { undoEd(); return; }
++      const out = await exportBlob();
++      if (b.dataset.e === 'copy') { const ok = out ? await copy({ png: out }) : false; toast(ok ? 'Картинка в буфере — в Figma и Slack без пересжатия' : 'Не удалось скопировать', ok); }
++      if (b.dataset.e === 'png') { download(out, `${location.hostname || 'page'}-${meta.title === 'Вся страница' ? 'vsya-stranica' : 'snimok'}.png`); toast('Сохранено'); }
++      if (b.dataset.e === 'agent') { A.sendToAgent({ kind: 'screenshot', url: location.href, png: out }); toast('Отправлено агенту'); }
++      if (b.dataset.e === 'bug' || b.dataset.bug) {
++        const t = b.dataset.bug || S.lastBugTarget; S.lastBugTarget = t; savePrefs(); ed.querySelector('[data-tn]').textContent = BUG_TARGETS[t]; ed.querySelectorAll('[data-bug]').forEach(x => x.classList.toggle('on', x.dataset.bug === t));
++        const bi = bugInfo({ left: 0, top: 0, width: meta.w || bmp.width, height: meta.h || bmp.height }, null, marks.filter(m => m.t === 'note' && m.text).map(m => `${m.n}. ${m.text}`).join('; '));
++        const textOnly = t === 'jira' || t === 'kaiten', dataUrl = await blobToDataUrl(out);
++        const ok = await copy({ text: bugText(bi, t), html: textOnly ? undefined : bugHtml(bi, dataUrl), png: textOnly ? undefined : out });
++        toast(ok ? `Баг для ${BUG_TARGETS[t]} в буфере${textOnly ? ' · картинку — «Скопировать»' : ''}` : 'Не удалось скопировать', ok);
++      }
++    });
++    ed.addEventListener('keydown', e => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); e.stopPropagation(); undoEd(); } });
++    return ed;
++  }
++
++  // ---------- phone frame: drawn inside an emulated phone tab (Meridian's «Телефон рядом»)
++  function phoneFrame(spec) {
++    const L = layer('phone'); L.innerHTML = '';
++    if (!spec) return; mount();
++    const r = spec.radius || 48, top = spec.kind === 'pixel' ? `<i style="position:absolute;left:50%;top:12px;width:12px;height:12px;margin-left:-6px;border-radius:50%;background:#0b0b0c"></i>` : spec.kind === 'iphone' ? `<i style="position:absolute;left:50%;top:11px;width:${Math.round(innerWidth * .32)}px;height:34px;margin-left:-${Math.round(innerWidth * .16)}px;border-radius:17px;background:#0b0b0c"></i>` : '';
++    L.innerHTML = `<div style="position:absolute;inset:0;border-radius:${r}px;box-shadow:0 0 0 ${Math.max(innerWidth, innerHeight)}px #1d1d1f, inset 0 0 0 1px rgba(0,0,0,.25)"></div>${top}
++      ${spec.kind === 'ipad' ? '' : `<i style="position:absolute;left:50%;bottom:8px;width:${Math.round(innerWidth * .34)}px;height:5px;margin-left:-${Math.round(innerWidth * .17)}px;border-radius:3px;background:rgba(0,0,0,.55);box-shadow:0 0 0 1px rgba(255,255,255,.35)"></i>`}`;
++  }
++
+   // ---------- dock with panels that grow out of it
+   let dock = null;
+   const TOOLS = () => [['lens', 'Линза', 'L', 'цвет, шрифт, отступы'], ['system', 'Система', 'G', 'палитра и шрифты сайта'], ['camera', 'Снимок', 'S', 'блок или область → как баг'], ['text', 'Стресс-текст', 'T', 'длинные тексты ломают вёрстку?'], ['contrast', 'Контраст', 'C', 'что трудно читать'], ['brandchk', 'Бренд', 'B', 'что не из бренда']]
+@@ -882,7 +1026,9 @@ function create(adapter = {}) {
+     if (cur && S.mode === cur) { exitModes(); return; }
+     if (t === 'lens') setMode('lens'); if (t === 'system') grabSystem(); if (t === 'camera') startCapture(); if (t === 'text') stress('long');
+     if (t === 'contrast') contrastMode(); if (t === 'brandchk') brandCheck();
+-    const x = (A.extraTools || []).find(e => e.id === t); if (x) x.run();
++    const x = (A.extraTools || []).find(e => e.id === t);
++    if (x) { if (S.mode === x.id) { exitModes(); return; } exitModes(); S.mode = x.id; mount(); showDock(); setDockOn(x.id);
++      x.run({ panel: html => S.mode === x.id ? dockPanel(html) : null, toast, exit: () => { if (S.mode === x.id) exitModes(); } }); }
+   }
+   function setMode(m) { exitModes(); S.mode = m; mount(); setDockOn(m); if (m === 'lens') { refreshSnap(); lensMove(S.mouse.x, S.mouse.y); } }
+   function exitModes(keepStress) {
+@@ -892,10 +1038,11 @@ function create(adapter = {}) {
+     if (S.mode === 'system') clear('sys');
+     if (S.mode === 'brandcheck') clear('bc');
+     if (S.mode === 'stress' && !keepStress) restoreText(false);
++    const xt = (A.extraTools || []).find(e => e.id === S.mode); try { xt?.stop?.(); } catch {}
+     closeMenus(); S.mode = null; S.peek = false; setDockOn(null); if (dock) dockPanel('');
+   }
+   function activate() { S.active = true; mount(); showDock(); }
+-  function deactivate() { exitModes(); dock?.remove(); dock = null; drawer?.remove(); drawer = null; S.active = false; unmountIfIdle(); }
++  function deactivate() { exitModes(); root.querySelector('.editor')?.remove(); dock?.remove(); dock = null; drawer?.remove(); drawer = null; S.active = false; unmountIfIdle(); }
+ 
+   // ---------- capture: marching ants → shutter → card
+   const BUG_TARGETS = { slack: 'Slack', jira: 'Jira', time: 'Time', kaiten: 'Kaiten', linear: 'Linear', md: 'Markdown' };
+@@ -925,7 +1072,8 @@ function create(adapter = {}) {
+   }
+   function startCapture() {
+     exitModes(); S.mode = 'capture'; mount(); setDockOn('capture');
+-    dockPanel(`<span class="ttl">Снимок</span><span class="m">наведите на блок и кликните — или обведите область</span><span class="kbd">Esc</span>`);
++    const p = dockPanel(`<span class="ttl">Снимок</span><span class="seg"><button class="on">Блок или область</button><button data-fp>Вся страница <span class="kbd" style="margin-left:4px">${K.mod}⇧2</span></button></span><span class="m">наведите и кликните — или обведите</span><span class="kbd">Esc</span>`);
++    p.querySelector('[data-fp]').addEventListener('click', fullPage);
+     S.cap = { L: layer('cap'), start: null, el: null };
+   }
+   function capMove(x, y) {
+@@ -955,7 +1103,7 @@ function create(adapter = {}) {
+       <div class="meta"><div>${esc(b0.url)}</div><div>${esc(b0.viewport)} · ${esc(b0.browser)}</div>${b0.selector ? `<div>${esc(b0.selector)}</div>` : ''}</div>
+       <textarea placeholder="Что не так? Попадёт в заголовок"></textarea>
+       <div class="acts"><button class="btn pri" data-a="bug">Как баг → <span data-tn>${BUG_TARGETS[t]}</span></button><span class="seg">${Object.entries(BUG_TARGETS).filter(([k]) => k !== 'md').map(([k, n]) => `<button data-bug="${k}" class="${k === t ? 'on' : ''}">${n}</button>`).join('')}</span>
+-      <button class="btn" data-a="img">Скопировать картинку</button><button class="btn ghost" data-a="save">PNG</button>${A.sendToAgent ? '<button class="btn ghost" data-a="agent">В агента</button>' : ''}${connected.map(k => `<button class="btn ghost" data-send="${k}">Отправить в ${BUG_TARGETS[k] || k}</button>`).join('')}</div>`;
++      ${blob ? '<button class="btn" data-a="edit">Разметить</button>' : ''}<button class="btn" data-a="img">Скопировать картинку</button><button class="btn ghost" data-a="save">PNG</button>${A.sendToAgent ? '<button class="btn ghost" data-a="agent">В агента</button>' : ''}${connected.map(k => `<button class="btn ghost" data-send="${k}">Отправить в ${BUG_TARGETS[k] || k}</button>`).join('')}</div>`;
+     if (!url && el) { const c = el.cloneNode(true); c.style.margin = '0'; c.style.width = getComputedStyle(el).width; const h2 = card.querySelector('.clone'); const bg = effectiveBg(el).color; h2.style.background = bg ? toHex(bg) : '#fff'; h2.appendChild(c); }
+     if (!reduced()) { const r = card.getBoundingClientRect();
+       card.animate([{ transform: `translate(${rect.left - r.left}px, ${rect.top - r.top}px) scale(${Math.min(rect.width / r.width, 3)}, ${Math.min(rect.height / r.height, 3)})`, transformOrigin: '0 0', opacity: .4 }, { transform: 'none', transformOrigin: '0 0', opacity: 1 }], { duration: 380, easing: 'cubic-bezier(.6,0,.2,1)' }); }
+@@ -974,6 +1122,7 @@ function create(adapter = {}) {
+       if (b.dataset.close !== undefined) { card.remove(); if (url) setTimeout(() => URL.revokeObjectURL(url), 1000); unmountIfIdle(); return; }
+       if (b.dataset.a === 'bug') doBug(S.lastBugTarget);
+       if (b.dataset.bug) doBug(b.dataset.bug);
++      if (b.dataset.a === 'edit') { card.remove(); showEditor(blob, { title: el ? kindName(el) : 'Область', w: rect.width, h: rect.height }); return; }
+       if (b.dataset.a === 'img') { const ok = blob ? await copy({ png: blob }) : false; toast(ok ? 'Картинка в буфере — в Figma и Slack без пересжатия' : blob ? 'Не удалось скопировать' : 'Картинка — в Meridian', ok); }
+       if (b.dataset.send) { const bi = bugInfo(rect, el, note()); const ok = await A.sendTo?.(b.dataset.send, { ...bi, text: bugText(bi, b.dataset.send), png: blob }); toast(ok ? 'Отправлено' : 'Не отправилось', !!ok); }
+       if (b.dataset.a === 'save') { if (blob) { download(blob, `${location.hostname || 'page'}-${el ? kindName(el).toLowerCase() : 'oblast'}.png`); toast('Сохранено'); } else toast('Файл картинкой — в Meridian', false); }
+@@ -1306,7 +1455,8 @@ function create(adapter = {}) {
+   const isAltKey = e => e.key === 'Alt' || e.key === 'AltGraph';
+   addEventListener('keydown', e => {
+     if (untrusted(e)) return;
+-    const editable = isEditable(document.activeElement) || isEditable(e.target);
++    const editable = isEditable(document.activeElement) || isEditable(e.target) || isEditable(e.composedPath()[0]);
++    if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.code === 'Digit2' && !editable && !e.altKey) { e.preventDefault(); e.stopImmediatePropagation(); fullPage(); return; }
+     if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.code === 'KeyX' && !editable) { e.preventDefault(); e.stopImmediatePropagation(); S.active ? deactivate() : activate(); return; }
+     if (isAltKey(e) && !e.repeat) {
+       altClean = !e.metaKey && !e.shiftKey && (K.mod === '⌘' ? !e.ctrlKey : true); altDown = performance.now();
+@@ -1315,9 +1465,9 @@ function create(adapter = {}) {
+     }
+     if (!isAltKey(e)) { altClean = false; clearTimeout(altTimer); }
+     if (editable) return;
+-    if (!(S.active || S.mode || S.peek)) return;
++    if (!(S.active || S.mode || S.peek || root.querySelector('.editor,.card'))) return;
+     const k = e.key.toLowerCase(), plain = !e.metaKey && !e.ctrlKey && !e.altKey, eat = () => { e.preventDefault(); e.stopImmediatePropagation(); };
+-    if (e.key === 'Escape') { eat(); if (root.querySelector('[data-menu]')) return closeMenus(); if (S.sel) { S.sel = null; [selEl, hudEl, capEl].forEach(n => n && n.remove()); selEl = hudEl = capEl = null; clear('pad'); clear('meas'); return; } if (S.mode) return exitModes(); if (drawer) { drawer.remove(); drawer = null; return; } const cd = root.querySelector('.card'); if (cd) { cd.remove(); return; } return deactivate(); }
++    if (e.key === 'Escape') { eat(); if (root.querySelector('[data-menu]')) return closeMenus(); { const ed0 = root.querySelector('.editor'); if (ed0) { ed0.remove(); return; } } if (S.sel) { S.sel = null; [selEl, hudEl, capEl].forEach(n => n && n.remove()); selEl = hudEl = capEl = null; clear('pad'); clear('meas'); return; } if (S.mode) return exitModes(); if (drawer) { drawer.remove(); drawer = null; return; } const ed2 = root.querySelector('.editor'); if (ed2) { ed2.remove(); return; } const cd = root.querySelector('.card'); if (cd) { cd.remove(); return; } return deactivate(); }
+     if ((e.metaKey || e.ctrlKey) && k === 'z' && undoStack.length && (S.mode === 'contrast' || S.mode === 'brandcheck')) { eat(); undo(); S.mode === 'contrast' ? renderContrast() : brandCheck(); return; }
+     if ((e.metaKey || e.ctrlKey) && k === 'c' && (S.sel || S.hover) && (S.mode === 'lens' || S.peek)) { eat(); selectEl((S.sel || S.hover).el, true); return; }
+     if (!plain) return;
+@@ -1366,7 +1516,7 @@ function create(adapter = {}) {
+   });
+ 
+   return {
+-    toggle() { S.active ? deactivate() : activate(); }, activate, deactivate, run: runTool, contextMenu, contextAction, showImages, savePngAt, stress, grabSystem,
++    toggle() { S.active ? deactivate() : activate(); }, activate, fullPage, showEditor, phoneFrame, setPhonePanel: p => { S.phone = p; }, deactivate, run: runTool, contextMenu, contextAction, showImages, savePngAt, stress, grabSystem,
+     captureElementAt(x, y) { const el = pick(x, y); if (el) finishCapture(el.getBoundingClientRect(), el); },
+     get state() { return { active: S.active, mode: S.mode, brand: S.brand, fmt: S.fmt, peek: S.peek }; },
+     setBrand(b) { if (b && b.colors) { S.brand = b; renderDrawer(); } },
+diff --git a/chrome/browser/meridian/toolkit/toolkit_meridian.js b/chrome/browser/meridian/toolkit/toolkit_meridian.js
+index 46577374bd..d33a77a88d 100644
+--- a/chrome/browser/meridian/toolkit/toolkit_meridian.js
++++ b/chrome/browser/meridian/toolkit/toolkit_meridian.js
+@@ -58,11 +58,66 @@
+       ctx.drawImage(bmp, 0, 0);
+       return {canvas, ctx, scale: bmp.width / innerWidth};
+     },
+-    store: {
++    // The whole page: the browser captures tiles beyond the viewport, here
++    // they become one PNG.
++    async capturePage(r) {
++      const res = await call('page', {width: r.width, height: r.height, dpr: r.dpr});
++      if (!res || !res.tiles || !res.tiles.length) return null;
++      const bmps = [];
++      for (const t of res.tiles) bmps.push(await createImageBitmap(fromB64(t)));
++      const w = bmps[0].width, h = bmps.reduce((s, b) => s + b.height, 0);
++      const canvas = document.createElement('canvas');
++      canvas.width = w;
++      canvas.height = Math.min(h, 32000);
++      const ctx = canvas.getContext('2d');
++      let y = 0;
++      for (const b of bmps) { ctx.drawImage(b, 0, y); y += b.height; }
++      return new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
++    },
++    // «Телефон рядом»: the browser opens this page again in a split, emulated.
++    extraTools: [{
++      id: 'phone', label: 'Телефон', key: 'P', hint: 'эта страница в рамке телефона, рядом',
++      run(ui) { phoneUi = ui; phone.open = true; call('phone', {op: 'open', ...phone}).then(ok => { if (!ok) ui.toast('Телефон не открылся', false); }); renderPhone(); },
++    }],
++        store: {
+       async get(key) { return store[key]; },
+       async set(key, value) { store[key] = value; call('store', {key, value}); },
+     },
+   };
++  let phoneUi = null;
++  const phone = {device: 'iphone', dark: false, motion: false, slow: false, landscape: false};
++  let qrHtml = '';
++  async function showQr() {
++    const r = await call('qr', {});
++    if (r && r.bits) {
++      const n = r.size, q = 4;
++      let rects = '';
++      for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) if (r.bits[y * n + x] === '1') rects += `<rect x="${x + q}" y="${y + q}" width="1.02" height="1.02"/>`;
++      qrHtml = `<div style="flex-basis:100%;display:flex;gap:14px;align-items:center;padding:6px 0 4px"><svg viewBox="0 0 ${n + 2 * q} ${n + 2 * q}" width="132" height="132" shape-rendering="crispEdges" style="background:#fff;border-radius:8px;flex:none"><g fill="#1d1d22">${rects}</g></svg>
++        <span style="font-size:12px;line-height:1.45;color:var(--m-hud-2);max-width:260px">Наведите камеру телефона. Откроется эта же страница — как её видит любой посетитель, без ваших правок Boost.</span></div>`;
++    } else if (r && r.local) {
++      qrHtml = `<div style="flex-basis:100%;font-size:12px;color:var(--m-hud-2);padding:4px 0">Для localhost и файлов QR будет в следующей версии: телефону нужен защищённый адрес в вашей сети.</div>`;
++    } else qrHtml = `<div style="flex-basis:100%;font-size:12px;color:var(--m-hud-2)">QR не получился.</div>`;
++    renderPhone();
++  }
++  function renderPhone() {
++    if (!phoneUi) return;
++    const seg = (k, on, label) => `<button data-ph="${k}" class="${on ? 'on' : ''}">${label}</button>`;
++    const p = phoneUi.panel(`<span class="ttl">Телефон</span>
++      <span class="seg">${seg('d:iphone', phone.device === 'iphone', 'iPhone 16 Pro')}${seg('d:pixel', phone.device === 'pixel', 'Pixel 9')}${seg('d:ipad', phone.device === 'ipad', 'iPad mini')}</span>
++      <span class="seg">${seg('dark', phone.dark, 'Тёмная')}${seg('motion', phone.motion, 'Без анимаций')}${seg('slow', phone.slow, 'Сеть 3G')}${seg('landscape', phone.landscape, 'Повернуть')}</span>
++      <button class="btn" data-ph="qr">QR на мой телефон</button><button class="btn ghost" data-ph="close">Закрыть телефон</button>${qrHtml}`);
++    if (!p) return;
++    p.addEventListener('click', e => {
++      const b = e.target.closest('[data-ph]'); if (!b) return;
++      const k = b.dataset.ph;
++      if (k === 'qr') { showQr(); return; }
++      if (k === 'close') { call('phone', {op: 'close'}); phoneUi.exit(); phoneUi = null; return; }
++      if (k.startsWith('d:')) phone.device = k.slice(2); else phone[k] = !phone[k];
++      call('phone', {op: 'set', ...phone});
++      renderPhone();
++    });
++  }
+   const tk = window.__meridianToolkitCore.create(adapter);
+   window.__meridianToolkit = {
+     tk,
+diff --git a/chrome/browser/meridian/toolkit/toolkit_tab_helper.cc b/chrome/browser/meridian/toolkit/toolkit_tab_helper.cc
+index 4e962e2c39..d336988dae 100644
+--- a/chrome/browser/meridian/toolkit/toolkit_tab_helper.cc
++++ b/chrome/browser/meridian/toolkit/toolkit_tab_helper.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/meridian/toolkit/toolkit_tab_helper.h"
+ 
++#include <algorithm>
++
+ #include <utility>
+ #include <vector>
+ 
+@@ -15,12 +17,22 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/meridian/prefs.h"
++#include "chrome/browser/meridian/sidebar_handler.h"
+ #include "chrome/browser/meridian/space_profiles.h"
++#include "chrome/browser/meridian/tab_data.h"
+ #include "chrome/browser/meridian/test_switches.h"
++#include "chrome/browser/meridian/toolkit/toolkit_cdp.h"
+ #include "chrome/browser/meridian/toolkit/toolkit_embed.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/navigator/browser_navigator.h"
++#include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/common/chrome_isolated_world_ids.h"
++#include "components/browser_apis/tab_strip/types/node_id.h"
++#include "components/tabs/public/tab_interface.h"
+ #include "components/prefs/pref_service.h"
++#include "components/qr_code_generator/qr_code_generator.h"
+ #include "components/prefs/scoped_user_pref_update.h"
+ #include "components/viz/common/frame_sinks/copy_output_result.h"
+ #include "content/public/browser/host_zoom_map.h"
+@@ -32,6 +44,7 @@
+ #include "ui/gfx/codec/png_codec.h"
+ #include "ui/gfx/geometry/rect_conversions.h"
+ #include "ui/gfx/geometry/rect_f.h"
++#include "net/base/url_util.h"
+ #include "url/gurl.h"
+ 
+ namespace meridian::toolkit {
+@@ -43,6 +56,40 @@ namespace {
+ constexpr base::TimeDelta kBusy = base::Milliseconds(60);
+ constexpr base::TimeDelta kIdle = base::Milliseconds(400);
+ 
++struct Device {
++  const char* id;
++  int width;
++  int height;
++  double scale;
++  int radius;
++  const char* ua;
++  const char* platform;
++};
++constexpr Device kDevices[] = {
++    {"iphone", 393, 852, 3, 55,
++     "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) "
++     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 "
++     "Safari/604.1",
++     "iPhone"},
++    {"pixel", 412, 915, 2.625, 40,
++     "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, "
++     "like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
++     "Linux armv8l"},
++    {"ipad", 744, 1133, 2, 18,
++     "Mozilla/5.0 (iPad; CPU OS 18_1 like Mac OS X) AppleWebKit/605.1.15 "
++     "(KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1",
++     "iPad"},
++};
++
++const Device& DeviceFor(const std::string& id) {
++  for (const Device& d : kDevices) {
++    if (id == d.id) {
++      return d;
++    }
++  }
++  return kDevices[0];
++}
++
+ constexpr char16_t kTake[] =
+     u"window.__meridianToolkit ? window.__meridianToolkit.take() : null";
+ 
+@@ -97,7 +144,8 @@ void ToolkitTabHelper::Inject() {
+   config.Set("platform", "other");
+ #endif
+   Run(std::string(kToolkitCoreJs) + "\nwindow.__meridianToolkitConfig = " +
+-      base::WriteJson(config).value_or("{}") + ";\n" + kToolkitMeridianJs);
++      base::WriteJson(config).value_or("{}") + ";\n" + kToolkitMeridianJs +
++      "\n" + PhoneFrameScript());
+   Schedule(false);
+ }
+ 
+@@ -159,6 +207,12 @@ void ToolkitTabHelper::OnPolled(base::Value result) {
+         Capture(id, *args);
+       } else if (*name == "store") {
+         Store(*args);
++      } else if (*name == "page") {
++        Page(id, *args);
++      } else if (*name == "phone") {
++        Phone(id, *args);
++      } else if (*name == "qr") {
++        Qr(id);
+       }
+     }
+   }
+@@ -276,6 +330,232 @@ void ToolkitTabHelper::ContextAction(const std::string& kind, int x, int y) {
+   Schedule(true);
+ }
+ 
++void ToolkitTabHelper::Page(int id, const base::DictValue& args) {
++  const double w = args.FindDouble("width").value_or(0);
++  const double h = std::min(args.FindDouble("height").value_or(0), 30000.0);
++  // The screenshot already has the screen's scale (2× on a Retina Mac).
++  const double scale = 1;
++  if (w <= 0 || h <= 0 || page_cdp_) {
++    return Answer(id, base::Value());
++  }
++  page_cdp_ = std::make_unique<CdpSession>(web_contents());
++  if (!page_cdp_->attached()) {
++    page_cdp_.reset();
++    return Answer(id, base::Value());
++  }
++  content::RenderWidgetHostView* view =
++      web_contents()->GetRenderWidgetHostView();
++  const float dsf = view ? view->GetDeviceScaleFactor() : 1.f;
++  const int tile = std::max(200, static_cast<int>(8000 / std::max(1.f, dsf)));
++  CaptureTile(id, w, h, scale, tile, 0, base::ListValue());
++}
++
++void ToolkitTabHelper::CaptureTile(int id,
++                                   double w,
++                                   double h,
++                                   double scale,
++                                   int tile,
++                                   int y,
++                                   base::ListValue tiles) {
++  if (y >= h) {
++    page_cdp_.reset();
++    return Answer(id, base::Value(base::DictValue()
++                                      .Set("tiles", std::move(tiles))
++                                      .Set("tile", tile)
++                                      .Set("scale", scale)));
++  }
++  const double th = std::min<double>(tile, h - y);
++  page_cdp_->Send(
++      "Page.captureScreenshot",
++      base::DictValue()
++          .Set("format", "png")
++          .Set("captureBeyondViewport", true)
++          .Set("fromSurface", true)
++          .Set("clip", base::DictValue()
++                           .Set("x", 0)
++                           .Set("y", y)
++                           .Set("width", w)
++                           .Set("height", th)
++                           .Set("scale", scale)),
++      base::BindOnce(
++          [](base::WeakPtr<ToolkitTabHelper> self, int id, double w, double h,
++             double scale, int tile, int y, base::ListValue tiles,
++             base::Value result) {
++            if (!self) {
++              return;
++            }
++            const std::string* data =
++                result.is_dict() ? result.GetDict().FindString("data")
++                                 : nullptr;
++            if (!data) {
++              self->page_cdp_.reset();
++              return self->Answer(id, base::Value());
++            }
++            tiles.Append(*data);
++            self->CaptureTile(id, w, h, scale, tile, y + tile,
++                              std::move(tiles));
++          },
++          weak_factory_.GetWeakPtr(), id, w, h, scale, tile, y,
++          std::move(tiles)));
++}
++
++void ToolkitTabHelper::Phone(int id, const base::DictValue& args) {
++  const std::string* op = args.FindString("op");
++  if (!op) {
++    return Answer(id, base::Value(false));
++  }
++  if (*op == "close") {
++    if (phone_) {
++      if (tabs::TabInterface* tab =
++              tabs::TabInterface::MaybeGetFromContents(phone_.get())) {
++        tab->Close();
++      }
++    }
++    phone_ = nullptr;
++    return Answer(id, base::Value(true));
++  }
++  base::DictValue spec = args.Clone();
++  spec.Remove("op");
++  if (!phone_) {
++    tabs::TabInterface* me =
++        tabs::TabInterface::MaybeGetFromContents(web_contents());
++    BrowserWindowInterface* window =
++        me ? me->GetBrowserWindowInterface() : nullptr;
++    SidebarHandler* handler = window ? SidebarHandler::For(window) : nullptr;
++    if (!handler) {
++      return Answer(id, base::Value(false));
++    }
++    NavigateParams params(window, web_contents()->GetLastCommittedURL(),
++                          ui::PAGE_TRANSITION_LINK);
++    params.disposition = WindowOpenDisposition::kNewBackgroundTab;
++    ::Navigate(&params);
++    content::WebContents* contents = params.navigated_or_inserted_contents;
++    tabs::TabInterface* tab =
++        contents ? tabs::TabInterface::MaybeGetFromContents(contents)
++                 : nullptr;
++    if (!tab) {
++      return Answer(id, base::Value(false));
++    }
++    if (const TabData* data = TabData::Get(web_contents())) {
++      TabData::Set(contents, data->space_id(), std::string());
++    }
++    window->GetTabStripModel()->ActivateTab(me);
++    handler->SplitWith(tabs_api::NodeId::FromTabHandle(tab->GetHandle()));
++    phone_ = contents->GetWeakPtr();
++  }
++  ToolkitTabHelper* phone = ToolkitTabHelper::FromWebContents(phone_.get());
++  if (!phone) {
++    return Answer(id, base::Value(false));
++  }
++  phone->ApplyPhone(std::move(spec));
++  Answer(id, base::Value(true));
++}
++
++void ToolkitTabHelper::ApplyPhone(base::DictValue spec) {
++  const std::string* id = spec.FindString("device");
++  const Device& d = DeviceFor(id ? *id : std::string("iphone"));
++  const bool land = spec.FindBool("landscape").value_or(false);
++  const bool dark = spec.FindBool("dark").value_or(false);
++  const bool motion = spec.FindBool("motion").value_or(false);
++  const bool slow = spec.FindBool("slow").value_or(false);
++  const int w = land ? d.height : d.width;
++  const int h = land ? d.width : d.height;
++  const gfx::Size view = web_contents()->GetContainerBounds().size();
++  double fit = 1;
++  if (!view.IsEmpty()) {
++    fit = std::min({1.0, (view.height() - 24.0) / h, (view.width() - 24.0) / w});
++  }
++  if (fit <= 0.1) {
++    fit = 1;
++  }
++  const bool reload =
++      !phone_spec_ || !phone_spec_->FindString("device") ||
++      *phone_spec_->FindString("device") != std::string(d.id);
++  if (!phone_cdp_) {
++    phone_cdp_ = std::make_unique<CdpSession>(web_contents());
++  }
++  CdpSession& s = *phone_cdp_;
++  s.Send("Emulation.setDeviceMetricsOverride",
++         base::DictValue()
++             .Set("width", w)
++             .Set("height", h)
++             .Set("deviceScaleFactor", d.scale)
++             .Set("mobile", true)
++             .Set("scale", fit)
++             .Set("screenWidth", w)
++             .Set("screenHeight", h)
++             .Set("screenOrientation",
++                  base::DictValue()
++                      .Set("type", land ? "landscapePrimary" : "portraitPrimary")
++                      .Set("angle", land ? 90 : 0)));
++  s.Send("Emulation.setTouchEmulationEnabled",
++         base::DictValue().Set("enabled", true).Set("maxTouchPoints", 5));
++  s.Send("Emulation.setEmitTouchEventsForMouse",
++         base::DictValue().Set("enabled", true).Set("configuration", "mobile"));
++  s.Send("Emulation.setUserAgentOverride",
++         base::DictValue().Set("userAgent", d.ua).Set("platform", d.platform));
++  s.Send("Emulation.setEmulatedMedia",
++         base::DictValue().Set(
++             "features",
++             base::ListValue()
++                 .Append(base::DictValue()
++                             .Set("name", "prefers-color-scheme")
++                             .Set("value", dark ? "dark" : "light"))
++                 .Append(base::DictValue()
++                             .Set("name", "prefers-reduced-motion")
++                             .Set("value", motion ? "reduce" : "no-preference"))));
++  s.Send("Network.enable", base::DictValue());
++  // "Slow 3G" of DevTools: 400 ms, ~400 kbit/s down, ~400 kbit/s up.
++  s.Send("Network.emulateNetworkConditions",
++         base::DictValue()
++             .Set("offline", false)
++             .Set("latency", slow ? 400 : 0)
++             .Set("downloadThroughput", slow ? 50000 : -1)
++             .Set("uploadThroughput", slow ? 50000 : -1));
++  spec.Set("frame", base::DictValue()
++                        .Set("kind", d.id)
++                        .Set("radius", land ? 0 : d.radius));
++  phone_spec_ = std::move(spec);
++  if (reload) {
++    s.Send("Page.reload", base::DictValue());
++  } else {
++    Run(PhoneFrameScript());
++  }
++}
++
++std::string ToolkitTabHelper::PhoneFrameScript() const {
++  if (!phone_spec_) {
++    return std::string();
++  }
++  const base::DictValue* frame = phone_spec_->FindDict("frame");
++  return "window.__meridianToolkit && window.__meridianToolkit.tk.phoneFrame(" +
++         (frame ? base::WriteJson(*frame).value_or("null") : "null") + ");";
++}
++
++void ToolkitTabHelper::Qr(int id) {
++  // Only a page the phone can open as is: http(s) and not this computer's
++  // own (localhost, 127.0.0.1, [::1], file:). Those would need a server on
++  // the network; not in this version.
++  const GURL& url = web_contents()->GetLastCommittedURL();
++  if (!url.SchemeIsHTTPOrHTTPS() || net::IsLocalhost(url)) {
++    return Answer(id, base::Value(base::DictValue().Set("local", true)));
++  }
++  const std::string spec = url.spec();
++  auto code = qr_code_generator::GenerateCode(base::as_byte_span(spec));
++  if (!code.has_value()) {
++    return Answer(id, base::Value());
++  }
++  std::string bits;
++  bits.reserve(code->data.size());
++  for (uint8_t b : code->data) {
++    bits.push_back((b & 1) ? '1' : '0');
++  }
++  Answer(id, base::Value(base::DictValue()
++                             .Set("size", code->qr_size)
++                             .Set("bits", std::move(bits))
++                             .Set("url", spec)));
++}
++
+ bool HasToolkit(content::WebContents* contents) {
+   ToolkitTabHelper* helper =
+       contents ? ToolkitTabHelper::FromWebContents(contents) : nullptr;
+diff --git a/chrome/browser/meridian/toolkit/toolkit_tab_helper.h b/chrome/browser/meridian/toolkit/toolkit_tab_helper.h
+index f9d479df28..5277b5235d 100644
+--- a/chrome/browser/meridian/toolkit/toolkit_tab_helper.h
++++ b/chrome/browser/meridian/toolkit/toolkit_tab_helper.h
+@@ -5,6 +5,8 @@
+ #ifndef CHROME_BROWSER_MERIDIAN_TOOLKIT_TOOLKIT_TAB_HELPER_H_
+ #define CHROME_BROWSER_MERIDIAN_TOOLKIT_TOOLKIT_TAB_HELPER_H_
+ 
++#include <memory>
++#include <optional>
+ #include <string>
+ 
+ #include "base/memory/weak_ptr.h"
+@@ -18,6 +20,8 @@ class Profile;
+ 
+ namespace meridian::toolkit {
+ 
++class CdpSession;
++
+ // The designer toolkit (behind a flag, off): the lens, the site's system,
+ // capture as a bug, images under the cursor, stress text, contrast, brand
+ // check. One portable page script (toolkit_core.js) plus Meridian's adapter
+@@ -58,8 +62,28 @@ class ToolkitTabHelper : public content::WebContentsObserver,
+   void Capture(int id, const base::DictValue& args);
+   void Store(const base::DictValue& args);
+   double Zoom() const;
++  // The whole page (Page.captureScreenshot beyond the viewport, in tiles of
++  // at most 8000 px that the page stitches).
++  void Page(int id, const base::DictValue& args);
++  void CaptureTile(int id, double w, double h, double scale, int tile, int y,
++                   base::ListValue tiles);
++  // «Телефон рядом»: this tab's page again in a split, emulated as a phone.
++  void Phone(int id, const base::DictValue& args);
++  // In the phone tab: device metrics, touch, UA, dark/reduced motion, slow
++  // network; the frame is drawn by the page script.
++  void ApplyPhone(base::DictValue spec);
++  std::string PhoneFrameScript() const;
++  // A QR of this page's address for the phone (public pages only).
++  void Qr(int id);
+ 
+   bool busy_ = false;
++  std::unique_ptr<CdpSession> page_cdp_;
++  // In a phone tab: its DevTools session (emulation lasts while it does) and
++  // what it emulates.
++  std::unique_ptr<CdpSession> phone_cdp_;
++  std::optional<base::DictValue> phone_spec_;
++  // In the tab that opened a phone.
++  base::WeakPtr<content::WebContents> phone_;
+   base::OneShotTimer timer_;
+   base::WeakPtrFactory<ToolkitTabHelper> weak_factory_{this};
+ 
