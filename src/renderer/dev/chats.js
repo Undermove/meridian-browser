@@ -28,22 +28,37 @@ function chatsStart() {
   btn.className = 'left-view';
   btn.setAttribute('role', 'tab');
   btn.title = 'Agent sessions';
-  btn.innerHTML = `${icon('chat', 14)}<span>Chats</span><span id="chats-count"></span>`;
+  btn.innerHTML = `<span class="ic-slot">${icon('chat', 14)}</span><span>Chats</span><span id="chats-count"></span>`;
   views.insertBefore(btn, views.firstChild);
-  const tools = document.createElement('div');
-  tools.id = 'chats-tools';
+  // The list: its own header (with "+"), the sessions, then the ended ones folded away.
+  const view = document.createElement('div');
+  view.id = 'chats-view';
+  const head = document.createElement('div');
+  head.className = 'chats-head';
+  const label = document.createElement('span');
+  label.className = 'chats-head-label';
+  label.textContent = 'Sessions';
   const add = document.createElement('button');
   add.className = 'icon-btn small';
   add.id = 'chats-new';
   add.title = 'New Claude Code session';
+  add.setAttribute('aria-label', 'New Claude Code session');
   add.innerHTML = icon('plus', 14);
   add.addEventListener('click', () => { if (typeof launch === 'function') launch('claude'); });
-  tools.appendChild(add);
-  $('#tree-tools').after(tools);
-  const view = document.createElement('div');
-  view.id = 'chats-view';
-  view.setAttribute('role', 'listbox');
-  view.setAttribute('aria-label', 'Agent sessions');
+  head.append(label, add);
+  const list = document.createElement('div');
+  list.className = 'chats-list';
+  list.setAttribute('role', 'listbox');
+  list.setAttribute('aria-label', 'Agent sessions');
+  const ended = document.createElement('details');
+  ended.className = 'chats-ended';
+  ended.open = load('chatsEndedOpen') === '1';
+  ended.addEventListener('toggle', () => store('chatsEndedOpen', ended.open ? '1' : ''));
+  const summary = document.createElement('summary');
+  const endedList = document.createElement('div');
+  endedList.className = 'chats-list';
+  ended.append(summary, endedList);
+  view.append(head, list, ended);
   $('#scm-view').after(view);
   const onFiles = () => chatsOpen(false);
   btn.addEventListener('click', () => chatsOpen(true));
@@ -60,7 +75,7 @@ function chatsStart() {
   // Room for three views over the list, unless the pane was sized by hand.
   const roomy = !Number(load('treeW'));
   if (roomy) document.documentElement.style.setProperty('--tree-w', '290px');
-  CHATS.dom = { btn, tools, view, onFiles, unsub, onVis, folds, roomy };
+  CHATS.dom = { btn, view, list, ended, summary, endedList, onFiles, unsub, onVis, folds, roomy };
   chatsOpen(load('chatsView') !== 'files');
   chatsRefresh();
 }
@@ -77,7 +92,7 @@ function chatsStop() {
   window.removeEventListener('focus', d.onVis);
   $('#view-files').removeEventListener('click', d.onFiles);
   $('#view-scm').removeEventListener('click', d.onFiles);
-  d.btn.remove(); d.tools.remove(); d.view.remove();
+  d.btn.remove(); d.view.remove();
   delete document.body.dataset.chats;
   if (d.roomy && !Number(load('treeW'))) document.documentElement.style.removeProperty('--tree-w');
   delete $('#tree-pane').dataset.left;
@@ -149,65 +164,72 @@ function chatsQuietWords(t) {
 
 function chatsRender() {
   if (!CHATS.on) return;
-  const view = CHATS.dom.view;
   const count = $('#chats-count');
   const live = S.terms.filter((t) => !t.exited).length;
   count.textContent = live ? String(live) : '';
   count.hidden = !live;
   if (!CHATS.open) return;
-  if (!S.terms.length) {
+  const { list, ended, summary, endedList } = CHATS.dom;
+  const running = S.terms.filter((t) => !t.exited);
+  const over = S.terms.filter((t) => t.exited);
+  if (!running.length) {
     const empty = document.createElement('div');
     empty.id = 'chats-empty';
-    empty.textContent = S.project ? 'No sessions yet. Start one with + or from the toolbar.' : 'Open a project to start a session.';
-    view.replaceChildren(empty);
-    return;
-  }
-  view.replaceChildren(...S.terms.map((t) => {
-    const st = SessionStatus.get(t.id);
-    const row = document.createElement('div');
-    row.className = `chat-row${t === S.activeTerm ? ' active' : ''}${st.state ? ' ' + st.state : ''}${t.exited ? ' exited' : ''}`;
-    row.dataset.term = t.id;
-    row.dataset.state = st.state || 'none';
-    row.setAttribute('role', 'option');
-    row.setAttribute('aria-selected', String(t === S.activeTerm));
-    const status = document.createElement('span');
-    status.className = 'chat-status';
-    const m = SessionStatus.mark(st.state);
-    if (m) status.appendChild(m);
-    row.appendChild(status);
-    row.appendChild(agentMark(t.kind === 'shell' && t.sessionId ? 'claude' : AGENT_UI[t.kind] ? t.kind : 'shell'));
-    const main = document.createElement('div');
-    main.className = 'chat-main';
-    const top = document.createElement('div');
-    top.className = 'chat-top';
-    const name = document.createElement('span');
-    name.className = 'chat-name';
-    name.textContent = termName(t);
-    top.appendChild(name);
-    if (t.rc === 'on') { const rc = termRcBadge(t); if (rc) top.appendChild(rc); }
-    const when = document.createElement('span');
-    when.className = 'chat-when';
-    when.textContent = st.state ? chatsWhen(st.since) : '';
-    top.appendChild(when);
-    const sub = document.createElement('div');
-    sub.className = 'chat-sub';
-    const words = document.createElement('span');
-    words.className = 'chat-words';
-    words.textContent = st.state ? SessionStatus.words(t.id) : chatsQuietWords(t);
-    words.title = words.textContent;
-    sub.appendChild(words);
-    const gauge = typeof termUsageBadge === 'function' ? termUsageBadge(t) : null;
-    if (gauge) sub.appendChild(gauge);
-    main.append(top, sub);
-    row.appendChild(main);
-    row.title = termName(t);
-    row.addEventListener('click', (e) => {
-      if (e.target.closest('.tab-usage')) return;
-      $('#term-area').classList.remove('collapsed');
-      activateTerm(t);
-    });
-    return row;
-  }));
+    empty.textContent = S.project ? 'No sessions running. Start one with + or from the toolbar.' : 'Open a project to start a session.';
+    list.replaceChildren(empty);
+  } else list.replaceChildren(...running.map(chatsRow));
+  // Ended sessions: at the bottom, folded unless opened (or the one on screen is there).
+  ended.hidden = !over.length;
+  summary.textContent = `Ended · ${over.length}`;
+  if (over.includes(S.activeTerm)) ended.open = true;
+  endedList.replaceChildren(...over.map(chatsRow));
+}
+
+function chatsRow(t) {
+  const st = SessionStatus.get(t.id);
+  const row = document.createElement('div');
+  row.className = `chat-row${t === S.activeTerm ? ' active' : ''}${st.state ? ' ' + st.state : ''}${t.exited ? ' exited' : ''}`;
+  row.dataset.term = t.id;
+  row.dataset.state = st.state || 'none';
+  row.setAttribute('role', 'option');
+  row.setAttribute('aria-selected', String(t === S.activeTerm));
+  const status = document.createElement('span');
+  status.className = 'chat-status';
+  const m = SessionStatus.mark(st.state);
+  if (m) status.appendChild(m);
+  row.appendChild(status);
+  row.appendChild(agentMark(t.kind === 'shell' && t.sessionId ? 'claude' : AGENT_UI[t.kind] ? t.kind : 'shell'));
+  const main = document.createElement('div');
+  main.className = 'chat-main';
+  const top = document.createElement('div');
+  top.className = 'chat-top';
+  const name = document.createElement('span');
+  name.className = 'chat-name';
+  name.textContent = termName(t);
+  top.appendChild(name);
+  if (t.rc === 'on') { const rc = termRcBadge(t); if (rc) top.appendChild(rc); }
+  const when = document.createElement('span');
+  when.className = 'chat-when';
+  when.textContent = st.state ? chatsWhen(st.since) : '';
+  top.appendChild(when);
+  const sub = document.createElement('div');
+  sub.className = 'chat-sub';
+  const words = document.createElement('span');
+  words.className = 'chat-words';
+  words.textContent = st.state ? SessionStatus.words(t.id) : chatsQuietWords(t);
+  words.title = words.textContent;
+  sub.appendChild(words);
+  const gauge = typeof termUsageBadge === 'function' ? termUsageBadge(t) : null;
+  if (gauge) sub.appendChild(gauge);
+  main.append(top, sub);
+  row.appendChild(main);
+  row.title = termName(t);
+  row.addEventListener('click', (e) => {
+    if (e.target.closest('.tab-usage')) return;
+    $('#term-area').classList.remove('collapsed');
+    activateTerm(t);
+  });
+  return row;
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
