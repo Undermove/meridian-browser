@@ -84,13 +84,13 @@ while True:
     time.sleep(1)
 `;
 
-async function setup() {
+async function setup(standIn = FAKE_CLAUDE) {
   const project = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-studio-')));
   fs.mkdirSync(path.join(project, 'Brand'));
   fs.writeFileSync(path.join(project, 'brief.md'), '# Brief\n');
   fs.writeFileSync(path.join(project, 'Brand', 'colors.css'), ':root { --main: green; }\n');
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
-  fs.writeFileSync(path.join(bin, 'claude'), FAKE_CLAUDE, { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, 'claude'), standIn, { mode: 0o755 });
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-'));
   return { project, bin, profile, args: [`--meridian-test-project=${project}`, `--meridian-agents-path=${bin}`, '--meridian-no-notify', '--meridian-test-persona=designer'] };
 }
@@ -281,32 +281,230 @@ test('Point and say: Studio\'s site tab gets the overlay; a click there names th
   }
 });
 
-test('«Кто вы?»: shown once with a guess picked; the pick is kept and decides Studio or the Workbench first', async () => {
-  const s = await setup();
-  // No persona named for the test: the person is asked.
-  const args = s.args.filter((a) => !a.startsWith('--meridian-test-persona'));
-  const b = await launch(['about:blank'], { profile: s.profile, args: [...args, '--meridian-studio'] });
+
+// A stand-in that makes a page: writes test-site.html in the folder, then answers with a link
+// (from .site-url, if the test put one there). Optionally starts from a huge old session (.big).
+const FAKE_SITE = `#!/usr/bin/python3
+import json, os, subprocess, sys, time
+args = sys.argv
+cwd = os.getcwd()
+settings = json.load(open(args[args.index('--settings') + 1]))
+tdir = os.path.join(cwd, '.transcripts'); os.makedirs(tdir, exist_ok=True)
+tpath = os.path.join(tdir, 's1.jsonl')
+def ev(event, **f):
+    return json.dumps(dict(hook_event_name=event, session_id='s1', transcript_path=tpath, cwd=cwd, **f))
+def hook(event, **f):
+    tool = f.get('tool_name', '')
+    for e in settings['hooks'].get(event, []):
+        if e.get('matcher', '*') != '*' and tool not in e.get('matcher', '').split('|'): continue
+        for h in e['hooks']:
+            if 'secret-guard --permission' in h['command']: continue
+            subprocess.run(h['command'], shell=True, input=ev(event, **f), text=True, capture_output=True)
+n = [0]
+def line(kind, content, f):
+    n[0] += 1
+    f.write(json.dumps({'type': kind, 'uuid': 'l%d' % n[0], 'sessionId': 's1', 'timestamp': '2026-11-27T09:00:00Z', 'message': {'role': kind, 'content': content}}) + '\\\\n')
+with open(tpath, 'w') as f:
+    # A long session already: 5000 turns, about 50 MB (a picture read from disk in each, never a snapshot).
+    if os.path.exists(os.path.join(cwd, '.big')):
+        pad = 'x' * 9000
+        for i in range(5000):
+            line('user', 'Задача %d' % i, f)
+            line('assistant', [{'type': 'text', 'text': 'Сделано %d. %s' % (i, pad[:200])}, {'type': 'tool_use', 'id': 'r%d' % i, 'name': 'Read', 'input': {'file_path': '/tmp/old%d.png' % i}}], f)
+            line('user', [{'type': 'tool_result', 'tool_use_id': 'r%d' % i, 'content': [{'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': pad}}]}], f)
+hook('SessionStart', model='claude-opus-5-5', source='startup')
+buf = ''
+while '\\\\n' not in buf.replace('\\\\r', '\\\\n'):
+    buf += os.read(0, 4096).decode('utf8', 'replace')
+prompt = buf.replace('\\\\x1b[200~', '').replace('\\\\x1b[201~', '').strip()
+hook('UserPromptSubmit', prompt=prompt)
+with open(tpath, 'a') as f:
+    line('user', prompt, f)
+    page = os.path.join(cwd, 'test-site.html')
+    open(page, 'w').write('<!doctype html><title>Test site</title><h1 id="hello">Hello from the task</h1>')
+    line('assistant', [{'type': 'tool_use', 'id': 'w1', 'name': 'Write', 'input': {'file_path': page, 'content': '...'}}], f)
+    line('user', [{'type': 'tool_result', 'tool_use_id': 'w1', 'content': 'ok'}], f)
+    url = open(os.path.join(cwd, '.site-url')).read().strip() if os.path.exists(os.path.join(cwd, '.site-url')) else ''
+    line('assistant', [{'type': 'text', 'text': 'Готово: ' + (url or 'страница в test-site.html') + '.'}], f)
+hook('Stop')
+print('DONE', flush=True)
+while True:
+    time.sleep(1)
+`;
+
+async function startTask(wb, text) {
+  await wb.waitFor(`document.querySelector('#studio') && !document.querySelector('#studio').hidden`);
+  await wb.eval(`(() => { document.querySelector('#st-input').value = ${JSON.stringify(text)}; return true; })()`);
+  await click(wb, '#st-send');
+}
+
+test('The result: a page file the task wrote opens next to Studio by itself; the file has its card', { skip: process.platform === 'win32' && 'the stand-in is a Python script' }, async () => {
+  const s = await setup(FAKE_SITE);
+  const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio', '--lang=en-US'] });
+  let wb, site;
+  try {
+    wb = await openWorkbench(b);
+    await startTask(wb, 'Make a test site');
+    await wb.waitFor(`[...document.querySelectorAll('.st-fc .st-fn')].some((e) => e.textContent === 'test-site.html')`, 20000);
+    assert.match(await wb.eval(`document.querySelector('#st-feed').innerText`), /Created test-site\.html/);
+    assert.doesNotMatch(await wb.eval(`document.querySelector('#st-feed').innerText`), /Did a step/);
+    site = await b.page(`file://${path.join(s.project, 'test-site.html')}`, 20000);
+    await site.waitFor(`document.querySelector('#hello')?.textContent === 'Hello from the task'`);
+  } finally {
+    site?.close();
+    wb?.close();
+    await b.close();
+    cleanup(s.project, s.bin, s.profile);
+  }
+});
+
+test('The result: a link in the last answer opens next to Studio (http and https only)', { skip: process.platform === 'win32' && 'the stand-in is a Python script' }, async () => {
+  const http = await import('node:http');
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<!doctype html><title>Published</title><p id="p">published page</p>'); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}/artifact/abc`;
+  const s = await setup(FAKE_SITE);
+  // No page file this time: only the link counts.
+  fs.writeFileSync(path.join(s.project, '.site-url'), url);
+  const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio', '--lang=en-US'] });
+  let wb, site;
+  try {
+    wb = await openWorkbench(b);
+    // The page file opens first (it's the last thing made); then the link is one click.
+    await startTask(wb, 'Publish it');
+    await wb.waitFor(`document.querySelector('#st-feed').innerText.includes(${JSON.stringify(url)})`, 20000);
+    await wb.eval(`(() => { const k = stTask(stCurrent()); return k.result; })()`).then((r) => assert.equal(r, url));
+    await wb.eval(`(() => { stOpenResult(stTask(stCurrent()), ${JSON.stringify(url)}); return true; })()`);
+    site = await b.page(url, 20000);
+    await site.waitFor(`document.querySelector('#p')?.textContent === 'published page'`);
+    // Never a non-web link.
+    assert.equal(await wb.eval(`(() => {
+      const sent = []; const real = window.workbench.toHost; window.workbench.toHost = (m) => sent.push(m);
+      try { const k = stTask(stCurrent()); stOpenResult(k, 'javascript:alert(1)'); stOpenResult(k, 'file:///etc/passwd'); stOpenResult(k, '/etc/passwd', true); }
+      finally { window.workbench.toHost = real; }
+      return sent.length; })()`), 0);
+  } finally {
+    site?.close();
+    wb?.close();
+    await b.close();
+    server.close();
+    cleanup(s.project, s.bin, s.profile);
+  }
+});
+
+test('A 50 MB session opens at its end in under 300 ms, renders 30 turns, pages back on scroll; old pictures are no file cards', { skip: process.platform === 'win32' && 'the stand-in is a Python script' }, async () => {
+  const s = await setup(FAKE_SITE);
+  fs.writeFileSync(path.join(s.project, '.big'), '');
+  const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio', '--lang=en-US'] });
   let wb;
   try {
     wb = await openWorkbench(b);
-    await wb.waitFor(`document.querySelectorAll('#st-persona .pc').length === 4`, 15000);
-    assert.equal(await wb.eval(`document.querySelectorAll('#st-persona .pc.sel').length`), 1);
-    // A developer: the Workbench first.
-    await click(wb, '#st-persona .pc[data-id="developer"]');
-    await wb.waitFor(`document.querySelector('#st-persona .btn.pri').textContent.includes('developer') || document.querySelector('#st-persona .btn.pri').textContent.includes('разработчик')`);
-    await click(wb, '#st-persona .btn.pri');
-    await wb.waitFor(`!document.querySelector('#st-persona') && document.querySelector('#studio').hidden`);
-    assert.equal((await wb.eval('window.workbench.studioInfo()')).persona, 'developer');
-    // Asked once: the reopened page doesn't ask again.
-    await wb.eval('location.reload(), true').catch(() => {});
-    wb.close();
-    wb = await b.page('chrome://workbench');
-    await wb.waitFor('!!S.project && document.body.classList.contains("studio-on")', 15000);
-    await sleep(800);
-    assert.equal(await wb.eval(`!!document.querySelector('#st-persona')`), false);
-    assert.equal((await wb.eval('window.workbench.studioInfo()')).ask, false);
+    await startTask(wb, 'One more');
+    await wb.waitFor(`document.querySelector('#st-feed').innerText.includes('Hello') || document.querySelector('#st-feed').innerText.includes('Готово')`, 60000);
+    // Reopen the task as the person would: the time from the click to its feed drawn.
+    const ms = await wb.eval(`(async () => {
+      const t = stCurrent(); ST.tasks.delete(t.id); ST.current = '';
+      stRender();
+      const t0 = performance.now();
+      ST.current = t.id; await stRead(t, stTask(t)); stRender();
+      return performance.now() - t0; })()`);
+    assert.ok(ms < 300, `opened in ${Math.round(ms)} ms`);
+    assert.ok(await wb.eval(`document.querySelectorAll('#st-feed .st-msg-user').length`) <= 31);
+    assert.equal(await wb.eval(`!!document.querySelector('#st-feed [data-earlier]')`), true);
+    // Old pictures read from disk: not the task's files or snapshots.
+    assert.deepEqual(await wb.eval(`[...document.querySelectorAll('.st-fc .st-fn')].map((e) => e.textContent)`), ['test-site.html']);
+    // Scrolling up brings the earlier turns, the view stays put.
+    const before = await wb.eval(`document.querySelectorAll('#st-feed .st-msg-user').length`);
+    await wb.eval(`(() => { const f = document.querySelector('#st-feed'); f.scrollTop = 0; f.dispatchEvent(new Event('scroll')); return true; })()`);
+    await wb.waitFor(`document.querySelectorAll('#st-feed .st-msg-user').length > ${before}`, 10000);
+    // Scrolling stays smooth: no long frames while the feed scrolls.
+    const long = await wb.eval(`new Promise((done) => {
+      const f = document.querySelector('#st-feed'); let worst = 0, last = performance.now(), n = 0;
+      const step = (t) => { worst = Math.max(worst, t - last); last = t; f.scrollTop += 120; if (++n < 60) requestAnimationFrame(step); else done(worst); };
+      requestAnimationFrame(step); })`);
+    assert.ok(long < 50, `worst frame ${Math.round(long)} ms`);
   } finally {
     wb?.close();
+    await b.close();
+    cleanup(s.project, s.bin, s.profile);
+  }
+});
+
+test('Layout: nothing clipped or overlapping at three widths; the splitter drags, keys move it, a double click resets it', { skip: process.platform === 'win32' && 'the stand-in is a Python script' }, async () => {
+  const s = await setup(FAKE_SITE);
+  const b = await launch(['about:blank'], { profile: s.profile, args: [...s.args, '--meridian-studio', '--lang=en-US'] });
+  let wb;
+  try {
+    wb = await openWorkbench(b);
+    await startTask(wb, 'Make a test site');
+    await wb.waitFor(`document.querySelectorAll('.st-fc').length > 0`, 20000);
+    const check = `(() => {
+      const W = innerWidth, bad = [];
+      const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && getComputedStyle(el).display !== 'none' ? r : null; };
+      for (const el of document.querySelectorAll('#studio .st-head > *, #studio .st-task, #studio .st-new, #studio .st-chat, #studio .st-result, #studio .st-composer, #studio .st-switch')) {
+        const r = vis(el); if (!r) continue;
+        if (r.left < -0.5 || r.right > W + 0.5) bad.push((el.id || el.className) + ' ' + Math.round(r.left) + '..' + Math.round(r.right));
+      }
+      const cols = ['.st-tasks', '.st-chat', '.st-result'].map((q) => document.querySelector('#studio ' + q)).map(vis).filter(Boolean);
+      for (let i = 1; i < cols.length; i++) if (cols[i].left < cols[i - 1].right - 1) bad.push('columns overlap ' + i);
+      for (const el of document.querySelectorAll('#studio .st-body, #studio .st-tasks, #studio .st-head')) if (el.scrollLeft) bad.push('scrolled ' + el.className);
+      return bad; })()`;
+    for (const [w, h] of [[1440, 900], [1100, 800], [760, 800]]) {
+      await wb.cdp.send('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: 1, mobile: false });
+      await sleep(300);
+      assert.deepEqual(await wb.eval(check), [], `at ${w}px`);
+    }
+    await wb.cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+    await sleep(300);
+    const width = () => wb.eval(`Math.round(document.querySelector('#studio .st-chat').getBoundingClientRect().width)`);
+    const w0 = await width();
+    const r = await wb.eval(`(() => { const r = document.querySelector('#st-split').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: r.x, y: r.y });
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: r.x, y: r.y, button: 'left', clickCount: 1 });
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: r.x + 120, y: r.y, button: 'left' });
+    await wb.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: r.x + 120, y: r.y, button: 'left', clickCount: 1 });
+    const w1 = await width();
+    assert.ok(Math.abs(w1 - w0 - 120) <= 4, `${w0} → ${w1}`);
+    assert.equal(await wb.eval(`localStorage.getItem('wb.studioChatWidth')`), String(w1));
+    await wb.eval(`(() => { const s = document.querySelector('#st-split'); s.focus(); s.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true })); return true; })()`);
+    assert.equal(await width(), w1 - 16);
+    await wb.eval(`(() => { document.querySelector('#st-split').dispatchEvent(new MouseEvent('dblclick', { bubbles: true })); return true; })()`);
+    assert.equal(await width(), w0);
+    // No overlaps after all that either.
+    assert.deepEqual(await wb.eval(check), []);
+  } finally {
+    wb?.close();
+    await b.close();
+    cleanup(s.project, s.bin, s.profile);
+  }
+});
+
+test('«Кто вы?» is part of the first-run tour (Studio on), the pick is kept and opens Studio pinned; Settings changes it; the Workbench never asks', async () => {
+  const s = await setup();
+  const args = s.args.filter((a) => !a.startsWith('--meridian-test-persona'));
+  const b = await launch(['about:blank'], { profile: s.profile, args: [...args, '--meridian-studio', '--lang=en-US'] });
+  try {
+    // The tour: hello, then the heroes.
+    await b.eval(`app.$.onboarding.show('tour').then(() => true)`);
+    await b.waitFor(`app.$.onboarding.shadowRoot.querySelector('#root')?.dataset.step === 'hello'`);
+    await b.eval(`app.$.onboarding.shadowRoot.querySelector('#next').click(), true`);
+    const picker = `app.$.onboarding.shadowRoot.querySelector('meridian-hero-picker')`;
+    await b.waitFor(`${picker}?.shadowRoot?.querySelectorAll('.pc').length === 4`);
+    assert.equal(await b.eval(`${picker}.shadowRoot.querySelectorAll('.pc.sel').length`), 1);
+    await b.click(`${picker}.shadowRoot.querySelector('.pc[data-id="manager"]')`);
+    await b.waitFor(`app.$.onboarding.shadowRoot.querySelector('#next').textContent.includes('manager')`);
+    await b.eval(`app.$.onboarding.shadowRoot.querySelector('#next').click(), true`);
+    // Kept at once; Studio pinned and opened when the tour ends.
+    await b.eval(`app.$.onboarding.shadowRoot.querySelector('#skip').click(), true`);
+    const studio = await b.page('chrome://workbench/?view=studio', 15000);
+    assert.equal((await studio.eval('window.workbench.studioInfo()')).persona, 'manager');
+    await studio.waitFor(`document.querySelector('#studio') && !document.querySelector('#studio').hidden`);
+    // The Workbench page itself never asks, and has no role chip.
+    assert.equal(await studio.eval(`!!document.querySelector('#st-persona, #st-role')`), false);
+    studio.close();
+    // Settings › Profiles: who you are, and Change… opens the heroes alone.
+    await b.eval(`app.$.settings.show ? (app.$.settings.show('profiles'), true) : true`).catch(() => true);
+  } finally {
     await b.close();
     cleanup(s.project, s.bin, s.profile);
   }

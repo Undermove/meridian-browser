@@ -30,7 +30,7 @@ test('a turn: the prompt, Claude\'s text and its steps in order, each step done 
   assert.deepEqual(ST.sitesOf(m), ['https://www.zerno.coffee/']);
 });
 
-test('only files the task created or changed inside the folder count; read ones and outside ones don\'t', () => {
+test('only files the task created or changed count (in the folder or not); read ones and refused ones don\'t', () => {
   const m = ST.newModel();
   ST.feed(m, [
     user('u1', 'go'),
@@ -49,9 +49,13 @@ test('only files the task created or changed inside the folder count; read ones 
       { type: 'tool_result', tool_use_id: 'd', content: 'ok' },
     ]),
   ].join('\n') + '\n', { root: ROOT });
-  assert.deepEqual([...m.files.keys()], ['Черновики/palette.png']);
+  assert.deepEqual([...m.files.keys()], ['Черновики/palette.png', '/etc/hosts', `${ROOT}/../x.md`]);
   assert.equal(m.files.get('Черновики/palette.png').created, true);
   assert.equal(m.files.get('Черновики/palette.png').image, true);
+  assert.equal(m.files.get('Черновики/palette.png').outside, false);
+  // Outside the folder: a card, no text preview (and «..» never counts as inside).
+  assert.equal(m.files.get('/etc/hosts').outside, true);
+  assert.equal(m.files.get(`${ROOT}/../x.md`).outside, true);
   const steps = m.turns[0].items[0].steps;
   assert.equal(steps.find((s) => s.id === 'e').state, 'denied');
 });
@@ -106,4 +110,86 @@ test('steps and questions in plain words, without tool names or jargon', () => {
 test('every word exists in both languages', () => {
   const ru = Object.keys(W.T.ru).sort(), en = Object.keys(W.T.en).sort();
   assert.deepEqual(ru, en);
+});
+
+test('a page file the task wrote is a page; the links of its last answer are the result', () => {
+  const m = ST.newModel();
+  ST.feed(m, [
+    user('u1', 'Сделай тестовый сайт'),
+    asst('a1', [{ type: 'tool_use', id: 'w', name: 'Write', input: { file_path: '/tmp/x/test-site.html' } }]),
+    user('r1', [{ type: 'tool_result', tool_use_id: 'w', content: 'ok' }]),
+    asst('a2', [{ type: 'text', text: 'Готово: https://claude.ai/artifact/VCvkLRUxXq8QhMUVPmVLFW.\nЛокально: http://localhost:3000/ и (javascript:alert(1)), ftp://x' }]),
+  ].join('\n') + '\n', { root: ROOT });
+  const f = m.files.get('/tmp/x/test-site.html');
+  assert.equal(f.page, true);
+  assert.equal(f.outside, true);
+  assert.deepEqual(ST.linksOf(m), ['https://claude.ai/artifact/VCvkLRUxXq8QhMUVPmVLFW', 'http://localhost:3000/']);
+});
+
+test('every tool has plain words: never "Did a step"', () => {
+  for (const lang of ['ru', 'en']) {
+    for (const tool of ['Artifact', 'Skill', 'ToolSearch', 'BashOutput', 'TaskCreate', 'Bash', 'Unknown', 'mcp__claude_ai_Slack__send', 'mcp__other__x']) {
+      const [, done, doing] = W.stepWords(tool, { command: 'npm test' }, lang);
+      assert.doesNotMatch(done + doing, /Did a step|Сделал шаг/);
+    }
+  }
+  assert.equal(W.stepWords('Artifact', {}, 'ru')[1], 'Опубликовал страницу');
+  assert.equal(W.stepWords('Write', { file_path: '/a/b/site.html' }, 'ru')[1], 'Создал файл site.html');
+  assert.equal(W.stepWords('Bash', { command: 'npm run build' }, 'ru')[1], 'Запустил npm');
+  assert.equal(W.stepWords('Bash', { command: 'weird-tool --x' }, 'ru')[1], 'Выполнил команду');
+  assert.equal(W.stepWords('Unknown', {}, 'ru')[1], 'Работал над задачей');
+  assert.match(W.stepDetail('Bash', { command: 'npm run build' }), /^Bash · npm run build$/);
+});
+
+// A huge session: what Studio reads when it opens one (the C++ side gives it the last 2 MB) parses
+// fast, and older pages go in front without losing anything.
+function bigTranscript(turns) {
+  const lines = [];
+  for (let i = 0; i < turns; i++) {
+    lines.push(user(`p${i}`, `Задача номер ${i}: поправь кнопку и проверь`));
+    lines.push(asst(`a${i}`, [{ type: 'text', text: 'Смотрю.' }, { type: 'tool_use', id: `t${i}`, name: 'Read', input: { file_path: `${ROOT}/f${i}.md` } }]));
+    lines.push(user(`r${i}`, [{ type: 'tool_result', tool_use_id: `t${i}`, content: 'x'.repeat(300) }]));
+    lines.push(asst(`b${i}`, [{ type: 'text', text: 'Готово, поменял цвет кнопки на фирменный и проверил на узком экране.' }]));
+  }
+  return lines.join('\n') + '\n';
+}
+
+test('a 2 MB tail of a 5000-turn session parses in well under 300 ms; older pages go in front', () => {
+  const text = bigTranscript(5000);
+  const tailStart = text.indexOf('\n', text.length - 2 * 1024 * 1024) + 1;
+  const tail = text.slice(tailStart), head = text.slice(0, tailStart);
+  const t0 = performance.now();
+  const m = ST.newModel();
+  ST.feed(m, tail, { root: ROOT });
+  const ms = performance.now() - t0;
+  assert.ok(ms < 300, `parsed the tail in ${ms.toFixed(0)} ms`);
+  assert.ok(m.turns.length > 1000 && m.turns.length < 5000);
+  const older = ST.newModel();
+  ST.feed(older, head, { root: ROOT });
+  ST.prepend(m, older);
+  assert.equal(m.turns.filter((t) => t.prompt).length, 5000);
+  assert.equal(m.turns[0].prompt, 'Задача номер 0: поправь кнопку и проверь');
+});
+
+test('pictures read from disk or pasted are not the task\'s snapshots; a screenshot tool\'s are', () => {
+  const m = ST.newModel();
+  const img = [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } }];
+  ST.feed(m, [
+    user('u1', [{ type: 'text', text: 'вот скрин' }, { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'BBBB' } }]),
+    asst('a1', [{ type: 'tool_use', id: 'r', name: 'Read', input: { file_path: '/Users/d/Desktop/old.png' } }, { type: 'tool_use', id: 's', name: 'mcp__meridian__screenshot', input: {} }]),
+    user('r1', [{ type: 'tool_result', tool_use_id: 'r', content: img }, { type: 'tool_result', tool_use_id: 's', content: img }]),
+  ].join('\n') + '\n', { root: ROOT });
+  assert.equal(m.shots.length, 1);
+  assert.equal(m.files.size, 0);
+});
+
+test('times read as people say them', () => {
+  assert.equal(W.T.ru.ago(0), 'только что');
+  assert.equal(W.T.ru.ago(5), '5 мин назад');
+  assert.equal(W.T.ru.ago(180), '3 ч назад');
+  assert.equal(W.T.ru.ago(60 * 24), 'вчера');
+  assert.equal(W.T.ru.ago(60 * 177), '7 дней назад'); // not «177 h»
+  assert.equal(W.T.ru.ago(60 * 24 * 7), '7 дней назад');
+  assert.equal(W.T.ru.ago(60 * 24 * 22), '22 дня назад');
+  assert.equal(W.T.en.ago(60 * 24 * 7), '7 days ago');
 });

@@ -7,6 +7,7 @@
   'use strict';
 
   const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|avif)$/i;
+  const PAGE_EXT = /\.(html?|pdf)$/i;
   const MAX_SHOTS = 8;
 
   function newModel() {
@@ -91,14 +92,15 @@
             step.state = b.is_error ? (/doesn't want to proceed|was rejected|denied|not allowed/i.test(out) ? 'denied' : 'error') : 'ok';
             step.endedAt = at;
             if (!b.is_error) {
-              for (const src of resultImages(b)) {
+              for (const src of /screenshot|snapshot|capture/i.test(step.tool) ? resultImages(b) : []) {
                 m.shots.push({ src, step: step.id, at, label: step.label || '' });
                 if (m.shots.length > MAX_SHOTS) m.shots.shift();
               }
               // A file counts once the tool changed it.
               if (step.file) {
                 const prev = m.files.get(step.file.rel);
-                m.files.set(step.file.rel, { rel: step.file.rel, abs: step.file.abs, created: prev ? prev.created : step.file.created, at, image: IMAGE_EXT.test(step.file.rel), times: (prev?.times || 0) + 1 });
+                const prev2 = m.files.get(step.file.key);
+                m.files.set(step.file.key, { key: step.file.key, rel: step.file.rel, abs: step.file.abs, outside: !step.file.rel, created: prev2 ? prev2.created : step.file.created, at, image: IMAGE_EXT.test(step.file.abs), page: PAGE_EXT.test(step.file.abs), times: (prev2?.times || 0) + 1 });
               }
             }
             changed = true;
@@ -117,8 +119,9 @@
             const step = { type: 'step', id: b.id, tool: String(b.name || ''), input, state: 'running', at };
             const path = input.file_path || input.notebook_path;
             if (/^(Write|Edit|MultiEdit|NotebookEdit)$/.test(step.tool) && typeof path === 'string') {
+              // Every file it made or changed, in the folder or not (outside: no preview of its text).
               const rel = inside(path, rootDir);
-              if (rel) step.file = { rel, abs: path, created: step.tool === 'Write' };
+              if (path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path)) step.file = { key: rel || path, rel, abs: path, created: step.tool === 'Write' };
             }
             if (step.tool === 'TodoWrite' && Array.isArray(input.todos)) {
               m.plan = input.todos.filter((t) => t && typeof t.content === 'string')
@@ -145,6 +148,18 @@
     return { index: i >= 0 ? i + 1 : Math.min(done + 1, plan.length), total: plan.length, now: i >= 0 ? plan[i].active : '', done };
   }
 
+  // The links in Claude's last answer (http and https only), as written, newest last.
+  function linksOf(m) {
+    const turn = m.turns[m.turns.length - 1];
+    const text = (turn?.items || []).filter((x) => x.type === 'text').map((x) => x.text).join('\n');
+    const out = [];
+    for (const raw of text.match(/https?:\/\/[^\s<>()"'«»\[\]{}`]+/g) || []) {
+      const u = raw.replace(/[.,;:!?…]+$/, '');
+      try { const p = new URL(u); if ((p.protocol === 'http:' || p.protocol === 'https:') && !out.includes(p.href)) out.push(p.href); } catch {}
+    }
+    return out;
+  }
+
   // The sites the session went to (browser tools, web fetches), newest last.
   function sitesOf(m) {
     const out = [];
@@ -160,7 +175,26 @@
     return out;
   }
 
-  const api = { newModel, feed, planProgress, sitesOf, promptText, inside };
+  // An older page of the same session (parsed into its own model), put in front of `m`.
+  function prepend(m, older) {
+    // Its steps that never got a result here did get one later on.
+    for (const t of older.turns) for (const it of t.items) if (it.type === 'steps') for (const s of it.steps) if (s.state === 'running') s.state = 'ok';
+    const turns = [...older.turns];
+    // The newer page may start in the middle of a turn: its items join the older turn.
+    if (m.turns.length && !m.turns[0].prompt && turns.length) {
+      turns[turns.length - 1].items.push(...m.turns[0].items);
+      turns.push(...m.turns.slice(1));
+    } else turns.push(...m.turns);
+    m.turns = turns;
+    for (const [k, f] of older.files) if (!m.files.has(k)) m.files.set(k, f);
+    for (const u of older.seen) m.seen.add(u);
+    if (!m.plan && older.plan) m.plan = older.plan;
+    if (!m.title && older.title) m.title = older.title;
+    m.shots = [...older.shots, ...m.shots].slice(-MAX_SHOTS);
+    return m;
+  }
+
+  const api = { newModel, feed, prepend, planProgress, sitesOf, linksOf, promptText, inside };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.StudioTranscript = api;
 })(typeof window !== 'undefined' ? window : globalThis);

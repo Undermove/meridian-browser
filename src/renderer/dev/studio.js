@@ -87,8 +87,8 @@ async function studioBoot() {
   stSwitchInTopbar();
   const wanted = new URL(location.href).searchParams.get('view');
   stShow(wanted === 'workbench' ? 'workbench' : wanted === 'studio' || ST.persona !== 'developer' ? 'studio' : 'workbench');
-  // "Кто вы?" once: the person's pick decides what the Workbench tab opens with.
-  if (info.ask) stPersonaPicker({ guess: ST.persona });
+  // (Who the person is, and so Studio or the Workbench first, is asked in the first-run tour and
+  // changed in Settings: never here.)
   bus.addEventListener('project', () => { stRender(); });
   if (typeof SessionStatus !== 'undefined' && SessionStatus?.onChange) SessionStatus.onChange(() => stRender());
   document.addEventListener('visibilitychange', stReport);
@@ -133,7 +133,7 @@ function stShow(view) {
   if (studio) {
     document.title = (stCurrent() && stTitle(stCurrent())) || STW().studio;
     stRender();
-    setTimeout(() => $('#st-input')?.focus(), 0);
+    setTimeout(() => $('#st-input')?.focus({ preventScroll: true }), 0);
   } else {
     document.title = S.project?.name || 'Workbench';
     // The same session, in its terminal.
@@ -205,15 +205,13 @@ function stBuild() {
       <div class="grow"></div>
       <div class="st-viewseg" role="tablist" aria-label="${esc(w.tasks)}">
         <button role="tab" data-mode="board">${icon('grid', 13)}<span>${esc(w.cards)}</span></button>
-        <button role="tab" data-mode="list">${icon('chat', 13)}<span>${esc(w.chat)}</span></button></div>
-      <button class="st-role-btn" id="st-role" title="${esc(w.roleChange)}">${icon('user', 14)}<span></span></button>
+        <button role="tab" data-mode="list">${icon('file', 13)}<span>${esc(w.taskView)}</span></button></div>
       ${stSwitchHtml()}
     </header>
     <div class="st-board" id="st-board" hidden></div>
     <div class="st-body">
       <aside class="st-tasks" aria-label="${esc(w.tasks)}">
         <button class="st-new" id="st-new">${icon('plus', 14)}<span>${esc(w.newTask)}</span></button>
-        <button class="st-new st-allcards" id="st-allcards">${icon('grid', 14)}<span>${esc(w.allTasks)}</span></button>
         <div class="st-task-list" id="st-task-list" role="list"></div>
       </aside>
       <div class="st-chat">
@@ -228,33 +226,33 @@ function stBuild() {
           <div class="st-chips" id="st-chips"></div>
           <form class="st-input" id="st-form">
             <textarea id="st-input" rows="1" placeholder="${esc(w.placeholder)}" aria-label="${esc(w.placeholder)}"></textarea>
-            <div class="st-input-row"><div class="grow"></div>
+            <div class="st-input-row"><button type="button" class="st-pick-btn" id="st-pick-btn" hidden title="${esc(w.pickTitle)}" aria-label="${esc(w.pickTitle)}" aria-pressed="false">${stCursorIcon()}</button><div class="grow"></div>
               <button type="submit" class="st-send" id="st-send" title="${esc(w.send)}" aria-label="${esc(w.send)}">${icon('arrowUp', 16)}</button></div>
           </form>
         </div>
       </div>
+      <div class="st-split" id="st-split" role="separator" aria-orientation="vertical" tabindex="0" aria-label="${esc(w.splitter)}" title="${esc(w.splitterHint)}"><i></i></div>
       <div class="st-result" id="st-result"></div>
     </div>
     <div class="st-pick" id="st-pick" hidden></div>`;
   document.body.appendChild(el);
   ST.el = el;
   $('.st-switch', el).addEventListener('click', stOnSwitch);
-  $('#st-role', el).addEventListener('click', () => stPersonaPicker({ current: ST.persona }));
   $('.st-viewseg', el).addEventListener('click', (e) => {
     const m = e.target.closest('[data-mode]')?.dataset.mode;
     if (m) stSetBoard(m === 'board');
   });
   $('#st-board', el).addEventListener('click', stOnBoardClick);
+  stSplitInit(el);
   $('.st-ctabs', el).addEventListener('click', (e) => {
     const p = e.target.closest('[data-pane]')?.dataset.pane;
     if (!p) return;
     ST.pane = p;
-    if (p === 'brand') stLoadBrand();
+    if (p === 'brand') { stLoadBrand(); stCheckFigma(); }
     stRender();
   });
   $('#st-brand', el).addEventListener('click', stOnBrandClick);
-  $('#st-new', el).addEventListener('click', () => { ST.current = ''; ST.preview = null; stRender(); $('#st-input').focus(); });
-  $('#st-allcards', el).addEventListener('click', () => stSetBoard(true));
+  $('#st-new', el).addEventListener('click', () => { ST.current = ''; ST.preview = null; stRender(); $('#st-input').focus({ preventScroll: true }); });
   $('#st-task-list', el).addEventListener('click', (e) => {
     const row = e.target.closest('[data-term]');
     if (!row) return;
@@ -265,20 +263,30 @@ function stBuild() {
     stRender();
   });
   $('#st-form', el).addEventListener('submit', (e) => { e.preventDefault(); stSubmit(); });
+  $('#st-pick-btn', el).addEventListener('click', () => stPoint(!ST.pointing));
   $('#st-input', el).addEventListener('input', () => { stGrow(); stRenderSend(stCurrent()); });
   $('#st-input', el).addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); stSubmit(); }
   });
   $('#st-chips', el).addEventListener('click', (e) => {
-    if (e.target.closest('[data-point]')) { stPoint(true); return; }
+    if (e.target.closest('[data-unpick]')) { ST.picked = []; stRender(); return; }
     const c = e.target.closest('[data-chip]');
     if (!c) return;
     const input = $('#st-input');
     input.value = c.dataset.chip;
-    input.focus();
+    input.focus({ preventScroll: true });
     input.setSelectionRange(input.value.length, input.value.length);
   });
   $('#st-feed', el).addEventListener('click', stOnFeedClick);
+  // Scrolled up to the top: the earlier part of the session.
+  let earlierBusy = false;
+  $('#st-feed', el).addEventListener('scroll', async (e) => {
+    if (earlierBusy || e.target.scrollTop > 40 || !e.target.querySelector('[data-earlier]')) return;
+    const t = stCurrent();
+    if (!t) return;
+    earlierBusy = true;
+    try { await stEarlier(t); } finally { setTimeout(() => { earlierBusy = false; }, 250); }
+  }, { passive: true });
   $('#st-result', el).addEventListener('click', stOnResultClick);
   $('#st-result', el).addEventListener('pointerdown', stWipeDrag);
   $('#st-result', el).addEventListener('dblclick', stWipeDrag);
@@ -317,7 +325,6 @@ function stRender() {
   if (ST.board) {
     $('#st-title').textContent = w.studio;
     $('#st-sub').textContent = `${S.project.name} · ${w.taskCount(terms.length)}`;
-    $('#st-role span').textContent = w.personas[ST.persona]?.name || '';
     document.title = w.studio;
     stRenderBoard(terms);
     stReport();
@@ -327,7 +334,6 @@ function stRender() {
   const t = stCurrent();
   $('#st-title').textContent = t ? stTitle(t) : w.newTask;
   $('#st-sub').textContent = `${S.project.name} · ${w.claude}`;
-  $('#st-role span').textContent = w.personas[ST.persona]?.name || '';
   document.title = t ? stTitle(t) : w.studio;
   stRenderTasks(terms);
   stRenderPane();
@@ -337,6 +343,7 @@ function stRender() {
   stRenderResultBar(t);
   stRenderSend(t);
   stReport();
+  stUnscroll();
 }
 
 // While Claude works and nothing is typed, the send button stops it (Esc, as in the terminal).
@@ -379,9 +386,24 @@ function stRenderTasks(terms) {
   $('#st-new').classList.toggle('active', !ST.current);
 }
 
+const ST_TURNS = 30;
+
 function stAgo(at) {
   if (!at) return '';
-  return STW().minutes(Math.max(0, Math.round((Date.now() - at) / 60000)));
+  return STW().ago(Math.max(0, Math.round((Date.now() - at) / 60000)));
+}
+
+// More of the session: the turns already read, else the page before them.
+async function stEarlier(t) {
+  const k = stTask(t);
+  const feed = $('#st-feed');
+  const before = feed.scrollHeight - feed.scrollTop;
+  if (k.model.turns.length > (k.shownTurns || ST_TURNS)) k.shownTurns = (k.shownTurns || ST_TURNS) + ST_TURNS;
+  else if (await stReadOlder(t, k)) k.shownTurns = (k.shownTurns || ST_TURNS) + ST_TURNS;
+  else return;
+  stRender();
+  // Where the person was stays where it was.
+  feed.scrollTop = feed.scrollHeight - before;
 }
 
 // The chat: each turn as the person's message, then Claude's text and steps in order; the open
@@ -400,8 +422,13 @@ function stRenderFeed(t) {
   const status = stStatus(t);
   const progress = StudioTranscript.planProgress(m.plan);
   const parts = [];
-  if (!t.studio && m.turns.length) parts.push(`<div class="st-note">${esc(w.startedInWorkbench)}</div>`);
+  if (!t.studio && m.turns.length) parts.push(`<div class="st-note" data-key="note">${icon('info', 12)}<span>${esc(w.startedInWorkbench)}</span></div>`);
+  // The last turns only (a long session renders fast); earlier ones on scroll-up or a click.
+  const shown = k.shownTurns || ST_TURNS;
+  const from = Math.max(0, m.turns.length - shown);
+  if (from > 0 || k.start) parts.push(`<button class="st-earlier" data-key="earlier" data-earlier>${esc(w.earlier)}</button>`);
   m.turns.forEach((turn, ti) => {
+    if (ti < from) return;
     if (turn.prompt) parts.push(`<div class="st-msg-user" data-key="u${ti}">${esc(turn.prompt)}</div>`);
     if (turn.items.length) {
       parts.push(`<div class="st-who" data-key="w${ti}"><span class="st-av">${icon('sparkles', 12)}</span>${esc(w.claude)}<span class="st-when">· ${esc(stAgo(turn.items[0].at || turn.at))}</span></div>`);
@@ -439,7 +466,8 @@ function stRenderFeed(t) {
   }
   const files = stFiles(k);
   if (files.length) {
-    parts.push(`<div class="st-files-l" data-key="fl">${esc(w.filesTitle)}</div><div class="st-files" data-key="files">${files.map((f, i) => stFileCard(k, f, i)).join('')}</div>`);
+    const total = k.model.files.size + k.model.shots.length;
+    parts.push(`<div class="st-files-l" data-key="fl">${esc(w.filesTitle)}${!k.allFiles && total > files.length ? ` <button class="st-link-btn" data-allfiles>${esc(w.allFiles(total))}</button>` : ''}</div><div class="st-files" data-key="files">${files.map((f, i) => stFileCard(k, f, i)).join('')}</div>`);
   }
   const html = parts.join('');
   if (feed.dataset.html === html) return;
@@ -536,7 +564,8 @@ function stStepHtml(s, live, progress, status = 'work', checked = true) {
     : state === 'running' ? stDot(status === 'needs' ? 'needs' : 'work')
       : state === 'denied' ? `<span class="st-no">${icon('x', 13)}</span>`
         : state === 'error' ? `<span class="st-no">${icon('x', 13)}</span>` : '';
-  return `<div class="st-step ${state}" data-step="${esc(s.id)}"><span class="st-si">${icon(ic, 13)}</span><span class="st-st">${esc(text)}</span>${mark}</div>`;
+  const more = ST.openSteps?.has(s.id) ? `<div class="st-step-more">${esc(StudioWords.stepDetail(s.tool, s.input))}</div>` : '';
+  return `<div class="st-step ${state}${more ? ' open' : ''}" data-step="${esc(s.id)}" title="${esc(STW().details)}"><span class="st-si">${icon(ic, 13)}</span><span class="st-st">${esc(text)}</span>${mark}${more}</div>`;
 }
 
 function stAskHtml(ask) {
@@ -558,9 +587,10 @@ function stAskHtml(ask) {
 // Only files the task created or changed, and its pictures; newest first.
 function stFiles(k) {
   const out = [];
-  for (const f of [...k.model.files.values()].sort((a, b) => b.at - a.at)) out.push({ kind: 'file', key: f.rel, f });
+  for (const f of [...k.model.files.values()].sort((a, b) => b.at - a.at)) out.push({ kind: 'file', key: f.key, f });
   k.model.shots.forEach((s, i) => out.push({ kind: 'shot', key: `shot${i}`, s, i }));
-  return out.slice(0, 12);
+  out.sort((a, b) => ((b.f || b.s).at || 0) - ((a.f || a.s).at || 0));
+  return k.allFiles ? out.slice(0, 60) : out.slice(0, 8);
 }
 
 function stFileCard(k, item, i) {
@@ -570,13 +600,14 @@ function stFileCard(k, item, i) {
       <span class="st-th img">${stImg(stShotKey(item.s))}</span><span class="st-fmeta"><span class="st-fn">${esc(item.i === 0 && k.model.shots.length > 1 ? w.shotBefore : item.i === k.model.shots.length - 1 && k.model.shots.length > 1 ? w.shotAfter : `${w.shot} ${item.i + 1}`)}</span><span class="st-fm">${esc(stAgo(item.s.at))}</span></span></button>`;
   }
   const f = item.f;
-  const thumb = k.thumbs.get(f.rel);
+  const thumb = k.thumbs.get(f.key);
   const th = f.image
     ? `<span class="st-th img">${thumb?.src ? stImg(thumb.src) : ''}</span>`
     : `<span class="st-th doc">${thumb?.lines ? thumb.lines.map((l) => `<i style="width:${l}%"></i>`).join('') : '<i></i><i></i><i></i>'}</span>`;
-  const sig = `${f.rel}|${f.times}|${thumb ? 1 : 0}`;
-  return `<button class="st-fc" data-file="${esc(f.rel)}" data-sig="${esc(sig)}" data-kind="file" style="--i:${Math.min(i, 5)}">${th}
-    <span class="st-fmeta"><span class="st-fn">${esc(basename(f.rel))}</span><span class="st-fm">${esc(f.created ? w.created : w.changed)} · ${esc(dirname(f.rel) || S.project?.name || '')}</span></span></button>`;
+  const sig = `${f.key}|${f.times}|${thumb ? 1 : 0}`;
+  const where = f.outside ? basename(dirname(f.abs)) : (dirname(f.rel) || S.project?.name || '');
+  return `<button class="st-fc" data-file="${esc(f.key)}" data-sig="${esc(sig)}" data-kind="file" style="--i:${Math.min(i, 5)}">${th}
+    <span class="st-fmeta"><span class="st-fn">${esc(basename(f.abs))}</span><span class="st-fm">${esc(f.created ? w.created : w.changed)} · ${esc(where)}</span></span></button>`;
 }
 
 // Pictures are kept here and set on <img data-img> after each render: the markup that is compared
@@ -591,30 +622,82 @@ function stImage(src) {
 const stImg = (key) => `<img alt="" data-img="${esc(key)}">`;
 function stFillImages(root) {
   for (const img of root.querySelectorAll('img[data-img]:not([src])')) {
-    const src = stImages.get(img.dataset.img);
+    const key = img.dataset.img;
+    // Thumbnails (in cards): a small copy, made once, only when in sight.
+    if (img.closest('.st-th, .st-cpv')) {
+      const small = stSmall.get(key);
+      if (small) { img.src = small; continue; }
+      stThumbObserver().observe(img);
+      continue;
+    }
+    const src = stImages.get(key);
     if (src) img.src = src;
+  }
+}
+const stSmall = new Map();
+let stObserver = null, stShrinking = 0;
+const stShrinkQueue = [];
+function stThumbObserver() {
+  if (!stObserver) {
+    stObserver = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        stObserver.unobserve(e.target);
+        stShrinkQueue.push(e.target);
+      }
+      stShrinkNext();
+    }, { rootMargin: '200px' });
+  }
+  return stObserver;
+}
+// At most two pictures are decoded at a time.
+async function stShrinkNext() {
+  while (stShrinking < 2 && stShrinkQueue.length) {
+    const img = stShrinkQueue.shift();
+    const key = img.dataset.img;
+    if (stSmall.has(key)) { img.src = stSmall.get(key); continue; }
+    const src = stImages.get(key);
+    if (!src) continue;
+    stShrinking++;
+    (async () => {
+      try {
+        const full = new Image();
+        full.src = src;
+        await full.decode();
+        const scale = Math.min(1, 240 / Math.max(full.naturalWidth, full.naturalHeight));
+        const c = document.createElement('canvas');
+        c.width = Math.max(1, Math.round(full.naturalWidth * scale));
+        c.height = Math.max(1, Math.round(full.naturalHeight * scale));
+        c.getContext('2d').drawImage(full, 0, 0, c.width, c.height);
+        const small = c.toDataURL('image/webp', 0.8);
+        stSmall.set(key, small);
+        for (const el of document.querySelectorAll(`img[data-img="${key}"]`)) if (!el.src && el.closest('.st-th, .st-cpv')) el.src = small;
+      } catch {} finally { stShrinking--; stShrinkNext(); }
+    })();
   }
 }
 const stShotKey = (sh) => { if (!sh.key) sh.key = stImage(sh.src); return sh.key; };
 
 async function stLoadThumbs(k) {
   for (const f of k.model.files.values()) {
-    const sig = `${f.rel}|${f.times}`;
-    const have = k.thumbs.get(f.rel);
+    const sig = `${f.key}|${f.times}`;
+    const have = k.thumbs.get(f.key);
     if (have && (have.sig === sig || have.loading)) continue;
-    k.thumbs.set(f.rel, { ...(have || {}), loading: true, sig });
+    k.thumbs.set(f.key, { ...(have || {}), loading: true, sig });
     try {
       if (f.image) {
         const img = await wb.termImage(f.abs);
-        if (img?.data) k.thumbs.set(f.rel, { sig, src: stImage(`data:${img.mime};base64,${img.data}`) });
-        else k.thumbs.set(f.rel, { sig });
+        if (img?.data) k.thumbs.set(f.key, { sig, src: stImage(`data:${img.mime};base64,${img.data}`) });
+        else k.thumbs.set(f.key, { sig });
+      } else if (f.outside) {
+        k.thumbs.set(f.key, { sig });
       } else {
         const file = await wb.read(f.rel);
         const text = String(file?.content || '');
         const lines = text.split('\n').filter((l) => l.trim()).slice(0, 4).map((l) => Math.max(30, Math.min(100, Math.round(l.length * 2.2))));
-        k.thumbs.set(f.rel, { sig, lines, text: text.slice(0, 20000) });
+        k.thumbs.set(f.key, { sig, lines, text: text.slice(0, 20000) });
       }
-    } catch { k.thumbs.set(f.rel, { sig }); }
+    } catch { k.thumbs.set(f.key, { sig }); }
     stRender();
   }
 }
@@ -625,10 +708,17 @@ function stRenderChips(t) {
   // Suggestions start a task; once it runs they'd only get in the way.
   const show = !t || !stTask(t).model.turns.length;
   const role = ST.persona in w.chips ? ST.persona : 'designer';
-  // With a site to show: the way to point at it, the hero of Studio.
-  const site = t && stTask(t).site && !ST.pointing;
-  const point = site ? `<button type="button" class="st-chip hero" data-point>${stCursorIcon()}<span>${esc(w.pointChip)}</span></button>` : '';
-  const picked = ST.pointing && ST.picked?.length ? `<span class="st-picked">${stCursorIcon()}${esc(ST.picked[0].name)}${ST.picked.length > 1 ? ` ${esc(w.andMore(ST.picked.length - 1))}` : ''}</span>` : '';
+  // A web page in the result (the task's site, or what it made, opened alongside).
+  const site = !!t && !!(stTask(t).site || stTask(t).resultOpened);
+  // One way to point at the page: the cursor button in the composer (and the same one in the result bar).
+  const point = '';
+  const picked = ST.pointing && ST.picked?.length ? `<span class="st-picked">${stCursorIcon()}${esc(ST.picked[0].name)}${ST.picked.length > 1 ? ` ${esc(w.andMore(ST.picked.length - 1))}` : ''}<button type="button" class="st-unpick" data-unpick title="${esc(w.unpick)}" aria-label="${esc(w.unpick)}">${icon('x', 11)}</button></span>` : '';
+  const pb = $('#st-pick-btn');
+  if (pb) {
+    pb.hidden = !site && !ST.pointing;
+    pb.classList.toggle('on', !!ST.pointing);
+    pb.setAttribute('aria-pressed', ST.pointing ? 'true' : 'false');
+  }
   const html = (show ? `${w.chips[role].map((c) => `<button type="button" class="st-chip" data-chip="${esc(c)}">${esc(c)}</button>`).join('')}` : '') + point + picked;
   if (box.dataset.html !== html) { box.innerHTML = html; box.dataset.html = html; }
   box.hidden = !html;
@@ -644,21 +734,36 @@ function stRenderResult(t) {
   const sel = ST.preview;
   const shots = k?.model.shots || [];
   const fileSel = sel?.kind === 'file' && k?.model.files.get(sel.key);
+  const links = k ? StudioTranscript.linksOf(k.model) : [];
+  const linksHtml = links.length > 1 ? `<div class="st-r-links">${links.slice(0, 6).map((u) => `<button class="st-r-link${u === k.result ? ' on' : ''}" data-r="link" data-url="${esc(u)}">${icon('globe', 12)}<span>${esc(stShortUrl(u))}</span></button>`).join('')}</div>` : '';
   if (fileSel) {
-    const th = k.thumbs.get(fileSel.rel);
-    html = `<div class="st-r-head"><span class="st-r-name">${esc(basename(fileSel.rel))}</span><span class="st-r-sub">${esc(dirname(fileSel.rel))}</span><div class="grow"></div>
-      <button class="st-btn" data-r="reveal" data-rel="${esc(fileSel.rel)}">${esc(w.openFile)}</button></div>`
+    const th = k.thumbs.get(fileSel.key);
+    html = `<div class="st-r-head"><span class="st-r-name">${esc(basename(fileSel.abs))}</span><span class="st-r-sub">${esc(fileSel.outside ? dirname(fileSel.abs) : dirname(fileSel.rel))}</span><div class="grow"></div>
+      ${fileSel.page ? `<button class="st-btn pri" data-r="file" data-abs="${esc(fileSel.abs)}">${icon('layers', 14)}<span>${esc(w.showPage)}</span></button>` : ''}
+      ${fileSel.outside ? '' : `<button class="st-btn" data-r="reveal" data-rel="${esc(fileSel.rel)}">${esc(w.openFile)}</button>`}</div>`
       + (fileSel.image ? `<div class="st-r-img">${th?.src ? stImg(th.src) : ''}</div>`
-        : `<div class="st-r-doc"><div class="st-paper">${stText(th?.text || '')}</div></div>`);
+        : fileSel.page ? `<div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(basename(fileSel.abs))}</div><p class="st-r-note">${esc(w.pageAlongside)}</p></div>`
+          : fileSel.outside ? `<div class="st-r-empty"><p>${esc(w.outsideFolder)}</p></div>`
+            : `<div class="st-r-doc"><div class="st-paper">${stText(th?.text || '')}</div></div>`);
+  } else if (!k?.site && stLastPreviewable(k)) {
+    const f = stLastPreviewable(k);
+    const th = k.thumbs.get(f.key);
+    html = `<div class="st-r-head"><span class="st-r-name">${esc(basename(f.abs))}</span><span class="st-r-sub">${esc(stAgo(f.at))}</span><div class="grow"></div>
+      ${f.page ? `<button class="st-btn pri" data-r="file" data-abs="${esc(f.abs)}">${icon('layers', 14)}<span>${esc(w.showPage)}</span></button>` : ''}</div>`
+      + (f.image ? `<div class="st-r-img">${th?.src ? stImg(th.src) : ''}</div>`
+        : f.page ? `<div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(basename(f.abs))}</div><p class="st-r-note">${esc(w.pageAlongside)}</p></div>`
+          : `<div class="st-r-doc"><div class="st-paper">${stText(th?.text || '')}</div></div>`);
+  } else if (!k?.site && k?.result) {
+    html = `<div class="st-r-head"><span class="st-url">${icon('globe', 12)}<b>${esc(stShortUrl(k.result))}</b></span><div class="grow"></div>
+      <button class="st-btn pri" data-r="link" data-url="${esc(k.result)}">${icon('layers', 14)}<span>${esc(w.showSite)}</span></button></div>${linksHtml}
+      <div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(stShortUrl(k.result))}</div><p class="st-r-note">${esc(w.pageAlongside)}</p></div>`;
   } else if (sel?.kind === 'shot' && shots[sel.key]) {
-    html = `<div class="st-r-head"><span class="st-r-name">${esc(w.shot)} ${sel.key + 1}</span></div><div class="st-r-img">${stImg(stShotKey(shots[sel.key]))}</div>`;
+    html = `<div class="st-r-head"><span class="st-r-name">${esc(sel.key === 0 && shots.length > 1 ? w.shotBefore : sel.key === shots.length - 1 && shots.length > 1 ? w.shotAfter : `${w.shot} ${sel.key + 1}`)}</span></div><div class="st-r-img">${stImg(stShotKey(shots[sel.key]))}</div>`;
   } else if (k?.site) {
     const shot = shots[shots.length - 1];
     html = `<div class="st-r-head"><span class="st-url">${icon('lock', 12)}<b>${esc(StudioWords.host(k.site))}</b></span>${shot ? `<span class="st-r-sub">${esc(shots.length > 1 ? w.wipeHint : w.lastShot)}</span>` : ''}<div class="grow"></div>
       <button class="st-btn pri" data-r="site">${icon('layers', 14)}<span>${esc(w.showSite)}</span></button></div>`
       + (shot ? (shots.length > 1 ? stWipeHtml(shots[0], shot) : `<div class="st-r-img">${stImg(stShotKey(shot))}</div>`) : `<div class="st-r-site"><div class="st-r-site-ic">${icon('globe', 22)}</div><div class="st-r-host">${esc(StudioWords.host(k.site))}</div></div>`);
-  } else if (shots.length) {
-    html = shots.length > 1 ? stWipeHtml(shots[0], shots[shots.length - 1]) : `<div class="st-r-img">${stImg(stShotKey(shots[shots.length - 1]))}</div>`;
   } else {
     html = `<div class="st-r-empty">${icon('eye', 22)}<p>${esc(w.resultEmpty)}</p></div>`;
   }
@@ -686,6 +791,13 @@ function stWipeDrag(e) {
   addEventListener('pointerup', up);
 }
 
+// The last file the task made that the result pane can show (a picture, a page, a text in the folder).
+function stLastPreviewable(k) {
+  if (!k) return null;
+  return [...k.model.files.values()].filter((f) => f.image || f.page || (!f.outside && /\.(md|txt|csv|json|css|html?)$/i.test(f.abs)))
+    .sort((a, b) => b.at - a.at)[0] || null;
+}
+
 function stRenderResultBar(t) {
   const w = STW();
   const bar = $('#st-resultbar');
@@ -707,6 +819,24 @@ function stRenderResultBar(t) {
 const stUndoIcon = () => '<svg class="ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14.5L4.5 10 9 5.5"/><path d="M4.5 10h10a5 5 0 0 1 0 10h-3"/></svg>';
 
 const stCursorIcon = () => '<svg class="ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 3.5l13 7-5.6 1.6L10 18z"/></svg>';
+
+const stShortUrl = (u) => { try { const p = new URL(u); return (p.host + (p.pathname === '/' ? '' : p.pathname)).replace(/^www\./, '').slice(0, 60); } catch { return String(u).slice(0, 60); } };
+
+// What the task made, next to Studio: a web page (http/https) or a page file it wrote (opened from
+// disk). Nothing else opens by itself.
+function stOpenResult(k, target, file = false) {
+  if (file) {
+    if (!/\.(html?|pdf)$/i.test(target)) return;
+    k.resultOpened = target;
+    wb.toHost({ type: 'studio-site', url: `file://${encodeURI(target.replace(/\\/g, '/')).replace(/^\/*/, '/')}` });
+    return;
+  }
+  let u;
+  try { u = new URL(target); } catch { return; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
+  k.resultOpened = u.href;
+  wb.toHost({ type: 'studio-site', url: u.href });
+}
 
 function stOpenSite(k) {
   if (!k?.site) return;
@@ -754,6 +884,8 @@ function stOnResultClick(e) {
   const r = e.target.closest('[data-r]');
   if (!r) return;
   const t = stCurrent();
+  if (r.dataset.r === 'link' && t) { const k = stTask(t); k.result = r.dataset.url; stOpenResult(k, r.dataset.url); stRender(); return; }
+  if (r.dataset.r === 'file' && t) { stOpenResult(stTask(t), r.dataset.abs, true); return; }
   if (r.dataset.r === 'site' && t) stOpenSite(stTask(t));
   if (r.dataset.r === 'reveal') wb.reveal(r.dataset.rel).catch(() => {});
 }
@@ -761,6 +893,15 @@ function stOnResultClick(e) {
 // ---------------------------------------------------------------- chat actions
 
 async function stOnFeedClick(e) {
+  if (e.target.closest('[data-earlier]')) { const t = stCurrent(); if (t) stEarlier(t); return; }
+  if (e.target.closest('[data-allfiles]')) { const t = stCurrent(); if (t) { stTask(t).allFiles = true; stRender(); } return; }
+  const step = e.target.closest('.st-step[data-step]');
+  if (step && !e.target.closest('a,button')) {
+    ST.openSteps = ST.openSteps || new Set();
+    if (ST.openSteps.has(step.dataset.step)) ST.openSteps.delete(step.dataset.step); else ST.openSteps.add(step.dataset.step);
+    stRender();
+    return;
+  }
   const fc = e.target.closest('.st-fc');
   if (fc) {
     ST.preview = fc.dataset.kind === 'shot' ? { kind: 'shot', key: Number(fc.dataset.i) } : { kind: 'file', key: fc.dataset.file };
@@ -936,15 +1077,21 @@ function stRenderBrand() {
   const b = ST.brand;
   const t = stCurrent();
   const k = t && stTask(t);
-  const figma = ST.info?.figma;
-  const figmaCard = figma
-    ? `<div class="st-bsrc"><span class="st-fig">${stFigmaIcon()}</span><div><b>Figma</b> <span class="m">· ${esc(w.figmaOn)}</span></div><span class="ro">${icon('eye', 12)}${esc(w.readOnly)}</span></div>
-       <form class="st-figform" id="st-figform"><input placeholder="${esc(w.figmaLink)}" aria-label="${esc(w.figmaLink)}"><button class="st-btn" type="submit">${esc(w.figmaTake)}</button></form>`
-    : `<div class="st-bsrc"><span class="st-fig">${stFigmaIcon()}</span><div><b>Figma</b> <span class="m">· ${esc(w.figmaOff)}</span></div><button class="st-btn" data-b="figma">${esc(w.figmaConnect)}</button></div>`;
+  const fs = ST.figma || { on: !!ST.info?.figma, reachable: false };
+  if (!ST.figmaChecked) { ST.figmaChecked = true; stCheckFigma(); }
+  const figmaCard = !fs.on
+    ? `<div class="st-bsrc"><span class="st-fig">${stFigmaIcon()}</span><div><b>Figma</b> <span class="m">· ${esc(w.figmaOff)}</span></div><button class="st-btn" data-b="figma">${esc(w.figmaConnect)}</button></div>`
+    : !fs.reachable
+      ? `<div class="st-bsrc"><span class="st-fig">${stFigmaIcon()}</span><div><b>Figma</b> <span class="m">· ${esc(w.figmaNotRunning)}</span></div><button class="st-btn" data-b="figma-open">${esc(w.figmaOpen)}</button></div>
+         <p class="st-hint">${esc(w.figmaHow)}</p>`
+      : `<div class="st-bsrc"><span class="st-fig">${stFigmaIcon()}</span><div><b>Figma</b> <span class="m">· ${esc(w.figmaOn)}</span></div><span class="ro">${icon('eye', 12)}${esc(w.readOnly)}</span></div>
+         <form class="st-figform" id="st-figform"><input placeholder="${esc(w.figmaLink)}" aria-label="${esc(w.figmaLink)}"><button class="st-btn" type="submit">${esc(w.figmaTake)}</button></form>
+         <p class="st-hint">${esc(w.figmaLinkHint)}</p>`;
+  const siteForm = `<form class="st-figform" id="st-siteform"><input placeholder="${esc(w.siteAddress)}" aria-label="${esc(w.siteAddress)}" value="${esc(k?.site ? StudioWords.host(k.site) : '')}"><button class="st-btn pri" type="submit">${icon('globe', 13)}<span>${esc(w.takeFromSite)}</span></button></form>`;
   let html;
   if (!b) {
-    html = `<div class="st-bempty"><div class="st-empty-ic">${icon('palette', 22)}</div><h3>${esc(w.brandNone)}</h3><p>${esc(w.brandNoneHint)}</p>
-      <button class="st-btn pri" data-b="site"${k?.site ? '' : ' disabled'}>${icon('globe', 14)}<span>${esc(k?.site ? w.brandFromSite(StudioWords.host(k.site)) : w.brandNeedSite)}</span></button></div>${figmaCard}`;
+    html = `<div class="st-bempty"><div class="st-empty-ic">${icon('palette', 22)}</div><h3>${esc(w.brandNone)}</h3><p>${esc(w.brandNoneHint)}</p></div>
+      ${siteForm}${figmaCard}`;
   } else {
     const drift = ST.drift;
     const groups = drift ? stDriftGroups(drift) : [];
@@ -959,13 +1106,15 @@ function stRenderBrand() {
       <div class="st-bsec"><h4>${esc(w.palette)} <span>· ${b.colors.length}</span></h4><div class="st-sw">${b.colors.map((c, i) => `<div><i style="background:${c.value}"></i><b>${esc(c.name || c.value)}</b>${c.name ? `<span>${esc(c.value)}</span>` : ''}<button class="st-swx" data-b="drop" data-i="${i}" title="${esc(w.remove)}">${icon('x', 11)}</button></div>`).join('')}</div></div>
       ${b.fonts.length ? `<div class="st-bsec"><h4>${esc(w.fonts)}</h4>${b.fonts.map((f) => `<div class="st-font"><span class="ex" style="font-family:'${esc(f.family.replace(/'/g, ''))}'">Аа ${esc(w.fontSample)}</span><span class="fm">${esc(f.family)} · ${esc(f.use === 'head' ? w.headings : w.bodyText)}</span></div>`).join('')}</div>` : ''}
       ${figmaCard}
-      <button class="st-link-btn" data-b="site"${k?.site ? '' : ' disabled'}>${esc(w.brandRetake)}</button>`;
+      <div class="st-bsec"><h4>${esc(w.brandRetake)}</h4>${siteForm}</div>`;
   }
   if (box.dataset.html === html) return;
   box.innerHTML = html;
   box.dataset.html = html;
   const form = $('#st-figform', box);
   if (form) form.onsubmit = (e) => { e.preventDefault(); stFigmaBrand(form.querySelector('input').value.trim()); };
+  const sform = $('#st-siteform', box);
+  if (sform) sform.onsubmit = (e) => { e.preventDefault(); stBrandFromAddress(sform.querySelector('input').value.trim()); };
 }
 
 const stFigmaIcon = () => '<svg width="10" height="15" viewBox="0 0 38 57" aria-hidden="true"><path d="M19 28.5a9.5 9.5 0 1 1 19 0 9.5 9.5 0 0 1-19 0z" fill="#1abcfe"/><path d="M0 47.5A9.5 9.5 0 0 1 9.5 38H19v9.5a9.5 9.5 0 1 1-19 0z" fill="#0acf83"/><path d="M19 0v19h9.5a9.5 9.5 0 1 0 0-19z" fill="#ff7262"/><path d="M0 9.5A9.5 9.5 0 0 0 9.5 19H19V0H9.5A9.5 9.5 0 0 0 0 9.5z" fill="#f24e1e"/><path d="M0 28.5A9.5 9.5 0 0 0 9.5 38H19V19H9.5A9.5 9.5 0 0 0 0 28.5z" fill="#a259ff"/></svg>';
@@ -984,15 +1133,36 @@ function stDriftGroups(drift) {
   return [...by.values()].sort((a, b) => b.items.length - a.items.length);
 }
 
-async function stBrandFromSite(k) {
+async function stCheckFigma() {
+  try { ST.figma = await wb.studioFigmaState(); } catch { ST.figma = { on: !!ST.info?.figma, reachable: false }; }
+  if (ST.pane === 'brand') stRender();
+}
+
+// «Забрать с сайта»: any address, no task needed. The site opens next to Studio and its colours and
+// fonts become the brand.
+async function stBrandFromAddress(text) {
+  const w = STW();
+  let url;
+  try { url = new URL(/^https?:\/\//i.test(text) ? text : `https://${text}`); } catch { return toast(w.siteBad); }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return toast(w.siteBad);
+  const t = stCurrent();
+  const k = t ? stTask(t) : { site: '', siteOpened: false };
+  k.site = url.href;
+  wb.toHost({ type: 'studio-site', url: url.href });
+  ST.brandSite = url.href;
+  await new Promise((r) => setTimeout(r, 600));
+  return stBrandFromSite(k, true);
+}
+
+async function stBrandFromSite(k, opened = false) {
   const w = STW();
   if (!k?.site) return toast(w.brandNeedSite);
   let site = await wb.studioPoint('site').catch(() => null);
   if (!site?.open) {
-    stOpenSite(k);
+    if (!opened) stOpenSite(k);
     for (let i = 0; i < 40 && !site?.open; i++) { await new Promise((r) => setTimeout(r, 150)); site = await wb.studioPoint('site').catch(() => null); }
   }
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 30; i++) {
     const got = await wb.studioPoint('brand', { op: 'read' }).catch(() => null);
     if (got?.colors?.length) {
       ST.brand = { source: 'site', name: StudioWords.host(k.site), colors: got.colors.map((c) => ({ value: c.value, name: '' })), fonts: got.fonts || [] };
@@ -1015,8 +1185,15 @@ async function stOnBrandClick(e) {
   if (op === 'site') return stBrandFromSite(k);
   if (op === 'figma') {
     try { ST.info.figma = await wb.studioFigma(true); } catch (err) { toast(err.message); }
-    toast(w.figmaHow, 7000);
+    await stCheckFigma();
+    if (!ST.figma?.reachable) toast(w.figmaHow, 7000);
     return stRender();
+  }
+  if (op === 'figma-open') {
+    wb.studioFigmaOpen().catch(() => {});
+    // Checked again a little later (the app takes a moment to start its server).
+    setTimeout(stCheckFigma, 4000);
+    return;
   }
   if (op === 'drop') {
     ST.brand.colors.splice(Number(a.dataset.i), 1);
@@ -1056,6 +1233,77 @@ async function stFigmaBrand(link) {
   $('#st-input').value = w.figmaPrompt(link);
   stRender();
   stSubmit();
+}
+
+// ---------------------------------------------------------------- the splitter (chat | result)
+
+// The chat column's width: dragged (8px to grab, a grip on hover), arrows from the keyboard (Shift: by
+// 64), double click back to the default; kept for this profile. The result never gets narrower than
+// 280, the chat than 320.
+const ST_CHAT_MIN = 320, ST_RESULT_MIN = 280, ST_SPLIT_STEP = 16;
+function stSplitInit(el) {
+  const split = $('#st-split', el);
+  const body = $('.st-body', el);
+  let saved = 0;
+  try { saved = Number(localStorage.getItem('wb.studioChatWidth')) || 0; } catch {}
+  if (saved) stSetChatWidth(saved, false);
+  const bounds = () => {
+    const tasks = $('.st-tasks', el);
+    const tw = tasks && getComputedStyle(tasks).display !== 'none' ? tasks.getBoundingClientRect().width : 0;
+    const max = body.getBoundingClientRect().width - tw - ST_RESULT_MIN - 8;
+    return { tw, max: Math.max(ST_CHAT_MIN, max) };
+  };
+  split.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    split.setPointerCapture(e.pointerId);
+    document.body.classList.add('st-resizing');
+    const { tw, max } = bounds();
+    const left = body.getBoundingClientRect().left + tw;
+    const move = (m) => stSetChatWidth(Math.min(max, Math.max(ST_CHAT_MIN, m.clientX - left)), false);
+    const up = () => {
+      split.removeEventListener('pointermove', move);
+      split.removeEventListener('pointerup', up);
+      split.removeEventListener('pointercancel', up);
+      document.body.classList.remove('st-resizing');
+      stSetChatWidth(ST.chatWidth, true);
+    };
+    split.addEventListener('pointermove', move);
+    split.addEventListener('pointerup', up);
+    split.addEventListener('pointercancel', up);
+  });
+  split.addEventListener('dblclick', () => stSetChatWidth(0, true));
+  split.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight' && e.key !== 'Home' && e.key !== 'End') return;
+    e.preventDefault();
+    const { max } = bounds();
+    const now = ST.chatWidth || $('.st-chat', el).getBoundingClientRect().width;
+    const step = e.shiftKey ? 64 : ST_SPLIT_STEP;
+    const next = e.key === 'Home' ? ST_CHAT_MIN : e.key === 'End' ? max : now + (e.key === 'ArrowRight' ? step : -step);
+    stSetChatWidth(Math.min(max, Math.max(ST_CHAT_MIN, next)), true);
+  });
+}
+// 0: the default (the columns share the room).
+function stSetChatWidth(px, save) {
+  ST.chatWidth = Math.round(px) || 0;
+  const el = ST.el;
+  if (!el) return;
+  if (ST.chatWidth) el.style.setProperty('--st-chat-w', `${ST.chatWidth}px`);
+  else el.style.removeProperty('--st-chat-w');
+  el.classList.toggle('st-chat-sized', !!ST.chatWidth);
+  const split = $('#st-split', el);
+  if (split) {
+    split.setAttribute('aria-valuenow', String(ST.chatWidth || Math.round($('.st-chat', el)?.getBoundingClientRect().width || 0)));
+    split.setAttribute('aria-valuemin', String(ST_CHAT_MIN));
+  }
+  if (save) { try { if (ST.chatWidth) localStorage.setItem('wb.studioChatWidth', String(ST.chatWidth)); else localStorage.removeItem('wb.studioChatWidth'); } catch {} }
+}
+
+// Nothing in Studio ever sits scrolled sideways (a focus or a find can scroll a box that clips).
+function stUnscroll() {
+  for (const n of [document.scrollingElement, document.body, ST.el, ST.el && $('.st-body', ST.el), ST.el && $('.st-head', ST.el), ST.el && $('.st-tasks', ST.el)]) {
+    if (n && n.scrollLeft) n.scrollLeft = 0;
+  }
 }
 
 // ---------------------------------------------------------------- the board (tasks as cards)
@@ -1151,7 +1399,7 @@ async function stOnBoardClick(e) {
     ST.preview = null;
     stSetBoard(false);
     $('#st-input').value = chip ? chip.dataset.newchip : '';
-    $('#st-input').focus();
+    $('#st-input').focus({ preventScroll: true });
     return;
   }
   const card = e.target.closest('.st-card[data-term]');
@@ -1190,78 +1438,6 @@ async function stOnBoardClick(e) {
   stSetBoard(false);
 }
 
-// ---------------------------------------------------------------- "Кто вы?" (the persona picker)
-
-const ST_PERSONAS = [['developer', 'dev'], ['designer', 'des'], ['manager', 'man'], ['everyday', 'use']];
-
-// Four heroes, as a game's character select (art and effects: studio-persona-fx.js, studio-persona.css):
-// the guess (or the current one) picked already. The pick decides what the Workbench tab shows first
-// (Studio, or the Workbench for developers); both stay a click away.
-function stPersonaPicker({ guess = '', current = '' } = {}) {
-  const w = STW();
-  $('#st-persona')?.remove();
-  const sel = w.personas[current] ? current : w.personas[guess] ? guess : 'designer';
-  const box = document.createElement('section');
-  box.id = 'st-persona';
-  box.setAttribute('role', 'dialog');
-  box.setAttribute('aria-label', w.whoTitle);
-  const svg = (name, size = 15, sw = 1.8) => `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${(typeof STUDIO_PERSONA_ICONS === 'object' && STUDIO_PERSONA_ICONS[name]) || ''}</svg>`;
-  const cards = ST_PERSONAS.map(([id, k], i) => {
-    const p = w.personas[id];
-    const col = (typeof STUDIO_PERSONA_COLORS === 'object' && STUDIO_PERSONA_COLORS[k]) || { c: '#8a8fe0', c2: '#ffffff', bg: ['#1d1b49', '#0c0b22'] };
-    const art = `studio-art/hero-${k}.webp`;
-    const frame = (typeof STUDIO_PERSONA_FRAMES === 'object' && STUDIO_PERSONA_FRAMES[k]) || '';
-    const rgb = k === 'dev' ? `<img class="rgb r" src="${art}" alt=""><img class="rgb b" src="${art}" alt="">` : '';
-    const scan = k === 'dev' ? '<span class="mask scan"><i></i></span>' : '';
-    return `<div class="pc${id === sel ? ' sel' : ''}" data-k="${k}" data-id="${id}" data-cta="${esc(p.cta)}" style="--c:${col.c};--c2:${col.c2};--hc:${col.c};--i:${i}" tabindex="0" role="button" aria-label="${esc(p.name)}">
-      <div class="beam"></div><div class="floor"></div>${frame}
-      <div class="art"><div class="tilt"><div class="stk" style="--img:url(${art})"><canvas class="back"></canvas>
-        <div class="bust"><img class="hero" src="${art}" alt="">${rgb}<span class="mask foil"><i></i></span>${scan}<span class="mask flash-m"><span class="flash"></span></span></div>
-        <canvas class="front"></canvas></div></div></div>
-      <div class="plate"><svg class="ribbon" width="292" height="46" viewBox="0 0 292 46" aria-hidden="true"><path d="M0 10 h20 v-6 h252 v6 h20 l-10 13 10 13 h-20 v6 h-252 v-6 h-20 l10 -13z" fill="${col.bg[1]}" stroke="${col.c}" stroke-opacity=".7"/><path d="M20 4 v6 M272 4 v6 M20 36 v6 M272 36 v6" stroke="${col.c}" stroke-opacity=".7"/></svg><h3>${esc(p.name)}</h3></div>
-      <div class="cls"><b>${esc(p.cls)}</b> · ${esc(p.role)}</div>
-      <ul class="perks">${p.perks.map(([icn, t]) => `<li><span class="pi">${svg(icn)}</span><span>${esc(t)}</span></li>`).join('')}</ul>
-      <div class="opens">${svg('arrow', 13)}<span>${p.gets}</span></div>
-      ${id === guess && !current ? `<div class="guess"><span class="seal">${svg('spark', 12, 2.2)}</span>${esc(w.guess)}</div>` : ''}
-    </div>`;
-  }).join('');
-  box.innerHTML = `<canvas class="dust"></canvas><h2>${esc(w.whoTitle)}</h2><p class="lead">${esc(w.whoLead)}</p>
-    <div class="cards">${cards}</div>
-    <div class="foot">${current ? '' : `<button class="btn ghost" data-a="skip">${esc(w.skip)}</button>`}<button class="btn pri" data-a="go">${esc(w.personas[sel].cta)}</button></div>
-    <div class="note">${esc(current ? w.whoChange : w.whoNote)}</div>`;
-  document.body.appendChild(box);
-  if (typeof studioPersonaDust === 'function') studioPersonaDust(box);
-  let picked = sel;
-  const fx = typeof studioPersonaFx === 'function'
-    ? studioPersonaFx(box, (k) => { picked = ST_PERSONAS.find((x) => x[1] === k)?.[0] || picked; })
-    : null;
-  // Keys: arrows move, Enter/Space picks (no motion for keys).
-  box.addEventListener('keydown', (e) => {
-    const card = e.target.closest('.pc');
-    if (card && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); card.click(); }
-    if (card && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) { e.preventDefault(); (e.key === 'ArrowRight' ? card.nextElementSibling : card.previousElementSibling)?.focus(); }
-    if (e.key === 'Escape' && current) box.remove();
-  });
-  if (!fx) box.querySelector('.cards').addEventListener('click', (e) => {
-    const card = e.target.closest('.pc');
-    if (!card) return;
-    picked = card.dataset.id;
-    for (const c of box.querySelectorAll('.pc')) { c.classList.toggle('sel', c === card); c.classList.toggle('dim', c !== card); }
-    box.querySelector('.btn.pri').textContent = card.dataset.cta;
-  });
-  box.addEventListener('click', async (e) => {
-    const a = e.target.closest('[data-a]')?.dataset.a;
-    if (!a) return;
-    const persona = a === 'skip' ? (w.personas[guess] ? guess : 'designer') : picked;
-    try { await wb.studioSetPersona(persona); } catch {}
-    ST.persona = persona;
-    box.classList.add('out');
-    setTimeout(() => box.remove(), stReduced() ? 0 : 220);
-    stShow(persona === 'developer' ? 'workbench' : 'studio');
-  });
-  setTimeout(() => box.querySelector('.pc.sel')?.focus(), 0);
-}
-
 // ---------------------------------------------------------------- point and say (the site next to Studio)
 
 // On: the overlay in the site's tab (studio_point.js): hover, click (Shift: more), say or change by
@@ -1270,9 +1446,9 @@ async function stPoint(on) {
   const t = stCurrent();
   const k = t && stTask(t);
   if (!on) { ST.pointing = false; wb.studioPoint?.('stop').catch(() => {}); stRender(); return; }
-  if (!k?.site) return;
+  if (!k?.site && !k?.resultOpened) return;
   let site = await wb.studioPoint('site').catch(() => null);
-  if (!site?.open) {
+  if (!site?.open && k.site) {
     stOpenSite(k);
     for (let i = 0; i < 40 && !site?.open; i++) { await new Promise((r) => setTimeout(r, 150)); site = await wb.studioPoint('site').catch(() => null); }
   }
@@ -1375,12 +1551,48 @@ function stSendPins(t, k, force = false) {
   if (typeof wb.studioPoint === 'function') wb.studioPoint('pins', shown).catch(() => {});
 }
 
+// The result in sight by itself: the page file the task wrote (again when it changes), else the first
+// link of its last answer. Once per thing; only while this task is the one on screen.
+function stAutoResult(t, k) {
+  const visible = ST.view === 'studio' && ST.current === t.id && !document.hidden;
+  const page = [...k.model.files.values()].filter((f) => f.page).sort((a, b) => b.at - a.at)[0];
+  if (page) {
+    const sig = `${page.key}|${page.times}`;
+    if (k.pageSig === sig) return;
+    const first = !k.pageSig || !k.pageSig.startsWith(`${page.key}|`);
+    k.pageSig = sig;
+    if (!visible) return;
+    if (first) { ST.preview = { kind: 'file', key: page.key }; stOpenResult(k, page.abs, true); }
+    else wb.studioPoint?.('reload').catch(() => {});
+    return;
+  }
+  const links = StudioTranscript.linksOf(k.model);
+  if (!links.length) return;
+  if (!k.result || !links.includes(k.result)) k.result = links[0];
+  if (visible && k.linksSeen !== links.join(' ')) {
+    k.linksSeen = links.join(' ');
+    if (k.resultOpened !== links[0]) stOpenResult(k, links[0]);
+  }
+}
+
 // ---------------------------------------------------------------- the loop: transcripts in
 
+// A session's transcript: its end first (the last 2 MB), then on as it grows; older pages only when
+// the person scrolls up to them (stReadOlder). Never the whole file at once.
 async function stRead(t, k) {
   if (k.reading) return;
   k.reading = true;
   try {
+    if (!k.loaded) {
+      const tail = await wb.studioTranscript(t.id, 0, 'tail');
+      if (tail) {
+        StudioTranscript.feed(k.model, tail.text, { root: S.project?.root || '' });
+        k.start = tail.start || 0;
+        k.offset = tail.next;
+        k.loaded = true;
+        stOnModel(t, k);
+      }
+    }
     for (let i = 0; i < 4; i++) {
       const chunk = await wb.studioTranscript(t.id, k.offset);
       if (!chunk) break;
@@ -1395,6 +1607,20 @@ async function stRead(t, k) {
   } catch {} finally { k.reading = false; }
 }
 
+async function stReadOlder(t, k) {
+  if (k.reading || !k.start) return false;
+  k.reading = true;
+  try {
+    const page = await wb.studioTranscript(t.id, k.start, 'before');
+    if (!page) return false;
+    const older = StudioTranscript.newModel();
+    StudioTranscript.feed(older, page.text, { root: S.project?.root || '' });
+    StudioTranscript.prepend(k.model, older);
+    k.start = page.start || 0;
+    return true;
+  } catch { return false; } finally { k.reading = false; }
+}
+
 function stOnModel(t, k) {
   // The site this task works on: the last one it opened.
   const sites = StudioTranscript.sitesOf(k.model);
@@ -1406,6 +1632,7 @@ function stOnModel(t, k) {
     if (!k.siteOpened && ST.view === 'studio' && ST.current === t.id && !document.hidden) stOpenSite(k);
   }
   stSendPins(t, k);
+  stAutoResult(t, k);
   // Claude wrote the brand (from Figma): read it again.
   const bf = k.model.files.get('brand.json');
   if (bf && bf.times !== k.brandSeen) { k.brandSeen = bf.times; ST.brandLoaded = false; stLoadBrand(); }
