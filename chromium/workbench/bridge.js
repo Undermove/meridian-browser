@@ -155,6 +155,7 @@
       resumeRemote: opts?.resumeRemote === true,
       accountId: typeof opts?.accountId === 'string' ? opts.accountId.slice(0, 16) : undefined,
       ...(opts?.studio === true ? { studio: true } : {}),
+      ...(opts?.studio === true && typeof opts?.taskDir === 'string' && opts.taskDir && !/[\/\\]|^\./.test(opts.taskDir) ? { taskDir: opts.taskDir.slice(0, 255) } : {}),
     }),
     ptyList: () => invoke('ptyList'),
     // What the page knows about a terminal (its name, its agent's session), kept with it while the
@@ -226,6 +227,9 @@
     // Studio (refused unless Meridian has it on): whether it's on and who the person is, a session's
     // transcript from an offset, an answer to its question, the result site's Boost.
     studioInfo: () => invoke('studioInfo'),
+    // Studio's own folder in Documents, opened as the project; a new task's folder in it.
+    studioHome: () => invoke('studioHome'),
+    studioTaskFolder: (title) => invoke('studioTaskFolder', str(title).slice(0, 400)),
     studioSetPersona: (p) => invoke('studioSetPersona', str(p)),
     studioFigma: (on) => invoke('studioFigma', on === true),
     // Connected in Studio, and whether the Figma app's server answers now; open the Figma app.
@@ -235,7 +239,7 @@
     studioPoint: (op, arg) => invoke('studioPoint', str(op), ...(arg === undefined ? [] : [JSON.parse(JSON.stringify(arg))])),
     // `mode` "tail" (a long session opens at its end) or "before" (the page before `offset`).
     studioTranscript: (id, offset, mode) => invoke('studioTranscript', str(id), Math.max(0, Number(offset) || 0), mode === 'tail' || mode === 'before' ? mode : ''),
-    studioAnswer: (askId, choice) => invoke('studioAnswer', str(askId), ['allow', 'deny', 'session'].includes(choice) ? choice : 'deny'),
+    studioAnswer: (askId, choice) => invoke('studioAnswer', str(askId), ['allow', 'deny', 'session'].includes(choice) || /^answers:\{/.test(String(choice)) ? String(choice).slice(0, 7000) : 'deny'),
     studioBoost: (op, host, ...rest) => invoke('studioBoost', str(op), str(host), ...JSON.parse(JSON.stringify(rest.slice(0, 2)))),
 
     toHost: (msg) => send('toHost', JSON.parse(JSON.stringify(msg || {}))),

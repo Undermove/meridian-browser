@@ -21,8 +21,10 @@
         return `${d} ${w} назад`;
       },
       earlier: 'Показать раньше', allFiles: (n) => `Показать все (${n})`,
-      pickFolder: 'Выберите папку для работы', pickFolderHint: 'Claude будет работать с копиями ваших файлов в этой папке — оригиналы не тронет.',
-      chooseFolder: 'Выбрать папку', recent: 'Недавние',
+      homeFailed: 'Не получилось создать папку для задач', retry: 'Попробовать ещё раз',
+      ownFiles: 'Работать с моими файлами…', ownChange: 'Другая папка…', backHome: 'Вернуться в Meridian Studio',
+      ownTitle: 'Работать с вашими файлами', ownHint: 'Выберите папку с файлами. Claude будет работать с копиями файлов из этой папки, оригиналы не тронет.', ownPick: 'Выбрать папку',
+      inFolder: (n) => `Папка «${n}»`, reveal: 'Показать в Finder', more: 'Ещё',
       emptyTitle: 'Что сделаем?', emptyHint: 'Напишите задачу своими словами или выберите подсказку. Claude покажет каждый шаг, спросит разрешения и ничего не отправит наружу без вас.',
       roles: { designer: 'Дизайнер:', manager: 'Менеджер:', developer: 'Разработчику:', everyday: 'Можно так:' },
       chips: {
@@ -94,8 +96,10 @@
         return d === 1 ? 'yesterday' : `${d} days ago`;
       },
       earlier: 'Show earlier', allFiles: (n) => `Show all (${n})`,
-      pickFolder: 'Pick a folder to work in', pickFolderHint: 'Claude works on copies of your files in this folder and leaves the originals as they are.',
-      chooseFolder: 'Choose a folder', recent: 'Recent',
+      homeFailed: 'Couldn’t make a folder for your tasks', retry: 'Try again',
+      ownFiles: 'Work with my files…', ownChange: 'Another folder…', backHome: 'Back to Meridian Studio',
+      ownTitle: 'Work with your files', ownHint: 'Pick a folder with your files. Claude works on copies of the files in it and leaves the originals as they are.', ownPick: 'Choose a folder',
+      inFolder: (n) => `Folder “${n}”`, reveal: 'Show in Finder', more: 'More',
       emptyTitle: 'What shall we make?', emptyHint: 'Describe the task in your own words or pick a suggestion. Claude shows every step, asks before it changes things and never sends anything out without you.',
       roles: { designer: 'Designer:', manager: 'Manager:', developer: 'Developer:', everyday: 'Try:' },
       chips: {
