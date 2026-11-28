@@ -179,6 +179,8 @@ test('scrolling through the spaces poses the stack, the window, the sky and the 
   await expect(page.locator('html')).toHaveClass(/\bkin\b/);
   expect(await page.locator('#win').evaluate((w) => w.parentElement === document.body)).toBe(true);
   await expect(page.locator('#dotname')).toHaveText('01 Hello');
+  await expect(page.locator('.space').nth(0)).toHaveClass(/\bon\b/);
+  await expect(page.locator('.space').nth(1)).not.toHaveClass(/\bon\b/);
   const atLoad = await poses(page, '#scene');
   // tabs are drawn back to front, so Linear, the pinned one, is the last tab
   expect(atLoad[8]).toEqual(['act slab', 'translate3d(-110px, -125px, 150px) rotateZ(0deg) scale(0.85)', '1', 'rgb(255, 255, 255)', 'LinearPinned', '0']);
@@ -233,11 +235,12 @@ test('leaving and re-entering the kinetic width puts the window back and restore
     home: document.getElementById('win').parentElement === document.querySelector('.space .in'),
     win: document.getElementById('win').style.cssText,
     iso: document.querySelector('#scene .iso').style.transform,
+    floor: document.querySelector('#scene .floor').style.transform,
     ins: [...document.querySelectorAll('.space .in')].every((e) => e.style.opacity === ''),
     sky: [...document.querySelectorAll('.sky i')].every((e) => e.style.transform === ''),
     weights: [...document.querySelectorAll('.c')].every((c) => c.style.fontWeight === ''),
   }));
-  expect(reset).toEqual({ home: true, win: '', iso: '', ins: true, sky: true, weights: true });
+  expect(reset).toEqual({ home: true, win: '', iso: '', floor: '', ins: true, sky: true, weights: true });
   expect(await poses(page, '#scene')).toEqual(await (async () => {
     const fresh = await page.context().newPage();
     await fresh.goto(PAGE);
@@ -255,6 +258,22 @@ test('leaving and re-entering the kinetic width puts the window back and restore
   await expect(page.locator('html')).toHaveClass(/\bkin\b/);
   await expect(page.locator('#dotname')).toHaveText('01 Hello');
   expect(await page.locator('#win').evaluate((w) => w.parentElement === document.body)).toBe(true);
+  // the spaces below fade out again, as at load
+  await expect(page.locator('.space').nth(3).locator('.in')).toHaveCSS('opacity', '0');
+  expect(await page.locator('.sky i').nth(3).evaluate((s) => s.style.transform)).toBe('translate3d(104%, 0px, 0px)');
+});
+
+test('leaving the kinetic width in a space and coming back poses the stack for that space', async ({ open }) => {
+  const page = await open(PAGE, { viewport: WIDE });
+  await goToSpace(page, 2);
+  await page.setViewportSize(NARROW);
+  await expect(page.locator('html')).not.toHaveClass(/\bkin\b/);
+  await page.setViewportSize(WIDE);
+  await expect(page.locator('html')).toHaveClass(/\bkin\b/);
+  const top = await page.locator('.space').nth(2).evaluate((s) => s.getBoundingClientRect().top + scrollY);
+  await page.evaluate((y) => scrollTo({ top: y, behavior: 'instant' }), top);
+  await expect(page.locator('#dotname')).toHaveText('03 Import');
+  await expect.poll(() => poses(page, '#scene')).toEqual(await poses(page, '.sc3[data-s="2"]'));
 });
 
 test('with reduced motion a wide screen stays still', async ({ open }) => {
@@ -416,4 +435,131 @@ test('red: without the focus handler the button stays faded', async ({ open }) =
   await page.goto(PAGE);
   expect(await tabToFadedCopy(page)).toBeGreaterThan(50);
   await expect(page.locator('#install .in')).toHaveCSS('opacity', '0');
+});
+
+test('the hero download on Windows also shows the Download space', async ({ open }) => {
+  const page = await open(null, { userAgent: UA.win, init: platform({ data: 'Windows', plat: 'Win32' }), viewport: WIDE });
+  await page.route(DL + 'win.exe', (r) => r.fulfill({ body: 'exe', headers: { 'content-disposition': 'attachment; filename=Meridian.exe' } }));
+  await page.goto(PAGE);
+  const download = page.waitForEvent('download');
+  await page.locator('[data-cta]').click();
+  expect((await download).url()).toBe(DL + 'win.exe');
+  await expect.poll(() => page.locator('#install').evaluate((s) => Math.round(s.getBoundingClientRect().top))).toBe(0);
+});
+
+test('on Linux the hero link goes to the Download space', async ({ open }) => {
+  const page = await open(PAGE, { userAgent: UA.linux, init: platform({ data: 'Linux', plat: 'Linux x86_64' }), viewport: WIDE });
+  await page.locator('[data-cta]').click();
+  await expect.poll(() => page.locator('#install').evaluate((s) => Math.round(s.getBoundingClientRect().top))).toBe(0);
+  expect(new URL(page.url()).hash).toBe('#install');
+});
+
+test('when the clipboard refuses, Copy replaces what was selected with the command', async ({ open }) => {
+  const page = await open(PAGE, { init: clipboard(false), viewport: NARROW });
+  await page.locator('h1').evaluate((h) => { const r = document.createRange(); r.selectNodeContents(h); getSelection().addRange(r); });
+  expect(await page.evaluate(() => getSelection().toString())).not.toBe('');
+  await page.locator('#copy').click();
+  await expect(page.locator('#copy')).toHaveText('Copied');
+  expect(await page.evaluate(() => getSelection().toString())).toBe(BREW);
+});
+
+test('at 900 px wide, just below the kinetic width, poster lines fill their column uncapped', async ({ open }) => {
+  const page = await open(PAGE, { viewport: { width: 900, height: 800 } });
+  await expect(page.locator('html')).not.toHaveClass(/\bkin\b/);
+  const fits = await fitState(page);
+  for (const h of fits) for (const [w] of h.lines) expect(Math.abs(w - h.W)).toBeLessThan(h.W * 0.01);
+});
+
+// Each letter's fixed box, against the width its glyph takes in the current font.
+const letterBoxes = (page) => page.locator('.fit .c').evaluateAll((cs) => cs.map((c) => {
+  const fixed = c.getBoundingClientRect().width;
+  const w = c.style.width; c.style.width = '';
+  const own = c.getBoundingClientRect().width; c.style.width = w;
+  return Math.abs(fixed - own);
+}));
+
+test('when the font changes, the letters get boxes for the new font', async ({ open }) => {
+  const page = await open(PAGE, { viewport: NARROW });
+  expect(Math.max(...await letterBoxes(page))).toBeLessThan(0.5);
+  // stands in for the web font arriving: the page refits on fonts' loadingdone
+  await page.evaluate(() => {
+    const sheet = new CSSStyleSheet();
+    sheet.replaceSync('.fit{font-family:monospace!important}');
+    document.adoptedStyleSheets = [sheet];
+    document.fonts.dispatchEvent(new Event('loadingdone'));
+  });
+  expect(Math.max(...await letterBoxes(page))).toBeLessThan(0.5);
+});
+
+test('after a scroll the letter under the pointer still bends the most', async ({ open }) => {
+  const page = await open(PAGE, { viewport: WIDE });
+  await expect(page.locator('#dotname')).toHaveText('01 Hello');
+  await page.evaluate(() => scrollTo({ top: 150, behavior: 'instant' }));
+  await stillScroll(page);
+  await expect(page.locator('#dotname')).toHaveText('01 Hello');
+  // a refit while scrolled, as when the web font arrives
+  await page.evaluate(() => document.fonts.dispatchEvent(new Event('loadingdone')));
+  const letter = page.locator('h1 .c').nth(2);
+  const lb = await letter.boundingBox();
+  await page.mouse.move(lb.x + lb.width / 2, lb.y + lb.height / 2);
+  await expect.poll(() => letter.evaluate((c) => c.style.fontWeight)).toBe('220');
+});
+
+test('each still stack shows only its own extras', async ({ open }) => {
+  const page = await open(PAGE, { viewport: NARROW });
+  // the shield is an icon with no text
+  const EXTRA = { 5: ['Local modelFree', 'GitHub Copilot', 'Claude API key', 'Summarise this page'], 6: ['Ads', 'Trackers', ''] };
+  for (const s of [1, 2, 3, 4, 5, 6]) {
+    const shown = await page.locator(`.sc3[data-s="${s}"] .act`).evaluateAll((els) =>
+      els.filter((e) => /^act (slab dk|slab no|shd)/.test(e.className) && e.style.opacity === '1').map((e) => e.textContent));
+    expect(shown, 'space ' + s).toEqual(EXTRA[s] || []);
+  }
+});
+
+test('in Today the pinned tab is lime and the last two tabs are blue', async ({ open }) => {
+  const page = await open(PAGE, { viewport: NARROW });
+  const bg = (s) => page.locator(`.sc3[data-s="${s}"] .act.slab:not(.dk):not(.no)`).evaluateAll((els) =>
+    Object.fromEntries(els.map((e) => [e.textContent.replace('Pinned', ''), e.style.background])));
+  const W = 'rgb(255, 255, 255)', LIME = 'rgb(201, 240, 46)', BLUE = 'rgb(169, 180, 255)';
+  expect(await bg(3)).toEqual({ Linear: LIME, Notion: W, YouTube: W, Figma: W, Spotify: BLUE, GitHub: BLUE });
+  expect(await bg(2)).toEqual({ Linear: W, Notion: W, YouTube: W, Figma: W, Spotify: W, GitHub: W });
+});
+
+test('a mouse click on a button in a space does not scroll the page', async ({ open }) => {
+  const page = await open(PAGE, { viewport: WIDE, init: clipboard(true) });
+  await goToSpace(page, 7);
+  await stillScroll(page);
+  const y = await page.evaluate(() => scrollY);
+  const copy = page.locator('#copy');
+  // off the middle, so a centring scroll would show
+  expect(await copy.evaluate((b) => { const r = b.getBoundingClientRect(); return Math.abs(r.top + r.height / 2 - innerHeight / 2); })).toBeGreaterThan(50);
+  await copy.click();
+  await expect(copy).toBeFocused();
+  await stillScroll(page);
+  expect(await page.evaluate(() => scrollY)).toBe(y);
+});
+
+test('on a narrow screen a button reached by keyboard is left where it is', async ({ open }) => {
+  const page = await open(PAGE, { viewport: NARROW });
+  const copy = page.locator('#copy');
+  // Copy near the bottom of the screen, but on it
+  await copy.evaluate((b) => scrollTo({ top: b.getBoundingClientRect().top + scrollY - innerHeight + 120, behavior: 'instant' }));
+  await stillScroll(page);
+  const y = await page.evaluate(() => scrollY);
+  await page.locator('#install .brew span').click();
+  await page.keyboard.press('Tab');
+  await expect(copy).toBeFocused();
+  await stillScroll(page);
+  expect(await page.evaluate(() => scrollY)).toBe(y);
+});
+
+test('other keys on a focused tab that is not open change nothing', async ({ open }) => {
+  const page = await open(PAGE, { userAgent: UA.mac, init: platform({ data: 'macOS', plat: 'MacIntel' }), viewport: NARROW });
+  // On Windows and Linux, pressing a tab and sliding off it focuses it without a click. Chromium on
+  // macOS doesn't focus buttons on press, so the test focuses it directly.
+  await page.locator('#t-win').focus();
+  await expect(page.locator('#t-win')).toBeFocused();
+  expect(await selectedTab(page)).toEqual(tabState('mac'));
+  await page.keyboard.press('Home');
+  expect(await selectedTab(page)).toEqual(tabState('mac'));
 });

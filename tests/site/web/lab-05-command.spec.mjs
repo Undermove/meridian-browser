@@ -214,6 +214,11 @@ const QUERIES = [
   { q: 'plit', first: 'Split view & Peek' },
   { q: 'sdbr', first: 'Spaces & sidebar' },
   { q: 'split zzz', none: true },
+  // a whole word beats the start of one
+  { q: 'window', top: ['Why does Windows show a blue window?', 'Download for Windows'] },
+  // scattered matches need three letters and the same first letter
+  { q: 'sb', none: true },
+  { q: 'plt', none: true },
 ];
 
 for (const c of QUERIES) {
@@ -243,6 +248,17 @@ test('the matched part of a title is marked, also at its end', async ({ open }) 
   await page.locator('#in').fill('');
   await page.keyboard.type('view');
   await expect(rows(page).first().locator('.tt')).toHaveJSProperty('innerHTML', 'Split <mark>view</mark> &amp; Peek');
+  await page.locator('#in').fill('');
+  await page.keyboard.type('split');
+  await expect(rows(page).first().locator('.tt')).toHaveJSProperty('innerHTML', '<mark>Split</mark> view &amp; Peek');
+});
+
+test('a query of only spaces lists everything in groups', async ({ open }) => {
+  const page = await load(open, { clock: true });
+  await drive(page);
+  await page.keyboard.type('  ');
+  await expect(page.locator('#list .grp')).toHaveText(['Actions', 'Features', 'Questions']);
+  await expect(rows(page)).toHaveCount(6 + 9 + 7);
 });
 
 test('a query is shown escaped when nothing matches', async ({ open }) => {
@@ -259,6 +275,13 @@ test('arrows move the selection and wrap', async ({ open }) => {
   await page.keyboard.press('ArrowUp');
   await expect(selected(page)).toHaveText('Is there a Linux build?');
   await expect(page.locator('#in')).toHaveAttribute('aria-activedescendant', 'r21');
+  // the list scrolls to keep the selection in view
+  const inView = () => page.evaluate(() => {
+    const l = document.querySelector('#list').getBoundingClientRect(), r = document.querySelector('#list .row.sel').getBoundingClientRect();
+    return r.top >= l.top - 0.5 && r.bottom <= l.bottom + 0.5;
+  });
+  expect(await page.locator('#list').evaluate((l) => l.scrollHeight > l.clientHeight)).toBe(true);
+  await expect.poll(inView).toBe(true);
   await page.keyboard.press('ArrowDown');
   await expect(selected(page)).toHaveText('Download Meridian');
   await page.keyboard.press('ArrowDown');
@@ -367,6 +390,29 @@ test('Enter on Copy brew command copies it, marks the row for 1.6 s and keeps it
   await page.clock.runFor(1700);
   await expect(page.locator('#list .row .ty').first()).toHaveText('Action');
   await expect(selected(page)).toHaveText(sel);
+});
+
+test('Enter on Copy brew command lower in the list keeps that row selected', async ({ open }) => {
+  const page = await load(open, { init: [clipboard(true)], clock: true });
+  await drive(page);
+  for (let i = 0; i < 3; i++) await page.keyboard.press('ArrowDown');
+  await expect(selected(page)).toHaveText('Copy brew command');
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#list .row.sel .ty')).toHaveText('Copied');
+  await expect(selected(page)).toHaveText('Copy brew command');
+});
+
+test('a panel loads its picture only when it opens', async ({ open }) => {
+  const page = await load(open, { clock: true });
+  const srcs = () => page.locator('#body .panel img').evaluateAll((ims) => ims.map((i) => [i.closest('.panel').dataset.id, !!i.getAttribute('src')]));
+  const before = await srcs();
+  expect(before.length).toBeGreaterThan(3);
+  expect(before.every(([, has]) => !has)).toBe(true);
+  await drive(page);
+  await page.keyboard.type('import');
+  await page.keyboard.press('Enter');
+  await expect(panelOn(page)).toHaveAttribute('data-id', 'import');
+  expect((await srcs()).filter(([, has]) => has).map(([id]) => id)).toEqual(['import']);
 });
 
 test('a copy timer that ends while a panel is open leaves the panel alone', async ({ open }) => {
@@ -632,6 +678,47 @@ test('opening a panel sends a ring out from the bar that fades', async ({ open }
   expect(r2).toBeGreaterThan(r1);
   await page.clock.runFor(2000);
   expect(await ringAt()).toBe(0);
+});
+
+test('the grid draws once a frame, however often it is woken', async ({ open }) => {
+  const page = await load(open, { init: [call(() => {
+    window.__draws = 0;
+    const clear = CanvasRenderingContext2D.prototype.clearRect;
+    CanvasRenderingContext2D.prototype.clearRect = function (...a) { window.__draws++; return clear.apply(this, a); };
+  })] });
+  // a visibility event while the loop runs must not start a second one
+  await page.evaluate(() => { for (let i = 0; i < 3; i++) document.dispatchEvent(new Event('visibilitychange')); });
+  const [frames, draws] = await page.evaluate(() => new Promise((done) => {
+    const d0 = window.__draws;
+    let n = 0;
+    const tick = () => { if (++n < 30) requestAnimationFrame(tick); else done([n, window.__draws - d0]); };
+    requestAnimationFrame(tick);
+  }));
+  expect(draws).toBeLessThanOrEqual(frames + 1);
+  expect(draws).toBeGreaterThanOrEqual(frames - 1);
+});
+
+test('Enter on a panel already open sends no second ring', async ({ open }) => {
+  const page = await load(open, { clock: true });
+  // focus without the mouse: a pointer over the stage would light dots too
+  await page.locator('#in').focus();
+  await page.keyboard.type('split');
+  await page.keyboard.press('Enter');
+  await expect(panelOn(page)).toHaveAttribute('data-id', 'split');
+  const lit = () => page.evaluate(() => {
+    const c = document.querySelector('#grid'), px = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+    let n = 0;
+    for (let i = 0; i < px.length; i += 4) if (px[i] === 255 && px[i + 1] === 90) n++;
+    return n;
+  });
+  await page.clock.runFor(500);
+  expect(await lit()).toBeGreaterThan(0);
+  // past the ring's 2.6 s
+  await page.clock.runFor(3000);
+  expect(await lit()).toBe(0);
+  await page.keyboard.press('Enter');
+  await page.clock.runFor(300);
+  expect(await lit()).toBe(0);
 });
 
 test('the canvas matches the screen density, up to 2x', async ({ open }) => {

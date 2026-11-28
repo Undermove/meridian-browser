@@ -33,6 +33,8 @@ const CASES = [
   { name: 'an iPhone', ua: UA.iphone, env: { plat: 'iPhone', touch: 5 }, cta: ['Download Meridian', 'Free · Meridian is for Mac and Windows', '#keys'], mine: null },
   // iPadOS Safari presents itself as a Mac; only the touch points give it away.
   { name: 'an iPad that says it is a Mac', ua: UA.mac, env: { plat: 'MacIntel', touch: 5 }, cta: ['Download Meridian', 'Free · Meridian is for Mac and Windows', '#keys'], mine: null },
+  // only more than one touch point marks an iPad
+  { name: 'a Mac with one touch point', ua: UA.mac, env: { data: 'macOS', plat: 'MacIntel', touch: 1 }, cta: ['Download for Mac', 'Free · Apple silicon (M1 and newer)', DL + 'mac-arm64.dmg'], mine: 'mac' },
 ];
 
 for (const c of CASES) {
@@ -77,6 +79,15 @@ test('when the clipboard refuses, Copy selects the command instead', async ({ op
   expect(await page.evaluate(() => getSelection().toString())).toBe(BREW);
 });
 
+test('when the clipboard refuses, Copy replaces what was selected with the command', async ({ open }) => {
+  const page = await open(PAGE, { init: clipboard(false) });
+  await page.locator('h1').evaluate((h) => { const r = document.createRange(); r.selectNodeContents(h); getSelection().addRange(r); });
+  expect(await page.evaluate(() => getSelection().toString())).not.toBe('');
+  await page.locator('#copy').click();
+  await expect(page.locator('#copy')).toHaveText('Copied');
+  expect(await page.evaluate(() => getSelection().toString())).toBe(BREW);
+});
+
 test('headings set themselves letter by letter, spaces stay plain', async ({ page }) => {
   await page.goto(PAGE);
   const letters = (sel) => page.locator(sel).evaluate((el) => ({
@@ -109,6 +120,43 @@ test('the closing line stays hidden until it is on screen, then replays its lett
   // the restart sets animation-name to none and back; it ends with no inline override
   expect(await big.locator('.ch').evaluateAll((cs) => cs.every((c) => c.style.animationName === ''))).toBe(true);
   expect(await big.locator('.ch').count()).toBe('Ready to'.replace(' ', '').length + 'move'.length + 'in?'.length);
+});
+
+// The closing line's letter animations: true while any still runs.
+const bigPlaying = (page) => page.locator('.band .big .ch').evaluateAll((cs) => cs.some((c) => c.getAnimations().some((a) => a.playState === 'running')));
+
+test('the closing line plays its letters when it comes on screen, and only the first time', async ({ page }) => {
+  await page.goto(PAGE);
+  // hidden letters still animate, so by now they have played out unseen
+  await expect.poll(() => bigPlaying(page), { timeout: 10_000 }).toBe(false);
+  const big = page.locator('.band .big');
+  await big.scrollIntoViewIfNeeded();
+  await expect(big).toHaveCSS('visibility', 'visible');
+  expect(await bigPlaying(page)).toBe(true);
+  await expect.poll(() => bigPlaying(page), { timeout: 10_000 }).toBe(false);
+  await page.evaluate(() => scrollTo({ top: 0, behavior: 'instant' }));
+  await expect.poll(() => big.evaluate((b) => b.getBoundingClientRect().top > innerHeight)).toBe(true);
+  // an observer with the page's options reports in the same update as the page's own
+  const seen = big.evaluate((b) => new Promise((done) => {
+    const io = new IntersectionObserver((es) => { if (es.some((e) => e.isIntersecting)) { io.disconnect(); requestAnimationFrame(done); } },
+      { threshold: 0.18, rootMargin: '0px 0px -6% 0px' });
+    io.observe(b);
+  }));
+  await big.scrollIntoViewIfNeeded();
+  await seen;
+  expect(await bigPlaying(page)).toBe(false);
+});
+
+test('plates and the packing list come in as they reach the screen', async ({ page }) => {
+  await page.goto(PAGE);
+  const els = page.locator('[data-plate],[data-inv]');
+  expect(await els.count()).toBe(6);
+  for (const el of await els.all()) {
+    // the hero plate is on screen at load
+    if (await el.evaluate((e) => e.getBoundingClientRect().top > innerHeight)) await expect(el).not.toHaveClass(/\bin\b/);
+    await el.scrollIntoViewIfNeeded();
+    await expect(el).toHaveClass(/\bin\b/);
+  }
 });
 
 test('red: the closing line check fails when it never shows', async ({ page }) => {

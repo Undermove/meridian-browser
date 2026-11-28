@@ -65,6 +65,15 @@ const shown = (page, id) => page.evaluate((id) => {
   return Math.abs(top) <= 1 || (top > 0 && atEnd);
 }, id);
 
+// A wheel turn the page has handled: mouse.wheel() can return before the page's listener runs.
+// The counter is added after the page's listener, so it counts an event once the page is done with it.
+const countWheels = (page) => page.evaluate(() => { window.__wheels = 0; addEventListener('wheel', () => window.__wheels++, { passive: true }); });
+async function wheel(page, dx, dy) {
+  const n = await page.evaluate(() => window.__wheels);
+  await page.mouse.wheel(dx, dy);
+  await expect.poll(() => page.evaluate(() => window.__wheels)).toBe(n + 1);
+}
+
 test.describe('tabs and spaces on a desktop', () => {
   test('starts on Welcome in the first space, with the pane focused', async ({ open }) => {
     const page = await load(open);
@@ -134,7 +143,7 @@ test.describe('tabs and spaces on a desktop', () => {
   test('arrow keys switch space, but not past the ends or with a modifier', async ({ open }) => {
     const page = await load(open);
     await page.keyboard.press('ArrowLeft');
-    expect((await state(page)).space).toBe(0);
+    expect(await state(page)).toMatchObject({ space: 0, tour: [] });
     await page.keyboard.press('ArrowRight');
     expect(await state(page)).toMatchObject({ space: 1, tab: ['download'], focus: 'pane1', tour: ['space'] });
     await page.keyboard.press('ArrowRight');
@@ -161,14 +170,15 @@ test.describe('tabs and spaces on a desktop', () => {
     await page.goto(URL);
     // Paused, so a slow machine cannot outlast the 900 ms cooldown between wheel events.
     await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1000));
+    await countWheels(page);
     await page.mouse.move(700, 400);
-    await page.mouse.wheel(0, 200);
-    await page.mouse.wheel(60, 0);
+    await wheel(page, 0, 200);
+    await wheel(page, 60, 0);
     expect((await state(page)).space).toBe(0);
-    await page.mouse.wheel(30, 0);
-    await expect.poll(async () => (await state(page)).space).toBe(1);
+    await wheel(page, 30, 0);
+    expect((await state(page)).space).toBe(1);
     // The same gesture keeps sending deltas: no second switch during the cooldown.
-    await page.mouse.wheel(200, 0);
+    await wheel(page, 200, 0);
     expect(await state(page)).toMatchObject({ space: 1, tour: ['space'] });
     await page.clock.resume();
     // A sideways scroll over code scrolls the code, not the window.
@@ -179,6 +189,42 @@ test.describe('tabs and spaces on a desktop', () => {
     await expect.poll(async () => { await page.mouse.wheel(-200, 0); return (await state(page)).space; }, { timeout: 3000 }).toBe(1);
     await page.mouse.move(700, 100);
     await expect.poll(async () => { await page.mouse.wheel(-200, 0); return (await state(page)).space; }).toBe(0);
+  });
+
+  test('back on the first tab and forward on the last do nothing, and throw nothing', async ({ open }) => {
+    const page = await load(open);
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.locator('#nav-back').click();
+    expect((await state(page)).tab).toEqual(['welcome']);
+    await page.locator('.spc-dot[data-space="2"]').click();
+    await page.locator('.tab[href="#small-print"]').click();
+    await page.locator('#nav-fwd').click();
+    expect(await state(page)).toMatchObject({ space: 2, tab: ['small-print'] });
+    await page.evaluate(() => new Promise((r) => setTimeout(r, 0)));
+    expect(errors).toEqual([]);
+  });
+
+  test('an animated tab click lights only that tab, not the ones it scrolls past', async ({ open }) => {
+    const page = await load(open, { calm: false });
+    await page.evaluate(() => {
+      window.__paths = [];
+      new MutationObserver(() => window.__paths.push(document.getElementById('url-path').textContent))
+        .observe(document.getElementById('url-path'), { childList: true, characterData: true, subtree: true });
+    });
+    await page.locator('.tab[href="#private"]').click();
+    await expect.poll(() => shown(page, 'private')).toBe(true);
+    expect([...new Set(await page.evaluate(() => window.__paths))]).toEqual(['/private']);
+  });
+
+  test('a sideways swipe interrupted by a vertical scroll starts counting again', async ({ open }) => {
+    const page = await load(open);
+    await countWheels(page);
+    await page.mouse.move(700, 400);
+    await wheel(page, 60, 0);
+    await wheel(page, 0, 200);
+    await wheel(page, 30, 0);
+    expect((await state(page)).space).toBe(0);
   });
 
   test('sliding past a space does not pick its tabs', async ({ open }) => {
@@ -244,6 +290,15 @@ test.describe('on a phone', () => {
     expect(await state(page)).toMatchObject({ space: 2, tab: ['q-free'], tour: ['tab', 'space'] });
   });
 
+  test('a sideways swipe does not switch space', async ({ open }) => {
+    const page = await load(open, { viewport: PHONE });
+    await countWheels(page);
+    await page.mouse.move(200, 400);
+    await wheel(page, 300, 0);
+    await wheel(page, 300, 0);
+    expect((await state(page)).space).toBe(0);
+  });
+
   test('turning the phone into a desktop window and back', async ({ open }) => {
     const page = await load(open, { viewport: PHONE });
     await page.evaluate(() => scrollTo(0, 400));
@@ -265,6 +320,16 @@ test.describe('opening at a tab', () => {
       const s = document.getElementById('homebrew');
       return Math.round(s.getBoundingClientRect().top - s.closest('.pane').getBoundingClientRect().top);
     })).toBeLessThanOrEqual(100);
+  });
+
+  test('animated, a link to a tab still jumps there at once', async ({ open }) => {
+    // Read before load: a smooth scroll would still be near the top of the pane then.
+    const atLoad = () => document.addEventListener('DOMContentLoaded', () => {
+      const s = document.getElementById('homebrew');
+      window.__top = s.getBoundingClientRect().top - s.closest('.pane').getBoundingClientRect().top;
+    });
+    const page = await load(open, { calm: false, hash: '#homebrew', init: atLoad });
+    expect(Math.abs(await page.evaluate(() => window.__top))).toBeLessThanOrEqual(1);
   });
 
   test('changing the hash moves to that tab; an unknown hash does nothing', async ({ open }) => {
@@ -316,6 +381,16 @@ test.describe('download button per system', () => {
     expect(await state(page)).toMatchObject({ space: 1, tab: ['download'] });
   });
 
+  test('on Linux the button does not pull you back to Download later', async ({ open }) => {
+    const page = await open(null, { userAgent: UA.linux, viewport: DESK, reducedMotion: 'reduce', init: stubs() });
+    await page.clock.install();
+    await page.goto(URL);
+    await page.locator('.hero [data-cta]').click();
+    await page.locator('.tab[href="#homebrew"]').click();
+    await page.clock.runFor(2000);
+    expect(await state(page)).toMatchObject({ space: 1, tab: ['homebrew'] });
+  });
+
   test('an unknown system', async ({ open }) => {
     const page = await load(open, { ua: UA.bot, init: noUAData('') });
     expect(await ctaState(page)).toMatchObject({ hero: '#download', label: 'Download Meridian', small: '', os: 'mac', panels: ['mac'] });
@@ -348,6 +423,8 @@ test.describe('download button per system', () => {
     expect((await state(page)).space).toBe(1);
     await page.keyboard.press('Enter');
     expect(await os()).toBe('linux');
+    await page.keyboard.press('Tab');
+    expect(await page.evaluate(() => !!document.activeElement.closest('.os'))).toBe(false);
   });
 });
 
@@ -419,6 +496,19 @@ test.describe('split view', () => {
     expect(await page.evaluate(() => scrollY)).toBe(y);
   });
 
+  test('on a phone it keeps where you scrolled to', async ({ open }) => {
+    const page = await load(open, { viewport: PHONE });
+    await page.locator('.tab[href="#split"]').click();
+    // A little off the section's top, but still on it.
+    await page.evaluate(() => scrollBy(0, 40));
+    const y = await page.evaluate(() => scrollY);
+    await page.locator('#split-btn').click();
+    // Past the page's 0 ms timer, which a desktop uses to scroll back.
+    await page.evaluate(() => new Promise((r) => setTimeout(r, 0)));
+    expect((await state(page)).tab).toEqual(['split']);
+    expect(await page.evaluate(() => scrollY)).toBe(y);
+  });
+
   test('the divider drags, within limits', async ({ open }) => {
     const page = await load(open);
     await page.locator('.tab[href="#split"]').click();
@@ -441,6 +531,11 @@ test.describe('split view', () => {
     await drag(main.x + main.width - 5);
     expect(await split()).toBe(26);
     await page.mouse.move(main.x + main.width / 2, main.y + 100);
+    expect(await split()).toBe(26);
+    // Hovering the divider after the release, without a button down, moves nothing.
+    const d = await page.locator('#divider').boundingBox();
+    await page.mouse.move(d.x + 2, d.y + d.height / 2);
+    await page.mouse.move(d.x + d.width - 2, d.y + d.height / 2, { steps: 3 });
     expect(await split()).toBe(26);
   });
 });
@@ -504,7 +599,7 @@ test.describe('peek', () => {
     test(`a guide that cannot load (${fail}) says so, and is tried again next time`, async ({ open }) => {
       const page = await load(open);
       let n = 0;
-      await page.route(GUIDE, (r) => (n++ === 0 ? (fail === '404' ? r.fulfill({ status: 404, body: 'no' }) : r.abort()) : r.continue()));
+      await page.route(GUIDE, (r) => (n++ === 0 ? (fail === '404' ? r.fulfill({ status: 404, contentType: 'text/html', body: '<main><h1>Not found</h1></main>' }) : r.abort()) : r.continue()));
       await page.locator('.tab[href="#split"]').click();
       await page.locator('#peek-link').click();
       await expect(page.locator('#peek-doc')).toHaveText('The preview could not load here. Use "Open as a tab" above.');
@@ -515,14 +610,16 @@ test.describe('peek', () => {
     });
   }
 
-  test('a modifier click opens the guide as a real link, not in Peek', async ({ open }) => {
-    const page = await load(open);
-    await page.locator('.tab[href="#split"]').click();
-    const req = page.context().waitForEvent('request', (r) => r.url() === 'https://meridianbrowser.app/import-from-arc/');
-    await page.locator('#peek-link').click({ modifiers: ['ControlOrMeta'] });
-    expect((await req).isNavigationRequest()).toBe(true);
-    expect((await peekState(page)).open).toBe(false);
-  });
+  for (const mod of ['ControlOrMeta', 'Shift']) {
+    test(`a modifier click (${mod}) opens the guide as a real link, not in Peek`, async ({ open }) => {
+      const page = await load(open);
+      await page.locator('.tab[href="#split"]').click();
+      const req = page.context().waitForEvent('request', (r) => r.url() === 'https://meridianbrowser.app/import-from-arc/');
+      await page.locator('#peek-link').click({ modifiers: [mod] });
+      expect((await peekState(page)).open).toBe(false);
+      expect((await req).isNavigationRequest()).toBe(true);
+    });
+  }
 });
 
 test.describe('small demos', () => {
@@ -542,6 +639,25 @@ test.describe('small demos', () => {
     await expect(page.locator('#move')).toHaveClass(/\bmoved\b/);
     await page.locator('#move-btn').click();
     await expect(page.locator('#move-btn span')).toHaveText('Import from Arc');
+  });
+
+  test('a demo put back stays put when its section comes into view again', async ({ open }) => {
+    const page = await load(open);
+    await page.locator('.tab[href="#today"]').click();
+    await expect(page.locator('#tidy')).toHaveClass(/\btidied\b/);
+    await page.locator('#tidy-btn').click();
+    await expect(page.locator('#tidy')).not.toHaveClass(/\btidied\b/);
+    await page.locator('.tab[href="#welcome"]').click();
+    await expect.poll(() => page.locator('#today').evaluate((s) => s.getBoundingClientRect().top > s.closest('.pane').getBoundingClientRect().bottom)).toBe(true);
+    // An observer made after the page's gets the same entry after it, so the page has had its
+    // turn (and its 0 ms timer) once this one sees Today.
+    const seen = page.evaluate(() => new Promise((r) => {
+      const o = new IntersectionObserver((es) => { if (es[0].isIntersecting) { o.disconnect(); setTimeout(r, 0); } }, { threshold: 0.18 });
+      o.observe(document.getElementById('today'));
+    }));
+    await page.locator('.tab[href="#today"]').click();
+    await seen;
+    await expect(page.locator('#tidy')).not.toHaveClass(/\btidied\b/);
   });
 
   test('animated, the question is typed out and the tidy-up runs after a pause', async ({ open }) => {
@@ -589,6 +705,8 @@ test.describe('command bar', () => {
     expect((await state(page)).focus).toBe('pane0');
     // Shift+⌘K is not the shortcut.
     await page.keyboard.press('Meta+Shift+k');
+    expect((await cmdState(page)).open).toBe(false);
+    await page.keyboard.press('Meta+Alt+k');
     expect((await cmdState(page)).open).toBe(false);
   });
 
@@ -710,13 +828,15 @@ test.describe('command bar', () => {
 
   test('while the bar or Peek is open, a sideways swipe does nothing', async ({ open }) => {
     const page = await load(open);
+    await countWheels(page);
     await page.mouse.move(700, 400);
     await page.keyboard.press('Meta+k');
-    await page.mouse.wheel(300, 0);
+    await wheel(page, 300, 0);
+    expect((await state(page)).space).toBe(0);
     await page.keyboard.press('Escape');
     await page.locator('.tab[href="#split"]').click();
     await page.locator('#peek-link').click();
-    await page.mouse.wheel(300, 0);
+    await wheel(page, 300, 0);
     // The arrows are for Peek while it is open.
     await page.keyboard.press('ArrowRight');
     expect((await state(page)).space).toBe(0);

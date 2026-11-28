@@ -87,6 +87,23 @@ test.describe('download button per system', () => {
     expect(await page.locator('#cta-icon path').getAttribute('d')).toBe('M12 4v11m0 0l-4.5-4.5M12 15l4.5-4.5M5 20h14');
   });
 
+  test('the platform alone is enough, whatever the user agent says', async ({ open }) => {
+    for (const [p, os] of [['Win32', 'win'], ['MacIntel', 'mac']]) {
+      const page = await open(URL, { userAgent: UA.bot, init: [platform(p), stubs()] });
+      expect(await ctaState(page)).toMatchObject({ tab: os, href: DL + (os === 'win' ? 'win.exe' : 'mac-arm64.dmg') });
+    }
+  });
+
+  test('a Windows laptop with a touch screen is not a phone', async ({ open }) => {
+    const page = await open(URL, { userAgent: UA.win, init: [touch, stubs()] });
+    expect(await ctaState(page)).toMatchObject({ label: 'Download for Windows', send: false });
+  });
+
+  test('opening the page focuses nothing and does not scroll', async ({ open }) => {
+    const page = await open(URL, { userAgent: UA.mac, init: stubs() });
+    expect(await page.evaluate(() => ({ focus: document.activeElement.tagName, y: scrollY }))).toEqual({ focus: 'BODY', y: 0 });
+  });
+
   test('fails when the Windows link changes (mutation)', async ({ open }) => {
     const page = await open(null, { userAgent: UA.win, init: stubs() });
     await mutate(page, FILE, "DOWNLOAD + 'win.exe'", "DOWNLOAD + 'windows.exe'");
@@ -96,16 +113,16 @@ test.describe('download button per system', () => {
 });
 
 test.describe('after the download starts', () => {
-  for (const reducedMotion of ['no-preference', 'reduce']) {
-    test(`a Mac click shows the install steps (${reducedMotion})`, async ({ open }) => {
-      const page = await open(URL, { userAgent: UA.mac, reducedMotion, init: stubs() });
+  for (const [os, other, reducedMotion] of [['mac', 'win', 'no-preference'], ['mac', 'win', 'reduce'], ['win', 'mac', 'reduce']]) {
+    test(`a ${os} click shows the install steps (${reducedMotion})`, async ({ open }) => {
+      const page = await open(URL, { userAgent: UA[os], reducedMotion, init: stubs() });
       // The real link would start a download; keep the page here.
-      await page.route('**/Meridian-mac-arm64.dmg', (r) => r.fulfill({ status: 204 }));
+      await page.route('**/Meridian-*', (r) => r.fulfill({ status: 204 }));
       await page.evaluate(() => document.querySelector('#cta').addEventListener('click', (e) => e.preventDefault()));
-      await page.locator('[data-os="win"]').click();
+      await page.locator(`[data-os="${other}"]`).click();
       await page.evaluate(() => scrollTo(0, 0));
       await page.locator('#cta').click();
-      await expect(page.locator('.panel.on')).toHaveAttribute('data-panel', 'mac');
+      await expect(page.locator('.panel.on')).toHaveAttribute('data-panel', os);
       await expect.poll(() => page.locator('#install').evaluate((e) => {
         const r = e.getBoundingClientRect(); return r.top < innerHeight && r.bottom > 0;
       })).toBe(true);
@@ -249,6 +266,19 @@ test.describe('reveals and the line', () => {
     await expect(page.locator('#hud-lat')).toHaveText('90°00′N');
   });
 
+  test('the HUD reads the latitude of the scroll, in whole minutes', async ({ open }) => {
+    // A page 18,900px tall in a 900px window: 18,000px of scroll, so 100px is one degree.
+    const tall = `new MutationObserver((_, o) => { if (document.head) { o.disconnect();
+      const s = document.createElement('style'); s.textContent = 'body > * { display: none !important } html, body { margin: 0; padding: 0; height: 18900px }'; document.head.append(s); } })
+      .observe(document, { childList: true, subtree: true });`;
+    const page = await open(URL, { userAgent: UA.mac, reducedMotion: 'reduce', viewport: { width: 1200, height: 900 }, init: [tall, stubs()] });
+    expect(await page.evaluate(() => document.documentElement.scrollHeight - innerHeight)).toBe(18000);
+    for (const [y, lat] of [[4500, '45°00′N'], [4509, '44°54′N'], [9000, '00°00′N'], [13500, '45°00′S'], [18000, '90°00′S'], [0, '90°00′N']]) {
+      await page.evaluate((y) => scrollTo(0, y), y);
+      await expect(page.locator('#hud-lat')).toHaveText(lat);
+    }
+  });
+
   test('with reduced motion the line jumps instead of easing', async ({ open }) => {
     const page = await open(URL, { userAgent: UA.mac, reducedMotion: 'reduce', init: stubs() });
     await page.evaluate(() => scrollTo(0, document.documentElement.scrollHeight / 2));
@@ -340,6 +370,37 @@ test.describe('the globe', () => {
     expect(narrow.w).toBe(600);
     await page.setViewportSize({ width: 1200, height: 900 });
     await expect.poll(async () => (await globe(page)).w).toBe(1200);
+  });
+
+  test('900px wide or less, the globe is higher, smaller, dimmer and has no degree labels', async ({ open }) => {
+    const spy = () => {
+      window.__cv = { alpha: [], text: 0, glow: null };
+      const P = CanvasRenderingContext2D.prototype, a = Object.getOwnPropertyDescriptor(P, 'globalAlpha'), ft = P.fillText;
+      // The first arc of a frame is the glow round the globe: centre (cx, cy), radius 1.25 R.
+      const cr = P.clearRect, arc = P.arc; let first = false;
+      P.clearRect = function (...args) { first = true; return cr.apply(this, args); };
+      P.arc = function (x, y, r, ...rest) { if (first) { first = false; window.__cv.glow = { y, r: r / 1.25 }; } return arc.call(this, x, y, r, ...rest); };
+      Object.defineProperty(P, 'globalAlpha', { configurable: true, get() { return a.get.call(this); }, set(v) { window.__cv.alpha.push(v); a.set.call(this, v); } });
+      P.fillText = function (...args) { window.__cv.text++; return ft.apply(this, args); };
+    };
+    const draws = async (width) => {
+      const page = await open(URL, { userAgent: UA.mac, reducedMotion: 'reduce', viewport: { width, height: 900 }, init: [spy, stubs()] });
+      expect((await globe(page)).w).toBe(width);
+      return page.evaluate(() => ({ alpha: [...new Set(window.__cv.alpha)].sort(), text: window.__cv.text, glow: window.__cv.glow }));
+    };
+    // In a 900px tall window: narrow, the centre is at a third of the height and R at 30% of it;
+    // wide, the centre is at 52% and R is min(41% of the height, 36% of the width).
+    const narrow = await draws(900);
+    expect(narrow).toMatchObject({ alpha: [0.62, 1], text: 0 });
+    expect(narrow.glow.y).toBeCloseTo(297, 5);
+    expect(narrow.glow.r).toBeCloseTo(270, 5);
+    const wide = await draws(901);
+    expect(wide.alpha).toEqual([1]);
+    expect(wide.glow.y).toBeCloseTo(468, 5);
+    expect(wide.glow.r).toBeCloseTo(901 * 0.36, 5);
+    // Ten labels a frame: 30° to 330° in steps of 30°, without 180°.
+    expect(wide.text).toBeGreaterThan(0);
+    expect(wide.text % 10).toBe(0);
   });
 
   test('uses the screen density, capped at 2', async ({ open }) => {

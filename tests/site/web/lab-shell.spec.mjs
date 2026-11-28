@@ -155,3 +155,31 @@ test('a concept whose check fails to connect counts as missing', async ({ page }
   await expect(page.locator('#missing')).toHaveClass(/\bon\b/);
   await expect(page.locator('#view')).toHaveAttribute('src', 'about:blank');
 });
+
+test('on a narrow screen the chosen concept is scrolled into the bar', async ({ open }) => {
+  const page = await open(FILE + '#05-command', { viewport: { width: 390, height: 800 } });
+  await expectConcept(page, 5);
+  const inBar = (i) => page.evaluate((i) => {
+    const bar = document.getElementById('concepts').getBoundingClientRect();
+    const b = document.querySelectorAll('#concepts button')[i].getBoundingClientRect();
+    return b.left >= bar.left - 0.5 && b.right <= bar.right + 0.5;
+  }, i);
+  // the bar is too narrow for all of them, so the last one starts out of view
+  expect(await page.locator('#concepts').evaluate((c) => c.scrollWidth > c.clientWidth)).toBe(true);
+  await expect.poll(() => inBar(5)).toBe(true);
+  await page.keyboard.press('0');
+  await expectConcept(page, 0);
+  await expect.poll(() => inBar(0)).toBe(true);
+});
+
+test('keys that do nothing do not reload the frame', async ({ page }) => {
+  await page.goto(FILE + '#03-moving-day');
+  await expectConcept(page, 3);
+  const loads = [];
+  page.on('request', (r) => { if (r.url().endsWith('03-moving-day.html')) loads.push(r.method()); });
+  for (const k of ['x', '6', 'Enter', 'Meta+ArrowRight']) await page.keyboard.press(k);
+  // a key that acts, so a stray reload would have been asked for by now
+  await page.keyboard.press('w');
+  await expect(sizes(page).nth(1)).toHaveAttribute('aria-pressed', 'true');
+  expect(loads).toEqual([]);
+});

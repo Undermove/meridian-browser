@@ -25,8 +25,12 @@ test.describe('built changelog', () => {
   });
 
   test('with storage blocked the page still sets its language', async ({ open }) => {
-    const page = await open('docs/ru/changelog.html', { init: NO_STORAGE });
+    const page = await open(null, { init: NO_STORAGE });
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await page.goto('docs/ru/changelog.html');
     expect(await lang(page)).toEqual(['ru', 'ru']);
+    expect(errors).toEqual([]);
   });
 });
 
@@ -42,7 +46,8 @@ test.describe('changelog source (both languages, with buttons)', () => {
   });
 
   test('with nothing saved, a Russian-family browser language picks Russian', async ({ open }) => {
-    for (const [locale, want] of [['uk-UA', 'ru'], ['kk-KZ', 'ru'], ['de-DE', 'en']]) {
+    // the language part decides, in any case: a Belgian (BE) region is not Belarusian (be)
+    for (const [locale, want] of [['uk-UA', 'ru'], ['kk-KZ', 'ru'], ['de-DE', 'en'], ['RU-RU', 'ru'], ['nl-BE', 'en']]) {
       const page = await open(SRC, { locale });
       expect((await lang(page))[0], locale).toBe(want);
     }
