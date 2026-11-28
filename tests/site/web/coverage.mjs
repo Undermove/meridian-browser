@@ -66,10 +66,10 @@ const lineOf = (starts, offset) => {
   return lo + 1;
 };
 
-function loadRaw() {
-  if (!fs.existsSync(RAW_DIR)) return [];
-  return fs.readdirSync(RAW_DIR).filter((f) => f.endsWith('.json'))
-    .flatMap((f) => JSON.parse(fs.readFileSync(path.join(RAW_DIR, f), 'utf8')));
+export function loadRaw(rawDir = RAW_DIR) {
+  if (!fs.existsSync(rawDir)) return [];
+  return fs.readdirSync(rawDir).filter((f) => f.endsWith('.json'))
+    .flatMap((f) => JSON.parse(fs.readFileSync(path.join(rawDir, f), 'utf8')));
 }
 
 // Raw entries -> per page: { code: Set<line>, missed: Set<line> }.
@@ -103,9 +103,9 @@ export function report(entries = loadRaw(), pages = PAGES, root = ROOT) {
   return result;
 }
 
-export function exclusions() {
-  if (!fs.existsSync(EXCLUSIONS)) return {};
-  return JSON.parse(fs.readFileSync(EXCLUSIONS, 'utf8'));
+export function exclusions(file = EXCLUSIONS) {
+  if (!fs.existsSync(file)) return {};
+  return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
 // Lines allowed to stay missed, and the problems with the exclusions themselves.
@@ -130,20 +130,22 @@ export const ranges = (lines) => {
 };
 
 // Prints the table; returns the pages that fall short.
-export function check({ only } = {}) {
-  const ex = exclusions();
-  const pages = only?.length ? PAGES.filter((p) => only.some((o) => p.includes(o))) : PAGES;
-  const res = report(loadRaw(), pages);
+export function check({
+  only, pages: all = PAGES, root = ROOT, rawDir = RAW_DIR, exclusionsFile = EXCLUSIONS, log = console.log,
+} = {}) {
+  const ex = exclusions(exclusionsFile);
+  const pages = only?.length ? all.filter((p) => only.some((o) => p.includes(o))) : all;
+  const res = report(loadRaw(rawDir), pages, root);
   const failing = [];
   for (const page of pages) {
     const { code, missed } = res[page];
-    const { set: ok, problems } = allowed(page, ex);
+    const { set: ok, problems } = allowed(page, ex, root);
     const bad = [...missed].filter((l) => !ok.has(l));
     for (const l of ok) if (!missed.has(l)) problems.push(`line ${l} is excluded but covered: remove its exclusion`);
     const pct = code.size ? (100 * (code.size - missed.size) / code.size).toFixed(2) : '100.00';
-    console.log(`${pct.padStart(6)}%  ${String(code.size - missed.size).padStart(5)}/${String(code.size).padEnd(5)} ${page}`);
-    if (bad.length) console.log(`         missed: ${ranges(bad).join(', ')}`);
-    for (const p of problems) console.log(`         ${p}`);
+    log(`${pct.padStart(6)}%  ${String(code.size - missed.size).padStart(5)}/${String(code.size).padEnd(5)} ${page}`);
+    if (bad.length) log(`         missed: ${ranges(bad).join(', ')}`);
+    for (const p of problems) log(`         ${p}`);
     if (bad.length || problems.length) failing.push(page);
   }
   return failing;

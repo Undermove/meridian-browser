@@ -24,6 +24,17 @@ test('ranByte: the innermost range decides', () => {
   assert.equal(bytes[src.indexOf('c()')], 0);
 });
 
+test('ranByte: of two ranges with the same start, the shorter one is inner', () => {
+  const src = 'skip(); run();';
+  const fns = [{ ranges: [
+    { startOffset: 0, endOffset: 7, count: 0 },
+    { startOffset: 0, endOffset: src.length, count: 1 },
+  ] }];
+  const bytes = ranByte(src, fns);
+  assert.equal(bytes[src.indexOf('skip')], 0);
+  assert.equal(bytes[src.indexOf('run')], 1);
+});
+
 test('report: lines map into the page; changed copies of a script are ignored', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cov-'));
   const body = '\nran();\nif (x) {\n  never();\n}\n';
