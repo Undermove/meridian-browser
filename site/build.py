@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Builds the site in docs/ (GitHub Pages, meridianbrowser.app) from site/.
 
-  python3 site/build.py
+  python3 site/build.py [--out DIR]
 
 - site/pages/changelog.html holds both languages (the home page, index.html, is English only): <span lang="en">…</span><span lang="ru">…</span>.
   Each becomes an English page (docs/<name>.html) and a Russian one (docs/ru/<name>.html),
@@ -16,6 +16,7 @@ Edit site/, never the built pages in docs/ (the build overwrites them). docs/pri
 images and install.sh stay hand-written in docs/.
 """
 
+import argparse
 import html
 import json
 import os
@@ -49,7 +50,6 @@ def url_of(name, lang):
 def strip_lang(text, keep):
   """Keeps one language: drops <span lang="other">…</span> (nested spans and all) and unwraps
   <span lang="keep">…</span>."""
-  other = 'ru' if keep == 'en' else 'en'
   out = []
   i = 0
   opener = re.compile(r'<span lang="(en|ru)">')
@@ -72,9 +72,7 @@ def strip_lang(text, keep):
     if m.group(1) == keep:
       out.append(strip_lang(inner, keep))
     i = j
-  result = ''.join(out)
-  assert 'lang="' + other + '"' not in re.sub(r'hreflang="[a-z-]+"', '', result) or True
-  return result
+  return ''.join(out)
 
 
 # The bilingual pages: a Russian page links to their Russian versions, next to it. The home page
@@ -155,7 +153,7 @@ def structured_data(text, lang):
                    for b in blocks)
 
 
-def build_page(name):
+def build_page(name, docs):
   source = open(os.path.join(SITE, 'pages', f'{name}.html'), encoding='utf-8').read()
   built = []
   one = name in ENGLISH_ONLY
@@ -190,7 +188,7 @@ def build_page(name):
     assert n == 1, name
     depth = 1 if lang == 'ru' else 0
     text = relocate(text, depth, siblings=lang == 'ru')
-    out = os.path.join(DOCS, 'ru' if lang == 'ru' else '', f'{name}.html')
+    out = os.path.join(docs, 'ru' if lang == 'ru' else '', f'{name}.html')
     os.makedirs(os.path.dirname(out), exist_ok=True)
     open(out, 'w', encoding='utf-8').write(text)
     built.append(url_of(name, lang))
@@ -235,7 +233,7 @@ def to_root(text):
                 r'\1="../../\2"', text)
 
 
-def build_guide(slug, lang, template, guides):
+def build_guide(slug, lang, template, guides, docs):
   folder = os.path.join(SITE, 'guides', 'ru') if lang == 'ru' else os.path.join(SITE, 'guides')
   meta, body = read_guide(os.path.join(folder, slug + '.html'))
   url = guide_url(slug, lang)
@@ -274,16 +272,20 @@ def build_guide(slug, lang, template, guides):
       assert en in page, en
       page = page.replace(en, ru)
     page = to_root(page)
-  out = os.path.join(DOCS, 'ru' if lang == 'ru' else '', slug, 'index.html')
+  out = os.path.join(docs, 'ru' if lang == 'ru' else '', slug, 'index.html')
   os.makedirs(os.path.dirname(out), exist_ok=True)
   open(out, 'w', encoding='utf-8').write(page)
   return url
 
 
-def main():
+def main(argv=None):
+  parser = argparse.ArgumentParser(description='Builds the site from site/.')
+  parser.add_argument('--out', help='the folder to build into (default: docs/)')
+  # DOCS is read at call time: tests patch it.
+  docs = parser.parse_args(argv).out or DOCS
   urls = []
   for name in ('index', 'changelog'):
-    urls += build_page(name)
+    urls += build_page(name, docs)
   guides_dir = os.path.join(SITE, 'guides')
   template = open(os.path.join(SITE, 'guide_template.html'), encoding='utf-8').read()
   guides = []
@@ -295,15 +297,15 @@ def main():
     guides.append({'slug': slug, 'nav': meta['nav'], 'nav_ru': nav_ru, 'order': meta.get('order', 99)})
   guides.sort(key=lambda g: g['order'])
   for g in guides:
-    urls.append(build_guide(g['slug'], 'en', template, guides))
+    urls.append(build_guide(g['slug'], 'en', template, guides, docs))
     if g['nav_ru']:
-      urls.append(build_guide(g['slug'], 'ru', template, guides))
+      urls.append(build_guide(g['slug'], 'ru', template, guides, docs))
   urls.append(BASE + 'privacy.html')
   sitemap = ['<?xml version="1.0" encoding="UTF-8"?>',
              '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
   sitemap += [f'  <url><loc>{u}</loc></url>' for u in urls]
   sitemap.append('</urlset>')
-  open(os.path.join(DOCS, 'sitemap.xml'), 'w').write('\n'.join(sitemap) + '\n')
+  open(os.path.join(docs, 'sitemap.xml'), 'w').write('\n'.join(sitemap) + '\n')
   print('\n'.join(urls))
 
 
