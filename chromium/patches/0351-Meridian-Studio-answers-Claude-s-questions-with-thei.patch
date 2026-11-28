@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 27 Nov 2026 10:59:38 +0400
+Subject: [PATCH] Meridian: Studio answers Claude's questions with their own
+ options
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A question Claude asks (AskUserQuestion) reaches Studio whole, and the
+option picked there goes back to Claude Code as the tool's answers
+(«answers:» + JSON, accepted only for AskUserQuestion).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/mission/mission_control.cc       |  8 +++--
+ .../browser/meridian/workbench/guard_hook.cc  | 30 ++++++++++++++++++-
+ chrome/browser/meridian/workbench/studio.cc   |  5 +++-
+ 3 files changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/chrome/browser/meridian/mission/mission_control.cc b/chrome/browser/meridian/mission/mission_control.cc
+index 50fcbc77e7..65f99d3c3b 100644
+--- a/chrome/browser/meridian/mission/mission_control.cc
++++ b/chrome/browser/meridian/mission/mission_control.cc
+@@ -1297,10 +1297,14 @@ bool MissionControl::AnswerPermission(const std::string& id,
+     return false;
+   }
+   const Ask& ask = it->second;
+-  if (!ask.answerable ||
++  // Studio's answer to a question Claude asked: "answers:" + JSON.
++  const bool answers = ask.tool == "AskUserQuestion" &&
++                       base::StartsWith(choice, "answers:") &&
++                       choice.size() < 8000;
++  if (!answers && (!ask.answerable ||
+       !(choice == "allow" || choice == "deny" ||
+         ((choice == "always" || choice == "session") && ask.can_always) ||
+-        (choice == "project" && ask.can_project))) {
++        (choice == "project" && ask.can_project)))) {
+     return false;
+   }
+   AskDone done = std::move(it->second.done);
+diff --git a/chrome/browser/meridian/workbench/guard_hook.cc b/chrome/browser/meridian/workbench/guard_hook.cc
+index 4cffdc5bbf..efd38222d7 100644
+--- a/chrome/browser/meridian/workbench/guard_hook.cc
++++ b/chrome/browser/meridian/workbench/guard_hook.cc
+@@ -155,7 +155,10 @@ int RunPermissionHook(const base::DictValue& ev) {
+       SessionOf(ev)
+           .Set("kind", "permission")
+           .Set("tool", tool ? tool->substr(0, 64) : std::string())
+-          .Set("summary", Summary(input))
++          // A question keeps its whole text and options: Studio shows them.
++          .Set("summary", tool && *tool == "AskUserQuestion"
++                              ? base::WriteJson(input).value_or("").substr(0, 2000)
++                              : Summary(input))
+           .Set("answerable", answerable)
+           .Set("can_always", answerable && suggestions && !suggestions->empty()),
+       590000);
+@@ -164,6 +167,31 @@ int RunPermissionHook(const base::DictValue& ev) {
+   const std::string* decision =
+       reply && reply->is_dict() ? reply->GetDict().FindString("decision")
+                                 : nullptr;
++  // Studio answered the question itself: "answers:" + {question: label}.
++  // Claude Code takes the answers with the tool's input, as from its SDK.
++  if (tool && *tool == "AskUserQuestion" && decision &&
++      base::StartsWith(*decision, "answers:")) {
++    std::optional<base::Value> answers = base::JSONReader::Read(
++        std::string_view(*decision).substr(8), 0);
++    if (!answers || !answers->is_dict() || answers->GetDict().empty()) {
++      return 0;
++    }
++    std::cout << base::WriteJson(
++                     base::DictValue().Set(
++                         "hookSpecificOutput",
++                         base::DictValue()
++                             .Set("hookEventName", "PermissionRequest")
++                             .Set("decision",
++                                  base::DictValue()
++                                      .Set("behavior", "allow")
++                                      .Set("updatedInput",
++                                           input.Clone().Set(
++                                               "answers",
++                                               std::move(answers->GetDict()))))))
++                     .value_or("")
++              << std::flush;
++    return 0;
++  }
+   if (!answerable || !decision) {
+     return 0;
+   }
+diff --git a/chrome/browser/meridian/workbench/studio.cc b/chrome/browser/meridian/workbench/studio.cc
+index 063636b355..f612f0befd 100644
+--- a/chrome/browser/meridian/workbench/studio.cc
++++ b/chrome/browser/meridian/workbench/studio.cc
+@@ -193,8 +193,11 @@ void WorkbenchHandler::DispatchStudio(const std::string& method,
+     // A question of one of this page's sessions, answered from the chat.
+     const std::string id = str(0);
+     const std::string choice = str(1);
++    // Or the options picked for a question Claude asked ("answers:" + JSON;
++    // Mission Control lets it through only for AskUserQuestion).
+     if (!mission || !(choice == "allow" || choice == "deny" ||
+-                      choice == "session")) {
++                      choice == "session" ||
++                      base::StartsWith(choice, "answers:"))) {
+       return std::move(reply).Run(base::unexpected("Not an answer."));
+     }
+     std::set<std::string> ids;
+-- 
+2.36.1
+

@@ -1,0 +1,1684 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 21:49:47 +0400
+Subject: [PATCH 1/3] Meridian: Studio, the Workbench's Claude Code session as
+ a chat for designers (behind a flag, off)
+
+Studio (meridian.studio.enabled, or --enable-meridian-studio; off by
+default) shows the Workbench's Claude Code terminals as a chat. The page
+gets, only while it is on: each terminal's status, open questions and
+recent steps with Mission Control's message; a session's transcript from
+an offset; answers to its permission questions; the result site's Boost
+(as it was, before/after, undo). A session started from Studio gets
+Studio's rules (keep originals, plain words, ask before anything leaves
+the computer) through --append-system-prompt. Off, nothing changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/BUILD.gn              |   9 +
+ chrome/browser/meridian/prefs.cc              |   3 +
+ chrome/browser/meridian/prefs.h               |   8 +
+ chrome/browser/meridian/workbench/agents.cc   |  16 +-
+ chrome/browser/meridian/workbench/agents.h    |   3 +
+ chrome/browser/meridian/workbench/studio.cc   | 350 +++++++++++++
+ chrome/browser/meridian/workbench/studio.h    |  48 ++
+ .../browser/meridian/workbench/studio_core.cc | 172 ++++++
+ .../meridian/workbench/studio_point.cc        | 137 +++++
+ .../browser/meridian/workbench/studio_point.h |  69 +++
+ .../meridian/workbench/studio_point.js        | 494 ++++++++++++++++++
+ .../meridian/workbench/studio_unittest.cc     |  70 +++
+ .../meridian/workbench/workbench_handler.cc   |  41 +-
+ .../meridian/workbench/workbench_handler.h    |   9 +
+ 14 files changed, 1420 insertions(+), 9 deletions(-)
+ create mode 100644 chrome/browser/meridian/workbench/studio.cc
+ create mode 100644 chrome/browser/meridian/workbench/studio.h
+ create mode 100644 chrome/browser/meridian/workbench/studio_core.cc
+ create mode 100644 chrome/browser/meridian/workbench/studio_point.cc
+ create mode 100644 chrome/browser/meridian/workbench/studio_point.h
+ create mode 100644 chrome/browser/meridian/workbench/studio_point.js
+ create mode 100644 chrome/browser/meridian/workbench/studio_unittest.cc
+
+diff --git a/chrome/browser/meridian/BUILD.gn b/chrome/browser/meridian/BUILD.gn
+index 85d531d0b8..41f5f72bff 100644
+--- a/chrome/browser/meridian/BUILD.gn
++++ b/chrome/browser/meridian/BUILD.gn
+@@ -222,6 +222,8 @@ source_set("workbench_core") {
+     "workbench/agent_insights.h",
+     "workbench/context_insights.cc",
+     "workbench/context_insights.h",
++    "workbench/studio.h",
++    "workbench/studio_core.cc",
+   ]
+   public_deps = [
+     ":test_switches", "//base" ]
+@@ -255,12 +257,15 @@ action("agent_embed") {
+   inputs = [
+     "agent/agent_page.js",
+     "agent/agent_tools.json",
++    "workbench/studio_point.js",
+   ]
+   outputs = [ "$target_gen_dir/agent/agent_embed.h" ]
+   args = [
+     rebase_path(outputs[0], root_build_dir),
+     "kAgentPageJs=" + rebase_path("agent/agent_page.js", root_build_dir),
+     "kAgentToolsJson=" + rebase_path("agent/agent_tools.json", root_build_dir),
++    "kStudioPointJs=" +
++        rebase_path("workbench/studio_point.js", root_build_dir),
+   ]
+ }
+ 
+@@ -396,6 +401,9 @@ source_set("meridian") {
+     "workbench/workbench_service.h",
+     "workbench/workbench_service_factory.cc",
+     "workbench/workbench_service_factory.h",
++    "workbench/studio.cc",
++    "workbench/studio_point.cc",
++    "workbench/studio_point.h",
+     "workbench/workbench_handler.cc",
+     "workbench/workbench_handler.h",
+     "workbench/workbench_source.cc",
+@@ -613,6 +621,7 @@ test("meridian_unittests") {
+     "workbench/guard_hook_unittest.cc",
+     "workbench/project_fs_unittest.cc",
+     "workbench/sandbox_unittest.cc",
++    "workbench/studio_unittest.cc",
+     "workbench/secret_files_unittest.cc",
+     "workbench/terminal_unittest.cc",
+   ]
+diff --git a/chrome/browser/meridian/prefs.cc b/chrome/browser/meridian/prefs.cc
+index ddc0c6eb59..f9976563a6 100644
+--- a/chrome/browser/meridian/prefs.cc
++++ b/chrome/browser/meridian/prefs.cc
+@@ -63,6 +63,9 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
+   registry->RegisterIntegerPref(kSleepAfterMinutes, 0);
+   registry->RegisterBooleanPref(kSleepNeverMigrated, false);
+   registry->RegisterBooleanPref(kCleanLinks, true);
++  registry->RegisterBooleanPref(kStudioEnabled, false);
++  registry->RegisterStringPref(kStudioPersona, std::string());
++  registry->RegisterBooleanPref(kStudioFigma, false);
+   registry->RegisterBooleanPref(kHideCookieBanners, true);
+ }
+ 
+diff --git a/chrome/browser/meridian/prefs.h b/chrome/browser/meridian/prefs.h
+index 3f96419170..2dfc407095 100644
+--- a/chrome/browser/meridian/prefs.h
++++ b/chrome/browser/meridian/prefs.h
+@@ -124,6 +124,14 @@ inline constexpr char kSleepAfterMinutes[] = "meridian.sleep_after_minutes";
+ inline constexpr char kSleepNeverMigrated[] = "meridian.sleep_never_migrated";
+ // Links copied without tracking parameters (utm_*, fbclid…).
+ inline constexpr char kCleanLinks[] = "meridian.clean_links";
++// Studio (the Workbench as a chat, for designers and managers): off until
++// turned on.
++inline constexpr char kStudioEnabled[] = "meridian.studio.enabled";
++// Who the person said they are in Studio's "Кто вы?" (developer, designer,
++// manager, everyday); "" until they pick.
++inline constexpr char kStudioPersona[] = "meridian.studio.persona";
++// Studio's tasks read Figma (the desktop app's own MCP server, read-only).
++inline constexpr char kStudioFigma[] = "meridian.studio.figma";
+ // Cookie notices hidden (EasyList Cookie List's element hiding rules).
+ inline constexpr char kHideCookieBanners[] = "meridian.hide_cookie_banners";
+ 
+diff --git a/chrome/browser/meridian/workbench/agents.cc b/chrome/browser/meridian/workbench/agents.cc
+index 32517b979b..cf82a7d966 100644
+--- a/chrome/browser/meridian/workbench/agents.cc
++++ b/chrome/browser/meridian/workbench/agents.cc
+@@ -399,13 +399,17 @@ base::expected<LaunchSpec, std::string> MakeLaunchSpec(
+   if (agent->mcp) {
+     spec.browser_tools = true;
+     if (kind == "claude") {
++      base::DictValue servers = base::DictValue().Set(
++          "meridian", base::DictValue()
++                          .Set("command", bridge.command)
++                          .Set("args", bridge_args.Clone()));
++      if (!bridge.figma_url.empty()) {
++        servers.Set("figma", base::DictValue()
++                                 .Set("type", "http")
++                                 .Set("url", bridge.figma_url));
++      }
+       std::optional<base::FilePath> file = private_file(
+-          "mcp", base::DictValue().Set(
+-                     "mcpServers",
+-                     base::DictValue().Set(
+-                         "meridian", base::DictValue()
+-                                         .Set("command", bridge.command)
+-                                         .Set("args", bridge_args.Clone()))));
++          "mcp", base::DictValue().Set("mcpServers", std::move(servers)));
+       if (file) {
+         // A variadic flag: keep it last.
+         spec.argv.push_back("--mcp-config");
+diff --git a/chrome/browser/meridian/workbench/agents.h b/chrome/browser/meridian/workbench/agents.h
+index e019d3a285..2c63110384 100644
+--- a/chrome/browser/meridian/workbench/agents.h
++++ b/chrome/browser/meridian/workbench/agents.h
+@@ -48,6 +48,9 @@ struct McpBridge {
+   // Vault secrets in the session's environment (names only): the agent is
+   // told, so it reads them instead of hunting for the blanked .env values.
+   std::vector<std::string> secret_names;
++  // Studio: the Figma desktop app's own MCP server (read-only design
++  // context) for Claude Code, when the person connected Figma ("": none).
++  std::string figma_url;
+ };
+ 
+ // `kind`: "shell" or an agent id. Blocking (writes temp files).
+diff --git a/chrome/browser/meridian/workbench/studio.cc b/chrome/browser/meridian/workbench/studio.cc
+new file mode 100644
+index 0000000000..d613c39550
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/studio.cc
+@@ -0,0 +1,350 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/workbench/studio.h"
++
++#include <optional>
++#include <utility>
++#include <vector>
++
++#include "base/command_line.h"
++#include "base/functional/bind.h"
++#include "base/strings/string_util.h"
++#include "base/task/thread_pool.h"
++#include "chrome/browser/meridian/boosts/boost_service.h"
++#include "chrome/browser/meridian/boosts/boost_service_factory.h"
++#include "chrome/browser/meridian/mission/mission_control.h"
++#include "chrome/browser/meridian/mission/mission_control_factory.h"
++#include "chrome/browser/meridian/prefs.h"
++#include "chrome/browser/meridian/setup_profile.h"
++#include "chrome/browser/meridian/space_profiles.h"
++#include "chrome/browser/meridian/test_switches.h"
++#include "chrome/browser/meridian/workbench/studio_point.h"
++#include "chrome/browser/meridian/workbench/workbench_handler.h"
++#include "chrome/browser/profiles/profile.h"
++#include "components/prefs/pref_service.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_ui.h"
++#include "url/gurl.h"
++
++namespace meridian::workbench {
++
++bool StudioEnabled(Profile* profile) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(
++          "enable-meridian-studio") ||
++      HasTestSwitch("meridian-studio")) {
++    return true;
++  }
++  return profile &&
++         MainProfileFor(profile)->GetPrefs()->GetBoolean(prefs::kStudioEnabled);
++}
++
++StudioPoint* WorkbenchHandler::studio_point() {
++  if (!studio_point_) {
++    studio_point_ = std::make_unique<StudioPoint>(base::BindRepeating(
++        [](base::WeakPtr<WorkbenchHandler> self, base::Value event) {
++          if (self) {
++            self->Emit("wb:command", std::move(event));
++          }
++        },
++        weak_factory_.GetWeakPtr()));
++  }
++  return studio_point_.get();
++}
++
++void WorkbenchHandler::DispatchStudio(const std::string& method,
++                                      const base::ListValue& params,
++                                      Reply reply) {
++  auto str = [&](size_t i) {
++    return i < params.size() && params[i].is_string() ? params[i].GetString()
++                                                      : std::string();
++  };
++  const bool on = StudioEnabled(profile_);
++  if (method == "studioInfo") {
++    base::DictValue info;
++    info.Set("enabled", on);
++    if (!on) {
++      return std::move(reply).Run(base::Value(std::move(info)));
++    }
++    info.Set("figma", MainProfileFor(profile_)->GetPrefs()->GetBoolean(
++                          prefs::kStudioFigma));
++    // Picked in "Кто вы?", else a guess (the tour's): the picker starts on it.
++    const std::string chosen =
++        MainProfileFor(profile_)->GetPrefs()->GetString(prefs::kStudioPersona);
++    info.Set("chosen", !chosen.empty());
++    std::string forced = TestSwitchValue("meridian-test-persona");
++    // "Кто вы?" shows until the person picks (tests that name a persona skip
++    // it).
++    info.Set("ask", chosen.empty() && forced.empty());
++    if (!chosen.empty() || !forced.empty() ||
++        MainProfileFor(profile_)->GetPrefs()->GetString(prefs::kMode) ==
++            "developer") {
++      info.Set("persona", !chosen.empty()   ? chosen
++                          : !forced.empty() ? forced
++                                            : std::string("developer"));
++      return std::move(reply).Run(base::Value(std::move(info)));
++    }
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++        base::BindOnce(
++            [] { return GuessPersona(InstalledApps(), StrongDevSignals()); }),
++        base::BindOnce(
++            [](Reply reply, base::DictValue info, std::string persona) {
++              info.Set("persona", persona);
++              std::move(reply).Run(base::Value(std::move(info)));
++            },
++            std::move(reply), std::move(info)));
++    return;
++  }
++  if (!on) {
++    return std::move(reply).Run(base::unexpected("Studio is off."));
++  }
++  if (method == "studioFigma") {
++    // Connect (true) or disconnect Figma for Studio's next tasks.
++    const bool connect =
++        !params.empty() && params[0].is_bool() && params[0].GetBool();
++    MainProfileFor(profile_)->GetPrefs()->SetBoolean(prefs::kStudioFigma,
++                                                     connect);
++    return std::move(reply).Run(base::Value(connect));
++  }
++  if (method == "studioSetPersona") {
++    const std::string persona = str(0);
++    if (persona != "developer" && persona != "designer" &&
++        persona != "manager" && persona != "everyday") {
++      return std::move(reply).Run(base::unexpected("Not a persona."));
++    }
++    MainProfileFor(profile_)->GetPrefs()->SetString(prefs::kStudioPersona,
++                                                    persona);
++    return std::move(reply).Run(base::Value(true));
++  }
++  tabs::TabInterface* tab =
++      tabs::TabInterface::MaybeGetFromContents(web_ui()->GetWebContents());
++  const int self = tab ? tab->GetHandle().raw_value() : 0;
++  mission::MissionControl* mission =
++      mission::MissionControlFactory::GetForProfile(profile_);
++  if (method == "studioTranscript") {
++    // Only a terminal of this page, and only its own session's transcript.
++    const std::string term = str(0);
++    if (!terms_.contains(term) || !mission) {
++      return std::move(reply).Run(base::unexpected("No such terminal."));
++    }
++    const std::string path = mission->TranscriptOf(self, term);
++    const int64_t offset =
++        params.size() > 1 && params[1].is_double()
++            ? static_cast<int64_t>(params[1].GetDouble())
++            : (params.size() > 1 && params[1].is_int() ? params[1].GetInt()
++                                                       : 0);
++    if (path.empty()) {
++      return std::move(reply).Run(base::Value(base::DictValue()
++                                                  .Set("size", 0)
++                                                  .Set("next", 0)
++                                                  .Set("text", "")
++                                                  .Set("reset", false)));
++    }
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++        base::BindOnce(&ReadTranscriptChunk, base::FilePath::FromUTF8Unsafe(path),
++                       offset),
++        base::BindOnce(
++            [](Reply reply, base::DictValue chunk) {
++              std::move(reply).Run(base::Value(std::move(chunk)));
++            },
++            std::move(reply)));
++    return;
++  }
++  if (method == "studioAnswer") {
++    // A question of one of this page's sessions, answered from the chat.
++    const std::string id = str(0);
++    const std::string choice = str(1);
++    if (!mission || !(choice == "allow" || choice == "deny" ||
++                      choice == "session")) {
++      return std::move(reply).Run(base::unexpected("Not an answer."));
++    }
++    std::set<std::string> ids;
++    for (const auto& [term_id, term] : terms_) {
++      ids.insert(term_id);
++    }
++    const base::DictValue terms = StudioTerms(mission->Snapshot(), self, ids);
++    bool ours = false;
++    for (const auto [term_id, entry] : terms) {
++      for (const base::Value& a : *entry.GetDict().FindList("asks")) {
++        const std::string* ask_id = a.GetDict().FindString("id");
++        ours = ours || (ask_id && *ask_id == id);
++      }
++    }
++    if (!ours) {
++      return std::move(reply).Run(base::unexpected("That question is gone."));
++    }
++    return std::move(reply).Run(
++        base::Value(mission->AnswerPermission(id, choice)));
++  }
++  if (method == "studioPoint") {
++    // Point and say on the site tab Studio opened (studio_point.h).
++    const std::string op = str(0);
++    StudioPoint* point = studio_point();
++    if (op == "start") {
++      base::DictValue config;
++      if (params.size() > 1 && params[1].is_dict()) {
++        config = params[1].GetDict().Clone();
++      }
++      return std::move(reply).Run(base::Value(point->Start(std::move(config))));
++    }
++    if (op == "stop") {
++      point->Stop();
++      return std::move(reply).Run(base::Value(true));
++    }
++    if (op == "pins") {
++      base::ListValue pins;
++      if (params.size() > 1 && params[1].is_list()) {
++        for (const base::Value& p : params[1].GetList()) {
++          if (p.is_dict() && pins.size() < 30) {
++            pins.Append(p.Clone());
++          }
++        }
++      }
++      point->Pins(std::move(pins));
++      return std::move(reply).Run(base::Value(true));
++    }
++    if (op == "brand") {
++      // {op: "read" | "check" | "show", arg}: the brand on the site tab.
++      const base::DictValue* d =
++          params.size() > 1 && params[1].is_dict() ? &params[1].GetDict()
++                                                   : nullptr;
++      const std::string* what = d ? d->FindString("op") : nullptr;
++      if (!what || !(*what == "read" || *what == "check" || *what == "show")) {
++        return std::move(reply).Run(base::unexpected("Unknown brand action."));
++      }
++      const base::Value* arg = d->Find("arg");
++      point->Brand(*what, arg ? arg->Clone() : base::Value(),
++                   base::BindOnce(
++                       [](Reply reply, base::Value result) {
++                         std::move(reply).Run(std::move(result));
++                       },
++                       std::move(reply)));
++      return;
++    }
++    if (op == "settled") {
++      point->Settled();
++      return std::move(reply).Run(base::Value(true));
++    }
++    if (op == "site") {
++      content::WebContents* site = point->site();
++      return std::move(reply).Run(base::Value(
++          base::DictValue()
++              .Set("open", !!site)
++              .Set("on", point->on())
++              .Set("url", site ? site->GetLastCommittedURL().spec()
++                               : std::string())));
++    }
++    return std::move(reply).Run(base::unexpected("Unknown point action."));
++  }
++  if (method == "studioBoost") {
++    // The result pane's Boost: what the site has now (to put back), До/После
++    // (the boost on or off) and "undo" (the site as it was before the task).
++    const std::string op = str(0);
++    const std::string host = str(1);
++    if (host.empty() || BoostHostFor(GURL("https://" + host)) != host) {
++      return std::move(reply).Run(base::unexpected("Not a site."));
++    }
++    BoostService* service = BoostServiceFactory::GetForProfile(profile_);
++    if (!service) {
++      return std::move(reply).Run(base::unexpected("Boosts are unavailable."));
++    }
++    auto list = [&] {
++      base::ListValue all;
++      for (const Boost* b : service->AllForHost(host)) {
++        if (b->host == host) {
++          all.Append(b->ToValue());
++        }
++      }
++      return all;
++    };
++    if (op == "get") {
++      return std::move(reply).Run(base::Value(list()));
++    }
++    if (op == "enable") {
++      const std::string id = str(2);
++      const bool enabled =
++          params.size() > 3 && params[3].is_bool() && params[3].GetBool();
++      for (const Boost& b : service->boosts()) {
++        if (b.id == id && b.host == host) {
++          Boost copy = b;
++          copy.enabled = enabled;
++          service->Set(std::move(copy));
++          return std::move(reply).Run(base::Value(list()));
++        }
++      }
++      return std::move(reply).Run(base::unexpected("No such boost."));
++    }
++    if (op == "hand") {
++      // The person's hand changes (point and say), as the CSS of a boost of
++      // their own; the site's first boost stays the one agents change.
++      const std::string id = "studio-hand-" + host;
++      const std::string css = str(2);
++      if (css.size() > 200000) {
++        return std::move(reply).Run(base::unexpected("Too much CSS."));
++      }
++      const Boost* hand = nullptr;
++      for (const Boost& b : service->boosts()) {
++        if (b.id == id) {
++          hand = &b;
++        }
++      }
++      if (css.empty()) {
++        if (hand) {
++          service->Remove(id);
++        }
++        return std::move(reply).Run(base::Value(list()));
++      }
++      if (!hand && service->AllForHost(host).empty()) {
++        Boost site;
++        site.host = host;
++        site.name = host;
++        service->Set(std::move(site));
++      }
++      Boost boost = hand ? *hand : Boost();
++      boost.id = id;
++      boost.host = host;
++      boost.name = "Studio · " + host;
++      boost.enabled = true;
++      boost.css = css;
++      service->Set(std::move(boost));
++      return std::move(reply).Run(base::Value(list()));
++    }
++    if (op == "restore") {
++      // The site's boosts exactly as they were.
++      if (params.size() < 3 || !params[2].is_list()) {
++        return std::move(reply).Run(base::unexpected("Nothing to restore."));
++      }
++      std::vector<Boost> before;
++      for (const base::Value& v : params[2].GetList()) {
++        if (!v.is_dict()) {
++          continue;
++        }
++        std::optional<Boost> b = Boost::FromValue(v.GetDict());
++        if (b && b->host == host) {
++          before.push_back(std::move(*b));
++        }
++      }
++      std::vector<std::string> now;
++      for (const Boost* b : service->AllForHost(host)) {
++        if (b->host == host) {
++          now.push_back(b->id);
++        }
++      }
++      for (const std::string& id : now) {
++        service->Remove(id);
++      }
++      for (Boost& b : before) {
++        service->Set(std::move(b));
++      }
++      return std::move(reply).Run(base::Value(list()));
++    }
++    return std::move(reply).Run(base::unexpected("Unknown boost action."));
++  }
++  std::move(reply).Run(base::unexpected("Unknown method: " + method));
++}
++
++}  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/studio.h b/chrome/browser/meridian/workbench/studio.h
+new file mode 100644
+index 0000000000..b4025d719f
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/studio.h
+@@ -0,0 +1,48 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_WORKBENCH_STUDIO_H_
++#define CHROME_BROWSER_MERIDIAN_WORKBENCH_STUDIO_H_
++
++#include <cstdint>
++#include <set>
++#include <string>
++
++#include "base/files/file_path.h"
++#include "base/values.h"
++
++class Profile;
++
++namespace meridian::workbench {
++
++// Studio: the Workbench's Claude Code sessions shown as a chat for people who
++// don't use a terminal (designers, managers). The same page, the same
++// terminals; only another view. Off unless `meridian.studio.enabled` (main
++// profile) or --enable-meridian-studio; off, nothing of it runs.
++bool StudioEnabled(Profile* profile);
++
++// What a session started from Studio is told on top of Claude Code's own
++// prompt (--append-system-prompt): keep the person's originals, say what it
++// does in plain words, ask before anything leaves the computer.
++std::string StudioRules();
++
++// The Figma desktop app's MCP server (Preferences › Enable Dev Mode MCP
++// Server): design context only, nothing in Figma changes.
++inline constexpr char kStudioFigmaMcpUrl[] = "http://127.0.0.1:3845/mcp";
++
++// Mission Control's view of this Workbench's terminals for Studio, by
++// terminal id: status, what it does now, its open questions and recent steps.
++base::DictValue StudioTerms(const base::DictValue& snapshot,
++                            int owner_tab,
++                            const std::set<std::string>& term_ids);
++
++// The transcript from `offset`: whole lines only, at most 8 MB (a longer
++// line is skipped). `next` is where to go on; a file that shrank (a new
++// session) starts over at 0. Blocking.
++base::DictValue ReadTranscriptChunk(const base::FilePath& path,
++                                    int64_t offset);
++
++}  // namespace meridian::workbench
++
++#endif  // CHROME_BROWSER_MERIDIAN_WORKBENCH_STUDIO_H_
+diff --git a/chrome/browser/meridian/workbench/studio_core.cc b/chrome/browser/meridian/workbench/studio_core.cc
+new file mode 100644
+index 0000000000..33eb550d39
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/studio_core.cc
+@@ -0,0 +1,172 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Studio's parts that need no browser (unit-tested): its rules, Mission
++// Control's view for it, and reading a transcript.
++
++#include <algorithm>
++#include <map>
++#include <optional>
++#include <utility>
++
++#include "base/containers/span.h"
++#include "base/files/file.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/meridian/workbench/studio.h"
++
++namespace meridian::workbench {
++
++namespace {
++
++constexpr int64_t kChunk = 8 * 1024 * 1024;
++constexpr size_t kLogShown = 40;
++
++}  // namespace
++
++std::string StudioRules() {
++  return "You are working in Meridian Studio, for a person who does not use a "
++         "terminal (a designer or a manager). They see your work as a chat "
++         "with steps, and the result next to it. Rules:\n"
++         "1. Never overwrite, move or delete the person's original files. "
++         "Before changing a file, copy it into a folder named \"Drafts\" "
++         "(\"Черновики\" if the person writes in Russian) in the project "
++         "folder and change the copy. New files go there too.\n"
++         "2. Keep notes.md in that folder: what you changed and why, in plain "
++         "words, a few lines.\n"
++         "3. Say what you do in plain, friendly words. No jargon: never "
++         "mention MCP, CLI, tokens, terminals, git, commits or flags.\n"
++         "4. Never send, publish, upload, push or post anything outside this "
++         "computer without asking first.\n"
++         "5. To change how a live website looks, use Meridian's browser tools "
++         "on the open tab (set_boost with CSS): it can be undone at once. "
++         "Take a screenshot before and after.\n"
++         "6. If the task is big, first propose splitting it into 2-4 steps "
++         "and wait for a yes.\n"
++         "7. Answer in the language the person writes in.\n"
++         "8. Ask your questions as plain text at the end of your answer, not "
++         "with a question or plan tool: the person answers in the chat.\n"
++         "9. A remark about one element of the open site goes on the page as "
++         "a pin: write it as [[pin: <CSS selector> | <short remark>]] in your "
++         "answer.\n"
++         "10. When the person changed things by hand on the page, keep those "
++         "changes: never undo or overwrite them.";
++}
++
++base::DictValue StudioTerms(const base::DictValue& snapshot,
++                            int owner_tab,
++                            const std::set<std::string>& term_ids) {
++  base::DictValue out;
++  std::map<std::string, std::string> term_of_node;
++  if (const base::ListValue* nodes = snapshot.FindList("nodes")) {
++    for (const base::Value& v : *nodes) {
++      const base::DictValue& n = v.GetDict();
++      const std::string* term = n.FindString("termId");
++      const std::string* id = n.FindString("id");
++      if (!term || !id || n.FindInt("ownerTab").value_or(0) != owner_tab ||
++          !term_ids.contains(*term)) {
++        continue;
++      }
++      // The session's own row (its subagents have a parent).
++      const std::string* parent = n.FindString("parentId");
++      if (parent && !parent->empty()) {
++        continue;
++      }
++      term_of_node[*id] = *term;
++      base::DictValue entry;
++      for (const char* key : {"status", "statusText", "label"}) {
++        if (const std::string* s = n.FindString(key)) {
++          entry.Set(key, *s);
++        }
++      }
++      if (const base::Value* tool = n.Find("tool"); tool && tool->is_dict()) {
++        entry.Set("tool", tool->Clone());
++      }
++      if (std::optional<double> w = n.FindDouble("waitingSince")) {
++        entry.Set("waitingSince", *w);
++      }
++      base::ListValue log;
++      if (const base::ListValue* l = n.FindList("log")) {
++        size_t from = l->size() > kLogShown ? l->size() - kLogShown : 0;
++        for (size_t i = from; i < l->size(); ++i) {
++          log.Append((*l)[i].Clone());
++        }
++      }
++      entry.Set("log", std::move(log));
++      entry.Set("asks", base::ListValue());
++      out.Set(*term, std::move(entry));
++    }
++  }
++  if (const base::ListValue* asks = snapshot.FindList("asks")) {
++    for (const base::Value& v : *asks) {
++      const base::DictValue& a = v.GetDict();
++      const std::string* node = a.FindString("nodeId");
++      if (!node || !term_of_node.contains(*node)) {
++        continue;
++      }
++      base::DictValue* entry = out.FindDict(term_of_node[*node]);
++      if (!entry) {
++        continue;
++      }
++      base::DictValue ask;
++      for (const char* key : {"id", "kind", "tool", "summary"}) {
++        if (const std::string* s = a.FindString(key)) {
++          ask.Set(key, *s);
++        }
++      }
++      ask.Set("answerable", a.FindBool("answerable").value_or(false));
++      ask.Set("canAlways", a.FindBool("canAlways").value_or(false));
++      entry->FindList("asks")->Append(std::move(ask));
++    }
++  }
++  return out;
++}
++
++base::DictValue ReadTranscriptChunk(const base::FilePath& path,
++                                    int64_t offset) {
++  base::File file(path, base::File::FLAG_OPEN | base::File::FLAG_READ);
++  if (!file.IsValid()) {
++    return base::DictValue()
++        .Set("size", 0)
++        .Set("next", 0)
++        .Set("text", "")
++        .Set("reset", false);
++  }
++  const int64_t size = file.GetLength();
++  bool reset = false;
++  if (offset < 0 || offset > size) {
++    offset = 0;
++    reset = true;
++  }
++  const int64_t want = std::min<int64_t>(kChunk, size - offset);
++  std::string text(static_cast<size_t>(std::max<int64_t>(want, 0)), '\0');
++  std::optional<size_t> read =
++      want > 0 ? file.Read(offset, base::as_writable_byte_span(text))
++               : std::optional<size_t>(0);
++  text.resize(read.value_or(0));
++  // Whole lines only: the last one may still be being written.
++  size_t end = text.rfind('\n');
++  bool skipped = false;
++  if (end == std::string::npos && want == kChunk && !text.empty()) {
++    // One line longer than a chunk (a huge picture): skipped; the reader
++    // drops the rest of it, which doesn't parse.
++    skipped = true;
++    end = text.size() - 1;
++  }
++  text.resize(end == std::string::npos ? 0 : end + 1);
++  const double next = static_cast<double>(offset + text.size());
++  if (skipped) {
++    text.clear();
++  }
++  if (!base::IsStringUTF8AllowingNoncharacters(text)) {
++    text = base::UTF16ToUTF8(base::UTF8ToUTF16(text));
++  }
++  return base::DictValue()
++      .Set("size", static_cast<double>(size))
++      .Set("next", next)
++      .Set("text", std::move(text))
++      .Set("reset", reset);
++}
++
++}  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/studio_point.cc b/chrome/browser/meridian/workbench/studio_point.cc
+new file mode 100644
+index 0000000000..c93c1cec28
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/studio_point.cc
+@@ -0,0 +1,137 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/workbench/studio_point.h"
++
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/json/json_writer.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/browser/meridian/agent/agent_embed.h"
++#include "chrome/common/chrome_isolated_world_ids.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/web_contents.h"
++
++namespace meridian::workbench {
++
++namespace {
++
++// The overlay's object, (re)made when the page has none (a new page).
++std::string Ensure() {
++  return std::string(kStudioPointJs) + "\n";
++}
++
++}  // namespace
++
++StudioPoint::StudioPoint(base::RepeatingCallback<void(base::Value)> emit)
++    : emit_(std::move(emit)) {}
++
++StudioPoint::~StudioPoint() = default;
++
++void StudioPoint::SetSite(content::WebContents* contents) {
++  site_ = contents ? contents->GetWeakPtr() : nullptr;
++}
++
++void StudioPoint::Run(const std::string& script) {
++  content::WebContents* contents = site_.get();
++  if (!contents) {
++    return;
++  }
++  contents->GetPrimaryMainFrame()->ExecuteJavaScriptInIsolatedWorld(
++      base::UTF8ToUTF16(script), base::NullCallback(),
++      ISOLATED_WORLD_ID_CHROME_INTERNAL);
++}
++
++bool StudioPoint::Start(base::DictValue config) {
++  if (!site_) {
++    return false;
++  }
++  config_ = std::move(config);
++  on_ = true;
++  Run(Ensure() + "window.__meridianStudioPoint.start(" +
++      base::WriteJson(config_).value_or("{}") + ");" +
++      "window.__meridianStudioPoint.pins(" +
++      base::WriteJson(pins_).value_or("[]") + ");");
++  timer_.Start(FROM_HERE, base::Milliseconds(200), this, &StudioPoint::Poll);
++  return true;
++}
++
++void StudioPoint::Stop() {
++  on_ = false;
++  timer_.Stop();
++  Run("window.__meridianStudioPoint && window.__meridianStudioPoint.stop();");
++}
++
++void StudioPoint::Pins(base::ListValue pins) {
++  pins_ = std::move(pins);
++  Run(Ensure() + "window.__meridianStudioPoint.pins(" +
++      base::WriteJson(pins_).value_or("[]") + ");");
++}
++
++void StudioPoint::Settled() {
++  Run("window.__meridianStudioPoint && window.__meridianStudioPoint.settled();");
++}
++
++void StudioPoint::Brand(const std::string& op,
++                        base::Value arg,
++                        base::OnceCallback<void(base::Value)> done) {
++  content::WebContents* contents = site_.get();
++  if (!contents) {
++    return std::move(done).Run(base::Value());
++  }
++  contents->GetPrimaryMainFrame()->ExecuteJavaScriptInIsolatedWorld(
++      base::UTF8ToUTF16(Ensure() + "window.__meridianStudioPoint.brand(" +
++                        base::WriteJson(base::Value(op)).value_or("\"\"") +
++                        ", " + base::WriteJson(arg).value_or("null") + ");"),
++      std::move(done), ISOLATED_WORLD_ID_CHROME_INTERNAL);
++}
++
++void StudioPoint::Poll() {
++  content::WebContents* contents = site_.get();
++  if (!contents) {
++    on_ = false;
++    timer_.Stop();
++    emit_.Run(base::Value(base::DictValue()
++                              .Set("type", "studio-point")
++                              .Set("on", false)
++                              .Set("gone", true)
++                              .Set("events", base::ListValue())));
++    return;
++  }
++  contents->GetPrimaryMainFrame()->ExecuteJavaScriptInIsolatedWorld(
++      u"window.__meridianStudioPoint ? window.__meridianStudioPoint.take() : "
++      u"null",
++      base::BindOnce(&StudioPoint::OnPolled, weak_factory_.GetWeakPtr()),
++      ISOLATED_WORLD_ID_CHROME_INTERNAL);
++}
++
++void StudioPoint::OnPolled(base::Value result) {
++  if (!on_) {
++    return;
++  }
++  // A new page: the overlay again, as it was.
++  if (!result.is_dict()) {
++    Run(Ensure() + "window.__meridianStudioPoint.start(" +
++        base::WriteJson(config_).value_or("{}") + ");" +
++        "window.__meridianStudioPoint.pins(" +
++        base::WriteJson(pins_).value_or("[]") + ");");
++    return;
++  }
++  const base::ListValue* events = result.GetDict().FindList("events");
++  const bool still = result.GetDict().FindBool("on").value_or(false);
++  if (!still) {
++    on_ = false;
++    timer_.Stop();
++  }
++  if ((events && !events->empty()) || !still) {
++    emit_.Run(base::Value(
++        base::DictValue()
++            .Set("type", "studio-point")
++            .Set("on", still)
++            .Set("events", events ? events->Clone() : base::ListValue())));
++  }
++}
++
++}  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/studio_point.h b/chrome/browser/meridian/workbench/studio_point.h
+new file mode 100644
+index 0000000000..d374faf99a
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/studio_point.h
+@@ -0,0 +1,69 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_MERIDIAN_WORKBENCH_STUDIO_POINT_H_
++#define CHROME_BROWSER_MERIDIAN_WORKBENCH_STUDIO_POINT_H_
++
++#include <string>
++
++#include "base/functional/callback.h"
++#include "base/memory/weak_ptr.h"
++#include "base/timer/timer.h"
++#include "base/values.h"
++
++namespace content {
++class WebContents;
++}
++
++namespace meridian::workbench {
++
++// Studio's "point and say" on the site it shows next to itself
++// (studio_point.js, in an isolated world of that tab): the person picks
++// elements, says what to change or changes them by hand; Studio's remarks
++// show there as pins. What happens there reaches the Studio page through
++// `emit` ({type: "studio-point", on, events}).
++class StudioPoint {
++ public:
++  explicit StudioPoint(base::RepeatingCallback<void(base::Value)> emit);
++  StudioPoint(const StudioPoint&) = delete;
++  StudioPoint& operator=(const StudioPoint&) = delete;
++  ~StudioPoint();
++
++  // The tab Studio opened the site in (its result).
++  void SetSite(content::WebContents* contents);
++  content::WebContents* site() const { return site_.get(); }
++
++  // On: the overlay in the site's tab (again after it reloads), `config`
++  // its language and colours. False when there is no site tab.
++  bool Start(base::DictValue config);
++  void Stop();
++  bool on() const { return on_; }
++  // Studio's remarks as numbered pins ([{n, sel, text}]).
++  void Pins(base::ListValue pins);
++  // The hand changes are in the site's Boost now: the page's copy goes.
++  void Settled();
++  // The brand (studio_point.js): "read" what the page uses, "check" it
++  // against `arg` (brand colours), "show" places. `done` gets the result
++  // (null without a site tab).
++  void Brand(const std::string& op,
++             base::Value arg,
++             base::OnceCallback<void(base::Value)> done);
++
++ private:
++  void Run(const std::string& script);
++  void Poll();
++  void OnPolled(base::Value result);
++
++  base::RepeatingCallback<void(base::Value)> emit_;
++  base::WeakPtr<content::WebContents> site_;
++  base::DictValue config_;
++  base::ListValue pins_;
++  bool on_ = false;
++  base::RepeatingTimer timer_;
++  base::WeakPtrFactory<StudioPoint> weak_factory_{this};
++};
++
++}  // namespace meridian::workbench
++
++#endif  // CHROME_BROWSER_MERIDIAN_WORKBENCH_STUDIO_POINT_H_
+diff --git a/chrome/browser/meridian/workbench/studio_point.js b/chrome/browser/meridian/workbench/studio_point.js
+new file mode 100644
+index 0000000000..d0a28f01f5
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/studio_point.js
+@@ -0,0 +1,494 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Studio's "point and say" on the site next to it (runs in an isolated world
++// of that tab; studio_point.cc). Hover outlines the element under the
++// pointer; a click picks it (Shift adds more): a frame with its name, a field
++// to say what to change, and handles to change it by hand (colour, text size,
++// corner radius, spacing). Hand changes show at once in the page and go out
++// as events (Studio puts them into the site's Boost); so do the words. Studio's
++// remarks show as numbered pins on their elements. Esc ends it.
++//   window.__meridianStudioPoint.start(cfg) / .stop() / .take() / .pins(list)
++(() => {
++  if (window.__meridianStudioPoint) return;
++  const S = { on: false, sel: [], events: [], pins: [], cfg: {}, hover: null, host: null, root: null, live: new Map(), open: -1 };
++  const T = {
++    ru: { button: 'Кнопка', link: 'Ссылка', heading: 'Заголовок', image: 'Картинка', text: 'Текст', field: 'Поле', menu: 'Меню', block: 'Блок', card: 'Карточка',
++      more: (n) => `+ ещё ${n}`, say: 'Скажите, что поменять…', chips: ['Крупнее', 'Мельче', 'В цвет бренда', 'Убрать'], all: 'Все такие — одинаковыми',
++      color: 'Цвет', size: 'Текст', radius: 'Скругление', space: 'Отступы', site: 'цвета сайта', note: 'Сразу на странице, через Boost — можно отменить. Claude узнает, что вы поменяли.',
++      hero: 'Ткни и скажи', esc: 'Esc — выйти', yes: 'Да', no: 'Нет' },
++    en: { button: 'Button', link: 'Link', heading: 'Heading', image: 'Picture', text: 'Text', field: 'Field', menu: 'Menu', block: 'Block', card: 'Card',
++      more: (n) => `+ ${n} more`, say: 'Say what to change…', chips: ['Bigger', 'Smaller', 'In brand colour', 'Remove'], all: 'Make all like it the same',
++      color: 'Colour', size: 'Text', radius: 'Corners', space: 'Spacing', site: 'site colours', note: 'Right on the page, through Boost — can be undone. Claude learns what you changed.',
++      hero: 'Point and say', esc: 'Esc — exit', yes: 'Yes', no: 'No' },
++  };
++  const w = () => T[S.cfg.lang === 'ru' ? 'ru' : 'en'];
++  const css = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/[^\w-]/g, '\\$&'));
++
++  // ---- what an element is called, and a selector that finds it again
++  function kind(el) {
++    const t = el.tagName.toLowerCase();
++    const role = el.getAttribute('role');
++    if (t === 'button' || role === 'button' || (t === 'a' && /btn|button/i.test(el.className))) return w().button;
++    if (t === 'a') return w().link;
++    if (/^h[1-6]$/.test(t)) return w().heading;
++    if (t === 'img' || t === 'svg' || t === 'picture' || t === 'video') return w().image;
++    if (t === 'input' || t === 'textarea' || t === 'select') return w().field;
++    if (t === 'nav' || t === 'header') return w().menu;
++    if (/card|item|product/i.test(el.className)) return w().card;
++    // Looks like a button: a short label on a filled, rounded shape.
++    const cs = getComputedStyle(el);
++    const filled = !/rgba\(.*, 0\)$|transparent/.test(cs.backgroundColor) || parseFloat(cs.borderTopWidth) > 0;
++    if (filled && parseFloat(cs.borderTopLeftRadius) >= 6 && (el.innerText || '').trim().length <= 40 && el.children.length <= 2 && el.getBoundingClientRect().height <= 64) return w().button;
++    if (t === 'p' || t === 'span' || t === 'li' || t === 'label') return w().text;
++    return w().block;
++  }
++  function label(el) {
++    const text = (el.getAttribute('aria-label') || el.innerText || el.getAttribute('alt') || el.getAttribute('placeholder') || '').replace(/\s+/g, ' ').trim();
++    const k = kind(el);
++    return text ? `${k} · «${text.length > 28 ? text.slice(0, 27) + '…' : text}»` : k;
++  }
++  function selector(el) {
++    if (el.id && document.querySelectorAll('#' + css(el.id)).length === 1) return '#' + css(el.id);
++    const parts = [];
++    for (let e = el; e && e.nodeType === 1 && e !== document.documentElement; e = e.parentElement) {
++      let p = e.tagName.toLowerCase();
++      if (e.id && document.querySelectorAll('#' + css(e.id)).length === 1) { parts.unshift('#' + css(e.id)); break; }
++      const same = e.parentElement ? [...e.parentElement.children].filter((c) => c.tagName === e.tagName) : [];
++      if (same.length > 1) p += `:nth-of-type(${same.indexOf(e) + 1})`;
++      parts.unshift(p);
++      if (e === document.body) break;
++    }
++    return parts.join(' > ');
++  }
++  // The elements "like it": the same tag and the same classes.
++  function alike(el) {
++    const cls = [...el.classList].filter((c) => /^[\w-]+$/.test(c)).slice(0, 4);
++    const sel = el.tagName.toLowerCase() + cls.map((c) => '.' + css(c)).join('');
++    try { return [...document.querySelectorAll(sel)].filter(visible).slice(0, 60); } catch { return [el]; }
++  }
++  const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 2 && r.height > 2; };
++  const ours = (el) => el === S.host || S.host?.contains(el);
++
++  // ---- the page's own colours (until a brand is connected)
++  function palette() {
++    if (Array.isArray(S.cfg.colors) && S.cfg.colors.length) return S.cfg.colors.slice(0, 8);
++    const count = new Map();
++    const add = (c, n) => { if (!c || /rgba\(.*, 0\)$/.test(c) || c === 'transparent') return; count.set(c, (count.get(c) || 0) + n); };
++    for (const el of [...document.querySelectorAll('body *')].slice(0, 1500)) {
++      if (ours(el) || !visible(el)) continue;
++      const s = getComputedStyle(el);
++      const r = el.getBoundingClientRect();
++      add(s.backgroundColor, Math.min(40, (r.width * r.height) / 4000));
++      add(s.color, 1);
++    }
++    return [...count.entries()].sort((a, b) => b[1] - a[1]).slice(0, 7).map(([c]) => c);
++  }
++
++  // ---- the overlay (closed shadow root: the page can't style or read it)
++  const STYLE = `
++    :host { all: initial; }
++    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
++    .layer { position: fixed; inset: 0; pointer-events: none; z-index: 2147483646; }
++    .hover { position: fixed; border: 1.5px solid #6d6fd6; border-radius: 6px; opacity: 0; transition: opacity 120ms ease-out; }
++    .hover.on { opacity: .7; }
++    .frame { position: fixed; left: 0; top: 0; border-radius: 8px; outline: 1.5px solid #6d6fd6; outline-offset: 2px; box-shadow: 0 0 0 5.5px rgba(109,111,214,.14);
++      transition: transform 260ms cubic-bezier(.2,1.25,.4,1), width 260ms cubic-bezier(.2,1.25,.4,1), height 260ms cubic-bezier(.2,1.25,.4,1); }
++    .frame.more { outline-color: rgba(109,111,214,.6); box-shadow: none; }
++    .tag { position: fixed; left: 0; top: 0; font-size: 11px; font-weight: 600; color: #fff; background: #6d6fd6; padding: 3px 8px; border-radius: 6px; white-space: nowrap;
++      box-shadow: 0 2px 6px rgba(60,40,140,.25); transition: transform 260ms cubic-bezier(.2,1.25,.4,1); }
++    .tag i { font-style: normal; opacity: .75; font-weight: 500; margin-left: 4px; }
++    .h { position: fixed; left: 0; top: 0; width: 12px; height: 12px; border-radius: 50%; background: #fff; border: 2px solid #6d6fd6; box-shadow: 0 1px 3px rgba(0,0,0,.25);
++      pointer-events: auto; opacity: 0; transition: opacity 120ms ease-out 140ms; }
++    .h.x { cursor: ew-resize; } .h.y { cursor: ns-resize; }
++    .shown .h { opacity: 1; }
++    .shim { position: fixed; left: 0; top: 0; border-radius: 8px; overflow: hidden; }
++    .shim::after { content: ''; position: absolute; inset: 0; background: linear-gradient(100deg, transparent 20%, rgba(255,255,255,.75) 45%, transparent 70%); transform: translateX(-100%); animation: shim 480ms ease-out forwards; }
++    @keyframes shim { to { transform: translateX(100%); } }
++    .panel { position: fixed; left: 0; top: 0; width: 340px; background: #fff; color: #222; border-radius: 14px; padding: 10px; display: flex; flex-direction: column; gap: 9px;
++      box-shadow: 0 14px 38px rgba(30,20,60,.24), 0 0 0 .5px rgba(0,0,0,.1); pointer-events: auto; font-size: 12px; opacity: 0; transform: translateY(6px);
++      transition: opacity 160ms ease-out, transform 200ms cubic-bezier(.23,1,.32,1); }
++    .panel.on { opacity: 1; transform: none; }
++    .in { display: flex; align-items: center; gap: 8px; border: 1px solid #e3e3ea; border-radius: 10px; padding: 5px 5px 5px 10px; }
++    .in:focus-within { border-color: #a9abe9; box-shadow: 0 0 0 3px rgba(109,111,214,.15); }
++    .in input { flex: 1; border: 0; outline: 0; font-size: 13px; color: #222; background: none; min-width: 0; }
++    button { font: inherit; color: inherit; border: 0; background: none; padding: 0; cursor: pointer; transition: transform 150ms cubic-bezier(.23,1,.32,1); }
++    button:active { transform: scale(.97); transition-duration: 80ms; }
++    .go { width: 26px; height: 26px; border-radius: 50%; background: #6d6fd6; color: #fff; display: inline-flex; align-items: center; justify-content: center; flex: none; }
++    .ch { display: flex; gap: 5px; flex-wrap: wrap; }
++    .ch button { height: 23px; padding: 0 9px; border-radius: 12px; background: #f2f2f6; font-size: 11.5px; }
++    .ch button:hover { background: #e9e9f2; }
++    .ch button.all { background: rgba(109,111,214,.14); color: #3f3aa8; font-weight: 500; }
++    .sep { height: 1px; background: #eee; margin: 0 -10px; }
++    .row { display: grid; grid-template-columns: 74px 1fr; align-items: center; gap: 8px; min-height: 26px; }
++    .l { color: #777; font-size: 11.5px; }
++    .sw { display: flex; gap: 5px; align-items: center; flex-wrap: wrap; }
++    .sw button { width: 20px; height: 20px; border-radius: 6px; box-shadow: inset 0 0 0 .5px rgba(0,0,0,.18); }
++    .sw button.on { box-shadow: 0 0 0 2px #fff, 0 0 0 3.5px #6d6fd6; }
++    .sw em { font-style: normal; color: #999; font-size: 10.5px; margin-left: 2px; }
++    .step { display: inline-flex; align-items: center; border: 1px solid #e3e3ea; border-radius: 8px; height: 26px; }
++    .step button { width: 26px; height: 24px; color: #555; font-size: 14px; }
++    .step span { padding: 0 8px; min-width: 34px; text-align: center; font-variant-numeric: tabular-nums; font-weight: 600; border-left: 1px solid #eee; border-right: 1px solid #eee; line-height: 24px; }
++    .fl { display: flex; align-items: center; gap: 8px; }
++    input[type=range] { flex: 1; accent-color: #6d6fd6; }
++    .v { width: 30px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; color: #444; font-size: 11.5px; }
++    .note { font-size: 11px; color: #777; line-height: 1.35; }
++    .hero { position: fixed; left: 14px; bottom: 14px; display: inline-flex; gap: 8px; align-items: center; height: 30px; padding: 0 12px; border-radius: 15px;
++      background: #2d2433; color: #fff; font-size: 12px; font-weight: 600; box-shadow: 0 6px 18px rgba(0,0,0,.25); pointer-events: auto; animation: rise 220ms cubic-bezier(.23,1,.32,1); }
++    .hero span { opacity: .7; font-weight: 500; }
++    @keyframes rise { from { opacity: 0; transform: translateY(8px); } }
++    /* drop pins: in the margin beside the element, the point toward it */
++    .pin { position: fixed; left: 0; top: 0; width: 22px; height: 22px; padding: 0; pointer-events: auto; animation: pop 240ms cubic-bezier(.3,1.35,.5,1); }
++    .pin i { position: absolute; inset: 0; border-radius: 50% 50% 50% 3px; background: #1d1d22; box-shadow: 0 0 0 1.5px #fff, 0 4px 10px -2px rgba(0,0,0,.35); transform: rotate(var(--rot, 45deg)); }
++    .pin b { position: relative; color: #fff; font-size: 11px; font-weight: 700; line-height: 22px; display: block; text-align: center; }
++    .pin.wait::after { content: ''; position: absolute; right: -3px; top: -3px; width: 8px; height: 8px; border-radius: 50%; background: #e0a400; box-shadow: 0 0 0 1.5px #fff; }
++    @keyframes pop { from { transform: scale(.4); opacity: 0; } }
++    .pop { position: fixed; left: 0; top: 0; width: 230px; background: #fff; color: #333; border-radius: 10px; padding: 8px 10px; font-size: 12px; line-height: 1.4;
++      box-shadow: 0 8px 24px rgba(0,0,0,.18), 0 0 0 .5px rgba(0,0,0,.08); pointer-events: auto; animation: rise 180ms cubic-bezier(.23,1,.32,1); }
++    .pop b { display: block; font-size: 11px; color: #4b4db8; margin-bottom: 2px; }
++    .pop .a { display: flex; gap: 6px; margin-top: 6px; }
++    .pop .a button { height: 22px; padding: 0 9px; border-radius: 7px; background: #f2f2f6; font-size: 11px; }
++    .pop .a button.p { background: #6d6fd6; color: #fff; }
++    @media (prefers-reduced-motion: reduce) {
++      .frame, .tag, .panel { transition: opacity 120ms; transform: none; }
++      .shim::after, .pin, .pop, .hero { animation: none; }
++    }`;
++
++  function build() {
++    S.host = document.createElement('meridian-studio-point');
++    S.host.style.cssText = 'all: initial; position: fixed; inset: 0; z-index: 2147483646; pointer-events: none;';
++    S.root = S.host.attachShadow({ mode: 'closed' });
++    S.root.innerHTML = `<style>${STYLE}</style><div class="layer"><div class="hover"></div><div class="frames"></div>
++      <div class="panel"></div><div class="pins"></div><div class="hero"></div></div>`;
++    (document.body || document.documentElement).appendChild(S.host);
++    S.root.querySelector('.hero').innerHTML = `${w().hero}<span>${w().esc}</span>`;
++  }
++  const $ = (q) => S.root.querySelector(q);
++
++  // ---- picking
++  function onMove(e) {
++    if (!S.on || S.drag) return;
++    const el = e.composedPath ? e.composedPath()[0] : e.target;
++    if (!el || el.nodeType !== 1 || ours(el) || el === document.body || el === document.documentElement) { $('.hover').classList.remove('on'); S.hover = null; return; }
++    S.hover = el;
++    const r = el.getBoundingClientRect();
++    const h = $('.hover');
++    h.style.cssText = `left:${r.left - 2}px;top:${r.top - 2}px;width:${r.width + 4}px;height:${r.height + 4}px`;
++    h.classList.add('on');
++  }
++  function onClick(e) {
++    if (!S.on) return;
++    if (e.composedPath().includes(S.host)) return;
++    e.preventDefault();
++    e.stopPropagation();
++    const el = S.hover || e.target;
++    if (!el || el.nodeType !== 1) return;
++    if (e.shiftKey && S.sel.length) {
++      if (!S.sel.includes(el)) S.sel.push(el);
++    } else {
++      S.sel = [el];
++    }
++    S.events.push({ type: 'select', items: S.sel.map((x) => ({ sel: selector(x), name: label(x) })) });
++    draw(true);
++  }
++  function block(e) { if (S.on && !e.composedPath().includes(S.host)) { e.preventDefault(); e.stopPropagation(); } }
++  function onKey(e) {
++    if (!S.on) return;
++    if (e.key === 'Escape') {
++      e.preventDefault();
++      if (S.open >= 0) { S.open = -1; drawPins(); return; }
++      if (S.sel.length) { S.sel = []; draw(); return; }
++      stop();
++      S.events.push({ type: 'exit' });
++    }
++  }
++
++  // ---- the frame, its handles and the panel
++  function draw(fresh = false) {
++    const frames = $('.frames');
++    frames.innerHTML = '';
++    const panel = $('.panel');
++    if (!S.sel.length) { panel.classList.remove('on'); return; }
++    const first = S.sel[0];
++    S.sel.forEach((el, i) => {
++      const r = el.getBoundingClientRect();
++      const f = document.createElement('div');
++      f.className = 'frame' + (i ? ' more' : '');
++      f.style.cssText = `transform:translate(${r.left}px,${r.top}px);width:${r.width}px;height:${r.height}px;border-radius:${getComputedStyle(el).borderRadius}`;
++      frames.appendChild(f);
++    });
++    const r = first.getBoundingClientRect();
++    const tag = document.createElement('div');
++    tag.className = 'tag';
++    tag.textContent = label(first);
++    if (S.sel.length > 1) { const i = document.createElement('i'); i.textContent = w().more(S.sel.length - 1); tag.appendChild(i); }
++    tag.style.transform = `translate(${r.left - 2}px,${Math.max(4, r.top - 26)}px)`;
++    frames.appendChild(tag);
++    // Drag the right edge: spacing left and right; the bottom edge: top and bottom.
++    for (const [cls, x, y] of [['h x', r.right - 6, r.top + r.height / 2 - 6], ['h y', r.left + r.width / 2 - 6, r.bottom - 6]]) {
++      const h = document.createElement('div');
++      h.className = cls;
++      h.style.transform = `translate(${x}px,${y}px)`;
++      h.addEventListener('pointerdown', (e) => startDrag(e, cls.endsWith('x') ? 'x' : 'y'));
++      frames.appendChild(h);
++    }
++    requestAnimationFrame(() => frames.classList.add('shown'));
++    if (fresh) fillPanel();
++    // Beside all of them, not over any.
++    const all = S.sel.map((el) => el.getBoundingClientRect());
++    const u = { left: Math.min(...all.map((x) => x.left)), top: Math.min(...all.map((x) => x.top)), right: Math.max(...all.map((x) => x.right)), bottom: Math.max(...all.map((x) => x.bottom)) };
++    place(panel, u);
++    panel.classList.add('on');
++  }
++  // Next to the element, never over it: below, above, right, left; else where most of it shows.
++  function place(panel, r) {
++    const pw = 340, ph = panel.offsetHeight || 300, m = 8;
++    const fitsX = (x) => x >= m && x + pw <= innerWidth - m;
++    const fitsY = (y) => y >= m && y + ph <= innerHeight - m;
++    const clampX = (x) => Math.min(Math.max(m, x), innerWidth - pw - m);
++    const clampY = (y) => Math.min(Math.max(m, y), innerHeight - ph - m);
++    const spots = [
++      [clampX(r.left), r.bottom + 14, fitsY(r.bottom + 14)],
++      [clampX(r.left), r.top - ph - 34, fitsY(r.top - ph - 34)],
++      [r.right + 16, clampY(r.top - 30), fitsX(r.right + 16)],
++      [r.left - pw - 16, clampY(r.top - 30), fitsX(r.left - pw - 16)],
++    ];
++    const [x, y] = spots.find((s) => s[2]) || [clampX(r.left), clampY(r.bottom + 14)];
++    panel.style.left = x + 'px';
++    panel.style.top = y + 'px';
++  }
++  const px = (v) => Math.round(parseFloat(v) || 0);
++  function fillPanel() {
++    const el = S.sel[0];
++    const s = getComputedStyle(el);
++    const t = w();
++    const colors = palette();
++    const bgVisible = !/rgba\(.*, 0\)$|transparent/.test(s.backgroundColor);
++    const now = bgVisible ? s.backgroundColor : s.color;
++    const panel = $('.panel');
++    panel.innerHTML = `
++      <form class="in"><input placeholder="${t.say}" aria-label="${t.say}"><button class="go" type="submit" aria-label="OK">↑</button></form>
++      <div class="ch">${t.chips.map((c) => `<button type="button" data-chip>${c}</button>`).join('')}<button type="button" class="all" data-all>${t.all}</button></div>
++      <div class="sep"></div>
++      <div class="row"><span class="l">${t.color}</span><span class="sw">${colors.map((c) => `<button type="button" data-color="${c}" class="${c === now ? 'on' : ''}" style="background:${c}"></button>`).join('')}<em>${S.cfg.colors?.length ? 'бренд' : t.site}</em></span></div>
++      <div class="row"><span class="l">${t.size}</span><span class="fl"><span class="step"><button type="button" data-size="-1">−</button><span class="sz">${px(s.fontSize)}</span><button type="button" data-size="1">+</button></span></span></div>
++      <div class="row"><span class="l">${t.radius}</span><span class="fl"><input type="range" min="0" max="40" value="${Math.min(40, px(s.borderTopLeftRadius))}" data-radius><span class="v rv">${px(s.borderTopLeftRadius)}</span></span></div>
++      <div class="row"><span class="l">${t.space}</span><span class="fl"><input type="range" min="0" max="64" value="${Math.min(64, px(s.paddingLeft))}" data-pad><span class="v pv">${px(s.paddingLeft)}</span></span></div>
++      <div class="note">${t.note}</div>`;
++    const input = panel.querySelector('input:not([type])');
++    panel.querySelector('form').addEventListener('submit', (e) => { e.preventDefault(); say(input.value); input.value = ''; });
++    panel.onclick = (e) => {
++      const b = e.target.closest('button');
++      if (!b) return;
++      if (b.hasAttribute('data-chip')) say(b.textContent);
++      if (b.hasAttribute('data-all')) { S.sel = alike(S.sel[0]); S.events.push({ type: 'select', items: S.sel.map((x) => ({ sel: selector(x), name: label(x) })) }); draw(); }
++      if (b.dataset.color) {
++        for (const x of panel.querySelectorAll('[data-color]')) x.classList.toggle('on', x === b);
++        edit({ [bgVisible ? 'background-color' : 'color']: b.dataset.color });
++      }
++      if (b.dataset.size) {
++        const v = Math.max(8, px(getComputedStyle(S.sel[0]).fontSize) + Number(b.dataset.size));
++        panel.querySelector('.sz').textContent = v;
++        edit({ 'font-size': v + 'px' });
++      }
++    };
++    panel.querySelector('[data-radius]').addEventListener('input', (e) => { panel.querySelector('.rv').textContent = e.target.value; edit({ 'border-radius': e.target.value + 'px' }, true); });
++    panel.querySelector('[data-radius]').addEventListener('change', (e) => edit({ 'border-radius': e.target.value + 'px' }));
++    panel.querySelector('[data-pad]').addEventListener('input', (e) => { panel.querySelector('.pv').textContent = e.target.value; edit({ 'padding-left': e.target.value + 'px', 'padding-right': e.target.value + 'px' }, true); });
++    panel.querySelector('[data-pad]').addEventListener('change', (e) => edit({ 'padding-left': e.target.value + 'px', 'padding-right': e.target.value + 'px' }));
++    panel.onkeydown = panel.onkeyup = panel.onkeypress = (e) => { if (e.key !== 'Escape') e.stopPropagation(); };
++    setTimeout(() => input.focus(), 0);
++  }
++  function startDrag(e, axis) {
++    e.preventDefault();
++    e.stopPropagation();
++    const el = S.sel[0];
++    const s = getComputedStyle(el);
++    const start = axis === 'x' ? e.clientX : e.clientY;
++    const base = axis === 'x' ? px(s.paddingLeft) : px(s.paddingTop);
++    S.drag = true;
++    const props = (v) => (axis === 'x' ? { 'padding-left': v + 'px', 'padding-right': v + 'px' } : { 'padding-top': v + 'px', 'padding-bottom': v + 'px' });
++    let last = base;
++    const move = (m) => { last = Math.max(0, Math.round(base + ((axis === 'x' ? m.clientX : m.clientY) - start) / 2)); edit(props(last), true); draw(); };
++    const up = () => { removeEventListener('pointermove', move, true); removeEventListener('pointerup', up, true); S.drag = false; edit(props(last)); draw(); };
++    addEventListener('pointermove', move, true);
++    addEventListener('pointerup', up, true);
++  }
++
++  // A hand change: in the page at once (its own style element), then to Studio (`preview`: while
++  // dragging, only in the page).
++  function edit(props, preview = false) {
++    for (const el of S.sel) {
++      const sel = selector(el);
++      const cur = S.live.get(sel) || {};
++      Object.assign(cur, props);
++      S.live.set(sel, cur);
++    }
++    let style = document.getElementById('meridian-studio-hand');
++    if (!style) { style = document.createElement('style'); style.id = 'meridian-studio-hand'; (document.head || document.documentElement).appendChild(style); }
++    style.textContent = [...S.live.entries()].map(([sel, p]) => `${sel} { ${Object.entries(p).map(([k, v]) => `${k}: ${v} !important;`).join(' ')} }`).join('\n');
++    if (preview) return;
++    S.events.push({ type: 'edit', items: S.sel.map((x) => ({ sel: selector(x), name: label(x) })), props });
++    shimmer();
++    requestAnimationFrame(() => draw());
++  }
++  function shimmer() {
++    const frames = $('.frames');
++    for (const el of S.sel) {
++      const r = el.getBoundingClientRect();
++      const s = document.createElement('div');
++      s.className = 'shim';
++      s.style.cssText = `transform:translate(${r.left}px,${r.top}px);width:${r.width}px;height:${r.height}px`;
++      S.root.querySelector('.layer').appendChild(s);
++      setTimeout(() => s.remove(), 600);
++    }
++  }
++  function say(text) {
++    text = String(text || '').trim();
++    if (!text || !S.sel.length) return;
++    S.events.push({ type: 'say', text, items: S.sel.map((x) => ({ sel: selector(x), name: label(x) })) });
++    shimmer();
++  }
++
++  // ---- Studio's pins
++  function drawPins() {
++    const box = $('.pins');
++    if (!box) return;
++    box.innerHTML = '';
++    S.pins.forEach((p, i) => {
++      let el;
++      try { el = document.querySelector(p.sel); } catch {}
++      if (!el || !visible(el)) return;
++      const r = el.getBoundingClientRect();
++      const pin = document.createElement('button');
++      pin.className = 'pin' + (S.open === i ? '' : ' wait');
++      pin.innerHTML = '<i></i><b></b>';
++      pin.querySelector('b').textContent = String(p.n || i + 1);
++      // In the free margin: right of the element (point left), else left of it (point right).
++      const right = r.right + 30 < innerWidth;
++      const x = right ? r.right + 6 : Math.max(4, r.left - 28);
++      const y = Math.min(innerHeight - 26, Math.max(4, r.top + r.height / 2 - 11));
++      pin.style.setProperty('--rot', right ? '45deg' : '-135deg');
++      pin.style.transform = `translate(${x}px,${y}px)`;
++      pin.addEventListener('click', (e) => { e.stopPropagation(); S.open = S.open === i ? -1 : i; drawPins(); });
++      box.appendChild(pin);
++      if (S.open === i) {
++        const pop = document.createElement('div');
++        pop.className = 'pop';
++        pop.innerHTML = '<b></b><div class="t"></div><div class="a"></div>';
++        pop.querySelector('b').textContent = `${p.who || 'Claude'} · ${p.n || i + 1}`;
++        pop.querySelector('.t').textContent = p.text || '';
++        for (const [a, label, cls] of [['yes', w().yes, 'p'], ['no', w().no, '']]) {
++          const b = document.createElement('button');
++          b.textContent = label;
++          b.className = cls;
++          b.addEventListener('click', (e) => { e.stopPropagation(); S.events.push({ type: 'pin', n: p.n || i + 1, answer: a, kind: p.kind || '' }); S.open = -1; drawPins(); });
++          pop.querySelector('.a').appendChild(b);
++        }
++        const px = right ? Math.min(innerWidth - 240, r.right + 34) : Math.max(4, r.left - 264);
++        pop.style.transform = `translate(${px}px,${Math.min(innerHeight - 120, Math.max(4, r.top - 6))}px)`;
++        box.appendChild(pop);
++      }
++    });
++  }
++
++  function start(cfg) {
++    S.cfg = cfg || {};
++    if (!S.host || !S.host.isConnected) build();
++    S.on = true;
++    $('.hero').hidden = false;
++    addEventListener('mousemove', onMove, true);
++    addEventListener('click', onClick, true);
++    for (const t of ['mousedown', 'mouseup', 'pointerdown', 'pointerup', 'auxclick', 'dblclick', 'submit']) addEventListener(t, block, true);
++    addEventListener('keydown', onKey, true);
++    addEventListener('scroll', redraw, true);
++    addEventListener('resize', redraw, true);
++    drawPins();
++    return true;
++  }
++  function redraw() { if (S.sel.length) draw(); drawPins(); }
++  function stop() {
++    S.on = false;
++    S.sel = [];
++    removeEventListener('mousemove', onMove, true);
++    removeEventListener('click', onClick, true);
++    for (const t of ['mousedown', 'mouseup', 'pointerdown', 'pointerup', 'auxclick', 'dblclick', 'submit']) removeEventListener(t, block, true);
++    removeEventListener('keydown', onKey, true);
++    if (S.root) { $('.frames').innerHTML = ''; $('.panel').classList.remove('on'); $('.hover').classList.remove('on'); $('.hero').hidden = true; }
++    return true;
++  }
++  // ---- the brand: what the page uses, and what on it isn't in the brand
++  const rgb = (c) => { const m = /rgba?\(\s*([\d.]+)[ ,]+([\d.]+)[ ,]+([\d.]+)(?:[ ,/]+([\d.]+))?/.exec(c || ''); return m && (m[4] === undefined || +m[4] > 0.05) ? [+m[1], +m[2], +m[3]] : null; };
++  const hex = (c) => { const v = rgb(c); return v ? '#' + v.map((x) => Math.round(x).toString(16).padStart(2, '0')).join('').toUpperCase() : ''; };
++  const parse = (h) => { const m = /^#?([0-9a-f]{6})$/i.exec(String(h || '').trim()); return m ? [0, 2, 4].map((i) => parseInt(m[1].slice(i, i + 2), 16)) : rgb(h); };
++  const dist = (a, b) => Math.sqrt((a[0] - b[0]) ** 2 * 0.3 + (a[1] - b[1]) ** 2 * 0.59 + (a[2] - b[2]) ** 2 * 0.11);
++  const els = () => [...document.querySelectorAll('body *')].filter((el) => !ours(el) && visible(el)).slice(0, 2500);
++  function brandRead() {
++    const colors = new Map(), fonts = new Map();
++    for (const el of els()) {
++      const s = getComputedStyle(el), r = el.getBoundingClientRect();
++      const bg = hex(s.backgroundColor), fg = hex(s.color);
++      if (bg) colors.set(bg, (colors.get(bg) || 0) + Math.min(40, (r.width * r.height) / 3000) + 1);
++      if (fg && el.childNodes.length && [...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim())) colors.set(fg, (colors.get(fg) || 0) + 1);
++      const fam = s.fontFamily.split(',')[0].replace(/["']/g, '').trim();
++      if (fam && [...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim())) {
++        const head = /^h[1-3]$/i.test(el.tagName) || parseFloat(s.fontSize) >= 24;
++        const f = fonts.get(fam) || { family: fam, head: 0, text: 0 };
++        f[head ? 'head' : 'text']++;
++        fonts.set(fam, f);
++      }
++    }
++    // Close shades count as one (the most used of them).
++    const list = [...colors.entries()].sort((a, b) => b[1] - a[1]);
++    const kept = [];
++    for (const [c, n] of list) if (!kept.some((k) => dist(parse(k.value), parse(c)) < 14)) kept.push({ value: c, weight: Math.round(n) });
++    return {
++      colors: kept.slice(0, 8),
++      fonts: [...fonts.values()].filter((f) => !/^(-apple-system|system-ui|BlinkMacSystemFont|sans-serif|serif)$/i.test(f.family))
++        .sort((a, b) => b.head + b.text - a.head - a.text).slice(0, 3).map((f) => ({ family: f.family, use: f.head ? 'head' : 'text' })),
++    };
++  }
++  // Elements whose colour is near no brand colour (but not far from everything: photos aside).
++  function brandCheck(brand) {
++    const tokens = (brand || []).map((c) => ({ c, v: parse(c) })).filter((x) => x.v);
++    if (!tokens.length) return [];
++    const out = [];
++    for (const el of els()) {
++      const s = getComputedStyle(el);
++      for (const prop of ['background-color', 'color']) {
++        const v = rgb(s.getPropertyValue(prop));
++        if (!v) continue;
++        if (prop === 'color' && ![...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim())) continue;
++        const near = tokens.map((t) => ({ t, d: dist(t.v, v) })).sort((a, b) => a.d - b.d)[0];
++        // Neutral greys near white/black are the page, not the brand.
++        const grey = Math.max(...v) - Math.min(...v) < 10 && (Math.min(...v) > 236 || Math.max(...v) < 24);
++        if (near.d > 6 && !grey) out.push({ sel: selector(el), name: label(el), prop, value: hex(s.getPropertyValue(prop)), nearest: near.t.c });
++      }
++      if (out.length >= 120) break;
++    }
++    return out;
++  }
++  function brandShow(items) {
++    if (!S.host || !S.host.isConnected) build();
++    S.pins = (items || []).slice(0, 30).map((x, i) => ({ n: i + 1, sel: x.sel, text: x.text || '', who: x.who || '', kind: 'brand' }));
++    drawPins();
++    return true;
++  }
++
++  window.__meridianStudioPoint = {
++    brand: (op, arg) => (op === 'read' ? brandRead() : op === 'check' ? brandCheck(arg) : op === 'show' ? brandShow(arg) : null),
++    start, stop,
++    // What happened since the last call (selected, said, changed by hand, a pin answered, Esc).
++    take: () => { const e = S.events; S.events = []; return { on: S.on, events: e }; },
++    pins: (list) => {
++      S.pins = Array.isArray(list) ? list.slice(0, 30) : [];
++      if (!S.host || !S.host.isConnected) { if (!S.pins.length) return true; build(); $('.hero').hidden = !S.on; }
++      if (!S.on) addEventListener('scroll', redraw, true);
++      drawPins();
++      return true;
++    },
++    // Hand changes Studio has put into the site's Boost: the page's own copy goes.
++    settled: () => { S.live.clear(); document.getElementById('meridian-studio-hand')?.remove(); return true; },
++  };
++})();
+diff --git a/chrome/browser/meridian/workbench/studio_unittest.cc b/chrome/browser/meridian/workbench/studio_unittest.cc
+new file mode 100644
+index 0000000000..54a1a02f93
+--- /dev/null
++++ b/chrome/browser/meridian/workbench/studio_unittest.cc
+@@ -0,0 +1,70 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/meridian/workbench/studio.h"
++
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/json/json_reader.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace meridian::workbench {
++namespace {
++
++TEST(StudioTest, TranscriptComesInWholeLinesAndStartsOverWhenItShrinks) {
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  base::FilePath file = dir.GetPath().AppendASCII("s.jsonl");
++  ASSERT_TRUE(base::WriteFile(file, "{\"a\":1}\n{\"b\":2}\n{\"c\""));
++  base::DictValue first = ReadTranscriptChunk(file, 0);
++  EXPECT_EQ(*first.FindString("text"), "{\"a\":1}\n{\"b\":2}\n");
++  EXPECT_EQ(first.FindDouble("next").value_or(-1), 16);
++  // Nothing new yet: the half-written line waits.
++  base::DictValue again = ReadTranscriptChunk(file, 16);
++  EXPECT_EQ(*again.FindString("text"), "");
++  EXPECT_EQ(again.FindDouble("next").value_or(-1), 16);
++  // A shorter file (another session): from the start.
++  ASSERT_TRUE(base::WriteFile(file, "{\"x\":1}\n"));
++  base::DictValue reset = ReadTranscriptChunk(file, 16);
++  EXPECT_TRUE(reset.FindBool("reset").value_or(false));
++  EXPECT_EQ(*reset.FindString("text"), "{\"x\":1}\n");
++  // No file: nothing, no error.
++  EXPECT_EQ(*ReadTranscriptChunk(dir.GetPath().AppendASCII("none"), 0)
++                 .FindString("text"),
++            "");
++}
++
++TEST(StudioTest, TermsOnlyOfThisPageWithTheirQuestions) {
++  std::optional<base::Value> snapshot = base::JSONReader::Read(R"({
++    "nodes": [
++      {"id": "n1", "termId": "t1", "ownerTab": 7, "status": "waiting",
++       "statusText": "Needs you", "log": [{"name": "Read", "summary": "a.md"}]},
++      {"id": "n2", "termId": "t1", "ownerTab": 9, "status": "thinking"},
++      {"id": "n3", "termId": "t2", "ownerTab": 7, "parentId": "n1",
++       "status": "tool"}
++    ],
++    "asks": [
++      {"id": "q1", "nodeId": "n1", "tool": "Edit", "summary": "Brand/a.css",
++       "answerable": true, "canAlways": true},
++      {"id": "q2", "nodeId": "n2", "tool": "Bash", "summary": "rm -rf /"}
++    ]})", 0);
++  ASSERT_TRUE(snapshot);
++  base::DictValue terms = StudioTerms(snapshot->GetDict(), 7, {"t1", "t2"});
++  ASSERT_EQ(terms.size(), 1u);
++  const base::DictValue* t1 = terms.FindDict("t1");
++  ASSERT_TRUE(t1);
++  EXPECT_EQ(*t1->FindString("status"), "waiting");
++  ASSERT_EQ(t1->FindList("asks")->size(), 1u);
++  EXPECT_EQ(*(*t1->FindList("asks"))[0].GetDict().FindString("id"), "q1");
++  EXPECT_EQ(t1->FindList("log")->size(), 1u);
++}
++
++TEST(StudioTest, RulesKeepOriginalsAndAvoidJargon) {
++  const std::string rules = StudioRules();
++  EXPECT_NE(rules.find("Never overwrite"), std::string::npos);
++  EXPECT_NE(rules.find("without asking first"), std::string::npos);
++}
++
++}  // namespace
++}  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index 38b299dc4d..d8ec2fd009 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -48,6 +48,8 @@
+ #include "chrome/browser/meridian/workbench/hubs.h"
+ #include "chrome/browser/meridian/workbench/native_dialog.h"
+ #include "chrome/browser/meridian/workbench/sandbox.h"
++#include "chrome/browser/meridian/workbench/studio.h"
++#include "chrome/browser/meridian/workbench/studio_point.h"
+ #include "chrome/browser/meridian/workbench/workbench_source.h"
+ #include "chrome/browser/meridian/workbench/secret_files.h"
+ #include "chrome/browser/meridian/workbench/vault.h"
+@@ -520,6 +522,9 @@ void WorkbenchHandler::Dispatch(const std::string& method,
+   if (method == "info") {
+     return Info(std::move(reply));
+   }
++  if (method.starts_with("studio")) {
++    return DispatchStudio(method, params, std::move(reply));
++  }
+   if (method == "pickProject") {
+     if (HasTestSwitch("meridian-test-project")) {
+       return OpenProject(TestSwitchPath("meridian-test-project"),
+@@ -2657,6 +2662,10 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+   }
+   const bool resume_remote = !resume_id.empty() && kind == "claude" &&
+                              opts.FindBool("resumeRemote").value_or(false);
++  // Started from Studio: Claude Code gets Studio's rules (studio.h).
++  const bool studio = kind == "claude" &&
++                      opts.FindBool("studio").value_or(false) &&
++                      StudioEnabled(profile_);
+   // Host terminals and agents get the project's vault secrets in their
+   // environment (names are shown, values never).
+   std::map<std::string, std::string> secrets =
+@@ -2684,6 +2693,12 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+   }
+   McpBridge bridge;
+   bridge.secret_names = secret_names;
++  // Studio's tasks read Figma when the person connected it.
++  if (kind == "claude" && opts.FindBool("studio").value_or(false) &&
++      StudioEnabled(profile_) &&
++      MainProfileFor(profile_)->GetPrefs()->GetBoolean(prefs::kStudioFigma)) {
++    bridge.figma_url = kStudioFigmaMcpUrl;
++  }
+   bridge.command = base::CommandLine::ForCurrentProcess()->GetProgram().AsUTF8Unsafe();
+   bridge.args = {"--mcp-bridge",
+                  "--user-data-dir=" + profile_->GetPath().DirName().AsUTF8Unsafe()};
+@@ -2749,7 +2764,7 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+       base::BindOnce(
+           [](std::string kind, McpBridge bridge, bool resume,
+              std::string resume_id, std::string resume_mode,
+-             std::string resume_model, bool resume_remote)
++             std::string resume_model, bool resume_remote, bool studio)
+               -> std::pair<base::expected<LaunchSpec, std::string>,
+                            std::map<std::string, std::string>> {
+             std::map<std::string, std::string> env = TerminalEnv();
+@@ -2804,10 +2819,16 @@ void WorkbenchHandler::ContinueTerminal(base::DictValue opts,
+               spec->argv.insert(spec->argv.begin() + 1, "--resume");
+               spec->title += " (resumed)";
+             }
++            if (spec.has_value() && studio && !spec->argv.empty()) {
++              spec->argv.insert(spec->argv.begin() + 1, StudioRules());
++              spec->argv.insert(spec->argv.begin() + 1,
++                                "--append-system-prompt");
++            }
+             return {std::move(spec), env};
+           },
+           kind, std::move(bridge), resume, std::move(resume_id),
+-          std::move(resume_mode), std::move(resume_model), resume_remote),
++          std::move(resume_mode), std::move(resume_model), resume_remote,
++          studio),
+       base::BindOnce(
+           [](base::WeakPtr<WorkbenchHandler> self, std::string kind, int cols,
+              int rows, mission::MissionControl::Registration registration,
+@@ -3826,6 +3847,14 @@ void WorkbenchHandler::OnMissionChanged(const base::DictValue& snapshot) {
+     }
+     counts.Set("sessions", std::move(sessions));
+   }
++  // Studio: each terminal's status, questions and recent steps.
++  if (StudioEnabled(profile_)) {
++    std::set<std::string> ids;
++    for (const auto& [id, term] : terms_) {
++      ids.insert(id);
++    }
++    counts.Set("studio", StudioTerms(snapshot, self, ids));
++  }
+   Emit("wb:command", base::Value(std::move(counts)));
+ }
+ 
+@@ -3906,8 +3935,14 @@ void WorkbenchHandler::ToHost(const base::DictValue& message) {
+   NavigateParams params(browser, target, ui::PAGE_TRANSITION_LINK);
+   params.disposition = WindowOpenDisposition::kNewForegroundTab;
+   Navigate(&params);
++  // Studio's result: the same, and Studio remembers the tab (point and say).
++  const bool studio_site = *type == "studio-site" && StudioEnabled(profile_);
++  if (studio_site && params.navigated_or_inserted_contents) {
++    studio_point()->SetSite(params.navigated_or_inserted_contents);
++  }
+   // A preview opens next to the workbench, side by side.
+-  if (*type == "preview" && params.navigated_or_inserted_contents) {
++  if ((*type == "preview" || studio_site) &&
++      params.navigated_or_inserted_contents) {
+     TabStripModel* model = browser->GetTabStripModel();
+     int workbench = model->GetIndexOfWebContents(web_ui()->GetWebContents());
+     int preview =
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.h b/chrome/browser/meridian/workbench/workbench_handler.h
+index fc2948f6af..239fec77e2 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.h
++++ b/chrome/browser/meridian/workbench/workbench_handler.h
+@@ -35,6 +35,7 @@ class Profile;
+ namespace meridian::workbench {
+ 
+ class ContextInsights;
++class StudioPoint;
+ class Terminal;
+ enum class AgentFormat;
+ 
+@@ -125,6 +126,10 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+   void Dispatch(const std::string& method,
+                 const base::ListValue& params,
+                 Reply reply);
++  // Studio's calls ("studio…", studio.cc): refused unless Studio is on.
++  void DispatchStudio(const std::string& method,
++                      const base::ListValue& params,
++                      Reply reply);
+ 
+   void Info(Reply reply);
+   void OpenProject(base::FilePath dir, Reply reply);
+@@ -216,6 +221,10 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+   // project.
+   std::set<std::string> git_repos_;
+   int term_seq_ = 0;
++  // Studio's site tab and its "point and say" (studio_point.h), made on
++  // first use.
++  std::unique_ptr<StudioPoint> studio_point_;
++  StudioPoint* studio_point();
+   // The terminal host (term_host.h): hands a terminal over, lets it go, and
+   // takes back the ones a crashed browser left for a project.
+   void KeepInHost(const std::string& id);

@@ -1,0 +1,326 @@
+/* Meridian Studio — its words, in Russian and English, and what each of Claude Code's steps is
+ * called in plain words (no tool names, commands or paths unless the person opens the details).
+ * Pure: node tests require it.
+ */
+(function (root) {
+  'use strict';
+
+  const T = {
+    ru: {
+      studio: 'Студия', workbench: 'Workbench', tasks: 'Задачи', newTask: 'Новая задача',
+      placeholder: 'Напишите, что сделать…', send: 'Отправить', stop: 'Остановить',
+      claude: 'Claude', you: 'Вы', minutes: (n) => (n < 1 ? 'только что' : n < 60 ? `${n} мин` : `${Math.floor(n / 60)} ч`),
+      ago: (n) => {
+        if (n < 1) return 'только что';
+        if (n < 60) return `${n} мин назад`;
+        const h = Math.floor(n / 60);
+        if (h < 24) return `${h} ч назад`;
+        const d = Math.floor(h / 24);
+        if (d === 1) return 'вчера';
+        const w = d % 10 === 1 && d % 100 !== 11 ? 'день' : [2, 3, 4].includes(d % 10) && ![12, 13, 14].includes(d % 100) ? 'дня' : 'дней';
+        return `${d} ${w} назад`;
+      },
+      earlier: 'Показать раньше', allFiles: (n) => `Показать все (${n})`,
+      homeFailed: 'Не получилось создать папку для задач', retry: 'Попробовать ещё раз',
+      ownFiles: 'Работать с моими файлами…', ownChange: 'Другая папка…', backHome: 'Вернуться в Meridian Studio',
+      ownTitle: 'Работать с вашими файлами', ownHint: 'Выберите папку с файлами. Claude будет работать с копиями файлов из этой папки, оригиналы не тронет.', ownPick: 'Выбрать папку',
+      inFolder: (n) => `Папка «${n}»`, reveal: 'Показать в Finder', more: 'Ещё',
+      emptyTitle: 'Что сделаем?', emptyHint: 'Напишите задачу своими словами или выберите подсказку. Claude покажет каждый шаг, спросит разрешения и ничего не отправит наружу без вас.',
+      roles: { designer: 'Дизайнер:', manager: 'Менеджер:', developer: 'Разработчику:', everyday: 'Можно так:' },
+      chips: {
+        designer: ['Перекрась сайт под наш бренд', 'Собери референсы в доску', 'Найди несостыковки в макете'],
+        manager: ['Сделай отчёт по задачам за неделю', 'Сравни два документа', 'Подготовь повестку встречи'],
+        developer: ['Найди и почини баг на странице', 'Объясни, как устроен этот проект'],
+        everyday: ['Сделай сайт удобнее для чтения', 'Собери заметки из этих страниц'],
+      },
+      allow: 'Разрешить', once: 'Только в этот раз', no: 'Нет', allowed: 'Разрешено', denied: 'Не разрешено',
+      answerInWorkbench: 'Ответить можно в Workbench', openWorkbench: 'Открыть Workbench',
+      qAsks: 'Claude спрашивает', qOwn: 'Своими словами — в Workbench', qSend: 'Ответить', qAnswered: 'Ответ',
+      filesTitle: 'Файлы по ходу работы', created: 'новый', changed: 'изменён', shot: 'скриншот', shots: 'Снимки', shotBefore: 'Было', shotAfter: 'Стало', wipeHint: 'было ← шторка → стало',
+      siteBar: 'Результат', showSite: 'Показать живой сайт рядом', lastShot: 'последний снимок', boostUndo: 'Boost · можно отменить', boostUndone: 'Вернули как было',
+      before: 'До', after: 'После', undo: 'Отменить', undoTitle: 'Вернуть сайт как был до задачи',
+      working: 'Работаю…', waiting: 'Ждёт вас', done: 'Готово', idle: 'Готово',
+      busy: 'Claude ещё работает — отправлю, когда закончит.', queued: 'В очереди',
+      startedInWorkbench: 'Начато в Workbench: здесь Claude правит файлы сразу, без черновиков.',
+      showPage: 'Открыть рядом', pageAlongside: 'Открыта рядом со Студией — меняется вместе с задачей.', outsideFolder: 'Этот файл лежит вне папки задачи: показать его здесь не получится.',
+      splitter: 'Ширина чата', splitterHint: 'Потяните, чтобы изменить ширину; двойной щелчок — как было', taskView: 'Задача',
+      step: (i, n) => `шаг ${i} из ${n}`, noFiles: 'Здесь появятся файлы, которые Claude создаст или поменяет.',
+      resultEmpty: 'Здесь будет результат: сайт, картинки и документы, которые получатся.',
+      openFile: 'Показать в папке', taskFallback: 'Без названия', notStarted: 'Не удалось запустить Claude',
+      details: 'Подробнее', consent: 'Задачи выполняет Claude от Anthropic: то, что вы пишете, и файлы, которые он смотрит, уходят в Anthropic.',
+      consentOk: 'Понятно, начать',
+      point: 'Ткни и скажи', pointTitle: 'Покажите на странице, что поменять: скажите словами или поправьте руками', pointNoSite: 'Сначала откройте сайт рядом',
+      pointChip: 'Показать на странице', pickTitle: 'Выбрать элемент на странице — сообщение будет про него', unpick: 'Убрать выбор',
+      pinYes: (n, t) => `Да, сделай то, что ты предложил в пине ${n}: ${t}`, andMore: (n) => `и ещё ${n}`,
+      handTitle: 'Вы поправили руками:', handNext: 'Claude узнает об этом со следующим сообщением.',
+      handPrompt: (host, lines) => `Я поправил руками на странице ${host} (это уже в Boost «Studio · ${host}», не перезаписывай и учитывай дальше):\n${lines}`,
+      sayPrompt: (host, list, text) => `На странице ${host} я показал на:\n${list}\n\n${text}\n\nМеняй только это (через Boost на этом сайте), остальное не трогай.`,
+      brand: 'Бренд', fromSite: 'с сайта', readOnly: 'только смотрю', palette: 'Палитра', fonts: 'Шрифты', fontSample: 'Свежий кофе', headings: 'заголовки', bodyText: 'текст', remove: 'Убрать',
+      brandNone: 'Бренд ещё не задан', brandNoneHint: 'Студия будет красить только цветами бренда и замечать, что на сайте из него выбивается.',
+      brandFromSite: (h) => `Взять цвета и шрифты с ${h}`, brandNeedSite: 'Сначала откройте сайт в задаче', brandRetake: 'Взять заново с сайта', brandNoColors: 'На странице не нашлось цветов',
+      brandCheck: 'Проверить сайт по бренду', brandAllGood: 'Всё на странице — в цветах бренда.',
+      driftTitle: (n) => `${n} ${n % 10 === 1 && n % 100 !== 11 ? 'цвет' : [2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100) ? 'цвета' : 'цветов'} на сайте не из бренда — заменить?`,
+      driftFix: 'Заменить все', driftWhere: 'Показать где', driftKeep: 'Оставить',
+      figmaOff: 'не подключена', figmaOn: 'подключена', figmaNotRunning: 'не подключена — Figma не отвечает', figmaOpen: 'Открыть Figma',
+      figmaLinkHint: 'Вставьте ссылку на файл с цветами и шрифтами (Styles / Variables)',
+      siteAddress: 'Адрес сайта', takeFromSite: 'Забрать с сайта', siteBad: 'Нужен адрес сайта, например zerno.coffee', figmaConnect: 'Подключить Figma', figmaLink: 'Ссылка на файл бренда в Figma', figmaTake: 'Взять бренд',
+      figmaHow: 'Откройте Figma на этом компьютере и один раз включите: меню Figma → Настройки → Dev Mode MCP Server. Студия только читает макеты.',
+      figmaBadLink: 'Нужна ссылка вида https://www.figma.com/…',
+      figmaPrompt: (l) => `Возьми бренд из Figma (только читай, ничего в Figma не меняй): ${l}\nНайди цвета и шрифты бренда (переменные и стили) и запиши их в brand.json в этой папке так: {"source":"figma","name":"<название>","colors":[{"name":"<имя>","value":"#RRGGBB"}],"fonts":[{"family":"<шрифт>","use":"head" или "text"}]}. Коротко скажи, что нашёл.`,
+      cards: 'Карточки', chat: 'Чат', allTasks: 'Все задачи', all: 'Все', inWork: 'В работе', look: 'Посмотреть',
+      handoff: 'Отправить разработчикам', ownWords: 'Или своими словами…',
+      taskCount: (n) => `${n} ${n % 10 === 1 && n % 100 !== 11 ? 'задача' : [2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100) ? 'задачи' : 'задач'}`,
+      needsCount: (n) => `${n} ${n % 10 === 1 && n % 100 !== 11 ? 'ждёт' : 'ждут'} вас`, filesCount: (n) => `Файлов: ${n}`,
+      handoffPrompt: 'Подготовь это для разработчиков: в папке «Черновики» собери handoff.md — что поменяли и зачем, скриншоты до и после, точные цвета, шрифты и отступы, и какие файлы сайта это затронет. Если это сайт в git-репозитории — подготовь ветку с правками и черновик pull request, но ничего не отправляй и не публикуй без моего «да». Пиши без жаргона.',
+      whoTitle: 'Кто вы?', whoLead: 'Выберите героя — Meridian подстроится под вашу работу. Поменять можно в любой момент.', skip: 'Пропустить',
+      whoNote: 'Догадка — по приложениям на этом компьютере. Никуда не отправляется.', whoChange: 'Студия и Workbench всегда в один клик — выбор решает, что открывается первым.',
+      guess: 'Похоже на вас', roleChange: 'Кто вы? Поменять роль',
+      personas: {
+        developer: { name: 'Разработчик', cls: 'Нетраннер', role: 'код и агенты', perks: [['term', 'Код и терминал в Workbench'], ['cursor', 'Агенты водят браузер'], ['grid', 'Все агенты — в Mission Control']], gets: 'Откроется <b>Workbench</b>', cta: 'Я разработчик — дальше' },
+        designer: { name: 'Дизайнер', cls: 'Чародейка', role: 'макеты и сайты', perks: [['brush', 'Правки словами на сайте'], ['drop', 'Бренд из Figma не уплывёт'], ['undo', 'Любую правку можно отменить']], gets: 'Откроется <b>Студия</b>', cta: 'Я дизайнер — дальше' },
+        manager: { name: 'Менеджер', cls: 'Волшебница', role: 'задачи и отчёты', perks: [['doc', 'Отчёт из задач на глазах'], ['shield', 'Наружу — только после «да»'], ['split', 'Работа и личное — раздельно']], gets: 'Откроется <b>Студия</b>', cta: 'Я менеджер — дальше' },
+        everyday: { name: 'Просто пользуюсь', cls: 'Путешественник', role: 'сайты и почта', perks: [['tabs', 'Вкладки сами в порядке'], ['search', 'Поиск по открытым вкладкам'], ['spark', 'AI — только по просьбе']], gets: 'Откроется <b>Студия</b>, без лишнего', cta: 'Просто пользуюсь — дальше' },
+      },
+      trustTitle: 'Разрешить Claude работать в этой папке?', trustDetail: (n) => `Claude будет смотреть файлы в папке ${n} и спрашивать, прежде чем что-то поменять.`,
+    },
+    en: {
+      studio: 'Studio', workbench: 'Workbench', tasks: 'Tasks', newTask: 'New task',
+      placeholder: 'Say what to do…', send: 'Send', stop: 'Stop',
+      claude: 'Claude', you: 'You', minutes: (n) => (n < 1 ? 'just now' : n < 60 ? `${n} min` : `${Math.floor(n / 60)} h`),
+      ago: (n) => {
+        if (n < 1) return 'just now';
+        if (n < 60) return `${n} min ago`;
+        const h = Math.floor(n / 60);
+        if (h < 24) return `${h} h ago`;
+        const d = Math.floor(h / 24);
+        return d === 1 ? 'yesterday' : `${d} days ago`;
+      },
+      earlier: 'Show earlier', allFiles: (n) => `Show all (${n})`,
+      homeFailed: 'Couldn’t make a folder for your tasks', retry: 'Try again',
+      ownFiles: 'Work with my files…', ownChange: 'Another folder…', backHome: 'Back to Meridian Studio',
+      ownTitle: 'Work with your files', ownHint: 'Pick a folder with your files. Claude works on copies of the files in it and leaves the originals as they are.', ownPick: 'Choose a folder',
+      inFolder: (n) => `Folder “${n}”`, reveal: 'Show in Finder', more: 'More',
+      emptyTitle: 'What shall we make?', emptyHint: 'Describe the task in your own words or pick a suggestion. Claude shows every step, asks before it changes things and never sends anything out without you.',
+      roles: { designer: 'Designer:', manager: 'Manager:', developer: 'Developer:', everyday: 'Try:' },
+      chips: {
+        designer: ['Restyle our site in our brand', 'Collect references into a board', 'Find inconsistencies in the mockup'],
+        manager: ['Write a weekly report from our tasks', 'Compare two documents', 'Prepare a meeting agenda'],
+        developer: ['Find and fix a bug on the page', 'Explain how this project works'],
+        everyday: ['Make the site easier to read', 'Collect notes from these pages'],
+      },
+      allow: 'Allow', once: 'Just this once', no: 'No', allowed: 'Allowed', denied: 'Not allowed',
+      answerInWorkbench: 'This one is answered in the Workbench', openWorkbench: 'Open Workbench',
+      qAsks: 'Claude asks', qOwn: 'In my own words — Workbench', qSend: 'Answer', qAnswered: 'Answer',
+      filesTitle: 'Files from this task', created: 'new', changed: 'changed', shot: 'screenshot', shots: 'Snapshots', shotBefore: 'Before', shotAfter: 'After', wipeHint: 'before ← drag → after',
+      siteBar: 'Result', showSite: 'Show the live site alongside', lastShot: 'latest snapshot', boostUndo: 'Boost · can be undone', boostUndone: 'Back as it was',
+      before: 'Before', after: 'After', undo: 'Undo', undoTitle: 'Put the site back as it was before the task',
+      working: 'Working…', waiting: 'Needs you', done: 'Done', idle: 'Done',
+      busy: 'Claude is still working — I’ll send it when it’s done.', queued: 'Queued',
+      startedInWorkbench: 'Started in the Workbench: here Claude edits files directly, without drafts.',
+      showPage: 'Open alongside', pageAlongside: 'Open next to Studio — it changes along with the task.', outsideFolder: 'This file is outside the task’s folder: it can’t be shown here.',
+      splitter: 'Chat width', splitterHint: 'Drag to change the width; double-click to reset', taskView: 'Task',
+      step: (i, n) => `step ${i} of ${n}`, noFiles: 'Files Claude creates or changes show up here.',
+      resultEmpty: 'The result shows here: the site, pictures and documents it makes.',
+      openFile: 'Show in folder', taskFallback: 'Untitled', notStarted: 'Couldn’t start Claude',
+      details: 'Details', consent: 'Tasks are done by Claude from Anthropic: what you write and the files it looks at go to Anthropic.',
+      consentOk: 'Got it, start',
+      point: 'Point and say', pointTitle: 'Show on the page what to change: say it, or change it by hand', pointNoSite: 'Open the site alongside first',
+      pointChip: 'Show on the page', pickTitle: 'Pick an element on the page — your message will be about it', unpick: 'Clear the pick',
+      pinYes: (n, t) => `Yes, do what you suggested in pin ${n}: ${t}`, andMore: (n) => `and ${n} more`,
+      handTitle: 'You changed by hand:', handNext: 'Claude hears about it with the next message.',
+      handPrompt: (host, lines) => `I changed these by hand on ${host} (already in the Boost "Studio · ${host}"; don't overwrite it, keep it from now on):\n${lines}`,
+      sayPrompt: (host, list, text) => `On ${host} I pointed at:\n${list}\n\n${text}\n\nChange only that (through a Boost on this site), leave the rest.`,
+      brand: 'Brand', fromSite: 'from the site', readOnly: 'read only', palette: 'Palette', fonts: 'Fonts', fontSample: 'Fresh coffee', headings: 'headings', bodyText: 'text', remove: 'Remove',
+      brandNone: 'No brand yet', brandNoneHint: 'Studio paints only with the brand’s colours and notices what on the site falls out of it.',
+      brandFromSite: (h) => `Take colours and fonts from ${h}`, brandNeedSite: 'Open the site in a task first', brandRetake: 'Take again from the site', brandNoColors: 'No colours found on the page',
+      brandCheck: 'Check the site against the brand', brandAllGood: 'Everything on the page is in brand colours.',
+      driftTitle: (n) => `${n} colour${n === 1 ? '' : 's'} on the site ${n === 1 ? 'isn’t' : 'aren’t'} from the brand — replace?`,
+      driftFix: 'Replace all', driftWhere: 'Show where', driftKeep: 'Keep',
+      figmaOff: 'not connected', figmaOn: 'connected', figmaNotRunning: 'not connected — Figma isn’t answering', figmaOpen: 'Open Figma',
+      figmaLinkHint: 'Paste a link to the file with the colours and fonts (Styles / Variables)',
+      siteAddress: 'Site address', takeFromSite: 'Take from the site', siteBad: 'It needs a site address, like zerno.coffee', figmaConnect: 'Connect Figma', figmaLink: 'Link to the brand file in Figma', figmaTake: 'Take the brand',
+      figmaHow: 'Open Figma on this computer and switch on, once: Figma menu → Preferences → Dev Mode MCP Server. Studio only reads designs.',
+      figmaBadLink: 'It needs a link like https://www.figma.com/…',
+      figmaPrompt: (l) => `Take the brand from Figma (read only, change nothing in Figma): ${l}\nFind the brand colours and fonts (variables and styles) and write them to brand.json in this folder as: {"source":"figma","name":"<name>","colors":[{"name":"<name>","value":"#RRGGBB"}],"fonts":[{"family":"<font>","use":"head" or "text"}]}. Say briefly what you found.`,
+      cards: 'Cards', chat: 'Chat', allTasks: 'All tasks', all: 'All', inWork: 'Working', look: 'Look',
+      handoff: 'Send to developers', ownWords: 'Or in your own words…',
+      taskCount: (n) => `${n} task${n === 1 ? '' : 's'}`,
+      needsCount: (n) => `${n} need${n === 1 ? 's' : ''} you`, filesCount: (n) => `Files: ${n}`,
+      handoffPrompt: 'Get this ready for the developers: in the Drafts folder write handoff.md — what changed and why, before and after screenshots, the exact colours, fonts and spacing, and which files of the site it touches. If the site is a git repository, prepare a branch with the changes and a draft pull request, but send or publish nothing without my yes. No jargon.',
+      whoTitle: 'Who are you?', whoLead: 'Pick a hero — Meridian fits itself to your work. Change it any time.', skip: 'Skip',
+      whoNote: 'The guess comes from the apps on this computer. Nothing is sent anywhere.', whoChange: 'Studio and the Workbench are always a click apart — this decides which opens first.',
+      guess: 'Looks like you', roleChange: 'Who are you? Change the role',
+      personas: {
+        developer: { name: 'Developer', cls: 'Netrunner', role: 'code and agents', perks: [['term', 'Code and terminal in the Workbench'], ['cursor', 'Agents drive the browser'], ['grid', 'Every agent in Mission Control']], gets: 'Opens the <b>Workbench</b>', cta: 'I’m a developer — next' },
+        designer: { name: 'Designer', cls: 'Enchantress', role: 'mockups and sites', perks: [['brush', 'Change the site in words'], ['drop', 'The Figma brand stays put'], ['undo', 'Every change can be undone']], gets: 'Opens <b>Studio</b>', cta: 'I’m a designer — next' },
+        manager: { name: 'Manager', cls: 'Sorceress', role: 'tasks and reports', perks: [['doc', 'Reports from tasks, live'], ['shield', 'Nothing goes out without a yes'], ['split', 'Work and personal apart']], gets: 'Opens <b>Studio</b>', cta: 'I’m a manager — next' },
+        everyday: { name: 'Just browsing', cls: 'Traveller', role: 'sites and mail', perks: [['tabs', 'Tabs that tidy themselves'], ['search', 'Find any open tab'], ['spark', 'AI only when asked']], gets: 'Opens <b>Studio</b>, nothing extra', cta: 'Just browsing — next' },
+      },
+      trustTitle: 'Let Claude work in this folder?', trustDetail: (n) => `Claude will look at the files in ${n} and ask before it changes anything.`,
+    },
+  };
+
+  const host = (url) => { try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; } };
+  const base = (p) => String(p || '').split('/').filter(Boolean).pop() || String(p || '');
+  const clip = (s, n = 60) => { s = String(s || '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
+
+  // [icon, done text, doing text] for a step, in `lang`.
+  function stepWords(tool, input, lang) {
+    const ru = lang === 'ru';
+    const i = input || {};
+    const f = base(i.file_path || i.notebook_path || i.path);
+    const site = host(i.url);
+    const say = (icon, r, e, rNow, eNow) => [icon, ru ? r : e, ru ? (rNow || r) : (eNow || e)];
+    const mcp = /^mcp__([^_]+(?:_[^_]+)*)__(.+)$/.exec(tool);
+    if (mcp) {
+      const server = mcp[1].toLowerCase(), name = mcp[2];
+      if (server.includes('meridian')) {
+        switch (name) {
+          case 'navigate': case 'open_tab': return say('globe', `Открыл сайт ${site}`.trim(), `Opened ${site || 'a site'}`, `Открываю ${site}`.trim(), `Opening ${site || 'a site'}`);
+          case 'screenshot': return say('camera', 'Снял скриншот', 'Took a screenshot', 'Снимаю скриншот', 'Taking a screenshot');
+          case 'read_page': case 'get_interactive_elements': return say('file', 'Прочитал страницу', 'Read the page', 'Читаю страницу', 'Reading the page');
+          case 'set_boost': return say('palette', 'Применил новый стиль к сайту', 'Restyled the site', 'Применяю стиль к сайту', 'Restyling the site');
+          case 'get_boost': return say('palette', 'Посмотрел текущий стиль сайта', 'Checked the site’s style');
+          case 'click': return say('sparkles', 'Нажал на странице', 'Clicked on the page');
+          case 'type_text': return say('pencil', 'Ввёл текст на странице', 'Typed on the page');
+          case 'scroll': return say('sparkles', 'Прокрутил страницу', 'Scrolled the page');
+          case 'list_tabs': case 'search_tabs': return say('layers', 'Посмотрел открытые вкладки', 'Looked at the open tabs');
+          case 'split_view': return say('layers', 'Открыл страницы рядом', 'Put pages side by side');
+          case 'translate_page': return say('globe', 'Перевёл страницу', 'Translated the page');
+          case 'wait_for': return say('history', 'Подождал, пока страница загрузится', 'Waited for the page');
+          default: return say('globe', 'Сделал шаг в браузере', 'Did a step in the browser');
+        }
+      }
+      if (server.includes('figma')) return say('palette', 'Посмотрел макет в Figma', 'Looked at the Figma file', 'Смотрю макет в Figma', 'Looking at the Figma file');
+      const svc = server.replace(/^claude_ai_/, '').replace(/[_-]+/g, ' ').trim();
+      const nice = svc ? svc.charAt(0).toUpperCase() + svc.slice(1) : '';
+      return say('puzzle', nice ? `Обратился к ${nice}` : 'Воспользовался подключённым сервисом', nice ? `Used ${nice}` : 'Used a connected service', nice ? `Обращаюсь к ${nice}` : 'Обращаюсь к сервису', nice ? `Using ${nice}` : 'Using a service');
+    }
+    switch (tool) {
+      case 'Read': case 'NotebookRead': return say('file', `Посмотрел ${f || 'файл'}`, `Looked at ${f || 'a file'}`, `Смотрю ${f || 'файл'}`, `Looking at ${f || 'a file'}`);
+      case 'Write': return say('pencil', `Создал файл ${f}`, `Created ${f}`, `Создаю файл ${f}`, `Creating ${f}`);
+      case 'Edit': case 'MultiEdit': case 'NotebookEdit': return say('pencil', `Изменил ${f}`, `Changed ${f}`, `Меняю ${f}`, `Changing ${f}`);
+      case 'Artifact': return say('globe', 'Опубликовал страницу', 'Published a page', 'Публикую страницу', 'Publishing a page');
+      case 'ArtifactComments': return say('chat', 'Посмотрел комментарии к странице', 'Read the page’s comments');
+      case 'ArtifactData': return say('layers', 'Обновил данные страницы', 'Updated the page’s data');
+      case 'Skill': return say('sparkles', `Взял навык${i.skill ? `: ${clip(i.skill, 30)}` : ''}`, `Used a skill${i.skill ? `: ${clip(i.skill, 30)}` : ''}`);
+      case 'ToolSearch': return say('search', 'Подготовил инструменты', 'Got its tools ready');
+      case 'BashOutput': case 'KillShell': case 'KillBash': case 'TaskOutput': case 'TaskStop': return say('history', 'Проверил, как идёт работа', 'Checked on the work');
+      case 'TaskCreate': case 'TaskUpdate': case 'TaskList': case 'TaskGet': return say('layers', 'Обновил план', 'Updated the plan');
+      case 'SlashCommand': return say('wand', 'Выполнил команду', 'Ran a command');
+      case 'Glob': case 'Grep': case 'LS': return say('search', 'Поискал по файлам', 'Searched the files', 'Ищу по файлам', 'Searching the files');
+      case 'WebFetch': return say('globe', `Открыл страницу ${site}`.trim(), `Opened ${site || 'a page'}`, `Открываю ${site}`.trim(), `Opening ${site || 'a page'}`);
+      case 'WebSearch': return say('search', `Поискал в интернете: ${clip(i.query, 40)}`, `Searched the web: ${clip(i.query, 40)}`);
+      case 'TodoWrite': return say('layers', 'Составил план', 'Made a plan');
+      case 'Task': case 'Agent': return say('sparkles', `Позвал помощника: ${clip(i.description, 40)}`, `Asked a helper: ${clip(i.description, 40)}`);
+      case 'Bash': case 'PowerShell': {
+        const d = clip(i.description, 56) || cmdWords(i.command, ru);
+        return d ? say('wand', d, d) : say('wand', 'Выполнил команду', 'Ran a command', 'Выполняю команду', 'Running a command');
+      }
+      case 'ExitPlanMode': return say('layers', 'Предложил план', 'Proposed a plan');
+      case 'AskUserQuestion': {
+        const q = clip(questionsOf(i)[0]?.question, 70);
+        return q ? say('chat', `Спросил: ${q}`, `Asked: ${q}`, `Спрашивает: ${q}`, `Asking: ${q}`) : say('chat', 'Задал вопрос', 'Asked a question', 'Задаёт вопрос', 'Asking a question');
+      }
+      default: return say('sparkles', 'Работал над задачей', 'Worked on the task', 'Работаю над задачей', 'Working on the task');
+    }
+  }
+
+  // A command in a few words, when Claude gave it no description.
+  function cmdWords(cmd, ru) {
+    const c = String(cmd || '').trim();
+    if (!c) return '';
+    const first = c.split(/\s+/)[0].replace(/^.*\//, '');
+    const known = {
+      npm: ['Запустил npm', 'Ran npm'], npx: ['Запустил инструмент', 'Ran a tool'], node: ['Запустил скрипт', 'Ran a script'], python3: ['Запустил скрипт', 'Ran a script'], python: ['Запустил скрипт', 'Ran a script'],
+      git: ['Посмотрел историю изменений', 'Checked the history'], ls: ['Посмотрел, что в папке', 'Looked at the folder'], cat: ['Посмотрел файл', 'Looked at a file'],
+      mkdir: ['Создал папку', 'Made a folder'], cp: ['Скопировал файлы', 'Copied files'], mv: ['Переместил файлы', 'Moved files'], open: ['Открыл файл', 'Opened a file'],
+      curl: ['Скачал страницу', 'Fetched a page'], grep: ['Поискал по файлам', 'Searched the files'], rg: ['Поискал по файлам', 'Searched the files'], find: ['Поискал файлы', 'Looked for files'],
+    };
+    const k = known[first];
+    return k ? (ru ? k[0] : k[1]) : '';
+  }
+
+  // The technical line under «Подробнее»: the tool and what it was given.
+  function stepDetail(tool, input) {
+    const i = input || {};
+    const what = i.command || i.file_path || i.notebook_path || i.url || i.query || i.pattern || i.path || i.description || i.skill || '';
+    return `${tool}${what ? ` · ${clip(what, 160)}` : ''}`;
+  }
+
+  // The questions of an AskUserQuestion, from its input (an object or its JSON,
+  // which may come cut): [{question, header, multiSelect, options: [{label, description}]}].
+  function questionsOf(input) {
+    let i = input;
+    if (typeof i === 'string') { try { i = JSON.parse(i); } catch { i = null; } }
+    const qs = Array.isArray(i?.questions) ? i.questions : [];
+    return qs.filter((q) => q && typeof q.question === 'string').map((q) => ({
+      question: q.question, header: typeof q.header === 'string' ? q.header : '', multiSelect: !!q.multiSelect,
+      options: (Array.isArray(q.options) ? q.options : []).filter((o) => o && typeof o.label === 'string')
+        .map((o) => ({ label: o.label, description: typeof o.description === 'string' ? o.description : '' })),
+    }));
+  }
+
+  // A permission question in plain words, saying what exactly: [title, detail].
+  // «Разрешить: создать файл compare.html?»
+  function askWords(tool, summary, lang) {
+    const ru = lang === 'ru';
+    const s = String(summary || '');
+    const parts = s.split('/').filter(Boolean);
+    const folder = parts.length > 1 ? parts[parts.length - 2] : '';
+    const file = clip(parts[parts.length - 1] || '', 60);
+    const mcp = /^mcp__([^_]+(?:_[^_]+)*)__(.+)$/.exec(tool || '');
+    const ask = (r, e) => (ru ? `Разрешить: ${r}?` : `Allow: ${e}?`);
+    const where = folder ? (ru ? ` Папка ${folder}.` : ` Folder ${folder}.`) : '';
+    if (tool === 'Write') {
+      return [file ? ask(`создать файл ${file}`, `create the file ${file}`) : ask('создать файл', 'create a file'),
+        (ru ? 'Новый файл, остальное не трогаю.' : 'A new file; nothing else is touched.') + where];
+    }
+    if (/^(Edit|MultiEdit|NotebookEdit)$/.test(tool)) {
+      return [file ? ask(`изменить ${file}`, `change ${file}`) : ask('изменить файл', 'change a file'),
+        (ru ? 'Всё можно вернуть.' : 'Everything can be undone.') + where];
+    }
+    if (tool === 'Read') return [file ? ask(`посмотреть ${file}`, `look at ${file}`) : ask('посмотреть файл', 'look at a file'), where.trim()];
+    if (mcp && mcp[1].toLowerCase().includes('meridian')) {
+      const n = mcp[2];
+      if (n === 'set_boost') return [ask('перекрасить сайт', 'restyle the site'), ru ? 'Это Boost: меняется только вид у вас в браузере, его можно отменить одной кнопкой.' : 'It’s a Boost: only how it looks in your browser changes, and one button undoes it.'];
+      if (n === 'navigate' || n === 'open_tab') return [ask(`открыть ${host(s) || 'сайт'}`, `open ${host(s) || 'a site'}`), s];
+      if (n === 'click') return [ask('нажать на странице', 'click on the page'), ''];
+      if (n === 'type_text') return [ask('ввести текст на странице', 'type on the page'), ''];
+      return [ask('действие в браузере', 'a step in the browser'), ''];
+    }
+    if (mcp && mcp[1].toLowerCase().includes('figma')) return [ask('посмотреть макет в Figma', 'read the Figma file'), ru ? 'Только чтение: в Figma ничего не меняется.' : 'Read only: nothing changes in Figma.'];
+    if (tool === 'Bash' || tool === 'PowerShell') {
+      const c = clip(s.split('\n')[0], 48);
+      return [c ? ask(`выполнить команду «${c}»`, `run the command “${c}”`) : ask('выполнить команду', 'run a command'), ru ? 'Команда целиком — в «Подробнее».' : 'The whole command is under Details.'];
+    }
+    if (tool === 'WebFetch') return [ask(`открыть ${host(s) || 'страницу'}`, `open ${host(s) || 'a page'}`), s];
+    if (tool === 'WebSearch') return [ask(`поискать «${clip(s, 40)}»`, `search for “${clip(s, 40)}”`), ''];
+    if (tool === 'ExitPlanMode') return [ru ? 'Claude предлагает план. Начинать?' : 'Claude has a plan. Start?', ''];
+    if (mcp) {
+      const svc = mcp[1].replace(/^claude_ai_/, '').replace(/[_-]+/g, ' ').trim();
+      const nice = svc ? svc.charAt(0).toUpperCase() + svc.slice(1) : '';
+      return [nice ? ask(`обратиться к ${nice}`, `use ${nice}`) : ask('обратиться к подключённому сервису', 'use a connected service'), s ? clip(s, 160) : ''];
+    }
+    if (tool === 'Task' || tool === 'Agent') return [ask('позвать помощника', 'ask a helper'), s ? clip(s, 160) : ''];
+    return [ask('следующий шаг', 'the next step'), s ? clip(s, 160) : ''];
+  }
+  // Hand changes (CSS properties) in words.
+  function handWords(props, lang) {
+    const ru = lang === 'ru';
+    const out = [];
+    for (const [p, v] of Object.entries(props || {})) {
+      if (p === 'background-color' || p === 'color') out.push(`${ru ? 'цвет' : 'colour'} ${v}`);
+      else if (p === 'font-size') out.push(`${ru ? 'текст' : 'text'} ${v}`);
+      else if (p === 'border-radius') out.push(`${ru ? 'скругление' : 'corners'} ${v}`);
+      else if (/^padding-(left|right)$/.test(p)) { const t = `${ru ? 'отступы по бокам' : 'side spacing'} ${v}`; if (!out.includes(t)) out.push(t); }
+      else if (/^padding-(top|bottom)$/.test(p)) { const t = `${ru ? 'отступы сверху и снизу' : 'top and bottom spacing'} ${v}`; if (!out.includes(t)) out.push(t); }
+      else out.push(`${p} ${v}`);
+    }
+    return out;
+  }
+
+  const api = { T, stepWords, askWords, questionsOf, host, handWords, stepDetail };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  else root.StudioWords = api;
+})(typeof window !== 'undefined' ? window : globalThis);

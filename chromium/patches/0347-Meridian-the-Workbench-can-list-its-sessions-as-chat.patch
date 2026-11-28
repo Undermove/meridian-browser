@@ -1,0 +1,766 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Thu, 26 Nov 2026 21:32:54 +0400
+Subject: [PATCH] Meridian: the Workbench can list its sessions as chats, each
+ with its status from Claude Code's hooks, and one mark on its sidebar row
+
+A preview the Workbench page turns on (Customize > Advanced > Chats list).
+Mission Control keeps, per Workbench that lists its sessions, the session on
+screen and the list's order: a turn that ends (Stop) in a session not on
+screen is "done, not seen" until shown. Snapshot nodes get "chat"
+(needs / working / done / idle, '' without hooks) and "unseen"; the
+snapshot gets "chats" per Workbench tab. The Workbench page gets each
+terminal's state with its mission message while it lists them. The
+sidebar's row of such a Workbench tab shows one mark: orange with a count
+when sessions need you, else blue with a count, else a spinner; a click
+while one needs you opens it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ .../meridian/mission/mission_control.cc       | 120 ++++++++++++++++--
+ .../meridian/mission/mission_control.h        |  32 +++++
+ .../meridian/workbench/workbench_handler.cc   |  76 +++++++++++
+ .../meridian/workbench/workbench_handler.h    |   2 +
+ .../browser/resources/webui_browser/BUILD.gn  |   1 +
+ .../webui_browser/meridian/item.html.ts       |   3 +
+ .../resources/webui_browser/meridian/item.ts  |  27 ++++
+ .../resources/webui_browser/meridian/rows.css |  55 ++++++++
+ .../webui_browser/meridian/sidebar.ts         |   3 +
+ .../webui_browser/meridian/tab_row.html.ts    |   3 +
+ .../webui_browser/meridian/tab_row.ts         |  27 ++++
+ .../webui_browser/meridian/workbench_badge.ts |  82 ++++++++++++
+ 12 files changed, 422 insertions(+), 9 deletions(-)
+ create mode 100644 chrome/browser/resources/webui_browser/meridian/workbench_badge.ts
+
+diff --git a/chrome/browser/meridian/mission/mission_control.cc b/chrome/browser/meridian/mission/mission_control.cc
+index 1981985c55..9dab4755f5 100644
+--- a/chrome/browser/meridian/mission/mission_control.cc
++++ b/chrome/browser/meridian/mission/mission_control.cc
+@@ -228,6 +228,11 @@ MissionControl::Node::Node() = default;
+ MissionControl::Node::Node(const Node&) = default;
+ MissionControl::Node& MissionControl::Node::operator=(const Node&) = default;
+ MissionControl::Node::~Node() = default;
++MissionControl::ChatsView::ChatsView() = default;
++MissionControl::ChatsView::ChatsView(const ChatsView&) = default;
++MissionControl::ChatsView& MissionControl::ChatsView::operator=(
++    const ChatsView&) = default;
++MissionControl::ChatsView::~ChatsView() = default;
+ 
+ MissionControl::MissionControl(Profile* profile)
+     : profile_(profile),
+@@ -854,6 +859,12 @@ void MissionControl::OnHookEvent(const std::string& node_id,
+     root = Get(root_id);
+     root->tool.reset();
+     SetStatus(*root, "idle", "Turn finished");
++    // A Workbench lists its sessions and shows another one (or is hidden):
++    // done, not seen yet.
++    if (auto view = chats_.find(root->owner_tab);
++        view != chats_.end() && view->second.on_screen != root->term_id) {
++      root->unseen = true;
++    }
+   } else if (event == "StopFailure") {
+     root->tool.reset();
+     root->errors++;
+@@ -1191,6 +1202,10 @@ void MissionControl::SetStatus(Node& node,
+   if (status != "tool" && status != "waiting") {
+     node.tool.reset();
+   }
++  // Working again (or waiting): no longer "done, not seen".
++  if (Working(status) || status == "waiting") {
++    node.unseen = false;
++  }
+   if (status == "waiting") {
+     if (was != "waiting") {
+       node.waiting_since = Now();
+@@ -1579,6 +1594,89 @@ base::DictValue MissionControl::Counts() const {
+       .Set("live", live);
+ }
+ 
++std::string MissionControl::ChatState(const Node& root) const {
++  if (root.kind != "session" || !root.parent_id.empty() || root.ended_at ||
++      root.dormant || root.source != "claude") {
++    return std::string();
++  }
++  bool needs = root.status == "waiting";
++  for (const auto& [id, n] : nodes_) {
++    needs =
++        needs || (n.root_id == root.id && !n.ended_at && n.status == "waiting");
++  }
++  if (needs) {
++    return "needs";
++  }
++  // "starting" is before any hook: nothing told yet.
++  if (root.status == "thinking" || root.status == "tool") {
++    return "working";
++  }
++  return root.unseen ? "done" : "idle";
++}
++
++base::ListValue MissionControl::ChatsSummary() const {
++  base::ListValue out;
++  for (const auto& [tab, view] : chats_) {
++    int needs = 0, done = 0, working = 0;
++    std::string first;
++    size_t first_at = 0;
++    for (const auto& [id, n] : nodes_) {
++      if (n.owner_tab != tab) {
++        continue;
++      }
++      std::string state = ChatState(n);
++      if (state == "needs") {
++        needs++;
++        size_t at = static_cast<size_t>(
++            std::ranges::find(view.order, n.term_id) - view.order.begin());
++        if (first.empty() || at < first_at) {
++          first = n.id;
++          first_at = at;
++        }
++      }
++      done += state == "done";
++      working += state == "working";
++    }
++    out.Append(base::DictValue()
++                   .Set("tab", tab)
++                   .Set("onScreen", view.on_screen)
++                   .Set("needs", needs)
++                   .Set("done", done)
++                   .Set("working", working)
++                   .Set("first", first));
++  }
++  return out;
++}
++
++void MissionControl::SetChatsView(int owner_tab,
++                                  bool on,
++                                  const std::string& on_screen,
++                                  std::vector<std::string> order) {
++  if (!owner_tab) {
++    return;
++  }
++  if (!on) {
++    if (chats_.erase(owner_tab)) {
++      Changed();
++    }
++    return;
++  }
++  if (order.size() > 200) {
++    order.resize(200);
++  }
++  ChatsView& view = chats_[owner_tab];
++  view.on_screen = on_screen;
++  view.order = std::move(order);
++  // Shown: seen.
++  for (auto& [id, n] : nodes_) {
++    if (!on_screen.empty() && n.owner_tab == owner_tab && n.parent_id.empty() &&
++        n.term_id == on_screen) {
++      n.unseen = false;
++    }
++  }
++  Changed();
++}
++
+ base::DictValue MissionControl::Snapshot() const {
+   base::ListValue nodes;
+   for (const auto& [id, n] : nodes_) {
+@@ -1601,23 +1699,24 @@ base::DictValue MissionControl::Snapshot() const {
+             .Set("source", n.source)
+             .Set("where", n.where)
+             .Set("label", n.display_name.empty() ? n.label : n.display_name)
+-            .Set("sublabel", n.display_name.empty()
+-                                 ? OptString(n.sublabel)
+-                                 : base::Value(AgentLine(n)))
++            .Set("sublabel", n.display_name.empty() ? OptString(n.sublabel)
++                                                    : base::Value(AgentLine(n)))
+             .Set("ownerTab", n.owner_tab)
+             .Set("background", n.background)
+             .Set("project", OptString(n.project))
+             .Set("status", n.status)
+             .Set("statusText", OptString(n.status_text))
+-            .Set("tool", n.tool ? base::Value(base::DictValue()
+-                                                  .Set("name", n.tool->first)
+-                                                  .Set("summary",
+-                                                       OptString(n.tool->second)))
+-                                : base::Value())
++            .Set("tool", n.tool
++                             ? base::Value(base::DictValue()
++                                               .Set("name", n.tool->first)
++                                               .Set("summary",
++                                                    OptString(n.tool->second)))
++                             : base::Value())
+             .Set("toolCalls", n.tool_calls)
+             .Set("errors", n.errors)
+             .Set("startedAt", n.started_at)
+-            .Set("endedAt", n.ended_at ? base::Value(n.ended_at) : base::Value())
++            .Set("endedAt",
++                 n.ended_at ? base::Value(n.ended_at) : base::Value())
+             .Set("waitingSince",
+                  n.waiting_since ? base::Value(n.waiting_since) : base::Value())
+             .Set("termId", OptString(n.term_id))
+@@ -1628,6 +1727,8 @@ base::DictValue MissionControl::Snapshot() const {
+                               ? base::Value()
+                               : base::Value(n.usage.dict.Clone()))
+             .Set("permissionMode", OptString(n.permission_mode))
++            .Set("unseen", n.unseen)
++            .Set("chat", ChatState(n))
+             .Set("log", std::move(log)));
+   }
+   base::ListValue asks;
+@@ -1655,6 +1756,7 @@ base::DictValue MissionControl::Snapshot() const {
+       .Set("asks", std::move(asks))
+       .Set("history", history_.Clone())
+       .Set("counts", Counts())
++      .Set("chats", ChatsSummary())
+       .Set("notified", notified_.Clone())
+       .Set("now", Now());
+ }
+diff --git a/chrome/browser/meridian/mission/mission_control.h b/chrome/browser/meridian/mission/mission_control.h
+index 8cfdef2e0b..9b261d76f5 100644
+--- a/chrome/browser/meridian/mission/mission_control.h
++++ b/chrome/browser/meridian/mission/mission_control.h
+@@ -196,6 +196,17 @@ class MissionControl : public KeyedService,
+   // Answered elsewhere (the native dialog): `done` gets "none".
+   void CancelAsk(const std::string& id);
+ 
++  // ---- The Workbench's chats list (a preview the page turns on) ----
++  // The Workbench in tab `owner_tab` lists its sessions: `on_screen` is the
++  // terminal the person sees there ("" while that tab is hidden), `order` the
++  // list's order (terminal ids). A Claude Code turn that ends (its Stop hook)
++  // in a session not on screen is "done, not seen" until it is shown. `on`
++  // false: that Workbench stopped listing them (or closed).
++  void SetChatsView(int owner_tab,
++                    bool on,
++                    const std::string& on_screen,
++                    std::vector<std::string> order);
++
+   // ---- The view ----
+   base::DictValue Snapshot() const;
+   bool Dismiss(const std::string& id);
+@@ -285,6 +296,9 @@ class MissionControl : public KeyedService,
+     int compactions = 0;
+     // The main session's permission mode, as its hooks last reported it.
+     std::string permission_mode;
++    // Its last turn ended while the Workbench listing it showed another
++    // session (or was hidden), and it hasn't been shown since.
++    bool unseen = false;
+   };
+   // Under a session's own name: the agent and its model.
+   static std::string AgentLine(const Node& n);
+@@ -326,6 +340,14 @@ class MissionControl : public KeyedService,
+   void Changed();
+   void Flush();
+   base::DictValue Counts() const;
++  // A session's state in the Workbench's chats list, from its hooks only:
++  // "needs" (it or a subagent waits for a permission or an answer),
++  // "working" (a turn runs), "done" (a turn ended, not seen yet), "idle";
++  // "" for what isn't a live Claude Code session (no hooks to go by).
++  std::string ChatState(const Node& root) const;
++  // Per Workbench listing its sessions: how many need you, are done unseen,
++  // work; the first that needs you in the list's order.
++  base::ListValue ChatsSummary() const;
+   std::vector<NamedSecret> SecretValues() const;
+   void LoadHistory();
+ 
+@@ -366,6 +388,16 @@ class MissionControl : public KeyedService,
+   base::ListValue notified_;
+   bool quiet_ = false;
+   std::string last_badge_;
++  // Workbench tab handle -> what its chats list shows.
++  struct ChatsView {
++    ChatsView();
++    ChatsView(const ChatsView&);
++    ChatsView& operator=(const ChatsView&);
++    ~ChatsView();
++    std::string on_screen;
++    std::vector<std::string> order;
++  };
++  std::map<int, ChatsView> chats_;
+   base::RepeatingTimer sweep_;
+   base::OneShotTimer flush_;
+   base::ImportantFileWriter history_writer_;
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.cc b/chrome/browser/meridian/workbench/workbench_handler.cc
+index be34c5b0e6..38b299dc4d 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.cc
++++ b/chrome/browser/meridian/workbench/workbench_handler.cc
+@@ -390,6 +390,9 @@ WorkbenchHandler::~WorkbenchHandler() {
+   std::vector<base::FilePath> cleanup;
+   mission::MissionControl* mission =
+       mission::MissionControlFactory::GetForProfile(profile_);
++  if (mission && chats_owner_) {
++    mission->SetChatsView(chats_owner_, false, std::string(), {});
++  }
+   // Closing the Workbench's tab doesn't stop what runs in its terminals
+   // (agents mid-work): they go on, kept by the profile's Workbench service,
+   // and the next Workbench that opens their project shows them again.
+@@ -3779,6 +3782,50 @@ void WorkbenchHandler::OnMissionChanged(const base::DictValue& snapshot) {
+     }
+   }
+   counts.Set("usage", std::move(usage));
++  // The chats list (a preview, only when the page lists them): each session's
++  // state from its hooks, by terminal.
++  if (chats_owner_) {
++    base::DictValue sessions;
++    const base::ListValue* asks = snapshot.FindList("asks");
++    if (const base::ListValue* nodes = snapshot.FindList("nodes")) {
++      for (const base::Value& v : *nodes) {
++        const base::DictValue& n = v.GetDict();
++        const std::string* term = n.FindString("termId");
++        const std::string* chat = n.FindString("chat");
++        const std::string* id = n.FindString("id");
++        if (n.FindInt("ownerTab").value_or(0) != self || !term || !chat ||
++            chat->empty() || !id || !terms_.contains(*term)) {
++          continue;
++        }
++        base::DictValue entry;
++        entry.Set("chat", *chat);
++        if (const std::string* text = n.FindString("statusText")) {
++          entry.Set("text", *text);
++        }
++        if (const base::DictValue* tool = n.FindDict("tool")) {
++          entry.Set("tool", tool->Clone());
++        }
++        // What it asks (the oldest question still open).
++        for (size_t i = 0; asks && i < asks->size(); ++i) {
++          const base::DictValue& a = (*asks)[i].GetDict();
++          const std::string* node = a.FindString("nodeId");
++          if (node && *node == *id) {
++            base::DictValue ask;
++            if (const std::string* t = a.FindString("tool")) {
++              ask.Set("tool", *t);
++            }
++            if (const std::string* sum = a.FindString("summary")) {
++              ask.Set("summary", *sum);
++            }
++            entry.Set("ask", std::move(ask));
++            break;
++          }
++        }
++        sessions.Set(*term, std::move(entry));
++      }
++    }
++    counts.Set("sessions", std::move(sessions));
++  }
+   Emit("wb:command", base::Value(std::move(counts)));
+ }
+ 
+@@ -3788,6 +3835,35 @@ void WorkbenchHandler::ToHost(const base::DictValue& message) {
+     SidebarHandler::ShowMissionControl(profile_, std::string());
+     return;
+   }
++  if (type && *type == "chats") {
++    // The chats list (a preview): which session is on screen, in what order.
++    tabs::TabInterface* tab =
++        tabs::TabInterface::MaybeGetFromContents(web_ui()->GetWebContents());
++    const int owner = tab ? tab->GetHandle().raw_value() : 0;
++    mission::MissionControl* mission =
++        mission::MissionControlFactory::GetForProfile(profile_);
++    if (!owner || !mission) {
++      return;
++    }
++    std::vector<std::string> order;
++    if (const base::ListValue* list = message.FindList("order")) {
++      for (const base::Value& v : *list) {
++        if (v.is_string() && terms_.contains(v.GetString())) {
++          order.push_back(v.GetString());
++        }
++      }
++    }
++    const std::string* shown = message.FindString("onScreen");
++    const bool on = message.FindBool("on").value_or(false);
++    if (chats_owner_ && chats_owner_ != owner) {
++      mission->SetChatsView(chats_owner_, false, std::string(), {});
++    }
++    chats_owner_ = on ? owner : 0;
++    mission->SetChatsView(
++        owner, on, shown && terms_.contains(*shown) ? *shown : std::string(),
++        std::move(order));
++    return;
++  }
+   if (type && *type == "ready") {
+     // A pinned hub reopens its project (chrome://workbench/?project=…); the
+     // page only opens folders already picked in the native dialog.
+diff --git a/chrome/browser/meridian/workbench/workbench_handler.h b/chrome/browser/meridian/workbench/workbench_handler.h
+index bed44f4751..fc2948f6af 100644
+--- a/chrome/browser/meridian/workbench/workbench_handler.h
++++ b/chrome/browser/meridian/workbench/workbench_handler.h
+@@ -241,6 +241,8 @@ class WorkbenchHandler : public content::WebUIMessageHandler,
+       session_accounts_;
+   // The space this page's terminals run in.
+   std::string SpaceForTerminals();
++  // The tab handle this page's chats list reported under (0: not listing).
++  int chats_owner_ = 0;
+   base::CallbackListSubscription custom_subscription_;
+   base::ScopedObservation<mission::MissionControl,
+                           mission::MissionControl::Observer>
+diff --git a/chrome/browser/resources/webui_browser/BUILD.gn b/chrome/browser/resources/webui_browser/BUILD.gn
+index 06cc6959cb..4f21e74a8e 100644
+--- a/chrome/browser/resources/webui_browser/BUILD.gn
++++ b/chrome/browser/resources/webui_browser/BUILD.gn
+@@ -96,6 +96,7 @@ build_webui("build") {
+     "meridian/theme_editor.html.ts",
+     "meridian/theme_editor.ts",
+     "meridian/tab_row.ts",
++    "meridian/workbench_badge.ts",
+     "side_panel.html.ts",
+     "side_panel.ts",
+     "tab_strip/events.ts",
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.html.ts b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+index e5d47fb457..c64ba8f0d0 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.html.ts
+@@ -5,6 +5,7 @@
+ import {html, repeat} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+ import {icon} from './icons.js';
++import {workbenchBadgeHtml} from './workbench_badge.js';
+ import type {MeridianItemElement} from './item.js';
+ 
+ export function getHtml(this: MeridianItemElement) {
+@@ -52,6 +53,7 @@ ${this.item && !this.item.isFolder ? html`
+       draggable="true" data-item="${this.item.id}"
+       data-parent="${this.parentId}" title="${this.title_}"
+       @mousedown="${this.onRowMousedown_}"
++      @click="${this.onRowClick_}"
+       @dblclick="${this.onRowDblclick_}"
+       @contextmenu="${this.onRowContextmenu_}">
+     ${this.away_ ? html`
+@@ -68,6 +70,7 @@ ${this.item && !this.item.isFolder ? html`
+       <input class="rename url" .value="${this.item.url}" spellcheck="false"
+           @keydown="${this.onRenameKeydown_}" @blur="${this.onUrlBlur_}">
+     ` : html`<span class="title">${this.title_}</span>`}`}
++    ${workbenchBadgeHtml(this.wbBadge_)}
+     ${this.call_ ? html`
+       <button class="row-btn call" title="This call is sharing a tab"
+           @mousedown="${this.onAudioMousedown_}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/item.ts b/chrome/browser/resources/webui_browser/meridian/item.ts
+index d064cb904f..edec23765f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/item.ts
++++ b/chrome/browser/resources/webui_browser/meridian/item.ts
+@@ -17,6 +17,8 @@ import type {IconName} from './icons.js';
+ import {getHtml} from './item.html.js';
+ import {getCss} from './rows.css.js';
+ import type {MeridianSidebarElement} from './sidebar.js';
++import {onWorkbenchBadges, workbenchBadge} from './workbench_badge.js';
++import type {WorkbenchBadge} from './workbench_badge.js';
+ 
+ export class MeridianItemElement extends CrLitElement {
+   static get is() {
+@@ -51,6 +53,7 @@ export class MeridianItemElement extends CrLitElement {
+       sharing_: {state: true, type: Boolean},
+       canShare_: {state: true, type: Boolean},
+       call_: {state: true, type: Boolean},
++      wbBadge_: {state: true, type: Object},
+     };
+   }
+ 
+@@ -77,6 +80,9 @@ export class MeridianItemElement extends CrLitElement {
+   protected accessor canShare_: boolean = false;
+   // The tab of a call that shares another tab.
+   protected accessor call_: boolean = false;
++  // A Workbench tab listing its sessions: their one mark.
++  protected accessor wbBadge_: WorkbenchBadge|null = null;
++  private stopBadges_: (() => void)|null = null;
+ 
+   override willUpdate(changed: PropertyValues<this>) {
+     super.willUpdate(changed);
+@@ -99,6 +105,7 @@ export class MeridianItemElement extends CrLitElement {
+     this.audioIcon_ = this.audio_ === 'muted' ? 'mute' : 'speaker';
+     this.sharing_ = alerts.includes(TabAlertState.kTabCapturing);
+     this.call_ = !!this.host?.isCallTab(this.tab_);
++    this.wbBadge_ = workbenchBadge(this.tab_?.id);
+     this.title_ = this.tab_ && this.away_ ?
+         this.tab_.title :
+         item.title || this.tab_?.title || item.url;
+@@ -120,6 +127,26 @@ export class MeridianItemElement extends CrLitElement {
+     this.host?.onItemMouseDown(e, this.item!);
+   }
+ 
++  // A Workbench whose sessions need you opens on the first of them.
++  protected onRowClick_(e: MouseEvent) {
++    const first = this.wbBadge_?.kind === 'needs' ? this.wbBadge_.first : '';
++    if (first && e.button === 0 && !e.metaKey && !e.shiftKey && !e.ctrlKey &&
++        !e.altKey && !(e.target as Element).closest?.('.row-btn')) {
++      this.host?.revealMissionNode(first);
++    }
++  }
++
++  override connectedCallback() {
++    super.connectedCallback();
++    this.stopBadges_ = onWorkbenchBadges(() => this.requestUpdate());
++  }
++
++  override disconnectedCallback() {
++    super.disconnectedCallback();
++    this.stopBadges_?.();
++    this.stopBadges_ = null;
++  }
++
+   // Not a press on the row (which would open the pinned tab).
+   protected onAudioMousedown_(e: Event) {
+     e.stopPropagation();
+diff --git a/chrome/browser/resources/webui_browser/meridian/rows.css b/chrome/browser/resources/webui_browser/meridian/rows.css
+index 9ab82d5d4f..2471e75da9 100644
+--- a/chrome/browser/resources/webui_browser/meridian/rows.css
++++ b/chrome/browser/resources/webui_browser/meridian/rows.css
+@@ -379,3 +379,58 @@ input.rename {
+ :host([agent]) .row {
+   box-shadow: inset 0 0 0 1.5px #8b6cff, 0 0 12px rgba(139, 108, 255, 0.35);
+ }
++
++/* A Workbench tab listing its sessions (workbench_badge.ts): orange with a
++ * count when some need you, blue when turns ended unseen, a calm spinner
++ * while any works. */
++.wb-badge {
++  flex: none;
++  display: inline-flex;
++  align-items: center;
++  gap: 5px;
++  height: 20px;
++  padding: 0 8px;
++  border-radius: 10px;
++  font-size: 12px;
++  font-weight: 600;
++  font-variant-numeric: tabular-nums;
++}
++
++.wb-badge.needs {
++  --wb-badge: #e8830c;
++  background: color-mix(in srgb, var(--wb-badge) 16%, transparent);
++  color: color-mix(in srgb, var(--wb-badge) 80%, var(--meridian-text));
++}
++
++.wb-badge.done {
++  --wb-badge: #2f7bf6;
++  background: color-mix(in srgb, var(--wb-badge) 14%, transparent);
++  color: color-mix(in srgb, var(--wb-badge) 80%, var(--meridian-text));
++}
++
++.wb-badge.working {
++  padding: 0 4px;
++}
++
++.wb-dot {
++  width: 7px;
++  height: 7px;
++  border-radius: 50%;
++  background: var(--wb-badge);
++}
++
++.wb-spin {
++  width: 11px;
++  height: 11px;
++  box-sizing: border-box;
++  border-radius: 50%;
++  border: 1.6px solid color-mix(in srgb, var(--meridian-text-muted) 35%, transparent);
++  border-top-color: var(--meridian-text-muted);
++  animation: wb-spin 1.1s linear infinite;
++}
++
++@keyframes wb-spin {
++  to {
++    transform: rotate(360deg);
++  }
++}
+diff --git a/chrome/browser/resources/webui_browser/meridian/sidebar.ts b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+index c81ded254c..172480d70f 100644
+--- a/chrome/browser/resources/webui_browser/meridian/sidebar.ts
++++ b/chrome/browser/resources/webui_browser/meridian/sidebar.ts
+@@ -41,6 +41,7 @@ import {getHtml} from './sidebar.html.js';
+ import {sourceName} from './import_sources.js';
+ import {isMac, keyText} from './keys.js';
+ import {backupFileName, backupOf, parseBackup, pickBackupFile, restoreBackup, saveBackup} from './space_backup.js';
++import {setWorkbenchChats} from './workbench_badge.js';
+ 
+ export const FAVORITES = 'favorites';
+ 
+@@ -312,6 +313,8 @@ export class MeridianSidebarElement extends CrLitElement implements
+       proxy.callbackRouter.onMissionState.addListener((json: string) => {
+         const snapshot = JSON.parse(json);
+         this.missionCounts_ = snapshot.counts;
++        // The Workbench tabs that list their sessions: one mark each.
++        setWorkbenchChats(snapshot.chats);
+         this.fire('meridian-mission-state', snapshot);
+       }),
+       proxy.callbackRouter.onMissionToast.addListener(
+diff --git a/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts b/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
+index 590e8ff0d9..3df3e3b924 100644
+--- a/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
++++ b/chrome/browser/resources/webui_browser/meridian/tab_row.html.ts
+@@ -5,6 +5,7 @@
+ import {html} from '//resources/lit/v3_0/lit.rollup.js';
+ 
+ import {icon} from './icons.js';
++import {workbenchBadgeHtml} from './workbench_badge.js';
+ import type {MeridianTabRowElement} from './tab_row.js';
+ 
+ export function getHtml(this: MeridianTabRowElement) {
+@@ -17,6 +18,7 @@ ${this.tab ? html`
+       data-tab="${this.tab.id}" title="${this.tab.title}"
+       @pointerenter="${this.onRowPointerenter_}"
+       @mousedown="${this.onRowMousedown_}"
++      @click="${this.onRowClick_}"
+       @dblclick="${this.onRowDblclick_}"
+       @contextmenu="${this.onRowContextmenu_}">
+     <span class="favicon">
+@@ -27,6 +29,7 @@ ${this.tab ? html`
+           spellcheck="false" @keydown="${this.onRenameKeydown_}"
+           @blur="${this.onRenameBlur_}">
+     ` : html`<span class="title">${this.tab.title || this.tab.url}</span>`}
++    ${workbenchBadgeHtml(this.wbBadge_)}
+     ${this.call ? html`
+       <button class="row-btn call" title="This call is sharing a tab"
+           @mousedown="${this.onAudioMousedown_}"
+diff --git a/chrome/browser/resources/webui_browser/meridian/tab_row.ts b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+index b159c04876..9f51383653 100644
+--- a/chrome/browser/resources/webui_browser/meridian/tab_row.ts
++++ b/chrome/browser/resources/webui_browser/meridian/tab_row.ts
+@@ -14,6 +14,8 @@ import type {IconName} from './icons.js';
+ import {getCss} from './rows.css.js';
+ import type {MeridianSidebarElement} from './sidebar.js';
+ import {getHtml} from './tab_row.html.js';
++import {onWorkbenchBadges, workbenchBadge} from './workbench_badge.js';
++import type {WorkbenchBadge} from './workbench_badge.js';
+ 
+ export class MeridianTabRowElement extends CrLitElement {
+   static get is() {
+@@ -49,6 +51,7 @@ export class MeridianTabRowElement extends CrLitElement {
+       audioIcon_: {state: true, type: String},
+       sharing_: {state: true, type: Boolean},
+       canShare_: {state: true, type: Boolean},
++      wbBadge_: {state: true, type: Object},
+     };
+   }
+ 
+@@ -71,6 +74,20 @@ export class MeridianTabRowElement extends CrLitElement {
+   protected accessor sharing_: boolean = false;
+   // Chromium would move the share here (asked on hover).
+   protected accessor canShare_: boolean = false;
++  // A Workbench tab listing its sessions: their one mark.
++  protected accessor wbBadge_: WorkbenchBadge|null = null;
++  private stopBadges_: (() => void)|null = null;
++
++  override connectedCallback() {
++    super.connectedCallback();
++    this.stopBadges_ = onWorkbenchBadges(() => this.requestUpdate());
++  }
++
++  override disconnectedCallback() {
++    super.disconnectedCallback();
++    this.stopBadges_?.();
++    this.stopBadges_ = null;
++  }
+ 
+   override willUpdate(changed: PropertyValues<this>) {
+     super.willUpdate(changed);
+@@ -88,6 +105,7 @@ export class MeridianTabRowElement extends CrLitElement {
+     this.audioTitle_ = this.audio_ === 'muted' ? 'Unmute Tab' : 'Mute Tab';
+     this.audioIcon_ = this.audio_ === 'muted' ? 'mute' : 'speaker';
+     this.sharing_ = alerts.includes(TabAlertState.kTabCapturing);
++    this.wbBadge_ = workbenchBadge(this.tab?.id);
+   }
+ 
+   override updated(changed: PropertyValues<this>) {
+@@ -113,6 +131,15 @@ export class MeridianTabRowElement extends CrLitElement {
+     this.host?.onTabDblclick(e, this.tab!);
+   }
+ 
++  // A Workbench whose sessions need you opens on the first of them.
++  protected onRowClick_(e: MouseEvent) {
++    const first = this.wbBadge_?.kind === 'needs' ? this.wbBadge_.first : '';
++    if (first && e.button === 0 && !e.metaKey && !e.shiftKey && !e.ctrlKey &&
++        !e.altKey && !(e.target as Element).closest?.('.row-btn')) {
++      this.host?.revealMissionNode(first);
++    }
++  }
++
+   protected onRenameKeydown_(e: KeyboardEvent) {
+     this.host?.onRenameKeydown(e);
+   }
+diff --git a/chrome/browser/resources/webui_browser/meridian/workbench_badge.ts b/chrome/browser/resources/webui_browser/meridian/workbench_badge.ts
+new file mode 100644
+index 0000000000..9d45d5a625
+--- /dev/null
++++ b/chrome/browser/resources/webui_browser/meridian/workbench_badge.ts
+@@ -0,0 +1,82 @@
++// Copyright 2026 The Meridian Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// One mark on a Workbench tab's row whose page lists its sessions as chats (a
++// preview the Workbench turns on): orange with a count when sessions need
++// you, else blue with a count when turns ended that you haven't seen, else a
++// calm spinner while any works, else nothing. From Mission Control's snapshot
++// ("chats": per Workbench tab, from the sessions' own hooks).
++
++import {html} from '//resources/lit/v3_0/lit.rollup.js';
++
++export interface WorkbenchBadge {
++  kind: 'needs'|'done'|'working';
++  count: number;
++  // The Mission Control node of the first session that needs you (in the
++  // Workbench's list order): a click on the row opens it.
++  first: string;
++}
++
++interface ChatsEntry {
++  tab: number;
++  needs: number;
++  done: number;
++  working: number;
++  first: string;
++}
++
++// Tab handle -> mark.
++let badges = new Map<string, WorkbenchBadge>();
++let key = '';
++const listeners = new Set<() => void>();
++
++export function setWorkbenchChats(chats: ChatsEntry[]|undefined) {
++  const next = new Map<string, WorkbenchBadge>();
++  for (const c of Array.isArray(chats) ? chats : []) {
++    const badge: WorkbenchBadge|null = c.needs > 0 ?
++        {kind: 'needs', count: c.needs, first: c.first || ''} :
++        c.done > 0    ? {kind: 'done', count: c.done, first: ''} :
++        c.working > 0 ? {kind: 'working', count: c.working, first: ''} :
++                        null;
++    if (badge) {
++      next.set(String(c.tab), badge);
++    }
++  }
++  const nextKey = JSON.stringify([...next]);
++  if (nextKey === key) {
++    return;
++  }
++  key = nextKey;
++  badges = next;
++  for (const fn of listeners) {
++    fn();
++  }
++}
++
++// `tabId`: the sidebar's tab id ("<handle>:<type>").
++export function workbenchBadge(tabId: string|undefined): WorkbenchBadge|null {
++  return tabId ? badges.get(tabId.split(':')[0]!) || null : null;
++}
++
++export function onWorkbenchBadges(fn: () => void): () => void {
++  listeners.add(fn);
++  return () => listeners.delete(fn);
++}
++
++export function workbenchBadgeHtml(badge: WorkbenchBadge|null) {
++  if (!badge) {
++    return '';
++  }
++  const title = badge.kind === 'needs' ?
++      `${badge.count} ${
++          badge.count === 1 ? 'session needs' : 'sessions need'} you` :
++      badge.kind === 'done' ?
++      `${badge.count} finished, not seen yet` :
++      `${badge.count} working`;
++  return html`<span class="wb-badge ${badge.kind}" title="${title}"
++      data-kind="${badge.kind}">${badge.kind === 'working' ?
++      html`<span class="wb-spin"></span>` :
++      html`<span class="wb-dot"></span><span class="wb-count">${
++          badge.count}</span>`}</span>`;
++}
