@@ -54,6 +54,7 @@ const state = (page) => page.evaluate(() => {
     shown: pages.map((p) => p.style.opacity).join(''),
     plate: r.querySelector('.pl').style.background,
     xs: bars.map((b) => +b.style.transform.match(/translate3d\(([-\d.]+)px/)[1]),
+    zs: bars.map((b) => +b.style.transform.match(/translate3d\([^,]+,[^,]+,\s*([-\d.]+)px/)[1]),
     vis: bars.map((b) => b.style.visibility[0]).join(''),
     snap: bars[0].style.transition,
     clip: pages.map((p) => p.style.clipPath),
@@ -86,11 +87,20 @@ test('it starts on Life, with Side waiting hidden under the page', async ({ open
   const page = await load(open);
   expect(await space(page)).toBe(1);
   expect(await state(page)).toMatchObject({ xs: xs(1), vis: 'vvh', rot: 0 });
+  // Work, already passed, sits a step higher
+  expect((await state(page)).zs).toEqual([34, 24, 24]);
+  await swipe(page, [50]);
+  expect((await state(page)).zs).toEqual([44, 34, 24]);
 });
 
 test('a vertical wheel scrolls the page and leaves the space alone', async ({ open }) => {
   const page = await load(open);
   expect(await wheel(page, 5, 30)).toBe(true);
+  await page.clock.runFor(200);
+  expect(await space(page)).toBe(1);
+  expect((await state(page)).xs).toEqual(xs(1));
+  // as much down as across: still a scroll
+  expect(await wheel(page, 30, 30)).toBe(true);
   await page.clock.runFor(200);
   expect(await space(page)).toBe(1);
   expect((await state(page)).xs).toEqual(xs(1));
@@ -101,7 +111,8 @@ test('a small horizontal pull follows the fingers, then springs back', async ({ 
   // not prevented, the browser would read it as Back
   expect(await wheel(page, 20)).toBe(false);
   await page.clock.runFor(16);
-  expect(await state(page)).toMatchObject({ xs: xs(1 + 20 / 230), snap: 'none', rot: 0 });
+  // Side, pulled toward the slot, shows; a real swipe never lifts the page card
+  expect(await state(page)).toMatchObject({ xs: xs(1 + 20 / 230), snap: 'none', rot: 0, vis: 'vvv', lift: '0px' });
   await page.clock.runFor(150);
   expect(await state(page)).toMatchObject({ xs: xs(1), snap: 'transform 0.38s cubic-bezier(0.25, 1.45, 0.4, 1)' });
   expect(await space(page)).toBe(1);
@@ -141,6 +152,31 @@ test('the fading tail of a swipe is ignored; a new swipe is not', async ({ open 
   await swipe(page, [25]);
   expect((await state(page)).xs).toEqual(xs(1 + 25 / 230));
   await swipe(page, [25]);
+  expect(await space(page)).toBe(2);
+});
+
+test('a tail that fades almost to nothing still needs a push of more than 14 to start a new swipe', async ({ open }) => {
+  const page = await load(open);
+  await swipe(page, [-50]);
+  expect(await space(page)).toBe(0);
+  await page.clock.runFor(200);
+  await swipe(page, [50]);
+  expect(await space(page)).toBe(1);
+  await swipe(page, [20, 10, 4, 2, 2, 2, 2, 2, 2, 2, 2, 2]);
+  // the tail is down to 2 (2.5 times that is 5): 12 is still tail, 16 is new
+  await swipe(page, [12]);
+  expect((await state(page)).xs).toEqual(xs(1));
+  await swipe(page, [16]);
+  expect((await state(page)).xs).toEqual(xs(1 + 16 / 230));
+});
+
+test('a slow pull that adds up over more than 150 ms still moves one space', async ({ open }) => {
+  const page = await load(open);
+  // 12 events of 4, 16 ms apart: past a fifth (.209) only at the last, 176 ms in
+  await swipe(page, Array(11).fill(4));
+  expect(await space(page)).toBe(1);
+  expect((await state(page)).xs).toEqual(xs(1 + 44 / 230));
+  await swipe(page, [4]);
   expect(await space(page)).toBe(2);
 });
 
@@ -236,8 +272,14 @@ test('in view, the hint tugs the strip toward Side, then toward Work, and lets g
   expect(s.xs).toEqual(xs(1.46));
   expect(s).toMatchObject({ shown: '011', clip: ['', '', 'inset(0px 0px 0px 56.8%)'], rot: -1.38, lift: '0px 0px 15.6px', snap: 'none' });
   expect(s.plate).toBe('color-mix(in srgb, rgb(255, 196, 219) 43.2%, rgb(255, 240, 168) 56.8%)');
-  // let go: it springs back and Life is shown alone again
-  await page.clock.runFor(1300);
+  // let go: it springs back, swinging a little past rest, and Work never shows through
+  for (let i = 0; i < 80; i++) {
+    await page.clock.runFor(16);
+    s = await state(page);
+    expect(s.shown[0], `Work shows ${i * 16} ms after the hold`).toBe('0');
+    expect(s.clip[0]).toBe('');
+  }
+  await page.clock.runFor(1300 - 80 * 16);
   s = await state(page);
   expect(s).toMatchObject({ shown: '010', clip: ['', '', ''], rot: 0, xs: xs(1), plate: PLATE[1] });
 
@@ -248,6 +290,19 @@ test('in view, the hint tugs the strip toward Side, then toward Work, and lets g
   expect(s).toMatchObject({ shown: '110', clip: ['inset(0px 56.8% 0px 0px)', '', ''], rot: 1.38 });
   await page.clock.runFor(1300);
   expect(await space(page)).toBe(1);
+});
+
+test('hints start about 4.8 s apart', async ({ open }) => {
+  const page = await loadKinetic(open);
+  await untilPeek(page);
+  // the first is over by 1.75 s; then 100 ms steps until the next tips the card
+  await page.clock.runFor(1800);
+  expect((await state(page)).rot).toBe(0);
+  let ms = 1800;
+  while ((await state(page)).rot === 0) { await page.clock.runFor(100); ms += 100; if (ms > 10000) break; }
+  // 12 ticks of 400 ms
+  expect(ms).toBeGreaterThan(4000);
+  expect(ms).toBeLessThan(5600);
 });
 
 test('a swipe during the hint takes the strip over, and the hint never comes back', async ({ open }) => {

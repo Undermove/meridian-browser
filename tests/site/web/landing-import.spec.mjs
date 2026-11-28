@@ -156,6 +156,51 @@ test('the flat copy replaces the 3D window, without ids, and is redrawn once aft
   await expect(page.locator('#imp .scene > .sb.arc')).toHaveCSS('opacity', '0');
 });
 
+test('once all have landed, the slots they left are empty and the travelled parts are put away', async ({ open }) => {
+  const page = await load(open);
+  await btn(page).click();
+  await page.clock.runFor(END + 10);
+  expect(await page.evaluate(() => {
+    const from = document.querySelector('#imp .sb.src');
+    const slots = [...from.querySelectorAll('.fv4 i, .rw:not(.nt)')];
+    const parts = [...from.querySelectorAll('.fv4 i svg, .rw:not(.nt) .tb2')];
+    return { home: slots.filter((e) => e.classList.contains('home')).length, hidden: parts.filter((e) => e.style.visibility === 'hidden').length };
+  })).toEqual({ home: 0, hidden: 13 });
+});
+
+test('resizes close together redraw the flat copy once, 150 ms after the last', async ({ open }) => {
+  const page = await load(open);
+  await pressAndFinish(page);
+  const flat = page.locator('#imp .flat2d');
+  await flat.evaluate((e) => { e.dataset.old = '1'; });
+  await page.evaluate(() => dispatchEvent(new Event('resize')));
+  await page.clock.runFor(100);
+  await page.evaluate(() => dispatchEvent(new Event('resize')));
+  // 200 ms after the first: a timer left from it would have redrawn by now
+  await page.clock.runFor(100);
+  await expect(page.locator('#imp .flat2d[data-old]')).toHaveCount(1);
+  await page.clock.runFor(60);
+  await expect(page.locator('#imp .flat2d[data-old]')).toHaveCount(0);
+  await expect(flat).toHaveCount(1);
+});
+
+test('redrawn at the same size, the flat copy lands exactly where it was', async ({ open }) => {
+  const page = await load(open);
+  await btn(page).click();
+  await page.clock.runFor(END + 450 + 2500 - 50);
+  // the fake clock jumps, but CSS transitions and el.animate() run on real time: let them end first,
+  // so the first copy is measured from the parts at rest, as a visitor's would be
+  await expect.poll(() => page.locator('#imp').evaluate((r) => r.getAnimations({ subtree: true }).filter((a) => a.playState === 'running' && a.effect.getComputedTiming().endTime !== Infinity).length), { timeout: 30000 }).toBe(0);
+  await page.clock.runFor(100);
+  const poses = () => page.locator('#imp .flat2d > *').evaluateAll((els) => els.map((e) => e.style.transform));
+  const before = await poses();
+  expect(before).toHaveLength(10);
+  // by now the 3D parts are hidden; measured hidden, a part is drawn flat and lands elsewhere
+  await page.evaluate(() => dispatchEvent(new Event('resize')));
+  await page.clock.runFor(200);
+  expect(await poses()).toEqual(before);
+});
+
 test('a resize before the window is finished draws no flat copy', async ({ open }) => {
   const page = await load(open);
   await page.evaluate(() => { window.resizes = 0; addEventListener('resize', () => window.resizes++); });

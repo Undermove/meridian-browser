@@ -30,6 +30,9 @@ test('untouched tabs age and drop into the archive, oldest first', async ({ open
   expect((await tags(page))[3]).toBe('Archived');
   // it takes the first free place on the tray, under the two already there
   await expect(tab(page, 3)).toHaveAttribute('style', /translate3d\(-88px, -12px, 16px\)/);
+  // the two already there keep their places
+  await expect(tab(page, 4)).toHaveAttribute('style', /translate3d\(-88px, -72px, 16px\)/);
+  await expect(tab(page, 5)).toHaveAttribute('style', /translate3d\(96px, -58px, 16px\)/);
   await page.clock.runFor(4000);
   await expect(archived(page)).toHaveCount(5);
   expect(await tags(page)).toEqual(['Pinned', 'Archived', 'Archived', 'Archived', 'Archived', 'Archived']);
@@ -59,6 +62,25 @@ test('with nothing left, the tabs come back one at a time, and a click during th
   expect(counts.filter((c) => c === 1).length).toBeGreaterThanOrEqual(2);
   // each comes back aged by its place (i * .12); nothing ages until the last one is back
   expect(await tags(page)).toEqual(['Pinned', 'Just now', 'A moment ago', 'A moment ago', 'A moment ago', 'A while ago']);
+  // Notion was used at the click, so it is fresh from then: still under .2 of its life 1.1 s on
+  await page.clock.runFor(1100);
+  await expect(tab(page, 1).locator('em')).toHaveText('Just now');
+});
+
+test('a tab used while all are archived starts the 2.6 s wait over once it drops back', async ({ open }) => {
+  const page = await load(open);
+  await page.clock.runFor(6500);
+  await expect(archived(page)).toHaveCount(5);
+  await page.clock.runFor(1000);
+  await press(tab(page, 2));
+  await expect(archived(page)).toHaveCount(4);
+  // YouTube drops back 7 s after the click; the tabs rise 2.6 s after that, not at once
+  await page.clock.runFor(7100);
+  await expect(archived(page)).toHaveCount(5);
+  await page.clock.runFor(1500);
+  await expect(archived(page)).toHaveCount(5);
+  await page.clock.runFor(1500);
+  await expect(archived(page)).not.toHaveCount(5);
 });
 
 test('a click brings an archived tab back to the top; the pinned tab stays pinned', async ({ open }) => {
@@ -71,6 +93,18 @@ test('a click brings an archived tab back to the top; the pinned tab stays pinne
   await press(tab(page, 0));
   await expect(tab(page, 0).locator('em')).toHaveText('Pinned');
   await expect(tab(page, 0)).toHaveAttribute('style', /translate3d\(-10px, -10px, 330px\)/);
+});
+
+test('a tab brought back and archived again takes the first free place on the tray', async ({ open }) => {
+  const page = await load(open);
+  // Spotify leaves place 0; Figma (2.8 s), YouTube (4.55 s), Notion (6.3 s) and Spotify (7 s) then drop in
+  await press(tab(page, 4));
+  await page.clock.runFor(7500);
+  await expect(archived(page)).toHaveCount(5);
+  await expect(tab(page, 3)).toHaveAttribute('style', /translate3d\(-88px, -72px, 16px\)/);
+  await expect(tab(page, 4)).toHaveAttribute('style', /translate3d\(-88px, 48px, 16px\)/);
+  const poses = await archived(page).evaluateAll((els) => els.map((e) => e.style.transform));
+  expect(new Set(poses).size).toBe(5);
 });
 
 test('Enter and Space bring a tab back; other keys do not', async ({ open }) => {

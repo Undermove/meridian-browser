@@ -180,6 +180,90 @@ test('peek and the divider work at the default viewport', async ({ page }) => {
   await expect(grip(page)).toHaveAttribute('aria-valuenow', '55');
 });
 
+const px = (page, sel, prop) => page.locator(sel).evaluate((e, prop) => parseFloat(prop.startsWith('--') ? e.style.getPropertyValue(prop) : e.style[prop]), prop);
+
+test('the grip follows the divider, and each big word shrinks with its page', async ({ open }) => {
+  const page = await load(open);
+  // grip: X0 + W * ratio - 8; word: 23% of the left page, 19% of the right one, at most 96
+  expect(await px(page, '#grip', 'left')).toBe(-8);
+  expect(await px(page, '#pl', '--s')).toBe(86);
+  expect(await px(page, '#pr', '--s')).toBe(71);
+  await grip(page).focus();
+  for (let i = 0; i < 8; i++) await page.keyboard.press('ArrowRight');
+  await expect(grip(page)).toHaveAttribute('aria-valuenow', '72');
+  expect(await px(page, '#grip', 'left')).toBeCloseTo(159.2, 1);
+  expect(await px(page, '#pl', '--s')).toBe(96);
+  expect(await px(page, '#pr', '--s')).toBe(39);
+  // split view off: the left page fills the window, and its word stops at 96
+  await page.locator('#keys').click();
+  expect(await px(page, '#pl', '--s')).toBe(96);
+});
+
+test('arrow keys on the grip do not scroll the page; other keys are left alone', async ({ open }) => {
+  const page = await load(open);
+  await page.evaluate(() => { window.prevented = []; addEventListener('keydown', (e) => prevented.push(e.key + ':' + e.defaultPrevented)); });
+  await grip(page).focus();
+  for (const k of ['ArrowRight', 'ArrowLeft', 'a']) await page.keyboard.press(k);
+  expect(await page.evaluate(() => prevented)).toEqual(['ArrowRight:true', 'ArrowLeft:true', 'a:false']);
+});
+
+test('grabbing the grip stops the snap the arrow keys started', async ({ open }) => {
+  const page = await load(open);
+  const spl = page.locator('#spl');
+  await grip(page).focus();
+  await page.keyboard.press('ArrowRight');
+  await expect(spl).toHaveClass(/\bsnap\b/);
+  const b = await grip(page).boundingBox();
+  await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
+  await page.mouse.down();
+  await expect(spl).toHaveClass(/\bdrag\b/);
+  await expect(spl).not.toHaveClass(/\bsnap\b/);
+  await page.mouse.up();
+});
+
+test('a cancelled drag ends it: the pointer moves nothing afterwards', async ({ open }) => {
+  const page = await load(open);
+  const spl = page.locator('#spl');
+  const b = await grip(page).boundingBox();
+  const x = b.x + b.width / 2, y = b.y + b.height / 2;
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  await expect(spl).toHaveClass(/\bdrag\b/);
+  await grip(page).dispatchEvent('pointercancel');
+  await expect(spl).not.toHaveClass(/\bdrag\b/);
+  await page.mouse.move(x + 1000, y, { steps: 4 });
+  await expect(grip(page)).toHaveAttribute('aria-valuenow', '50');
+  await page.mouse.up();
+});
+
+test('a second "beside" while the card lands is ignored, and a new peek after it stays open', async ({ open }) => {
+  const page = await load(open);
+  const spl = page.locator('#spl');
+  await press(link(page, 'train'));
+  await press(page.locator('#beside'));
+  await page.clock.runFor(400);
+  await page.locator('#beside').dispatchEvent('click');
+  await page.clock.runFor(450);
+  await expect(page.locator('#pk')).not.toHaveClass(/\bland\b/);
+  await press(link(page, 'home'));
+  await expect(spl).toHaveClass(/\bopen\b/);
+  // past where a second landing, had it started, would have ended (400 + 800)
+  await page.clock.runFor(800);
+  await expect(spl).toHaveClass(/\bopen\b/);
+  await expect(page.locator('#pk .pkh span')).toHaveText('The long way home');
+});
+
+test('after "beside", the same link opens the card again', async ({ open }) => {
+  const page = await load(open);
+  await press(link(page, 'train'));
+  await press(page.locator('#beside'));
+  await page.clock.runFor(850);
+  await expect(page.locator('#spl')).not.toHaveClass(/\bopen\b/);
+  await press(link(page, 'train'));
+  await expect(page.locator('#spl')).toHaveClass(/\bopen\b/);
+  await expect(link(page, 'train')).toHaveClass(/\bcur\b/);
+});
+
 test('red: ArrowRight moves the divider right', async ({ open }) => {
   const page = await load(open, (p) => mutate(p, 'docs/index.html', "e.key === 'ArrowRight' ? .05", "e.key === 'ArrowRight' ? -.05"));
   await grip(page).focus();
