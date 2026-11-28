@@ -22,6 +22,8 @@ It runs three suites, and each fails below 100% coverage:
 - `yarn test:node`: `node:test` for the lab tools and the `serve`/`lab` scripts (`tests/site/node/`).
 - `yarn test:web`: Playwright on the built `docs/index.html` and the lab pages (`tests/site/web/`). It covers every inline `<script>` line, using V8 coverage (`tests/site/web/coverage.mjs`). `tests/site/web/coverage-exclusions.json` lists the few lines allowed to stay missed, each with the reason. Tests never reach the network: every request off 127.0.0.1 is blocked unless a test answers it.
 
+To check that the tests catch a change, run them against a mutant: `MUTANT='{"file":"docs/index.html","from":"a < b","to":"a <= b"}' npx playwright test <specs>`. It serves the changed page in place of the file (`from` must occur once) and never writes to disk. The raw coverage files start with the spec's name, so you can see which specs run a line.
+
 The first run needs Playwright's Chromium (`npx playwright install chromium`) and [uv](https://docs.astral.sh/uv/).
 
 ## The design lab

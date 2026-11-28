@@ -9,6 +9,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { RAW_DIR } from './coverage.mjs';
+import { mutantFrom, mutantBody } from './mutant.mjs';
 
 const LOCAL = /^http:\/\/127\.0\.0\.1:\d+\//;
 
@@ -41,10 +42,16 @@ function platformFromUserAgent() {
   if (self.NavigatorUAData) Object.defineProperty(NavigatorUAData.prototype, 'platform', { get: () => uaPlatform, configurable: true });
 }
 
+// Read once per worker: a bad MUTANT fails the run before any test passes against the real page.
+const MUTANT = mutantFrom(process.env);
+const MUTANT_BODY = MUTANT && mutantBody(MUTANT, process.cwd());
+
 async function isolate(context) {
   await context.addInitScript(noPhantomPointer);
   await context.addInitScript(platformFromUserAgent);
   await context.route((url) => !LOCAL.test(url.href), (route) => route.abort('blockedbyclient'));
+  if (MUTANT) await context.route((url) => url.pathname === '/' + MUTANT.file, (route) =>
+    route.fulfill({ contentType: 'text/html; charset=utf-8', body: MUTANT_BODY }));
 }
 
 async function startCoverage(page) {
@@ -57,7 +64,8 @@ function saveCoverage(entries, testInfo) {
     .map(({ url, source, functions }) => ({ url: new URL(url).pathname, source, functions }));
   if (!keep.length) return;
   fs.mkdirSync(RAW_DIR, { recursive: true });
-  const name = `${testInfo.workerIndex}-${crypto.randomUUID()}.json`;
+  // The spec's name leads, so the files show which specs run a line (mutation sweeps run only those).
+  const name = `${path.basename(testInfo.file, '.spec.mjs')}-${testInfo.workerIndex}-${crypto.randomUUID()}.json`;
   fs.writeFileSync(path.join(RAW_DIR, name), JSON.stringify(keep));
 }
 
