@@ -1313,6 +1313,7 @@ function saveTermName(t, name) {
   try { sessionStorage.setItem('termNames', JSON.stringify(all)); } catch {}
   syncTermMeta(t);
   if (t.kind === 'claude' || t.kind === 'codex') saveClaudeSessions();
+  if (typeof chatsRenamed === 'function') chatsRenamed(t, name); // Claude Code's own name too (Chats preview)
 }
 
 // A name given by hand, else the session's name (Claude Code's status line), else the terminal's title.
@@ -1430,6 +1431,7 @@ function renderTermTabs() {
   $('#term-empty').hidden = S.terms.length > 0;
   renderTermStart();
   sendMissionNames();
+  if (typeof chatsAfterTabs === 'function') chatsAfterTabs(); // the Chats list (a preview, off by default)
 }
 
 // ---------------------------------------------------------------- a terminal's settings
