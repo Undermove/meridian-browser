@@ -5,6 +5,7 @@
 // line still shows.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -36,6 +37,43 @@ out = subprocess.run(settings['statusLine']['command'], shell=True, input=json.d
 print('STATUS: ' + out, flush=True)
 sys.stdin.readline()
 `;
+
+// The same stand-in on Windows: claude.exe (a few lines of C#, built by the C# compiler every
+// Windows has) runs node with this script; the status line goes through cmd, as Claude Code's does.
+const WIN = process.platform === 'win32';
+const FAKE_CLAUDE_JS = String.raw`const fs = require('fs'), path = require('path'), cp = require('child_process');
+const args = process.argv.slice(2);
+const settings = JSON.parse(fs.readFileSync(args[args.indexOf('--settings') + 1], 'utf8'));
+const cwd = process.cwd(), now = Date.now() / 1000;
+const env = { ...process.env, HOME: path.join(cwd, 'home'), USERPROFILE: path.join(cwd, 'home') };
+delete env.CLAUDE_CONFIG_DIR;
+const status = {
+  session_id: 's1', session_name: 'Fix the login page', transcript_path: path.join(cwd, 'session.jsonl'),
+  model: { id: 'claude-opus-5-5', display_name: 'Opus 5.5' }, workspace: { project_dir: cwd, current_dir: cwd },
+  context_window: { context_window_size: 200000, used_percentage: 46,
+    current_usage: { input_tokens: 10, cache_creation_input_tokens: 2000, cache_read_input_tokens: 89990, output_tokens: 300 } },
+  rate_limits: { five_hour: { used_percentage: 41.5, resets_at: now + 7200 }, seven_day: { used_percentage: 12, resets_at: now + 3 * 86400 } },
+  prompt_cache: { requests: 12, misses: 1, hit_ratio: 0.87, warm: true, ttl: '5m', expires_at: now + 200, miss_causes: { ttl_expired_5m: 1 } },
+  cost: { total_cost_usd: 1.23 },
+};
+process.stdout.write('\x1b]0;✳ terminal title\x07');
+const out = cp.execSync(settings.statusLine.command, { input: JSON.stringify(status), env, encoding: 'utf8' });
+process.stdout.write('STATUS: ' + out + '\r\n');
+process.stdin.once('data', () => process.exit(0));
+`;
+const SHIM_CS = `using System; using System.Diagnostics; using System.IO; using System.Linq;
+class Claude { static int Main(string[] args) {
+  string dir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
+  Func<string, string> q = (a) => "\\"" + a.Replace("\\"", "\\\\\\"") + "\\"";
+  var p = Process.Start(new ProcessStartInfo(Environment.GetEnvironmentVariable("FAKE_CLAUDE_NODE"),
+    q(Path.Combine(dir, "claude.js")) + " " + string.Join(" ", args.Select(q))) { UseShellExecute = false });
+  p.WaitForExit(); return p.ExitCode; } }`;
+function fakeClaudeWin(bin) {
+  fs.writeFileSync(path.join(bin, 'claude.js'), FAKE_CLAUDE_JS);
+  fs.writeFileSync(path.join(bin, 'claude.cs'), SHIM_CS);
+  const csc = path.join(process.env.WINDIR, 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
+  execFileSync(csc, ['/nologo', '/out:' + path.join(bin, 'claude.exe'), path.join(bin, 'claude.cs')], { stdio: 'pipe' });
+}
 
 // A transcript in Claude Code's format: the request's system prompt and tools, CLAUDE.md, skills; a
 // prompt; app.js read twice (≈10k tokens each) and a screenshot; a 10-minute pause that left the cache
@@ -86,7 +124,12 @@ async function setup({ ownStatusLine, ctx, session }) {
     fs.writeFileSync(path.join(project, 'home', '.claude', 'settings.json'), JSON.stringify({ statusLine: { type: 'command', command: 'cat > /dev/null; echo MY-OWN-LINE' } }));
   }
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'meridian-e2e-bin-'));
-  fs.writeFileSync(path.join(bin, 'claude'), FAKE_CLAUDE, { mode: 0o755 });
+  if (WIN) {
+    fakeClaudeWin(bin);
+    process.env.FAKE_CLAUDE_NODE = process.execPath;
+  } else {
+    fs.writeFileSync(path.join(bin, 'claude'), FAKE_CLAUDE, { mode: 0o755 });
+  }
   const b = await launch(['about:blank'], { args: [`--meridian-test-project=${project}`, `--meridian-agents-path=${bin}`, '--meridian-no-notify'] });
   await b.waitFor(`${SB}.querySelectorAll('meridian-tab-row').length === 1`);
   await b.eval('app.$.tabstrip.runCommand(16, 0)');
@@ -114,8 +157,9 @@ test('a Claude Code tab takes the session\'s name and shows its context; the top
   const { wb, done } = await setup({ ownStatusLine: true });
   try {
     await wb.eval(`launch('claude').then((t) => !!t)`);
-    // The person's own status line still shows in the terminal.
-    await wb.waitFor(`${termText}.includes('STATUS: MY-OWN-LINE')`, 15000);
+    // The person's own status line still shows in the terminal (on Windows, Meridian's: theirs is
+    // run along on macOS and Linux only).
+    await wb.waitFor(`${termText}.includes('STATUS: ${WIN ? 'context 46%' : 'MY-OWN-LINE'}')`, 15000);
     // The session's name beats the terminal title; the context gauge is on the tab.
     await wb.waitFor(`${tabName} === 'Fix the login page'`, 15000);
     assert.equal(await wb.eval(`document.querySelector('#term-tab-list .ttab.active .ctx-badge').textContent`), '46%');
@@ -180,8 +224,16 @@ test('without a status line of their own, Meridian\'s shows the context and limi
     await wb.eval(`launch('shell').then((t) => !!t)`);
     await wb.waitFor(`S.activeTerm?.kind === 'shell'`);
     await sleep(800);
-    await wb.eval(`(() => { window.workbench.ptyWrite(S.activeTerm.id, "printf '\\\\033]0;deploy-logs\\\\007'; sleep 8\\r"); return true; })()`);
-    await wb.waitFor(`${tabName} === 'deploy-logs'`, 10000);
+    if (WIN) {
+      // The shell's own title (cmd's `title`, PowerShell's WindowTitle); ConPTY hands it on as
+      // ESC ] 0 ; … BEL.
+      const cmd = /^cmd/i.test(await wb.eval('S.activeTerm.title'));
+      const line = cmd ? 'title deploy-logs & ping -n 9 127.0.0.1 >nul' : "$Host.UI.RawUI.WindowTitle = 'deploy-logs'; Start-Sleep 8";
+      await wb.eval(`(() => { window.workbench.ptyWrite(S.activeTerm.id, ${JSON.stringify(line + '\r')}); return true; })()`);
+    } else {
+      await wb.eval(`(() => { window.workbench.ptyWrite(S.activeTerm.id, "printf '\\\\033]0;deploy-logs\\\\007'; sleep 8\\r"); return true; })()`);
+    }
+    await wb.waitFor(`${tabName} === 'deploy-logs'`, 10000).catch(async (e) => { console.log('DIAG ' + JSON.stringify(await wb.eval(`[${tabName}, S.activeTerm.auto, S.activeTerm.title, ${termText}.slice(-400)]`))); throw e; });
   } finally { await done(); }
 });
 
