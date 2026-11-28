@@ -122,6 +122,58 @@ test('trackers come every 800 ms while the scene is in view, and stop when it is
   await expect(count(page)).toHaveText(away);
 });
 
+// Each hit of a pack lands while the block is still in the air; it climbs, but never over the rim.
+test('a block hit again in mid-air tops out 26px above the floor', async ({ open }) => {
+  const page = await load(open, { reducedMotion: 'reduce' });
+  await press(block(page, 'Tabs'));
+  // off the block, so it is not lifted
+  await page.mouse.move(5, 5);
+  let top = 0;
+  for (let i = 0; i < 60; i++) {
+    await page.clock.runFor(25);
+    top = Math.max(top, ...(await poses(page)).map((p) => p.z));
+  }
+  // above one throw's top (26 + 230² / 3000 = 43.6), never over FLOOR (26) plus 26
+  expect(top).toBeGreaterThan(46);
+  expect(top).toBeLessThanOrEqual(52);
+});
+
+// Friction slows a block to a stop: the last move before it rests is a crawl, not a sudden halt.
+test('a thrown block slides to a stop', async ({ open }) => {
+  const page = await load(open, { reducedMotion: 'reduce' });
+  await clickFloor(page);
+  await page.clock.runFor(1300);
+  const step = [];
+  let prev = await poses(page);
+  for (let i = 0; i < 400; i++) {
+    await page.clock.runFor(16);
+    const now = await poses(page);
+    step.push(Math.max(...now.map((p, k) => Math.hypot(p.x - prev[k].x, p.y - prev[k].y))));
+    prev = now;
+    if (step.length > 30 && step.slice(-30).every((d) => d === 0)) break;
+  }
+  const moved = step.filter((d) => d > 0);
+  expect(step.slice(-30).every((d) => d === 0)).toBe(true);
+  expect(moved.at(-1)).toBeLessThan(0.5);
+});
+
+// Trackers coming from the right (Math.random near 1) throw the blocks to the left wall.
+test('a block thrown into a wall bounces off it', async ({ open }) => {
+  const page = await loadAt(open, '#pvw', { reducedMotion: 'reduce', init: 'Math.random = () => .999' });
+  await clickFloor(page);
+  const touched = new Set(), away = new Set();
+  for (let i = 0; i < 80; i++) {
+    await page.clock.runFor(25);
+    (await poses(page)).forEach((p, k) => {
+      if (p.x <= -214) touched.add(k);
+      else if (touched.has(k) && p.x > -212) away.add(k);
+    });
+  }
+  expect(touched.size).toBeGreaterThan(0);
+  // without the bounce a block stays pressed on the wall, at -214 exactly
+  expect([...away].sort()).toEqual([...touched].sort());
+});
+
 test('under fire the blocks stay inside the wall, and come to rest on the floor', async ({ open }) => {
   // many clock steps; slow when the machine is busy
   test.slow();
@@ -148,29 +200,50 @@ test('under fire the blocks stay inside the wall, and come to rest on the floor'
   expect(rest.every(inBox)).toBe(true);
 });
 
+// A style put in before the page's script measures the blocks.
+const styled = (css) => `(${(c) => {
+  const mo = new MutationObserver(() => {
+    if (!document.head) return;
+    const s = document.createElement('style'); s.textContent = c; document.head.append(s); mo.disconnect();
+  });
+  mo.observe(document, { childList: true, subtree: true });
+}})(${JSON.stringify(css)})`;
+const BARE = 'padding:0!important;border:0!important;box-sizing:border-box!important';
+
 // Every block the same size, all on one spot, all thrown the same way (Math.random is a constant), so
 // two of them meet exactly centre on centre: the case where the push apart has no side to go by.
-for (const [w, h, axis] of [[40, 80, 'x'], [80, 40, 'y']]) {
+for (const [w, h, axis, other] of [[40, 80, 'x', 'y'], [80, 40, 'y', 'x']]) {
   test(`blocks on the very same spot are still pushed apart (${axis})`, async ({ open }) => {
-    const css = `#pvw .it{left:-40px!important;top:-40px!important;width:${w}px!important;height:${h}px!important;padding:0!important;border:0!important;box-sizing:border-box!important}`;
-    // the style must be in before the page's script measures the blocks
-    const stack = `(${(c) => {
-      const mo = new MutationObserver(() => {
-        if (!document.head) return;
-        const s = document.createElement('style'); s.textContent = c; document.head.append(s); mo.disconnect();
-      });
-      mo.observe(document, { childList: true, subtree: true });
-    }})(${JSON.stringify(css)})`;
-    const page = await loadAt(open, '#pvw', { reducedMotion: 'reduce', init: ['Math.random = () => .5', stack] });
+    const css = `#pvw .it{left:-40px!important;top:-40px!important;width:${w}px!important;height:${h}px!important;${BARE}}`;
+    const page = await loadAt(open, '#pvw', { reducedMotion: 'reduce', init: ['Math.random = () => .5', styled(css)] });
     const start = await poses(page);
     expect(new Set(start.map((p) => `${p.x},${p.y}`)).size).toBe(1);
     await clickFloor(page);
     await page.clock.runFor(3000);
     const end = await poses(page);
     expect(new Set(end.map((p) => p[axis])).size).toBe(5);
+    // pushed apart along the side they overlap least on, so they barely move the other way
+    const o = end.map((p) => p[other]);
+    expect(Math.max(...o) - Math.min(...o)).toBeLessThan(20);
     expect(end.every(inBox)).toBe(true);
   });
 }
+
+// Five blocks in a row, 40px apart: side by side but not touching, so nothing pushes them together.
+test('blocks that do not touch are left apart', async ({ open }) => {
+  const css = `#pvw .it{top:-40px!important;width:40px!important;height:40px!important;${BARE}}`
+    + [0, 1, 2, 3, 4].map((i) => `#pvw .it:nth-child(${i + 1} of .it){left:${-200 + i * 80}px!important}`).join('');
+  const page = await loadAt(open, '#pvw', { reducedMotion: 'reduce', init: [SEED, styled(css)] });
+  const gaps = async () => (await poses(page)).map((p) => p.x).sort((a, b) => a - b).map((x, i, xs) => i && xs[i] - xs[i - 1] - 40).slice(1);
+  expect(await gaps()).toEqual([40, 40, 40, 40]);
+  const start = JSON.stringify(await poses(page));
+  await clickFloor(page);
+  // the jolt reaches them from 750 ms on; later they do meet, so look at the first frame they move
+  await page.clock.runFor(700);
+  for (let i = 0; i < 60 && JSON.stringify(await poses(page)) === start; i++) await page.clock.runFor(16);
+  expect(JSON.stringify(await poses(page))).not.toBe(start);
+  for (const g of await gaps()) expect(g).toBeGreaterThan(30);
+});
 
 // A browser that rounds its clock (as privacy modes do) hands a frame the same time as the last one.
 test('with a coarse clock the blocks still move', async ({ open }) => {
@@ -196,6 +269,48 @@ test('trackers come at the default viewport too', async ({ open }) => {
   await page.evaluate(() => scrollTo(0, document.querySelector('#private').offsetTop + 300));
   await expect(page.locator('#pvw')).not.toHaveAttribute('data-hold');
   await expect.poll(async () => { await page.clock.runFor(800); return Number(await count(page).textContent()); }).toBeGreaterThan(0);
+});
+
+test('a tracker stops dead at the wall and hits it 750 ms after it sets off', async ({ open }) => {
+  const page = await load(open, { reducedMotion: 'reduce' });
+  await press(block(page, 'Tabs'));
+  await page.clock.runFor(1);
+  // the keyframe at the wall: translate3d(x, y, 46px), on the wall's line |x| = 322 or |y| = 196
+  const stop = await page.locator('#pvw .ad').first().evaluate((el) => {
+    const m = /translate3d\((-?[\d.]+)px, ?(-?[\d.]+)px/.exec(el.getAnimations()[0].effect.getKeyframes()[2].transform);
+    return Math.max(Math.abs(+m[1]) / 322, Math.abs(+m[2]) / 196);
+  });
+  expect(stop).toBeCloseTo(1, 2);
+  await page.clock.runFor(748);
+  await expect(count(page)).toHaveText('0');
+  await page.clock.runFor(1);
+  await expect(count(page)).toHaveText('1');
+});
+
+test('trackers come one every 800 ms', async ({ open }) => {
+  const page = await load(open);
+  await page.clock.runFor(4000);
+  const seen = [];
+  for (let i = 0; i < 7; i++) {
+    const n = Number(await count(page).textContent());
+    await page.clock.runFor(800);
+    seen.push(Number(await count(page).textContent()) - n);
+  }
+  expect(seen).toEqual([1, 1, 1, 1, 1, 1, 1]);
+});
+
+test('no tracker comes while the tab is hidden', async ({ open }) => {
+  const page = await load(open);
+  const hide = (on) => page.evaluate((on) => Object.defineProperty(document, 'hidden', { get: () => on, configurable: true }), on);
+  await hide(true);
+  // trackers already on their way still land
+  await page.clock.runFor(1000);
+  const n = await count(page).textContent();
+  await page.clock.runFor(4000);
+  await expect(count(page)).toHaveText(n);
+  await hide(false);
+  await page.clock.runFor(2000);
+  expect(Number(await count(page).textContent())).toBeGreaterThan(Number(n));
 });
 
 test('red: the lift is what raises a pointed-at valuable', async ({ open }) => {

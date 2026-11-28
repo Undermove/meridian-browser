@@ -67,6 +67,25 @@ test('a press while the page is changing is ignored', async ({ open }) => {
   expect(await faces(page)).toEqual(['face f-sum']);
 });
 
+test('the new sheet wipes in from nothing', async ({ open }) => {
+  const page = await load(open);
+  await button(page, 'sum').click();
+  // a width transition runs only if the sheet was drawn at 0px before it was set to 100%
+  const wipes = await page.locator('#aipg .face.f-sum, #aipg .fw.wip').evaluateAll((els) =>
+    els.map((e) => e.getAnimations().filter((a) => a.transitionProperty === 'width').length));
+  expect(wipes).toEqual([1, 1]);
+});
+
+test('the old sheet stays until the wipe is over (730 ms)', async ({ open }) => {
+  const page = await load(open);
+  await button(page, 'sum').click();
+  await page.clock.runFor(720);
+  expect(await faces(page)).toEqual(['face f-base', 'face f-sum wip']);
+  await expect(page.locator('#aiw')).toHaveClass(/\bbusy\b/);
+  await page.clock.runFor(20);
+  expect(await faces(page)).toEqual(['face f-sum']);
+});
+
 test('the buttons work at the default viewport too', async ({ page }) => {
   await page.clock.install();
   await page.goto('docs/index.html');

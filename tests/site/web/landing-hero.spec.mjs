@@ -75,6 +75,18 @@ test('the mouse does nothing until the drop is over (2.8 s)', async ({ open }) =
   expect((await pose(page)).p.a.t).not.toBe(before.p.a.t);
 });
 
+test('the mouse starts to count at 2.8 s, not before', async ({ open }) => {
+  const page = await load(open);
+  const before = await pose(page);
+  // at() runs the clock 20 ms itself
+  await page.clock.runFor(2760);
+  await at(page, 0, 0);
+  expect(await pose(page)).toEqual(before);
+  await page.clock.runFor(30);
+  await at(page, 0.01, 0);
+  expect((await pose(page)).o).toBe('1.000');
+});
+
 test('in the middle the window is blown apart; off to one side it turns', async ({ open }) => {
   const page = await load(open);
   await page.clock.runFor(2800);
@@ -97,12 +109,19 @@ test('in the middle the window is blown apart; off to one side it turns', async 
   for (const [, , z] of side) expect(z).toBeGreaterThan(14.6);
   expect(new Set(SIDEBAR.map((k) => s.p[k].t.match(/rotateZ\([^)]*\)/)[0])).size).toBe(16);
   for (const k of SIDEBAR) expect(s.p[k].tr).toBe('transform 0.16s ease-out');
+  // odd parts fly right of the -40px drift, even ones left of it
+  side.forEach(([x], i) => expect(x > -40, SIDEBAR[i]).toBe(i % 2 === 1));
 
   // right of the middle: less apart, turned to the right
   await at(page, 0.5, 0);
   s = await pose(page);
   expect(turnOf(s.scene)).toBeCloseTo(14, 0);
   expect(parseFloat(s.p.b.e)).toBeCloseTo(0.5 * 0.5 / 0.7, 2);
+
+  // just inside the bottom edge, as far right: it hardly turns (8 + 0.5 * 0.05 / 0.25 * 12)
+  await at(page, 0.5, 0.95);
+  s = await pose(page);
+  expect(turnOf(s.scene)).toBeCloseTo(9.2, 0);
 
   // near a corner, still over the drawing: assembled
   await at(page, 0.95, 0.95);

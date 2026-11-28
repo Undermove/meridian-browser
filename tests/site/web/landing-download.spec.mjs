@@ -72,6 +72,11 @@ const CASES = [
     href: '#install', label: 'Send to my computer', sub: 'Free · Meridian is for Mac and Windows', icon: SEND_ICON, tab: 'mac' },
   { name: 'iPad in desktop mode (Mac with touch)', env: { ua: UA.mac, platform: 'MacIntel', touch: 5 },
     href: '#install', label: 'Send to my computer', sub: 'Free · Meridian is for Mac and Windows', icon: SEND_ICON, tab: 'mac' },
+  // only more than one touch point on a Mac means an iPad
+  { name: 'Mac with one touch point', env: { ua: UA.mac, platform: 'MacIntel', touch: 1 },
+    href: DMG, label: 'Download for Mac', sub: 'Free · Apple silicon (M1 and newer)', icon: ARROW_ICON, tab: 'mac' },
+  { name: 'Windows with a touch screen', env: { ua: UA.win, touch: 10 },
+    href: EXE, label: 'Download for Windows', sub: 'Free · Windows 10 and 11', icon: ARROW_ICON, tab: 'win' },
 ];
 
 for (const c of CASES) {
@@ -119,6 +124,24 @@ for (const [os, ua, href] of [['mac', UA.mac, DMG], ['win', UA.win, EXE]]) {
       await page.clock.runFor(1);
       await expect.poll(() => page.locator('#install').evaluate((el) => Math.round(el.getBoundingClientRect().top)))
         .toBe(0);
+    });
+  }
+}
+
+// Linux and unknown systems have nothing to download: their link goes to #install, and nothing scrolls
+// again 400 ms later. Mac is the control that shows the spy sees that scroll.
+for (const [os, env, scrolls] of [['mac', { ua: UA.mac }, true], ['linux', { ua: UA.linux, platform: 'Linux x86_64' }, false], ['an unknown system', { ua: UA.bot }, false]]) {
+  for (const which of ['[data-cta]', '#nav-go']) {
+    test(`${os}: ${which} ${scrolls ? 'scrolls' : 'does not scroll'} to the install steps after 400 ms`, async ({ open }) => {
+      const page = await load(open, { ...env, clock: true });
+      await page.evaluate(() => {
+        const was = Element.prototype.scrollIntoView;
+        window.__scrolled = [];
+        Element.prototype.scrollIntoView = function (...a) { window.__scrolled.push(this.id); return was.apply(this, a); };
+      });
+      await page.locator(which).first().click();
+      await page.clock.runFor(500);
+      expect((await page.evaluate(() => window.__scrolled)).includes('install')).toBe(scrolls);
     });
   }
 }
@@ -229,6 +252,16 @@ test.describe('send to my computer (phones)', () => {
       expect(page.url()).toMatch(/\/docs\/index\.html$/);
     });
   }
+
+  test('the send box scrolls to the middle of the screen when it opens', async ({ open }) => {
+    const page = await load(open, PHONE);
+    const mid = (el) => { const b = el.getBoundingClientRect(); return Math.round(b.top + b.height / 2 - innerHeight / 2); };
+    // the install part starts below the screen, so the box can only be seen by scrolling
+    expect(await page.locator('#install').evaluate((el) => el.getBoundingClientRect().top - innerHeight)).toBeGreaterThan(0);
+    await cta(page).click();
+    await expect.poll(() => page.locator('#sendbox').evaluate(mid), { timeout: 10000 }).toBeLessThanOrEqual(2);
+    expect(await page.locator('#sendbox').evaluate(mid)).toBeGreaterThanOrEqual(-2);
+  });
 
   test('Copy puts the link on the clipboard', async ({ open }) => {
     const page = await load(open, PHONE);
