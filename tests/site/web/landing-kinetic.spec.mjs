@@ -92,6 +92,9 @@ test.describe('kinetic mode on (1280x800)', () => {
       if (i === 3) {
         // Today: the pinned tab is green and wears its "Pinned" tag
         expect(await tab0(page)).toMatchObject({ background: 'rgb(201, 240, 46)', pinned: '1' });
+        // its two last tabs are the archived ones, in blue
+        const bgs = await page.evaluate(() => Object.fromEntries([...document.querySelectorAll('#scene .act.slab:not(.dk):not(.no)')].map((e) => [e.textContent.replace('Pinned', ''), e.style.background])));
+        expect(bgs).toEqual({ Linear: 'rgb(201, 240, 46)', Notion: 'rgb(255, 255, 255)', YouTube: 'rgb(255, 255, 255)', Figma: 'rgb(255, 255, 255)', Spotify: 'rgb(169, 180, 255)', GitHub: 'rgb(169, 180, 255)' });
       }
     }
     // spaces 0-6 each have their own pose; Download and Questions keep the last one
@@ -331,6 +334,84 @@ test.describe('switching at runtime', () => {
     await page.emulateMedia({ reducedMotion: 'no-preference' });
     await expect.poll(() => kin(page)).toBe(true);
   });
+
+  test('turned off and on again in the same place, the space is drawn again from scratch', async ({ page }) => {
+    await page.setViewportSize(BIG);
+    await page.goto(URL);
+    await landed(page);
+    await toSpace(page, 3);
+    await expect.poll(async () => (await look(page)).nav).toBe('nav s3');
+    const pose = (await tab0(page)).transform;
+    // (reduced motion, not a resize: the page stays where it is)
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await expect.poll(() => kin(page)).toBe(false);
+    expect((await look(page)).ins[3]).toBe('');
+    expect((await tab0(page)).transform).not.toBe(pose);
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    await expect.poll(() => kin(page)).toBe(true);
+    await expect.poll(async () => [(await look(page)).ins[3], (await look(page)).on[3], (await tab0(page)).transform]).toEqual(['1', true, pose]);
+  });
+});
+
+// Each demo scene is laid out 960px wide and scaled to fit its box, flat (narrow) or in kinetic mode.
+test('every demo scene fills its box, and again after a resize', async ({ open }) => {
+  const page = await load(open, { viewport: NARROW });
+  // the scene's 960px frame, measured untransformed: its own scale against the box's width
+  const fit = () => page.evaluate(() => ['#asm .asmf', '#swp .swpf', '#imp .impf', '#tdy .tdyf', '#spl .splf', '#aiw .aif', '#pvw .pvf'].map((sel) => {
+    const f = document.querySelector(sel), box = f.closest('#asm, #swp, #imp, #tdy, #spl, #aiw, #pvw');
+    return +(parseFloat(getComputedStyle(f).transform.split(',')[0].split('(')[1]) * 960 / box.clientWidth).toFixed(3);
+  }));
+  expect(await fit()).toEqual([1, 1, 1, 1, 1, 1, 1]);
+  await page.setViewportSize(BIG);
+  await expect.poll(() => kin(page)).toBe(true);
+  await expect.poll(fit).toEqual([1, 1, 1, 1, 1, 1, 1]);
+});
+
+test('the Windows tab makes Download taller: the spaces after it are measured again', async ({ open }) => {
+  const page = await load(open);
+  await page.evaluate(() => document.querySelector('#install').scrollIntoView({ behavior: 'instant' }));
+  const top = () => page.evaluate(() => document.querySelectorAll('.space')[8].getBoundingClientRect().top + scrollY);
+  const before = await top();
+  await page.locator('#t-win').click();
+  await expect.poll(top).toBeGreaterThan(before + 100);
+  // Questions' top half a screen below the bottom edge: not on yet (it is at p > .62)
+  const at = (p) => page.evaluate((p) => {
+    const s = document.querySelectorAll('.space')[8];
+    scrollTo({ top: s.getBoundingClientRect().top + scrollY - innerHeight + p * innerHeight, behavior: 'instant' });
+  }, p);
+  await at(.5);
+  await page.waitForFunction(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true)))));
+  expect((await look(page)).on[8]).toBe(false);
+  await at(.7);
+  await expect.poll(async () => (await look(page)).on[8]).toBe(true);
+});
+
+test('while the headline drops in, a resize does not measure its letters where they are', async ({ open }) => {
+  // The drop is held part-way: its timers wait for page.clock, and its CSS transitions are stopped, so
+  // the lines stay lifted (translateY(-.45em)) above where they land.
+  const page = await open(null, { viewport: BIG });
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('Animation.enable');
+  await cdp.send('Animation.setPlaybackRate', { playbackRate: 0 });
+  await page.clock.install({ time: new Date('2026-01-01T00:00:00Z') });
+  await page.clock.pauseAt(new Date('2026-01-01T00:00:01Z'));
+  await page.goto(URL);
+  await expect(page.locator('h1.fit')).toHaveClass(/\bgo\b/);
+  // where the first letter lands
+  const c = await page.evaluate(() => {
+    const l = document.querySelector('h1 .l'), r = l.querySelector('.c').getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 + .45 * parseFloat(getComputedStyle(l).fontSize) };
+  });
+  await page.evaluate(() => dispatchEvent(new Event('resize')));
+  // past the resize's 120 ms wait, short of the drop's end
+  await page.clock.runFor(300);
+  expect(await page.evaluate(() => document.querySelector('h1 .l').style.transition)).not.toBe('');
+  // the pointer on that spot thins the letter as if it were there (measured lifted, it would lie some 50px off and stay heavier)
+  await page.mouse.move(c.x, c.y);
+  await page.clock.runFor(100);
+  const w = await page.evaluate(() => +document.querySelector('h1 .c').style.fontWeight);
+  expect(w).toBeGreaterThan(0);
+  expect(w).toBeLessThan(300);
 });
 
 test('without document.fonts the headline still lands and kinetic mode starts', async ({ open }) => {

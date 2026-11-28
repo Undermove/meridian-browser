@@ -229,6 +229,17 @@ test.describe('pairing parts up', () => {
   });
 });
 
+test.describe('a scene with nothing to show', () => {
+  test('a crossing from a scene with no part showing makes no copies and throws nothing', async ({ open }) => {
+    const page = await wide(open, { css: '#swp .scene * { visibility: hidden !important }' });
+    await goTo(page, 0, .5);
+    await record(page, () => document.querySelectorAll('.lkw .lk-c').length);
+    await expect.poll(async () => (await seen(page)).length, { timeout: 15000 }).toBeGreaterThan(30);
+    expect(new Set(await seen(page))).toEqual(new Set([0]));
+    expect(page.errors).toEqual([]);
+  });
+});
+
 test.describe('degenerate shapes', () => {
   test('a part squashed flat still has its riders and the morph its corners', async ({ open }) => {
     const frames = await squashed(open);

@@ -185,8 +185,17 @@ test.describe('connected scenes: interruptions', () => {
     await page.setViewportSize(BIG.viewport);
     await page.goto(URL);
     await landed(page);
-    await goTo(page, 3, .5);
+    // Crossing 0: its figure does not move by itself, so the copies come to rest. By then they have been
+    // taken a second time (as the first part changes face) and are not taken again on their own.
+    await goTo(page, 0, .5);
     await inFlight(page);
+    let last = '';
+    await expect.poll(async () => {
+      const now = await page.evaluate(() => [...document.querySelectorAll('.lkw > div')].map((e) => e.style.transform).join());
+      const same = now === last;
+      last = now;
+      return same;
+    }, { intervals: [500], timeout: 15000 }).toBe(true);
     await page.evaluate(() => { window.oldCopy = document.querySelector('.lkw > div'); });
     await page.setViewportSize({ width: 1300, height: 800 });
     await expect.poll(() => page.evaluate(() => !window.oldCopy.isConnected)).toBe(true);
@@ -213,8 +222,27 @@ test.describe('connected scenes: interruptions', () => {
     const page = await load(open);
     await goTo(page, 1, .5);
     await inFlight(page);
-    await page.evaluate(() => document.querySelector('#faq').scrollIntoView({ behavior: 'instant' }));
+    // at once: counted in frames from the jump (played out to its end, it takes well over a second)
+    const frames = await page.evaluate(() => new Promise((done) => {
+      document.querySelector('#faq').scrollIntoView({ behavior: 'instant' });
+      let n = 0;
+      const tick = () => { if (!document.querySelector('.lkw').children.length || ++n > 60) done(n); else requestAnimationFrame(tick); };
+      requestAnimationFrame(tick);
+    }));
+    expect(frames).toBeLessThanOrEqual(2);
     await ended(page);
+  });
+
+  test('turning reduced motion on mid-way hands the real scenes back', async ({ open }) => {
+    const page = await load(open);
+    await goTo(page, 5, .5);
+    await inFlight(page);
+    expect((await state(page)).pvwHold).toBe(true);
+    // no resize: the page sees only its media query change
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await expect(page.locator('html')).not.toHaveClass(/\bkin\b/);
+    await ended(page);
+    expect((await state(page)).pvwHold).toBe(false);
   });
 
   test('just past the end it was handed back at, the crossing does not restart', async ({ open }) => {

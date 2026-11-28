@@ -1,6 +1,7 @@
 // Poster type: every line of a .fit heading is sized to fill its column, capped in height on wide
 // screens.
 import { test, expect, mutate } from './fixtures.mjs';
+import { landed, goTo, inFlight } from './scene-helpers.mjs';
 
 const PAGE = 'docs/index.html';
 
@@ -84,6 +85,38 @@ test('the lines are fitted again after a resize', async ({ open }) => {
     const h = (await measure(page))[0];
     return h.W < before.W && h.lines.every((l) => near(l.w, h.W));
   }).toBe(true);
+});
+
+test('at 900px wide, the last width without kinetic mode, lines fill the column uncapped', async ({ open }) => {
+  // short, so the wide-screen cap would bite
+  const page = await open(PAGE, { viewport: { width: 900, height: 500 } });
+  const hs = (await settled(page)).filter((h) => h.W);
+  for (const h of hs) for (const l of h.lines) expect(near(l.w, h.W), `${h.text}: ${l.w} vs ${h.W}`).toBe(true);
+});
+
+test('a heading fitted while it flies keeps its size', async ({ open }) => {
+  const page = await open(PAGE, { viewport: { width: 1280, height: 800 } });
+  await landed(page);
+  const head = async () => (await measure(page)).find((h) => h.text === 'Download');
+  const before = await head();
+  // Download's heading is one of crossing 6's parts: it carries the zero-size marks the copies are measured by
+  await goTo(page, 6, .5);
+  await inFlight(page);
+  expect(await page.evaluate(() => document.querySelectorAll('#install h2 > lk-pt').length)).toBeGreaterThan(0);
+  // a font arriving now fits every heading again
+  await page.evaluate(() => document.fonts.dispatchEvent(new Event('loadingdone')));
+  expect((await head()).lines.map((l) => l.size)).toEqual(before.lines.map((l) => l.size));
+});
+
+test('the pointer finds the headline letters after a fit done part-way down the page', async ({ open }) => {
+  const page = await open(PAGE, { viewport: { width: 1280, height: 800 } });
+  await landed(page);
+  await page.evaluate(() => scrollTo({ top: 100, behavior: 'instant' }));
+  await page.evaluate(() => document.fonts.dispatchEvent(new Event('loadingdone')));
+  await page.evaluate(() => scrollTo({ top: 0, behavior: 'instant' }));
+  const c = await page.evaluate(() => { const r = document.querySelector('h1 .c').getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; });
+  await page.mouse.move(c.x, c.y);
+  await expect.poll(() => page.evaluate(() => +document.querySelector('h1 .c').style.fontWeight)).toBe(220);
 });
 
 // A page shown inside a hidden frame has no width: the headings are left alone rather than sized
