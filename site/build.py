@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Builds the site in docs/ (GitHub Pages, meridianbrowser.app) from site/.
 
-  python3 site/build.py
+  python3 site/build.py [--out DIR]
 
-- site/pages/*.html hold both languages: <span lang="en">…</span><span lang="ru">…</span>.
+- site/pages/changelog.html holds both languages (the home page, index.html, is English only): <span lang="en">…</span><span lang="ru">…</span>.
   Each becomes an English page (docs/<name>.html) and a Russian one (docs/ru/<name>.html),
   with hreflang alternates, x-default, canonical links and the language switch as a link.
 - site/guides/<slug>.html are English pages with a JSON header in a leading comment; each becomes
@@ -16,6 +16,7 @@ Edit site/, never the built pages in docs/ (the build overwrites them). docs/pri
 images and install.sh stay hand-written in docs/.
 """
 
+import argparse
 import html
 import json
 import os
@@ -26,15 +27,11 @@ SITE = os.path.join(ROOT, 'site')
 DOCS = os.path.join(ROOT, 'docs')
 BASE = 'https://meridianbrowser.app/'
 LANGS = ('en', 'ru')
+# Pages with no Russian version: the Russian pages link to the English one.
+ENGLISH_ONLY = ('index',)
 
 # The head of each bilingual page, per language (the English one is in the page itself).
 RU_META = {
-  'index': {
-    'title': 'Meridian — браузер с открытым кодом на замену Arc',
-    'description': 'Бесплатный браузер с открытым кодом для тех, кто любил Arc: спейсы, закреплённые вкладки, сплит-вью и импорт из Arc в один клик. Для macOS и Windows.',
-    'og_title': 'Meridian — браузер с открытым кодом на замену Arc',
-    'og_description': 'Спейсы, закреплённые вкладки, сплит-вью и импорт из Arc в один клик. Бесплатно для macOS и Windows.',
-  },
   'changelog': {
     'title': 'Что нового в Meridian',
     'description': 'Что нового в каждой версии Meridian, браузера с открытым кодом на замену Arc.',
@@ -53,7 +50,6 @@ def url_of(name, lang):
 def strip_lang(text, keep):
   """Keeps one language: drops <span lang="other">…</span> (nested spans and all) and unwraps
   <span lang="keep">…</span>."""
-  other = 'ru' if keep == 'en' else 'en'
   out = []
   i = 0
   opener = re.compile(r'<span lang="(en|ru)">')
@@ -76,13 +72,12 @@ def strip_lang(text, keep):
     if m.group(1) == keep:
       out.append(strip_lang(inner, keep))
     i = j
-  result = ''.join(out)
-  assert 'lang="' + other + '"' not in re.sub(r'hreflang="[a-z-]+"', '', result) or True
-  return result
+  return ''.join(out)
 
 
-# The bilingual pages: a Russian page links to their Russian versions, next to it.
-SIBLINGS = re.compile(r'^(?:\./|\.|index\.html|changelog\.html|(?:arc-shutdown|import-from-arc|windows|developers|arc-alternatives)/)(?:#.*)?$|^\./#')
+# The bilingual pages: a Russian page links to their Russian versions, next to it. The home page
+# is not one of them, so a Russian page's link to it goes up to the site root.
+SIBLINGS = re.compile(r'^(?:changelog\.html|(?:arc-shutdown|import-from-arc|windows|developers|arc-alternatives)/)(?:#.*)?$')
 
 
 def relocate(text, depth, siblings=False):
@@ -123,7 +118,8 @@ def set_meta(text, name, content, prop=False):
 def faq_items(text):
   """(question, answer) from the page's Questions, as plain text."""
   items = []
-  for m in re.finditer(r'<details><summary>(.*?)</summary><p>(.*?)</p></details>', text, re.S):
+  qa = text[text.index('<div class="qa">'):]
+  for m in re.finditer(r'<article[^>]*><h3>(.*?)</h3><p>(.*?)</p></article>', qa, re.S):
     plain = lambda s: html.unescape(re.sub(r'<[^>]+>', '', s)).strip()
     items.append((plain(m.group(1)), plain(m.group(2))))
   return items
@@ -151,15 +147,17 @@ def structured_data(text, lang):
     'mainEntity': [{'@type': 'Question', 'name': q,
                     'acceptedAnswer': {'@type': 'Answer', 'text': a}} for q, a in faq_items(text)],
   }
-  blocks = [app] + ([faq] if faq['mainEntity'] else [])
+  assert faq['mainEntity'], 'the home page has no Questions the build can read'
+  blocks = [app, faq]
   return '\n'.join('<script type="application/ld+json">' + json.dumps(b, ensure_ascii=False) + '</script>'
                    for b in blocks)
 
 
-def build_page(name):
+def build_page(name, docs):
   source = open(os.path.join(SITE, 'pages', f'{name}.html'), encoding='utf-8').read()
   built = []
-  for lang in LANGS:
+  one = name in ENGLISH_ONLY
+  for lang in ('en',) if one else LANGS:
     text = strip_lang(source, lang)
     other = 'ru' if lang == 'en' else 'en'
     text = re.sub(r'<html lang="[a-z]+">', f'<html lang="{lang}">', text, count=1)
@@ -167,8 +165,9 @@ def build_page(name):
     # The switch: a link to the same page in the other language.
     switch = (f'<a class="link lang-link" href="{url_of(name, other)}" hreflang="{other}">'
               f'{"Русский" if other == "ru" else "English"}</a>')
-    text, n = re.subn(r'<div class="lang"[^>]*>.*?</div>', switch, text, count=1, flags=re.S)
-    assert n == 1, name
+    if not one:
+      text, n = re.subn(r'<div class="lang"[^>]*>.*?</div>', switch, text, count=1, flags=re.S)
+      assert n == 1, name
     # The scripts take the page's language.
     text = re.sub(r"let lang = '[a-z]*';\n\s*try \{ lang = localStorage\.getItem\('lang'\) \|\| ''; \} catch \{\}\n\s*if \([^\n]*\) lang = [^\n]*\n",
                   "let lang = document.documentElement.lang === 'ru' ? 'ru' : 'en';\n", text, count=1)
@@ -178,7 +177,7 @@ def build_page(name):
       text = set_meta(text, 'description', meta['description'])
       text = set_meta(text, 'og:title', meta['og_title'], prop=True)
       text = set_meta(text, 'og:description', meta['og_description'], prop=True)
-    head = f'<link rel="canonical" href="{url_of(name, lang)}">\n{alternates(name)}'
+    head = f'<link rel="canonical" href="{url_of(name, lang)}">' + ('' if one else '\n' + alternates(name))
     if lang == 'ru':
       head += '\n<meta property="og:locale" content="ru_RU">'
     else:
@@ -189,7 +188,7 @@ def build_page(name):
     assert n == 1, name
     depth = 1 if lang == 'ru' else 0
     text = relocate(text, depth, siblings=lang == 'ru')
-    out = os.path.join(DOCS, 'ru' if lang == 'ru' else '', f'{name}.html')
+    out = os.path.join(docs, 'ru' if lang == 'ru' else '', f'{name}.html')
     os.makedirs(os.path.dirname(out), exist_ok=True)
     open(out, 'w', encoding='utf-8').write(text)
     built.append(url_of(name, lang))
@@ -227,13 +226,14 @@ def guide_url(slug, lang):
 
 
 def to_root(text):
-  """A Russian guide sits one folder deeper. Links to other guides, the Russian home page and the
-  changelog stay inside /ru/; shared files (icon, images, privacy) go up to the site root."""
-  return re.sub(r'\b(href|src)="\.\./(icon\.png|privacy\.html|changelog-images/[^"]*|screenshot[^"]*)"',
+  """A Russian guide sits one folder deeper. Links to other guides and the changelog stay inside
+  /ru/; shared files (icon, images, privacy) and the home page, which is English only, go up to
+  the site root."""
+  return re.sub(r'\b(href|src)="\.\./(icon\.png|privacy\.html|changelog-images/[^"]*|screenshot[^"]*|#[^"]*|)"',
                 r'\1="../../\2"', text)
 
 
-def build_guide(slug, lang, template, guides):
+def build_guide(slug, lang, template, guides, docs):
   folder = os.path.join(SITE, 'guides', 'ru') if lang == 'ru' else os.path.join(SITE, 'guides')
   meta, body = read_guide(os.path.join(folder, slug + '.html'))
   url = guide_url(slug, lang)
@@ -272,16 +272,20 @@ def build_guide(slug, lang, template, guides):
       assert en in page, en
       page = page.replace(en, ru)
     page = to_root(page)
-  out = os.path.join(DOCS, 'ru' if lang == 'ru' else '', slug, 'index.html')
+  out = os.path.join(docs, 'ru' if lang == 'ru' else '', slug, 'index.html')
   os.makedirs(os.path.dirname(out), exist_ok=True)
   open(out, 'w', encoding='utf-8').write(page)
   return url
 
 
-def main():
+def main(argv=None):
+  parser = argparse.ArgumentParser(description='Builds the site from site/.')
+  parser.add_argument('--out', help='the folder to build into (default: docs/)')
+  # DOCS is read at call time: tests patch it.
+  docs = parser.parse_args(argv).out or DOCS
   urls = []
   for name in ('index', 'changelog'):
-    urls += build_page(name)
+    urls += build_page(name, docs)
   guides_dir = os.path.join(SITE, 'guides')
   template = open(os.path.join(SITE, 'guide_template.html'), encoding='utf-8').read()
   guides = []
@@ -293,15 +297,15 @@ def main():
     guides.append({'slug': slug, 'nav': meta['nav'], 'nav_ru': nav_ru, 'order': meta.get('order', 99)})
   guides.sort(key=lambda g: g['order'])
   for g in guides:
-    urls.append(build_guide(g['slug'], 'en', template, guides))
+    urls.append(build_guide(g['slug'], 'en', template, guides, docs))
     if g['nav_ru']:
-      urls.append(build_guide(g['slug'], 'ru', template, guides))
+      urls.append(build_guide(g['slug'], 'ru', template, guides, docs))
   urls.append(BASE + 'privacy.html')
   sitemap = ['<?xml version="1.0" encoding="UTF-8"?>',
              '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
   sitemap += [f'  <url><loc>{u}</loc></url>' for u in urls]
   sitemap.append('</urlset>')
-  open(os.path.join(DOCS, 'sitemap.xml'), 'w').write('\n'.join(sitemap) + '\n')
+  open(os.path.join(docs, 'sitemap.xml'), 'w').write('\n'.join(sitemap) + '\n')
   print('\n'.join(urls))
 
 
