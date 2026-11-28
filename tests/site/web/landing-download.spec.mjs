@@ -200,7 +200,7 @@ test.describe('send to my computer (phones)', () => {
   test('the share sheet gets the link; the send box stays closed', async ({ open }) => {
     const page = await load(open, { ...PHONE, share: 'resolve' });
     await cta(page).click();
-    await expect.poll(() => gcPaths(page)).toContain('send-shared');
+    await expect.poll(() => gcPaths(page)).toEqual(['send-tap', 'send-shared']);
     expect(await page.evaluate(() => window.__calls.share)).toEqual([
       { title: 'Meridian', text: 'Meridian browser', url: await sendUrl(page) },
     ]);
@@ -211,7 +211,7 @@ test.describe('send to my computer (phones)', () => {
   test('the bar button shares too', async ({ open }) => {
     const page = await load(open, { ...IPAD, share: 'resolve' });
     await page.locator('#nav-go').click();
-    await expect.poll(() => gcPaths(page)).toContain('send-shared');
+    await expect.poll(() => gcPaths(page)).toEqual(['send-tap', 'send-shared']);
     await expect(page.locator('#sendbox')).toBeHidden();
     expect(page.url()).toMatch(/\/docs\/index\.html$/);
   });
@@ -224,7 +224,7 @@ test.describe('send to my computer (phones)', () => {
       await expect(page.locator('#sendbox')).toBeVisible();
       await expect(page.locator('#send-note')).toHaveText('Open this link on your Mac or Windows computer:');
       await expect(page.locator('#send-url')).toHaveValue(await sendUrl(page));
-      expect(await gcPaths(page)).toEqual(['send-shown']);
+      expect(await gcPaths(page)).toEqual(['send-tap', 'send-shown']);
       expect(await page.evaluate(() => window.__calls.share.length)).toBe(share ? 1 : 0);
       expect(page.url()).toMatch(/\/docs\/index\.html$/);
     });
@@ -237,7 +237,7 @@ test.describe('send to my computer (phones)', () => {
     await page.locator('#send-copy').click();
     await expect(page.locator('#send-copy')).toHaveText('Copied!');
     expect(await page.evaluate(() => window.__calls.clip)).toEqual([await sendUrl(page)]);
-    expect(await gcPaths(page)).toEqual(['send-shown', 'send-copied']);
+    expect(await gcPaths(page)).toEqual(['send-tap', 'send-shown', 'send-copied']);
   });
 
   test('Copy selects the link when the clipboard refuses', async ({ open }) => {
@@ -249,7 +249,7 @@ test.describe('send to my computer (phones)', () => {
     await page.locator('#send-copy').click();
     await expect(page.locator('#send-copy')).toHaveText('Copied!');
     expect(await sel()).toEqual([0, len, len]);
-    expect(await gcPaths(page)).toEqual(['send-shown', 'send-copied']);
+    expect(await gcPaths(page)).toEqual(['send-tap', 'send-shown', 'send-copied']);
   });
 
   test('Email it to me opens a mail with the link', async ({ open }) => {
@@ -261,7 +261,7 @@ test.describe('send to my computer (phones)', () => {
     // cancel the mailto navigation so no mail app is asked; only the count is checked
     await mail.evaluate((a) => a.addEventListener('click', (e) => e.preventDefault()));
     await mail.click();
-    expect(await gcPaths(page)).toEqual(['send-shown', 'send-email']);
+    expect(await gcPaths(page)).toEqual(['send-tap', 'send-shown', 'send-email']);
   });
 });
 
@@ -288,13 +288,18 @@ test.describe('goatcounter', () => {
     expect(page.errors).toEqual([]);
   });
 
+  // The tap is counted first, so without the try a throwing counter stops the button before it shares.
   test('the same check fails without the try in gc', async ({ open }) => {
     const page = await open(null, { userAgent: UA.iphone, init: init({ platform: 'iPhone', gc: 'throw', share: 'resolve' }) });
     await mutate(page, PAGE, 'const gc = (path) => { try { window.goatcounter && window.goatcounter.count({ path, title: path, event: true }); } catch {} };',
       'const gc = (path) => { window.goatcounter && window.goatcounter.count({ path, title: path, event: true }); };');
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
     await page.goto(PAGE);
     await cta(page).click();
-    await expect(page.locator('#sendbox')).toBeVisible();
+    await expect.poll(() => errors.length).toBeGreaterThan(0);
+    expect(await page.evaluate(() => window.__calls.share.length)).toBe(0);
+    await expect(page.locator('#sendbox')).toBeHidden();
   });
 });
 

@@ -108,8 +108,8 @@ ${JSON.stringify(DEFAULT_SETTINGS, null, 2)}
 - \`agents.autoContinue\`: after Meridian restarts, agent sessions come back resumed and wait with a
   "Restored — continue?" bar; \`true\` sends "continue" to each one by itself.
 
-The Customize panel's one-click looks (Designer mode, Minimal) are laid over this file without
-changing it; Reset there takes them off.
+The Customize panel's looks (Familiar, Calm, Minimal) are laid over this file without
+changing it; «As it was» there takes them off.
 
 ## user.css
 

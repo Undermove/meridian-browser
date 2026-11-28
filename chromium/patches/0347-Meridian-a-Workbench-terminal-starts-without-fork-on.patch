@@ -1,0 +1,382 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Afonchenko <undermove1@gmail.com>
+Date: Fri, 27 Nov 2026 00:36:02 +0400
+Subject: [PATCH] Meridian: a Workbench terminal starts without fork on the Mac
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A test build crashed opening a Workbench terminal (27.11 00:10, SIGSEGV):
+fork() in the many-threaded browser ran libSystem's atfork handlers in
+the child, libxpc's released an XPC object there, and Chromium's
+Objective-C zombie tracking (ZombieDealloc) took the child's copy of the
+browser down inside fork(), before exec. Present since the terminals
+came; rare, but any terminal opening could hit it.
+
+On the Mac the program now starts with posix_spawn, which runs no atfork
+handler. posix_spawn can't make the pty the controlling terminal
+(TIOCSCTTY: ^C, job control; without it a shell's loop didn't stop on
+^C), so it runs the browser's own binary as a trampoline first:
+`Meridian --meridian-pty-exec -- <program…>` (helper_modes.cc, before
+anything of the browser) takes the pty as its controlling terminal,
+resets the signals and execs the program, which keeps that pid. The same
+child as before: a new session (POSIX_SPAWN_SETSID), the pty on
+stdin/stdout/stderr, no other descriptor (POSIX_SPAWN_CLOEXEC_DEFAULT),
+no blocked signal, every signal at its default, in the project folder
+(where Meridian is when the folder is gone). Linux keeps fork(). A
+program that can't be run now says "Couldn't start the terminal."
+instead of a terminal that ends with 127.
+
+Unit tests (the test binary is its own trampoline): the child is a
+session leader in the pty's foreground group with the pty as /dev/tty,
+in its folder, without Meridian's open files; a folder that's gone still
+starts the shell; 60 terminals one after another while four threads keep
+allocating.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SwxrQ2eLfJ2bv8cCoG2va1
+---
+ chrome/browser/meridian/helper_modes.cc       |   8 ++
+ chrome/browser/meridian/workbench/terminal.cc | 112 +++++++++++++++++
+ chrome/browser/meridian/workbench/terminal.h  |   7 ++
+ .../meridian/workbench/terminal_unittest.cc   | 116 ++++++++++++++++++
+ 4 files changed, 243 insertions(+)
+
+diff --git a/chrome/browser/meridian/helper_modes.cc b/chrome/browser/meridian/helper_modes.cc
+index 66f5e58c65..81c28ed348 100644
+--- a/chrome/browser/meridian/helper_modes.cc
++++ b/chrome/browser/meridian/helper_modes.cc
+@@ -14,6 +14,7 @@
+ #include "chrome/browser/meridian/workbench/guard_hook.h"
+ #if BUILDFLAG(IS_POSIX)
+ #include "chrome/browser/meridian/workbench/term_host.h"
++#include "chrome/browser/meridian/workbench/terminal.h"
+ #endif
+ 
+ #if BUILDFLAG(IS_WIN)
+@@ -37,6 +38,13 @@ namespace meridian {
+ namespace {
+ 
+ std::optional<int> Run(int argc, const char** argv) {
++#if BUILDFLAG(IS_MAC)
++  // A Workbench terminal's program on its way (terminal.cc): first, before
++  // anything of the browser.
++  if (workbench::IsPtyExec(argc, argv)) {
++    return workbench::RunPtyExec(argc, argv);
++  }
++#endif
+   if (workbench::IsSecretGuard(argc, argv)) {
+     return workbench::RunSecretGuard(argc, argv);
+   }
+diff --git a/chrome/browser/meridian/workbench/terminal.cc b/chrome/browser/meridian/workbench/terminal.cc
+index d7e064589f..05ac8b1b00 100644
+--- a/chrome/browser/meridian/workbench/terminal.cc
++++ b/chrome/browser/meridian/workbench/terminal.cc
+@@ -15,10 +15,16 @@
+ #include <unistd.h>
+ #include <termios.h>
+ #endif
++#if BUILDFLAG(IS_MAC)
++#include <spawn.h>
++#endif
+ 
+ #include <array>
+ #include <atomic>
+ 
++#include "base/base_paths.h"
++#include "base/files/file_path.h"
++#include "base/path_service.h"
+ #include "base/containers/span.h"
+ #include "base/files/file_util.h"
+ #include "base/memory/ptr_util.h"
+@@ -211,6 +217,10 @@ class Terminal::Io : public base::RefCountedThreadSafe<Terminal::Io> {
+   ExitCallback on_exit_;
+ };
+ 
++namespace {
++constexpr char kPtyExec[] = "--meridian-pty-exec";
++}  // namespace
++
+ // static
+ std::unique_ptr<Terminal> Terminal::Start(const Spec& spec,
+                                           DataCallback on_data,
+@@ -250,6 +260,77 @@ std::unique_ptr<Terminal> Terminal::Start(const Spec& spec,
+     max_fd = 65536;
+   }
+ 
++#if BUILDFLAG(IS_MAC)
++  // posix_spawn, not fork: fork() in the browser runs libSystem's atfork
++  // handlers in the child, and libxpc's releases Objective-C objects there;
++  // with Chromium's zombie tracking that crashed Meridian (27.11, a SIGSEGV
++  // in xpc_atfork_child while a Workbench terminal opened). posix_spawn
++  // can't make the pty the controlling terminal (TIOCSCTTY, needed for ^C
++  // and job control), so the browser's own binary does that first and then
++  // execs the program (RunPtyExec below; the program keeps its pid). The
++  // same child as before: a new session with the pty as its controlling
++  // terminal and stdio, no other descriptor, no blocked signal, every signal
++  // at its default, in `cwd` when it is there.
++  (void)max_fd;
++  // (Absolute: the child changes to `cwd` before it runs.)
++  base::FilePath exe;
++  if (!base::PathService::Get(base::FILE_EXE, &exe)) {
++    close(master);
++    close(slave);
++    return nullptr;
++  }
++  std::string self = exe.value();
++  std::string flag = kPtyExec;
++  std::string dashes = "--";
++  std::vector<char*> spawn_argv = {self.data(), flag.data(), dashes.data()};
++  spawn_argv.insert(spawn_argv.end(), argv.begin(), argv.end());
++  pid_t pid = -1;
++  for (bool with_cwd : {true, false}) {
++    if (with_cwd && cwd.empty()) {
++      continue;
++    }
++    posix_spawn_file_actions_t actions;
++    posix_spawn_file_actions_init(&actions);
++    posix_spawn_file_actions_adddup2(&actions, slave, STDIN_FILENO);
++    posix_spawn_file_actions_adddup2(&actions, slave, STDOUT_FILENO);
++    posix_spawn_file_actions_adddup2(&actions, slave, STDERR_FILENO);
++    if (with_cwd) {
++      if (__builtin_available(macOS 26, *)) {
++        posix_spawn_file_actions_addchdir(&actions, cwd.c_str());
++      } else {
++        posix_spawn_file_actions_addchdir_np(&actions, cwd.c_str());
++      }
++    }
++    posix_spawnattr_t attr;
++    posix_spawnattr_init(&attr);
++    sigset_t none;
++    sigemptyset(&none);
++    sigset_t all;
++    sigfillset(&all);
++    posix_spawnattr_setsigmask(&attr, &none);
++    posix_spawnattr_setsigdefault(&attr, &all);
++    posix_spawnattr_setflags(
++        &attr, POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT |
++                   POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
++    const int error = posix_spawn(&pid, self.c_str(), &actions, &attr,
++                                  spawn_argv.data(), envp.data());
++    posix_spawnattr_destroy(&attr);
++    posix_spawn_file_actions_destroy(&actions);
++    if (error == 0) {
++      break;
++    }
++    pid = -1;
++    // The folder is gone: the shell starts where Meridian is (as before).
++    if (!with_cwd) {
++      break;
++    }
++  }
++  if (pid < 0) {
++    close(master);
++    close(slave);
++    return nullptr;
++  }
++#else
+   pid_t pid = fork();
+   if (pid < 0) {
+     close(master);
+@@ -279,6 +360,7 @@ std::unique_ptr<Terminal> Terminal::Start(const Spec& spec,
+     execve(argv[0], argv.data(), envp.data());
+     _exit(127);
+   }
++#endif
+   close(slave);
+   auto terminal = base::WrapUnique(new Terminal(pid));
+   terminal->io_ = base::MakeRefCounted<Io>(pid, master, std::move(on_data),
+@@ -366,4 +448,34 @@ void Terminal::Kill() {
+ }
+ #endif  // !BUILDFLAG(IS_WIN)
+ 
++#if !BUILDFLAG(IS_WIN)
++bool IsPtyExec(int argc, const char** argv) {
++  if (argc < 4) {
++    return false;
++  }
++  // SAFETY: main's argv has argc entries.
++  const auto args =
++      UNSAFE_BUFFERS(base::span(argv, static_cast<size_t>(argc)));
++  return std::string_view(args[1]) == kPtyExec &&
++         std::string_view(args[2]) == "--";
++}
++
++int RunPtyExec(int argc, const char** argv) {
++  // A new process (posix_spawn made its session): only what a fork child
++  // did before exec. Nothing of the browser started yet.
++  ioctl(STDIN_FILENO, TIOCSCTTY, 0);
++  sigset_t none;
++  sigemptyset(&none);
++  sigprocmask(SIG_SETMASK, &none, nullptr);
++  struct sigaction dfl = {};
++  dfl.sa_handler = SIG_DFL;
++  for (int s = 1; s < NSIG; ++s) {
++    sigaction(s, &dfl, nullptr);
++  }
++  // SAFETY: argv has argc entries and a null after them (as main's does).
++  UNSAFE_BUFFERS(execv(argv[3], const_cast<char* const*>(argv + 3)));
++  return 127;
++}
++#endif
++
+ }  // namespace meridian::workbench
+diff --git a/chrome/browser/meridian/workbench/terminal.h b/chrome/browser/meridian/workbench/terminal.h
+index 48c3c41162..dca556a5f4 100644
+--- a/chrome/browser/meridian/workbench/terminal.h
++++ b/chrome/browser/meridian/workbench/terminal.h
+@@ -83,6 +83,13 @@ class Terminal {
+ // rest stays in `buffer` for the next read.
+ std::string TakeCompleteUtf8(std::string& buffer);
+ 
++// macOS: a terminal's program starts through the browser's own binary,
++// `<exe> --meridian-pty-exec -- <program> <args…>` (posix_spawn, not fork:
++// see terminal.cc). It makes the pty on its stdin the controlling terminal
++// and execs the program, so the program keeps this process's pid.
++bool IsPtyExec(int argc, const char** argv);
++int RunPtyExec(int argc, const char** argv);
++
+ }  // namespace meridian::workbench
+ 
+ #endif  // CHROME_BROWSER_MERIDIAN_WORKBENCH_TERMINAL_H_
+diff --git a/chrome/browser/meridian/workbench/terminal_unittest.cc b/chrome/browser/meridian/workbench/terminal_unittest.cc
+index da45517de7..7ef255a6cd 100644
+--- a/chrome/browser/meridian/workbench/terminal_unittest.cc
++++ b/chrome/browser/meridian/workbench/terminal_unittest.cc
+@@ -5,14 +5,35 @@
+ #include "chrome/browser/meridian/workbench/terminal.h"
+ 
+ #include "base/environment.h"
++#include "base/files/file_util.h"
++#include "base/files/scoped_temp_dir.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/run_loop.h"
+ #include "base/test/task_environment.h"
++#include "base/threading/platform_thread.h"
+ #include "build/build_config.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+ #if !BUILDFLAG(IS_WIN)
++#include <fcntl.h>
+ #include <signal.h>
++#include <unistd.h>
++
++#include <atomic>
++#include <thread>
++#include <vector>
++#endif
++
++#if BUILDFLAG(IS_MAC)
++// This test binary is the terminals' trampoline here, as the browser's
++// binary is in Meridian (helper_modes.cc): before any test runs.
++__attribute__((constructor)) static void MaybePtyExec(int argc,
++                                                      const char** argv) {
++  if (meridian::workbench::IsPtyExec(argc, argv)) {
++    _exit(meridian::workbench::RunPtyExec(argc, argv));
++  }
++}
+ #endif
+ 
+ namespace meridian::workbench {
+@@ -124,5 +145,100 @@ TEST(TerminalTest, KillEndsTheProcessGroup) {
+ #endif
+ }
+ 
++#if !BUILDFLAG(IS_WIN)
++// Runs `script` in /bin/sh on a terminal in `cwd`; what it printed and its exit code.
++std::pair<std::string, int> RunScript(const std::string& script,
++                                      const std::string& cwd = "") {
++  Terminal::Spec spec;
++  spec.argv = {"/bin/sh", "-c", script};
++  spec.env = {{"PATH", "/usr/bin:/bin"}};
++  spec.cwd = cwd;
++  std::string out;
++  int exit_code = -2;
++  base::RunLoop exited;
++  std::unique_ptr<Terminal> term = Terminal::Start(
++      spec,
++      base::BindRepeating([](std::string* out, std::string d) { *out += d; },
++                          &out),
++      base::BindOnce(
++          [](int* code, base::OnceClosure quit, int c, int) {
++            *code = c;
++            std::move(quit).Run();
++          },
++          &exit_code, exited.QuitClosure()));
++  if (!term) {
++    return {"<not started>", -3};
++  }
++  exited.Run();
++  return {out, exit_code};
++}
++
++// The shell's own session, with the pty as its controlling terminal (job
++// control, Ctrl+C), in the folder asked for, with none of Meridian's open
++// files and no signal blocked or ignored.
++TEST(TerminalTest, ANewSessionWithThePtyAsItsTerminalInItsFolder) {
++  base::test::TaskEnvironment env;
++  base::ScopedTempDir dir;
++  ASSERT_TRUE(dir.CreateUniqueTempDir());
++  const base::FilePath real = base::MakeAbsoluteFilePath(dir.GetPath());
++  // A file Meridian has open, not close-on-exec: the shell must not get it.
++  const int leaked = open(real.AppendASCII("open").value().c_str(),
++                          O_CREAT | O_RDWR, 0600);
++  ASSERT_GE(leaked, 3);
++  auto [out, code] = RunScript(
++      "pwd -P; [ \"$(ps -o sess= -p $$ | tr -d ' ')\" = \"$(ps -o pid= -p $$ | "
++      "tr -d ' ')\" ] || [ \"$(ps -o pgid= -p $$ | tr -d ' ')\" = \"$$\" ] && "
++      "echo leader; (exec 3</dev/tty) 2>/dev/null && echo ctty; "
++      "[ -e /dev/fd/" + base::NumberToString(leaked) + " ] && echo leaked; "
++      "trap -p INT; (exec 3</dev/tty && ps -o tpgid=,pgid= -p $$ | awk '$1==$2{print \"fg\"}'); echo done",
++      real.value());
++  close(leaked);
++  EXPECT_EQ(code, 0) << out;
++  EXPECT_NE(out.find(real.value()), std::string::npos) << out;
++  EXPECT_NE(out.find("leader"), std::string::npos) << out;
++  EXPECT_NE(out.find("ctty"), std::string::npos) << out;
++  EXPECT_EQ(out.find("leaked"), std::string::npos) << out;
++  EXPECT_NE(out.find("fg"), std::string::npos) << out;
++  EXPECT_NE(out.find("done"), std::string::npos) << out;
++}
++
++// The project folder was removed: the shell still starts (where Meridian is).
++TEST(TerminalTest, AFolderThatIsGoneStillStartsTheShell) {
++  base::test::TaskEnvironment env;
++  auto [out, code] = RunScript("echo started", "/nonexistent/meridian-gone");
++  EXPECT_EQ(code, 0) << out;
++  EXPECT_NE(out.find("started"), std::string::npos) << out;
++}
++
++// Many terminals opened and ended one after another while other threads of
++// the browser allocate and free Objective-C and other objects: none takes the
++// process down (27.11: fork() crashed in libxpc's atfork handler).
++TEST(TerminalTest, ManyTerminalsWhileOtherThreadsAreBusy) {
++  base::test::TaskEnvironment env;
++  std::atomic<bool> stop{false};
++  std::vector<std::thread> busy;
++  for (int i = 0; i < 4; ++i) {
++    busy.emplace_back([&stop] {
++      while (!stop) {
++        std::vector<std::string> junk(64, std::string(256, 'x'));
++        junk.clear();
++      }
++    });
++  }
++  int ok = 0;
++  for (int i = 0; i < 60; ++i) {
++    auto [out, code] = RunScript("echo hi");
++    if (code == 0 && out.find("hi") != std::string::npos) {
++      ++ok;
++    }
++  }
++  stop = true;
++  for (std::thread& t : busy) {
++    t.join();
++  }
++  EXPECT_EQ(ok, 60);
++}
++#endif
++
+ }  // namespace
+ }  // namespace meridian::workbench
